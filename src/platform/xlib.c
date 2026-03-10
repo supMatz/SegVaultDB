@@ -24,7 +24,7 @@ struct PlatformWindow {
     Atom wm_delete;         // serve per non crashare o ignorare chiusura finestra
 };
 
-bool platform_init(void){
+bool platform_init(void) {
     //xlib richiede che i thread usino XInitThreads(), per query async
     if(XInitThreads())
         return true;
@@ -32,7 +32,7 @@ bool platform_init(void){
         return false;  // se non va in errore ritorno true, altrimenti false
 }
 
-PlatformWindow* platform_window_create(const char* title, int w, int h){
+PlatformWindow* platform_window_create(const char* title, int w, int h) {
     PlatformWindow* win = calloc(1, sizeof(PlatformWindow));
 
     // apertura della connessione al server X
@@ -94,12 +94,12 @@ PlatformWindow* platform_window_create(const char* title, int w, int h){
 }
 
 // funzione per mostrare la finestra passata
-void platform_window_show(PlatformWindow* win){
+void platform_window_show(PlatformWindow* win) {
     XMapWindow(win->display, win->window); // rende visibile la finestra
     XFlush(win->display); // invia i comandi al server X
 }
 
-bool platform_poll_event(PlatformWindow *win, sEvent *evt){
+bool platform_poll_event(PlatformWindow *win, sEvent *evt) {
     if(!XPending(win->display)) return false; // nessun evento
 
     XEvent xe;
@@ -148,7 +148,7 @@ bool platform_poll_event(PlatformWindow *win, sEvent *evt){
 
             // generazione EVT_CHAR per differenziare caratteri di controllo da lettere o num
             char buff[4] = {0};
-            if(XLookupString(&xe.xkey, buff, 4, NULL, NULL) > 0 && buff[0] >= 32){
+            if(XLookupString(&xe.xkey, buff, 4, NULL, NULL) > 0 && buff[0] >= 32) {
                 evt->type = EVT_CHAR;
                 evt->character = (uint32_t)buff[0];
             }
@@ -179,7 +179,41 @@ bool platform_poll_event(PlatformWindow *win, sEvent *evt){
     return evt->type != EVT_NONE; // return del fatto se l'evento è diverso da "nessuno"
 }
 
-// TODO : clear, e successivi
 void platform_clear(PlatformWindow* win, Color c) {
+    unsigned long pixel = ((c.r << 16) | (c.g << 8) | c.b); // conversione color in pixel X11 - rosso nei bit significativi, verde al centro e blu nei bit finali : r-g-b
 
+    XSetForeground(win->display, win->gc_buf, pixel); // scelta colore per la prossima operazione di disegno
+    XFillRectangle(win->display, win->backbuf, win->gc_buf, 0, 0, win->w, win->h); // disegno rettangolo in pos (0;0) con w e h tante quante la finestra (copre tutto)   
+}
+
+int platform_draw_text(PlatformWindow *win, const char *text, Point pos, Color c, int size) {
+    unsigned long pixel = ((c.r << 16) | (c.g << 8) | c.b); // stessa conversione che per platform_clear()
+
+    XSetForeground(win->display, win->gc_buf, pixel); // stessa scelta colore per la prossima operazione di disegno
+    
+    XDrawString(        // funzione per disegnare una stringa (testo)
+        win->display, 
+        win->backbuf, 
+        win->gc_buf, 
+        pos.x, 
+        (pos.y + size), // pos.y è la base line in Xlib a cui applico un offset di +size (altezza font) 
+        text, 
+        strlen(text)
+    );
+
+    return XTextWidth(win->font, text, strlen(text)); // ritorno la misurazione della grandezza del testo nella finestra
+}
+
+void platform_present(PlatformWindow *win) {
+    // copio il backbuffer sulla finestra principale (equivalente a BitBlt)
+    XCopyArea(
+        win->display, 
+        win->backbuf,   // sorgente copiatura
+        win->window,    // destinazione : finestra utente
+        win->gc,      
+        0, 0,           // posizione sorgente
+        win->w, win->h, // dimensioni finestra
+        0,0             // posizione destinazione
+    );       
+    XFlush(win->display); // invio al server X
 }
