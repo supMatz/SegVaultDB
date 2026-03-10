@@ -1,0 +1,185 @@
+/* 
+SCOPO: Stessa interfaccia di win32.c ma usa Xlib (Linux/X11).
+       Il codice dei widget non cambia NULLA tra i due file.
+       Compilato SOLO su Linux (vedi Makefile).
+*/
+
+#include <X11/X.h>
+#include <X11/Xlib.h>     // API Xlib
+#include <X11/Xutil.h>    // XTextExtents, XSizeHints
+#include <X11/keysym.h>   // cstanti tasti (XK_Return, ecc.)
+#include <stdlib.h>
+#include <string.h>
+#include "platform.h"
+
+struct PlatformWindow {
+    Display* display;       // connessione al server X (può essere remoto)
+    Window window;          // id finestra
+    GC gc;                  // equivalente all'HDC di Win32, per disegnare sulla finestra dal backbuffer
+    Pixmap backbuf;         // backbuffer per double buffering, disegno nella Pixmap poi copio sulla finestra
+    GC gc_buf;              // GC del backbuffer dove disegnamo inizialmente
+    int screen;             // numero schermo (solitamente 0)
+    int w, h;               // dimensioni finestra
+    XFontStruct* font;      // font caricato
+    Atom wm_delete;         // serve per non crashare o ignorare chiusura finestra
+};
+
+bool platform_init(void){
+    //xlib richiede che i thread usino XInitThreads(), per query async
+    if(XInitThreads())
+        return true;
+    else 
+        return false;  // se non va in errore ritorno true, altrimenti false
+}
+
+PlatformWindow* platform_window_create(const char* title, int w, int h){
+    PlatformWindow* win = calloc(1, sizeof(PlatformWindow));
+
+    // apertura della connessione al server X
+    win->display = XOpenDisplay(NULL); // NULL per usare $DISPLAY default dell'OS
+    win->screen = DefaultScreen(win->display);
+    win->w = w;
+    win->h = h;
+
+    // creazione finestra
+    win->window = XCreateSimpleWindow(
+        win->display,
+        RootWindow(win->display, win->screen),
+        0,0, w, h, // posizione iniziale e dimensioni  
+        1, // spessore bordo
+        BlackPixel(win->display, win->screen), // colore bordo
+        BlackPixel(win->display, win->screen) // colore sfondo
+    );
+
+    // registrazione eventi da ricevere nella finestra
+    XSelectInput(
+        win->display, 
+        win->window,
+        ExposureMask        | // finestra da disegnare
+        KeyPressMask        | // EVT_KEY_DOWN
+        ButtonPressMask     | // EVT_MOUSE_DOWN
+        ButtonReleaseMask   | // EVT_MOUSE_UP
+        PointerMotionMask   | // EVT_MOUSE_MOVE
+        StructureNotifyMask   // EVT_RESIZE
+    );
+
+    // intercettazione click sulla X per generazione eventi chiusure
+    win->wm_delete = XInternAtom(win->display, "WM_DELETE_WINDOW", false);
+    XSetWMProtocols(win->display, win->window, &win->wm_delete, 1);
+
+    // impostazione titolo della finestra
+    XStoreName(win->display, win->window, title);
+
+    // crezione backbuffer
+    win->backbuf = XCreatePixmap(
+        win->display, 
+        win->window, 
+        w, h, 
+        DefaultDepth(win->display, win->screen)
+    );
+
+    // creazione dei grafic contexts
+    win->gc     = XCreateGC(win->display, win->window, 0, NULL);
+    win->gc_buf = XCreateGC(win->display, win->window, 0, NULL);
+
+    // caricamento font di sistema
+    win->font = XLoadQueryFont(win->display, "-*-dejavu sans-medium-r-*-*-14-*-*-*-*-*-*-*");
+
+    if(!win->font)
+        win->font = XLoadQueryFont(win->display, "fixed");
+    
+    XSetFont(win->display, win->gc_buf, win->font->fid);
+
+    return win;
+}
+
+// funzione per mostrare la finestra passata
+void platform_window_show(PlatformWindow* win){
+    XMapWindow(win->display, win->window); // rende visibile la finestra
+    XFlush(win->display); // invia i comandi al server X
+}
+
+bool platform_poll_event(PlatformWindow *win, sEvent *evt){
+    if(!XPending(win->display)) return false; // nessun evento
+
+    XEvent xe;
+    XNextEvent(win->display, &xe);
+    evt->type = EVT_NONE;
+
+    switch (xe.type) {
+        case ClientMessage: 
+            if((Atom)xe.xclient.data.l[0] == win->wm_delete) 
+                evt->type = EVT_QUIT; 
+            break;
+
+        case MotionNotify:
+            evt->type = EVT_MOUSE_MOVE;
+            evt->mouse_x = xe.xmotion.x;
+            evt->mouse_y = xe.xmotion.y;
+            break;
+
+        case ButtonPress: 
+            evt->type = EVT_MOUSE_DOWN;
+            evt->mouse_x = xe.xmotion.x;
+            evt->mouse_y = xe.xmotion.y;
+            evt->mouse_button = xe.xbutton.button;
+            break;
+
+        case ButtonRelease:
+            evt->type         = EVT_MOUSE_UP;
+            evt->mouse_x      = xe.xbutton.x;
+            evt->mouse_y      = xe.xbutton.y;
+            evt->mouse_button = xe.xbutton.button;
+            break;
+
+        case KeyPress: {
+            // conversione KeySym X11 -> sKeyCode di platform.h
+            KeySym sym = XLookupKeysym(&xe.xkey, 0);
+            evt->type = EVT_KEY_DOWN;
+
+            switch (sym) {
+                case XK_Return:    evt->key = KEY_ENTER;     break;
+                case XK_Escape:    evt->key = KEY_ESCAPE;    break;
+                case XK_BackSpace: evt->key = KEY_BACKSPACE; break;
+                case XK_Left:      evt->key = KEY_LEFT;      break;
+                case XK_Right:     evt->key = KEY_RIGHT;     break;
+                default:           evt->key = KEY_NONE;      break;
+            }
+
+            // generazione EVT_CHAR per differenziare caratteri di controllo da lettere o num
+            char buff[4] = {0};
+            if(XLookupString(&xe.xkey, buff, 4, NULL, NULL) > 0 && buff[0] >= 32){
+                evt->type = EVT_CHAR;
+                evt->character = (uint32_t)buff[0];
+            }
+            break;
+        }
+
+        case ConfigureNotify: {
+            // finestra ridimensionata: ricrea il backbuffer
+            if (xe.xconfigure.width  != win->w || xe.xconfigure.height != win->h) {
+                win->w  = xe.xconfigure.width;
+                win->h = xe.xconfigure.height;
+                XFreePixmap(win->display, win->backbuf);
+                win->backbuf = XCreatePixmap(
+                    win->display, win->window,
+                    win->w, win->h,
+                    DefaultDepth(win->display, win->screen)
+                );
+                XFreeGC(win->display, win->gc_buf);
+                win->gc_buf = XCreateGC(win->display,
+                                         win->backbuf, 0, NULL);
+                evt->type       = EVT_RESIZE;
+                evt->new_width  = win->w;
+                evt->new_height = win->h;
+            }
+            break;
+        }
+    }
+    return evt->type != EVT_NONE; // return del fatto se l'evento è diverso da "nessuno"
+}
+
+// TODO : clear, e successivi
+void platform_clear(PlatformWindow* win, Color c) {
+
+}
