@@ -26,7 +26,7 @@ typedef struct {
 
 // -- metodi della struct button --
 
-Button* button_create(int x, int y, int w, int h, const char* label, void* (*on_click), void* user_data);
+Button* button_create(int x, int y, int w, int h, const char* label, void (*on_click)(void* user_data), void* user_data);
 void button_set_label(Button* btn, const char* label);
 void button_set_enabled(Button* btn, bool enabled);
 
