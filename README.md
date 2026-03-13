@@ -10,6 +10,8 @@
 
 - [Overview](#overview)
 - [Architecture](#architecture)
+- [GUI Layout](#gui-layout)
+- [Source Structure](#source-structure)
 - [Documentation & References](#documentation--references)
   - [GUI — Win32 (Windows)](#1--gui--win32-windows)
   - [GUI — Xlib (Linux/X11)](#2--gui--xlibx11-linux)
@@ -27,13 +29,14 @@
 
 ## Overview
 
-**CRelDB** is a didactic yet fully functional relational DBMS built entirely in C — no external libraries, no frameworks, no shortcuts.
+**SegVault** is a didactic yet fully functional relational DBMS built entirely in C — no external libraries, no frameworks, no shortcuts.
 
 | Feature | Details |
 |---|---|
 | **Language** | C (C11) |
-| **GUI** | Win32 API (Windows) · Xlib/X11 (Linux) |
-| **Storage** | Custom B+Tree with page-based I/O |
+| **Version** | 0.1.0 |
+| **GUI** | Win32 / GDI (Windows) · Xlib/X11 (Linux) |
+| **Storage** | Custom B+Tree with page-based I/O (4 KB pages) |
 | **SQL** | Flex + Bison parser (or hand-written recursive descent) |
 | **Transactions** | Write-Ahead Log (ARIES-style recovery) |
 | **Cross-compilation** | MinGW-w64 — build `.exe` from Linux |
@@ -43,34 +46,132 @@
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                  GUI Layer                       │
-│         Win32 (Windows) │ Xlib (Linux)           │
-└─────────────────────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────┐
-│               SQL Parser Layer                   │
-│           Flex (lexer) + Bison (parser)          │
-│       or hand-written recursive descent          │
-└─────────────────────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────┐
-│             Query Executor / Planner             │
-└─────────────────────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────┐
-│               Storage Engine                     │
-│   B+Tree Index │ Buffer Pool (LRU) │ Catalog     │
-└─────────────────────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────┐
-│         Write-Ahead Log (WAL / ARIES)            │
-└─────────────────────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────┐
-│          POSIX File I/O  (pread / pwrite)        │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                        GUI Layer                            │
+│  window.c / window.h  —  layout principale dell'app        │
+│  Widget system: button · label · textbox · table_view · …  │
+│                                                             │
+│    platform/win32.c (Windows)  │  platform/xlib.c (Linux)  │
+│    GDI — double buffer (HDC)   │  Xlib — Pixmap backbuffer │
+└──────────────────────┬──────────────────────────────────────┘
+                       │  platform.h  (interfaccia unificata)
+                       │  db_api.h    (unico punto di contatto GUI ↔ DB)
+┌──────────────────────▼──────────────────────────────────────┐
+│                    SQL Parser Layer                         │
+│            Flex (lexer) + Bison (parser)                    │
+│        o recursive descent scritto a mano in C              │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────────────┐
+│              Query Executor / Planner                       │
+│          EXPLAIN support  (ExplainNode / ExplainResult)     │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────────────┐
+│                  Storage Engine                             │
+│    B+Tree Index  │  Buffer Pool LRU (1024 pagine)          │
+│    Catalog (Hash Map)  │  Page size: 4 KB                  │
+│    Limiti: 64 DB · 256 tabelle · 64 colonne · 16 indici    │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────────────┐
+│           Write-Ahead Log (WAL / ARIES)                     │
+│         BEGIN · COMMIT · ROLLBACK · SAVEPOINT               │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────────────┐
+│           POSIX File I/O  (pread / pwrite)                  │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## GUI Layout
+
+Il layout principale è definito in `window.h` / `window.c`:
+
+```
+┌──────────────────────────────────────────────────────┐
+│  TOOLBAR: [Run] [Commit] [Rollback] [DB selector]    │
+├────────────┬─────────────────────────────────────────┤
+│            │  EDITOR SQL (textbox multilinea)        │
+│  SIDEBAR   ├─────────────────────────────────────────┤
+│  (tree)    │  STATUS BAR (righe affected, tempo ms)  │
+│            ├─────────────────────────────────────────┤
+│            │  RESULTS (table_view)                   │
+└────────────┴─────────────────────────────────────────┘
+```
+
+Il sistema grafico è astratto da `platform.h` — tutti i widget usano **solo** quell'interfaccia e non toccano mai `<windows.h>` o `<X11/Xlib.h>` direttamente. La GUI comunica con il DB engine **esclusivamente** tramite `db_api.h`.
+
+### Widget system
+
+Ogni widget estende `Widget` (da `widget.h`) mettendolo come **primo campo** della propria struct — pattern che emula l'ereditarietà in C:
+
+| Widget | File | Descrizione |
+|---|---|---|
+| `Widget` | `widget.h` / `widget.c` | Struct base con vtable (`draw`, `handle_event`, `destroy`) |
+| `Button` | `button.h` / `button.c` | Bottone con label, hover, pressed, disabled |
+| `Label` | `label.h` / `label.c` | Testo non interattivo, allineamento L/C/R |
+| `Textbox` | — | Input SQL multilinea *(planned)* |
+| `TableView` | — | Griglia risultati query *(planned)* |
+| `TreeView` | — | Sidebar oggetti DB *(planned)* |
+| `Scrollbar` | — | *(planned)* |
+| `Panel` | — | Contenitore *(planned)* |
+| `Splitter` | — | Divisore ridimensionabile *(planned)* |
+
+### Colori di sistema (`platform.h`)
+
+| Costante | Hex | Uso |
+|---|---|---|
+| `COLOR_BG` | `#0F1116` | Sfondo principale |
+| `COLOR_PANEL` | `#161922` | Pannelli |
+| `COLOR_ACCENT` | `#6E56FF` | Viola elettrico — pulsanti principali |
+| `COLOR_TEXT` | `#E1E4F0` | Testo principale |
+| `COLOR_TEXT_DIM` | `#585E78` | Testo secondario / placeholder |
+| `COLOR_BORDER` | `#262A3A` | Bordi |
+| `COLOR_HOVER` | `#202432` | Hover |
+| `COLOR_SELECT` | `#3C2E8C` | Selezione |
+
+---
+
+## Source Structure
+
+```
+SegVaultDB/
+├── main.c                  # entry point
+├── common.h                # tipi, macro, costanti globali (SV_*)
+├── db_api.h                # interfaccia GUI ↔ DB engine
+│
+├── src/
+│   ├── platform/
+│   │   ├── platform.h      # astrazione OS (Point, Rect, Color, sEvent, …)
+│   │   ├── win32.c         # implementazione Win32 / GDI
+│   │   └── xlib.c          # implementazione Xlib / X11
+│   │
+│   ├── widgets/
+│   │   ├── widget.h / .c   # base Widget (vtable pattern)
+│   │   ├── button.h / .c   # Button
+│   │   ├── label.h  / .c   # Label
+│   │   └── window.h / .c   # layout principale dell'app
+│   │
+│   └── engine/             # DB engine (in sviluppo)
+│       └── …
+│
+└── Makefile
+```
+
+### Costanti globali (`common.h`)
+
+| Costante | Valore | Significato |
+|---|---|---|
+| `SV_PAGE_SIZE` | `4096` | Dimensione pagina su disco (4 KB) |
+| `SV_BUFFER_POOL_CAP` | `1024` | Max pagine in cache RAM |
+| `SV_MAX_DATABASES` | `64` | Max database aperti |
+| `SV_MAX_TABLES` | `256` | Max tabelle per DB |
+| `SV_MAX_COLUMNS` | `64` | Max colonne per tabella |
+| `SV_MAX_INDEXES` | `16` | Max indici per tabella |
+| `SV_MAX_SQL_LEN` | `65536` | Max lunghezza query SQL |
 
 ---
 
@@ -131,7 +232,7 @@ Reference: [en.cppreference.com/w/c](https://en.cppreference.com/w/c)
 
 POSIX reference: [pubs.opengroup.org/onlinepubs/9699919799/](https://pubs.opengroup.org/onlinepubs/9699919799/)
 
-> `pread` and `pwrite` read/write at a precise offset **without moving the file cursor** — ideal for page-based database storage.
+> `pread` e `pwrite` leggono/scrivono a un offset preciso **senza spostare il cursore del file** — ideale per le pagine da 4 KB del database.
 
 | Function | Purpose | Link |
 |---|---|---|
@@ -210,12 +311,14 @@ Build `.exe` files from Arch Linux without touching Windows.
 ## Building
 
 ```bash
-# Linux (Xlib)
-gcc -o creldb main.c gui_xlib.c engine.c parser.c -lX11
+# Linux — produce ./segvault  (-lX11 -lm)
+make
 
-# Cross-compile for Windows (from Linux, using MinGW-w64)
-x86_64-w64-mingw32-gcc -o creldb.exe main.c gui_win32.c engine.c parser.c -lgdi32 -luser32
+# Windows — produce segvault.exe  (-lgdi32 -luser32 -lkernel32)
+make   # eseguito da un ambiente Windows o MinGW
 ```
+
+Il Makefile rileva automaticamente la piattaforma tramite `$(OS)` e seleziona il sorgente corretto (`src/platform/xlib.c` o `src/platform/win32.c`).
 
 ---
 
@@ -227,6 +330,5 @@ Feel free to study, fork, and extend it.
 ---
 
 <p align="center">
-  Built with ❤️ in pure C — no dependencies, no shortcuts.
+  Built with no dependencies, no shortcuts.
 </p>
-```
