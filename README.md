@@ -1,4 +1,4 @@
-# 🗄️ CRelDB — Relational DBMS in Pure C
+# 🗄️ SegVault — Relational DBMS in pure C
 
 > A fully hand-crafted relational database management system written in C,  
 > complete with a native GUI for both **Windows** (Win32) and **Linux** (Xlib/X11),  
