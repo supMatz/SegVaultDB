@@ -24,6 +24,10 @@ typedef struct { uint8_t r, g, b, a; } Color;
 #define COLOR_HOVER     (Color){32,  36,  50,  255}  // hover
 #define COLOR_SELECT    (Color){60,  46,  140, 255}  // selezione viola
 
+#define SV_MOD_CTRL  0x01
+#define SV_MOD_SHIFT 0x02
+#define SV_MOD_ALT   0x04
+
 // platform.h — visibile a tutti
 typedef struct PlatformWindow PlatformWindow;  // forward declaration, esiste ma non sai cosa contiene
 
@@ -58,6 +62,7 @@ typedef struct{
     sKeyCode key;                  // tasto premuto se EVT_KEY_DOWN
     uint32_t character;          // unicode se EVT_CHAR
     int new_width, new_height;  // nuove dimensioni se EVT_RESIZE
+    uint32_t modifiers;   // ← aggiungi questo
 } sEvent;
 
 // inizializzazione della platform (api).
