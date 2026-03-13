@@ -55,7 +55,7 @@ SCOPO: Header incluso da TUTTI i moduli del progetto.
 // controlla se un puntatore è NULL
 #define SV_CHECK_NULL(msg) do { \
     fprintf(stderr, "[ERROR] %s:%d: NULL pointer\n", __FILE__, __LINE__, msg); \
-    return SV_ERROR; \
+    return SV_ERR; \
 } while (0)
 
 // -- macro di debug -- attivate solo con -DDEBUG come parametro di compilazione
@@ -71,7 +71,7 @@ SCOPO: Header incluso da TUTTI i moduli del progetto.
 #define SV_MIN(a,b) ((a) < (b) ? (a) : (b))
 #define SV_MAX(a,b) ((a) > (b) ? (a) : (b))
 #define SV_CLAMP(v, lo, hi) (SV_MIN(SV_MAX((v), (lo)), (hi))) // se v < lo => v = lo; se v > hi => v = hi; mantiene v in un range di valori passati
-#define SV_ARRAY_LEN(arr) (sizeof(array) / sizeof(array[0]));
+#define SV_ARRAY_LEN(arr) (sizeof(arr) / sizeof(arr[0]));
 
 #define SV_ALLOC(type) ((type*)calloc(1, sizeof(type))) // alloca e azzera — simile a calloc ma per tipo singolo
 #define SV_ALLOC_N(type, n) ((type*)calloc((n), sizeof(type))) // alloca array e azzera
