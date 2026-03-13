@@ -139,26 +139,56 @@ Ogni widget estende `Widget` (da `widget.h`) mettendolo come **primo campo** del
 
 ```
 SegVaultDB/
-├── main.c                  # entry point
-├── common.h                # tipi, macro, costanti globali (SV_*)
-├── db_api.h                # interfaccia GUI ↔ DB engine
 │
 ├── src/
-│   ├── platform/
-│   │   ├── platform.h      # astrazione OS (Point, Rect, Color, sEvent, …)
-│   │   ├── win32.c         # implementazione Win32 / GDI
-│   │   └── xlib.c          # implementazione Xlib / X11
 │   │
-│   ├── widgets/
-│   │   ├── widget.h / .c   # base Widget (vtable pattern)
-│   │   ├── button.h / .c   # Button
-│   │   ├── label.h  / .c   # Label
-│   │   └── window.h / .c   # layout principale dell'app
+│   ├── platform/              # Astrazione OS (Win32 vs Xlib)
+│   │   ├── platform.h         # Interfaccia comune: UNICA per entrambi gli OS
+│   │   ├── win32.c            # Implementazione Windows
+│   │   └── xlib.c             # Implementazione Linux
 │   │
-│   └── engine/             # DB engine (in sviluppo)
-│       └── …
+│   ├── widgets/               # Componenti grafici (usano solo platform.h)
+│   │   ├── widget.h           # Struttura base di ogni widget
+│   │   ├── window.c           # Finestra principale + dialoghi
+│   │   ├── button.c           # Bottoni cliccabili
+│   │   ├── textbox.c          # Input testo (per scrivere SQL)
+│   │   ├── label.c            # Testo non interattivo
+│   │   ├── table_view.c       # Griglia per mostrare risultati query
+│   │   ├── tree_view.c        # Albero per DB/tabelle/viste nel pannello sx
+│   │   └── scrollbar.c        # Scrollbar per tabelle e alberi
+│   │
+│   ├── storage/               # Layer fisico: pagine su disco
+│   │   ├── page.h / page.c
+│   │   └── buffer_pool.h / buffer_pool.c
+│   │
+│   ├── catalog/               # Metadati: tabelle, colonne, tipi, viste
+│   │   └── schema.h / schema.c
+│   │
+│   ├── table/                 # Heap file + tuple
+│   │   ├── heap.h / heap.c
+│   │   └── tuple.h / tuple.c
+│   │
+│   ├── index/                 # B+Tree
+│   │   └── btree.h / btree.c
+│   │
+│   ├── query/                 # SQL: lexer → parser → executor
+│   │   ├── lexer.h / lexer.c
+│   │   ├── parser.h / parser.c
+│   │   └── executor.h / executor.c
+│   │
+│   ├── tx/                    # Transazioni + WAL
+│   │   ├── transaction.h / transaction.c
+│   │   └── wal.h / wal.c
+│   │
+│   ├── bridge/                # IL PONTE TRA GUI E DB
+│   │   └── db_api.h / db_api.c
+│   │
+│   └── main.c                 # Entry point
 │
-└── Makefile
+├── include/
+│   └── common.h               # Tipi globali, macro
+│
+└── Makefile.
 ```
 
 ### Costanti globali (`common.h`)
