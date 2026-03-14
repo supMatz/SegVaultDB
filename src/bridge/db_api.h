@@ -9,7 +9,6 @@ SCOPO: L'unico punto di contatto tra GUI e DB engine.
 #ifndef DB_API_H
 #define DB_API_H
 
-#include <cstdint>
 #include <stdbool.h>
 #include <stdint.h>
 
