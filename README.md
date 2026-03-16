@@ -48,11 +48,11 @@
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        GUI Layer                            │
-│  window.c / window.h  —  layout principale dell'app        │
-│  Widget system: button · label · textbox · table_view · …  │
+│  window.c / window.h  —  layout principale dell'app         │
+│  Widget system: button · label · textbox · table_view · …   │
 │                                                             │
-│    platform/win32.c (Windows)  │  platform/xlib.c (Linux)  │
-│    GDI — double buffer (HDC)   │  Xlib — Pixmap backbuffer │
+│    platform/win32.c (Windows)  │  platform/xlib.c (Linux)   │
+│    GDI — double buffer (HDC)   │  Xlib — Pixmap backbuffer  │
 └──────────────────────┬──────────────────────────────────────┘
                        │  platform.h  (interfaccia unificata)
                        │  db_api.h    (unico punto di contatto GUI ↔ DB)
@@ -69,9 +69,9 @@
                        │
 ┌──────────────────────▼──────────────────────────────────────┐
 │                  Storage Engine                             │
-│    B+Tree Index  │  Buffer Pool LRU (1024 pagine)          │
-│    Catalog (Hash Map)  │  Page size: 4 KB                  │
-│    Limiti: 64 DB · 256 tabelle · 64 colonne · 16 indici    │
+│    B+Tree Index  │  Buffer Pool LRU (1024 pagine)           │
+│    Catalog (Hash Map)  │  Page size: 4 KB                   │
+│    Limiti: 64 DB · 256 tabelle · 64 colonne · 16 indici     │
 └──────────────────────┬──────────────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────────────┐
