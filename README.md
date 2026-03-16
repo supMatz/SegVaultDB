@@ -147,14 +147,21 @@ SegVaultDB/
 │   │   ├── win32.c            # Implementazione Windows
 │   │   └── xlib.c             # Implementazione Linux
 │   │
-│   ├── widgets/               # Componenti grafici (usano solo platform.h)
+│   ├── widgets/               # Componenti grafici (usano solo platform.h), file.h per definizioni di tipo, ecc. ...
 │   │   ├── widget.h           # Struttura base di ogni widget
+│   │   ├── window.h
 │   │   ├── window.c           # Finestra principale + dialoghi
+│   │   ├── button.h
 │   │   ├── button.c           # Bottoni cliccabili
+│   │   ├── textbox.h
 │   │   ├── textbox.c          # Input testo (per scrivere SQL)
+│   │   ├── label.h
 │   │   ├── label.c            # Testo non interattivo
+│   │   ├── table_view.h
 │   │   ├── table_view.c       # Griglia per mostrare risultati query
+│   │   ├── tree_view.h
 │   │   ├── tree_view.c        # Albero per DB/tabelle/viste nel pannello sx
+│   │   ├── scrollbar.h
 │   │   └── scrollbar.c        # Scrollbar per tabelle e alberi
 │   │
 │   ├── storage/               # Layer fisico: pagine su disco
