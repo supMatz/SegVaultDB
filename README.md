@@ -1,5 +1,8 @@
 # 🗄️ SegVault — Relational DBMS in pure C
 
+> Project not functional right now! 
+
+
 > A fully hand-crafted relational database management system written in C,  
 > complete with a native GUI for both **Windows** (Win32) and **Linux** (Xlib/X11),  
 > a SQL parser, a B+Tree storage engine, Write-Ahead Logging, and zero dependencies.
