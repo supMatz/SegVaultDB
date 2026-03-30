@@ -116,9 +116,9 @@ Ogni widget estende `Widget` (da `widget.h`) mettendolo come **primo campo** del
 | `Widget` | `widget.h` / `widget.c` | Struct base con vtable (`draw`, `handle_event`, `destroy`) |
 | `Button` | `button.h` / `button.c` | Bottone con label, hover, pressed, disabled |
 | `Label` | `label.h` / `label.c` | Testo non interattivo, allineamento L/C/R |
-| `Textbox` | — | Input SQL multilinea *(planned)* |
-| `TableView` | — | Griglia risultati query *(planned)* |
-| `TreeView` | — | Sidebar oggetti DB *(planned)* |
+| `Textbox` | `textbox.h` / `textbox.c` | Input SQL multilinea |
+| `TableView` | `table_view.h` / `table_view.c` | Griglia risultati query |
+| `TreeView` | `tree_view.h` / `tree_view.c` | Sidebar oggetti DB |
 | `Scrollbar` | — | *(planned)* |
 | `Panel` | — | Contenitore *(planned)* |
 | `Splitter` | — | Divisore ridimensionabile *(planned)* |
