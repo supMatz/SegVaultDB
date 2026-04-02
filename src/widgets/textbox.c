@@ -164,14 +164,14 @@ static void textbox_draw(Widget* self, PlatformWindow* win) {
         i++;
     }
 
-    // ── Cursore (solo se focused e visibile per il blink) ────────
+    // ── CURSORE (solo se focused e visibile per il blink) ────────
     if (self->state == WIDGET_STATE_FOCUSED && tb->cursor_visible) {
         // stima la X del cursore: larghezza media per colonna
         // (approssimazione per font monospace; per font proporzionali
         //  bisognerebbe misurare i primi cursor_col caratteri)
         int cx = text_area_x + tb->cursor_col * (tb->font_size / 2);
 
-        int cy = b.y + (tb->cursor_line - first_line) * tb->line_height;
+        int cy = b.y + (tb->cursor_line - first_line) * tb->line_height + tb->line_height - 4;
 
         // Disegna solo se il cursore è nell'area visibile
         if (cx < b.x + b.w - 4) {
