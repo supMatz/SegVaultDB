@@ -141,16 +141,27 @@ bool platform_poll_event(PlatformWindow *win, sEvent *evt) {
                 case XK_Return:    evt->key = KEY_ENTER;     break;
                 case XK_Escape:    evt->key = KEY_ESCAPE;    break;
                 case XK_BackSpace: evt->key = KEY_BACKSPACE; break;
+                case XK_Delete:    evt->key = KEY_DELETE;    break;  // canc
                 case XK_Left:      evt->key = KEY_LEFT;      break;
                 case XK_Right:     evt->key = KEY_RIGHT;     break;
+                case XK_Up:        evt->key = KEY_UP;        break;
+                case XK_Down:      evt->key = KEY_DOWN;      break;
+                case XK_Home:      evt->key = KEY_HOME;      break;
+                case XK_End:       evt->key = KEY_END;       break;
+                case XK_Tab:       evt->key = KEY_TAB;       break;
                 default:           evt->key = KEY_NONE;      break;
             }
 
             // generazione EVT_CHAR per differenziare caratteri di controllo da lettere o num
-            char buff[4] = {0};
-            if(XLookupString(&xe.xkey, buff, 4, NULL, NULL) > 0 && buff[0] >= 32) {
-                evt->type = EVT_CHAR;
-                evt->character = (uint32_t)buff[0];
+            // EVT_CHAR solo se NON è un tasto speciale già riconosciuto
+            if (evt->key == KEY_NONE) {
+                char buff[4] = {0};
+                if (XLookupString(&xe.xkey, buff, 4, NULL, NULL) > 0
+                    && buff[0] >= 32
+                    && buff[0] != 127) {
+                    evt->type      = EVT_CHAR;
+                    evt->character = (uint32_t)buff[0];
+                }
             }
             break;
         }
@@ -175,6 +186,7 @@ bool platform_poll_event(PlatformWindow *win, sEvent *evt) {
             }
             break;
         }
+        
     }
     return evt->type != EVT_NONE; // return del fatto se l'evento è diverso da "nessuno"
 }
@@ -216,4 +228,61 @@ void platform_present(PlatformWindow *win) {
         0,0             // posizione destinazione
     );       
     XFlush(win->display); // invio al server X
+}
+
+void platform_fill_rect(PlatformWindow* win, Rect r, Color c) {
+    unsigned long pixel = ((c.r << 16) | (c.g << 8) | c.b);
+    XSetForeground(win->display, win->gc_buf, pixel);
+    XFillRectangle(win->display, win->backbuf, win->gc_buf,
+                   r.x, r.y, r.w, r.h);
+}
+
+void platform_draw_rect(PlatformWindow* win, Rect r, Color c, int thickness) {
+    unsigned long pixel = ((c.r << 16) | (c.g << 8) | c.b);
+    XSetForeground(win->display, win->gc_buf, pixel);
+    XSetLineAttributes(win->display, win->gc_buf,
+                       thickness, LineSolid, CapButt, JoinMiter);
+    XDrawRectangle(win->display, win->backbuf, win->gc_buf,
+                   r.x, r.y, r.w, r.h);
+}
+
+void platform_draw_line(PlatformWindow* win, Point a, Point b, Color c, int thickness) {
+    unsigned long pixel = ((c.r << 16) | (c.g << 8) | c.b);
+    XSetForeground(win->display, win->gc_buf, pixel);
+    XSetLineAttributes(win->display, win->gc_buf,
+                       thickness, LineSolid, CapButt, JoinMiter);
+    XDrawLine(win->display, win->backbuf, win->gc_buf,
+              a.x, a.y, b.x, b.y);
+}
+
+int platform_measure_text(PlatformWindow* win, const char* text, int size) {
+    (void)size; // Xlib usa il font caricato, size ignorata
+    if (!win->font || !text) return 0;
+    return XTextWidth(win->font, text, strlen(text));
+}
+
+void platform_fill_rect_rounded(PlatformWindow* win, Rect r, Color c, int radius) {
+    // Xlib non ha rettangoli arrotondati nativi: disegna rettangolo normale
+    (void)radius;
+    platform_fill_rect(win, r, c);
+}
+
+void platform_draw_bitmap(PlatformWindow* win, Rect dest, uint32_t* pixels, int pw, int ph) {
+    // Stub: da implementare con XPutImage se necessario
+    (void)win; (void)dest; (void)pixels; (void)pw; (void)ph;
+}
+
+void platform_window_destroy(PlatformWindow* win) {
+    if (!win) return;
+    XFreePixmap(win->display, win->backbuf);
+    XFreeGC(win->display, win->gc);
+    XFreeGC(win->display, win->gc_buf);
+    if (win->font) XFreeFont(win->display, win->font);
+    XDestroyWindow(win->display, win->window);
+    XCloseDisplay(win->display);
+    free(win);
+}
+
+void platform_shutdown(void) {
+    // Niente da fare a livello globale su Xlib
 }

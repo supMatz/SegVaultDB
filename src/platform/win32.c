@@ -206,3 +206,77 @@ void platform_present(PlatformWindow* win) {
         SRCCOPY
     );                // operazione: copia diretta
 }
+
+void platform_draw_rect(PlatformWindow* win, Rect r, Color c, int thickness) {
+    HPEN pen = CreatePen(PS_SOLID, thickness, RGB(c.r, c.g, c.b));
+    HPEN old = SelectObject(win->hdc_mem, pen);
+    HBRUSH old_brush = SelectObject(win->hdc_mem, GetStockObject(NULL_BRUSH));
+    Rectangle(win->hdc_mem, r.x, r.y, r.x + r.w, r.y + r.h);
+    SelectObject(win->hdc_mem, old);
+    SelectObject(win->hdc_mem, old_brush);
+    DeleteObject(pen);
+}
+
+void platform_draw_line(PlatformWindow* win, Point a, Point b, Color c, int thickness) {
+    HPEN pen = CreatePen(PS_SOLID, thickness, RGB(c.r, c.g, c.b));
+    HPEN old = SelectObject(win->hdc_mem, pen);
+    MoveToEx(win->hdc_mem, a.x, a.y, NULL);
+    LineTo(win->hdc_mem, b.x, b.y);
+    SelectObject(win->hdc_mem, old);
+    DeleteObject(pen);
+}
+
+int platform_measure_text(PlatformWindow* win, const char* text, int size) {
+    HFONT font = CreateFontA(
+        size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI"
+    );
+    HFONT old = SelectObject(win->hdc_mem, font);
+    SIZE sz;
+    GetTextExtentPoint32A(win->hdc_mem, text, strlen(text), &sz);
+    SelectObject(win->hdc_mem, old);
+    DeleteObject(font);
+    return sz.cx;
+}
+
+void platform_fill_rect_rounded(PlatformWindow* win, Rect r, Color c, int radius) {
+    HBRUSH brush = CreateSolidBrush(RGB(c.r, c.g, c.b));
+    HBRUSH old = SelectObject(win->hdc_mem, brush);
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(c.r, c.g, c.b));
+    HPEN old_pen = SelectObject(win->hdc_mem, pen);
+    RoundRect(win->hdc_mem, r.x, r.y, r.x + r.w, r.y + r.h,
+              radius * 2, radius * 2);
+    SelectObject(win->hdc_mem, old);
+    SelectObject(win->hdc_mem, old_pen);
+    DeleteObject(brush);
+    DeleteObject(pen);
+}
+
+void platform_draw_bitmap(PlatformWindow* win, Rect dest,
+                           uint32_t* pixels, int pw, int ph) {
+    BITMAPINFO bmi = {0};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = pw;
+    bmi.bmiHeader.biHeight      = -ph; // negativo = top-down
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    StretchDIBits(win->hdc_mem,
+        dest.x, dest.y, dest.w, dest.h,
+        0, 0, pw, ph,
+        pixels, &bmi, DIB_RGB_COLORS, SRCCOPY);
+}
+
+void platform_window_destroy(PlatformWindow* win) {
+    if (!win) return;
+    DeleteObject(win->hbm_mem);
+    DeleteDC(win->hdc_mem);
+    ReleaseDC(win->hwnd, win->hdc);
+    DestroyWindow(win->hwnd);
+    free(win);
+}
+
+void platform_shutdown(void) {
+    // Niente da fare a livello globale su Win32
+}

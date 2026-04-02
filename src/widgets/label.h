@@ -23,7 +23,7 @@ typedef struct {
     bool clip; // se true taglia il testo ai bordi per non uscires
 } Label;
 
-Label* label_crate(int x, int y, int w, int h, const char* text, int font_size, Color color);
+Label* label_create(int x, int y, int w, int h, const char* text, int font_size, Color color);
 void label_set_text(Label* lbl, const char* text);
 void label_set_color(Label* lbl, Color color);
 
