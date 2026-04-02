@@ -1,6 +1,6 @@
 # 🗄️ SegVault — Relational DBMS in pure C
 
-> Project not functional right now! 
+> Project not functional right now! I'm still testing my own GUI
 
 
 > A fully hand-crafted relational database management system written in C,  
