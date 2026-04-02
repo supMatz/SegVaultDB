@@ -232,7 +232,7 @@ static bool textbox_handle_event(Widget* self, sEvent* evt) {
                     return true;
 
                 case KEY_UP:
-                    if (tb->cursor_line > 0) tb->scroll_y--;
+                    if (tb->scroll_y > 0) tb->scroll_y--;
                     return true;
 
                 case KEY_DOWN:

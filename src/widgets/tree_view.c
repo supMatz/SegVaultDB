@@ -252,11 +252,12 @@ void tree_node_clear_children(TreeNode* node) {
     node->expanded     = false;
 }
  
+
 void tree_view_refresh(TreeView* tv) {
     if (!tv) return;
     // Rimuovi tutti i figli dalla radice
     tree_node_clear_children(tv->root);
- 
+    
     // ricarica la lista dei database dal bridge
     NameList* dbs = db_list_databases();
     if (!dbs) return;
@@ -268,7 +269,7 @@ void tree_view_refresh(TreeView* tv) {
     db_namelist_free(dbs);
 }
  
-void tree_view_select(SVTreeView* tv, SVTreeNode* node) {
+void tree_view_select(TreeView* tv, TreeNode* node) {
     if (!tv || !node) return;
     if (tv->selected) tv->selected->selected = false;
     node->selected = true;

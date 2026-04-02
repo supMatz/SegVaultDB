@@ -185,4 +185,14 @@ void db_namelist_free(NameList* nl); // libera una NameList
 
 void db_shutdown(void); // shutdown
 
+NameList* db_list_databases(void);
+
+NameList* db_list_tables(const char* db_name);
+
+NameList* db_list_views(const char* db_name);
+
+ColumnInfo* db_list_columns(const char* db_name, const char* table, int* out_count);
+
+void db_columns_free(ColumnInfo* cols, int count);
+
 #endif

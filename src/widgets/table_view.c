@@ -86,7 +86,7 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
                 tc, tv->font_size
             );
  
-            // Separatore verticale
+            // separatore verticale
             platform_draw_line(win,
                 (Point){x + cw, ry},
                 (Point){x + cw, ry + TABLE_VIEW_ROW_H},
@@ -94,14 +94,14 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
             x += cw;
         }
  
-        // Separatore orizzontale riga
+        // separatore orizzontale riga
         platform_draw_line(win,
             (Point){b.x, ry + TABLE_VIEW_ROW_H},
             (Point){b.x + b.w, ry + TABLE_VIEW_ROW_H},
             tv->color_border, 1);
     }
  
-    // Bordo esterno
+    // bordo esterno
     platform_draw_rect(win, b, tv->color_border, 1);
 }
  
@@ -114,10 +114,10 @@ static bool table_view_handle_event(Widget* self, sEvent* evt) {
             if (!widget_contains_point(self, evt->mouse_x, evt->mouse_y))
                 return false;
             {
-                // Calcola quale riga è stata cliccata
+                // calcola quale riga è stata cliccata
                 int rel_y = evt->mouse_y - self->bounds.y
                             - TABLE_VIEW_HEADER_H;
-                if (rel_y < 0) return false; // Click sull'header
+                if (rel_y < 0) return false; // click sull'header
                 int clicked_row = tv->scroll_y + rel_y / TABLE_VIEW_ROW_H;
                 if (clicked_row < tv->result->num_rows) {
                     tv->selected_row = clicked_row;
@@ -156,11 +156,11 @@ TableView* table_view_create(int x, int y, int w, int h) {
     tv->scroll_y     = 0;
     tv->font_size    = 13;
  
-    // Larghezza default colonne
+    // larghezza default colonne
     for (int i = 0; i < TABLE_VIEW_MAX_COLS; i++)
         tv->col_widths[i] = 120;
  
-    // Colori (tema Obsidian)
+    // colori (tema Obsidian)
     tv->color_header_bg    = (Color){38,  38,  45,  255};
     tv->color_header_text  = (Color){180, 180, 200, 255};
     tv->color_row_even     = (Color){24,  24,  28,  255};
@@ -180,11 +180,11 @@ void table_view_set_result(TableView* tv, QueryResult* result) {
     tv->scroll_x     = 0;
     tv->scroll_y     = 0;
  
-    // Auto-dimensiona colonne in base al nome della colonna
+    // auto-dimensiona colonne in base al nome della colonna
     if (result && result->success) {
         for (int c = 0; c < result->num_cols && c < TABLE_VIEW_MAX_COLS; c++) {
             int name_len = strlen(result->col_names[c]);
-            // Minimo 80px, massimo 300px
+            // msinimo 80px, massimo 300px
             tv->col_widths[c] = SV_CLAMP(name_len * 9 + 20, 80, 300);
         }
     }
