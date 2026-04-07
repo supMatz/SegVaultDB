@@ -166,14 +166,26 @@ static void textbox_draw(Widget* self, PlatformWindow* win) {
 
     // ── CURSORE (solo se focused e visibile per il blink) ────────
     if (self->state == WIDGET_STATE_FOCUSED && tb->cursor_visible) {
-        // stima la X del cursore: larghezza media per colonna
-        // (approssimazione per font monospace; per font proporzionali
-        //  bisognerebbe misurare i primi cursor_col caratteri)
-        int cx = text_area_x + tb->cursor_col * (tb->font_size / 2);
+        // misura la larghezza reale dei caratteri fino al cursore
+        char line_before_cursor[4096] = {0};
+        int col_count = 0;
+        int idx = 0;
+        // trova l'inizio della riga corrente nel testo
+        while (idx < tb->cursor_pos) {
+            if (tb->text[idx] == '\n') col_count = 0;
+            else col_count++;
+            idx++;
+        }
+        // ora risali per trovare l'inizio della riga
+        int line_start_idx = tb->cursor_pos - tb->cursor_col;
+        int copy = tb->cursor_col < 4095 ? tb->cursor_col : 4095;
+        memcpy(line_before_cursor, tb->text + line_start_idx, copy);
+        line_before_cursor[copy] = '\0';
 
+        int cx = text_area_x + platform_measure_text(win, line_before_cursor, tb->font_size);
         int cy = b.y + (tb->cursor_line - first_line) * tb->line_height + tb->line_height - 4;
-
-        // Disegna solo se il cursore è nell'area visibile
+        
+        // disegna solo se il cursore è nell'area visibile
         if (cx < b.x + b.w - 4) {
             platform_fill_rect(win,
                 (Rect){cx, cy + 2, 2, tb->line_height - 4},
