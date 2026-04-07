@@ -47,19 +47,19 @@ static void on_tree_select(TreeNode* node, void* ud) {
     }
 }
 
-// ── Layout helper ────────────────────────────────────────────────
+// -- layout helper --
 
-// Ricalcola la posizione e dimensione di tutti i widget
-// in base alle dimensioni correnti della finestra
+// Ricalcola la posizione e dimensione di tutti i widget in base alle dimensioni correnti della finestra
 static void layout_widgets(AppWindow* app) {
     int W = app->win_w;
     int H = app->win_h;
 
     // Toolbar: striscia in alto
     int ty = 0;
-    app->btn_run->base.bounds      = (Rect){SIDEBAR_W + 8, ty + 6, 80, 28};
-    app->btn_commit->base.bounds   = (Rect){SIDEBAR_W + 96, ty + 6, 80, 28};
-    app->btn_rollback->base.bounds = (Rect){SIDEBAR_W + 184, ty + 6, 90, 28};
+    int t_btn_w = 80, t_btn_h = 28;
+    app->btn_run->base.bounds      = (Rect){SIDEBAR_W + 8, ty + 6, t_btn_h, t_btn_w};
+    app->btn_commit->base.bounds   = (Rect){SIDEBAR_W + 96, ty + 6, t_btn_h, t_btn_w};
+    app->btn_rollback->base.bounds = (Rect){SIDEBAR_W + 184, ty + 6, t_btn_h, t_btn_w};
     app->lbl_db_name->base.bounds  = (Rect){W - 200, ty + 8, 190, 24};
 
     // Sidebar: colonna sinistra
@@ -96,7 +96,7 @@ static void layout_widgets(AppWindow* app) {
         (Rect){center_x, H - 12, center_w - 12, 12};
 }
 
-// ── API pubblica ─────────────────────────────────────────────────
+// -- API pubblica --
 
 AppWindow* app_window_create(PlatformWindow* win,
                                 int width, int height) {
