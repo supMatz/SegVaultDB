@@ -2,14 +2,13 @@
 
 > Project not functional right now! I'm still testing my own GUI
 
-
 > A fully hand-crafted relational database management system written in C,  
 > complete with a native GUI for both **Windows** (Win32) and **Linux** (Xlib/X11),  
 > a SQL parser, a B+Tree storage engine, Write-Ahead Logging, and zero dependencies.
 
 > execute on linux : 
-> gcc -o segvault src/main.c src/platform/xlib.c src/widgets/widget.c src/widgets/button.c src/widgets/label.c src/widgets/textbox. 
-> c src/widgets/table_view.c src/widgets/tree_view.c src/widgets/scrollbar.c src/widgets/window.c src/bridge/db_api_test.c -I 
+> gcc -o segvault src/main.c src/platform/xlib.c src/widgets/widget.c src/widgets/button.c src/widgets/label.c src/widgets/textbox.c
+> src/widgets/table_view.c src/widgets/tree_view.c src/widgets/scrollbar.c src/widgets/window.c src/bridge/db_api_test.c -I 
 > include -I src -I src/platform -I src/widgets -lX11 -lm -o segvault
 
 > then hit : ./segvault
