@@ -95,10 +95,12 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
         }
  
         // separatore orizzontale riga
-        platform_draw_line(win,
+        platform_draw_line(
+            win,
             (Point){b.x, ry + TABLE_VIEW_ROW_H},
             (Point){b.x + b.w, ry + TABLE_VIEW_ROW_H},
-            tv->color_border, 1);
+            tv->color_border, 1
+        );
     }
  
     // bordo esterno
@@ -141,7 +143,7 @@ TableView* table_view_create(int x, int y, int w, int h) {
  
     tv->base.type         = WIDGET_TABLE_VIEW;
     tv->base.state        = WIDGET_STATE_NORMAL;
-    tv->base.bounds       = (Rect){x, y, w, h};
+    tv->base.bounds       = (Rect){x, y, h, w};
     tv->base.visible      = true;
     tv->base.enabled      = true;
     tv->base.draw         = table_view_draw;

@@ -1,5 +1,5 @@
 /* 
-SCOPO: Griglia per mostrare i risultati delle query SQL.a
+SCOPO: griglia per mostrare i risultati delle query SQL.a
        Supporta: header colonne, scroll, selezione riga,
        ridimensionamento colonne, ordinamento.
 */

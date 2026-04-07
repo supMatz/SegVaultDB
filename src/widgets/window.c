@@ -54,7 +54,7 @@ static void layout_widgets(AppWindow* app) {
     int W = app->win_w;
     int H = app->win_h;
 
-    // Toolbar: striscia in alto
+    // toolbar: striscia in alto
     int ty = 0;
     int t_btn_w = 80, t_btn_h = 28;
     app->btn_run->base.bounds      = (Rect){SIDEBAR_W + 8, ty + 6, t_btn_h, t_btn_w};
@@ -62,27 +62,26 @@ static void layout_widgets(AppWindow* app) {
     app->btn_rollback->base.bounds = (Rect){SIDEBAR_W + 184, ty + 6, t_btn_h, t_btn_w};
     app->lbl_db_name->base.bounds  = (Rect){W - 200, ty + 8, 190, 24};
 
-    // Sidebar: colonna sinistra
+    // sidebar: colonna sinistra
     int content_h = H - TOOLBAR_H;
     app->tree->base.bounds =
         (Rect){0, TOOLBAR_H, SIDEBAR_W - 12, content_h};
     app->tree_scroll->base.bounds =
         (Rect){SIDEBAR_W - 12, TOOLBAR_H, 12, content_h};
 
-    // Area centrale: divisa dallo splitter
+    // area centrale: divisa dallo splitter
     int center_x = SIDEBAR_W;
     int center_w = W - SIDEBAR_W;
     int editor_h = app->splitter_y - TOOLBAR_H;
     int results_y = app->splitter_y + SPLITTER_H + STATUSBAR_H;
     int results_h = H - results_y - 12; // 12 = scrollbar orizzontale
 
-    // Editor SQL
-    app->editor->base.bounds =
-        (Rect){center_x, TOOLBAR_H, center_w - 12, editor_h};
-    app->editor_scroll->base.bounds =
-        (Rect){W - 12, TOOLBAR_H, 12, editor_h};
+    // editor SQL
+    app->editor->base.bounds = (Rect){center_x, TOOLBAR_H, center_w - 12, editor_h};
+    
+    app->editor_scroll->base.bounds = (Rect){W - 12, TOOLBAR_H, 12, editor_h};
 
-    // Status bar
+    // status bar
     app->lbl_status->base.bounds =
         (Rect){center_x, app->splitter_y + SPLITTER_H,
                  center_w, STATUSBAR_H};
@@ -98,8 +97,7 @@ static void layout_widgets(AppWindow* app) {
 
 // -- API pubblica --
 
-AppWindow* app_window_create(PlatformWindow* win,
-                                int width, int height) {
+AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
     AppWindow* app = SV_ALLOC(AppWindow);
     if (!app) return NULL;
 
@@ -110,54 +108,49 @@ AppWindow* app_window_create(PlatformWindow* win,
     app->splitter_drag = false;
     app->last_result   = NULL;
 
-    // ── Toolbar ──────────────────────────────────────────────────
-    app->btn_run = button_create(0, 0, 0, 0, "▶  Run",
-                                  on_run_click, app);
+    // -- toolbar --
+    app->btn_run = button_create(0, 0, 0, 0, "Run Query", on_run_click, app);
     app->btn_run->color_bg      = (Color){30,  100, 50,  255};
     app->btn_run->color_hover   = (Color){40,  130, 65,  255};
     app->btn_run->color_pressed = (Color){20,  70,  35,  255};
 
-    app->btn_commit   = button_create(0, 0, 0, 0, "Commit",
-                                       on_commit_click, app);
-    app->btn_rollback = button_create(0, 0, 0, 0, "Rollback",
-                                       on_rollback_click, app);
+    app->btn_commit   = button_create(0, 0, 0, 0, "Commit", on_commit_click, app);
+
+    app->btn_rollback = button_create(0, 0, 0, 0, "Rollback", on_rollback_click, app);
 
     app->lbl_db_name = label_create(0, 0, 0, 0, db_current_database() ? db_current_database() : "(nessun DB)", 13, (Color){150, 200, 255, 255});
     app->lbl_db_name->align = LABEL_ALIGN_RIGHT;
 
-    // ── Sidebar ──────────────────────────────────────────────────
+    // -- sidebar --
     app->tree = tree_view_create(0, 0, 0, 0);
     app->tree->base.user_data = app;
     app->tree->on_select      = on_tree_select;
     tree_view_refresh(app->tree);
 
-    app->tree_scroll = scrollbar_create(0, 0, 0, 0,
-                                         SCROLLBAR_VERTICAL);
+    app->tree_scroll = scrollbar_create(0, 0, 0, 0, SCROLLBAR_VERTICAL);
 
-    // ── Editor SQL ───────────────────────────────────────────────
+    // -- editor SQL --
     app->editor = textbox_create(0, 0, 0, 0);
     app->editor->base.user_data = app;
-    app->editor->on_execute     = on_editor_execute;
+    app->editor->on_execute = on_editor_execute;
     textbox_set_text(app->editor,
         "-- SegVault SQL Editor\n"
         "-- Ctrl+Enter per eseguire\n\n"
-        "SELECT 1;\n");
+        "CREATE DATABASE test;\n");
 
-    app->editor_scroll = scrollbar_create(0, 0, 0, 0,
-                                           SCROLLBAR_VERTICAL);
+    app->editor_scroll = scrollbar_create(0, 0, 0, 0, SCROLLBAR_VERTICAL);
 
-    // ── Status bar ───────────────────────────────────────────────
-    app->lbl_status = label_create(0, 0, 0, 0,
-        "Pronto", 12, (Color){150, 150, 160, 255});
+    // -- status bar --
+    app->lbl_status = label_create(0, 0, 0, 0, "Pronto", 12, (Color){150, 150, 160, 255});
 
-    // ── Risultati ────────────────────────────────────────────────
+    // -- risultati --
     app->results = table_view_create(0, 0, 0, 0);
-    app->results_scroll_v = scrollbar_create(0, 0, 0, 0,
-                                              SCROLLBAR_VERTICAL);
-    app->results_scroll_h = scrollbar_create(0, 0, 0, 0,
-                                              SCROLLBAR_HORIZONTAL);
+    
+    app->results_scroll_v = scrollbar_create(0, 0, 0, 0,SCROLLBAR_VERTICAL);
+    
+    app->results_scroll_h = scrollbar_create(0, 0, 0, 0,SCROLLBAR_HORIZONTAL);
 
-    // Applica il layout iniziale
+    // applica il layout iniziale
     layout_widgets(app);
 
     return app;
@@ -166,13 +159,13 @@ AppWindow* app_window_create(PlatformWindow* win,
 void app_window_handle_event(AppWindow* app, sEvent* evt) {
     if (!app) return;
 
-    // Resize: ricalcola il layout
+    // resize: ricalcola il layout
     if (evt->type == EVT_RESIZE) {
         app_window_resize(app, evt->new_width, evt->new_height);
         return;
     }
 
-    // Splitter drag
+    // splitter drag
     if (evt->type == EVT_MOUSE_DOWN) {
         int sy = app->splitter_y;
         if (evt->mouse_y >= sy && evt->mouse_y <= sy + SPLITTER_H) {
@@ -181,6 +174,7 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         }
     }
     if (evt->type == EVT_MOUSE_UP)   app->splitter_drag = false;
+
     if (evt->type == EVT_MOUSE_MOVE && app->splitter_drag) {
         int min_y = TOOLBAR_H + 80;
         int max_y = app->win_h - STATUSBAR_H - 80;
@@ -189,7 +183,7 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         return;
     }
 
-    // Smista l'evento ai widget in ordine di priorità
+    // smista l'evento ai widget in ordine di priorità
     // (chi è "in primo piano" riceve prima)
     if (widget_handle_event((Widget*)app->btn_run,       evt)) return;
     if (widget_handle_event((Widget*)app->btn_commit,    evt)) return;
@@ -199,6 +193,7 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
     if (widget_handle_event((Widget*)app->editor,        evt)) return;
     if (widget_handle_event((Widget*)app->editor_scroll, evt)) return;
     if (widget_handle_event((Widget*)app->results,       evt)) return;
+    
     widget_handle_event((Widget*)app->results_scroll_v,  evt);
     widget_handle_event((Widget*)app->results_scroll_h,  evt);
 }
@@ -207,36 +202,44 @@ void app_window_draw(AppWindow* app) {
     if (!app) return;
     PlatformWindow* win = app->win;
 
-    // Sfondo generale
+    // sfondo generale
     platform_clear(win, (Color){18, 18, 18, 255});
 
-    // Toolbar background
-    platform_fill_rect(win,
-        (Rect){0, 0, app->win_w, TOOLBAR_H},
-        (Color){28, 28, 34, 255});
-    platform_draw_line(win,
+    // toolbar background
+    platform_fill_rect(
+        win,
+        (Rect){0, 0, TOOLBAR_H, app->win_w},
+        (Color){28, 28, 34, 255}
+    );
+    
+    platform_draw_line(
+        win,
         (Point){0, TOOLBAR_H},
         (Point){app->win_w, TOOLBAR_H},
-        (Color){50, 50, 60, 255}, 1);
+        (Color){50, 50, 60, 255}, 1
+    );
 
-    // Separatore sidebar
-    platform_draw_line(win,
+    // separatore sidebar
+    platform_draw_line(
+        win,
         (Point){SIDEBAR_W, TOOLBAR_H},
         (Point){SIDEBAR_W, app->win_h},
-        (Color){50, 50, 60, 255}, 1);
+        (Color){50, 50, 60, 255}, 1
+    );
 
-    // Splitter
+    // splitter
     platform_fill_rect(win,
-        (Rect){SIDEBAR_W, app->splitter_y, app->win_w - SIDEBAR_W, SPLITTER_H},
-        (Color){38, 38, 48, 255});
+        (Rect){SIDEBAR_W, app->splitter_y, SPLITTER_H, (app->win_w - SIDEBAR_W) },
+        (Color){38, 38, 48, 255}
+    );
 
-    // Status bar background
+    // status bar background
     platform_fill_rect(win,
-        (Rect){SIDEBAR_W, app->splitter_y + SPLITTER_H,
-                 app->win_w - SIDEBAR_W, STATUSBAR_H},
-        (Color){28, 28, 34, 255});
+        (Rect){SIDEBAR_W, app->splitter_y + SPLITTER_H, STATUSBAR_H, (app->win_w - SIDEBAR_W)},
+        (Color){28, 28, 34, 255}
+    );
 
-    // Disegna tutti i widget
+    // disegna tutti i widget
     widget_draw((Widget*)app->tree,           win);
     widget_draw((Widget*)app->tree_scroll,    win);
     widget_draw((Widget*)app->editor,         win);
@@ -255,13 +258,12 @@ void app_window_draw(AppWindow* app) {
 
 void app_window_resize(AppWindow* app, int new_w, int new_h) {
     if (!app) return;
-    // Mantieni la proporzione dello splitter
-    float ratio = (float)(app->splitter_y - TOOLBAR_H)
-                  / (float)(app->win_h - TOOLBAR_H);
+    // mantieni la proporzione dello splitter
+    float ratio = (float)(app->splitter_y - TOOLBAR_H) / (float)(app->win_h - TOOLBAR_H);
     app->win_w = new_w;
     app->win_h = new_h;
-    app->splitter_y = TOOLBAR_H +
-                      (int)(ratio * (new_h - TOOLBAR_H));
+
+    app->splitter_y = TOOLBAR_H + (int)(ratio * (new_h - TOOLBAR_H));
     layout_widgets(app);
 }
 
@@ -271,20 +273,20 @@ void app_window_run_query(AppWindow* app) {
     const char* sql = textbox_get_text(app->editor);
     if (!sql || sql[0] == '\0') return;
 
-    // Libera il risultato precedente
+    // liberazione risultato precedente
     if (app->last_result) {
         db_result_free(app->last_result);
         app->last_result = NULL;
     }
 
-    // Esegui la query tramite il bridge
+    // esecuzione query tramite il bridge
     QueryResult* result = db_execute(sql);
     app->last_result    = result;
 
-    // Aggiorna la griglia dei risultati
+    // aggiornamento griglia dei risultati
     table_view_set_result(app->results, result);
 
-    // Aggiorna la status bar
+    // aggiornamento status bar
     char status[256];
     if (!result) {
         snprintf(status, sizeof(status), "Errore: risposta NULL");
@@ -304,11 +306,11 @@ void app_window_run_query(AppWindow* app) {
     }
     label_set_text(app->lbl_status, status);
 
-    // Aggiorna nome DB (potrebbe essere cambiato con USE)
+    // aggiornamento nome DB (potrebbe essere cambiato con USE)
     const char* db = db_current_database();
     label_set_text(app->lbl_db_name, db ? db : "(nessun DB)");
 
-    // Ricarica l'albero se il DDL ha modificato la struttura
+    // ricarica l'albero se il DDL ha modificato la struttura
     if (result && result->success && result->num_cols == 0)
         tree_view_refresh(app->tree);
 }

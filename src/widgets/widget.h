@@ -36,10 +36,10 @@ typedef enum {
 typedef struct Widget {
     WidgetType  type;       // Tipo del widget
     WidgetState state;      // Stato visivo corrente
-    Rect        bounds;     // Posizione e dimensioni (x, y, w, h)
-    bool          visible;    // Se false: non disegnato e non interagibile
-    bool          enabled;    // Se false: disegnato ma non interagibile
-    void*         user_data;  // Puntatore a dati custom (callback context)
+    Rect bounds;     // Posizione e dimensioni (x, y, w, h)
+    bool visible;    // Se false: non disegnato e non interagibile
+    bool enabled;    // Se false: disegnato ma non interagibile
+    void* user_data;  // Puntatore a dati custom (callback context)
  
     // -- funzioni virtuali -- ogni widget implementa le sue
     void (*draw)(struct Widget* self, PlatformWindow* win); // disegna il widget sulla finestra
