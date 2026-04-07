@@ -37,7 +37,7 @@ static void button_draw(Widget* self, PlatformWindow* win){
        // calcolo per posizionare il testo al centro
        int text_w = platform_measure_text(win, btn->label, btn->font_size);
        int text_x = self->bounds.x + (self->bounds.w - text_w) / 2;
-       int text_y = self->bounds.y + (self->bounds.y - btn->font_size) / 2;
+       int text_y = self->bounds.y + self->bounds.y / 2;
 
        // se non è enabled metto un colore piu scuro dello standard
        Color tc = self->enabled ? btn->color_text : (Color) {100, 100, 110, 255};
