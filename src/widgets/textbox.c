@@ -94,10 +94,10 @@ static void textbox_draw(Widget* self, PlatformWindow* win) {
     platform_fill_rect(win, b, tb->color_bg);
 
     // Bordo: ciano se focused, grigio altrimenti
-    platform_draw_rect(win, b,
-        self->state == WIDGET_STATE_FOCUSED
-            ? (Color){100, 210, 255, 255}
-            : (Color){70,  70,  80,  255},
+    platform_draw_rect(
+        win, 
+        b,
+        self->state == WIDGET_STATE_FOCUSED ? (Color){100, 210, 255, 255} : (Color){70,  70,  80,  255},
         1);
 
     // Larghezza colonna numeri di riga
