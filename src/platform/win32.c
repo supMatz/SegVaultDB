@@ -29,6 +29,26 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (!g_win) return DefWindowProcA(hwnd, msg, wp, lp);
 
     switch (msg) {
+        case WM_KEYDOWN:
+    	g_win->pending_evt.type = EVT_KEY_DOWN;
+    	g_win->pending_evt.modifiers = (GetKeyState(VK_CONTROL) & 0x8000) ? SV_MOD_CTRL  : 0 | (GetKeyState(VK_SHIFT)   & 0x8000) ? SV_MOD_SHIFT : 0;
+    	switch (wp) {
+        	case VK_RETURN:    g_win->pending_evt.key = KEY_ENTER;     break;
+        	case VK_ESCAPE:    g_win->pending_evt.key = KEY_ESCAPE;    break;
+        	case VK_BACK:      g_win->pending_evt.key = KEY_BACKSPACE; break;
+        	case VK_DELETE:    g_win->pending_evt.key = KEY_DELETE;    break;
+        	case VK_LEFT:      g_win->pending_evt.key = KEY_LEFT;      break;
+        	case VK_RIGHT:     g_win->pending_evt.key = KEY_RIGHT;     break;
+        	case VK_UP:        g_win->pending_evt.key = KEY_UP;        break;
+        	case VK_DOWN:      g_win->pending_evt.key = KEY_DOWN;      break;
+        	case VK_HOME:      g_win->pending_evt.key = KEY_HOME;      break;
+        	case VK_END:       g_win->pending_evt.key = KEY_END;       break;
+        	case VK_TAB:       g_win->pending_evt.key = KEY_TAB;       break;
+        	default:           g_win->pending_evt.type = EVT_NONE;     break;
+    	}
+    	if (g_win->pending_evt.type != EVT_NONE)
+            g_win->has_event = true;
+    	break;
         case WM_DESTROY:
             // Utente ha premuto la X: genera EVT_QUIT
             g_win->pending_evt.type = EVT_QUIT;
