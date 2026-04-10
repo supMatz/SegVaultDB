@@ -16,7 +16,7 @@ struct PlatformWindow {
     HBITMAP hbm_mem;     // Bitmap del backbuffer
     int     width;
     int     height;
-    Event   pending_evt; // Evento in attesa dal WndProc
+    sEvent   pending_evt; // Evento in attesa dal WndProc
     bool    has_event;   // true se c'è un evento da processare
 };
 
@@ -25,8 +25,7 @@ static PlatformWindow* g_win = NULL;
 
 // window procedure: chiamata da Windows per OGNI messaggio
 // Traduce i messaggi Win32 negli Event di platform.h
-static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg,
-                                   WPARAM wp, LPARAM lp) {
+static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (!g_win) return DefWindowProcA(hwnd, msg, wp, lp);
 
     switch (msg) {
@@ -137,7 +136,7 @@ void platform_window_show(PlatformWindow* win) {
     UpdateWindow(win->hwnd);        // forza il primo WM_PAINT
 }
 
-bool platform_poll_event(PlatformWindow* win, Event* evt) {
+bool platform_poll_event(PlatformWindow* win, sEvent* evt) {
     // processa i messaggi Win32 in coda
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
