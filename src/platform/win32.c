@@ -137,13 +137,13 @@ void platform_window_show(PlatformWindow* win) {
 }
 
 bool platform_poll_event(PlatformWindow* win, sEvent* evt) {
-    // processa i messaggi Win32 in coda
+    MsgWaitForMultipleObjects(0, NULL, FALSE, 16, QS_ALLINPUT); // aspetta un messaggio invece di girare a vuoto
+    
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg); // onverte WM_KEYDOWN -> WM_CHAR
-        DispatchMessageA(&msg); // chiama wnd_proc
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
     }
-    // se wnd_proc ha generato un evento, consegnalo
     if (win->has_event) {
         *evt = win->pending_evt;
         win->has_event = false;

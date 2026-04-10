@@ -91,21 +91,16 @@ int main(int argc, char** argv) {
     bool needs_redraw = true;
 
     while (running) {
-        bool got_event = false;
+    bool got_event = false;
 
-        while (platform_poll_event(win, &evt)) {
-            if (evt.type == EVT_QUIT) { running = 0; break; }
-            app_window_handle_event(app, &evt);
-            got_event = true;
-        }
+    while (platform_poll_event(win, &evt)) {
+        if (evt.type == EVT_QUIT) { running = 0; break; }
+        app_window_handle_event(app, &evt);
+        got_event = true;
+    }
 
-        if (!running) break;
-
-        if (got_event) {
-            app_window_draw(app);
-        }
-		
-        sleep_ms(8000); // ~120 controlli al secondo, senza ridisegnare sempre
+       if (!running) break;
+       if (got_event) app_window_draw(app);	
     }
 
     printf("[SegVault] Chiusura in corso...\n");
