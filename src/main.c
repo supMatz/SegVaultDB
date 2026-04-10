@@ -14,11 +14,14 @@ SCOPO: Entry point di SegVault.
 #include <stdio.h>
 
 #ifdef _WIN32
+    #include <windows.h> // per Sleep
     #include <direct.h>   // _mkdir su Windows
+    #define sleep_ms(ms) Sleep(ms)
 #else
     #include <sys/stat.h> // mkdir su Linux
     #include <sys/types.h>
     #include <unistd.h>   // usleep
+    #define sleep_ms(ms) usleep(ms * 1000) // generalizzazione sleep per windows e linux
 #endif
 
 // larghezza e altezza iniziale della finestra
@@ -101,8 +104,8 @@ int main(int argc, char** argv) {
         if (got_event) {
             app_window_draw(app);
         }
-
-        usleep(8000); // ~120 controlli al secondo, senza ridisegnare sempre
+		
+        sleep_ms(8000); // ~120 controlli al secondo, senza ridisegnare sempre
     }
 
     printf("[SegVault] Chiusura in corso...\n");
