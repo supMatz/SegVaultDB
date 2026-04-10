@@ -11,7 +11,7 @@
 > src/widgets/table_view.c src/widgets/tree_view.c src/widgets/scrollbar.c src/widgets/window.c src/bridge/db_api_test.c -I 
 > include -I src -I src/platform -I src/widgets -lX11 -lm -o segvault
 
-> then hit : ./segvault
+> or/then hit : ./segvault
 ---
 
 ## 📋 Table of Contents
