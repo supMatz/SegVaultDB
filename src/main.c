@@ -1,4 +1,4 @@
-/* 
+/*
 SCOPO: Entry point di SegVault.
        1. Inizializza il DB engine (recovery, catalog, buffer pool)
        2. Inizializza la GUI (platform + finestra)
@@ -84,9 +84,9 @@ int main(int argc, char** argv) {
 
     printf("[SegVault] Avvio completato. Finestra aperta.\n");
 
-    // -- loop principale --
+    // loop principale //
     sEvent evt;
-    int     running = 1;
+    int running = 1;
 
     bool needs_redraw = true;
 
@@ -100,12 +100,12 @@ int main(int argc, char** argv) {
     }
 
        if (!running) break;
-       if (got_event) app_window_draw(app);	
+       if (got_event) app_window_draw(app);
     }
 
     printf("[SegVault] Chiusura in corso...\n");
 
-    // -- shutdown in ordine inverso all'inizializzazione --
+    // shutdown in ordine inverso all'inizializzazione //
     app_window_destroy(app);
     platform_window_destroy(win);
     platform_shutdown();
