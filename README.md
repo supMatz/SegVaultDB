@@ -1,17 +1,8 @@
 # 🗄️ SegVault — Relational DBMS in pure C
 
-> Project not functional right now! I'm still testing my own GUI
-
 > A fully hand-crafted relational database management system written in C,  
 > complete with a native GUI for both **Windows** (Win32) and **Linux** (Xlib/X11),  
-> a SQL parser, a B+Tree storage engine, Write-Ahead Logging, and zero dependencies.
-
-> execute on linux : 
-> gcc -o segvault src/main.c src/platform/xlib.c src/widgets/widget.c src/widgets/button.c src/widgets/label.c src/widgets/textbox.c
-> src/widgets/table_view.c src/widgets/tree_view.c src/widgets/scrollbar.c src/widgets/window.c src/bridge/db_api_test.c -I 
-> include -I src -I src/platform -I src/widgets -lX11 -lm -o segvault
-
-> or/then hit : ./segvault
+> a hand-written SQL parser, a B+Tree storage engine, Write-Ahead Logging, and zero dependencies.
 ---
 
 ## 📋 Table of Contents
@@ -45,7 +36,7 @@
 | **Version** | 0.1.0 |
 | **GUI** | Win32 / GDI (Windows) · Xlib/X11 (Linux) |
 | **Storage** | Custom B+Tree with page-based I/O (4 KB pages) |
-| **SQL** | Flex + Bison parser (or hand-written recursive descent) |
+| **SQL** | Hand-written recursive descent parser + lexer |
 | **Transactions** | Write-Ahead Log (ARIES-style recovery) |
 | **Cross-compilation** | MinGW-w64 — build `.exe` from Linux |
 
@@ -66,25 +57,25 @@
                        │  db_api.h    (unico punto di contatto GUI ↔ DB)
 ┌──────────────────────▼──────────────────────────────────────┐
 │                    SQL Parser Layer                         │
-│            Flex (lexer) + Bison (parser)                    │
-│        o recursive descent scritto a mano in C              │
+│        Hand-written lexer (src/query/lexer.c)               │
+│        Recursive descent parser (src/query/parser.c)        │
 └──────────────────────┬──────────────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────────────┐
-│              Query Executor / Planner                       │
-│          EXPLAIN support  (ExplainNode / ExplainResult)     │
+│              Query Executor                                 │
+│        src/query/executor.c — dispatches AST → results      │
 └──────────────────────┬──────────────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────────────┐
 │                  Storage Engine                             │
 │    B+Tree Index  │  Buffer Pool LRU (1024 pagine)           │
-│    Catalog (Hash Map)  │  Page size: 4 KB                   │
+│    Heap File     │  Page size: 4 KB                         │
 │    Limiti: 64 DB · 256 tabelle · 64 colonne · 16 indici     │
 └──────────────────────┬──────────────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────────────┐
-│           Write-Ahead Log (WAL / ARIES)                     │
-│         BEGIN · COMMIT · ROLLBACK · SAVEPOINT               │
+│           Write-Ahead Log (WAL)                             │
+│         BEGIN · COMMIT · ROLLBACK                           │
 └──────────────────────┬──────────────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────────────┐
@@ -124,9 +115,9 @@ Ogni widget estende `Widget` (da `widget.h`) mettendolo come **primo campo** del
 | `Textbox` | `textbox.h` / `textbox.c` | Input SQL multilinea |
 | `TableView` | `table_view.h` / `table_view.c` | Griglia risultati query |
 | `TreeView` | `tree_view.h` / `tree_view.c` | Sidebar oggetti DB |
-| `Scrollbar` | — | *(planned)* |
-| `Panel` | — | Contenitore *(planned)* |
-| `Splitter` | — | Divisore ridimensionabile *(planned)* |
+| `Scrollbar` | `scrollbar.h` / `scrollbar.c` | Scrollbar verticale/orizzontale |
+| `Panel` | `panel.h` / `panel.c` | Contenitore con 128 figli, bordo, padding |
+| `Splitter` | `splitter.h` / `splitter.c` | Divisore ridimensionabile orizzontale/verticale |
 
 ### Colori di sistema (`platform.h`)
 
@@ -155,22 +146,27 @@ SegVaultDB/
 │   │   ├── win32.c            # Implementazione Windows
 │   │   └── xlib.c             # Implementazione Linux
 │   │
-│   ├── widgets/               # Componenti grafici (usano solo platform.h), file.h per definizioni di tipo, ecc. ...
-│   │   ├── widget.h           # Struttura base di ogni widget
+│   ├── widgets/               # Componenti grafici (usano solo platform.h)
+│   │   ├── widget.h           # Struttura base con vtable
+│   │   ├── widget.c
 │   │   ├── window.h
-│   │   ├── window.c           # Finestra principale + dialoghi
+│   │   ├── window.c           # Finestra principale + layout app
 │   │   ├── button.h
 │   │   ├── button.c           # Bottoni cliccabili
 │   │   ├── textbox.h
-│   │   ├── textbox.c          # Input testo (per scrivere SQL)
+│   │   ├── textbox.c          # Editor SQL multilinea
 │   │   ├── label.h
 │   │   ├── label.c            # Testo non interattivo
 │   │   ├── table_view.h
-│   │   ├── table_view.c       # Griglia per mostrare risultati query
+│   │   ├── table_view.c       # Griglia risultati query
 │   │   ├── tree_view.h
-│   │   ├── tree_view.c        # Albero per DB/tabelle/viste nel pannello sx
+│   │   ├── tree_view.c        # Albero DB/tabelle nel pannello sx
 │   │   ├── scrollbar.h
-│   │   └── scrollbar.c        # Scrollbar per tabelle e alberi
+│   │   ├── scrollbar.c        # Scrollbar per tabelle e alberi
+│   │   ├── panel.h
+│   │   ├── panel.c            # Contenitore con bordo/padding
+│   │   ├── splitter.h
+│   │   └── splitter.c         # Divisore ridimensionabile
 │   │
 │   ├── storage/               # Layer fisico: pagine su disco
 │   │   ├── page.h / page.c
@@ -290,19 +286,16 @@ POSIX reference: [pubs.opengroup.org/onlinepubs/9699919799/](https://pubs.opengr
 
 ---
 
-### 5 · SQL Parser — Flex + Bison
+### 5 · SQL Parser — Hand-written Recursive Descent
 
-The same toolchain used by **PostgreSQL** and **MySQL**.
+SegVault implements its own SQL parser from scratch — no Flex or Bison needed.
 
-| Tool | Documentation |
+| Resource | Link |
 |---|---|
-| Flex (lexer) | [westes.github.io/flex/manual/](https://westes.github.io/flex/manual/) |
-| Bison (parser) | [gnu.org/software/bison/manual/](https://www.gnu.org/software/bison/manual/bison.html) |
+| Hand-written lexer guide | [craftinginterpreters.com — Scanning](https://craftinginterpreters.com/ch04-scanning.html) |
+| Recursive descent parsing | [craftinginterpreters.com — Parsing](https://craftinginterpreters.com/ch06-parsing.html) |
 | SQL-92 grammar reference | [SQL 1992 spec (CMU)](http://www.contrib.andrew.cmu.edu/~shadow/sql/sql1992.txt) |
 | SQLite SQL dialect (practical) | [sqlite.org/lang.html](https://www.sqlite.org/lang.html) |
-
-**Writing the parser by hand?** The best guide for hand-written recursive descent in C:  
-📖 [craftinginterpreters.com](https://craftinginterpreters.com/) — Chapters 4 (Scanning) and 6 (Parsing) — **free online**
 
 ---
 
@@ -319,7 +312,7 @@ All core engine structures are implemented from scratch.
 
 ---
 
-### 7 · Write-Ahead Log & Recovery (ARIES)
+### 7 · Write-Ahead Log (WAL)
 
 | Resource | Link |
 |---|---|
@@ -356,14 +349,18 @@ Build `.exe` files from Arch Linux without touching Windows.
 ## Building
 
 ```bash
-# Linux — produce ./segvault  (-lX11 -lm)
+# Full build (real DB engine) — produce ./segvault
 make
+
+# GUI-only build (uses db_api_test.c stub, no engine) — same binary name
+make gui
 
 # Windows — produce segvault.exe  (-lgdi32 -luser32 -lkernel32)
 make   # eseguito da un ambiente Windows o MinGW
 ```
 
 Il Makefile rileva automaticamente la piattaforma tramite `$(OS)` e seleziona il sorgente corretto (`src/platform/xlib.c` o `src/platform/win32.c`).
+`make` (default) produce il binario completo con motore DB reale; `make gui` compila solo la GUI con uno stub di test (`db_api_test.c`).
 
 ---
 
