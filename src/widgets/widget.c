@@ -27,10 +27,10 @@ void widget_destroy(Widget *w) {
 bool widget_contains_point(Widget *w, int px, int py) {
     if(!w || !w->visible) return false;
 
-    return px >= w->bounds.x && // se sta dopo la x iniziale del widget
-           px <= w->bounds.x + w->bounds.w && // controlla se sta all interno della larghezza del widget
-           py >= w->bounds.y && // stessa cosa per le y...
-           py <= w->bounds.h;
+    return px >= w->bounds.x &&
+           px <= w->bounds.x + w->bounds.w &&
+           py >= w->bounds.y &&
+           py <= w->bounds.y + w->bounds.h;
 }
 
 void widget_update_hover(Widget *w, int mx, int my) { // mouse x e y

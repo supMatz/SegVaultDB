@@ -88,8 +88,6 @@ int main(int argc, char** argv) {
     sEvent evt;
     int running = 1;
 
-    bool needs_redraw = true;
-
     while (running) {
     bool got_event = false;
 

@@ -15,13 +15,13 @@ static void label_draw(Widget* self, PlatformWindow* win) {
         case LABEL_ALIGN_RIGHT:
             x = self->bounds.x + self->bounds.w - text_w;
             break;
-        default: // LEFT
+        default:
             x = self->bounds.x;
             break;
     }
 
-    int y = self->bounds.y + (self->bounds.h - lbl->font_size) / 2;
-    platform_draw_text(win, lbl->text,(Point){x, y}, lbl->color, lbl->font_size);
+    int y = self->bounds.y + (self->bounds.h - lbl->font_size) / 2 + 1;
+    platform_draw_text(win, lbl->text, (Point){x, y}, lbl->color, lbl->font_size);
 }
 
 static bool label_handle_event(Widget* self, sEvent* evt) {
@@ -38,7 +38,7 @@ Label* label_create(int x, int y, int w, int h, const char* text, int font_size,
 
     lbl->base.type = WIDGET_LABEL;
     lbl->base.state = WIDGET_STATE_NORMAL;
-    lbl->base.bounds = (Rect) {x,y,h,w};
+    lbl->base.bounds = (Rect) {x, y, w, h};
 
     lbl->base.visible      = true;
     lbl->base.enabled      = false; // Label non interagisce

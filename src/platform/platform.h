@@ -12,7 +12,7 @@ SCOPO: astrarre Win32 e Xlib in un'unica interfaccia.
 
 // tipi geometrici (point, rectangle [x offset from left, y offset from top, h altezza, w larghezza], color)
 typedef struct { int x, y; } Point;
-typedef struct { int x, y, h, w; } Rect;
+typedef struct { int x, y, w, h; } Rect;
 typedef struct { uint8_t r, g, b, a; } Color;
 
 #define COLOR_BG        (Color){15,  17,  22,  255}  // blu notte profondo

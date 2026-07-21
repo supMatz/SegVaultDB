@@ -24,6 +24,8 @@ SCOPO: Layout principale dell'applicazione SegVault.
 #include "table_view.h"
 #include "tree_view.h"
 #include "scrollbar.h"
+#include "panel.h"
+#include "splitter.h"
 #include "../bridge/db_api.h"
 
 #define TOOLBAR_H    40   // Altezza toolbar in pixel

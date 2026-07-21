@@ -92,6 +92,7 @@ Scrollbar* scrollbar_create(int x, int y, int w, int h, ScrollbarDir dir) {
     sb->base.type         = WIDGET_SCROLLBAR;
     sb->base.state        = WIDGET_STATE_NORMAL;
     sb->base.bounds       = (Rect){x, y, w, h};
+
     sb->base.visible      = true;
     sb->base.enabled      = true;
     sb->base.draw         = scrollbar_draw;

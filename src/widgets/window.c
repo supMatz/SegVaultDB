@@ -57,9 +57,9 @@ static void layout_widgets(AppWindow* app) {
     // toolbar: striscia in alto
     int ty = 0;
     int t_btn_w = 80, t_btn_h = 28;
-    app->btn_run->base.bounds      = (Rect){SIDEBAR_W + 8, ty + 6, t_btn_h, t_btn_w};
-    app->btn_commit->base.bounds   = (Rect){SIDEBAR_W + 96, ty + 6, t_btn_h, t_btn_w};
-    app->btn_rollback->base.bounds = (Rect){SIDEBAR_W + 184, ty + 6, t_btn_h, t_btn_w};
+    app->btn_run->base.bounds      = (Rect){SIDEBAR_W + 8, ty + 6, t_btn_w, t_btn_h};
+    app->btn_commit->base.bounds   = (Rect){SIDEBAR_W + 96, ty + 6, t_btn_w, t_btn_h};
+    app->btn_rollback->base.bounds = (Rect){SIDEBAR_W + 184, ty + 6, t_btn_w, t_btn_h};
     app->lbl_db_name->base.bounds  = (Rect){W - 200, ty + 8, 190, 24};
 
     // sidebar: colonna sinistra
@@ -205,10 +205,9 @@ void app_window_draw(AppWindow* app) {
     // sfondo generale
     platform_clear(win, (Color){18, 18, 18, 255});
 
-    // toolbar background
     platform_fill_rect(
         win,
-        (Rect){0, 0, TOOLBAR_H, app->win_w},
+        (Rect){0, 0, app->win_w, TOOLBAR_H},
         (Color){28, 28, 34, 255}
     );
     
@@ -227,15 +226,14 @@ void app_window_draw(AppWindow* app) {
         (Color){50, 50, 60, 255}, 1
     );
 
-    // splitter
+    int center_w = app->win_w - SIDEBAR_W;
     platform_fill_rect(win,
-        (Rect){SIDEBAR_W, app->splitter_y, SPLITTER_H, (app->win_w - SIDEBAR_W) },
+        (Rect){SIDEBAR_W, app->splitter_y, center_w, SPLITTER_H},
         (Color){38, 38, 48, 255}
     );
 
-    // status bar background
     platform_fill_rect(win,
-        (Rect){SIDEBAR_W, app->splitter_y + SPLITTER_H, STATUSBAR_H, (app->win_w - SIDEBAR_W)},
+        (Rect){SIDEBAR_W, app->splitter_y + SPLITTER_H, center_w, STATUSBAR_H},
         (Color){28, 28, 34, 255}
     );
 
@@ -286,12 +284,11 @@ void app_window_run_query(AppWindow* app) {
     // aggiornamento griglia dei risultati
     table_view_set_result(app->results, result);
 
-    // aggiornamento status bar
-    char status[256];
+    char status[1024];
     if (!result) {
         snprintf(status, sizeof(status), "Errore: risposta NULL");
     } else if (!result->success) {
-        snprintf(status, sizeof(status), "Errore: %s", result->error);
+        snprintf(status, sizeof(status), "Errore: %.980s", result->error);
         label_set_color(app->lbl_status, (Color){220, 80, 80, 255});
     } else if (result->num_cols > 0) {
         snprintf(status, sizeof(status),

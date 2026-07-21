@@ -16,52 +16,45 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
 
     QueryResult* r = tv->result;
 
-    // header
-    Rect header = {b.x, b.y, TABLE_VIEW_HEADER_H, b.w} ;
-    platform_fill_rect(win, header, tv->color_header_bg);
+    platform_fill_rect(win, (Rect){b.x, b.y, b.w, TABLE_VIEW_HEADER_H}, tv->color_header_bg);
 
-    int x = b.x - tv->scroll_x, y = b.y, w = b.w, h = b.h;
+    int cx = b.x - tv->scroll_x;
 
     for(int c = 0; c < r->num_cols; c++) {
         int cw = tv->col_widths[c];
         
-        // testo colonna
         platform_draw_text(
             win, 
             r->col_names[c], 
-            (Point) {x + 6, y + (TABLE_VIEW_HEADER_H - tv->font_size) / 2}, 
+            (Point) {cx + 6, b.y + (TABLE_VIEW_HEADER_H - tv->font_size) / 2 + 1}, 
             tv->color_header_text,
-            1
+            tv->font_size
         );       
 
-        // separatore verticale
         platform_draw_line(
-            win, (Point){x + cw, y}, 
-            (Point){x + cw, y + TABLE_VIEW_HEADER_H}, 
+            win, (Point){cx + cw, b.y}, 
+            (Point){cx + cw, b.y + TABLE_VIEW_HEADER_H}, 
             tv->color_border, 
             1
         );
-        x += cw;
+        cx += cw;
     }
 
-    // bordo inferire header
     platform_draw_line(
         win, 
-        (Point) {x, y + TABLE_VIEW_HEADER_H},
-        (Point) {x + w, y + TABLE_VIEW_HEADER_H},
+        (Point) {b.x, b.y + TABLE_VIEW_HEADER_H},
+        (Point) {b.x + b.w, b.y + TABLE_VIEW_HEADER_H},
         tv->color_border,
         1
     );
 
-    // disegno le righe
-    int visible_rows = (h - TABLE_VIEW_HEADER_H) / TABLE_VIEW_ROW_H + 1;
+    int visible_rows = (b.h - TABLE_VIEW_HEADER_H) / TABLE_VIEW_ROW_H + 1;
     int first_row = tv->scroll_y;
     int last_row = SV_MIN(first_row + visible_rows, r->num_rows);
 
     for(int row = first_row; row < last_row; row++) {
-        int ry = y + TABLE_VIEW_ROW_H + (row - first_row) * TABLE_VIEW_ROW_H;
+        int ry = b.y + TABLE_VIEW_HEADER_H + (row - first_row) * TABLE_VIEW_ROW_H;
 
-        // colore alternato riga pari/dispari
         Color row_bg;
         if (row == tv->selected_row)
             row_bg = tv->color_row_selected;
@@ -69,32 +62,29 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
             row_bg = tv->color_row_even;
         else
             row_bg = tv->color_row_odd;
- 
-        platform_fill_rect(win, (Rect){b.x, ry, b.w, TABLE_VIEW_ROW_H},row_bg);
- 
-        // celle
-        x = b.x - tv->scroll_x;
+
+        platform_fill_rect(win, (Rect){b.x, ry, b.w, TABLE_VIEW_ROW_H}, row_bg);
+
+        cx = b.x - tv->scroll_x;
         for (int c = 0; c < r->num_cols; c++) {
             int cw = tv->col_widths[c];
             Cell* cell = &r->rows[row].cells[c];
- 
+
             Color tc = cell->is_null ? tv->color_text_null : tv->color_text;
             const char* val = cell->is_null ? "NULL" : cell->value;
- 
+
             platform_draw_text(win, val,
-                (Point){x + 6,ry + (TABLE_VIEW_ROW_H - tv->font_size) / 2},
+                (Point){cx + 6, ry + (TABLE_VIEW_ROW_H - tv->font_size) / 2},
                 tc, tv->font_size
             );
- 
-            // separatore verticale
+
             platform_draw_line(win,
-                (Point){x + cw, ry},
-                (Point){x + cw, ry + TABLE_VIEW_ROW_H},
+                (Point){cx + cw, ry},
+                (Point){cx + cw, ry + TABLE_VIEW_ROW_H},
                 tv->color_border, 1);
-            x += cw;
+            cx += cw;
         }
- 
-        // separatore orizzontale riga
+
         platform_draw_line(
             win,
             (Point){b.x, ry + TABLE_VIEW_ROW_H},
@@ -102,8 +92,7 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
             tv->color_border, 1
         );
     }
- 
-    // bordo esterno
+
     platform_draw_rect(win, b, tv->color_border, 1);
 }
  
@@ -143,7 +132,7 @@ TableView* table_view_create(int x, int y, int w, int h) {
  
     tv->base.type         = WIDGET_TABLE_VIEW;
     tv->base.state        = WIDGET_STATE_NORMAL;
-    tv->base.bounds       = (Rect){x, y, h, w};
+    tv->base.bounds       = (Rect){x, y, w, h};
     tv->base.visible      = true;
     tv->base.enabled      = true;
     tv->base.draw         = table_view_draw;

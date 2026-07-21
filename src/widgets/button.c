@@ -34,10 +34,9 @@ static void button_draw(Widget* self, PlatformWindow* win){
        // disegno il bordo
        platform_draw_rect(win, self->bounds, btn->color_border, 1);
 
-       // calcolo per posizionare il testo al centro
        int text_w = platform_measure_text(win, btn->label, btn->font_size);
        int text_x = self->bounds.x + (self->bounds.w - text_w) / 2;
-       int text_y = self->bounds.y + self->bounds.y / 2 + 1;
+       int text_y = self->bounds.y + (self->bounds.h - btn->font_size) / 2;
 
        // se non è enabled metto un colore piu scuro dello standard
        Color tc = self->enabled ? btn->color_text : (Color) {100, 100, 110, 255};
@@ -57,18 +56,17 @@ static bool button_handle_event(Widget* self, sEvent* evt) {
                             return true;
                      }
                      break;
-              case EVT_MOUSE_UP : 
-                     if(self->state == WIDGET_STATE_PRESSED) {
-                            // rilascio : controlla se il mouse è ancora sopra
-                            if(widget_contains_point(self, evt->mouse_x, evt->mouse_y)){
-                                   self->state = WIDGET_STATE_HOVER;
-                            }
-                            else {
-                                   self->state = WIDGET_STATE_NORMAL;
-                            }
-                            return true;
-                     }
-                     break;
+               case EVT_MOUSE_UP :
+                      if(self->state == WIDGET_STATE_PRESSED) {
+                             if(widget_contains_point(self, evt->mouse_x, evt->mouse_y)){
+                                    self->state = WIDGET_STATE_HOVER;
+                                    if(btn->on_click) btn->on_click(self->user_data);
+                             } else {
+                                    self->state = WIDGET_STATE_NORMAL;
+                             }
+                             return true;
+                      }
+                      break;
               default:
                      break;
        }
@@ -89,7 +87,7 @@ Button* button_create(int x, int y, int w, int h, const char* label,void (*on_cl
        // inizializzazione base widget
        btn->base.type = WIDGET_BUTTON;
        btn->base.state = WIDGET_STATE_NORMAL;
-       btn->base.bounds = (Rect) {x, y, h, w};
+       btn->base.bounds = (Rect) {x, y, w, h};
        btn->base.visible = true;
        btn->base.enabled = true;
        btn->base.user_data = user_data;

@@ -2,112 +2,64 @@
 #include "../bridge/db_api.h"
 #include <string.h>
 
-// helper ricorsiva per contare le righe visibili ricorsivamente
-static int count_visible(TreeNode* node) {
-    int count = 0; // inizializzo il contatore a 0
-    for(int i = 0; i < node->num_children; i++) {
-        count++;
-        if(node->children[i].expanded)
-            count += count_visible(&node->children[i]);
-    }
-    return count;
-}
-
-// helper che disegna di node e figli
 static int draw_node(TreeView* tv, PlatformWindow* win, TreeNode* node, int depth, int y_offset, int first_visible) {
     Rect b = tv->base.bounds;
     int visible_rows = b.h / TREE_ROW_H;
+    int last_visible = first_visible + visible_rows;
 
     for(int i = 0; i < node->num_children; i++) {
         TreeNode* child = &node->children[i];
-        int draw_y = b.y + (y_offset - first_visible) * TREE_ROW_H;
 
-        if(y_offset >= first_visible && y_offset < first_visible + visible_rows) {
+        if(y_offset >= first_visible && y_offset < last_visible) {
+            int draw_y = b.y + (y_offset - first_visible) * TREE_ROW_H;
             Color bg = (child == tv->selected) ? tv->color_row_selected : tv->color_bg;
-            
-            // sfondo riga
-            platform_fill_rect(win, (Rect) {b.x, b.y, TREE_ROW_H, b.w}, bg);
-            
-            // indentazione
+
+            platform_fill_rect(win, (Rect){b.x, draw_y, b.w, TREE_ROW_H}, bg);
+
             int ix = b.x + depth * TREE_INDENT;
 
-            // triangolo expamnd / collapse (se ha figli il nodo)
-            if(child->has_children) {
+            if (child->has_children) {
                 const char* arrow = child->expanded ? "v" : ">";
-                platform_draw_text(
-                    win, 
-                    arrow, 
-                    (Point){ix, draw_y + (TREE_ROW_H - tv->font_size) / 2}, 
-                    (Color) {150, 150, 160, 255},
-                    tv->font_size 
-                );
+                platform_draw_text(win, arrow,
+                    (Point){ix, draw_y + (TREE_ROW_H - tv->font_size) / 2},
+                    (Color){150, 150, 160, 255}, tv->font_size);
             }
 
-            // icona colorata per tipo di nodo
             Color icon_color;
-            const char* icon; 
-            switch(child->type) {
-                case TREE_NODE_DATABASE:
-                    icon = "DB"; icon_color = tv->color_icon_db; break;
-                case TREE_NODE_TABLE:
-                    icon = "T";  icon_color = tv->color_icon_table; break;
-                case TREE_NODE_VIEW:
-                    icon = "V";  icon_color = tv->color_icon_view; break;
+            const char* icon;
+            switch (child->type) {
+                case TREE_NODE_DATABASE: icon = "DB"; icon_color = tv->color_icon_db; break;
+                case TREE_NODE_TABLE:    icon = "T";  icon_color = tv->color_icon_table; break;
+                case TREE_NODE_VIEW:     icon = "V";  icon_color = tv->color_icon_view; break;
                 case TREE_NODE_PROCEDURE:
-                case TREE_NODE_FUNCTION:
-                    icon = "F";  icon_color = tv->color_icon_proc; break;
-                case TREE_NODE_COLUMN:
-                    icon = "C";
-                    icon_color = (Color){150, 150, 160, 255}; break;
-                default:
-                    icon = "-";
-                    icon_color = (Color){100, 100, 110, 255}; break;
+                case TREE_NODE_FUNCTION: icon = "F";  icon_color = tv->color_icon_proc; break;
+                case TREE_NODE_COLUMN:   icon = "C";  icon_color = (Color){150,150,160,255}; break;
+                default:                 icon = "-";  icon_color = (Color){100,100,110,255}; break;
             }
 
-            // disegno l' "icona"
-            platform_draw_text(
-                win, 
-                icon, 
-                (Point) {ix + 14, draw_y + (TREE_ROW_H - tv->font_size) / 2}, 
-                icon_color,
-                tv->font_size - 1
-            );
+            platform_draw_text(win, icon,
+                (Point){ix + 14, draw_y + (TREE_ROW_H - tv->font_size) / 2},
+                icon_color, tv->font_size - 1);
 
-            // label del nodo 
-            platform_draw_text(
-                win, 
-                child->label, 
-                (Point) {ix + 14, draw_y + (TREE_ROW_H - tv->font_size) / 2}, 
-                tv->color_text, 
-                tv->font_size
-            );
+            int lx = ix + 30;
+            platform_draw_text(win, child->label,
+                (Point){lx, draw_y + (TREE_ROW_H - tv->font_size) / 2},
+                tv->color_text, tv->font_size);
 
-            // extra info (tipo colonna, ecc.) in grigio
             if (child->extra[0]) {
-                int lw = platform_measure_text(win, child->label,
-                                               tv->font_size);
-                platform_draw_text(
-                    win, 
-                    child->extra,
-                    (Point){ix + 30 + lw + 6, draw_y + (TREE_ROW_H - tv->font_size) / 2},
-                    tv->color_text_extra, 
-                    tv->font_size - 1
-                );
+                int lw = platform_measure_text(win, child->label, tv->font_size);
+                platform_draw_text(win, child->extra,
+                    (Point){lx + lw + 6, draw_y + (TREE_ROW_H - tv->font_size) / 2},
+                    tv->color_text_extra, tv->font_size - 1);
             }
-
-            y_offset++;
-
-            // ricorsione sui figlio se espanso 
-            if(child->expanded && child->num_children > 0) 
-                y_offset = draw_node(
-                                tv, 
-                                win, 
-                                child, 
-                                depth + 1, 
-                                y_offset, 
-                                first_visible
-                            );            
         }
+
+        y_offset++;
+
+        if (child->expanded && child->num_children > 0)
+            y_offset = draw_node(tv, win, child, depth + 1, y_offset, first_visible);
+
+        if (y_offset >= last_visible + 10) break;
     }
     return y_offset;
 }
@@ -123,15 +75,12 @@ static void tree_view_draw(Widget* self, PlatformWindow* win) {
     platform_draw_rect(win, b, (Color) {50, 50, 60, 255}, 1);
 }
 
-static TreeNode* find_node_at_row(TreeNode* node,
-                                     int target, int* current) {
+static TreeNode* find_node_at_row(TreeNode* node, int target, int* current) {
     for (int i = 0; i < node->num_children; i++) {
         if (*current == target) return &node->children[i];
         (*current)++;
-        if (node->children[i].expanded) {
-            TreeNode* found = find_node_at_row(&node->children[i], target, current);
-            if (found) return found;
-        }
+        if (node->children[i].expanded)
+            find_node_at_row(&node->children[i], target, current);
     }
     return NULL;
 }
@@ -180,6 +129,7 @@ TreeView* tree_view_create(int x, int y, int w, int h) {
     tv->base.type         = WIDGET_TREE_VIEW;
     tv->base.state        = WIDGET_STATE_NORMAL;
     tv->base.bounds       = (Rect){x, y, w, h};
+
     tv->base.visible      = true;
     tv->base.enabled      = true;
     tv->base.draw         = tree_view_draw;
