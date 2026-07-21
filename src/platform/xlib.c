@@ -104,6 +104,7 @@ bool platform_poll_event(PlatformWindow *win, sEvent *evt) {
 
     XEvent xe;
     XNextEvent(win->display, &xe);
+    memset(evt, 0, sizeof(*evt));
     evt->type = EVT_NONE;
 
     switch (xe.type) {

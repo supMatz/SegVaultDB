@@ -15,10 +15,10 @@ else
 endif
 
 CC       = gcc
-CFLAGS   = -std=c11 -Wall -Wextra -Wno-unused-parameter -g -O2
-INCLUDES = -Iinclude -Isrc -Isrc/platform -Isrc/widgets
+CFLAGS   = -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -g -O2
+INCLUDES = -Iinclude -Isrc -Isrc/platform -Isrc/widgets -Isrc/catalog -Isrc/storage -Isrc/table -Isrc/index -Isrc/query -Isrc/tx -Isrc/bridge
 
-# GUI test build (uses db_api_test.c stub — no DB engine required)
+# ── Widget / GUI source files ──
 WIDGET_SRCS = \
 	src/widgets/widget.c \
 	src/widgets/button.c \
@@ -31,20 +31,47 @@ WIDGET_SRCS = \
 	src/widgets/splitter.c \
 	src/widgets/window.c
 
-GUI_SRCS = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) src/bridge/db_api_test.c
-GUI_OBJS = $(GUI_SRCS:.c=.o)
+# ── DB engine source files ──
+ENGINE_SRCS = \
+	src/catalog/schema.c \
+	src/storage/page.c \
+	src/storage/buffer_pool.c \
+	src/table/tuple.c \
+	src/table/heap.c \
+	src/index/btree.c \
+	src/query/lexer.c \
+	src/query/parser.c \
+	src/query/executor.c \
+	src/tx/wal.c \
+	src/tx/transaction.c \
+	src/bridge/db_api.c
 
-.PHONY: all gui clean
+# ── Targets ──
+#   gui    — GUI test (no real DB engine, uses db_api_test.c stub)
+#   full   — Full SegVault DBMS with real engine
+#   all    — full (default)
 
-all: gui
+GUI_SRCS  = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) src/bridge/db_api_test.c
+GUI_OBJS  = $(GUI_SRCS:.c=.o)
+
+FULL_SRCS = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) $(ENGINE_SRCS)
+FULL_OBJS = $(FULL_SRCS:.c=.o)
+
+.PHONY: all gui full clean
+
+all: full
 
 gui: $(GUI_OBJS)
 	$(CC) $(CFLAGS) -o $(OUT) $(GUI_OBJS) $(LIBS)
-	@echo "=== Build complete: $(OUT) ==="
+	@echo "=== GUI test build: $(OUT) ==="
+
+full: $(FULL_OBJS)
+	$(CC) $(CFLAGS) -o $(OUT) $(FULL_OBJS) $(LIBS)
+	@echo "=== Full build: $(OUT) ==="
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 clean:
-	$(RM) $(GUI_OBJS) $(OUT) $(FULL_OBJS)
+	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(OUT)
 	$(RM) -r obj

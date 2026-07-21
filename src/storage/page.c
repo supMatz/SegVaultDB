@@ -1,5 +1,6 @@
 #include "page.h"
 #include "../../include/common.h"
+#include <sys/types.h>
 #include <unistd.h>  // pread, pwrite
 
 Page* page_create(uint32_t id) {

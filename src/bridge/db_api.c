@@ -18,6 +18,10 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
 #include <stdio.h>
 #include <string.h>
 
+// ── Forward declarations ─────────────────────────────────────────
+static QueryResult* result_error(const char* msg);
+static QueryResult* result_ok(int rows_affected);
+
 // ── Stato globale del DB engine ──────────────────────────────────
 
 static struct {
@@ -329,7 +333,7 @@ SessionInfo* db_session_info(void) {
     if (db) strncpy(s->current_db, db, 63);
     s->tx_id          = g_db.exec_ctx.tx_id;
     s->in_transaction = (s->tx_id != 0);
-    s->autocommit     = g_db.txm ? g_db.txm->autocommit : true;
+    s->auto_commit    = g_db.txm ? g_db.txm->autocommit : true;
     strncpy(s->server_version, SV_VERSION_STR, 31);
     return s;
 }
@@ -353,14 +357,14 @@ void db_shutdown(void) {
 
 // ── Helper per l'executor ────────────────────────────────────────
 
-QueryResult* result_error(const char* msg) {
+static QueryResult* result_error(const char* msg) {
     QueryResult* r = make_result();
     r->success = false;
     strncpy(r->error, msg, sizeof(r->error) - 1);
     return r;
 }
 
-QueryResult* result_ok(int rows_affected) {
+static QueryResult* result_ok(int rows_affected) {
     QueryResult* r = make_result();
     r->success      = true;
     r->rows_affected = rows_affected;

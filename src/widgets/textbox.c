@@ -247,15 +247,9 @@ static bool textbox_handle_event(Widget* self, sEvent* evt) {
                     return true;
 
                 case KEY_ENTER:
-                    // Ctrl+Enter = esegui query
-                    if (evt->modifiers & SV_MOD_CTRL) {
-                        if (tb->on_execute)
-                            tb->on_execute(tb->text, self->user_data);
-                    } else {
-                        textbox_insert_char(tb, '\n');
-                        if (tb->on_change)
-                            tb->on_change(tb->text, self->user_data);
-                    }
+                    textbox_insert_char(tb, '\n');
+                    if (tb->on_change)
+                        tb->on_change(tb->text, self->user_data);
                     return true;
 
                 default: break;

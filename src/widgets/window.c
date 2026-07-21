@@ -135,7 +135,7 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
     app->editor->on_execute = on_editor_execute;
     textbox_set_text(app->editor,
         "-- SegVault SQL Editor\n"
-        "-- Ctrl+Enter per eseguire\n\n"
+        "-- Premi \"Run Query\" per eseguire\n\n"
         "CREATE DATABASE test;\n");
 
     app->editor_scroll = scrollbar_create(0, 0, 0, 0, SCROLLBAR_VERTICAL);
