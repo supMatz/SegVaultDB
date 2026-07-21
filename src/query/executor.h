@@ -8,11 +8,13 @@
 #include "../table/heap.h"
 #include "../index/btree.h"
 #include "../bridge/db_api.h"
+#include "../tx/wal.h"
 #include "parser.h"
 
 typedef struct {
     Catalog*    catalog;
     BufferPool* bp;
+    WAL*        wal;
     uint64_t    tx_id;
 } ExecCtx;
 

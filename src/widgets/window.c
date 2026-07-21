@@ -33,10 +33,60 @@ static void on_editor_execute(const char* text, void* ud) {
     app_window_run_query(app);
 }
 
+// risale l'albero fino a trovare il database genitore
+static const char* find_db_name(TreeNode* node) {
+    while (node) {
+        if (node->type == TREE_NODE_DATABASE) return node->label;
+        node = node->parent;
+    }
+    return NULL;
+}
+
+static void load_db_children(TreeNode* db_node) {
+    const char* db_name = db_node->label;
+    NameList* tables = db_list_tables(db_name);
+    if (tables) {
+        for (int i = 0; i < tables->count; i++)
+            tree_node_add_child(db_node, TREE_NODE_TABLE, tables->names[i], NULL);
+        db_namelist_free(tables);
+    }
+    NameList* views = db_list_views(db_name);
+    if (views) {
+        for (int i = 0; i < views->count; i++)
+            tree_node_add_child(db_node, TREE_NODE_VIEW, views->names[i], NULL);
+        db_namelist_free(views);
+    }
+}
+
+static void load_table_children(TreeNode* tbl_node) {
+    const char* db_name = find_db_name(tbl_node);
+    if (!db_name) return;
+    int ncols = 0;
+    ColumnInfo* cols = db_list_columns(db_name, tbl_node->label, &ncols);
+    if (!cols) return;
+    for (int i = 0; i < ncols; i++) {
+        TreeNode* c = tree_node_add_child(tbl_node, TREE_NODE_COLUMN,
+                                           cols[i].name, cols[i].type);
+        if (cols[i].primary_key) snprintf(c->extra, sizeof(c->extra), "PK");
+    }
+    db_columns_free(cols, ncols);
+}
+
 // Callback selezione nodo nell'albero
 static void on_tree_select(TreeNode* node, void* ud) {
     AppWindow* app = (AppWindow*)ud;
     if (!node) return;
+
+    // lazy loading: ricarica i figli ogni volta che si espande (real-time)
+    if (node->expanded) {
+        if (node->type == TREE_NODE_DATABASE && node->num_children == 0)
+            load_db_children(node);
+        else if (node->type == TREE_NODE_TABLE) {
+            tree_node_clear_children(node);
+            node->expanded = true;
+            load_table_children(node);
+        }
+    }
 
     // Se è una tabella: genera automaticamente SELECT * FROM tabella
     if (node->type == TREE_NODE_TABLE) {

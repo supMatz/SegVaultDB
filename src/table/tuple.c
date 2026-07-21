@@ -12,14 +12,13 @@ Tuple* tuple_create(int num_cols) {
 
 void tuple_free(Tuple* t) {
     if (!t) return;
-    for (int i = 0; i < t->num_values; i++) {
-        Value* v = &t->values[i];
-        if (!v->is_null) {
-            // Libera le stringhe allocate dinamicamente
-        }
-    }
     free(t->values);
     free(t);
+}
+
+void tuple_free_with_schema(Tuple* t, TableSchema* s) {
+    (void)s;
+    tuple_free(t);
 }
 
 // Formato di serializzazione:

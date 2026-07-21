@@ -82,7 +82,6 @@ void bp_unpin(BufferPool* bp, uint32_t page_id, bool dirty) {
 }
 
 int bp_new_page(BufferPool* bp, uint32_t* out_page_id) {
-    // Trova il prossimo page_id disponibile cercando il massimo esistente
     uint32_t max_id = 0;
     for (int i = 0; i < bp->capacity; i++) {
         if (bp->frames[i].page &&
@@ -120,11 +119,27 @@ int bp_flush_page(BufferPool* bp, uint32_t page_id) {
 
 int bp_flush_all(BufferPool* bp) {
     for (int i = 0; i < bp->capacity; i++) {
-        if (bp->frames[i].page && bp->frames[i].dirty)
+        if (bp->frames[i].page && bp->frames[i].dirty) {
             page_write(bp->frames[i].page, bp->db_fd);
+            bp->frames[i].dirty = false;
+        }
     }
     fsync(bp->db_fd); // Garantisce che tutto sia su disco
     return SV_OK;
+}
+
+void bp_remove_page(BufferPool* bp, uint32_t page_id) {
+    if (!bp) return;
+    for (int i = 0; i < bp->capacity; i++) {
+        if (bp->frames[i].page && bp->frames[i].page->page_id == page_id) {
+            if (bp->frames[i].dirty) page_write(bp->frames[i].page, bp->db_fd);
+            page_free(bp->frames[i].page);
+            bp->frames[i].page = NULL;
+            bp->frames[i].dirty = false;
+            bp->frames[i].pin_count = 0;
+            return;
+        }
+    }
 }
 
 void bp_destroy(BufferPool* bp) {

@@ -56,6 +56,10 @@ static TokenType keyword_or_id(const char* word, int len) {
         {"DESCRIBE",TOK_DESCRIBE},{"EXPLAIN",TOK_EXPLAIN},
         {"TRUNCATE",TOK_TRUNCATE},{"UNION",TOK_UNION},{"ALL",TOK_ALL},
         {"EXISTS",TOK_EXISTS},{"BETWEEN",TOK_BETWEEN},{"KEY",TOK_KEY},
+        {"SAVEPOINT",TOK_SAVEPOINT},{"TO",TOK_TO},{"TRIGGER",TOK_TRIGGER},
+        {"BEFORE",TOK_BEFORE},{"AFTER",TOK_AFTER},{"FOR",TOK_FOR},
+        {"EACH",TOK_EACH},{"ROW",TOK_ROW},{"RENAME",TOK_RENAME},
+        {"BOOLEAN",TOK_BOOLEAN},
     };
     char buf[64];
     int n = len < 63 ? len : 63;

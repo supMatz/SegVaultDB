@@ -10,8 +10,11 @@ typedef enum {
     NODE_DROP_DB, NODE_DROP_TABLE, NODE_DROP_VIEW, NODE_DROP_INDEX,
     NODE_ALTER_TABLE, NODE_USE, NODE_SHOW, NODE_DESCRIBE,
     NODE_EXPLAIN, NODE_BEGIN, NODE_COMMIT, NODE_ROLLBACK,
-    NODE_TRUNCATE,
+    NODE_TRUNCATE, NODE_SAVEPOINT, NODE_ROLLBACK_TO,
+    NODE_CREATE_TRIGGER, NODE_DROP_TRIGGER,
 } StmtType;
+
+typedef enum { JOIN_INNER, JOIN_LEFT, JOIN_RIGHT, JOIN_CROSS } JoinType;
 
 typedef enum { EXPR_COLUMN, EXPR_INT, EXPR_FLOAT, EXPR_STRING, EXPR_STAR,
                EXPR_BINARY, EXPR_UNARY } ExprType;
@@ -44,10 +47,18 @@ typedef struct {
 } ColumnDef;
 
 typedef struct {
+    ASTExpr*   left;
+    ASTExpr*   right;
+    ASTExpr*   condition;
+    JoinType   type;
+    char       table_name[64];
+} ASTJoin;
+
+typedef struct {
     StmtType type;
     union {
         struct {
-            ASTExpr**  columns;
+            ASTExpr*   columns[64];
             int        num_cols;
             char       table_name[64];
             ASTExpr*   where;
@@ -55,12 +66,17 @@ typedef struct {
             bool       order_asc;
             int        limit;
             bool       distinct;
+            char       group_cols[64][64];
+            int        num_group_cols;
+            ASTExpr*   having;
+            ASTJoin    joins[8];
+            int        num_joins;
         } select_stmt;
         struct {
             char       table_name[64];
-            char**     columns;
+            char*      columns[64];
             int        num_cols;
-            ASTExpr**  values;
+            ASTExpr*   values[64];
             int        num_values;
         } insert_stmt;
         struct {
@@ -110,6 +126,22 @@ typedef struct {
         struct {
             char       db_name[64];
         } use_stmt;
+        struct {
+            char       name[64];
+        } savepoint;
+        struct {
+            char       name[64];
+        } rollback_to;
+        struct {
+            char       name[64];
+            char       table_name[64];
+            bool       before;
+            char       event[16];
+            char       body[SV_MAX_SQL_LEN];
+        } create_trigger;
+        struct {
+            char       name[64];
+        } drop_trigger;
     };
 } ASTNode;
 

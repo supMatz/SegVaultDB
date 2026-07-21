@@ -32,6 +32,36 @@ static void add_stmt(ParserState* ps, ASTNode* stmt) {
 }
 
 static ASTNode* parse_select(ParserState* ps);
+static ASTNode* parse_create_trigger(ParserState* ps, ASTNode* n) {
+    n->type = NODE_CREATE_TRIGGER;
+    Token tg = consume(ps);
+    snprintf(n->create_trigger.name, sizeof(n->create_trigger.name), "%s", tg.text);
+    if (match(ps, TOK_BEFORE)) n->create_trigger.before = true;
+    else if (match(ps, TOK_AFTER)) n->create_trigger.before = false;
+    else { n->create_trigger.before = true; }
+    Token ev = consume(ps);
+    snprintf(n->create_trigger.event, sizeof(n->create_trigger.event), "%s", ev.text);
+    expect(ps, TOK_ON);
+    Token tbl = consume(ps);
+    snprintf(n->create_trigger.table_name, sizeof(n->create_trigger.table_name), "%s", tbl.text);
+    match(ps, TOK_FOR);
+    match(ps, TOK_EACH);
+    match(ps, TOK_ROW);
+    char body[SV_MAX_SQL_LEN] = {0};
+    int di = 0;
+    while (peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF && di < (int)sizeof(body) - 2) {
+        Token t = consume(ps);
+        int tl = strlen(t.text);
+        if (di + tl + 1 < (int)sizeof(body)) {
+            if (di > 0) body[di++] = ' ';
+            memcpy(body + di, t.text, tl);
+            di += tl;
+        }
+    }
+    snprintf(n->create_trigger.body, sizeof(n->create_trigger.body), "%s", body);
+    return n;
+}
+
 static ASTNode* parse_statement(ParserState* ps) {
     ASTNode* n = calloc(1, sizeof(ASTNode));
     if (!n) return NULL;
@@ -95,7 +125,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                 w->type = EXPR_COLUMN; snprintf(w->col_name, sizeof(w->col_name), "%s", wc.text);
                 ASTExpr* we = calloc(1, sizeof(ASTExpr));
                 we->type = EXPR_BINARY; we->op = OP_EQ; we->left = w;
-                Token op = consume(ps);
+                consume(ps); /* consume the = operator */
                 ASTExpr* wr = calloc(1, sizeof(ASTExpr));
                 Token wv = consume(ps);
                 if (wv.type == TOK_INTEGER) { wr->type = EXPR_INT; wr->int_val = atoll(wv.text); }
@@ -134,6 +164,8 @@ static ASTNode* parse_statement(ParserState* ps) {
                 n->type = NODE_CREATE_DB;
                 Token dn = consume(ps);
                 snprintf(n->create_db.db_name, sizeof(n->create_db.db_name), "%s", dn.text);
+            } else if (sub.type == TOK_TRIGGER) {
+                return parse_create_trigger(ps, n);
             } else if (sub.type == TOK_TABLE) {
                 n->type = NODE_CREATE_TABLE;
                 Token tn = consume(ps);
@@ -203,6 +235,19 @@ static ASTNode* parse_statement(ParserState* ps) {
             }
             break;
         }
+        case TOK_ALTER: {
+            consume(ps);
+            expect(ps, TOK_TABLE);
+            n->type = NODE_ALTER_TABLE;
+            Token tn = consume(ps);
+            snprintf(n->alter_table.table_name, sizeof(n->alter_table.table_name), "%s", tn.text);
+            if (match(ps, TOK_RENAME)) {
+                expect(ps, TOK_TO);
+                Token nn = consume(ps);
+                snprintf(n->alter_table.new_name, sizeof(n->alter_table.new_name), "%s", nn.text);
+            }
+            break;
+        }
         case TOK_DROP: {
             consume(ps);
             Token sub = consume(ps);
@@ -225,6 +270,10 @@ static ASTNode* parse_statement(ParserState* ps) {
                 expect(ps, TOK_ON);
                 Token tn = consume(ps);
                 snprintf(n->drop_index.table_name, sizeof(n->drop_index.table_name), "%s", tn.text);
+            } else if (sub.type == TOK_TRIGGER) {
+                n->type = NODE_DROP_TRIGGER;
+                Token tg = consume(ps);
+                snprintf(n->drop_trigger.name, sizeof(n->drop_trigger.name), "%s", tg.text);
             }
             break;
         }
@@ -268,7 +317,20 @@ static ASTNode* parse_statement(ParserState* ps) {
         }
         case TOK_ROLLBACK: {
             consume(ps);
-            n->type = NODE_ROLLBACK;
+            if (match(ps, TOK_TO)) {
+                n->type = NODE_ROLLBACK_TO;
+                Token sn = consume(ps);
+                snprintf(n->rollback_to.name, sizeof(n->rollback_to.name), "%s", sn.text);
+            } else {
+                n->type = NODE_ROLLBACK;
+            }
+            break;
+        }
+        case TOK_SAVEPOINT: {
+            consume(ps);
+            n->type = NODE_SAVEPOINT;
+            Token sn = consume(ps);
+            snprintf(n->savepoint.name, sizeof(n->savepoint.name), "%s", sn.text);
             break;
         }
         case TOK_TRUNCATE: {
@@ -309,8 +371,66 @@ static ASTNode* parse_select(ParserState* ps) {
     }
 
     expect(ps, TOK_FROM);
-    Token tn = consume(ps);
-    snprintf(n->select_stmt.table_name, sizeof(n->select_stmt.table_name), "%s", tn.text);
+
+    // Handle JOIN: comma-separated tables or JOIN keyword
+    n->select_stmt.num_joins = 0;
+    bool first_table = true;
+
+    while (1) {
+        Token tn = consume(ps);
+        if (first_table) {
+            snprintf(n->select_stmt.table_name, sizeof(n->select_stmt.table_name), "%s", tn.text);
+            first_table = false;
+        } else {
+            ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
+            memset(j, 0, sizeof(ASTJoin));
+            snprintf(j->table_name, sizeof(j->table_name), "%s", tn.text);
+            j->type = JOIN_INNER;
+        }
+
+        if (match(ps, TOK_JOIN)) {
+            // JOIN table ON condition (next iteration handles the table name)
+            Token jt = consume(ps);
+            ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
+            memset(j, 0, sizeof(ASTJoin));
+            snprintf(j->table_name, sizeof(j->table_name), "%s", jt.text);
+            j->type = JOIN_INNER;
+            if (match(ps, TOK_ON)) {
+                ASTExpr* cond = calloc(1, sizeof(ASTExpr));
+                Token lc = consume(ps);
+                ASTExpr* left = calloc(1, sizeof(ASTExpr));
+                left->type = EXPR_COLUMN; snprintf(left->col_name, sizeof(left->col_name), "%s", lc.text);
+                match(ps, TOK_EQ);
+                Token rc = consume(ps);
+                ASTExpr* right = calloc(1, sizeof(ASTExpr));
+                right->type = EXPR_COLUMN; snprintf(right->col_name, sizeof(right->col_name), "%s", rc.text);
+                cond->type = EXPR_BINARY; cond->op = OP_EQ; cond->left = left; cond->right = right;
+                j->condition = cond;
+            }
+        } else if (match(ps, TOK_LEFT) || match(ps, TOK_RIGHT)) {
+            expect(ps, TOK_JOIN);
+            Token jt = consume(ps);
+            ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
+            memset(j, 0, sizeof(ASTJoin));
+            snprintf(j->table_name, sizeof(j->table_name), "%s", jt.text);
+            j->type = JOIN_LEFT;
+            if (match(ps, TOK_ON)) {
+                ASTExpr* cond = calloc(1, sizeof(ASTExpr));
+                Token lc = consume(ps);
+                ASTExpr* left = calloc(1, sizeof(ASTExpr));
+                left->type = EXPR_COLUMN; snprintf(left->col_name, sizeof(left->col_name), "%s", lc.text);
+                match(ps, TOK_EQ);
+                Token rc = consume(ps);
+                ASTExpr* right = calloc(1, sizeof(ASTExpr));
+                right->type = EXPR_COLUMN; snprintf(right->col_name, sizeof(right->col_name), "%s", rc.text);
+                cond->type = EXPR_BINARY; cond->op = OP_EQ; cond->left = left; cond->right = right;
+                j->condition = cond;
+            }
+        } else if (match(ps, TOK_COMMA)) {
+            continue;
+        }
+        break;
+    }
 
     if (match(ps, TOK_WHERE)) {
         ASTExpr* w = calloc(1, sizeof(ASTExpr));
@@ -334,6 +454,32 @@ static ASTNode* parse_select(ParserState* ps) {
         else { right->type = EXPR_COLUMN; snprintf(right->col_name, sizeof(right->col_name), "%s", wv.text); }
         w->right = right;
         n->select_stmt.where = w;
+    }
+
+    if (match(ps, TOK_GROUP)) {
+        expect(ps, TOK_BY);
+        n->select_stmt.num_group_cols = 0;
+        while (1) {
+            Token gc = consume(ps);
+            snprintf(n->select_stmt.group_cols[n->select_stmt.num_group_cols++],
+                     sizeof(n->select_stmt.group_cols[0]), "%s", gc.text);
+            if (!match(ps, TOK_COMMA)) break;
+        }
+    }
+
+    if (match(ps, TOK_HAVING)) {
+        ASTExpr* h = calloc(1, sizeof(ASTExpr));
+        Token hc = consume(ps);
+        ASTExpr* left = calloc(1, sizeof(ASTExpr));
+        left->type = EXPR_COLUMN; snprintf(left->col_name, sizeof(left->col_name), "%s", hc.text);
+        h->type = EXPR_BINARY; h->left = left;
+        match(ps, TOK_EQ);
+        ASTExpr* right = calloc(1, sizeof(ASTExpr));
+        Token hv = consume(ps);
+        if (hv.type == TOK_INTEGER) { right->type = EXPR_INT; right->int_val = atoll(hv.text); }
+        else { right->type = EXPR_COLUMN; snprintf(right->col_name, sizeof(right->col_name), "%s", hv.text); }
+        h->op = OP_EQ; h->right = right;
+        n->select_stmt.having = h;
     }
 
     if (match(ps, TOK_ORDER)) {

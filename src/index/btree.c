@@ -28,18 +28,16 @@ BTree* btree_create(BufferPool* bp, uint32_t root_id) {
     if (!bt) return NULL;
     bt->bp        = bp;
     bt->root_id   = root_id;
-    bt->num_pages = 0;
-
-    uint32_t pid = btree_new_page(bt);
-    BTreeNode* node = btree_fetch(bt, pid);
-    if (node) {
-        BTREE_SET_LEAF(node);
-        node->hdr.num_keys = 0;
-        node->next_leaf    = 0;
-        btree_unpin(bt, pid, true);
-    }
-    bt->root_id = pid;
     bt->num_pages = 1;
+
+    Page* p = bp_fetch(bp, root_id);
+    if (!p) { free(bt); return NULL; }
+    BTreeNode* node = (BTreeNode*)p->data;
+    memset(p->data, 0, SV_PAGE_SIZE - SV_PAGE_HEADER_SIZE);
+    BTREE_SET_LEAF(node);
+    node->hdr.num_keys = 0;
+    node->next_leaf    = 0;
+    bp_unpin(bp, root_id, true);
     return bt;
 }
 

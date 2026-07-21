@@ -38,6 +38,7 @@ typedef struct {
 
 Tuple* tuple_create(int num_cols);
 void     tuple_free(Tuple* t);
+void     tuple_free_with_schema(Tuple* t, TableSchema* s);
 
 // Serializza la tuple in un byte array (da inserire in una pagina)
 uint8_t* tuple_serialize(Tuple* t, TableSchema* s, size_t* out_len);

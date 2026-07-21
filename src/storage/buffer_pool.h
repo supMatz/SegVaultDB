@@ -47,6 +47,9 @@ int bp_flush_page(BufferPool* bp, uint32_t page_id);
 // scrive su disco tutte le pagine dirty
 int bp_flush_all(BufferPool* bp);
 
+// Rimuove una pagina dalla cache (forza la rilettura dal disco)
+void bp_remove_page(BufferPool* bp, uint32_t page_id);
+
 // dealloca il buffer pool (fa flush prima di liberare)
 void bp_destroy(BufferPool* bp);
 

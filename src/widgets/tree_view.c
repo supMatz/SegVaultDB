@@ -183,13 +183,7 @@ void tree_node_toggle(TreeView* tv, TreeNode* node) {
     (void)tv;
     if (!node->has_children) return;
     node->expanded = !node->expanded;
- 
-    // lazy loading: carica figli dal DB solo la prima volta
-    if (node->expanded && !node->loaded) {
-        node->loaded = true;
-        // la logica di caricamento è in window.c che conosce il DB
-        // qui emetto solo il flag — il chiamante ricarica
-    }
+    // I figli vengono popolati da on_tree_select in window.c
 }
  
 void tree_node_clear_children(TreeNode* node) {

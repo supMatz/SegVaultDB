@@ -42,6 +42,93 @@
 
 ---
 
+## Supported SQL
+
+Tutte le query si scrivono nell'editor SQL e si eseguono cliccando **Run Query** (pulsante verde in alto a sinistra).
+
+### Data Definition Language (DDL)
+
+```sql
+-- Database
+CREATE DATABASE nome_db;
+DROP DATABASE nome_db;
+USE nome_db;
+SHOW DATABASES;
+SHOW TABLES;
+DESCRIBE nome_tabella;
+
+-- Table
+CREATE TABLE utenti (
+    id     INT,
+    nome   VARCHAR(100),
+    eta    INT,
+    salario FLOAT,
+    attivo BOOLEAN
+);
+DROP TABLE nome_tabella;
+
+-- Index
+CREATE INDEX idx_nome ON utenti (nome);
+```
+
+### Data Manipulation Language (DML)
+
+```sql
+-- Insert
+INSERT INTO utenti VALUES (1, 'Alice', 30, 45000.0, 1);
+INSERT INTO utenti (id, nome) VALUES (2, 'Bob');
+
+-- Select
+SELECT * FROM utenti;
+SELECT nome, eta FROM utenti;
+SELECT * FROM utenti WHERE id = 1;
+SELECT * FROM utenti WHERE nome = 'Alice';
+
+-- Update
+UPDATE utenti SET eta = 31 WHERE id = 1;
+
+-- Delete
+DELETE FROM utenti WHERE id = 2;
+```
+
+### Transactions
+
+```sql
+BEGIN;
+INSERT INTO utenti VALUES (3, 'Charlie', 25, 50000.0, 1);
+COMMIT;
+
+BEGIN;
+UPDATE utenti SET eta = 26 WHERE id = 3;
+ROLLBACK;
+```
+
+### Tipi di dato supportati
+
+| Tipo | Descrizione |
+|---|---|
+| `INT` / `INTEGER` | 4 byte, signed |
+| `BIGINT` | 8 byte, signed |
+| `FLOAT` / `DOUBLE` | 8 byte floating point |
+| `VARCHAR(n)` | Stringa a lunghezza variabile |
+| `CHAR(n)` | Stringa a lunghezza fissa |
+| `TEXT` | Stringa lunga (max 65535 byte) |
+| `BOOL` / `BOOLEAN` | 1 byte (0/1) |
+| `DATE` | 4 byte (giorni dal 1970) |
+| `DATETIME` | 8 byte (ms dal 1970) |
+| `BLOB` | Dati binari |
+| `DECIMAL` | Numero decimale a precisione fissa |
+
+### Column constraints (parsed, not enforced)
+
+`NOT NULL`, `NULL`, `PRIMARY KEY`, `AUTO_INCREMENT`, `DEFAULT valore`
+
+### Non ancora implementato
+
+`ALTER TABLE`, `JOIN`, `ORDER BY`, `GROUP BY`, `HAVING`, `LIMIT`, subquery, viste, trigger, stored procedure, EXPLAIN, SAVEPOINT.
+
+---
+
 ## Architecture
 
 ```
@@ -56,10 +143,10 @@
                        │  platform.h  (interfaccia unificata)
                        │  db_api.h    (unico punto di contatto GUI ↔ DB)
 ┌──────────────────────▼──────────────────────────────────────┐
-│                    SQL Parser Layer                         │
-│        Hand-written lexer (src/query/lexer.c)               │
-│        Recursive descent parser (src/query/parser.c)        │
-└──────────────────────┬──────────────────────────────────────┘
+│                    SQL Parser Layer                          │
+│        Hand-written lexer (src/query/lexer.c)                │
+│        Recursive descent parser (src/query/parser.c)         │
+└──────────────────────┬───────────────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────────────┐
 │              Query Executor                                 │
