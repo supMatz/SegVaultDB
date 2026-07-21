@@ -1,0 +1,16 @@
+# Build output
+segvault
+segvault.exe
+*.o
+obj/
+
+# Runtime data directory (created by ./segvault)
+data/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
