@@ -1,5 +1,5 @@
 #include "buffer_pool.h"
-#include <unistd.h>
+#include "platform_compat.h"
 
 BufferPool* bp_create(int capacity, int db_fd) {
     BufferPool* bp = SV_ALLOC(BufferPool);
@@ -124,7 +124,7 @@ int bp_flush_all(BufferPool* bp) {
             bp->frames[i].dirty = false;
         }
     }
-    fsync(bp->db_fd); // Garantisce che tutto sia su disco
+    sv_fsync(bp->db_fd);
     return SV_OK;
 }
 

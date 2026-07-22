@@ -57,7 +57,7 @@ GUI_OBJS  = $(GUI_SRCS:.c=.o)
 FULL_SRCS = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) $(ENGINE_SRCS)
 FULL_OBJS = $(FULL_SRCS:.c=.o)
 
-.PHONY: all gui full clean
+.PHONY: all gui full clean test
 
 all: full
 
@@ -69,9 +69,15 @@ full: $(FULL_OBJS)
 	$(CC) $(CFLAGS) -o $(OUT) $(FULL_OBJS) $(LIBS)
 	@echo "=== Full build: $(OUT) ==="
 
+test: test_engine
+	./test_engine
+
+test_engine: test_engine.c $(ENGINE_SRCS)
+	$(CC) $(CFLAGS) $(INCLUDES) -o test_engine test_engine.c $(ENGINE_SRCS) -lm
+
 %.o: %.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 clean:
-	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(OUT)
+	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(OUT) test_engine
 	$(RM) -r obj

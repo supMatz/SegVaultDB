@@ -1,7 +1,6 @@
 #include "schema.h"
 #include <string.h>
-#include <fcntl.h>
-#include <unistd.h>
+#include "platform_compat.h"
 
 int datatype_size(DataType t) {
     switch (t) {
@@ -43,14 +42,14 @@ Catalog* catalog_create(void) {
 }
 
 Catalog* catalog_load(const char* path) {
-    int fd = open(path, O_RDONLY);
+    int fd = sv_open(path, SV_O_RDONLY, 0);
     if (fd < 0) return catalog_create();
 
     Catalog* c = SV_ALLOC(Catalog);
-    if (!c) { close(fd); return NULL; }
+    if (!c) { sv_close(fd); return NULL; }
 
-    ssize_t n = read(fd, c, sizeof(Catalog));
-    close(fd);
+    ssize_t n = sv_read(fd, c, sizeof(Catalog));
+    sv_close(fd);
 
     if (n != (ssize_t)sizeof(Catalog)) {
         free(c);
@@ -61,11 +60,11 @@ Catalog* catalog_load(const char* path) {
 
 int catalog_save(Catalog* c, const char* path) {
     if (!c || !path) return SV_ERR;
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = sv_open(path, SV_O_WRONLY | SV_O_CREAT | SV_O_TRUNC, 0644);
     if (fd < 0) return SV_IO_ERROR;
 
-    ssize_t n = write(fd, c, sizeof(Catalog));
-    close(fd);
+    ssize_t n = sv_write(fd, c, sizeof(Catalog));
+    sv_close(fd);
     return (n == (ssize_t)sizeof(Catalog)) ? SV_OK : SV_IO_ERROR;
 }
 

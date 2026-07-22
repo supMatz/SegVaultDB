@@ -12,9 +12,7 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
 #include "../query/executor.h"
 #include "../tx/transaction.h"
 #include "../tx/wal.h"
-#include <fcntl.h>
-#include <unistd.h>
-#include <time.h>
+#include "platform_compat.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -44,11 +42,7 @@ static QueryResult* make_result(void) {
     return SV_ALLOC(QueryResult);
 }
 
-static double get_time_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
-}
+static double get_time_ms(void) { return sv_get_time_ms(); }
 
 // ── API principale ───────────────────────────────────────────────
 
@@ -56,15 +50,15 @@ bool db_init(const char* data_directory) {
     if (g_db.initialized) return true;
 
     strncpy(g_db.data_dir, data_directory, sizeof(g_db.data_dir)-1);
-    snprintf(g_db.db_path,  sizeof(g_db.db_path),  "%s/segvault.db",  data_directory);
-    snprintf(g_db.cat_path, sizeof(g_db.cat_path), "%s/segvault.cat", data_directory);
-    snprintf(g_db.log_path, sizeof(g_db.log_path), "%s/segvault.wal", data_directory);
+    snprintf(g_db.db_path,  sizeof(g_db.db_path),  "%s" SV_PATH_SEP "segvault.db",  data_directory);
+    snprintf(g_db.cat_path, sizeof(g_db.cat_path), "%s" SV_PATH_SEP "segvault.cat", data_directory);
+    snprintf(g_db.log_path, sizeof(g_db.log_path), "%s" SV_PATH_SEP "segvault.wal", data_directory);
 
     // Recovery prima di aprire qualsiasi cosa
     wal_recovery(g_db.log_path, g_db.db_path, g_db.cat_path);
 
     // Apri il file del database
-    g_db.db_fd = open(g_db.db_path, O_RDWR | O_CREAT, 0644);
+    g_db.db_fd = sv_open(g_db.db_path, SV_O_RDWR | SV_O_CREAT, 0644);
     if (g_db.db_fd < 0) return false;
 
     // Inizializza i componenti
@@ -232,7 +226,7 @@ bool db_savepoint(const char* name) {
     // Record offset
     if (g_num_savepoints < 64) {
         snprintf(g_savepoints[g_num_savepoints].name, sizeof(g_savepoints[g_num_savepoints].name), "%s", name);
-        g_savepoints[g_num_savepoints].offset = lseek(g_db.wal->fd, 0, SEEK_CUR);
+        g_savepoints[g_num_savepoints].offset = sv_lseek(g_db.wal->fd, 0, SEEK_CUR);
         g_num_savepoints++;
     }
     return true;
@@ -251,9 +245,9 @@ bool db_rollback_to(const char* name) {
 
     // Undo only entries after the savepoint offset for current tx
     off_t sp_off = g_savepoints[sp_idx].offset;
-    int log_fd = open(g_db.log_path, O_RDONLY);
+    int log_fd = sv_open(g_db.log_path, SV_O_RDONLY, 0);
     if (log_fd >= 0) {
-        lseek(log_fd, sp_off, SEEK_SET);
+        sv_lseek(log_fd, sp_off, SEEK_SET);
         #define MAX_UNDO 4096
         typedef struct { uint8_t type; uint32_t page_id; uint16_t slot_id;
                          uint32_t data_len; uint32_t old_data_len;
@@ -262,7 +256,7 @@ bool db_rollback_to(const char* name) {
         int n_undo = 0;
 
         uint8_t hdr[23];
-        while (read(log_fd, hdr, 23) == 23 && n_undo < MAX_UNDO) {
+        while (sv_read(log_fd, hdr, 23) == 23 && n_undo < MAX_UNDO) {
             uint64_t entry_tx_id;
             memcpy(&entry_tx_id, hdr + 1, 8);
             uint32_t page_id; memcpy(&page_id, hdr + 9, 4);
@@ -278,16 +272,16 @@ bool db_rollback_to(const char* name) {
                 e->data_len = dlen; e->old_data_len = oldlen;
                 e->data = dlen > 0 ? malloc(dlen) : NULL;
                 e->old_data = oldlen > 0 ? malloc(oldlen) : NULL;
-                read(log_fd, e->data, dlen);
-                read(log_fd, e->old_data, oldlen);
+                sv_read(log_fd, e->data, dlen);
+                sv_read(log_fd, e->old_data, oldlen);
             } else {
-                if (dlen > 0) lseek(log_fd, dlen, SEEK_CUR);
-                if (oldlen > 0) lseek(log_fd, oldlen, SEEK_CUR);
+                if (dlen > 0) sv_lseek(log_fd, dlen, SEEK_CUR);
+                if (oldlen > 0) sv_lseek(log_fd, oldlen, SEEK_CUR);
             }
         }
-        close(log_fd);
+        sv_close(log_fd);
 
-        int db_fd = open(g_db.db_path, O_RDWR);
+        int db_fd = sv_open(g_db.db_path, SV_O_RDWR, 0);
         if (db_fd >= 0) {
             for (int i = n_undo - 1; i >= 0; i--) {
                 UndoEntry* e = &undo[i];
@@ -312,12 +306,12 @@ bool db_rollback_to(const char* name) {
                 free(e->data);
                 free(e->old_data);
             }
-            close(db_fd);
+            sv_close(db_fd);
         }
     }
 
-    ftruncate(g_db.wal->fd, sp_off);
-    lseek(g_db.wal->fd, 0, SEEK_END);
+    sv_ftruncate(g_db.wal->fd, sp_off);
+    sv_lseek(g_db.wal->fd, 0, SEEK_END);
     g_num_savepoints = sp_idx;
 
     for (int i = 0; i < g_db.bp->capacity; i++) {
@@ -476,7 +470,7 @@ void db_shutdown(void) {
     bp_destroy(g_db.bp);
     txm_destroy(g_db.txm);
     catalog_free(g_db.catalog);
-    close(g_db.db_fd);
+    sv_close(g_db.db_fd);
     g_db.initialized = false;
 }
 

@@ -38,7 +38,7 @@
 | **Storage** | Custom B+Tree with page-based I/O (4 KB pages) |
 | **SQL** | Hand-written recursive descent parser + lexer |
 | **Transactions** | Write-Ahead Log (ARIES-style recovery) |
-| **Cross-compilation** | MinGW-w64 — build `.exe` from Linux |
+| **Cross-compilation** | MinGW-w64 — build `.exe` from Linux (⚠ richiede fix `pread`/`pwrite`) |
 
 ---
 
@@ -123,9 +123,35 @@ ROLLBACK;
 
 `NOT NULL`, `NULL`, `PRIMARY KEY`, `AUTO_INCREMENT`, `DEFAULT valore`
 
-### Non ancora implementato
+### Stato implementazione SQL — giugno 2026
 
-`ALTER TABLE`, `JOIN`, `ORDER BY`, `GROUP BY`, `HAVING`, `LIMIT`, subquery, viste, trigger, stored procedure, EXPLAIN, SAVEPOINT.
+| Feature | Stato |
+|---|---|
+| `SELECT` con proiezione colonne | ✅ |
+| `WHERE` (con operatori =, !=, <, >, <=, >=) | ✅ |
+| `ORDER BY` (ASC/DESC) | ✅ |
+| `LIMIT` | ✅ |
+| `DISTINCT` | ✅ |
+| `JOIN` (INNER, LEFT, RIGHT, CROSS) | ✅ |
+| `GROUP BY` | ✅ |
+| `HAVING` | ✅ |
+| `INSERT` (con/senza colonne) | ✅ |
+| `UPDATE` | ✅ |
+| `DELETE` | ✅ |
+| `WHERE` con nomi qualificati (`tabella.colonna`) | ✅ |
+| Transazioni (BEGIN/COMMIT/ROLLBACK) | ✅ |
+| SAVEPOINT / ROLLBACK TO | ✅ |
+| CREATE / DROP INDEX | ✅ |
+| CREATE / DROP VIEW | ✅ |
+| CREATE / DROP TRIGGER (parsing, non eseguito) | ✅ |
+| ALTER TABLE (RENAME TO) | ✅ |
+| EXPLAIN | ✅ |
+| TRUNCATE | ✅ |
+| Subquery | ❌ |
+| Stored procedure | ❌ |
+| NULL / NOT NULL / PRIMARY KEY / DEFAULT (parsed) | ✅ parsing |
+| `LIKE`, `IN`, `BETWEEN` | ❌ |
+| `UNION` | ❌ |
 
 ---
 
@@ -442,12 +468,28 @@ make
 # GUI-only build (uses db_api_test.c stub, no engine) — same binary name
 make gui
 
-# Windows — produce segvault.exe  (-lgdi32 -luser32 -lkernel32)
-make   # eseguito da un ambiente Windows o MinGW
+# Test suite (71 test — include JOIN, GROUP BY, HAVING, DISTINCT, ORDER BY, ecc.)
+make test
 ```
 
 Il Makefile rileva automaticamente la piattaforma tramite `$(OS)` e seleziona il sorgente corretto (`src/platform/xlib.c` o `src/platform/win32.c`).
 `make` (default) produce il binario completo con motore DB reale; `make gui` compila solo la GUI con uno stub di test (`db_api_test.c`).
+
+### Compilazione per Windows (cross-compilation da Linux)
+
+```bash
+# Installare MinGW-w64
+sudo apt install mingw-w64
+
+# Compilare con x86_64-w64-mingw32-gcc
+x86_64-w64-mingw32-gcc -std=c11 -Wall -Wextra -Wno-unused-parameter \
+    -Iinclude -Isrc -Isrc/platform -Isrc/widgets -Isrc/catalog \
+    -Isrc/storage -Isrc/table -Isrc/index -Isrc/query -Isrc/tx -Isrc/bridge \
+    src/main.c src/platform/win32.c $(WIDGET_SRCS) $(ENGINE_SRCS) \
+    -lgdi32 -luser32 -lkernel32 -o segvault.exe
+```
+
+**⚠ Nota:** Il layer storage (`page.c`) usa `pread()`/`pwrite()` (POSIX). Su Windows con MinGW-w64 queste funzioni sono disponibili tramite `_pread()`/`_pwrite()` o definendo `_WIN32_WINNT=0x0600`. Se la compilazione fallisce con `undefined reference to 'pread'`, editare `page.c` per usare `#ifdef _WIN32` con `SetFilePointer`/`ReadFile`/`WriteFile`.
 
 ---
 

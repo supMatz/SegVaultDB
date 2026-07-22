@@ -8,7 +8,7 @@ SCOPO: Widget di input testo multilinea per l'editor SQL.
 #define TEXTBOX_H
  
 #include "widget.h"
-#include <sys/types.h>
+#include "platform_compat.h"
 
 #define TEXTBOX_MAX_LEN 65536 // 64KB id lunghezza massima
 #define TEXTBOX_MAX_LINES 4096 // num max di righe

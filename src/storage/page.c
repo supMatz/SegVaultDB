@@ -1,7 +1,6 @@
 #include "page.h"
-#include "../../include/common.h"
-#include <sys/types.h>
-#include <unistd.h>  // pread, pwrite
+#include "common.h"
+#include "platform_compat.h"
 
 Page* page_create(uint32_t id) {
     Page* p = (Page*)calloc(1, sizeof(Page));
@@ -18,7 +17,7 @@ void page_free(Page* p) { free(p); }
 
 int page_write(Page* p, int fd) {
     off_t offset = (off_t)p->page_id * SV_PAGE_SIZE;
-    ssize_t written = pwrite(fd, p, SV_PAGE_SIZE, offset);
+    ssize_t written = sv_pwrite(fd, p, SV_PAGE_SIZE, offset);
     return (written == SV_PAGE_SIZE) ? SV_OK : SV_IO_ERROR;
 }
 
@@ -26,7 +25,7 @@ Page* page_read(uint32_t id, int fd) {
     Page* p = (Page*)malloc(sizeof(Page));
     if (!p) return NULL;
     off_t offset = (off_t)id * SV_PAGE_SIZE;
-    ssize_t n = pread(fd, p, SV_PAGE_SIZE, offset);
+    ssize_t n = sv_pread(fd, p, SV_PAGE_SIZE, offset);
     if (n != SV_PAGE_SIZE) { free(p); return NULL; }
     return p;
 }

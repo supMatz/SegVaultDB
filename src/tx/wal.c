@@ -1,14 +1,13 @@
 #include "wal.h"
 #include "../storage/page.h"
-#include <fcntl.h>
-#include <unistd.h>
+#include "platform_compat.h"
 #include <string.h>
 #include <stdio.h>
 
 WAL* wal_create(const char* path) {
     WAL* wal = calloc(1, sizeof(WAL));
     snprintf(wal->path, sizeof(wal->path), "%s", path);
-    wal->fd = open(path, O_RDWR | O_CREAT | O_APPEND, 0644);
+    wal->fd = sv_open(path, SV_O_RDWR | SV_O_CREAT | SV_O_APPEND, 0644);
     if (wal->fd < 0) {
         free(wal);
         return NULL;
@@ -28,16 +27,16 @@ int wal_write(WAL* wal, uint8_t type, uint64_t tx_id, uint32_t page_id,
     memcpy(hdr + 15, &data_len, 4);
     memcpy(hdr + 19, &old_data_len, 4);
 
-    write(wal->fd, hdr, 23);
-    if (data && data_len > 0) write(wal->fd, data, data_len);
-    if (old_data && old_data_len > 0) write(wal->fd, old_data, old_data_len);
+    sv_write(wal->fd, hdr, 23);
+    if (data && data_len > 0) sv_write(wal->fd, data, data_len);
+    if (old_data && old_data_len > 0) sv_write(wal->fd, old_data, old_data_len);
     wal->sequence++;
     return SV_OK;
 }
 
 int wal_flush(WAL* wal) {
     if (!wal) return SV_ERR;
-    fsync(wal->fd);
+    sv_fsync(wal->fd);
     return SV_OK;
 }
 
@@ -104,11 +103,11 @@ static void undo_entry(int db_fd, uint8_t type, uint32_t page_id,
 
 int wal_recovery(const char* log_path, const char* db_path, const char* cat_path) {
     (void)cat_path;
-    int log_fd = open(log_path, O_RDONLY);
+    int log_fd = sv_open(log_path, SV_O_RDONLY, 0);
     if (log_fd < 0) return SV_OK; // No log to recover
 
-    int db_fd = open(db_path, O_RDWR);
-    if (db_fd < 0) { close(log_fd); return SV_ERR; }
+    int db_fd = sv_open(db_path, SV_O_RDWR, 0);
+    if (db_fd < 0) { sv_close(log_fd); return SV_ERR; }
 
     // Phase 1: Read all entries, track transaction state
     #define MAX_ENTRIES 65536
@@ -131,7 +130,7 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
     int num_active = 0;
 
     uint8_t hdr[23];
-    while (read(log_fd, hdr, 23) == 23 && num_entries < MAX_ENTRIES) {
+    while (sv_read(log_fd, hdr, 23) == 23 && num_entries < MAX_ENTRIES) {
         LogEntry* e = &entries[num_entries];
         e->type = hdr[0];
         memcpy(&e->tx_id, hdr + 1, 8);
@@ -145,11 +144,11 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
 
         if (e->data_len > 0) {
             e->data = malloc(e->data_len);
-            read(log_fd, e->data, e->data_len);
+            sv_read(log_fd, e->data, e->data_len);
         }
         if (e->old_data_len > 0) {
             e->old_data = malloc(e->old_data_len);
-            read(log_fd, e->old_data, e->old_data_len);
+            sv_read(log_fd, e->old_data, e->old_data_len);
         }
 
         // Track transaction state
@@ -165,7 +164,7 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
         }
         num_entries++;
     }
-    close(log_fd);
+    sv_close(log_fd);
 
     // Phase 2: REDO — replay all entries (idempotent)
     for (int i = 0; i < num_entries; i++) {
@@ -200,17 +199,17 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
         free(entries[i].old_data);
     }
 
-    close(db_fd);
+    sv_close(db_fd);
     remove(log_path);
     return SV_OK;
 }
 
 int wal_undo_tx(const char* log_path, const char* db_path, uint64_t tx_id) {
-    int log_fd = open(log_path, O_RDONLY);
+    int log_fd = sv_open(log_path, SV_O_RDONLY, 0);
     if (log_fd < 0) return SV_NOT_FOUND;
 
-    int db_fd = open(db_path, O_RDWR);
-    if (db_fd < 0) { close(log_fd); return SV_ERR; }
+    int db_fd = sv_open(db_path, SV_O_RDWR, 0);
+    if (db_fd < 0) { sv_close(log_fd); return SV_ERR; }
 
     #define MAX_ENTRIES 65536
     typedef struct {
@@ -227,7 +226,7 @@ int wal_undo_tx(const char* log_path, const char* db_path, uint64_t tx_id) {
     int num_entries = 0;
 
     uint8_t hdr[23];
-    while (read(log_fd, hdr, 23) == 23 && num_entries < MAX_ENTRIES) {
+    while (sv_read(log_fd, hdr, 23) == 23 && num_entries < MAX_ENTRIES) {
         LogEntry* e = &entries[num_entries];
         e->type = hdr[0];
         uint64_t entry_tx_id;
@@ -241,22 +240,22 @@ int wal_undo_tx(const char* log_path, const char* db_path, uint64_t tx_id) {
 
         if (entry_tx_id != tx_id) {
             // Skip but advance file position
-            if (e->data_len > 0) lseek(log_fd, e->data_len, SEEK_CUR);
-            if (e->old_data_len > 0) lseek(log_fd, e->old_data_len, SEEK_CUR);
+            if (e->data_len > 0) sv_lseek(log_fd, e->data_len, SEEK_CUR);
+            if (e->old_data_len > 0) sv_lseek(log_fd, e->old_data_len, SEEK_CUR);
             continue;
         }
 
         if (e->data_len > 0) {
             e->data = malloc(e->data_len);
-            read(log_fd, e->data, e->data_len);
+            sv_read(log_fd, e->data, e->data_len);
         }
         if (e->old_data_len > 0) {
             e->old_data = malloc(e->old_data_len);
-            read(log_fd, e->old_data, e->old_data_len);
+            sv_read(log_fd, e->old_data, e->old_data_len);
         }
         num_entries++;
     }
-    close(log_fd);
+    sv_close(log_fd);
 
     // Undo in reverse order
     for (int i = num_entries - 1; i >= 0; i--) {
@@ -267,12 +266,12 @@ int wal_undo_tx(const char* log_path, const char* db_path, uint64_t tx_id) {
         free(e->old_data);
     }
 
-    close(db_fd);
+    sv_close(db_fd);
     return SV_OK;
 }
 
 void wal_destroy(WAL* wal) {
     if (!wal) return;
-    if (wal->fd >= 0) close(wal->fd);
+    if (wal->fd >= 0) sv_close(wal->fd);
     free(wal);
 }
