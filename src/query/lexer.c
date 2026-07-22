@@ -104,16 +104,37 @@ TokenList* lexer_tokenize(const char* sql) {
             continue;
         }
 
+        // Backtick-quoted identifiers (e.g. `table_name`)
+        if (*lx.pos == '`') {
+            lx.pos++;
+            while (*lx.pos && *lx.pos != '`') { lx.pos++; }
+            Token bt = make_token(&lx, TOK_IDENTIFIER);
+            int blen = strlen(bt.text);
+            if (blen > 0 && bt.text[0] == '`') memmove(bt.text, bt.text + 1, blen);
+            blen = strlen(bt.text);
+            if (blen > 0 && bt.text[blen-1] == '`') bt.text[blen-1] = '\0';
+            if (*lx.pos) lx.pos++;
+            lx.start = lx.pos;
+            add_token(list, bt);
+            continue;
+        }
+
         // String literals
         if (*lx.pos == '\'' || *lx.pos == '"') {
             char quote = *lx.pos;
             lx.pos++;
+            lx.start = lx.pos;
             while (*lx.pos && *lx.pos != quote) {
                 if (*lx.pos == '\\') lx.pos++;
                 lx.pos++;
             }
+            Token t = make_token(&lx, TOK_STRING);
+            int slen = strlen(t.text);
+            if (slen > 0 && (t.text[slen-1] == '\'' || t.text[slen-1] == '"'))
+                t.text[slen-1] = '\0';
             if (*lx.pos) lx.pos++;
-            add_token(list, make_token(&lx, TOK_STRING));
+            lx.start = lx.pos;
+            add_token(list, t);
             continue;
         }
 

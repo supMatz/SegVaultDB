@@ -1,6 +1,5 @@
 #include "src/bridge/db_api.h"
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
 
 static int tests = 0, passed = 0;
@@ -85,11 +84,45 @@ int main() {
     test_sql("INSERT t2(20)", "INSERT INTO t2 VALUES (20)", -1);
     test_sql("CROSS JOIN", "SELECT * FROM t1, t2", 4);
 
+    // Qualified columns
+    test_sql("QUALIFIED SELECT", "SELECT t1.a FROM t1", 2);
+    test_sql("QUALIFIED WHERE", "SELECT * FROM t1 WHERE t1.a = 1", 1);
+
+    // JOIN with ON
+    test_sql("CREATE T3", "CREATE TABLE t3 (c INT, d INT)", -1);
+    test_sql("INSERT t3(10,1)", "INSERT INTO t3 VALUES (10, 1)", -1);
+    test_sql("INSERT t3(20,2)", "INSERT INTO t3 VALUES (20, 2)", -1);
+    test_sql("INSERT t3(30,3)", "INSERT INTO t3 VALUES (30, 3)", -1);
+    test_sql("JOIN ON", "SELECT * FROM t1 JOIN t3 ON t1.a = t3.d", 2);
+    test_sql("JOIN WHERE", "SELECT t1.a, t3.c FROM t1 JOIN t3 ON t1.a = t3.d WHERE t1.a = 1", 1);
+    test_sql("QUALIFIED JOIN COLS", "SELECT t1.a, t3.c FROM t1, t3 WHERE t1.a = t3.d", 2);
+
+    // LEFT JOIN
+    test_sql("INSERT t4(1)", "INSERT INTO t1 VALUES (4)", -1);
+    test_sql("LEFT JOIN", "SELECT * FROM t1 LEFT JOIN t3 ON t1.a = t3.d", 3);
+
+    // Qualified UPDATE/DELETE
+    // ORDER BY and LIMIT with JOIN
+    test_sql("JOIN ORDER BY", "SELECT t1.a, t3.c FROM t1 JOIN t3 ON t1.a = t3.d ORDER BY t1.a DESC", 2);
+    test_sql("JOIN LIMIT", "SELECT t1.a, t3.c FROM t1 JOIN t3 ON t1.a = t3.d LIMIT 1", 1);
+
+    // GROUP BY
+    test_sql("GROUP BY", "SELECT age FROM people GROUP BY age", 4);
+
+    test_sql("CREATE T4", "CREATE TABLE t4 (x INT, y INT)", -1);
+    test_sql("INSERT t4(1,10)", "INSERT INTO t4 VALUES (1, 10)", -1);
+    test_sql("INSERT t4(2,20)", "INSERT INTO t4 VALUES (2, 20)", -1);
+    test_sql("UPDATE QUALIFIED", "UPDATE t4 SET y = 99 WHERE t4.x = 1", -1);
+    test_sql("DELETE QUALIFIED", "DELETE FROM t4 WHERE t4.x = 2", -1);
+    test_sql("SELECT AFTER UPD/DEL", "SELECT * FROM t4", 1);
+
     // Cleanup
     test_sql("DROP VIEW", "DROP VIEW v1", -1);
     test_sql("DROP TABLE", "DROP TABLE people", -1);
     test_sql("DROP TABLE t1", "DROP TABLE t1", -1);
     test_sql("DROP TABLE t2", "DROP TABLE t2", -1);
+    test_sql("DROP TABLE t3", "DROP TABLE t3", -1);
+    test_sql("DROP TABLE t4", "DROP TABLE t4", -1);
     test_sql("DROP DB", "DROP DATABASE testdb", -1);
 
     db_shutdown();

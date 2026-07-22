@@ -471,9 +471,15 @@ static ASTNode* parse_select(ParserState* ps) {
         expect(ps, TOK_BY);
         n->select_stmt.num_group_cols = 0;
         while (1) {
-            Token gc = consume(ps);
-            snprintf(n->select_stmt.group_cols[n->select_stmt.num_group_cols++],
-                     sizeof(n->select_stmt.group_cols[0]), "%s", gc.text);
+            ASTExpr gc_expr;
+            memset(&gc_expr, 0, sizeof(gc_expr));
+            parse_column_ref(ps, &gc_expr);
+            if (gc_expr.table_name[0])
+                snprintf(n->select_stmt.group_cols[n->select_stmt.num_group_cols++],
+                         sizeof(n->select_stmt.group_cols[0]), "%s.%s", gc_expr.table_name, gc_expr.col_name);
+            else
+                snprintf(n->select_stmt.group_cols[n->select_stmt.num_group_cols++],
+                         sizeof(n->select_stmt.group_cols[0]), "%s", gc_expr.col_name);
             if (!match(ps, TOK_COMMA)) break;
         }
     }
@@ -493,8 +499,13 @@ static ASTNode* parse_select(ParserState* ps) {
 
     if (match(ps, TOK_ORDER)) {
         expect(ps, TOK_BY);
-        Token oc = consume(ps);
-        snprintf(n->select_stmt.order_col, sizeof(n->select_stmt.order_col), "%s", oc.text);
+        ASTExpr oc;
+        memset(&oc, 0, sizeof(oc));
+        parse_column_ref(ps, &oc);
+        if (oc.table_name[0])
+            snprintf(n->select_stmt.order_col, sizeof(n->select_stmt.order_col), "%s.%s", oc.table_name, oc.col_name);
+        else
+            snprintf(n->select_stmt.order_col, sizeof(n->select_stmt.order_col), "%s", oc.col_name);
         n->select_stmt.order_asc = true;
         if (match(ps, TOK_DESC)) n->select_stmt.order_asc = false;
     }

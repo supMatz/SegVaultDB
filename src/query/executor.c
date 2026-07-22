@@ -85,6 +85,38 @@ typedef struct {
 
 static SortCtx g_sort_ctx;
 
+typedef struct {
+    Row* rows;
+    int sort_col;
+    bool order_asc;
+} SortRowCtx;
+
+static SortRowCtx g_sort_rows;
+
+static int row_compare_cells(const void* a, const void* b) {
+    const Row* ra = (const Row*)a;
+    const Row* rb = (const Row*)b;
+    int ci = g_sort_rows.sort_col;
+    if (ci < 0 || ci >= ra->num_cells || ci >= rb->num_cells) return 0;
+    const Cell* ca = &ra->cells[ci];
+    const Cell* cb = &rb->cells[ci];
+    if (ca->is_null && cb->is_null) return 0;
+    if (ca->is_null) return g_sort_rows.order_asc ? -1 : 1;
+    if (cb->is_null) return g_sort_rows.order_asc ? 1 : -1;
+    const char* sa = ca->value ? ca->value : "";
+    const char* sb = cb->value ? cb->value : "";
+    int cmp = strcmp(sa, sb);
+    // Try numeric comparison if both look like numbers
+    char* ea = NULL; char* eb = NULL;
+    double da = strtod(sa, &ea);
+    double db = strtod(sb, &eb);
+    if (ea && *ea == '\0' && eb && *eb == '\0') {
+        double diff = da - db;
+        cmp = (diff > 0) ? 1 : (diff < 0) ? -1 : 0;
+    }
+    return g_sort_rows.order_asc ? cmp : -cmp;
+}
+
 static int row_compare(const void* a, const void* b) {
     int ia = *(int*)a;
     int ib = *(int*)b;
@@ -553,65 +585,81 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
     HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
     if (!hf) return result_error_msg("Failed to open heap");
 
-    int affected = 0;
-    HeapScan* scan = heap_scan_open(hf, ts);
-    if (!scan) { free(hf); return result_error_msg("Failed to scan"); }
-
-    RID rid;
-    Tuple* t;
-    while ((t = heap_scan_next(scan, &rid)) != NULL) {
-        if (eval_where(n->update_stmt.where, t, ts)) {
-            // Capture before-image for WAL
-            uint8_t* old_serial = NULL;
-            uint32_t old_serial_len = 0;
-            if (ctx->wal) {
-                size_t slen;
-                old_serial = tuple_serialize(t, ts, &slen);
-                old_serial_len = (uint32_t)slen;
+    // First pass: collect matching RIDs (avoid heap_update infinite loop)
+    RID* match_rids = NULL;
+    int num_match = 0, cap_match = 0;
+    {
+        HeapScan* scan = heap_scan_open(hf, ts);
+        if (!scan) { free(hf); return result_error_msg("Failed to scan"); }
+        RID rid;
+        Tuple* t;
+        while ((t = heap_scan_next(scan, &rid)) != NULL) {
+            if (eval_where(n->update_stmt.where, t, ts)) {
+                if (num_match >= cap_match) {
+                    cap_match = cap_match ? cap_match * 2 : 64;
+                    match_rids = realloc(match_rids, cap_match * sizeof(RID));
+                }
+                match_rids[num_match++] = rid;
             }
-
-            int ci = catalog_get_col_index(ts, n->update_stmt.set_col);
-            if (ci >= 0) {
-                Value* v = &t->values[ci];
-                v->is_null = false;
-                if (n->update_stmt.set_expr->type == EXPR_INT)
-                    v->int_val = (int32_t)n->update_stmt.set_expr->int_val;
-                else if (n->update_stmt.set_expr->type == EXPR_FLOAT)
-                    v->float_val = n->update_stmt.set_expr->float_val;
-                else if (n->update_stmt.set_expr->type == EXPR_STRING) {
-                    if (v->str_val) free(v->str_val);
-                    v->str_val = strdup(n->update_stmt.set_expr->str_val);
-                }
-                heap_update(hf, rid, t, ts);
-                // Write WAL entry with before/after images
-                if (ctx->wal && old_serial) {
-                    size_t new_len;
-                    uint8_t* new_serial = tuple_serialize(t, ts, &new_len);
-                    if (new_serial) {
-                        wal_write(ctx->wal, LOG_UPDATE, ctx->tx_id, rid.page_id,
-                                  (SVRID){rid.page_id, rid.slot_id},
-                                  new_serial, (uint32_t)new_len, old_serial, old_serial_len);
-                        free(new_serial);
-                    }
-                }
-                // Update indexes
-                for (int idx_i = 0; idx_i < ts->num_indexes; idx_i++) {
-                    if (ts->indexes[idx_i].root_page_id > 0) {
-                        BTree* bt = btree_open(ctx->bp, ts->indexes[idx_i].root_page_id);
-                        if (bt) {
-                            uint64_t key = (uint64_t)v->int_val;
-                            btree_insert(bt, key, (BTreeValue){rid.page_id, rid.slot_id});
-                            free(bt);
-                        }
-                    }
-                }
-                affected++;
-            }
-            free(old_serial);
+            tuple_free(t);
         }
+        heap_scan_close(scan);
+    }
+
+    // Second pass: update each matched row
+    int affected = 0;
+    for (int i = 0; i < num_match; i++) {
+        Tuple* t = heap_get(hf, match_rids[i], ts);
+        if (!t) continue;
+
+        uint8_t* old_serial = NULL;
+        uint32_t old_serial_len = 0;
+        if (ctx->wal) {
+            size_t slen;
+            old_serial = tuple_serialize(t, ts, &slen);
+            old_serial_len = (uint32_t)slen;
+        }
+
+        int ci = catalog_get_col_index(ts, n->update_stmt.set_col);
+        if (ci >= 0) {
+            Value* v = &t->values[ci];
+            v->is_null = false;
+            if (n->update_stmt.set_expr->type == EXPR_INT)
+                v->int_val = (int32_t)n->update_stmt.set_expr->int_val;
+            else if (n->update_stmt.set_expr->type == EXPR_FLOAT)
+                v->float_val = n->update_stmt.set_expr->float_val;
+            else if (n->update_stmt.set_expr->type == EXPR_STRING) {
+                if (v->str_val) free(v->str_val);
+                v->str_val = strdup(n->update_stmt.set_expr->str_val);
+            }
+            heap_update(hf, match_rids[i], t, ts);
+            if (ctx->wal && old_serial) {
+                size_t new_len;
+                uint8_t* new_serial = tuple_serialize(t, ts, &new_len);
+                if (new_serial) {
+                    wal_write(ctx->wal, LOG_UPDATE, ctx->tx_id, match_rids[i].page_id,
+                              (SVRID){match_rids[i].page_id, match_rids[i].slot_id},
+                              new_serial, (uint32_t)new_len, old_serial, old_serial_len);
+                    free(new_serial);
+                }
+            }
+            for (int idx_i = 0; idx_i < ts->num_indexes; idx_i++) {
+                if (ts->indexes[idx_i].root_page_id > 0) {
+                    BTree* bt = btree_open(ctx->bp, ts->indexes[idx_i].root_page_id);
+                    if (bt) {
+                        uint64_t key = (uint64_t)v->int_val;
+                        btree_insert(bt, key, (BTreeValue){match_rids[i].page_id, match_rids[i].slot_id});
+                        free(bt);
+                    }
+                }
+            }
+            affected++;
+        }
+        free(old_serial);
         tuple_free(t);
     }
-    heap_scan_close(scan);
+
+    free(match_rids);
     free(hf);
     return result_ok_msg(affected);
 }
@@ -626,44 +674,61 @@ static QueryResult* exec_delete(ExecCtx* ctx, ASTNode* n) {
     HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
     if (!hf) return result_error_msg("Failed to open heap");
 
-    int affected = 0;
-    HeapScan* scan = heap_scan_open(hf, ts);
-    if (!scan) { free(hf); return result_error_msg("Failed to scan"); }
+    // First pass: collect matching RIDs
+    RID* match_rids = NULL;
+    int num_match = 0, cap_match = 0;
+    {
+        HeapScan* scan = heap_scan_open(hf, ts);
+        if (!scan) { free(hf); return result_error_msg("Failed to scan"); }
+        RID rid;
+        Tuple* t;
+        while ((t = heap_scan_next(scan, &rid)) != NULL) {
+            if (eval_where(n->delete_stmt.where, t, ts)) {
+                if (num_match >= cap_match) {
+                    cap_match = cap_match ? cap_match * 2 : 64;
+                    match_rids = realloc(match_rids, cap_match * sizeof(RID));
+                }
+                match_rids[num_match++] = rid;
+            }
+            tuple_free(t);
+        }
+        heap_scan_close(scan);
+    }
 
-    RID rid;
-    Tuple* t;
-    while ((t = heap_scan_next(scan, &rid)) != NULL) {
-        if (eval_where(n->delete_stmt.where, t, ts)) {
-            // Remove from indexes
-            for (int i = 0; i < ts->num_indexes; i++) {
-                if (ts->indexes[i].root_page_id > 0) {
-                    int ci = catalog_get_col_index(ts, ts->indexes[i].col_name);
-                    if (ci >= 0 && !t->values[ci].is_null) {
-                        BTree* bt = btree_open(ctx->bp, ts->indexes[i].root_page_id);
-                        if (bt) {
-                            btree_delete(bt, (uint64_t)t->values[ci].int_val);
-                            free(bt);
-                        }
+    // Second pass: delete each matched row
+    int affected = 0;
+    for (int i = 0; i < num_match; i++) {
+        Tuple* t = heap_get(hf, match_rids[i], ts);
+        if (!t) continue;
+
+        for (int idx_i = 0; idx_i < ts->num_indexes; idx_i++) {
+            if (ts->indexes[idx_i].root_page_id > 0) {
+                int ci = catalog_get_col_index(ts, ts->indexes[idx_i].col_name);
+                if (ci >= 0 && !t->values[ci].is_null) {
+                    BTree* bt = btree_open(ctx->bp, ts->indexes[idx_i].root_page_id);
+                    if (bt) {
+                        btree_delete(bt, (uint64_t)t->values[ci].int_val);
+                        free(bt);
                     }
                 }
             }
-            // Write WAL before-image
-            if (ctx->wal) {
-                size_t serial_len;
-                uint8_t* serial = tuple_serialize(t, ts, &serial_len);
-                if (serial) {
-                    wal_write(ctx->wal, LOG_DELETE, ctx->tx_id, rid.page_id,
-                              (SVRID){rid.page_id, rid.slot_id}, NULL, 0, serial, (uint32_t)serial_len);
-                    free(serial);
-                }
-            }
-            heap_delete(hf, rid);
-            ts->num_rows--;
-            affected++;
         }
+        if (ctx->wal) {
+            size_t serial_len;
+            uint8_t* serial = tuple_serialize(t, ts, &serial_len);
+            if (serial) {
+                wal_write(ctx->wal, LOG_DELETE, ctx->tx_id, match_rids[i].page_id,
+                          (SVRID){match_rids[i].page_id, match_rids[i].slot_id}, NULL, 0, serial, (uint32_t)serial_len);
+                free(serial);
+            }
+        }
+        heap_delete(hf, match_rids[i]);
+        ts->num_rows--;
+        affected++;
         tuple_free(t);
     }
-    heap_scan_close(scan);
+
+    free(match_rids);
     free(hf);
     return result_ok_msg(affected);
 }
@@ -1094,6 +1159,33 @@ static QueryResult* exec_join(ExecCtx* ctx, ASTNode* n) {
         }
     }
 
+    // ORDER BY for JOIN
+    if (n->select_stmt.order_col[0] && r->num_rows > 0) {
+        int sort_col = -1;
+        for (int i = 0; i < out_cols; i++) {
+            const char* dot = strchr(r->col_names[i], '.');
+            if (strcmp(r->col_names[i], n->select_stmt.order_col) == 0 ||
+                (dot && strcmp(dot + 1, n->select_stmt.order_col) == 0)) {
+                sort_col = i;
+                break;
+            }
+        }
+        if (sort_col >= 0) {
+            g_sort_rows.rows = r->rows;
+            g_sort_rows.sort_col = sort_col;
+            g_sort_rows.order_asc = n->select_stmt.order_asc;
+            qsort(r->rows, r->num_rows, sizeof(Row), row_compare_cells);
+        }
+    }
+
+    // LIMIT for JOIN
+    if (n->select_stmt.limit > 0 && r->num_rows > n->select_stmt.limit) {
+        for (int i = n->select_stmt.limit; i < r->num_rows; i++)
+            free(r->rows[i].cells);
+        r->num_rows = n->select_stmt.limit;
+        r->rows = realloc(r->rows, r->num_rows * sizeof(Row));
+    }
+
     for (int i = 0; i < n1; i++) tuple_free(rows1[i]);
     for (int i = 0; i < n2; i++) tuple_free(rows2[i]);
     free(rows1); free(rows2);
@@ -1122,29 +1214,123 @@ static QueryResult* exec_group_by(ExecCtx* ctx, ASTNode* n) {
     }
     heap_scan_close(scan); free(hf);
 
-    /* GROUP BY not fully implemented - returning all rows as simple select */
-    QueryResult* r = calloc(1, sizeof(QueryResult));
-    r->success = true;
     int out_cols = n->select_stmt.num_cols > 0 ? n->select_stmt.num_cols : ts->num_columns;
-    r->num_cols = out_cols;
-    r->col_names = calloc(out_cols, sizeof(char*));
-    for (int i = 0; i < out_cols && i < ts->num_columns; i++)
-        r->col_names[i] = strdup(ts->columns[i].name);
-    r->rows = calloc(num_rows, sizeof(Row));
-    int out = 0;
+    if (out_cols < 1) out_cols = ts->num_columns;
+
+    // Apply WHERE and convert Tuples to Rows
+    Row* all_rows = NULL;
+    int total = 0;
+    Tuple** filtered = NULL;
+    int nf = 0;
     for (int i = 0; i < num_rows; i++) {
         if (!eval_where(n->select_stmt.where, rows[i], ts)) { tuple_free(rows[i]); continue; }
-        Row* row = &r->rows[out++];
+        filtered = realloc(filtered, (nf + 1) * sizeof(Tuple*));
+        filtered[nf++] = rows[i];
+    }
+
+    // Build groups: each group is a set of rows sharing the same GROUP BY column values
+    int ng = 0;
+    int* group_size = NULL;
+    int** group_rows = NULL;
+
+    for (int i = 0; i < nf; i++) {
+        // Find matching group
+        int gi = -1;
+        for (int g = 0; g < ng; g++) {
+            bool match = true;
+            for (int k = 0; k < n->select_stmt.num_group_cols; k++) {
+                const char* gc_name = n->select_stmt.group_cols[k];
+                const char* dot = strchr(gc_name, '.');
+                if (dot) gc_name = dot + 1;
+                int col_idx = catalog_get_col_index(ts, gc_name);
+                if (col_idx < 0) continue;
+                // Compare group key using first row of group vs current row
+                Tuple* first = filtered[group_rows[g][0]];
+                if (first->values[col_idx].is_null != filtered[i]->values[col_idx].is_null) { match = false; break; }
+                if (!first->values[col_idx].is_null) {
+                    Value* va = &first->values[col_idx];
+                    Value* vb = &filtered[i]->values[col_idx];
+                    if (ts->columns[col_idx].type == SV_TYPE_INT || ts->columns[col_idx].type == SV_TYPE_BIGINT) {
+                        if (va->int_val != vb->int_val) { match = false; break; }
+                    } else if (ts->columns[col_idx].type == SV_TYPE_FLOAT) {
+                        if (va->float_val != vb->float_val) { match = false; break; }
+                    } else {
+                        const char* sa = va->str_val ? va->str_val : "";
+                        const char* sb = vb->str_val ? vb->str_val : "";
+                        if (strcmp(sa, sb) != 0) { match = false; break; }
+                    }
+                }
+            }
+            if (match) { gi = g; break; }
+        }
+
+        if (gi < 0) {
+            gi = ng++;
+            group_size = realloc(group_size, ng * sizeof(int));
+            group_rows = realloc(group_rows, ng * sizeof(int*));
+            group_size[gi] = 0;
+            group_rows[gi] = NULL;
+        }
+
+        group_size[gi]++;
+        group_rows[gi] = realloc(group_rows[gi], group_size[gi] * sizeof(int));
+        group_rows[gi][group_size[gi] - 1] = i;
+    }
+
+    // Build column map from SELECT column references
+    int* col_map = NULL;
+    bool output_all = false;
+    if (n->select_stmt.num_cols == 0) {
+        output_all = true;
+    } else if (n->select_stmt.num_cols == 1 && n->select_stmt.columns[0]->type == EXPR_STAR) {
+        output_all = true;
+    } else {
+        col_map = malloc(n->select_stmt.num_cols * sizeof(int));
+        for (int i = 0; i < n->select_stmt.num_cols; i++) {
+            if (n->select_stmt.columns[i]->type == EXPR_COLUMN) {
+                col_map[i] = catalog_get_col_index(ts, n->select_stmt.columns[i]->col_name);
+            } else {
+                col_map[i] = -1;
+            }
+        }
+    }
+
+    // Build result: one row per group
+    QueryResult* r = calloc(1, sizeof(QueryResult));
+    r->success = true;
+    r->num_cols = out_cols;
+    r->col_names = calloc(out_cols + 1, sizeof(char*));
+    for (int i = 0; i < out_cols; i++) {
+        int ci = output_all ? i : (col_map ? col_map[i] : -1);
+        if (ci >= 0 && ci < ts->num_columns)
+            r->col_names[i] = strdup(ts->columns[ci].name);
+        else
+            r->col_names[i] = strdup("?");
+    }
+    r->rows = calloc(ng > 0 ? ng : 1, sizeof(Row));
+    r->num_rows = ng;
+
+    for (int g = 0; g < ng; g++) {
+        Row* row = &r->rows[g];
         row->num_cells = out_cols;
         row->cells = calloc(out_cols, sizeof(Cell));
-        for (int j = 0; j < out_cols && j < rows[i]->num_values; j++) {
-            Value* v = &rows[i]->values[j];
-            if (!v->is_null) value_to_string(v, ts->columns[j].type, row->cells[j].value, sizeof(row->cells[j].value));
-            else snprintf(row->cells[j].value, sizeof(row->cells[j].value), "NULL");
+        int first_i = group_rows[g][0];
+        for (int j = 0; j < out_cols; j++) {
+            int ci = output_all ? j : (col_map ? col_map[j] : -1);
+            if (ci >= 0 && ci < filtered[first_i]->num_values) {
+                Value* v = &filtered[first_i]->values[ci];
+                if (!v->is_null) value_to_string(v, ts->columns[ci].type, row->cells[j].value, sizeof(row->cells[j].value));
+                else snprintf(row->cells[j].value, sizeof(row->cells[j].value), "NULL");
+            }
         }
-        tuple_free(rows[i]);
     }
-    r->num_rows = out;
+
+    free(col_map);
+
+    // Cleanup
+    for (int i = 0; i < nf; i++) tuple_free(filtered[i]);
+    for (int i = 0; i < ng; i++) free(group_rows[i]);
+    free(group_rows); free(group_size); free(filtered);
     free(rows);
     return r;
 }
