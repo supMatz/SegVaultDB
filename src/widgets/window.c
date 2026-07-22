@@ -189,7 +189,7 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
     app->editor_scroll = scrollbar_create(0, 0, 0, 0, SCROLLBAR_VERTICAL);
 
     // -- status bar --
-    app->lbl_status = label_create(0, 0, 0, 0, "Pronto", 12, (Color){150, 150, 160, 255});
+    app->lbl_status = label_create(0, 0, 0, 0, "Ready", 12, (Color){150, 150, 160, 255});
 
     // -- risultati --
     app->results = table_view_create(0, 0, 0, 0);

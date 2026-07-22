@@ -41,7 +41,7 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
 
     if(!tv->result || !tv->result->success || tv->result->num_cols == 0) {
         // nessun risultato mostro messaggio
-        platform_draw_text(win, "Nessun risultato", (Point){b.x + 10, b.y + b.h / 2 - 7}, (Color) {100, 100, 110, 255} , tv->font_size);
+        platform_draw_text(win, "No Results", (Point){b.x + 10, b.y + b.h / 2 - 7}, (Color) {100, 100, 110, 255} , tv->font_size);
         return;
     }
 

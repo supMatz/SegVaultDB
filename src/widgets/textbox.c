@@ -2,6 +2,7 @@
 
 #include "textbox.h"
 #include "widget.h"
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 

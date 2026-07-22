@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
        if (got_event) app_window_draw(app);
     }
 
-    printf("[SegVault] Chiusura in corso...\n");
+    printf("[SegVault] Closing...\n");
 
     // shutdown in ordine inverso all'inizializzazione //
     app_window_destroy(app);
