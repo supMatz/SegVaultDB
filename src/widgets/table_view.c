@@ -1,6 +1,37 @@
 #include "table_view.h"
 #include <string.h>
 
+
+// stima la larghezza in pixel di una stringa per un dato font. sarebbe da fare un platform_text_width() per il pixel perfect!
+static int measure_text_width(const char* text, int font_size) {
+    if (!text) return 0;
+    return (int)(strlen(text) * font_size * 0.6f);
+}
+
+static void draw_clipped_text(PlatformWindow* win, const char* text, Point pos, Color col, int font_size, int max_width) {
+    if (measure_text_width(text, font_size) <= max_width) {
+        platform_draw_text(win, text, pos, col, font_size);
+        return;
+    }
+
+    char buf[256];
+    size_t len = strlen(text);
+    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+    memcpy(buf, text, len);
+    buf[len] = '\0';
+
+    while (len > 3 && measure_text_width(buf, font_size) > max_width) {
+        len--;
+        buf[len] = '\0';
+    }
+    if (len > 3) {
+        buf[len - 1] = '.';
+        buf[len - 2] = '.';
+        buf[len - 3] = '.';
+    }
+    platform_draw_text(win, buf, pos, col, font_size);
+}
+
 static void table_view_draw(Widget* self, PlatformWindow* win) {
     TableView* tv = (TableView*)self;
     Rect b = self->bounds; // bordi
@@ -22,26 +53,26 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
 
     for(int c = 0; c < r->num_cols; c++) {
         int cw = tv->col_widths[c];
-        
+
         platform_draw_text(
-            win, 
-            r->col_names[c], 
-            (Point) {cx + 6, b.y + (TABLE_VIEW_HEADER_H - tv->font_size) / 2 + 1}, 
+            win,
+            r->col_names[c],
+            (Point) {cx + 6, b.y + (TABLE_VIEW_HEADER_H - tv->font_size) / 2 + 1},
             tv->color_header_text,
             tv->font_size
-        );       
+        );
 
         platform_draw_line(
-            win, (Point){cx + cw, b.y}, 
-            (Point){cx + cw, b.y + TABLE_VIEW_HEADER_H}, 
-            tv->color_border, 
+            win, (Point){cx + cw, b.y},
+            (Point){cx + cw, b.y + TABLE_VIEW_HEADER_H},
+            tv->color_border,
             1
         );
         cx += cw;
     }
 
     platform_draw_line(
-        win, 
+        win,
         (Point) {b.x, b.y + TABLE_VIEW_HEADER_H},
         (Point) {b.x + b.w, b.y + TABLE_VIEW_HEADER_H},
         tv->color_border,
@@ -73,9 +104,10 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
             Color tc = cell->is_null ? tv->color_text_null : tv->color_text;
             const char* val = cell->is_null ? "NULL" : cell->value;
 
-            platform_draw_text(win, val,
+            draw_clipped_text(win, val,
                 (Point){cx + 6, ry + (TABLE_VIEW_ROW_H - tv->font_size) / 2},
-                tc, tv->font_size
+                tc, tv->font_size,
+                cw - 12 // padding sx+dx
             );
 
             platform_draw_line(win,
@@ -95,11 +127,11 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
 
     platform_draw_rect(win, b, tv->color_border, 1);
 }
- 
+
 static bool table_view_handle_event(Widget* self, sEvent* evt) {
     TableView* tv = (TableView*)self;
     if (!tv->result) return false;
- 
+
     switch (evt->type) {
         case EVT_MOUSE_DOWN:
             if (!widget_contains_point(self, evt->mouse_x, evt->mouse_y))
@@ -117,19 +149,19 @@ static bool table_view_handle_event(Widget* self, sEvent* evt) {
                 }
             }
             return true;
- 
+
         default:
             break;
     }
     return false;
 }
- 
+
 static void table_view_destroy_fn(Widget* self) { (void)self; }
- 
+
 TableView* table_view_create(int x, int y, int w, int h) {
     TableView* tv = SV_ALLOC(TableView);
     if (!tv) return NULL;
- 
+
     tv->base.type         = WIDGET_TABLE_VIEW;
     tv->base.state        = WIDGET_STATE_NORMAL;
     tv->base.bounds       = (Rect){x, y, w, h};
@@ -138,7 +170,7 @@ TableView* table_view_create(int x, int y, int w, int h) {
     tv->base.draw         = table_view_draw;
     tv->base.handle_event = table_view_handle_event;
     tv->base.destroy      = table_view_destroy_fn;
- 
+
     tv->result       = NULL;
     tv->selected_row = -1;
     tv->sort_col     = -1;
@@ -146,11 +178,11 @@ TableView* table_view_create(int x, int y, int w, int h) {
     tv->scroll_x     = 0;
     tv->scroll_y     = 0;
     tv->font_size    = 13;
- 
+
     // larghezza default colonne
     for (int i = 0; i < TABLE_VIEW_MAX_COLS; i++)
         tv->col_widths[i] = 120;
- 
+
     // colori (tema Obsidian)
     tv->color_header_bg    = (Color){38,  38,  45,  255};
     tv->color_header_text  = (Color){180, 180, 200, 255};
@@ -160,33 +192,43 @@ TableView* table_view_create(int x, int y, int w, int h) {
     tv->color_text         = (Color){212, 212, 212, 255};
     tv->color_text_null    = (Color){100, 100, 130, 255};
     tv->color_border       = (Color){50,  50,  60,  255};
- 
+
     return tv;
 }
- 
+
 void table_view_set_result(TableView* tv, QueryResult* result) {
     if (!tv) return;
     tv->result       = result;
     tv->selected_row = -1;
     tv->scroll_x     = 0;
     tv->scroll_y     = 0;
- 
-    // auto-dimensiona colonne in base al nome della colonna
+
     if (result && result->success) {
         for (int c = 0; c < result->num_cols && c < TABLE_VIEW_MAX_COLS; c++) {
-            int name_len = strlen(result->col_names[c]);
-            // msinimo 80px, massimo 300px
-            tv->col_widths[c] = SV_CLAMP(name_len * 9 + 20, 80, 300);
+            // punto di partenza: larghezza del nome colonna
+            int max_w = measure_text_width(result->col_names[c], tv->font_size);
+
+            // scansiona i valori della colonna e trova il piu' largo
+            int rows_to_scan = SV_MIN(result->num_rows, TABLE_VIEW_AUTOSIZE_SCAN_LIMIT);
+            for (int row = 0; row < rows_to_scan; row++) {
+                Cell* cell = &result->rows[row].cells[c];
+                const char* val = cell->is_null ? "NULL" : cell->value;
+                int w = measure_text_width(val, tv->font_size);
+                if (w > max_w) max_w = w;
+            }
+
+            // padding: 6px margine sx (come nel draw) + un po' di respiro
+            tv->col_widths[c] = SV_CLAMP(max_w + 20, 80, 400);
         }
     }
 }
- 
+
 void table_view_clear(TableView* tv) {
     if (!tv) return;
     tv->result       = NULL;
     tv->selected_row = -1;
 }
- 
+
 void table_view_scroll_to(TableView* tv, int row) {
     if (!tv) return;
     tv->scroll_y = SV_MAX(0, row);

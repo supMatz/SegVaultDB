@@ -1,4 +1,4 @@
-/* 
+/*
 SCOPO: griglia per mostrare i risultati delle query SQL.a
        Supporta: header colonne, scroll, selezione riga,
        ridimensionamento colonne, ordinamento.
@@ -13,6 +13,7 @@ SCOPO: griglia per mostrare i risultati delle query SQL.a
 #define TABLE_VIEW_MAX_COLS  64
 #define TABLE_VIEW_ROW_H     24 // altezza righe
 #define TABLE_VIEW_HEADER_H 28 //altezza header colonen
+#define TABLE_VIEW_AUTOSIZE_SCAN_LIMIT 500 // righe max da scansionare per l'autosize
 
 typedef struct {
     Widget base;
