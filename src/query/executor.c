@@ -860,6 +860,36 @@ static QueryResult* exec_explain(ExecCtx* ctx, ASTNode* n) {
     return r;
 }
 
+static int find_join_col(ASTExpr* col, TableSchema* ts1, TableSchema* ts2) {
+    if (col->table_name[0]) {
+        if (strcmp(col->table_name, ts1->name) == 0)
+            return catalog_get_col_index(ts1, col->col_name);
+        int ci = catalog_get_col_index(ts2, col->col_name);
+        return (ci >= 0) ? ci + ts1->num_columns : -1;
+    }
+    int ci = catalog_get_col_index(ts1, col->col_name);
+    if (ci >= 0) return ci;
+    ci = catalog_get_col_index(ts2, col->col_name);
+    return (ci >= 0) ? ci + ts1->num_columns : -1;
+}
+
+static bool eval_on_cond(ASTExpr* cond, Tuple* t1, Tuple* t2,
+                          TableSchema* ts1, TableSchema* ts2) {
+    if (!cond) return true;
+    int li = find_join_col(cond->left, ts1, ts2);
+    int ri = find_join_col(cond->right, ts1, ts2);
+    if (li < 0 || ri < 0) return true;
+    Value* lv = (li < ts1->num_columns) ? &t1->values[li] : &t2->values[li - ts1->num_columns];
+    Value* rv = (ri < ts1->num_columns) ? &t1->values[ri] : &t2->values[ri - ts1->num_columns];
+    if (lv->is_null || rv->is_null) return false;
+    char lbuf[64], rbuf[64];
+    DataType lt = (li < ts1->num_columns) ? ts1->columns[li].type : ts2->columns[li - ts1->num_columns].type;
+    DataType rt = (ri < ts1->num_columns) ? ts1->columns[ri].type : ts2->columns[ri - ts1->num_columns].type;
+    value_to_string(lv, lt, lbuf, sizeof(lbuf));
+    value_to_string(rv, rt, rbuf, sizeof(rbuf));
+    return strcmp(lbuf, rbuf) == 0;
+}
+
 static QueryResult* exec_join(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
@@ -875,7 +905,6 @@ static QueryResult* exec_join(ExecCtx* ctx, ASTNode* n) {
     TableSchema* ts2 = catalog_get_table(ctx->catalog, db->name, tables[1]);
     if (!ts1 || !ts2) return result_error_msg("Table not found in JOIN");
 
-    // Collect all rows from both tables
     HeapFile* hf1 = heap_open(ctx->bp, ts1->root_page_id, ts1->num_pages);
     HeapFile* hf2 = heap_open(ctx->bp, ts2->root_page_id, ts2->num_pages);
     if (!hf1 || !hf2) { free(hf1); free(hf2); return result_error_msg("Failed to open heap"); }
@@ -891,20 +920,60 @@ static QueryResult* exec_join(ExecCtx* ctx, ASTNode* n) {
     free(hf1); free(hf2);
 
     int total_cols = ts1->num_columns + ts2->num_columns;
-    int max_rows = n1 * n2;
 
+    // Determine output columns and map
+    int out_cols = n->select_stmt.num_cols;
+    int* col_map = NULL;
+    bool output_all = false;
+
+    if (out_cols == 0 || (out_cols == 1 && n->select_stmt.columns[0]->type == EXPR_STAR && !n->select_stmt.columns[0]->table_name[0])) {
+        output_all = true;
+        out_cols = total_cols;
+    } else if (out_cols == 1 && n->select_stmt.columns[0]->type == EXPR_STAR && n->select_stmt.columns[0]->table_name[0]) {
+        output_all = true;
+        out_cols = (strcmp(n->select_stmt.columns[0]->table_name, ts1->name) == 0) ? ts1->num_columns : ts2->num_columns;
+    } else {
+        col_map = malloc(out_cols * sizeof(int));
+        for (int i = 0; i < out_cols; i++) {
+            if (n->select_stmt.columns[i]->type == EXPR_STAR)
+                col_map[i] = -1;
+            else
+                col_map[i] = find_join_col(n->select_stmt.columns[i], ts1, ts2);
+        }
+    }
+
+    ASTExpr* on_cond = (n->select_stmt.num_joins > 0) ? n->select_stmt.joins[0].condition : NULL;
+
+    int max_rows = n1 * n2;
     QueryResult* r = calloc(1, sizeof(QueryResult));
     r->success = true;
-    r->num_cols = total_cols;
-    r->col_names = calloc(total_cols, sizeof(char*));
-    for (int i = 0; i < ts1->num_columns; i++) r->col_names[i] = strdup(ts1->columns[i].name);
-    for (int i = 0; i < ts2->num_columns; i++) r->col_names[ts1->num_columns + i] = strdup(ts2->columns[i].name);
+    r->num_cols = out_cols;
+    r->col_names = calloc(out_cols + 1, sizeof(char*));
 
-    r->rows = calloc(max_rows, sizeof(Row));
+    for (int i = 0; i < out_cols; i++) {
+        int ci = output_all ? i : (col_map ? col_map[i] : -1);
+        if (ci < 0) { r->col_names[i] = strdup("?"); continue; }
+        char buf[128];
+        if (ci < ts1->num_columns)
+            snprintf(buf, sizeof(buf), "%s.%s", ts1->name, ts1->columns[ci].name);
+        else
+            snprintf(buf, sizeof(buf), "%s.%s", ts2->name, ts2->columns[ci - ts1->num_columns].name);
+        r->col_names[i] = strdup(buf);
+    }
+
+    JoinType join_type = (n->select_stmt.num_joins > 0) ? n->select_stmt.joins[0].type : JOIN_INNER;
+    int max_alloc = (join_type == JOIN_LEFT) ? n1 * (n2 > 0 ? n2 : 1) : n1 * n2;
+    if (max_alloc < 1) max_alloc = 1;
+    r->rows = calloc(max_alloc, sizeof(Row));
     int out = 0;
 
+    bool nulls_used = false;
     for (int i = 0; i < n1; i++) {
+        bool matched = false;
         for (int j = 0; j < n2; j++) {
+            if (!eval_on_cond(on_cond, rows1[i], rows2[j], ts1, ts2)) continue;
+            matched = true;
+
             Row* row = &r->rows[out++];
             row->num_cells = total_cols;
             row->cells = calloc(total_cols, sizeof(Cell));
@@ -922,12 +991,113 @@ static QueryResult* exec_join(ExecCtx* ctx, ASTNode* n) {
                 else snprintf(row->cells[ci].value, sizeof(row->cells[ci].value), "NULL");
             }
         }
+        if (!matched && join_type == JOIN_LEFT) {
+            Row* row = &r->rows[out++];
+            row->num_cells = total_cols;
+            row->cells = calloc(total_cols, sizeof(Cell));
+            int ci = 0;
+            for (int k = 0; k < ts1->num_columns; k++, ci++) {
+                Value* v = &rows1[i]->values[k];
+                row->cells[ci].is_null = v->is_null;
+                if (!v->is_null) value_to_string(v, ts1->columns[k].type, row->cells[ci].value, sizeof(row->cells[ci].value));
+                else snprintf(row->cells[ci].value, sizeof(row->cells[ci].value), "NULL");
+            }
+            for (int k = 0; k < ts2->num_columns; k++, ci++) {
+                row->cells[ci].is_null = true;
+                snprintf(row->cells[ci].value, sizeof(row->cells[ci].value), "NULL");
+            }
+            nulls_used = true;
+        }
     }
     r->num_rows = out;
+
+    // Apply WHERE clause
+    if (n->select_stmt.where) {
+        int wi = 0;
+        for (int i = 0; i < out; i++) {
+            Row* row = &r->rows[i];
+            bool keep = true;
+            ASTExpr* w = n->select_stmt.where;
+            if (w->type == EXPR_BINARY) {
+                int li = find_join_col(w->left, ts1, ts2);
+                if (li >= 0 && li < row->num_cells) {
+                    if (w->right->type == EXPR_INT) {
+                        if (row->cells[li].is_null) { keep = false; }
+                        else {
+                            int64_t cv = atoll(row->cells[li].value);
+                            switch (w->op) {
+                                case OP_EQ: keep = (cv == w->right->int_val); break;
+                                case OP_NEQ: keep = (cv != w->right->int_val); break;
+                                case OP_LT: keep = (cv < w->right->int_val); break;
+                                case OP_GT: keep = (cv > w->right->int_val); break;
+                                case OP_LE: keep = (cv <= w->right->int_val); break;
+                                case OP_GE: keep = (cv >= w->right->int_val); break;
+                                default: keep = true;
+                            }
+                        }
+                    } else if (w->right->type == EXPR_FLOAT) {
+                        if (row->cells[li].is_null) { keep = false; }
+                        else {
+                            double cv = atof(row->cells[li].value);
+                            switch (w->op) {
+                                case OP_EQ: keep = (cv == w->right->float_val); break;
+                                case OP_NEQ: keep = (cv != w->right->float_val); break;
+                                case OP_LT: keep = (cv < w->right->float_val); break;
+                                case OP_GT: keep = (cv > w->right->float_val); break;
+                                case OP_LE: keep = (cv <= w->right->float_val); break;
+                                case OP_GE: keep = (cv >= w->right->float_val); break;
+                                default: keep = true;
+                            }
+                        }
+                    } else if (w->right->type == EXPR_STRING) {
+                        if (row->cells[li].is_null) { keep = false; }
+                        else {
+                            const char* rv = w->right->str_val;
+                            if (rv[0] == '\'' || rv[0] == '"') rv++;
+                            char buf[512]; snprintf(buf, sizeof(buf), "%s", rv);
+                            int blen = strlen(buf);
+                            if (blen > 0 && (buf[blen-1] == '\'' || buf[blen-1] == '"')) buf[blen-1] = '\0';
+                            if (w->op == OP_EQ) keep = (strcmp(row->cells[li].value, buf) == 0);
+                        }
+                    } else if (w->right->type == EXPR_COLUMN) {
+                        int ri = find_join_col(w->right, ts1, ts2);
+                        if (ri >= 0 && ri < row->num_cells) {
+                            if (row->cells[li].is_null || row->cells[ri].is_null) keep = false;
+                            else if (w->op == OP_EQ) keep = (strcmp(row->cells[li].value, row->cells[ri].value) == 0);
+                        }
+                    }
+                }
+            }
+            if (keep) {
+                if (wi != i) r->rows[wi] = r->rows[i];
+                wi++;
+            } else {
+                free(row->cells);
+            }
+        }
+        r->num_rows = wi;
+    }
+
+    // Apply column projection
+    if (!output_all && col_map) {
+        for (int i = 0; i < r->num_rows; i++) {
+            Row* row = &r->rows[i];
+            Cell* new_cells = calloc(out_cols, sizeof(Cell));
+            for (int j = 0; j < out_cols; j++) {
+                int ci = col_map[j];
+                if (ci >= 0 && ci < row->num_cells)
+                    new_cells[j] = row->cells[ci];
+            }
+            free(row->cells);
+            row->cells = new_cells;
+            row->num_cells = out_cols;
+        }
+    }
 
     for (int i = 0; i < n1; i++) tuple_free(rows1[i]);
     for (int i = 0; i < n2; i++) tuple_free(rows2[i]);
     free(rows1); free(rows2);
+    free(col_map);
     return r;
 }
 

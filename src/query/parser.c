@@ -32,6 +32,27 @@ static void add_stmt(ParserState* ps, ASTNode* stmt) {
 }
 
 static ASTNode* parse_select(ParserState* ps);
+static void parse_column_ref(ParserState* ps, ASTExpr* e) {
+    Token t = consume(ps);
+    if (t.type == TOK_STAR) {
+        e->type = EXPR_STAR;
+        return;
+    }
+    e->type = EXPR_COLUMN;
+    if (peek(ps).type == TOK_DOT) {
+        snprintf(e->table_name, sizeof(e->table_name), "%s", t.text);
+        consume(ps);
+        Token t2 = consume(ps);
+        if (t2.type == TOK_STAR) {
+            e->type = EXPR_STAR;
+        } else {
+            snprintf(e->col_name, sizeof(e->col_name), "%s", t2.text);
+        }
+    } else {
+        snprintf(e->col_name, sizeof(e->col_name), "%s", t.text);
+    }
+}
+
 static ASTNode* parse_create_trigger(ParserState* ps, ASTNode* n) {
     n->type = NODE_CREATE_TRIGGER;
     Token tg = consume(ps);
@@ -121,8 +142,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             if (match(ps, TOK_WHERE)) {
                 // Simple WHERE: identifier = value
                 ASTExpr* w = calloc(1, sizeof(ASTExpr));
-                Token wc = consume(ps);
-                w->type = EXPR_COLUMN; snprintf(w->col_name, sizeof(w->col_name), "%s", wc.text);
+                parse_column_ref(ps, w);
                 ASTExpr* we = calloc(1, sizeof(ASTExpr));
                 we->type = EXPR_BINARY; we->op = OP_EQ; we->left = w;
                 consume(ps); /* consume the = operator */
@@ -143,8 +163,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             snprintf(n->delete_stmt.table_name, sizeof(n->delete_stmt.table_name), "%s", tn.text);
             if (match(ps, TOK_WHERE)) {
                 ASTExpr* w = calloc(1, sizeof(ASTExpr));
-                Token wc = consume(ps);
-                w->type = EXPR_COLUMN; snprintf(w->col_name, sizeof(w->col_name), "%s", wc.text);
+                parse_column_ref(ps, w);
                 ASTExpr* we = calloc(1, sizeof(ASTExpr));
                 we->type = EXPR_BINARY; we->op = OP_EQ; we->left = w;
                 match(ps, TOK_EQ);
@@ -363,9 +382,7 @@ static ASTNode* parse_select(ParserState* ps) {
     n->select_stmt.num_cols = 0;
     while (peek(ps).type != TOK_FROM && peek(ps).type != TOK_EOF) {
         ASTExpr* e = calloc(1, sizeof(ASTExpr));
-        Token ct = consume(ps);
-        if (ct.type == TOK_STAR) { e->type = EXPR_STAR; }
-        else { e->type = EXPR_COLUMN; snprintf(e->col_name, sizeof(e->col_name), "%s", ct.text); }
+        parse_column_ref(ps, e);
         n->select_stmt.columns[n->select_stmt.num_cols++] = e;
         if (!match(ps, TOK_COMMA)) break;
     }
@@ -397,13 +414,11 @@ static ASTNode* parse_select(ParserState* ps) {
             j->type = JOIN_INNER;
             if (match(ps, TOK_ON)) {
                 ASTExpr* cond = calloc(1, sizeof(ASTExpr));
-                Token lc = consume(ps);
                 ASTExpr* left = calloc(1, sizeof(ASTExpr));
-                left->type = EXPR_COLUMN; snprintf(left->col_name, sizeof(left->col_name), "%s", lc.text);
+                parse_column_ref(ps, left);
                 match(ps, TOK_EQ);
-                Token rc = consume(ps);
                 ASTExpr* right = calloc(1, sizeof(ASTExpr));
-                right->type = EXPR_COLUMN; snprintf(right->col_name, sizeof(right->col_name), "%s", rc.text);
+                parse_column_ref(ps, right);
                 cond->type = EXPR_BINARY; cond->op = OP_EQ; cond->left = left; cond->right = right;
                 j->condition = cond;
             }
@@ -416,13 +431,11 @@ static ASTNode* parse_select(ParserState* ps) {
             j->type = JOIN_LEFT;
             if (match(ps, TOK_ON)) {
                 ASTExpr* cond = calloc(1, sizeof(ASTExpr));
-                Token lc = consume(ps);
                 ASTExpr* left = calloc(1, sizeof(ASTExpr));
-                left->type = EXPR_COLUMN; snprintf(left->col_name, sizeof(left->col_name), "%s", lc.text);
+                parse_column_ref(ps, left);
                 match(ps, TOK_EQ);
-                Token rc = consume(ps);
                 ASTExpr* right = calloc(1, sizeof(ASTExpr));
-                right->type = EXPR_COLUMN; snprintf(right->col_name, sizeof(right->col_name), "%s", rc.text);
+                parse_column_ref(ps, right);
                 cond->type = EXPR_BINARY; cond->op = OP_EQ; cond->left = left; cond->right = right;
                 j->condition = cond;
             }
@@ -435,9 +448,8 @@ static ASTNode* parse_select(ParserState* ps) {
     if (match(ps, TOK_WHERE)) {
         ASTExpr* w = calloc(1, sizeof(ASTExpr));
         w->type = EXPR_BINARY;
-        Token wc = consume(ps);
         ASTExpr* left = calloc(1, sizeof(ASTExpr));
-        left->type = EXPR_COLUMN; snprintf(left->col_name, sizeof(left->col_name), "%s", wc.text);
+        parse_column_ref(ps, left);
         w->left = left;
         if (match(ps, TOK_EQ)) w->op = OP_EQ;
         else if (match(ps, TOK_NEQ)) w->op = OP_NEQ;
@@ -447,11 +459,10 @@ static ASTNode* parse_select(ParserState* ps) {
         else if (match(ps, TOK_GE)) w->op = OP_GE;
         else w->op = OP_EQ;
         ASTExpr* right = calloc(1, sizeof(ASTExpr));
-        Token wv = consume(ps);
-        if (wv.type == TOK_INTEGER) { right->type = EXPR_INT; right->int_val = atoll(wv.text); }
-        else if (wv.type == TOK_FLOAT) { right->type = EXPR_FLOAT; right->float_val = atof(wv.text); }
-        else if (wv.type == TOK_STRING) { right->type = EXPR_STRING; snprintf(right->str_val, sizeof(right->str_val), "%s", wv.text); }
-        else { right->type = EXPR_COLUMN; snprintf(right->col_name, sizeof(right->col_name), "%s", wv.text); }
+        if (peek(ps).type == TOK_INTEGER) { Token v = consume(ps); right->type = EXPR_INT; right->int_val = atoll(v.text); }
+        else if (peek(ps).type == TOK_FLOAT) { Token v = consume(ps); right->type = EXPR_FLOAT; right->float_val = atof(v.text); }
+        else if (peek(ps).type == TOK_STRING) { Token v = consume(ps); right->type = EXPR_STRING; snprintf(right->str_val, sizeof(right->str_val), "%s", v.text); }
+        else { parse_column_ref(ps, right); }
         w->right = right;
         n->select_stmt.where = w;
     }
@@ -469,15 +480,13 @@ static ASTNode* parse_select(ParserState* ps) {
 
     if (match(ps, TOK_HAVING)) {
         ASTExpr* h = calloc(1, sizeof(ASTExpr));
-        Token hc = consume(ps);
         ASTExpr* left = calloc(1, sizeof(ASTExpr));
-        left->type = EXPR_COLUMN; snprintf(left->col_name, sizeof(left->col_name), "%s", hc.text);
+        parse_column_ref(ps, left);
         h->type = EXPR_BINARY; h->left = left;
         match(ps, TOK_EQ);
         ASTExpr* right = calloc(1, sizeof(ASTExpr));
-        Token hv = consume(ps);
-        if (hv.type == TOK_INTEGER) { right->type = EXPR_INT; right->int_val = atoll(hv.text); }
-        else { right->type = EXPR_COLUMN; snprintf(right->col_name, sizeof(right->col_name), "%s", hv.text); }
+        if (peek(ps).type == TOK_INTEGER) { Token v = consume(ps); right->type = EXPR_INT; right->int_val = atoll(v.text); }
+        else { parse_column_ref(ps, right); }
         h->op = OP_EQ; h->right = right;
         n->select_stmt.having = h;
     }
