@@ -1,4 +1,4 @@
-/* 
+/*
 SCOPO: Implementa platform.h usando le API native Windows.
        Compilato SOLO su Windows (vedi Makefile).
        Usa GDI (Graphics Device Interface) per il disegno.
@@ -81,6 +81,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
 
         case WM_CHAR:
+            // Ignora i caratteri di controllo (backspace, tab, invio, escape...):
+            // Windows li genera automaticamente anche per i tasti già gestiti
+            // in WM_KEYDOWN (VK_BACK, VK_RETURN, ecc). Se non li filtriamo qui,
+            // sovrascrivono l'evento KEY_DOWN corretto nello stesso ciclo di
+            // PeekMessage, perché pending_evt ha un solo slot.
+            if (wp < 0x20 || wp == 0x7F) break;
+
             // carattere unicode digitato (per le textbox SQL)
             g_win->pending_evt.type      = EVT_CHAR;
             g_win->pending_evt.character = (uint32_t)wp;
@@ -96,14 +103,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_win->hbm_mem) DeleteObject(g_win->hbm_mem);
 
             g_win->hbm_mem = CreateCompatibleBitmap(g_win->hdc, g_win->width, g_win->height);
-            
+
             SelectObject(g_win->hdc_mem, g_win->hbm_mem);
-            
+
             g_win->pending_evt.type       = EVT_RESIZE;
             g_win->pending_evt.new_width  = g_win->width;
             g_win->pending_evt.new_height = g_win->height;
             g_win->has_event = true;
-            
+
             break;
 
         default:
@@ -119,7 +126,7 @@ bool platform_init(void) {
 
 PlatformWindow* platform_window_create(const char* title, int w, int h) {
     PlatformWindow* win = calloc(1, sizeof(PlatformWindow));
-    
+
     win->width  = w;
     win->height = h;
     g_win = win;
@@ -158,7 +165,7 @@ void platform_window_show(PlatformWindow* win) {
 
 bool platform_poll_event(PlatformWindow* win, sEvent* evt) {
     MsgWaitForMultipleObjects(0, NULL, FALSE, 16, QS_ALLINPUT); // aspetta un messaggio invece di girare a vuoto
-    
+
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);

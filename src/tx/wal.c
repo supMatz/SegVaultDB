@@ -123,7 +123,8 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
         off_t    offset; // unused but kept for structure
     } LogEntry;
 
-    LogEntry entries[MAX_ENTRIES];
+    LogEntry* entries = calloc(MAX_ENTRIES, sizeof(LogEntry));
+    if (!entries) { close(log_fd); close(db_fd); return SV_ERR; }
     int num_entries = 0;
 
     uint64_t active_tx[64];
@@ -198,8 +199,9 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
         free(entries[i].data);
         free(entries[i].old_data);
     }
+    free(entries);
 
-    sv_close(db_fd);
+    close(db_fd);
     remove(log_path);
     return SV_OK;
 }
@@ -222,7 +224,8 @@ int wal_undo_tx(const char* log_path, const char* db_path, uint64_t tx_id) {
         uint8_t* old_data;
     } LogEntry;
 
-    LogEntry entries[MAX_ENTRIES];
+    LogEntry* entries = calloc(MAX_ENTRIES, sizeof(LogEntry));
+    if (!entries) { close(log_fd); close(db_fd); return SV_ERR; }
     int num_entries = 0;
 
     uint8_t hdr[23];
@@ -266,6 +269,7 @@ int wal_undo_tx(const char* log_path, const char* db_path, uint64_t tx_id) {
         free(e->old_data);
     }
 
+    free(entries);
     sv_close(db_fd);
     return SV_OK;
 }

@@ -54,7 +54,7 @@ static void textbox_insert_char(TextBox* tb, char c) {
     update_cursor_linecol(tb);
 }
 
-// tronca `src` in `dst` in modo che la sua larghezza in pixel non superi `max_px`. Aggiunge "…" se troncato. 
+// tronca `src` in `dst` in modo che la sua larghezza in pixel non superi `max_px`. Aggiunge "…" se troncato.
 // `win` serve per misurare la larghezza carattere per carattere.
 static void clip_text(PlatformWindow* win, const char* src, char* dst, size_t dst_cap, int max_px, int font_size) {
     int len = (int)strlen(src);
@@ -95,7 +95,7 @@ static void textbox_draw(Widget* self, PlatformWindow* win) {
 
     // Bordo: ciano se focused, grigio altrimenti
     platform_draw_rect(
-        win, 
+        win,
         b,
         self->state == WIDGET_STATE_FOCUSED ? (Color){100, 210, 255, 255} : (Color){70,  70,  80,  255},
         1);
@@ -207,6 +207,11 @@ static bool textbox_handle_event(Widget* self, sEvent* evt) {
 
         case EVT_CHAR:
             if (self->state != WIDGET_STATE_FOCUSED) return false;
+            // Ignora i caratteri di controllo (backspace, tab, invio, escape...):
+            // sono già gestiti da EVT_KEY_DOWN più sotto. Su Windows, WM_CHAR
+            // li manda comunque insieme al tasto, e se non li filtriamo finiscono
+            // inseriti come testo letterale (da qui il carattere strano "[?]").
+            if (evt->character < 0x20 || evt->character == 0x7F) return false;
             textbox_insert_char(tb, (char)evt->character);
             if (tb->on_change)
                 tb->on_change(tb->text, self->user_data);
