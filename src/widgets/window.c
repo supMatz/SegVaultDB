@@ -14,7 +14,7 @@ static void on_run_click(void* ud) {
 static void on_commit_click(void* ud) {
     AppWindow* app = (AppWindow*)ud;
     db_commit();
-    label_set_text(app->lbl_status, "COMMIT eseguito");
+    label_set_text(app->lbl_status, "COMMIT executed");
     // Aggiorna il nome DB in caso di cambio
     label_set_text(app->lbl_db_name, db_current_database()
                    ? db_current_database() : "(nessun DB)");
@@ -23,10 +23,10 @@ static void on_commit_click(void* ud) {
 static void on_rollback_click(void* ud) {
     AppWindow* app = (AppWindow*)ud;
     db_rollback();
-    label_set_text(app->lbl_status, "ROLLBACK eseguito");
+    label_set_text(app->lbl_status, "ROLLBACK executed");
 }
 
-// Callback dell'editor: Ctrl+Enter esegue la query
+// callback dell'editor: Ctrl+Enter esegue la query
 static void on_editor_execute(const char* text, void* ud) {
     (void)text;
     AppWindow* app = (AppWindow*)ud;
@@ -72,7 +72,7 @@ static void load_table_children(TreeNode* tbl_node) {
     db_columns_free(cols, ncols);
 }
 
-// Callback selezione nodo nell'albero
+// callback selezione nodo nell'albero
 static void on_tree_select(TreeNode* node, void* ud) {
     AppWindow* app = (AppWindow*)ud;
     if (!node) return;
@@ -97,9 +97,7 @@ static void on_tree_select(TreeNode* node, void* ud) {
     }
 }
 
-// -- layout helper --
-
-// Ricalcola la posizione e dimensione di tutti i widget in base alle dimensioni correnti della finestra
+// ricalcola la posizione e dimensione di tutti i widget in base alle dimensioni correnti della finestra
 static void layout_widgets(AppWindow* app) {
     int W = app->win_w;
     int H = app->win_h;
@@ -128,7 +126,7 @@ static void layout_widgets(AppWindow* app) {
 
     // editor SQL
     app->editor->base.bounds = (Rect){center_x, TOOLBAR_H, center_w - 12, editor_h};
-    
+
     app->editor_scroll->base.bounds = (Rect){W - 12, TOOLBAR_H, 12, editor_h};
 
     // status bar
@@ -185,7 +183,7 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
     app->editor->on_execute = on_editor_execute;
     textbox_set_text(app->editor,
         "-- SegVault SQL Editor\n"
-        "-- Premi \"Run Query\" per eseguire\n\n"
+        "-- Press \"Run Query\" to execute\n\n"
         "CREATE DATABASE test;\n");
 
     app->editor_scroll = scrollbar_create(0, 0, 0, 0, SCROLLBAR_VERTICAL);
@@ -195,9 +193,9 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
 
     // -- risultati --
     app->results = table_view_create(0, 0, 0, 0);
-    
+
     app->results_scroll_v = scrollbar_create(0, 0, 0, 0,SCROLLBAR_VERTICAL);
-    
+
     app->results_scroll_h = scrollbar_create(0, 0, 0, 0,SCROLLBAR_HORIZONTAL);
 
     // applica il layout iniziale
@@ -243,7 +241,7 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
     if (widget_handle_event((Widget*)app->editor,        evt)) return;
     if (widget_handle_event((Widget*)app->editor_scroll, evt)) return;
     if (widget_handle_event((Widget*)app->results,       evt)) return;
-    
+
     widget_handle_event((Widget*)app->results_scroll_v,  evt);
     widget_handle_event((Widget*)app->results_scroll_h,  evt);
 }
@@ -260,7 +258,7 @@ void app_window_draw(AppWindow* app) {
         (Rect){0, 0, app->win_w, TOOLBAR_H},
         (Color){28, 28, 34, 255}
     );
-    
+
     platform_draw_line(
         win,
         (Point){0, TOOLBAR_H},
@@ -336,18 +334,18 @@ void app_window_run_query(AppWindow* app) {
 
     char status[1024];
     if (!result) {
-        snprintf(status, sizeof(status), "Errore: risposta NULL");
+        snprintf(status, sizeof(status), "Error: response NULL");
     } else if (!result->success) {
-        snprintf(status, sizeof(status), "Errore: %.980s", result->error);
+        snprintf(status, sizeof(status), "Error: %.980s", result->error);
         label_set_color(app->lbl_status, (Color){220, 80, 80, 255});
     } else if (result->num_cols > 0) {
         snprintf(status, sizeof(status),
-                 "%d righe  |  %.1f ms  |  %d colonne",
+                 "%d rows  |  %.1f ms  |  %d columns",
                  result->num_rows, result->exec_time_ms, result->num_cols);
         label_set_color(app->lbl_status, (Color){150, 150, 160, 255});
     } else {
         snprintf(status, sizeof(status),
-                 "%d righe modificate  |  %.1f ms",
+                 "%d affected rows  |  %.1f ms",
                  result->rows_affected, result->exec_time_ms);
         label_set_color(app->lbl_status, (Color){80, 200, 120, 255});
     }
@@ -355,7 +353,7 @@ void app_window_run_query(AppWindow* app) {
 
     // aggiornamento nome DB (potrebbe essere cambiato con USE)
     const char* db = db_current_database();
-    label_set_text(app->lbl_db_name, db ? db : "(nessun DB)");
+    label_set_text(app->lbl_db_name, db ? db : "(no DB selected)");
 
     // ricarica l'albero se il DDL ha modificato la struttura
     if (result && result->success && result->num_cols == 0)

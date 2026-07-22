@@ -42,28 +42,28 @@ int main(int argc, char** argv) {
     #endif
 
     // -- inizializza il DB engine --
-    printf("[SegVault %s] Inizializzazione DB engine...\n", SV_VERSION_STR);
+    printf("[SegVault %s] DB engine initialization...\n", SV_VERSION_STR);
 
     if (!db_init(data_dir)) {
-        fprintf(stderr, "[ERRORE] Impossibile aprire '%s'\n", data_dir);
+        fprintf(stderr, "[ERROR] Impossible to open '%s'\n", data_dir);
         return 1;
     }
 
-    printf("[SegVault] DB engine pronto.\n");
+    printf("[SegVault] DB engine ready.\n");
 
     // -- inizializza il sistema grafico dell'OS --
     if (!platform_init()) {
-        fprintf(stderr, "[ERRORE] Impossibile inizializzare la GUI\n");
+        fprintf(stderr, "[ERROR] Impossible to initialize the GUI\n");
         db_shutdown();
         return 1;
     }
 
     // -- crea la finestra --
     PlatformWindow* win = platform_window_create(
-        SV_NAME " — SQL Client", INITIAL_W, INITIAL_H);
+        SV_NAME "- SQL Client", INITIAL_W, INITIAL_H);
 
     if (!win) {
-        fprintf(stderr, "[ERRORE] Impossibile creare la finestra\n");
+        fprintf(stderr, "[ERROR] Impossible to create the window\n");
         platform_shutdown();
         db_shutdown();
         return 1;
@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
     // -- crea il layout dell'applicazione --
     AppWindow* app = app_window_create(win, INITIAL_W, INITIAL_H);
     if (!app) {
-        fprintf(stderr, "[ERRORE] Impossibile creare il layout\n");
+        fprintf(stderr, "[ERRORE] Impossible to create the layout\n");
         platform_window_destroy(win);
         platform_shutdown();
         db_shutdown();
@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
     }
     app_window_resize(app, INITIAL_W, INITIAL_H);
 
-    printf("[SegVault] Avvio completato. Finestra aperta.\n");
+    printf("[SegVault] Started correctly. Window opened.\n");
 
     // loop principale //
     sEvent evt;
@@ -109,6 +109,6 @@ int main(int argc, char** argv) {
     platform_shutdown();
     db_shutdown();  // flush WAL + salva catalogo su disco
 
-    printf("[SegVault] Chiusura completata.\n");
+    printf("[SegVault] Closed correctly.\n");
     return 0;
 }
