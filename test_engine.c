@@ -42,6 +42,8 @@ int main() {
     test_sql("INSERT 3", "INSERT INTO users VALUES (3, 'Charlie', 35)", -1);
     test_sql("SELECT *", "SELECT * FROM users", 3);
     test_sql("WHERE", "SELECT * FROM users WHERE id = 1", 1);
+    test_sql("WHERE STR", "SELECT * FROM users WHERE name = 'Alice'", 1);
+    test_sql("WHERE QUAL STR", "SELECT * FROM users WHERE users.name = 'Alice'", 1);
     test_sql("ORDER BY DESC", "SELECT * FROM users ORDER BY age DESC", 3);
     test_sql("LIMIT", "SELECT * FROM users LIMIT 2", 2);
     test_sql("DISTINCT", "SELECT DISTINCT age FROM users", 3);
@@ -100,14 +102,17 @@ int main() {
     // LEFT JOIN
     test_sql("INSERT t4(1)", "INSERT INTO t1 VALUES (4)", -1);
     test_sql("LEFT JOIN", "SELECT * FROM t1 LEFT JOIN t3 ON t1.a = t3.d", 3);
+    test_sql("RIGHT JOIN", "SELECT * FROM t1 RIGHT JOIN t3 ON t1.a = t3.d", 3);
 
     // Qualified UPDATE/DELETE
     // ORDER BY and LIMIT with JOIN
     test_sql("JOIN ORDER BY", "SELECT t1.a, t3.c FROM t1 JOIN t3 ON t1.a = t3.d ORDER BY t1.a DESC", 2);
     test_sql("JOIN LIMIT", "SELECT t1.a, t3.c FROM t1 JOIN t3 ON t1.a = t3.d LIMIT 1", 1);
+    test_sql("JOIN DISTINCT", "SELECT DISTINCT t1.a FROM t1, t3", 3);
 
     // GROUP BY
     test_sql("GROUP BY", "SELECT age FROM people GROUP BY age", 4);
+    test_sql("HAVING", "SELECT age FROM people GROUP BY age HAVING age > 28", 2);
 
     test_sql("CREATE T4", "CREATE TABLE t4 (x INT, y INT)", -1);
     test_sql("INSERT t4(1,10)", "INSERT INTO t4 VALUES (1, 10)", -1);

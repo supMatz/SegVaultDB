@@ -1032,12 +1032,13 @@ static QueryResult* exec_join(ExecCtx* ctx, ASTNode* n) {
     r->rows = calloc(max_alloc, sizeof(Row));
     int out = 0;
 
-    bool nulls_used = false;
+    bool* right_matched = join_type == JOIN_RIGHT ? calloc(n2, sizeof(bool)) : NULL;
     for (int i = 0; i < n1; i++) {
         bool matched = false;
         for (int j = 0; j < n2; j++) {
             if (!eval_on_cond(on_cond, rows1[i], rows2[j], ts1, ts2)) continue;
             matched = true;
+            if (right_matched) right_matched[j] = true;
 
             Row* row = &r->rows[out++];
             row->num_cells = total_cols;
@@ -1071,8 +1072,28 @@ static QueryResult* exec_join(ExecCtx* ctx, ASTNode* n) {
                 row->cells[ci].is_null = true;
                 snprintf(row->cells[ci].value, sizeof(row->cells[ci].value), "NULL");
             }
-            nulls_used = true;
         }
+    }
+    // RIGHT JOIN: add unmatched right rows with NULL left columns
+    if (right_matched) {
+        for (int j = 0; j < n2; j++) {
+            if (right_matched[j]) continue;
+            Row* row = &r->rows[out++];
+            row->num_cells = total_cols;
+            row->cells = calloc(total_cols, sizeof(Cell));
+            int ci = 0;
+            for (int k = 0; k < ts1->num_columns; k++, ci++) {
+                row->cells[ci].is_null = true;
+                snprintf(row->cells[ci].value, sizeof(row->cells[ci].value), "NULL");
+            }
+            for (int k = 0; k < ts2->num_columns; k++, ci++) {
+                Value* v = &rows2[j]->values[k];
+                row->cells[ci].is_null = v->is_null;
+                if (!v->is_null) value_to_string(v, ts2->columns[k].type, row->cells[ci].value, sizeof(row->cells[ci].value));
+                else snprintf(row->cells[ci].value, sizeof(row->cells[ci].value), "NULL");
+            }
+        }
+        free(right_matched);
     }
     r->num_rows = out;
 
@@ -1157,6 +1178,31 @@ static QueryResult* exec_join(ExecCtx* ctx, ASTNode* n) {
             row->cells = new_cells;
             row->num_cells = out_cols;
         }
+    }
+
+    // DISTINCT for JOIN
+    if (n->select_stmt.distinct && r->num_rows > 1) {
+        int wi = 0;
+        for (int i = 0; i < r->num_rows; i++) {
+            bool dup = false;
+            for (int j = 0; j < wi; j++) {
+                bool same = true;
+                for (int c = 0; c < out_cols; c++) {
+                    if (strcmp(r->rows[i].cells[c].value, r->rows[j].cells[c].value) != 0 ||
+                        r->rows[i].cells[c].is_null != r->rows[j].cells[c].is_null) {
+                        same = false; break;
+                    }
+                }
+                if (same) { dup = true; break; }
+            }
+            if (!dup) {
+                if (wi != i) r->rows[wi] = r->rows[i];
+                wi++;
+            } else {
+                free(r->rows[i].cells);
+            }
+        }
+        r->num_rows = wi;
     }
 
     // ORDER BY for JOIN
@@ -1275,6 +1321,22 @@ static QueryResult* exec_group_by(ExecCtx* ctx, ASTNode* n) {
         group_size[gi]++;
         group_rows[gi] = realloc(group_rows[gi], group_size[gi] * sizeof(int));
         group_rows[gi][group_size[gi] - 1] = i;
+    }
+
+    // HAVING: filter groups using the first tuple of each group
+    if (n->select_stmt.having) {
+        int wg = 0;
+        for (int g = 0; g < ng; g++) {
+            Tuple* first_t = filtered[group_rows[g][0]];
+            if (eval_where(n->select_stmt.having, first_t, ts)) {
+                group_rows[wg] = group_rows[g];
+                group_size[wg] = group_size[g];
+                wg++;
+            } else {
+                free(group_rows[g]);
+            }
+        }
+        ng = wg;
     }
 
     // Build column map from SELECT column references

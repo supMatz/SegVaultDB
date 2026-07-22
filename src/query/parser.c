@@ -406,7 +406,6 @@ static ASTNode* parse_select(ParserState* ps) {
         }
 
         if (match(ps, TOK_JOIN)) {
-            // JOIN table ON condition (next iteration handles the table name)
             Token jt = consume(ps);
             ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
             memset(j, 0, sizeof(ASTJoin));
@@ -422,7 +421,7 @@ static ASTNode* parse_select(ParserState* ps) {
                 cond->type = EXPR_BINARY; cond->op = OP_EQ; cond->left = left; cond->right = right;
                 j->condition = cond;
             }
-        } else if (match(ps, TOK_LEFT) || match(ps, TOK_RIGHT)) {
+        } else if (match(ps, TOK_LEFT)) {
             expect(ps, TOK_JOIN);
             Token jt = consume(ps);
             ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
@@ -439,9 +438,29 @@ static ASTNode* parse_select(ParserState* ps) {
                 cond->type = EXPR_BINARY; cond->op = OP_EQ; cond->left = left; cond->right = right;
                 j->condition = cond;
             }
+        } else if (match(ps, TOK_RIGHT)) {
+            expect(ps, TOK_JOIN);
+            Token jt = consume(ps);
+            ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
+            memset(j, 0, sizeof(ASTJoin));
+            snprintf(j->table_name, sizeof(j->table_name), "%s", jt.text);
+            j->type = JOIN_RIGHT;
+            if (match(ps, TOK_ON)) {
+                ASTExpr* cond = calloc(1, sizeof(ASTExpr));
+                ASTExpr* left = calloc(1, sizeof(ASTExpr));
+                parse_column_ref(ps, left);
+                match(ps, TOK_EQ);
+                ASTExpr* right = calloc(1, sizeof(ASTExpr));
+                parse_column_ref(ps, right);
+                cond->type = EXPR_BINARY; cond->op = OP_EQ; cond->left = left; cond->right = right;
+                j->condition = cond;
+            }
         } else if (match(ps, TOK_COMMA)) {
             continue;
         }
+        if (match(ps, TOK_COMMA)) continue;
+        TokenType ptype = peek(ps).type;
+        if (ptype == TOK_JOIN || ptype == TOK_LEFT || ptype == TOK_RIGHT) continue;
         break;
     }
 
@@ -489,11 +508,18 @@ static ASTNode* parse_select(ParserState* ps) {
         ASTExpr* left = calloc(1, sizeof(ASTExpr));
         parse_column_ref(ps, left);
         h->type = EXPR_BINARY; h->left = left;
-        match(ps, TOK_EQ);
+        if (match(ps, TOK_EQ)) h->op = OP_EQ;
+        else if (match(ps, TOK_NEQ)) h->op = OP_NEQ;
+        else if (match(ps, TOK_LT)) h->op = OP_LT;
+        else if (match(ps, TOK_GT)) h->op = OP_GT;
+        else if (match(ps, TOK_LE)) h->op = OP_LE;
+        else if (match(ps, TOK_GE)) h->op = OP_GE;
+        else h->op = OP_EQ;
         ASTExpr* right = calloc(1, sizeof(ASTExpr));
         if (peek(ps).type == TOK_INTEGER) { Token v = consume(ps); right->type = EXPR_INT; right->int_val = atoll(v.text); }
+        else if (peek(ps).type == TOK_STRING) { Token v = consume(ps); right->type = EXPR_STRING; snprintf(right->str_val, sizeof(right->str_val), "%s", v.text); }
         else { parse_column_ref(ps, right); }
-        h->op = OP_EQ; h->right = right;
+        h->right = right;
         n->select_stmt.having = h;
     }
 
