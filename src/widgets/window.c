@@ -92,7 +92,7 @@ static void on_tree_select(TreeNode* node, void* ud) {
     if (node->type == TREE_NODE_TABLE) {
         char sql[256];
         snprintf(sql, sizeof(sql),
-                 "SELECT * FROM `%s` LIMIT 100;", node->label);
+                 "SELECT * FROM %s LIMIT 100;", node->label);
         textbox_set_text(app->editor, sql);
     }
 }
