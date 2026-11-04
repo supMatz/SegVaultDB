@@ -508,6 +508,118 @@ static void duplicate(TextBox* tb) {
     move_cursor(tb, offset_at_col(tb, l + 1, col), false, false);
 }
 
+// sposta le righe selezionate di una posizione in su (dir < 0) o in giù (dir > 0)
+static void move_lines(TextBox* tb, int dir) {
+    int l0, l1;
+    selected_lines(tb, &l0, &l1);
+    if ((dir < 0 && l0 == 0) || (dir > 0 && l1 >= tb->num_lines - 1)) return;
+
+    int nb  = dir < 0 ? l0 - 1 : l1 + 1;            // riga vicina che scambia di posto
+    int a   = line_start(tb, SV_MIN(l0, nb));
+    int b   = line_end(tb, SV_MAX(l1, nb));
+    int bs  = line_start(tb, l0), be = line_end(tb, l1);
+    int ns  = line_start(tb, nb), ne = line_end(tb, nb);
+    int blen = be - bs, nlen = ne - ns;
+
+    char* out = malloc(blen + nlen + 2);
+    if (!out) return;
+    if (dir < 0) {
+        memcpy(out, tb->text + bs, blen); out[blen] = '\n';
+        memcpy(out + blen + 1, tb->text + ns, nlen);
+    } else {
+        memcpy(out, tb->text + ns, nlen); out[nlen] = '\n';
+        memcpy(out + nlen + 1, tb->text + bs, blen);
+    }
+    int shift  = dir < 0 ? -(nlen + 1) : (nlen + 1);
+    int cursor = tb->cursor_pos + shift;
+    int anchor = tb->sel_anchor >= 0 ? tb->sel_anchor + shift : -1;
+
+    undo_push(tb, EDIT_OTHER);
+    replace_range(tb, a, b, out, blen + nlen + 1);
+    free(out);
+    tb->cursor_pos = SV_CLAMP(cursor, 0, tb->text_len);
+    tb->sel_anchor = anchor >= 0 ? SV_CLAMP(anchor, 0, tb->text_len) : -1;
+    update_cursor_linecol(tb);
+    tb->pref_col = tb->cursor_col;
+    ensure_visible(tb);
+}
+
+// elimina le righe selezionate (o quella del cursore)
+static void delete_lines(TextBox* tb) {
+    int l0, l1;
+    selected_lines(tb, &l0, &l1);
+    int col = tb->cursor_col;
+    int a = line_start(tb, l0);
+    int b = (l1 + 1 < tb->num_lines) ? line_start(tb, l1 + 1) : tb->text_len;
+    if (l1 + 1 >= tb->num_lines && a > 0) a--; // ultima riga: rimuove il '\n' precedente
+    if (a >= b) return;
+    undo_push(tb, EDIT_OTHER);
+    replace_range(tb, a, b, "", 0);
+    int l = SV_MIN(l0, tb->num_lines - 1);
+    move_cursor(tb, offset_at_col(tb, l, col), false, false);
+}
+
+// maiuscolo / minuscolo della selezione (o della parola sotto il cursore)
+static void change_case(TextBox* tb, bool upper) {
+    int a, b;
+    bool had_sel = has_sel(tb);
+    if (had_sel) {
+        sel_range(tb, &a, &b);
+    } else {
+        a = b = tb->cursor_pos;
+        while (a > 0 && is_word_char(tb->text[a - 1])) a--;
+        while (b < tb->text_len && is_word_char(tb->text[b])) b++;
+    }
+    if (a >= b) return;
+    char* buf = malloc(b - a);
+    if (!buf) return;
+    for (int i = a; i < b; i++) {
+        unsigned char c = (unsigned char)tb->text[i];
+        buf[i - a] = (char)(c < 0x80 ? (upper ? toupper(c) : tolower(c)) : c);
+    }
+    int cursor = tb->cursor_pos, anchor = tb->sel_anchor;
+    undo_push(tb, EDIT_OTHER);
+    replace_range(tb, a, b, buf, b - a);
+    free(buf);
+    tb->cursor_pos = cursor;
+    tb->sel_anchor = had_sel ? anchor : -1;
+    update_cursor_linecol(tb);
+}
+
+// Ctrl+L: seleziona la riga corrente; ripetuto estende alla riga successiva
+static void select_line_extend(TextBox* tb) {
+    int l0, l1;
+    if (has_sel(tb)) {
+        selected_lines(tb, &l0, &l1);
+        int s, e;
+        sel_range(tb, &s, &e);
+        int full_end = (l1 + 1 < tb->num_lines) ? line_start(tb, l1 + 1) : tb->text_len;
+        if (s == line_start(tb, l0) && e == full_end && l1 + 1 < tb->num_lines) l1++;
+    } else {
+        l0 = l1 = tb->cursor_line;
+    }
+    select_lines(tb, l0, l1);
+    ensure_visible(tb);
+}
+
+// inserisce una riga vuota sotto (o sopra) quella corrente mantenendo l'indentazione
+static void open_line(TextBox* tb, bool above) {
+    int l = tb->cursor_line;
+    int ls = line_start(tb, l);
+    int indent = first_non_space(tb, l) - ls;
+    indent = SV_MIN(indent, 200);
+    char buf[256];
+    int n = 0;
+    if (!above) buf[n++] = '\n';
+    for (int i = 0; i < indent; i++) buf[n++] = ' ';
+    int cursor_at = n;
+    if (above) buf[n++] = '\n';
+    int at = above ? ls : line_end(tb, l);
+    undo_push(tb, EDIT_OTHER);
+    replace_range(tb, at, at, buf, n);
+    move_cursor(tb, at + cursor_at, false, false);
+}
+
 // ═════════════════════════════════════════════════════════════════
 //  Appunti
 // ═════════════════════════════════════════════════════════════════
@@ -688,12 +800,17 @@ static void zoom(TextBox* tb, int delta) {
 static bool handle_key(TextBox* tb, sEvent* evt) {
     bool ctrl  = evt->modifiers & SV_MOD_CTRL;
     bool shift = evt->modifiers & SV_MOD_SHIFT;
+    bool alt   = evt->modifiers & SV_MOD_ALT;
     int  vis   = visible_lines(tb);
 
     switch (evt->key) {
         case KEY_ENTER:
-            if (ctrl) {
+            if (ctrl && shift) {
+                open_line(tb, true);              // Ctrl+Shift+Enter: nuova riga sopra
+            } else if (ctrl) {
                 if (tb->on_execute) tb->on_execute(tb->text, tb->base.user_data);
+            } else if (shift) {
+                open_line(tb, false);             // Shift+Enter: nuova riga sotto
             } else {
                 handle_enter(tb);
             }
@@ -719,12 +836,14 @@ static bool handle_key(TextBox* tb, sEvent* evt) {
             return true;
         }
         case KEY_UP:
+            if (alt) { move_lines(tb, -1); return true; }
             if (ctrl) { tb->scroll_y--; clamp_scroll(tb); return true; }
             if (tb->cursor_line == 0) move_cursor(tb, 0, shift, false);
             else move_cursor(tb, offset_at_col(tb, tb->cursor_line - 1, tb->pref_col), shift, true);
             return true;
 
         case KEY_DOWN:
+            if (alt) { move_lines(tb, +1); return true; }
             if (ctrl) { tb->scroll_y++; clamp_scroll(tb); return true; }
             if (tb->cursor_line >= tb->num_lines - 1) move_cursor(tb, tb->text_len, shift, false);
             else move_cursor(tb, offset_at_col(tb, tb->cursor_line + 1, tb->pref_col), shift, true);
@@ -787,6 +906,9 @@ static bool handle_key(TextBox* tb, sEvent* evt) {
                 case 'z': if (shift) do_redo(tb); else do_undo(tb); return true;
                 case 'y': do_redo(tb); return true;
                 case 'd': duplicate(tb); return true;
+                case 'k': if (shift) { delete_lines(tb); return true; } return false;
+                case 'u': change_case(tb, shift); return true;
+                case 'l': select_line_extend(tb); return true;
                 case '/': toggle_comment(tb); return true;
                 case '7': if (shift) { toggle_comment(tb); return true; } return false; // Ctrl+/ su tastiera italiana
                 case '=': case '+': zoom(tb, +1); return true;
@@ -1102,6 +1224,23 @@ static void textbox_draw(Widget* self, PlatformWindow* win) {
         else if ((m = find_match(tb, tb->cursor_pos - 1)) >= 0) { br_a = tb->cursor_pos - 1; br_b = m; }
     }
 
+    // occorrenze della parola sotto il cursore (o della parola selezionata)
+    int occ_a = -1, occ_len = 0;
+    if (focused) {
+        if (sel) {
+            bool word = se - sa >= 2 && se - sa <= 64 && line_of(tb, sa) == line_of(tb, se);
+            for (int i = sa; word && i < se; i++) if (!is_word_char(tb->text[i])) word = false;
+            if (word) { occ_a = sa; occ_len = se - sa; }
+        } else {
+            int a = tb->cursor_pos, e = tb->cursor_pos;
+            while (a > 0 && is_word_char(tb->text[a - 1])) a--;
+            while (e < tb->text_len && is_word_char(tb->text[e])) e++;
+            if (e - a >= 2 && e - a <= 64 && sql_classify_word(tb->text + a, e - a) == SQL_WORD_IDENT) {
+                occ_a = a; occ_len = e - a;
+            }
+        }
+    }
+
     LexState st = lex_state_at(tb, line_start(tb, first));
 
     for (int l = first; l < last; l++) {
@@ -1126,6 +1265,23 @@ static void textbox_draw(Widget* self, PlatformWindow* win) {
             int w  = (c1 - c0) * tb->char_w + (se > le ? tb->char_w / 2 : 0);
             platform_fill_rect_rounded(win, (Rect){x0 + c0 * tb->char_w, y, w, tb->line_height},
                                        TH_EDITOR_SELECT, 3);
+        }
+
+        // altre occorrenze della parola
+        if (occ_a >= 0) {
+            for (int i = ls; i + occ_len <= le; i++) {
+                if (i == occ_a || (i > 0 && is_word_char(tb->text[i - 1]))) continue;
+                if (i + occ_len < tb->text_len && is_word_char(tb->text[i + occ_len])) continue;
+                int k = 0;
+                while (k < occ_len && tolower((unsigned char)tb->text[i + k]) ==
+                                      tolower((unsigned char)tb->text[occ_a + k])) k++;
+                if (k < occ_len) continue;
+                int c0 = count_chars(tb->text + ls, i - ls);
+                platform_fill_rect_rounded(win, (Rect){x0 + c0 * tb->char_w, y + 1,
+                                                       count_chars(tb->text + i, occ_len) * tb->char_w,
+                                                       tb->line_height - 2}, TH_EDITOR_OCCUR, 3);
+                i += occ_len - 1;
+            }
         }
 
         // parentesi

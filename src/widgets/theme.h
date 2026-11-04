@@ -56,6 +56,9 @@ SCOPO: Palette colori, metriche e primitive grafiche condivise da tutti i widget
 #define TH_EDITOR_LINE    (Color){21,  24,  35,  255}  // riga corrente
 #define TH_EDITOR_SELECT  (Color){48,  43,  98,  255}  // selezione testo
 #define TH_EDITOR_MATCH   (Color){52,  60,  84,  255}  // parentesi corrispondente
+#define TH_EDITOR_OCCUR   (Color){40,  46,  66,  255}  // altre occorrenze della parola sotto il cursore
+#define TH_EDITOR_FIND    (Color){78,  62,  22,  255}  // risultati della ricerca
+#define TH_EDITOR_FIND_CUR (Color){150, 108, 30, 255}  // risultato di ricerca corrente
 #define TH_GUTTER_TEXT    (Color){58,  65,  88,  255}
 #define TH_GUTTER_ACTIVE  (Color){170, 178, 205, 255}
 
