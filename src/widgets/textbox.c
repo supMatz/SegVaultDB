@@ -742,6 +742,38 @@ static void popup_add_kind(TextBox* tb, CompletionKind k, const char* pre, int p
     qsort(tb->popup_items + start, tb->popup_n - start, sizeof(CompletionItem), cmp_items);
 }
 
+// alias di tabella nello statement corrente: "FROM users u" / "JOIN orders AS o".
+// Se qual è un alias di una tabella nota, scrive il nome della tabella in out.
+static bool resolve_table_alias(const TextBox* tb, const char* qual, char* out, int out_cap) {
+    SqlRange r;
+    if (!sql_statement_at(tb->text, tb->text_len, tb->cursor_pos, &r)) return false;
+    const char* s = tb->text;
+    int i = r.start, end = SV_MIN(r.end_semi, tb->text_len);
+    char prev[64] = "", prev2[64] = "";   // ultime due parole lette
+    while (i < end) {
+        if (!is_word_char(s[i])) { if (s[i] != ' ' && s[i] != '\n' && s[i] != '\t') prev[0] = prev2[0] = '\0'; i++; continue; }
+        int b = i;
+        while (i < end && is_word_char(s[i])) i++;
+        char w[64];
+        int n = SV_MIN(i - b, 63);
+        memcpy(w, s + b, n);
+        w[n] = '\0';
+        if (ieq(w, qual)) {
+            // "tabella alias" oppure "tabella AS alias"
+            const char* table = ieq(prev, "AS") ? prev2 : prev;
+            for (int k = 0; table[0] && k < tb->comp_count; k++)
+                if ((tb->comp_items[k].kind == COMP_TABLE || tb->comp_items[k].kind == COMP_VIEW) &&
+                    ieq(tb->comp_items[k].name, table)) {
+                    snprintf(out, out_cap, "%s", tb->comp_items[k].name);
+                    return true;
+                }
+        }
+        snprintf(prev2, sizeof(prev2), "%s", prev);
+        snprintf(prev, sizeof(prev), "%s", w);
+    }
+    return false;
+}
+
 // ricalcola i suggerimenti per la parola sotto il cursore.
 // force = apertura esplicita (Ctrl+Space o dopo un '.')
 static void popup_update(TextBox* tb, bool force) {
@@ -775,6 +807,11 @@ static void popup_update(TextBox* tb, bool force) {
         bool known = false;
         for (int i = 0; i < tb->comp_count && !known; i++)
             known = tb->comp_items[i].kind == COMP_COLUMN && ieq(tb->comp_items[i].parent, qual);
+        char real[64];
+        if (!known && resolve_table_alias(tb, qual, real, sizeof(real))) {   // u. -> colonne di users
+            snprintf(qual, sizeof(qual), "%s", real);
+            known = true;
+        }
         int start = tb->popup_n;
         for (int i = 0; i < tb->comp_count; i++) {
             const CompletionItem* it = &tb->comp_items[i];

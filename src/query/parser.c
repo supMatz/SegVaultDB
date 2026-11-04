@@ -71,6 +71,63 @@ static void copy_qualified(ParserState* ps, char* dst, size_t cap, const char* t
 static ASTNode* parse_select(ParserState* ps);
 static void parse_column_ref(ParserState* ps, ASTExpr* e);
 
+static void parse_fail(ParserState* ps, const char* msg, Token at);
+
+// ── alias di tabella (FROM users u) ──
+
+typedef struct { char alias[64]; char table[64]; } TableAlias;
+
+// identificatore con quel nome (parole come INNER/OUTER/CROSS non sono keyword del lexer)
+static bool ident_is(ParserState* ps, const char* word) {
+    Token t = peek(ps);
+    return t.type == TOK_IDENTIFIER && strcasecmp(t.text, word) == 0;
+}
+
+static void parse_table_alias(ParserState* ps, const char* table, TableAlias* al, int* nal) {
+    bool as = match(ps, TOK_AS);
+    Token t = peek(ps);
+    if (t.type != TOK_IDENTIFIER || ident_is(ps, "INNER") || ident_is(ps, "CROSS") || ident_is(ps, "OUTER")) {
+        if (as) parse_fail(ps, "Expected an alias after AS", t);
+        return;
+    }
+    consume(ps);
+    if (*nal >= 9) return;
+    copy_text(ps, al[*nal].alias, sizeof(al[*nal].alias), t.text);
+    copy_text(ps, al[*nal].table, sizeof(al[*nal].table), table);
+    (*nal)++;
+}
+
+static const char* alias_table(const char* name, TableAlias* al, int nal) {
+    for (int i = 0; i < nal; i++) if (strcasecmp(al[i].alias, name) == 0) return al[i].table;
+    return NULL;
+}
+
+static void resolve_alias_expr(ASTExpr* e, TableAlias* al, int nal) {
+    if (!e) return;
+    if (e->table_name[0]) {
+        const char* real = alias_table(e->table_name, al, nal);
+        if (real) snprintf(e->table_name, sizeof(e->table_name), "%s", real);
+    }
+    resolve_alias_expr(e->left, al, nal);
+    resolve_alias_expr(e->right, al, nal);
+}
+
+// "alias.colonna" -> "tabella.colonna"
+static void resolve_alias_qualified(ParserState* ps, char* q, size_t cap, TableAlias* al, int nal) {
+    char* dot = strchr(q, '.');
+    if (!dot) return;
+    char prefix[64];
+    size_t pl = (size_t)(dot - q);
+    if (pl >= sizeof(prefix)) return;
+    memcpy(prefix, q, pl);
+    prefix[pl] = '\0';
+    const char* real = alias_table(prefix, al, nal);
+    if (!real) return;
+    char col[64];
+    snprintf(col, sizeof(col), "%s", dot + 1);
+    copy_qualified(ps, q, cap, real, col);
+}
+
 // ═════════════════════════════════════════════════════════════════
 //  Condizioni (WHERE / HAVING)
 //    condizione := and_expr { OR and_expr }
@@ -603,83 +660,45 @@ static ASTNode* parse_select(ParserState* ps) {
 
     expect(ps, TOK_FROM);
 
-    // Handle JOIN: comma-separated tables or JOIN keyword
+    // FROM tabella [[AS] alias] { , tabella [[AS] alias]
+    //                            | [INNER | LEFT [OUTER] | RIGHT [OUTER] | CROSS] JOIN tabella [[AS] alias] [ON a = b] }
     n->select_stmt.num_joins = 0;
-    bool first_table = true;
+    TableAlias aliases[9];
+    int nal = 0;
+    memset(aliases, 0, sizeof(aliases));
 
-    while (1) {
-        Token tn = consume(ps);
-        if (first_table) {
-            copy_text(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name), tn.text);
-            first_table = false;
-        } else {
-            if (n->select_stmt.num_joins >= 8) { parse_fail(ps, "Too many JOINs (max 8)", peek(ps)); break; }
-            ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
-            memset(j, 0, sizeof(ASTJoin));
-            copy_text(ps, j->table_name, sizeof(j->table_name), tn.text);
-            j->type = JOIN_INNER;
-        }
+    Token first = consume(ps);
+    copy_text(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name), first.text);
+    parse_table_alias(ps, n->select_stmt.table_name, aliases, &nal);
 
-        if (match(ps, TOK_JOIN)) {
-            Token jt = consume(ps);
-            if (n->select_stmt.num_joins >= 8) { parse_fail(ps, "Too many JOINs (max 8)", peek(ps)); break; }
-            ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
-            memset(j, 0, sizeof(ASTJoin));
-            copy_text(ps, j->table_name, sizeof(j->table_name), jt.text);
-            j->type = JOIN_INNER;
-            if (match(ps, TOK_ON)) {
-                ASTExpr* cond = calloc(1, sizeof(ASTExpr));
-                ASTExpr* left = calloc(1, sizeof(ASTExpr));
-                parse_column_ref(ps, left);
-                match(ps, TOK_EQ);
-                ASTExpr* right = calloc(1, sizeof(ASTExpr));
-                parse_column_ref(ps, right);
-                cond->type = EXPR_BINARY; cond->op = OP_EQ; cond->left = left; cond->right = right;
-                j->condition = cond;
-            }
-        } else if (match(ps, TOK_LEFT)) {
-            expect(ps, TOK_JOIN);
-            Token jt = consume(ps);
-            if (n->select_stmt.num_joins >= 8) { parse_fail(ps, "Too many JOINs (max 8)", peek(ps)); break; }
-            ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
-            memset(j, 0, sizeof(ASTJoin));
-            copy_text(ps, j->table_name, sizeof(j->table_name), jt.text);
-            j->type = JOIN_LEFT;
-            if (match(ps, TOK_ON)) {
-                ASTExpr* cond = calloc(1, sizeof(ASTExpr));
-                ASTExpr* left = calloc(1, sizeof(ASTExpr));
-                parse_column_ref(ps, left);
-                match(ps, TOK_EQ);
-                ASTExpr* right = calloc(1, sizeof(ASTExpr));
-                parse_column_ref(ps, right);
-                cond->type = EXPR_BINARY; cond->op = OP_EQ; cond->left = left; cond->right = right;
-                j->condition = cond;
-            }
-        } else if (match(ps, TOK_RIGHT)) {
-            expect(ps, TOK_JOIN);
-            Token jt = consume(ps);
-            if (n->select_stmt.num_joins >= 8) { parse_fail(ps, "Too many JOINs (max 8)", peek(ps)); break; }
-            ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
-            memset(j, 0, sizeof(ASTJoin));
-            copy_text(ps, j->table_name, sizeof(j->table_name), jt.text);
-            j->type = JOIN_RIGHT;
-            if (match(ps, TOK_ON)) {
-                ASTExpr* cond = calloc(1, sizeof(ASTExpr));
-                ASTExpr* left = calloc(1, sizeof(ASTExpr));
-                parse_column_ref(ps, left);
-                match(ps, TOK_EQ);
-                ASTExpr* right = calloc(1, sizeof(ASTExpr));
-                parse_column_ref(ps, right);
-                cond->type = EXPR_BINARY; cond->op = OP_EQ; cond->left = left; cond->right = right;
-                j->condition = cond;
-            }
-        } else if (match(ps, TOK_COMMA)) {
-            continue;
+    while (ps->result->success) {
+        JoinType jt;
+        bool comma = false;
+        if (match(ps, TOK_COMMA))            { jt = JOIN_INNER; comma = true; }
+        else if (match(ps, TOK_JOIN))        jt = JOIN_INNER;
+        else if (ident_is(ps, "INNER"))      { consume(ps); expect(ps, TOK_JOIN); jt = JOIN_INNER; }
+        else if (ident_is(ps, "CROSS"))      { consume(ps); expect(ps, TOK_JOIN); jt = JOIN_INNER; }
+        else if (match(ps, TOK_LEFT))        { if (ident_is(ps, "OUTER")) consume(ps); expect(ps, TOK_JOIN); jt = JOIN_LEFT; }
+        else if (match(ps, TOK_RIGHT))       { if (ident_is(ps, "OUTER")) consume(ps); expect(ps, TOK_JOIN); jt = JOIN_RIGHT; }
+        else break;
+
+        if (n->select_stmt.num_joins >= 8) { parse_fail(ps, "Too many JOINs (max 8)", peek(ps)); break; }
+        ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
+        memset(j, 0, sizeof(ASTJoin));
+        Token tt = consume(ps);
+        copy_text(ps, j->table_name, sizeof(j->table_name), tt.text);
+        j->type = jt;
+        parse_table_alias(ps, j->table_name, aliases, &nal);
+        if (!comma && match(ps, TOK_ON)) {
+            ASTExpr* cond = calloc(1, sizeof(ASTExpr));
+            ASTExpr* left = calloc(1, sizeof(ASTExpr));
+            parse_column_ref(ps, left);
+            if (!match(ps, TOK_EQ)) parse_fail(ps, "Only equality (a = b) is supported in JOIN ... ON", peek(ps));
+            ASTExpr* right = calloc(1, sizeof(ASTExpr));
+            parse_column_ref(ps, right);
+            cond->type = EXPR_BINARY; cond->op = OP_EQ; cond->left = left; cond->right = right;
+            j->condition = cond;
         }
-        if (match(ps, TOK_COMMA)) continue;
-        TokenType ptype = peek(ps).type;
-        if (ptype == TOK_JOIN || ptype == TOK_LEFT || ptype == TOK_RIGHT) continue;
-        break;
     }
 
     if (match(ps, TOK_WHERE)) n->select_stmt.where = parse_condition(ps);
@@ -721,6 +740,16 @@ static ASTNode* parse_select(ParserState* ps) {
         n->select_stmt.limit = atoi(lv.text);
     }
 
+    // gli alias di tabella vengono sostituiti dal nome reale in tutte le espressioni
+    if (nal > 0) {
+        for (int c = 0; c < n->select_stmt.num_cols; c++) resolve_alias_expr(n->select_stmt.columns[c], aliases, nal);
+        resolve_alias_expr(n->select_stmt.where, aliases, nal);
+        resolve_alias_expr(n->select_stmt.having, aliases, nal);
+        for (int c = 0; c < n->select_stmt.num_joins; c++) resolve_alias_expr(n->select_stmt.joins[c].condition, aliases, nal);
+        for (int c = 0; c < n->select_stmt.num_group_cols; c++)
+            resolve_alias_qualified(ps, n->select_stmt.group_cols[c], sizeof(n->select_stmt.group_cols[c]), aliases, nal);
+        resolve_alias_qualified(ps, n->select_stmt.order_col, sizeof(n->select_stmt.order_col), aliases, nal);
+    }
     return n;
 }
 
