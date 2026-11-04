@@ -7,7 +7,9 @@ ifeq ($(OS), Windows_NT)
     SEP          = \\
 else
     PLATFORM_SRC = src/platform/xlib.c
-    LIBS         = -lX11 -lm
+    XFT_CFLAGS  := $(shell pkg-config --cflags xft 2>/dev/null || echo -I/usr/include/freetype2)
+    XFT_LIBS    := $(shell pkg-config --libs xft xrender 2>/dev/null || echo -lXft -lXrender -lfontconfig)
+    LIBS         = -lX11 $(XFT_LIBS) -lm
     OUT          = segvault
     MKDIR        = mkdir -p
     RM           = rm -f
@@ -16,11 +18,13 @@ endif
 
 CC       = gcc
 CFLAGS   = -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -g -O2
-INCLUDES = -Iinclude -Isrc -Isrc/platform -Isrc/widgets -Isrc/catalog -Isrc/storage -Isrc/table -Isrc/index -Isrc/query -Isrc/tx -Isrc/bridge
+INCLUDES = $(XFT_CFLAGS) -Iinclude -Isrc -Isrc/platform -Isrc/widgets -Isrc/catalog -Isrc/storage -Isrc/table -Isrc/index -Isrc/query -Isrc/tx -Isrc/bridge
 
 # ── Widget / GUI source files ──
 WIDGET_SRCS = \
 	src/widgets/widget.c \
+	src/widgets/theme.c \
+	src/widgets/sql_text.c \
 	src/widgets/button.c \
 	src/widgets/label.c \
 	src/widgets/textbox.c \

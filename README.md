@@ -34,7 +34,8 @@
 |---|---|
 | **Language** | C (C11) |
 | **Version** | 0.1.0 |
-| **GUI** | Win32 / GDI (Windows) · Xlib/X11 (Linux) |
+| **GUI** | Win32 / GDI (Windows) · Xlib/X11 + Xft (Linux) |
+| **Font** | JetBrains Mono (editor e dati) · Inter / Fira Sans (interfaccia), con fallback automatico |
 | **Storage** | Custom B+Tree with page-based I/O (4 KB pages) |
 | **SQL** | Hand-written recursive descent parser + lexer |
 | **Transactions** | Write-Ahead Log (ARIES-style recovery) |
@@ -44,7 +45,33 @@
 
 ## Supported SQL
 
-Tutte le query si scrivono nell'editor SQL e si eseguono cliccando **Run Query** (pulsante verde in alto a sinistra).
+Tutte le query si scrivono nell'editor SQL:
+
+- **Run** (`F5`) esegue l'intero script, oppure solo il testo selezionato
+- **Run statement** (`Ctrl+Enter`) esegue solo lo statement sotto il cursore (evidenziato da una barra viola nel margine)
+
+Gli statement separati da `;` vengono eseguiti in sequenza (i `;` dentro stringhe e commenti sono ignorati). In caso di errore l'esecuzione si ferma, la riga dello statement fallito viene evidenziata in rosso nell'editor e il messaggio compare nel pannello dei risultati.
+
+### Editor SQL — scorciatoie
+
+| Scorciatoia | Azione |
+|---|---|
+| `F5` | Esegui script / selezione |
+| `Ctrl+Enter` | Esegui lo statement sotto il cursore |
+| `Ctrl+A` / `C` / `X` / `V` | Seleziona tutto / copia / taglia / incolla (senza selezione: riga intera) |
+| `Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z`) | Annulla / ripeti |
+| `Ctrl+D` | Duplica riga o selezione |
+| `Ctrl+/` (`Ctrl+Shift+7` su tastiera italiana) | Commenta / decommenta le righe |
+| `Tab` / `Shift+Tab` | Indenta / de-indenta (anche su più righe) |
+| `Ctrl+←/→`, `Ctrl+Backspace/Canc` | Movimento e cancellazione per parola |
+| `Home` | "Smart home": primo carattere, poi inizio riga |
+| `Ctrl` + rotella, `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Zoom del font dell'editor |
+| doppio / triplo click, click sul numero di riga | Seleziona parola / riga |
+
+L'editor chiude automaticamente parentesi e apici, mantiene l'indentazione andando a capo, evidenzia la parentesi corrispondente e colora keyword, tipi, funzioni, stringhe, numeri e commenti.
+
+**Explorer:** click per espandere database e tabelle; doppio click su un database = `USE`, su una tabella = anteprima dei dati (`SELECT * … LIMIT 200`), su una colonna = inserisce il nome nell'editor.
+**Risultati:** click su una cella e `Ctrl+C` per copiarla, frecce per navigare, trascina il bordo dell'header per ridimensionare una colonna (doppio click = adatta al contenuto), `Shift` + rotella per lo scroll orizzontale.
 
 ### Data Definition Language (DDL)
 
@@ -231,19 +258,22 @@ Ogni widget estende `Widget` (da `widget.h`) mettendolo come **primo campo** del
 | `Scrollbar` | `scrollbar.h` / `scrollbar.c` | Scrollbar verticale/orizzontale |
 | `Panel` | `panel.h` / `panel.c` | Contenitore con 128 figli, bordo, padding |
 | `Splitter` | `splitter.h` / `splitter.c` | Divisore ridimensionabile orizzontale/verticale |
+| *(tema)* | `theme.h` / `theme.c` | Palette, testo con ellissi, icone vettoriali antialiasing |
+| *(SQL)* | `sql_text.h` / `sql_text.c` | Divisione degli statement, statement sotto il cursore, keyword per l'highlighting |
 
 ### Colori di sistema (`platform.h`)
 
+La palette completa è in `src/widgets/theme.h` (prefisso `TH_`); i `COLOR_*` di `platform.h` restano per compatibilità.
+
 | Costante | Hex | Uso |
 |---|---|---|
-| `COLOR_BG` | `#0F1116` | Sfondo principale |
-| `COLOR_PANEL` | `#161922` | Pannelli |
-| `COLOR_ACCENT` | `#6E56FF` | Viola elettrico — pulsanti principali |
-| `COLOR_TEXT` | `#E1E4F0` | Testo principale |
-| `COLOR_TEXT_DIM` | `#585E78` | Testo secondario / placeholder |
-| `COLOR_BORDER` | `#262A3A` | Bordi |
-| `COLOR_HOVER` | `#202432` | Hover |
-| `COLOR_SELECT` | `#3C2E8C` | Selezione |
+| `TH_BG` | `#0D0F14` | Sfondo principale |
+| `TH_SURFACE` / `TH_SURFACE_2` | `#11141B` / `#151922` | Sidebar, toolbar, header |
+| `TH_ACCENT` | `#7C6AFF` | Viola elettrico — azione principale, cursore, selezione |
+| `TH_TEXT` / `TH_TEXT_DIM` | `#E2E6F2` / `#5C6480` | Testo principale / secondario |
+| `TH_BORDER` | `#212634` | Bordi |
+| `TH_SUCCESS` / `TH_ERROR` / `TH_WARNING` | `#3DD68C` / `#FF5C7A` / `#FFB547` | Stati (OK, errore, transazione aperta) |
+| `TH_SYN_*` | — | Colori del syntax highlighting SQL |
 
 ---
 
@@ -471,6 +501,8 @@ make gui
 # Test suite (71 test — include JOIN, GROUP BY, HAVING, DISTINCT, ORDER BY, ecc.)
 make test
 ```
+
+**Dipendenze su Linux:** `libX11`, `libXft`, `libXrender`, `fontconfig` (presenti su qualsiasi desktop X11; su Debian/Ubuntu: `sudo apt install libx11-dev libxft-dev`, su Arch: `sudo pacman -S libx11 libxft`). Per il miglior risultato installare **JetBrains Mono** e **Inter** o **Fira Sans**: se mancano, fontconfig sceglie automaticamente il miglior font monospace / sans-serif disponibile.
 
 Il Makefile rileva automaticamente la piattaforma tramite `$(OS)` e seleziona il sorgente corretto (`src/platform/xlib.c` o `src/platform/win32.c`).
 `make` (default) produce il binario completo con motore DB reale; `make gui` compila solo la GUI con uno stub di test (`db_api_test.c`).

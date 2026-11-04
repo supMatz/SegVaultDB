@@ -1,278 +1,1208 @@
-// SCOPO: Implementazione editor SQL multilinea.
+// SCOPO: Implementazione editor SQL multilinea (vedi textbox.h per le funzionalità).
 
 #include "textbox.h"
 #include "widget.h"
+#include "theme.h"
+#include "sql_text.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <ctype.h>
 
-// aggiorna cursor_line e cursor_col dal cursor_pos
-static void update_cursor_linecol(TextBox* tb) {
-    tb->cursor_line = 0;
-    tb->cursor_col  = 0;
-    for (int i = 0; i < tb->cursor_pos; i++) {
-        if (tb->text[i] == '\n') {
-            tb->cursor_line++;
-            tb->cursor_col = 0;
-        } else {
-            tb->cursor_col++;
-        }
+#define INDENT 4
+
+enum { EDIT_NONE, EDIT_TYPE, EDIT_DELETE, EDIT_OTHER };
+
+// ═════════════════════════════════════════════════════════════════
+//  UTF-8 e righe
+// ═════════════════════════════════════════════════════════════════
+
+static bool is_cont(char c) { return ((unsigned char)c & 0xC0) == 0x80; }
+
+static int utf8_prev(const TextBox* tb, int pos) {
+    if (pos <= 0) return 0;
+    pos--;
+    while (pos > 0 && is_cont(tb->text[pos])) pos--;
+    return pos;
+}
+
+static int utf8_next(const TextBox* tb, int pos) {
+    if (pos >= tb->text_len) return tb->text_len;
+    pos++;
+    while (pos < tb->text_len && is_cont(tb->text[pos])) pos++;
+    return pos;
+}
+
+static int utf8_encode(uint32_t cp, char* out) {
+    if (cp < 0x80)    { out[0] = (char)cp; return 1; }
+    if (cp < 0x800)   { out[0] = (char)(0xC0 | (cp >> 6)); out[1] = (char)(0x80 | (cp & 0x3F)); return 2; }
+    if (cp < 0x10000) { out[0] = (char)(0xE0 | (cp >> 12)); out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        out[2] = (char)(0x80 | (cp & 0x3F)); return 3; }
+    out[0] = (char)(0xF0 | (cp >> 18)); out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+static int count_chars(const char* s, int len) {
+    int n = 0;
+    for (int i = 0; i < len; i++) if (!is_cont(s[i])) n++;
+    return n;
+}
+
+static bool is_word_char(char c) {
+    unsigned char u = (unsigned char)c;
+    return isalnum(u) || c == '_' || u >= 0x80;
+}
+
+static void rebuild_lines(TextBox* tb) {
+    tb->num_lines = 0;
+    int need = 1;
+    for (int i = 0; i < tb->text_len; i++) if (tb->text[i] == '\n') need++;
+    if (need > tb->lines_cap) {
+        tb->lines_cap   = need + 256;
+        tb->line_starts = realloc(tb->line_starts, tb->lines_cap * sizeof(int));
     }
+    tb->line_starts[tb->num_lines++] = 0;
+    for (int i = 0; i < tb->text_len; i++)
+        if (tb->text[i] == '\n') tb->line_starts[tb->num_lines++] = i + 1;
 }
 
-// cancella il carattere prima del cursore (backspace)
-static void textbox_backspace(TextBox* tb) {
-    if (tb->cursor_pos == 0) return;
-    memmove(tb->text + tb->cursor_pos - 1,
-            tb->text + tb->cursor_pos,
-            tb->text_len - tb->cursor_pos);
-    tb->cursor_pos--;
-    tb->text_len--;
-    tb->text[tb->text_len] = '\0';
+static int line_of(const TextBox* tb, int off) {
+    int lo = 0, hi = tb->num_lines - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (tb->line_starts[mid] <= off) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+}
+
+static int line_start(const TextBox* tb, int l) { return tb->line_starts[l]; }
+
+static int line_end(const TextBox* tb, int l) {
+    return (l + 1 < tb->num_lines) ? tb->line_starts[l + 1] - 1 : tb->text_len;
+}
+
+static int col_of(const TextBox* tb, int off) {
+    int ls = line_start(tb, line_of(tb, off));
+    return count_chars(tb->text + ls, off - ls);
+}
+
+static int offset_at_col(const TextBox* tb, int l, int col) {
+    int p = line_start(tb, l), e = line_end(tb, l), c = 0;
+    while (p < e && c < col) { p = utf8_next(tb, p); c++; }
+    return p;
+}
+
+static int first_non_space(const TextBox* tb, int l) {
+    int p = line_start(tb, l), e = line_end(tb, l);
+    while (p < e && tb->text[p] == ' ') p++;
+    return p;
+}
+
+static void update_cursor_linecol(TextBox* tb) {
+    tb->cursor_line = line_of(tb, tb->cursor_pos);
+    tb->cursor_col  = col_of(tb, tb->cursor_pos);
+}
+
+static bool has_sel(const TextBox* tb) {
+    return tb->sel_anchor >= 0 && tb->sel_anchor != tb->cursor_pos;
+}
+
+static void sel_range(const TextBox* tb, int* s, int* e) {
+    if (!has_sel(tb)) { *s = *e = tb->cursor_pos; return; }
+    *s = SV_MIN(tb->sel_anchor, tb->cursor_pos);
+    *e = SV_MAX(tb->sel_anchor, tb->cursor_pos);
+}
+
+static int visible_lines(const TextBox* tb) {
+    int v = (tb->base.bounds.h - tb->pad_top) / SV_MAX(1, tb->line_height);
+    return SV_MAX(1, v);
+}
+
+static int max_line_cols(const TextBox* tb) {
+    int m = 0;
+    for (int l = 0; l < tb->num_lines; l++) {
+        int ls = line_start(tb, l);
+        int c = count_chars(tb->text + ls, line_end(tb, l) - ls);
+        if (c > m) m = c;
+    }
+    return m;
+}
+
+static int text_x0(const TextBox* tb) { return tb->base.bounds.x + tb->gutter_w + 10; }
+static int text_area_w(const TextBox* tb) { return tb->base.bounds.w - tb->gutter_w - 10; }
+
+static void clamp_scroll(TextBox* tb) {
+    int max_y = SV_MAX(0, tb->num_lines - visible_lines(tb) + 1);
+    tb->scroll_y = SV_CLAMP(tb->scroll_y, 0, max_y);
+    int max_x = SV_MAX(0, (max_line_cols(tb) + 4) * tb->char_w - text_area_w(tb));
+    tb->scroll_x = SV_CLAMP(tb->scroll_x, 0, max_x);
+}
+
+static void ensure_visible(TextBox* tb) {
+    int vis = visible_lines(tb);
+    if (tb->cursor_line < tb->scroll_y) tb->scroll_y = tb->cursor_line;
+    else if (tb->cursor_line >= tb->scroll_y + vis) tb->scroll_y = tb->cursor_line - vis + 1;
+
+    int cx = tb->cursor_col * tb->char_w;
+    int aw = text_area_w(tb);
+    if (cx - tb->scroll_x < 0)
+        tb->scroll_x = SV_MAX(0, cx - tb->char_w * 8);
+    else if (cx - tb->scroll_x > aw - tb->char_w * 3)
+        tb->scroll_x = cx - aw + tb->char_w * 8;
+    clamp_scroll(tb);
+}
+
+static void reset_blink(TextBox* tb) {
+    tb->cursor_visible = true;
+    tb->cursor_blink   = platform_time_ms();
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  Annulla / ripeti
+// ═════════════════════════════════════════════════════════════════
+
+static TextSnapshot snapshot_take(const TextBox* tb) {
+    TextSnapshot s;
+    s.text = malloc(tb->text_len + 1);
+    if (s.text) memcpy(s.text, tb->text, tb->text_len + 1);
+    s.cursor = tb->cursor_pos;
+    s.anchor = tb->sel_anchor;
+    return s;
+}
+
+static void clear_redo(TextBox* tb) {
+    for (int i = 0; i < tb->redo_count; i++) free(tb->redo[i].text);
+    tb->redo_count = 0;
+}
+
+static void stack_push(TextSnapshot* stack, int* count, TextSnapshot s) {
+    if (*count == TEXTBOX_UNDO_CAP) {
+        free(stack[0].text);
+        memmove(stack, stack + 1, (TEXTBOX_UNDO_CAP - 1) * sizeof(TextSnapshot));
+        (*count)--;
+    }
+    stack[(*count)++] = s;
+}
+
+static void undo_push(TextBox* tb, int kind) {
+    uint64_t now = platform_time_ms();
+    bool coalesce = (kind == EDIT_TYPE || kind == EDIT_DELETE) &&
+                    kind == tb->last_edit_kind &&
+                    now - tb->last_edit_ms < 1500 &&
+                    tb->undo_count > 0;
+    tb->last_edit_kind = kind;
+    tb->last_edit_ms   = now;
+    clear_redo(tb);
+    if (coalesce) return;
+    stack_push(tb->undo, &tb->undo_count, snapshot_take(tb));
+}
+
+static void restore_snapshot(TextBox* tb, TextSnapshot* s) {
+    int len = (int)strlen(s->text);
+    if (len + 1 > tb->text_cap) {
+        tb->text_cap = len + 1024;
+        tb->text = realloc(tb->text, tb->text_cap);
+    }
+    memcpy(tb->text, s->text, len + 1);
+    tb->text_len   = len;
+    rebuild_lines(tb);
+    tb->cursor_pos = SV_CLAMP(s->cursor, 0, len);
+    tb->sel_anchor = (s->anchor >= 0 && s->anchor <= len) ? s->anchor : -1;
     update_cursor_linecol(tb);
+    tb->pref_col = tb->cursor_col;
+    tb->error_line = -1;
+    ensure_visible(tb);
+    reset_blink(tb);
+    if (tb->on_change) tb->on_change(tb->text, tb->base.user_data);
 }
 
-// cancella il carattere dopo il cursore (delete)
-static void textbox_delete_char(TextBox* tb) {
-    if (tb->cursor_pos >= tb->text_len) return;
-    memmove(tb->text + tb->cursor_pos,
-            tb->text + tb->cursor_pos + 1,
-            tb->text_len - tb->cursor_pos - 1);
-    tb->text_len--;
-    tb->text[tb->text_len] = '\0';
+static void do_undo(TextBox* tb) {
+    if (tb->undo_count == 0) return;
+    stack_push(tb->redo, &tb->redo_count, snapshot_take(tb));
+    TextSnapshot s = tb->undo[--tb->undo_count];
+    restore_snapshot(tb, &s);
+    free(s.text);
+    tb->last_edit_kind = EDIT_NONE;
 }
 
-// inserisce un singolo carattere alla posizione del cursore
-static void textbox_insert_char(TextBox* tb, char c) {
-    if (tb->text_len >= TEXTBOX_MAX_LEN - 1) return;
-    memmove(tb->text + tb->cursor_pos + 1,
-            tb->text + tb->cursor_pos,
-            tb->text_len - tb->cursor_pos);
-    tb->text[tb->cursor_pos] = c;
-    tb->cursor_pos++;
-    tb->text_len++;
-    tb->text[tb->text_len] = '\0';
+static void do_redo(TextBox* tb) {
+    if (tb->redo_count == 0) return;
+    stack_push(tb->undo, &tb->undo_count, snapshot_take(tb));
+    TextSnapshot s = tb->redo[--tb->redo_count];
+    restore_snapshot(tb, &s);
+    free(s.text);
+    tb->last_edit_kind = EDIT_NONE;
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  Modifica del testo (tutte le modifiche passano da replace_range)
+// ═════════════════════════════════════════════════════════════════
+
+static void replace_range(TextBox* tb, int start, int end, const char* s, int slen) {
+    if (slen < 0) slen = (int)strlen(s);
+    start = SV_CLAMP(start, 0, tb->text_len);
+    end   = SV_CLAMP(end, start, tb->text_len);
+
+    // s potrebbe puntare dentro tb->text: copia di sicurezza
+    char* tmp = NULL;
+    if (s >= tb->text && s < tb->text + tb->text_cap) {
+        tmp = malloc(slen + 1);
+        if (!tmp) return;
+        memcpy(tmp, s, slen);
+        s = tmp;
+    }
+
+    int new_len = tb->text_len - (end - start) + slen;
+    if (new_len > TEXTBOX_MAX_LEN - 1) {
+        slen -= new_len - (TEXTBOX_MAX_LEN - 1);
+        while (slen > 0 && is_cont(s[slen])) slen--;
+        if (slen < 0) { free(tmp); return; }
+        new_len = tb->text_len - (end - start) + slen;
+    }
+    if (new_len + 1 > tb->text_cap) {
+        int cap = SV_MAX(tb->text_cap * 2, new_len + 1024);
+        char* nt = realloc(tb->text, cap);
+        if (!nt) { free(tmp); return; }
+        tb->text = nt;
+        tb->text_cap = cap;
+    }
+
+    memmove(tb->text + start + slen, tb->text + end, tb->text_len - end);
+    memcpy(tb->text + start, s, slen);
+    tb->text_len = new_len;
+    tb->text[new_len] = '\0';
+    free(tmp);
+
+    tb->cursor_pos = start + slen;
+    tb->sel_anchor = -1;
+    rebuild_lines(tb);
     update_cursor_linecol(tb);
+    tb->pref_col   = tb->cursor_col;
+    tb->error_line = -1;
+    ensure_visible(tb);
+    reset_blink(tb);
+    if (tb->on_change) tb->on_change(tb->text, tb->base.user_data);
 }
 
-// tronca `src` in `dst` in modo che la sua larghezza in pixel non superi `max_px`. Aggiunge "…" se troncato.
-// `win` serve per misurare la larghezza carattere per carattere.
-static void clip_text(PlatformWindow* win, const char* src, char* dst, size_t dst_cap, int max_px, int font_size) {
-    int len = (int)strlen(src);
+// inserisce testo "pulito" (niente \r, tab convertiti in spazi) al posto della selezione
+static void insert_text(TextBox* tb, const char* s, int kind) {
+    int len = (int)strlen(s);
+    char* clean = malloc(len * INDENT + 1);
+    if (!clean) return;
+    int j = 0;
+    for (int i = 0; i < len; i++) {
+        if (s[i] == '\r') continue;
+        if (s[i] == '\t') { for (int k = 0; k < INDENT; k++) clean[j++] = ' '; continue; }
+        clean[j++] = s[i];
+    }
+    clean[j] = '\0';
 
-    // misura l'intera stringa
-    int full_w = platform_measure_text(win, src, font_size);
-    if (full_w <= max_px) {
-        // Entra tutta: copia direttamente
-        snprintf(dst, dst_cap, "%s", src);
+    int a, b;
+    sel_range(tb, &a, &b);
+    undo_push(tb, kind);
+    replace_range(tb, a, b, clean, j);
+    free(clean);
+}
+
+static void delete_range(TextBox* tb, int a, int b, int kind) {
+    if (a >= b) return;
+    undo_push(tb, kind);
+    replace_range(tb, a, b, "", 0);
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  Movimento del cursore
+// ═════════════════════════════════════════════════════════════════
+
+static void move_cursor(TextBox* tb, int pos, bool select, bool keep_pref) {
+    if (select) {
+        if (tb->sel_anchor < 0) tb->sel_anchor = tb->cursor_pos;
+    } else {
+        tb->sel_anchor = -1;
+    }
+    tb->cursor_pos = SV_CLAMP(pos, 0, tb->text_len);
+    update_cursor_linecol(tb);
+    if (!keep_pref) tb->pref_col = tb->cursor_col;
+    tb->last_edit_kind = EDIT_NONE;
+    ensure_visible(tb);
+    reset_blink(tb);
+}
+
+static int word_left(const TextBox* tb, int p) {
+    if (p <= 0) return 0;
+    while (p > 0 && tb->text[p - 1] == ' ') p--;
+    if (p > 0 && is_word_char(tb->text[p - 1])) {
+        while (p > 0 && is_word_char(tb->text[p - 1])) p--;
+    } else if (p > 0) {
+        p = utf8_prev(tb, p);
+    }
+    return p;
+}
+
+static int word_right(const TextBox* tb, int p) {
+    int n = tb->text_len;
+    if (p >= n) return n;
+    if (is_word_char(tb->text[p])) {
+        while (p < n && is_word_char(tb->text[p])) p++;
+    } else if (tb->text[p] != ' ') {
+        p = utf8_next(tb, p);
+    }
+    while (p < n && tb->text[p] == ' ') p++;
+    return p;
+}
+
+static void select_word_at(TextBox* tb, int off) {
+    int a = off, b = off;
+    if (off < tb->text_len && is_word_char(tb->text[off])) {
+        while (a > 0 && is_word_char(tb->text[a - 1])) a--;
+        while (b < tb->text_len && is_word_char(tb->text[b])) b++;
+    } else if (off > 0 && is_word_char(tb->text[off - 1])) {
+        while (a > 0 && is_word_char(tb->text[a - 1])) a--;
+    } else {
+        b = utf8_next(tb, off);
+    }
+    tb->sel_anchor = a;
+    tb->cursor_pos = b;
+    update_cursor_linecol(tb);
+    tb->pref_col = tb->cursor_col;
+}
+
+static void select_lines(TextBox* tb, int l0, int l1) {
+    tb->sel_anchor = line_start(tb, l0);
+    tb->cursor_pos = (l1 + 1 < tb->num_lines) ? line_start(tb, l1 + 1) : tb->text_len;
+    update_cursor_linecol(tb);
+    tb->pref_col = tb->cursor_col;
+}
+
+static int hit_offset(const TextBox* tb, int mx, int my) {
+    Rect b = tb->base.bounds;
+    int rel_y = my - b.y - tb->pad_top;
+    int l = tb->scroll_y + (rel_y >= 0 ? rel_y / tb->line_height : -1);
+    if (l < 0) return 0;
+    if (l >= tb->num_lines) return tb->text_len;
+    int rel_x = mx - text_x0(tb) + tb->scroll_x;
+    int col = rel_x <= 0 ? 0 : (rel_x + tb->char_w / 2) / tb->char_w;
+    return offset_at_col(tb, l, col);
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  Operazioni su blocchi di righe
+// ═════════════════════════════════════════════════════════════════
+
+// righe coinvolte dalla selezione (o la riga del cursore)
+static void selected_lines(const TextBox* tb, int* l0, int* l1) {
+    int a, b;
+    sel_range(tb, &a, &b);
+    *l0 = line_of(tb, a);
+    *l1 = line_of(tb, b);
+    if (*l1 > *l0 && b == line_start(tb, *l1)) (*l1)--; // selezione che finisce a inizio riga
+}
+
+// sostituisce il blocco di righe l0..l1 con new_block e lo riseleziona
+static void replace_lines(TextBox* tb, int l0, int l1, const char* new_block, int len, bool reselect,
+                          int cursor_delta) {
+    int a = line_start(tb, l0), b = line_end(tb, l1);
+    int old_cursor = tb->cursor_pos;
+    undo_push(tb, EDIT_OTHER);
+    replace_range(tb, a, b, new_block, len);
+    if (reselect && l1 > l0) {
+        tb->sel_anchor = a;
+        tb->cursor_pos = a + len;
+    } else {
+        tb->cursor_pos = SV_CLAMP(old_cursor + cursor_delta, a, a + len);
+    }
+    update_cursor_linecol(tb);
+    tb->pref_col = tb->cursor_col;
+    ensure_visible(tb);
+}
+
+static void indent_lines(TextBox* tb, bool outdent) {
+    int l0, l1;
+    selected_lines(tb, &l0, &l1);
+    int a = line_start(tb, l0), b = line_end(tb, l1);
+    char* out = malloc((b - a) + (l1 - l0 + 1) * INDENT + 1);
+    if (!out) return;
+    int j = 0, delta_first = 0;
+    for (int l = l0; l <= l1; l++) {
+        int ls = line_start(tb, l), le = line_end(tb, l);
+        int skip = 0;
+        if (outdent) {
+            while (skip < INDENT && ls + skip < le && tb->text[ls + skip] == ' ') skip++;
+            if (l == tb->cursor_line) delta_first = -SV_MIN(skip, tb->cursor_pos - ls);
+        } else {
+            if (ls < le) { for (int k = 0; k < INDENT; k++) out[j++] = ' '; }
+            if (l == tb->cursor_line && ls < le) delta_first = INDENT;
+        }
+        memcpy(out + j, tb->text + ls + skip, le - ls - skip);
+        j += le - ls - skip;
+        if (l < l1) out[j++] = '\n';
+    }
+    replace_lines(tb, l0, l1, out, j, true, delta_first);
+    free(out);
+}
+
+static void toggle_comment(TextBox* tb) {
+    int l0, l1;
+    selected_lines(tb, &l0, &l1);
+
+    // tutte le righe non vuote sono già commentate?
+    bool all = true;
+    int min_indent = 1 << 30;
+    for (int l = l0; l <= l1; l++) {
+        int fns = first_non_space(tb, l), le = line_end(tb, l);
+        if (fns == le) continue;
+        min_indent = SV_MIN(min_indent, fns - line_start(tb, l));
+        if (!(le - fns >= 2 && tb->text[fns] == '-' && tb->text[fns + 1] == '-')) all = false;
+    }
+    if (min_indent == (1 << 30)) return; // solo righe vuote
+
+    int a = line_start(tb, l0), b = line_end(tb, l1);
+    char* out = malloc((b - a) + (l1 - l0 + 1) * 3 + 1);
+    if (!out) return;
+    int j = 0, delta = 0;
+    for (int l = l0; l <= l1; l++) {
+        int ls = line_start(tb, l), le = line_end(tb, l), fns = first_non_space(tb, l);
+        if (fns == le) {
+            memcpy(out + j, tb->text + ls, le - ls); j += le - ls;
+        } else if (all) {
+            int rm = 2 + ((fns + 2 < le && tb->text[fns + 2] == ' ') ? 1 : 0);
+            memcpy(out + j, tb->text + ls, fns - ls); j += fns - ls;
+            memcpy(out + j, tb->text + fns + rm, le - fns - rm); j += le - fns - rm;
+            if (l == tb->cursor_line) delta = -rm;
+        } else {
+            int ins = ls + min_indent;
+            memcpy(out + j, tb->text + ls, ins - ls); j += ins - ls;
+            memcpy(out + j, "-- ", 3); j += 3;
+            memcpy(out + j, tb->text + ins, le - ins); j += le - ins;
+            if (l == tb->cursor_line) delta = 3;
+        }
+        if (l < l1) out[j++] = '\n';
+    }
+    replace_lines(tb, l0, l1, out, j, true, delta);
+    free(out);
+}
+
+static void duplicate(TextBox* tb) {
+    if (has_sel(tb)) {
+        int a, b;
+        sel_range(tb, &a, &b);
+        char* copy = malloc(b - a + 1);
+        if (!copy) return;
+        memcpy(copy, tb->text + a, b - a);
+        undo_push(tb, EDIT_OTHER);
+        replace_range(tb, b, b, copy, b - a);
+        tb->sel_anchor = b;
+        free(copy);
         return;
     }
-
-    // Misura "…" una volta sola
-    int ellipsis_w = platform_measure_text(win, "\xe2\x80\xa6", font_size);
-    int available  = max_px - ellipsis_w;
-
-    // Trova quanti caratteri stanno nell'area disponibile
-    char tmp[4096] = {0};
-    int  fit = 0;
-    for (int i = 0; i < len && i < (int)sizeof(tmp) - 1; i++) {
-        tmp[i] = src[i];
-        tmp[i + 1] = '\0';
-        if (platform_measure_text(win, tmp, font_size) > available) break;
-        fit = i + 1;
-    }
-
-    // Scrivi i caratteri che stanno + "…"
-    snprintf(dst, dst_cap, "%.*s\xe2\x80\xa6", fit, src);
+    int l = tb->cursor_line, col = tb->cursor_col;
+    int ls = line_start(tb, l), le = line_end(tb, l);
+    char* copy = malloc(le - ls + 2);
+    if (!copy) return;
+    copy[0] = '\n';
+    memcpy(copy + 1, tb->text + ls, le - ls);
+    undo_push(tb, EDIT_OTHER);
+    replace_range(tb, le, le, copy, le - ls + 1);
+    free(copy);
+    move_cursor(tb, offset_at_col(tb, l + 1, col), false, false);
 }
 
-// -- draw --
-static void textbox_draw(Widget* self, PlatformWindow* win) {
-    TextBox* tb = (TextBox*)self;
-    Rect b = self->bounds;
+// ═════════════════════════════════════════════════════════════════
+//  Appunti
+// ═════════════════════════════════════════════════════════════════
 
-    // Sfondo
-    platform_fill_rect(win, b, tb->color_bg);
+static void copy_to_clipboard(TextBox* tb, bool cut) {
+    if (!tb->win) return;
+    int a, b;
+    if (has_sel(tb)) {
+        sel_range(tb, &a, &b);
+    } else {
+        // nessuna selezione: copia/taglia l'intera riga
+        int l = tb->cursor_line;
+        a = line_start(tb, l);
+        b = (l + 1 < tb->num_lines) ? line_start(tb, l + 1) : tb->text_len;
+        if (a == b) return;
+    }
+    char* s = malloc(b - a + 2);
+    if (!s) return;
+    memcpy(s, tb->text + a, b - a);
+    int n = b - a;
+    if (!has_sel(tb) && (n == 0 || s[n - 1] != '\n')) s[n++] = '\n';
+    s[n] = '\0';
+    platform_set_clipboard(tb->win, s);
+    free(s);
+    if (cut) delete_range(tb, a, b, EDIT_OTHER);
+}
 
-    // Bordo: ciano se focused, grigio altrimenti
-    platform_draw_rect(
-        win,
-        b,
-        self->state == WIDGET_STATE_FOCUSED ? (Color){100, 210, 255, 255} : (Color){70,  70,  80,  255},
-        1);
+static void paste_from_clipboard(TextBox* tb) {
+    if (!tb->win) return;
+    char* s = platform_get_clipboard(tb->win);
+    if (!s) return;
+    insert_text(tb, s, EDIT_OTHER);
+    free(s);
+}
 
-    // Larghezza colonna numeri di riga
-    int line_num_w  = tb->show_line_nums ? 48 : 0;
-    int text_area_x = b.x + line_num_w + 4;
-    int text_area_w = b.w - line_num_w - 8; // larghezza disponibile per il testo
+// ═════════════════════════════════════════════════════════════════
+//  Input
+// ═════════════════════════════════════════════════════════════════
 
-    // Separatore fra numeri di riga e area testo
-    if (tb->show_line_nums) {
-        platform_draw_line(win,
-            (Point){b.x + line_num_w, b.y},
-            (Point){b.x + line_num_w, b.y + b.h},
-            (Color){50, 50, 65, 255}, 1);
+static char char_at(const TextBox* tb, int pos) {
+    return (pos >= 0 && pos < tb->text_len) ? tb->text[pos] : '\0';
+}
+
+static void wrap_selection(TextBox* tb, const char* open, const char* close) {
+    int a, b;
+    sel_range(tb, &a, &b);
+    int ol = (int)strlen(open), cl = (int)strlen(close);
+    char* buf = malloc(b - a + ol + cl + 1);
+    if (!buf) return;
+    memcpy(buf, open, ol);
+    memcpy(buf + ol, tb->text + a, b - a);
+    memcpy(buf + ol + (b - a), close, cl);
+    undo_push(tb, EDIT_OTHER);
+    replace_range(tb, a, b, buf, b - a + ol + cl);
+    tb->sel_anchor = a + ol;
+    tb->cursor_pos = b + ol;
+    update_cursor_linecol(tb);
+    free(buf);
+}
+
+static void insert_pair(TextBox* tb, const char* pair) {
+    undo_push(tb, EDIT_OTHER);
+    int a, b;
+    sel_range(tb, &a, &b);
+    replace_range(tb, a, b, pair, 2);
+    move_cursor(tb, tb->cursor_pos - 1, false, false);
+}
+
+static void handle_char(TextBox* tb, uint32_t cp) {
+    char next = char_at(tb, tb->cursor_pos);
+    char prev = char_at(tb, tb->cursor_pos - 1);
+    bool sel  = has_sel(tb);
+
+    // sovrascrittura della chiusura già inserita automaticamente
+    if (!sel && (cp == ')' || cp == ']') && next == (char)cp) {
+        move_cursor(tb, tb->cursor_pos + 1, false, false);
+        return;
+    }
+    if (cp == '\'' || cp == '"' || cp == '`') {
+        char q[3] = {(char)cp, (char)cp, 0};
+        if (!sel && next == (char)cp) { move_cursor(tb, tb->cursor_pos + 1, false, false); return; }
+        if (sel) { wrap_selection(tb, q + 1, q + 1); return; }
+        if (!is_word_char(prev) && !is_word_char(next)) { insert_pair(tb, q); return; }
+    }
+    if (cp == '(') {
+        if (sel) { wrap_selection(tb, "(", ")"); return; }
+        if (next == '\0' || next == ' ' || next == '\n' || next == ')' || next == ',' || next == ';') {
+            insert_pair(tb, "()");
+            return;
+        }
     }
 
-    // righe visibili
-    int first_line   = tb->scroll_y;
-    int visible_lines = b.h / tb->line_height;
-    int i            = 0;
+    char buf[5] = {0};
+    utf8_encode(cp, buf);
+    insert_text(tb, buf, EDIT_TYPE);
+    if (cp == ' ') tb->last_edit_kind = EDIT_NONE; // ogni parola è un passo di annulla
+}
 
-    // salta le righe prima dello scroll
-    int line = 0;
-    while (i < tb->text_len && line < first_line) {
-        if (tb->text[i] == '\n') line++;
-        i++;
+static void handle_enter(TextBox* tb) {
+    int l = tb->cursor_line;
+    int ls = line_start(tb, l);
+    int indent = 0;
+    while (ls + indent < tb->cursor_pos && tb->text[ls + indent] == ' ') indent++;
+
+    // carattere non-spazio prima del cursore
+    int p = tb->cursor_pos;
+    while (p > ls && tb->text[p - 1] == ' ') p--;
+    bool after_open = p > ls && tb->text[p - 1] == '(';
+    bool before_close = char_at(tb, tb->cursor_pos) == ')';
+
+    char buf[512];
+    int n = 0;
+    buf[n++] = '\n';
+    int ind = SV_MIN(indent + (after_open ? INDENT : 0), 200);
+    for (int i = 0; i < ind; i++) buf[n++] = ' ';
+    int cursor_at = n;
+    if (after_open && before_close) {
+        buf[n++] = '\n';
+        for (int i = 0; i < SV_MIN(indent, 200); i++) buf[n++] = ' ';
     }
+    buf[n] = '\0';
 
-    // disegns ogni riga visibile
-    int draw_line = 0;
-    int line_start = i;
+    int a, b;
+    sel_range(tb, &a, &b);
+    undo_push(tb, EDIT_OTHER);
+    replace_range(tb, a, b, buf, n);
+    move_cursor(tb, a + cursor_at, false, false);
+}
 
-    while (i <= tb->text_len && draw_line < visible_lines) {
-        if (i == tb->text_len || tb->text[i] == '\n') {
-            int ry = b.y + draw_line * tb->line_height + 2;
+static void handle_backspace(TextBox* tb, bool ctrl) {
+    if (has_sel(tb)) {
+        int a, b;
+        sel_range(tb, &a, &b);
+        delete_range(tb, a, b, EDIT_OTHER);
+        return;
+    }
+    int pos = tb->cursor_pos;
+    if (pos == 0) return;
+    if (ctrl) { delete_range(tb, word_left(tb, pos), pos, EDIT_OTHER); return; }
 
-            // numero di riga
-            if (tb->show_line_nums) {
-                char num[16];
-                snprintf(num, sizeof(num), "%d",
-                         first_line + draw_line + 1);
-                platform_draw_text(win, num,
-                    (Point){b.x + 4, ry},
-                    tb->color_line_num, tb->font_size);
+    char prev = char_at(tb, pos - 1), next = char_at(tb, pos);
+    // coppia vuota "()" o "''": cancella entrambi
+    if ((prev == '(' && next == ')') || ((prev == '\'' || prev == '"' || prev == '`') && next == prev)) {
+        delete_range(tb, pos - 1, pos + 1, EDIT_DELETE);
+        return;
+    }
+    // indentazione: torna al multiplo di INDENT precedente
+    int ls = line_start(tb, tb->cursor_line);
+    bool only_spaces = true;
+    for (int i = ls; i < pos; i++) if (tb->text[i] != ' ') { only_spaces = false; break; }
+    if (only_spaces && pos - ls > 0) {
+        int col = pos - ls;
+        int target = ((col - 1) / INDENT) * INDENT;
+        delete_range(tb, ls + target, pos, EDIT_DELETE);
+        return;
+    }
+    delete_range(tb, utf8_prev(tb, pos), pos, EDIT_DELETE);
+}
+
+static void handle_delete(TextBox* tb, bool ctrl) {
+    if (has_sel(tb)) {
+        int a, b;
+        sel_range(tb, &a, &b);
+        delete_range(tb, a, b, EDIT_OTHER);
+        return;
+    }
+    int pos = tb->cursor_pos;
+    if (pos >= tb->text_len) return;
+    int end = ctrl ? word_right(tb, pos) : utf8_next(tb, pos);
+    delete_range(tb, pos, end, EDIT_DELETE);
+}
+
+static void zoom(TextBox* tb, int delta) {
+    if (delta == 0) tb->font_size = TH_FONT_MONO;
+    else tb->font_size = SV_CLAMP(tb->font_size + delta, 10, 28);
+}
+
+static bool handle_key(TextBox* tb, sEvent* evt) {
+    bool ctrl  = evt->modifiers & SV_MOD_CTRL;
+    bool shift = evt->modifiers & SV_MOD_SHIFT;
+    int  vis   = visible_lines(tb);
+
+    switch (evt->key) {
+        case KEY_ENTER:
+            if (ctrl) {
+                if (tb->on_execute) tb->on_execute(tb->text, tb->base.user_data);
+            } else {
+                handle_enter(tb);
+            }
+            return true;
+
+        case KEY_BACKSPACE: handle_backspace(tb, ctrl); return true;
+        case KEY_DELETE:    handle_delete(tb, ctrl);    return true;
+
+        case KEY_LEFT: {
+            int a, b;
+            sel_range(tb, &a, &b);
+            if (has_sel(tb) && !shift) { move_cursor(tb, a, false, false); return true; }
+            int p = ctrl ? word_left(tb, tb->cursor_pos) : utf8_prev(tb, tb->cursor_pos);
+            move_cursor(tb, p, shift, false);
+            return true;
+        }
+        case KEY_RIGHT: {
+            int a, b;
+            sel_range(tb, &a, &b);
+            if (has_sel(tb) && !shift) { move_cursor(tb, b, false, false); return true; }
+            int p = ctrl ? word_right(tb, tb->cursor_pos) : utf8_next(tb, tb->cursor_pos);
+            move_cursor(tb, p, shift, false);
+            return true;
+        }
+        case KEY_UP:
+            if (ctrl) { tb->scroll_y--; clamp_scroll(tb); return true; }
+            if (tb->cursor_line == 0) move_cursor(tb, 0, shift, false);
+            else move_cursor(tb, offset_at_col(tb, tb->cursor_line - 1, tb->pref_col), shift, true);
+            return true;
+
+        case KEY_DOWN:
+            if (ctrl) { tb->scroll_y++; clamp_scroll(tb); return true; }
+            if (tb->cursor_line >= tb->num_lines - 1) move_cursor(tb, tb->text_len, shift, false);
+            else move_cursor(tb, offset_at_col(tb, tb->cursor_line + 1, tb->pref_col), shift, true);
+            return true;
+
+        case KEY_PAGEUP: {
+            int l = SV_MAX(0, tb->cursor_line - vis);
+            tb->scroll_y -= vis;
+            move_cursor(tb, offset_at_col(tb, l, tb->pref_col), shift, true);
+            return true;
+        }
+        case KEY_PAGEDOWN: {
+            int l = SV_MIN(tb->num_lines - 1, tb->cursor_line + vis);
+            tb->scroll_y += vis;
+            clamp_scroll(tb);
+            move_cursor(tb, offset_at_col(tb, l, tb->pref_col), shift, true);
+            return true;
+        }
+        case KEY_HOME: {
+            if (ctrl) { move_cursor(tb, 0, shift, false); return true; }
+            // "smart home": primo carattere non spazio, poi inizio riga
+            int fns = first_non_space(tb, tb->cursor_line);
+            int ls  = line_start(tb, tb->cursor_line);
+            move_cursor(tb, tb->cursor_pos == fns ? ls : fns, shift, false);
+            return true;
+        }
+        case KEY_END:
+            if (ctrl) move_cursor(tb, tb->text_len, shift, false);
+            else      move_cursor(tb, line_end(tb, tb->cursor_line), shift, false);
+            return true;
+
+        case KEY_TAB: {
+            if (shift) { indent_lines(tb, true); return true; }
+            if (has_sel(tb)) {
+                int a, b;
+                sel_range(tb, &a, &b);
+                if (line_of(tb, a) != line_of(tb, b)) { indent_lines(tb, false); return true; }
+            }
+            int spaces = INDENT - (tb->cursor_col % INDENT);
+            char buf[INDENT + 1] = "    ";
+            buf[spaces] = '\0';
+            insert_text(tb, buf, EDIT_OTHER);
+            return true;
+        }
+        case KEY_ESCAPE:
+            if (has_sel(tb)) { tb->sel_anchor = -1; return true; }
+            return false;
+
+        case KEY_LETTER:
+            if (!ctrl) return false;
+            switch (evt->character) {
+                case 'a':
+                    tb->sel_anchor = 0;
+                    tb->cursor_pos = tb->text_len;
+                    update_cursor_linecol(tb);
+                    return true;
+                case 'c': copy_to_clipboard(tb, false); return true;
+                case 'x': copy_to_clipboard(tb, true);  return true;
+                case 'v': paste_from_clipboard(tb);     return true;
+                case 'z': if (shift) do_redo(tb); else do_undo(tb); return true;
+                case 'y': do_redo(tb); return true;
+                case 'd': duplicate(tb); return true;
+                case '/': toggle_comment(tb); return true;
+                case '7': if (shift) { toggle_comment(tb); return true; } return false; // Ctrl+/ su tastiera italiana
+                case '=': case '+': zoom(tb, +1); return true;
+                case '-': zoom(tb, -1); return true;
+                case '0': zoom(tb, 0);  return true;
+                default: return false;
             }
 
-            // testo della riga con clipping
-            int line_len = i - line_start;
-            if (line_len > 0) {
-                // copia la riga in un buffer temporaneo
-                char raw[4096] = {0};
-                int  copy_len  = line_len < 4095 ? line_len : 4095;
-                memcpy(raw, tb->text + line_start, copy_len);
-
-                // tronca se supera text_area_w
-                char clipped[4096];
-                clip_text(win, raw, clipped, sizeof(clipped), text_area_w, tb->font_size);
-
-                platform_draw_text(win, clipped,(Point){text_area_x, ry},tb->color_text, tb->font_size);
-            }
-
-            draw_line++;
-            line_start = i + 1;
-        }
-        i++;
-    }
-
-    // ── CURSORE (solo se focused e visibile per il blink) ────────
-    if (self->state == WIDGET_STATE_FOCUSED && tb->cursor_visible) {
-        // misura la larghezza reale dei caratteri fino al cursore
-        char line_before_cursor[4096] = {0};
-        int idx = 0;
-        while (idx < tb->cursor_pos) {
-            idx++;
-        }
-        // ora risali per trovare l'inizio della riga
-        int line_start_idx = tb->cursor_pos - tb->cursor_col;
-        int copy = tb->cursor_col < 4095 ? tb->cursor_col : 4095;
-        memcpy(line_before_cursor, tb->text + line_start_idx, copy);
-        line_before_cursor[copy] = '\0';
-
-        int cx = text_area_x + platform_measure_text(win, line_before_cursor, tb->font_size);
-        int cy = b.y + (tb->cursor_line - first_line) * tb->line_height;
-
-        if (cx < b.x + b.w - 4) {
-            platform_fill_rect(win,
-                (Rect){cx, cy, 2, tb->line_height},
-                tb->color_cursor);
-        }
+        default:
+            return false;
     }
 }
 
-// -- Event handler --
 static bool textbox_handle_event(Widget* self, sEvent* evt) {
     TextBox* tb = (TextBox*)self;
+    bool focused = self->state == WIDGET_STATE_FOCUSED;
 
     switch (evt->type) {
+        case EVT_MOUSE_DOWN: {
+            if (!widget_contains_point(self, evt->mouse_x, evt->mouse_y)) {
+                if (focused) self->state = WIDGET_STATE_NORMAL; // click fuori: perde il focus
+                return false;
+            }
+            self->state = WIDGET_STATE_FOCUSED;
+            reset_blink(tb);
+            if (evt->mouse_button != SV_MOUSE_LEFT) return true;
 
-        case EVT_MOUSE_DOWN:
-            if (widget_contains_point(self, evt->mouse_x, evt->mouse_y)) {
-                self->state = WIDGET_STATE_FOCUSED;
+            uint64_t now = platform_time_ms();
+            if (now - tb->last_click_ms < 400 &&
+                abs(evt->mouse_x - tb->last_click_x) < 5 && abs(evt->mouse_y - tb->last_click_y) < 5)
+                tb->click_count = tb->click_count % 3 + 1;
+            else
+                tb->click_count = 1;
+            tb->last_click_ms = now;
+            tb->last_click_x  = evt->mouse_x;
+            tb->last_click_y  = evt->mouse_y;
+
+            int off = hit_offset(tb, evt->mouse_x, evt->mouse_y);
+            bool in_gutter = evt->mouse_x < self->bounds.x + tb->gutter_w;
+
+            if (in_gutter) {
+                int l = line_of(tb, off);
+                select_lines(tb, l, l);
+            } else if (tb->click_count == 2) {
+                select_word_at(tb, off);
+            } else if (tb->click_count == 3) {
+                int l = line_of(tb, off);
+                select_lines(tb, l, l);
+            } else if (evt->modifiers & SV_MOD_SHIFT) {
+                move_cursor(tb, off, true, false);
+            } else {
+                move_cursor(tb, off, false, false);
+                tb->sel_anchor = tb->cursor_pos;
+            }
+            tb->dragging = tb->click_count == 1;
+            tb->last_edit_kind = EDIT_NONE;
+            return true;
+        }
+
+        case EVT_MOUSE_MOVE:
+            if (tb->dragging) {
+                Rect b = self->bounds;
+                // auto-scroll trascinando oltre i bordi
+                if (evt->mouse_y < b.y) tb->scroll_y--;
+                else if (evt->mouse_y > b.y + b.h) tb->scroll_y++;
+                clamp_scroll(tb);
+                int off = hit_offset(tb, evt->mouse_x, evt->mouse_y);
+                if (tb->sel_anchor < 0) tb->sel_anchor = tb->cursor_pos;
+                tb->cursor_pos = off;
+                update_cursor_linecol(tb);
+                tb->pref_col = tb->cursor_col;
+                ensure_visible(tb);
+                reset_blink(tb);
                 return true;
             }
-            // click fuori: perde il focus
-            if (self->state == WIDGET_STATE_FOCUSED)
-                self->state = WIDGET_STATE_NORMAL;
-            break;
+            return false;
+
+        case EVT_MOUSE_UP:
+            if (tb->dragging) { tb->dragging = false; return true; }
+            return false;
+
+        case EVT_MOUSE_WHEEL:
+            if (!widget_contains_point(self, evt->mouse_x, evt->mouse_y)) return false;
+            if (evt->modifiers & SV_MOD_CTRL)       zoom(tb, evt->wheel_delta > 0 ? 1 : -1);
+            else if (evt->modifiers & SV_MOD_SHIFT) tb->scroll_x -= evt->wheel_delta * tb->char_w * 6;
+            else                                    tb->scroll_y -= evt->wheel_delta * 3;
+            clamp_scroll(tb);
+            return true;
 
         case EVT_CHAR:
-            if (self->state != WIDGET_STATE_FOCUSED) return false;
-            // Ignora i caratteri di controllo (backspace, tab, invio, escape...):
-            // sono già gestiti da EVT_KEY_DOWN più sotto. Su Windows, WM_CHAR
-            // li manda comunque insieme al tasto, e se non li filtriamo finiscono
-            // inseriti come testo letterale (da qui il carattere strano "[?]").
-            if (evt->character < 0x20 || evt->character == 0x7F) return false;
-            textbox_insert_char(tb, (char)evt->character);
-            if (tb->on_change)
-                tb->on_change(tb->text, self->user_data);
+            if (!focused) return false;
+            handle_char(tb, evt->character);
             return true;
 
         case EVT_KEY_DOWN:
-            if (self->state != WIDGET_STATE_FOCUSED) return false;
-
-            switch (evt->key) {
-                case KEY_BACKSPACE:
-                    textbox_backspace(tb);
-                    if (tb->on_change)
-                        tb->on_change(tb->text, self->user_data);
-                    return true;
-
-                case KEY_DELETE:
-                    textbox_delete_char(tb);
-                    if (tb->on_change)
-                        tb->on_change(tb->text, self->user_data);
-                    return true;
-
-                case KEY_LEFT:
-                    if (tb->cursor_pos > 0) tb->cursor_pos--;
-                    update_cursor_linecol(tb);
-                    return true;
-
-                case KEY_RIGHT:
-                    if (tb->cursor_pos < tb->text_len) tb->cursor_pos++;
-                    update_cursor_linecol(tb);
-                    return true;
-
-                case KEY_UP:
-                    if (tb->scroll_y > 0) tb->scroll_y--;
-                    return true;
-
-                case KEY_DOWN:
-                    tb->scroll_y++;
-                    return true;
-
-                case KEY_ENTER:
-                    textbox_insert_char(tb, '\n');
-                    if (tb->on_change)
-                        tb->on_change(tb->text, self->user_data);
-                    return true;
-
-                default: break;
-            }
-            break;
+            if (!focused) return false;
+            return handle_key(tb, evt);
 
         default: break;
     }
     return false;
 }
 
+// ═════════════════════════════════════════════════════════════════
+//  Disegno con syntax highlighting
+// ═════════════════════════════════════════════════════════════════
+
+typedef enum { LX_NORMAL, LX_BLOCK_COMMENT, LX_STRING_SQ, LX_STRING_DQ, LX_STRING_BT } LexState;
+
+// stato del lexer all'inizio dell'offset `upto` (commenti /* */ e stringhe su più righe)
+static LexState lex_state_at(const TextBox* tb, int upto) {
+    LexState st = LX_NORMAL;
+    const char* s = tb->text;
+    for (int i = 0; i < upto; i++) {
+        char c = s[i];
+        switch (st) {
+            case LX_NORMAL:
+                if (c == '-' && i + 1 < upto && s[i + 1] == '-') {
+                    while (i < upto && s[i] != '\n') i++;
+                } else if (c == '/' && i + 1 < upto && s[i + 1] == '*') {
+                    st = LX_BLOCK_COMMENT; i++;
+                } else if (c == '\'') st = LX_STRING_SQ;
+                else if (c == '"')    st = LX_STRING_DQ;
+                else if (c == '`')    st = LX_STRING_BT;
+                break;
+            case LX_BLOCK_COMMENT:
+                if (c == '*' && i + 1 < upto && s[i + 1] == '/') { st = LX_NORMAL; i++; }
+                break;
+            case LX_STRING_SQ: if (c == '\\') i++; else if (c == '\'') st = LX_NORMAL; break;
+            case LX_STRING_DQ: if (c == '\\') i++; else if (c == '"')  st = LX_NORMAL; break;
+            case LX_STRING_BT: if (c == '`') st = LX_NORMAL; break;
+        }
+    }
+    return st;
+}
+
+typedef struct {
+    PlatformWindow* win;
+    TextBox* tb;
+    int x0, y, col;
+    int clip_l, clip_r;
+} SpanCtx;
+
+static void draw_span(SpanCtx* c, int from, int to, Color color, FontStyle style) {
+    if (to <= from) return;
+    const char* s = c->tb->text + from;
+    int n = to - from;
+    int chars = count_chars(s, n);
+    int x = c->x0 + c->col * c->tb->char_w;
+    int w = chars * c->tb->char_w;
+    if (x + w >= c->clip_l && x <= c->clip_r)
+        platform_draw_text_ex(c->win, s, n, (Point){x, c->y}, color, c->tb->font_size, style);
+    c->col += chars;
+}
+
+// disegna una riga colorando i token; ritorna lo stato del lexer alla fine della riga
+// keyword dopo le quali un nome seguito da '(' è una tabella, non una funzione
+static bool names_object(const char* w, int len) {
+    static const char* KW[] = { "TABLE", "INTO", "VIEW", "INDEX", "ON", "REFERENCES", "EXISTS",
+                                "UPDATE", "FROM", "JOIN", "TRIGGER" };
+    for (size_t k = 0; k < sizeof(KW) / sizeof(KW[0]); k++) {
+        int kl = (int)strlen(KW[k]);
+        if (kl != len) continue;
+        int j = 0;
+        while (j < len && toupper((unsigned char)w[j]) == KW[k][j]) j++;
+        if (j == len) return true;
+    }
+    return false;
+}
+
+static LexState draw_line_tokens(SpanCtx* c, int ls, int le, LexState st) {
+    const char* s = c->tb->text;
+    int i = ls;
+    int prev_w = -1, prev_len = 0;   // parola precedente sulla riga
+    while (i < le) {
+        if (st == LX_BLOCK_COMMENT) {
+            int j = i;
+            while (j < le && !(s[j] == '*' && j + 1 < le && s[j + 1] == '/')) j++;
+            if (j < le) { j += 2; st = LX_NORMAL; }
+            draw_span(c, i, j, TH_SYN_COMMENT, FONT_MONO);
+            i = j;
+            continue;
+        }
+        if (st == LX_STRING_SQ || st == LX_STRING_DQ || st == LX_STRING_BT) {
+            char q = st == LX_STRING_SQ ? '\'' : st == LX_STRING_DQ ? '"' : '`';
+            int j = i;
+            while (j < le && s[j] != q) { if (s[j] == '\\' && q != '`') j++; j++; }
+            if (j < le) { j++; st = LX_NORMAL; }
+            j = SV_MIN(j, le);
+            draw_span(c, i, j, st == LX_STRING_BT || q == '`' ? TH_SYN_IDENT : TH_SYN_STRING, FONT_MONO);
+            i = j;
+            continue;
+        }
+
+        char ch = s[i];
+        if (ch == ' ') {
+            int j = i;
+            while (j < le && s[j] == ' ') j++;
+            c->col += j - i;
+            i = j;
+        } else if (ch == '-' && i + 1 < le && s[i + 1] == '-') {
+            draw_span(c, i, le, TH_SYN_COMMENT, FONT_MONO);
+            i = le;
+        } else if (ch == '/' && i + 1 < le && s[i + 1] == '*') {
+            st = LX_BLOCK_COMMENT;
+            draw_span(c, i, i + 2, TH_SYN_COMMENT, FONT_MONO);
+            i += 2;
+        } else if (ch == '\'') { st = LX_STRING_SQ; draw_span(c, i, i + 1, TH_SYN_STRING, FONT_MONO); i++; }
+        else if (ch == '"')    { st = LX_STRING_DQ; draw_span(c, i, i + 1, TH_SYN_STRING, FONT_MONO); i++; }
+        else if (ch == '`')    { st = LX_STRING_BT; draw_span(c, i, i + 1, TH_SYN_IDENT,  FONT_MONO); i++; }
+        else if (isdigit((unsigned char)ch) && (i == ls || !is_word_char(s[i - 1]))) {
+            int j = i;
+            while (j < le && (isalnum((unsigned char)s[j]) || s[j] == '.' || s[j] == '_')) j++;
+            draw_span(c, i, j, TH_SYN_NUMBER, FONT_MONO);
+            i = j;
+        } else if (is_word_char(ch)) {
+            int j = i;
+            while (j < le && is_word_char(s[j])) j++;
+            SqlWordKind k = sql_classify_word(s + i, j - i);
+            int p = j;
+            while (p < le && s[p] == ' ') p++;
+            bool call = p < le && s[p] == '(';
+            bool after_dot = i > ls && s[i - 1] == '.';
+            Color col; FontStyle fs = FONT_MONO;
+            if (after_dot)                     col = TH_SYN_IDENT;
+            else if (k == SQL_WORD_KEYWORD)  { col = TH_SYN_KEYWORD; fs = FONT_MONO_BOLD; }
+            else if (k == SQL_WORD_TYPE)       col = TH_SYN_TYPE;
+            else if (k == SQL_WORD_LITERAL)    col = TH_SYN_NUMBER;
+            else if (k == SQL_WORD_FUNC || (call && !(prev_w >= 0 && names_object(s + prev_w, prev_len))))
+                                               col = TH_SYN_FUNC;
+            else                               col = TH_SYN_IDENT;
+            draw_span(c, i, j, col, fs);
+            prev_w = i; prev_len = j - i;
+            i = j;
+        } else if (strchr("=<>!+-*/%|&^~?", ch)) {
+            draw_span(c, i, i + 1, TH_SYN_OPERATOR, FONT_MONO);
+            i++;
+        } else {
+            int j = utf8_next(c->tb, i);
+            draw_span(c, i, SV_MIN(j, le), TH_SYN_PUNCT, FONT_MONO);
+            i = j;
+        }
+    }
+    return st;
+}
+
+// trova la parentesi corrispondente a quella in pos (o -1)
+static int find_match(const TextBox* tb, int pos) {
+    char c = char_at(tb, pos);
+    const char* open = "([", *close = ")]";
+    const char* o = strchr(open, c);
+    const char* cl = strchr(close, c);
+    if (!c || (!o && !cl)) return -1;
+    char want = o ? close[o - open] : open[cl - close];
+    int dir = o ? 1 : -1, depth = 0;
+    int limit = 20000;
+    for (int i = pos; i >= 0 && i < tb->text_len && limit-- > 0; i += dir) {
+        if (tb->text[i] == c) depth++;
+        else if (tb->text[i] == want && --depth == 0) return i;
+    }
+    return -1;
+}
+
+static void textbox_draw(Widget* self, PlatformWindow* win) {
+    TextBox* tb = (TextBox*)self;
+    Rect b = self->bounds;
+    bool focused = self->state == WIDGET_STATE_FOCUSED;
+    tb->win = win;
+
+    // -- metriche --
+    tb->char_w      = SV_MAX(1, platform_measure_text_ex(win, "MMMMMMMMMM", 10, tb->font_size, FONT_MONO) / 10);
+    tb->line_height = (tb->font_size * 16 + 5) / 10 + 2;
+    int text_h      = platform_text_height(win, tb->font_size, FONT_MONO);
+    int digits = 1;
+    for (int n = tb->num_lines; n >= 10; n /= 10) digits++;
+    digits = SV_MAX(digits, 3);
+    int gutter_size = SV_MAX(10, tb->font_size - 1);
+    int gutter_cw = SV_MAX(1, platform_measure_text_ex(win, "0000000000", 10, gutter_size, FONT_MONO) / 10);
+    tb->gutter_w = tb->show_line_nums ? digits * gutter_cw + 28 : 0;
+    clamp_scroll(tb);
+
+    platform_fill_rect(win, b, TH_EDITOR_BG);
+    platform_set_clip(win, b);
+
+    int vis   = visible_lines(tb);
+    int first = tb->scroll_y;
+    int last  = SV_MIN(tb->num_lines, first + vis + 1);
+    int x0    = text_x0(tb) - tb->scroll_x;
+    int tx_l  = b.x + tb->gutter_w;   // bordo sinistro area testo
+
+    int sa, se;
+    sel_range(tb, &sa, &se);
+    bool sel = has_sel(tb);
+
+    // statement corrente (quello che Ctrl+Enter eseguirebbe)
+    int st_l0 = -1, st_l1 = -1;
+    if (!sel) {
+        SqlRange r;
+        if (sql_statement_at(tb->text, tb->text_len, tb->cursor_pos, &r)) {
+            st_l0 = line_of(tb, r.code_start);
+            st_l1 = line_of(tb, SV_MAX(r.code_start, r.end_semi - 1));
+        }
+    } else {
+        st_l0 = line_of(tb, sa);
+        st_l1 = line_of(tb, se > sa ? se - 1 : se);
+    }
+
+    // parentesi corrispondenti (prima o dopo il cursore)
+    int br_a = -1, br_b = -1;
+    if (focused) {
+        int m = find_match(tb, tb->cursor_pos);
+        if (m >= 0) { br_a = tb->cursor_pos; br_b = m; }
+        else if ((m = find_match(tb, tb->cursor_pos - 1)) >= 0) { br_a = tb->cursor_pos - 1; br_b = m; }
+    }
+
+    LexState st = lex_state_at(tb, line_start(tb, first));
+
+    for (int l = first; l < last; l++) {
+        int y  = b.y + tb->pad_top + (l - first) * tb->line_height;
+        int ty = y + (tb->line_height - text_h) / 2;
+        int ls = line_start(tb, l), le = line_end(tb, l);
+
+        // sfondo riga corrente / errore
+        if (l == tb->error_line) {
+            platform_fill_rect(win, (Rect){b.x, y, b.w, tb->line_height}, TH_ERROR_SOFT);
+        } else if (focused && !sel && l == tb->cursor_line) {
+            platform_fill_rect(win, (Rect){b.x, y, b.w, tb->line_height}, TH_EDITOR_LINE);
+        }
+
+        platform_set_clip(win, (Rect){tx_l, b.y, b.w - tb->gutter_w, b.h});
+
+        // selezione
+        if (sel && sa <= le && se > ls) {
+            int a = SV_MAX(sa, ls), e = SV_MIN(se, le);
+            int c0 = count_chars(tb->text + ls, a - ls);
+            int c1 = c0 + count_chars(tb->text + a, e - a);
+            int w  = (c1 - c0) * tb->char_w + (se > le ? tb->char_w / 2 : 0);
+            platform_fill_rect_rounded(win, (Rect){x0 + c0 * tb->char_w, y, w, tb->line_height},
+                                       TH_EDITOR_SELECT, 3);
+        }
+
+        // parentesi
+        for (int k = 0; k < 2; k++) {
+            int bp = k == 0 ? br_a : br_b;
+            if (bp >= ls && bp < le) {
+                int c0 = count_chars(tb->text + ls, bp - ls);
+                ui_round_box(win, (Rect){x0 + c0 * tb->char_w - 1, y + 2, tb->char_w + 2, tb->line_height - 4},
+                             TH_EDITOR_MATCH, TH_BORDER_STRONG, 3);
+            }
+        }
+
+        // testo
+        SpanCtx ctx = { win, tb, x0, ty, 0, tx_l, b.x + b.w };
+        st = draw_line_tokens(&ctx, ls, le, st);
+        if (le < tb->text_len && st == LX_NORMAL) { /* fine riga */ }
+
+        platform_set_clip(win, b);
+
+        // gutter
+        if (tb->show_line_nums) {
+            char num[16];
+            snprintf(num, sizeof(num), "%d", l + 1);
+            int nw = platform_measure_text_ex(win, num, -1, gutter_size, FONT_MONO);
+            Color nc = (l == tb->cursor_line) ? TH_GUTTER_ACTIVE : TH_GUTTER_TEXT;
+            if (l == tb->error_line) nc = TH_ERROR;
+            int gy = y + (tb->line_height - platform_text_height(win, gutter_size, FONT_MONO)) / 2;
+            platform_draw_text_ex(win, num, -1, (Point){b.x + tb->gutter_w - 14 - nw, gy}, nc, gutter_size, FONT_MONO);
+
+            // barra dello statement corrente
+            if (l >= st_l0 && l <= st_l1) {
+                Color bc = focused ? TH_ACCENT : ui_alpha(TH_ACCENT, 90);
+                int top = (l == st_l0) ? y + 2 : y;
+                int bot = (l == st_l1) ? y + tb->line_height - 2 : y + tb->line_height;
+                platform_fill_rect(win, (Rect){b.x + tb->gutter_w - 6, top, 2, bot - top}, bc);
+            }
+            if (l == tb->error_line)
+                ui_circle(win, b.x + 8, y + tb->line_height / 2, 3, TH_ERROR);
+        }
+    }
+
+    // placeholder
+    if (tb->text_len == 0 && tb->placeholder) {
+        int y = b.y + tb->pad_top + (tb->line_height - text_h) / 2;
+        platform_draw_text_ex(win, tb->placeholder, -1, (Point){text_x0(tb), y}, TH_TEXT_FAINT,
+                              tb->font_size, FONT_MONO);
+    }
+
+    // dissolvenza sul bordo inferiore (la riga tagliata a metà non "sporca" lo splitter)
+    for (int k = 0; k < 4; k++)
+        platform_fill_rect(win, (Rect){b.x, b.y + b.h - 8 + k * 2, b.w, 2},
+                           ui_alpha(TH_EDITOR_BG, (uint8_t)(90 + k * 55)));
+
+    // cursore
+    if (focused && tb->cursor_visible &&
+        tb->cursor_line >= first && tb->cursor_line < first + vis + 1) {
+        int cx = x0 + tb->cursor_col * tb->char_w;
+        int cy = b.y + tb->pad_top + (tb->cursor_line - first) * tb->line_height;
+        if (cx >= tx_l) {
+            platform_fill_rect(win, (Rect){cx, cy + 2, 2, tb->line_height - 4}, (Color){176, 164, 255, 255});
+        }
+    }
+
+    platform_reset_clip(win);
+}
+
 static void textbox_destroy_fn(Widget* self) {
     TextBox* tb = (TextBox*)self;
     free(tb->text);
+    free(tb->line_starts);
+    for (int i = 0; i < tb->undo_count; i++) free(tb->undo[i].text);
+    for (int i = 0; i < tb->redo_count; i++) free(tb->redo[i].text);
 }
 
-// ── API pubblica ─────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════
+//  API pubblica
+// ═════════════════════════════════════════════════════════════════
 
 TextBox* textbox_create(int x, int y, int w, int h) {
     TextBox* tb = SV_ALLOC(TextBox);
@@ -287,46 +1217,29 @@ TextBox* textbox_create(int x, int y, int w, int h) {
     tb->base.handle_event = textbox_handle_event;
     tb->base.destroy      = textbox_destroy_fn;
 
-    tb->text_cap       = 4096;
-    tb->text           = (char*)calloc(tb->text_cap, 1);
-    tb->text_len       = 0;
-    tb->cursor_pos     = 0;
-    tb->cursor_line    = 0;
-    tb->cursor_col     = 0;
+    tb->text_cap   = 4096;
+    tb->text       = (char*)calloc(tb->text_cap, 1);
+    tb->sel_anchor = -1;
     tb->cursor_visible = true;
-    tb->cursor_blink   = 0;
-    tb->sel_start      = -1;
-    tb->sel_end        = -1;
-    tb->scroll_x       = 0;
-    tb->scroll_y       = 0;
-    tb->font_size      = 14;
-    tb->line_height    = 20;
+    tb->font_size   = TH_FONT_MONO;
+    tb->line_height = 22;
+    tb->char_w      = 8;
+    tb->gutter_w    = 44;
+    tb->pad_top     = 8;
     tb->show_line_nums = true;
-
-    tb->color_bg       = (Color){20,  20,  24,  255};
-    tb->color_text     = (Color){212, 212, 212, 255};
-    tb->color_cursor   = (Color){100, 210, 255, 255};
-    tb->color_select   = (Color){50,  100, 180, 100};
-    tb->color_line_num = (Color){80,  80,  100, 255};
-    tb->color_keyword  = (Color){86,  156, 214, 255};
-    tb->color_string   = (Color){206, 145, 120, 255};
-    tb->color_number   = (Color){181, 206, 168, 255};
-    tb->color_comment  = (Color){106, 153, 85,  255};
+    tb->error_line  = -1;
+    tb->placeholder = "-- Write SQL here. Ctrl+Enter runs the statement under the cursor, F5 runs everything";
+    rebuild_lines(tb);
 
     return tb;
 }
 
 void textbox_set_text(TextBox* tb, const char* text) {
     if (!tb || !text) return;
-    int len = (int)strlen(text);
-    if (len >= tb->text_cap) {
-        tb->text_cap = len + 1024;
-        tb->text     = realloc(tb->text, tb->text_cap);
-    }
-    memcpy(tb->text, text, len + 1);
-    tb->text_len   = len;
-    tb->cursor_pos = len;
-    update_cursor_linecol(tb);
+    if (tb->text_len > 0) undo_push(tb, EDIT_OTHER);
+    tb->sel_anchor = -1;
+    replace_range(tb, 0, tb->text_len, text, -1);
+    tb->last_edit_kind = EDIT_NONE;
 }
 
 const char* textbox_get_text(TextBox* tb) {
@@ -334,25 +1247,86 @@ const char* textbox_get_text(TextBox* tb) {
 }
 
 void textbox_clear(TextBox* tb) {
-    if (!tb) return;
-    memset(tb->text, 0, tb->text_cap);
-    tb->text_len    = 0;
-    tb->cursor_pos  = 0;
-    tb->cursor_line = 0;
-    tb->cursor_col  = 0;
-    tb->scroll_y    = 0;
+    if (!tb || tb->text_len == 0) return;
+    undo_push(tb, EDIT_OTHER);
+    replace_range(tb, 0, tb->text_len, "", 0);
+    tb->scroll_x = tb->scroll_y = 0;
 }
 
 void textbox_insert(TextBox* tb, const char* text) {
     if (!tb || !text) return;
-    for (int i = 0; text[i]; i++)
-        textbox_insert_char(tb, text[i]);
+    insert_text(tb, text, EDIT_OTHER);
+    tb->last_edit_kind = EDIT_NONE;
 }
 
-void textbox_tick(TextBox* tb, uint64_t now_ms) {
-    if (!tb) return;
-    if (now_ms - tb->cursor_blink > 500) {
+bool textbox_tick(TextBox* tb, uint64_t now_ms) {
+    if (!tb || tb->base.state != WIDGET_STATE_FOCUSED) return false;
+    if (now_ms - tb->cursor_blink >= 530) {
         tb->cursor_visible = !tb->cursor_visible;
         tb->cursor_blink   = now_ms;
+        return true;
     }
+    return false;
+}
+
+void textbox_focus(TextBox* tb, bool focused) {
+    if (!tb) return;
+    tb->base.state = focused ? WIDGET_STATE_FOCUSED : WIDGET_STATE_NORMAL;
+    reset_blink(tb);
+}
+
+bool textbox_has_selection(TextBox* tb) { return tb && has_sel(tb); }
+
+void textbox_get_selection_range(TextBox* tb, int* start, int* end) {
+    sel_range(tb, start, end);
+}
+
+char* textbox_get_selection(TextBox* tb) {
+    if (!tb || !has_sel(tb)) return NULL;
+    int a, b;
+    sel_range(tb, &a, &b);
+    char* s = malloc(b - a + 1);
+    if (!s) return NULL;
+    memcpy(s, tb->text + a, b - a);
+    s[b - a] = '\0';
+    return s;
+}
+
+int textbox_get_run_text(TextBox* tb, char** out) {
+    *out = NULL;
+    if (!tb) return -1;
+    int a, b;
+    if (has_sel(tb)) {
+        sel_range(tb, &a, &b);
+    } else {
+        SqlRange r;
+        if (!sql_statement_at(tb->text, tb->text_len, tb->cursor_pos, &r)) return -1;
+        a = r.code_start;
+        b = r.end_semi;
+    }
+    char* s = malloc(b - a + 1);
+    if (!s) return -1;
+    memcpy(s, tb->text + a, b - a);
+    s[b - a] = '\0';
+    *out = s;
+    return a;
+}
+
+int textbox_line_of_offset(TextBox* tb, int offset) {
+    return line_of(tb, SV_CLAMP(offset, 0, tb->text_len));
+}
+
+int textbox_visible_lines(TextBox* tb) { return visible_lines(tb); }
+
+void textbox_set_error_line(TextBox* tb, int line) {
+    if (!tb) return;
+    tb->error_line = (line >= 0 && line < tb->num_lines) ? line : -1;
+}
+
+void textbox_scroll_to_line(TextBox* tb, int line) {
+    if (!tb) return;
+    int vis = visible_lines(tb);
+    if (line < tb->scroll_y || line >= tb->scroll_y + vis)
+        tb->scroll_y = SV_MAX(0, line - vis / 3);
+    clamp_scroll(tb);
 }

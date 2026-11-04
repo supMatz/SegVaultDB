@@ -1,20 +1,20 @@
 #ifndef WINDOW_H
 #define WINDOW_H
 
-/* 
+/*
 SCOPO: Layout principale dell'applicazione SegVault.
        gestisce la disposizione di tutti i widget:
 
-  ┌──────────────────────────────────────────────────────┐
-  │  TOOLBAR: [Run] [Commit] [Rollback] [DB selector]    │
-  ├────────────┬─────────────────────────────────────────┤
-  │            │  EDITOR SQL (textbox multilinea)        │
-  │  SIDEBAR   ├─────────────────────────────────────────┤
-  │  (tree)    │  STATUS BAR (righe affected, tempo)     │
-  │            ├─────────────────────────────────────────┤
-  │            │  RESULTS (table_view)                   │
-  └────────────┴─────────────────────────────────────────┘
- ───────────────────────────────────────────────────────────
+  ┌──────────────────────────────────────────────────────────────┐
+  │ ◆ SegVault │ [▶ Run F5] [Run statement] [✓ Commit] [↺ Roll.] │ ● db │
+  ├────────────┬─────────────────────────────────────────────────┤
+  │ EXPLORER ⟳ │  EDITOR SQL (textbox multilinea)                │
+  │            ├──────────────────── splitter ───────────────────┤
+  │  (tree)    │  RESULTS ● stato                     meta       │
+  │            │  griglia risultati (table_view)                 │
+  ├────────────┴─────────────────────────────────────────────────┤
+  │ footer: versione · database · transazione      Ln, Col · ... │
+  └──────────────────────────────────────────────────────────────┘
 */
 
 #include "widget.h"
@@ -28,16 +28,24 @@ SCOPO: Layout principale dell'applicazione SegVault.
 #include "splitter.h"
 #include "../bridge/db_api.h"
 
-#define TOOLBAR_H    40   // Altezza toolbar in pixel
-#define SIDEBAR_W   240   // Larghezza sidebar in pixel
-#define STATUSBAR_H  28   // Altezza status bar
-#define SPLITTER_H   6    // Altezza splitter tra editor e risultati
+#define TOOLBAR_H         52   // Altezza toolbar in pixel
+#define SIDEBAR_W        264   // Larghezza sidebar in pixel
+#define SIDEBAR_HEADER_H  38   // Intestazione "EXPLORER"
+#define STATUSBAR_H       38   // Intestazione dei risultati (stato ultima query)
+#define FOOTER_H          26   // Barra di stato in basso
+#define SPLITTER_H         7   // Altezza splitter tra editor e risultati
+#define SCROLLBAR_W       10   // Spessore delle scrollbar
+
+typedef enum { RUN_SCRIPT, RUN_CURRENT } RunMode;
+
+typedef enum { STATUS_IDLE, STATUS_OK, STATUS_ERROR, STATUS_INFO } StatusKind;
 
 typedef struct {
     PlatformWindow* win;        // Finestra OS sottostante
 
     // -- toolbar --
-    Button* btn_run;            // esegui query (Ctrl+Enter)
+    Button* btn_run;            // esegui script / selezione (F5)
+    Button* btn_run_current;    // esegui statement sotto il cursore (Ctrl+Enter)
     Button* btn_commit;         // COMMIT transazione
     Button* btn_rollback;       // ROLLBACK transazione
     Label*  lbl_db_name;        // nome database corrente
@@ -45,6 +53,7 @@ typedef struct {
     // -- sidebar --
     TreeView*  tree;            // albero DB/Tabelle/Colonne
     Scrollbar* tree_scroll;     // scrollbar della sidebar
+    Button*    btn_refresh;     // ricarica l'albero
 
     // ── area centrale ────────────────────────────────────────────
     TextBox*   editor;          // editor SQL multilinea
@@ -52,6 +61,8 @@ typedef struct {
 
     // -- status bar --
     Label* lbl_status;          // "3 rows | 12ms | OK"
+    StatusKind status_kind;
+    char       status_meta[128]; // testo a destra (righe, colonne, tempo)
 
     // -- risultati --
     TableView* results;          // griglia risultati
@@ -63,6 +74,9 @@ typedef struct {
     int          win_w, win_h;    // dimensioni correnti finestra
     int          splitter_y;      // y dello splitter (editor/risultati)
     bool         splitter_drag;   // true = utente sta spostando il splitter
+    bool         splitter_hover;
+    bool         in_transaction;  // transazione aperta (badge in toolbar e footer)
+    int          mouse_x, mouse_y;
 } AppWindow;
 
 // crea il layout principale
@@ -71,6 +85,9 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height);
 // gestisce un evento OS e lo smista ai widget
 void app_window_handle_event(AppWindow* app, sEvent* evt);
 
+// animazioni (blink del cursore): true se serve ridisegnare
+bool app_window_tick(AppWindow* app, uint64_t now_ms);
+
 // ridisegna tutta la UI
 void app_window_draw(AppWindow* app);
 
@@ -78,7 +95,8 @@ void app_window_draw(AppWindow* app);
 void app_window_resize(AppWindow* app, int new_w, int new_h);
 
 // esegue la query nell'editor e aggiorna i risultati
-void app_window_run_query(AppWindow* app);
+void app_window_run_query(AppWindow* app);              // = RUN_SCRIPT
+void app_window_run(AppWindow* app, RunMode mode);
 
 // dealloca tutto
 void app_window_destroy(AppWindow* app);

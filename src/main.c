@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
 
     // -- crea la finestra --
     PlatformWindow* win = platform_window_create(
-        SV_NAME "- SQL Client", INITIAL_W, INITIAL_H);
+        SV_NAME " \xe2\x80\x94 SQL Client", INITIAL_W, INITIAL_H);
 
     if (!win) {
         fprintf(stderr, "[ERROR] Impossible to create the window\n");
@@ -85,20 +85,27 @@ int main(int argc, char** argv) {
     printf("[SegVault] Started correctly. Window opened.\n");
 
     // loop principale //
+    // ridisegna solo quando serve (eventi o blink del cursore) e attende
+    // gli eventi senza consumare CPU a vuoto
     sEvent evt;
     int running = 1;
+    bool dirty = true;
 
     while (running) {
-    bool got_event = false;
+        while (platform_poll_event(win, &evt)) {
+            if (evt.type == EVT_QUIT) { running = 0; break; }
+            app_window_handle_event(app, &evt);
+            dirty = true;
+        }
+        if (!running) break;
 
-    while (platform_poll_event(win, &evt)) {
-        if (evt.type == EVT_QUIT) { running = 0; break; }
-        app_window_handle_event(app, &evt);
-        got_event = true;
-    }
+        if (app_window_tick(app, platform_time_ms())) dirty = true;
 
-       if (!running) break;
-       if (got_event) app_window_draw(app);
+        if (dirty) {
+            app_window_draw(app);
+            dirty = false;
+        }
+        platform_wait_event(win, 40);
     }
 
     printf("[SegVault] Closing...\n");

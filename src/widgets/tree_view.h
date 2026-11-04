@@ -14,8 +14,9 @@ SCOPO: Albero gerarchico nella sidebar sinistra.
 #include "widget.h"
 
 #define TREE_MAX_NODES   1024
-#define TREE_ROW_H       22
+#define TREE_ROW_H       26
 #define TREE_INDENT      16   // pixel di indentazione per livello
+#define TREE_PAD_TOP     4
 
 // tipo del nodo — determina icona e azioni disponibili
 typedef enum {
@@ -54,6 +55,11 @@ typedef struct {
     TreeNode* selected;       // nodo attualmente selezionato
     int         scroll_y;       // righe scrollate
     int         font_size;
+    int         hover_row;      // riga sotto il mouse (-1 = nessuna)
+
+    // doppio click
+    uint64_t    last_click_ms;
+    TreeNode*   last_click_node;
 
     Color color_bg;
     Color color_row_hover;
@@ -81,7 +87,7 @@ TreeNode* tree_node_add_child(TreeNode* parent,
                                  const char* label,
                                  const char* extra);
 
-// rspande/collassa un nodo
+// espande/collassa un nodo
 void tree_node_toggle(TreeView* tv, TreeNode* node);
 
 // rimuove tutti i figli di un nodo (per ricaricare)
@@ -92,5 +98,10 @@ void tree_view_refresh(TreeView* tv);
 
 // seleziona un nodo programmaticamente
 void tree_view_select(TreeView* tv, TreeNode* node);
+
+// numero di righe attualmente visibili (nodi espansi inclusi) e righe che entrano nel widget
+int  tree_view_row_count(TreeView* tv);
+int  tree_view_visible_rows(TreeView* tv);
+void tree_view_clamp_scroll(TreeView* tv);
 
 #endif 

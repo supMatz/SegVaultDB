@@ -1,4 +1,4 @@
-/* 
+/*
 SCOPO: Widget testo non interattivo.
        Usato per titoli, etichette, status bar, ecc.
 */
@@ -20,11 +20,13 @@ typedef struct {
     int font_size;
     Color color;
     LabelAlign align;
-    bool clip; // se true taglia il testo ai bordi per non uscires
+    FontStyle style;
+    bool clip; // se true tronca il testo con "…" ai bordi per non uscire
 } Label;
 
 Label* label_create(int x, int y, int w, int h, const char* text, int font_size, Color color);
 void label_set_text(Label* lbl, const char* text);
 void label_set_color(Label* lbl, Color color);
+void label_set_style(Label* lbl, FontStyle style);
 
 #endif
