@@ -109,6 +109,8 @@ typedef struct {
     bool         showing_history;   // la griglia mostra la cronologia
     Button*      btn_history;
 
+    bool         help_open;         // pannello scorciatoie (F1)
+
     // -- stato --
     QueryResult* last_result;     // ultimo risultato (da liberare)
     int          win_w, win_h;    // dimensioni correnti finestra

@@ -1017,6 +1017,88 @@ static void draw_bar(AppWindow* app) {
     ui_icon_cross(win, c.x + c.w / 2, c.y + c.h / 2, 9, TH_TEXT_MUTED);
 }
 
+// ── pannello scorciatoie (F1) ───────────────────────────────────
+
+typedef struct { const char* keys; const char* what; } Shortcut;
+typedef struct { const char* title; const Shortcut* items; int count; } ShortcutGroup;
+
+static const Shortcut SC_RUN[] = {
+    { "F5", "Run script or selection" }, { "Ctrl+Enter", "Run statement under cursor" },
+    { "Ctrl+Shift+F", "Format SQL" }, { "Ctrl+Shift+H", "Query history" },
+};
+static const Shortcut SC_FILE[] = {
+    { "Ctrl+N", "New script" }, { "Ctrl+O", "Open file" },
+    { "Ctrl+S", "Save" }, { "Ctrl+Shift+S", "Save as" },
+};
+static const Shortcut SC_FIND[] = {
+    { "Ctrl+F", "Find" }, { "Ctrl+H", "Find and replace" }, { "F3 / Shift+F3", "Next / previous match" },
+    { "Alt+C / Alt+W", "Match case / whole word" }, { "Ctrl+G", "Go to line" },
+};
+static const Shortcut SC_EDIT[] = {
+    { "Ctrl+Space", "Autocomplete" }, { "Alt+Up / Down", "Move lines" }, { "Ctrl+D", "Duplicate line" },
+    { "Ctrl+Shift+K", "Delete line" }, { "Ctrl+L", "Select line" }, { "Ctrl+/", "Toggle comment" },
+    { "Ctrl+Shift+U / U", "Upper / lower case" }, { "Shift+Enter", "New line below" },
+    { "Tab / Shift+Tab", "Indent / outdent" }, { "Ctrl+Z / Ctrl+Y", "Undo / redo" },
+    { "Ctrl + wheel, Ctrl+0", "Zoom / reset" },
+};
+static const Shortcut SC_GRID[] = {
+    { "Click header", "Sort asc / desc / off" }, { "Ctrl+C", "Copy cell (or row)" },
+    { "Ctrl+Shift+C", "Copy all as TSV" }, { "Ctrl+E", "Export CSV" },
+    { "Double-click border", "Fit column width" },
+};
+
+#define SC_GROUP(t, a) { t, a, (int)(sizeof(a) / sizeof(a[0])) }
+static const ShortcutGroup SC_GROUPS[] = {
+    SC_GROUP("RUN", SC_RUN), SC_GROUP("FILES", SC_FILE), SC_GROUP("FIND", SC_FIND),
+    SC_GROUP("EDITING", SC_EDIT), SC_GROUP("RESULTS", SC_GRID),
+};
+
+static void draw_help(AppWindow* app) {
+    if (!app->help_open) return;
+    PlatformWindow* win = app->win;
+    int W = app->win_w, H = app->win_h;
+    platform_fill_rect(win, (Rect){0, 0, W, H}, ui_alpha(TH_BG, 200));
+
+    int col_w = 340, row_h = 22, gap = 28;
+    int ncols = W >= 2 * col_w + 120 ? 2 : 1;
+    int ngroups = (int)(sizeof(SC_GROUPS) / sizeof(SC_GROUPS[0]));
+    // colonna sinistra: RUN, FILES, FIND · destra: EDITING, RESULTS
+    int split = ncols == 2 ? 3 : ngroups;
+    int hcol[2] = {0, 0};
+    for (int g = 0; g < ngroups; g++) hcol[g < split ? 0 : 1] += 24 + SC_GROUPS[g].count * row_h + 12;
+    int pw = ncols * col_w + (ncols - 1) * gap + 48;
+    int ph = SV_MAX(hcol[0], hcol[1]) + 58 + 10;
+    Rect r = {(W - pw) / 2, SV_MAX(12, (H - ph) / 2), pw, SV_MIN(ph, H - 24)};
+    platform_fill_rect_rounded(win, (Rect){r.x - 2, r.y + 4, r.w + 4, r.h + 4}, ui_alpha(TH_BG, 200), 12);
+    ui_round_box(win, r, TH_SURFACE_2, TH_BORDER_STRONG, 10);
+    platform_set_clip(win, r);
+
+    platform_draw_text_ex(win, "Keyboard shortcuts", -1, (Point){r.x + 24, r.y + 18}, TH_TEXT, 16, FONT_UI_BOLD);
+    const char* close = "F1 or Esc to close";
+    int cw = platform_measure_text_ex(win, close, -1, TH_FONT_SMALL + 1, FONT_UI);
+    platform_draw_text_ex(win, close, -1, (Point){r.x + r.w - 24 - cw, r.y + 22}, TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_UI);
+
+    int y0 = r.y + 58;
+    int y[2] = {y0, y0};
+    for (int g = 0; g < ngroups; g++) {
+        int c = g < split ? 0 : 1;
+        int x = r.x + 24 + c * (col_w + gap);
+        const ShortcutGroup* grp = &SC_GROUPS[g];
+        platform_draw_text_ex(win, grp->title, -1, (Point){x, y[c]}, TH_ACCENT_TEXT, TH_FONT_SMALL, FONT_UI_BOLD);
+        y[c] += 24;
+        for (int i = 0; i < grp->count; i++) {
+            Rect kr = {x, y[c], 150, row_h};
+            ui_text_clipped(win, grp->items[i].keys, kr.x, ui_text_y(win, kr, TH_FONT_SMALL + 1, FONT_MONO), 150,
+                            TH_TEXT, TH_FONT_SMALL + 1, FONT_MONO);
+            ui_text_clipped(win, grp->items[i].what, x + 158, ui_text_y(win, kr, TH_FONT_UI, FONT_UI), col_w - 158,
+                            TH_TEXT_MUTED, TH_FONT_UI, FONT_UI);
+            y[c] += row_h;
+        }
+        y[c] += 12;
+    }
+    platform_reset_clip(win);
+}
+
 // ── layout ───────────────────────────────────────────────────────
 
 // ricalcola la posizione e dimensione di tutti i widget in base alle dimensioni correnti della finestra
@@ -1241,7 +1323,17 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
 
     sync_scrollbars(app);
 
+    // pannello scorciatoie aperto: qualsiasi tasto o click lo chiude
+    if (app->help_open) {
+        if (evt->type == EVT_KEY_DOWN || evt->type == EVT_MOUSE_DOWN) app->help_open = false;
+        if (evt->type != EVT_MOUSE_MOVE) return;
+    }
+
     // -- scorciatoie globali --
+    if (evt->type == EVT_KEY_DOWN && evt->key == KEY_F1) {
+        app->help_open = true;
+        return;
+    }
     if (evt->type == EVT_KEY_DOWN) {
         bool ctrl  = evt->modifiers & SV_MOD_CTRL;
         bool shift = evt->modifiers & SV_MOD_SHIFT;
@@ -1513,8 +1605,11 @@ static void draw_footer(AppWindow* app) {
     else
         snprintf(buf, sizeof(buf), "Ln %d, Col %d    %d lines    UTF-8    SQL",
                  tb->cursor_line + 1, tb->cursor_col + 1, tb->num_lines);
+    const char* help = "F1 Shortcuts";
+    int hw = platform_measure_text_ex(win, help, -1, fs, FONT_UI_BOLD);
+    platform_draw_text_ex(win, help, -1, (Point){W - 16 - hw, ty}, TH_ACCENT_TEXT, fs, FONT_UI_BOLD);
     int w = platform_measure_text_ex(win, buf, -1, fs, FONT_UI);
-    platform_draw_text_ex(win, buf, -1, (Point){W - 16 - w, ty}, TH_TEXT_DIM, fs, FONT_UI);
+    platform_draw_text_ex(win, buf, -1, (Point){W - 16 - hw - 22 - w, ty}, TH_TEXT_DIM, fs, FONT_UI);
 }
 
 void app_window_draw(AppWindow* app) {
@@ -1538,6 +1633,7 @@ void app_window_draw(AppWindow* app) {
     draw_toolbar(app);
     draw_footer(app);
     textbox_draw_overlay(app->editor, win, (Rect){0, 0, app->win_w, app->win_h});
+    draw_help(app);
 
     platform_present(win);
 }

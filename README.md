@@ -67,11 +67,49 @@ Gli statement separati da `;` vengono eseguiti in sequenza (i `;` dentro stringh
 | `Home` | "Smart home": primo carattere, poi inizio riga |
 | `Ctrl` + rotella, `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Zoom del font dell'editor |
 | doppio / triplo click, click sul numero di riga | Seleziona parola / riga |
+| `Ctrl+Space` | Autocompletamento (si apre anche da solo dopo 2 caratteri) |
+| `Alt+↑` / `Alt+↓` | Sposta la riga (o il blocco selezionato) su / giù |
+| `Ctrl+Shift+K` | Elimina la riga / le righe selezionate |
+| `Ctrl+L` | Seleziona la riga (ripetuto: estende alla successiva) |
+| `Ctrl+Shift+U` / `Ctrl+U` | Maiuscolo / minuscolo della selezione o della parola |
+| `Shift+Enter` / `Ctrl+Shift+Enter` | Nuova riga indentata sotto / sopra |
+| `Ctrl+Shift+F` | Formatta l'SQL (selezione o intero script) |
+| `F1` | Pannello con tutte le scorciatoie |
 
-L'editor chiude automaticamente parentesi e apici, mantiene l'indentazione andando a capo, evidenzia la parentesi corrispondente e colora keyword, tipi, funzioni, stringhe, numeri e commenti.
+L'editor chiude automaticamente parentesi e apici, mantiene l'indentazione andando a capo, evidenzia la parentesi corrispondente e le altre occorrenze dell'identificatore sotto il cursore, e colora keyword, tipi, funzioni, stringhe, numeri e commenti.
+
+**Autocompletamento:** propone colonne, tabelle, viste e database del database corrente insieme a keyword, tipi e funzioni SQL. Dopo `FROM` / `JOIN` / `INTO` / `UPDATE` le tabelle vengono prima; scrivendo `tabella.` compaiono solo le colonne di quella tabella. `↑`/`↓` per scegliere, `Enter`/`Tab` o click per inserire, `Esc` per chiudere. Le keyword rispettano il maiuscolo/minuscolo che stai usando e le funzioni vengono inserite con le parentesi.
+
+**Formattazione (`Ctrl+Shift+F` o pulsante *Format*):** keyword in maiuscolo, una clausola per riga, `AND`/`OR` indentati, colonne di `CREATE TABLE` una per riga, spaziatura normalizzata; stringhe e commenti non vengono toccati. Si annulla con `Ctrl+Z`.
+
+### Trova e sostituisci
+
+| Scorciatoia | Azione |
+|---|---|
+| `Ctrl+F` | Trova (precompilato con la selezione o la parola sotto il cursore) |
+| `Ctrl+H` | Trova e sostituisci (`Enter` nel campo sostituisci = sostituisci, `Ctrl+Enter` = sostituisci tutto) |
+| `Enter` / `Shift+Enter`, `F3` / `Shift+F3` | Risultato successivo / precedente |
+| `Alt+C` / `Alt+W` | Distingui maiuscole / solo parole intere |
+| `Ctrl+G` | Vai alla riga |
+| `Esc` | Chiude la barra |
+
+### File, sessione e cronologia
+
+| Scorciatoia | Azione |
+|---|---|
+| `Ctrl+N` | Nuovo script |
+| `Ctrl+O` | Apri un file `.sql` |
+| `Ctrl+S` / `Ctrl+Shift+S` | Salva / salva con nome |
+| `Ctrl+Shift+H` (o pulsante *History*) | Cronologia delle query eseguite |
+
+I percorsi si scrivono nella barra in alto a destra dell'editor (`~` viene espanso). Aprire un file o creare uno script nuovo resta annullabile con `Ctrl+Z`. Il footer mostra il nome del file e un pallino se ci sono modifiche non salvate.
+
+Alla chiusura (anche con `Ctrl+C` / `SIGTERM` dal terminale) il contenuto dell'editor, la posizione del cursore, il file aperto e lo zoom vengono salvati in `<data>/session.sql` e `<data>/session.ini` e ripristinati all'avvio successivo.
+
+Ogni statement eseguito viene registrato in `<data>/history.sql` (data, esito, righe, durata). La cronologia si apre nella griglia dei risultati: doppio click o `Enter` su una riga aggiunge lo statement in fondo allo script.
 
 **Explorer:** click per espandere database e tabelle; doppio click su un database = `USE`, su una tabella = anteprima dei dati (`SELECT * … LIMIT 200`), su una colonna = inserisce il nome nell'editor.
-**Risultati:** click su una cella e `Ctrl+C` per copiarla, frecce per navigare, trascina il bordo dell'header per ridimensionare una colonna (doppio click = adatta al contenuto), `Shift` + rotella per lo scroll orizzontale.
+**Risultati:** click su una cella e `Ctrl+C` per copiarla, frecce per navigare, trascina il bordo dell'header per ridimensionare una colonna (doppio click = adatta al contenuto), `Shift` + rotella per lo scroll orizzontale. Click sull'intestazione di una colonna = ordina (crescente → decrescente → ordine originale). `Ctrl+Shift+C` copia l'intero risultato come TSV (si incolla direttamente in un foglio di calcolo), `Ctrl+E` esporta in CSV.
 
 ### Data Definition Language (DDL)
 
@@ -252,14 +290,15 @@ Ogni widget estende `Widget` (da `widget.h`) mettendolo come **primo campo** del
 | `Widget` | `widget.h` / `widget.c` | Struct base con vtable (`draw`, `handle_event`, `destroy`) |
 | `Button` | `button.h` / `button.c` | Bottone con label, hover, pressed, disabled |
 | `Label` | `label.h` / `label.c` | Testo non interattivo, allineamento L/C/R |
-| `Textbox` | `textbox.h` / `textbox.c` | Input SQL multilinea |
-| `TableView` | `table_view.h` / `table_view.c` | Griglia risultati query |
+| `Textbox` | `textbox.h` / `textbox.c` | Editor SQL multilinea: highlighting, ricerca/sostituzione, autocompletamento |
+| `LineEdit` | `line_edit.h` / `line_edit.c` | Campo di input a riga singola (barra trova / vai alla riga / percorsi file) |
+| `TableView` | `table_view.h` / `table_view.c` | Griglia risultati query: ordinamento, copia TSV, export CSV |
 | `TreeView` | `tree_view.h` / `tree_view.c` | Sidebar oggetti DB |
 | `Scrollbar` | `scrollbar.h` / `scrollbar.c` | Scrollbar verticale/orizzontale |
 | `Panel` | `panel.h` / `panel.c` | Contenitore con 128 figli, bordo, padding |
 | `Splitter` | `splitter.h` / `splitter.c` | Divisore ridimensionabile orizzontale/verticale |
 | *(tema)* | `theme.h` / `theme.c` | Palette, testo con ellissi, icone vettoriali antialiasing |
-| *(SQL)* | `sql_text.h` / `sql_text.c` | Divisione degli statement, statement sotto il cursore, keyword per l'highlighting |
+| *(SQL)* | `sql_text.h` / `sql_text.c` | Divisione degli statement, statement sotto il cursore, keyword per highlighting e autocompletamento, formattatore SQL |
 
 ### Colori di sistema (`platform.h`)
 
