@@ -27,7 +27,8 @@ typedef struct RunJob {
     int          total_code;      // statement con codice
     RunLog*      log;             // uno per statement eseguito (per la cronologia)
     int          log_n;
-    QueryResult* grid;            // ultimo risultato tabellare
+    QueryResult* grids[MAX_RESULT_TABS];   // risultati tabellari (gli ultimi MAX_RESULT_TABS)
+    int          ngrids;
     QueryResult* failed;
     int          failed_idx, failed_offset;
     int          executed, affected;
@@ -114,13 +115,41 @@ static void update_session(AppWindow* app) {
     update_completions(app);
 }
 
-static void show_result(AppWindow* app, QueryResult* r) {
-    // il vecchio risultato si libera solo dopo aver aggiornato la griglia
-    QueryResult* old = app->last_result;
-    app->last_result = r;
+static void layout_widgets(AppWindow* app);
+
+// imposta i risultati mostrati (uno per scheda); i precedenti vengono liberati dopo aver
+// aggiornato la griglia, così la table view non punta mai a memoria liberata
+static void set_result_tabs(AppWindow* app, QueryResult** rs, int n, int select) {
+    QueryResult* old[MAX_RESULT_TABS];
+    int nold = app->num_tabs;
+    memcpy(old, app->tabs, sizeof(old));
+    n = SV_CLAMP(n, 0, MAX_RESULT_TABS);
+    for (int i = 0; i < n; i++) app->tabs[i] = rs[i];
+    app->num_tabs = n;
+    app->cur_tab  = n ? SV_CLAMP(select, 0, n - 1) : 0;
+    app->last_result = n ? app->tabs[app->cur_tab] : NULL;
     app->showing_history = false;
-    table_view_set_result(app->results, r);
-    if (old && old != r) db_result_free(old);
+    table_view_set_result(app->results, app->last_result);
+    for (int i = 0; i < nold; i++) {
+        bool kept = false;
+        for (int k = 0; k < n && !kept; k++) kept = app->tabs[k] == old[i];
+        if (!kept && old[i]) db_result_free(old[i]);
+    }
+    layout_widgets(app);   // la barra delle schede compare solo con più risultati
+}
+
+static void show_result(AppWindow* app, QueryResult* r) {
+    set_result_tabs(app, r ? &r : NULL, r ? 1 : 0, 0);
+}
+
+static void select_result_tab(AppWindow* app, int i) {
+    if (i < 0 || i >= app->num_tabs || i == app->cur_tab) return;
+    app->cur_tab = i;
+    app->last_result = app->tabs[i];
+    table_view_set_result(app->results, app->last_result);
+    QueryResult* r = app->last_result;
+    if (r) snprintf(app->status_meta, sizeof(app->status_meta), "%d rows  \xc2\xb7  %d cols  \xc2\xb7  %.1f ms",
+                    r->num_rows, r->num_cols, r->exec_time_ms);
 }
 
 // ── file ─────────────────────────────────────────────────────────
@@ -1201,6 +1230,7 @@ static const Shortcut SC_EDIT[] = {
 static const Shortcut SC_GRID[] = {
     { "Click header", "Sort asc / desc / off" }, { "Ctrl+C", "Copy cell (or row)" },
     { "Ctrl+Shift+C", "Copy all as TSV" }, { "Ctrl+E", "Export CSV" },
+    { "Ctrl+Tab", "Next result tab" },
     { "Double-click border", "Fit column width" },
 };
 
@@ -1414,7 +1444,7 @@ static void layout_widgets(AppWindow* app) {
     int center_w  = W - app->side_w;
     int editor_h  = app->splitter_y - TOOLBAR_H;
     int status_y  = app->splitter_y + SPLITTER_H;
-    int results_y = status_y + STATUSBAR_H;
+    int results_y = status_y + STATUSBAR_H + (app->num_tabs > 1 ? RESULT_TABS_H : 0);
     int results_h = H - FOOTER_H - results_y;
 
     app->editor->base.bounds        = (Rect){center_x, TOOLBAR_H, center_w, editor_h};
@@ -1626,6 +1656,17 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         if (evt->type == EVT_MOUSE_MOVE || evt->type == EVT_MOUSE_DOWN)
             platform_set_cursor(app->win, rect_has(app->theme_menu, evt->mouse_x, evt->mouse_y) ||
                                           rect_has(app->theme_btn, evt->mouse_x, evt->mouse_y) ? CURSOR_HAND : CURSOR_ARROW);
+        return;
+    }
+
+    // schede dei risultati
+    if (evt->type == EVT_MOUSE_DOWN && evt->mouse_button == SV_MOUSE_LEFT) {
+        for (int i = 0; i < app->num_tabs; i++)
+            if (rect_has(app->tab_rects[i], evt->mouse_x, evt->mouse_y)) { select_result_tab(app, i); return; }
+    }
+    if (evt->type == EVT_KEY_DOWN && evt->key == KEY_TAB && (evt->modifiers & SV_MOD_CTRL) && app->num_tabs > 1) {
+        int d = (evt->modifiers & SV_MOD_SHIFT) ? -1 : 1;
+        select_result_tab(app, (app->cur_tab + d + app->num_tabs) % app->num_tabs);
         return;
     }
 
@@ -1927,6 +1968,34 @@ static void draw_splitter_and_status(AppWindow* app) {
     widget_draw((Widget*)app->lbl_status, win);
 }
 
+// schede dei risultati (solo quando un'esecuzione ha prodotto più griglie)
+static void draw_result_tabs(AppWindow* app) {
+    for (int i = 0; i < MAX_RESULT_TABS; i++) app->tab_rects[i] = (Rect){0, 0, 0, 0};
+    if (app->num_tabs <= 1) return;
+    PlatformWindow* win = app->win;
+    int cx = app->side_w, cw = app->win_w - app->side_w;
+    int y = app->splitter_y + SPLITTER_H + STATUSBAR_H;
+    platform_fill_rect(win, (Rect){cx, y, cw, RESULT_TABS_H}, TH_SURFACE);
+    platform_fill_rect(win, (Rect){cx, y + RESULT_TABS_H - 1, cw, 1}, TH_BORDER);
+    int x = cx + 10;
+    for (int i = 0; i < app->num_tabs; i++) {
+        QueryResult* r = app->tabs[i];
+        char label[64];
+        snprintf(label, sizeof(label), "Result %d \xc2\xb7 %d row%s", i + 1, r ? r->num_rows : 0,
+                 r && r->num_rows == 1 ? "" : "s");
+        int tw = platform_measure_text_ex(win, label, -1, TH_FONT_SMALL + 1, FONT_UI);
+        Rect t = {x, y + 4, tw + 22, RESULT_TABS_H - 8};
+        if (t.x + t.w > cx + cw - 10) break;   // le schede che non entrano restano raggiungibili con Ctrl+Tab
+        app->tab_rects[i] = t;
+        bool active = i == app->cur_tab;
+        bool hover = rect_has(t, app->mouse_x, app->mouse_y);
+        if (active || hover) platform_fill_rect_rounded(win, t, active ? TH_ACCENT_SOFT : TH_HOVER, 6);
+        platform_draw_text_ex(win, label, -1, (Point){t.x + 11, ui_text_y(win, t, TH_FONT_SMALL + 1, FONT_UI)},
+                              active ? TH_ACCENT_TEXT : TH_TEXT_MUTED, TH_FONT_SMALL + 1, active ? FONT_UI_BOLD : FONT_UI);
+        x += t.w + 6;
+    }
+}
+
 static void draw_footer(AppWindow* app) {
     PlatformWindow* win = app->win;
     int W = app->win_w, H = app->win_h;
@@ -2013,6 +2082,7 @@ void app_window_draw(AppWindow* app) {
     draw_bar(app);
 
     draw_splitter_and_status(app);
+    draw_result_tabs(app);
     draw_sidebar(app);
     draw_toolbar(app);
     draw_footer(app);
@@ -2073,8 +2143,12 @@ static void run_worker(void* arg) {
         }
         j->total_ms += res->exec_time_ms;
         if (res->num_cols > 0) {
-            if (j->grid) db_result_free(j->grid);
-            j->grid = res;
+            if (j->ngrids == MAX_RESULT_TABS) {          // tiene gli ultimi MAX_RESULT_TABS
+                db_result_free(j->grids[0]);
+                memmove(j->grids, j->grids + 1, sizeof(j->grids[0]) * (MAX_RESULT_TABS - 1));
+                j->ngrids--;
+            }
+            j->grids[j->ngrids++] = res;
         } else {
             j->affected += res->rows_affected;
             j->changed = true;
@@ -2090,7 +2164,7 @@ static void job_free(RunJob* j) {
     free(j->log);
     free(j->ranges);
     free(j->text);
-    if (j->grid) db_result_free(j->grid);
+    for (int i = 0; i < j->ngrids; i++) db_result_free(j->grids[i]);
     if (j->failed) db_result_free(j->failed);
     free(j);
 }
@@ -2225,11 +2299,13 @@ static void finish_run(AppWindow* app) {
         table_view_set_message(app->results, TABLE_MSG_ERROR, "Execution cancelled",
                                "Statements already completed were applied; the rest was not executed.");
         set_status(app, STATUS_INFO, msg, meta);
-    } else if (j->grid) {
-        QueryResult* grid = j->grid;
-        j->grid = NULL;
-        show_result(app, grid);
-        if (j->executed > 1) snprintf(msg, sizeof(msg), "%d statements executed, showing last result", j->executed);
+    } else if (j->ngrids > 0) {
+        int ng = j->ngrids;
+        QueryResult* grid = j->grids[ng - 1];
+        set_result_tabs(app, j->grids, ng, ng - 1);   // la proprietà passa alle schede
+        j->ngrids = 0;
+        if (ng > 1)          snprintf(msg, sizeof(msg), "%d statements executed \xc2\xb7 %d result sets", j->executed, ng);
+        else if (j->executed > 1) snprintf(msg, sizeof(msg), "%d statements executed", j->executed);
         else                 snprintf(msg, sizeof(msg), "%d row%s returned", grid->num_rows, grid->num_rows == 1 ? "" : "s");
         snprintf(meta, sizeof(meta), "%d rows  \xc2\xb7  %d cols  \xc2\xb7  %.1f ms",
                  grid->num_rows, grid->num_cols, j->total_ms);
@@ -2264,7 +2340,7 @@ void app_window_destroy(AppWindow* app) {
         app->job_thread = NULL;
         finish_run(app);
     }
-    if (app->last_result) db_result_free(app->last_result);
+    for (int i = 0; i < app->num_tabs; i++) db_result_free(app->tabs[i]);
     widget_destroy((Widget*)app->btn_run);
     widget_destroy((Widget*)app->btn_run_current);
     widget_destroy((Widget*)app->btn_commit);

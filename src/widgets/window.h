@@ -38,6 +38,8 @@ SCOPO: Layout principale dell'applicazione SegVault.
 #define FOOTER_H          26   // Barra di stato in basso
 #define SPLITTER_H         7   // Altezza splitter tra editor e risultati
 #define SCROLLBAR_W       10   // Spessore delle scrollbar
+#define RESULT_TABS_H     30   // barra delle schede quando una esecuzione produce più risultati
+#define MAX_RESULT_TABS   20
 
 typedef enum { RUN_SCRIPT, RUN_CURRENT } RunMode;
 
@@ -140,7 +142,10 @@ typedef struct {
     int          theme_hover;       // voce sotto il mouse / evidenziata da tastiera
 
     // -- stato --
-    QueryResult* last_result;     // ultimo risultato (da liberare)
+    QueryResult* last_result;     // risultato mostrato (= tabs[cur_tab])
+    QueryResult* tabs[MAX_RESULT_TABS];   // un risultato per SELECT dell'ultima esecuzione (posseduti)
+    int          num_tabs, cur_tab;
+    Rect         tab_rects[MAX_RESULT_TABS];
     int          win_w, win_h;    // dimensioni correnti finestra
     int          splitter_y;      // y dello splitter (editor/risultati)
     bool         splitter_drag;   // true = utente sta spostando il splitter
