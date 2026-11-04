@@ -8,6 +8,7 @@
   #include <io.h>
   #include <direct.h>
   #include <fcntl.h>
+  #include <sys/stat.h>
 
   #ifdef _MSC_VER
     #include <BaseTsd.h>
@@ -19,7 +20,9 @@
 
   static inline int sv_open(const char* path, int flags, int mode) {
       (void)mode;
-      return _open(path, flags | _O_BINARY);
+      // con _O_CREAT il terzo argomento (permessi) è obbligatorio: senza, il file
+      // può essere creato in sola lettura e le aperture successive in scrittura falliscono
+      return _open(path, flags | _O_BINARY, _S_IREAD | _S_IWRITE);
   }
   static inline int sv_close(int fd) { return _close(fd); }
   static inline int sv_read(int fd, void* buf, unsigned int count) { return _read(fd, buf, count); }

@@ -3,6 +3,7 @@ segvault
 segvault.exe
 *.o
 obj/
+build-win/
 
 # Runtime data directory (created by ./segvault)
 data/

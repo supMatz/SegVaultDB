@@ -17,6 +17,7 @@ SCOPO: Stessa interfaccia di win32.c ma usa Xlib (Linux/X11).
 #include <X11/Xft/Xft.h>  // font antialiasing
 #include <X11/extensions/Xrender.h>
 #include <sys/select.h>
+#include <unistd.h>      // readlink
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -24,7 +25,8 @@ SCOPO: Stessa interfaccia di win32.c ma usa Xlib (Linux/X11).
 #include "platform.h"
 
 // famiglie di font in ordine di preferenza: fontconfig sceglie la prima installata
-#define SV_FONT_UI   "Inter,Fira Sans,Noto Sans,Cantarell,Ubuntu,DejaVu Sans,sans-serif"
+// Fira Sans e JetBrains Mono sono inclusi in assets/fonts (stessi font anche su Windows)
+#define SV_FONT_UI   "Fira Sans,Inter,Noto Sans,Cantarell,Ubuntu,DejaVu Sans,sans-serif"
 #define SV_FONT_MONO "JetBrains Mono,JetBrainsMono Nerd Font Mono,Fira Code,FiraCode Nerd Font Mono," \
                      "Cascadia Mono,Source Code Pro,Hack,DejaVu Sans Mono,monospace"
 
@@ -124,9 +126,29 @@ static void apply_clip(PlatformWindow* win) {
 
 // -- init / finestra --
 
+// rende disponibili a fontconfig i font inclusi nel progetto (assets/fonts accanto
+// all'eseguibile o nella cartella corrente)
+static void load_bundled_fonts(void) {
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) {
+        exe[n] = '\0';
+        char* slash = strrchr(exe, '/');
+        if (slash) *slash = '\0';
+        char dir[4200];
+        snprintf(dir, sizeof(dir), "%s/assets/fonts", exe);
+        if (FcConfigAppFontAddDir(NULL, (const FcChar8*)dir)) return;
+        snprintf(dir, sizeof(dir), "%s/fonts", exe);
+        if (FcConfigAppFontAddDir(NULL, (const FcChar8*)dir)) return;
+    }
+    FcConfigAppFontAddDir(NULL, (const FcChar8*)"assets/fonts");
+}
+
 bool platform_init(void) {
-    // xlib richiede XInitThreads() se si usano thread (query async future)
-    return XInitThreads() != 0;
+    // xlib richiede XInitThreads() perché le query girano in un thread separato
+    if (!XInitThreads()) return false;
+    load_bundled_fonts();
+    return true;
 }
 
 PlatformWindow* platform_window_create(const char* title, int w, int h) {

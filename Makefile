@@ -8,7 +8,7 @@ ifeq ($(OS), Windows_NT)
 else
     PLATFORM_SRC = src/platform/xlib.c
     XFT_CFLAGS  := $(shell pkg-config --cflags xft 2>/dev/null || echo -I/usr/include/freetype2)
-    XFT_LIBS    := $(shell pkg-config --libs xft xrender 2>/dev/null || echo -lXft -lXrender -lfontconfig)
+    XFT_LIBS    := $(shell pkg-config --libs xft xrender fontconfig 2>/dev/null || echo -lXft -lXrender -lfontconfig)
     LIBS         = -lX11 $(XFT_LIBS) -lm
     OUT          = segvault
     MKDIR        = mkdir -p
@@ -18,6 +18,7 @@ endif
 
 CC       = gcc
 CFLAGS   = -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -g -O2
+BASE_INCLUDES = -Iinclude -Isrc -Isrc/platform -Isrc/widgets -Isrc/catalog -Isrc/storage -Isrc/table -Isrc/index -Isrc/query -Isrc/tx -Isrc/bridge
 INCLUDES = $(XFT_CFLAGS) -Iinclude -Isrc -Isrc/platform -Isrc/widgets -Isrc/catalog -Isrc/storage -Isrc/table -Isrc/index -Isrc/query -Isrc/tx -Isrc/bridge
 
 # ── Widget / GUI source files ──
@@ -62,7 +63,7 @@ GUI_OBJS  = $(GUI_SRCS:.c=.o)
 FULL_SRCS = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) $(ENGINE_SRCS)
 FULL_OBJS = $(FULL_SRCS:.c=.o)
 
-.PHONY: all gui full clean test
+.PHONY: all gui full clean test windows
 
 all: full
 
@@ -83,6 +84,20 @@ test_engine: test_engine.c $(ENGINE_SRCS)
 %.o: %.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+# ── Cross-compilazione Windows da Linux (MinGW-w64) ──
+#   make windows  ->  segvault.exe (statico: basta copiarlo con la cartella assets/)
+WIN_CC   ?= x86_64-w64-mingw32-gcc
+WIN_SRCS  = src/main.c src/platform/win32.c $(WIDGET_SRCS) $(ENGINE_SRCS)
+WIN_OBJS  = $(patsubst %.c,build-win/%.o,$(WIN_SRCS))
+
+windows: $(WIN_OBJS)
+	$(WIN_CC) $(CFLAGS) -o segvault.exe $(WIN_OBJS) -static -mwindows -lgdi32 -luser32 -lkernel32
+	@echo "=== Windows build: segvault.exe ==="
+
+build-win/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(WIN_CC) $(CFLAGS) $(BASE_INCLUDES) -c $< -o $@
+
 clean:
 	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(OUT) test_engine
-	$(RM) -r obj
+	$(RM) -r obj build-win

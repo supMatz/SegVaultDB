@@ -247,8 +247,41 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// carica come font privati dell'app i .ttf inclusi nel progetto (assets\fonts accanto
+// all'eseguibile o nella cartella corrente), così l'aspetto è uguale a Linux
+static int load_fonts_from(const WCHAR* dir) {
+    WCHAR pattern[MAX_PATH];
+    if (swprintf(pattern, MAX_PATH, L"%ls\\*.ttf", dir) < 0) return 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int n = 0;
+    do {
+        WCHAR path[MAX_PATH];
+        if (swprintf(path, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName) >= 0 &&
+            AddFontResourceExW(path, FR_PRIVATE, 0) > 0) n++;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return n;
+}
+
+static void load_bundled_fonts(void) {
+    WCHAR exe[MAX_PATH];
+    DWORD len = GetModuleFileNameW(NULL, exe, MAX_PATH);
+    if (len > 0 && len < MAX_PATH) {
+        WCHAR* slash = wcsrchr(exe, L'\\');
+        if (slash) *slash = 0;
+        WCHAR dir[MAX_PATH];
+        swprintf(dir, MAX_PATH, L"%ls\\assets\\fonts", exe);
+        if (load_fonts_from(dir) > 0) return;
+        swprintf(dir, MAX_PATH, L"%ls\\fonts", exe);
+        if (load_fonts_from(dir) > 0) return;
+    }
+    load_fonts_from(L"assets\\fonts");
+}
+
 bool platform_init(void) {
-    // niente da inizializzare a livello globale su Win32
+    load_bundled_fonts();
     return true;
 }
 
@@ -354,9 +387,12 @@ static FontEntry* get_font(PlatformWindow* win, int size, FontStyle style) {
     bool mono = (style == FONT_MONO || style == FONT_MONO_BOLD);
     int weight = (style == FONT_UI_BOLD) ? FW_SEMIBOLD : (style == FONT_MONO_BOLD) ? FW_BOLD : FW_NORMAL;
 
-    const WCHAR* faces_ui[]   = { L"Segoe UI Variable Text", L"Segoe UI", NULL };
-    const WCHAR* faces_mono[] = { L"JetBrains Mono", L"Cascadia Mono", L"Cascadia Code", L"Consolas", NULL };
-    const WCHAR** faces = mono ? faces_mono : faces_ui;
+    // stessi font di Linux (inclusi in assets/fonts), poi i font di sistema di Windows.
+    // Il SemiBold di Fira Sans è una famiglia GDI a sé: chiederlo per nome evita il grassetto sintetico.
+    const WCHAR* faces_ui[]      = { L"Fira Sans", L"Segoe UI Variable Text", L"Segoe UI", NULL };
+    const WCHAR* faces_ui_bold[] = { L"Fira Sans SemiBold", L"Fira Sans", L"Segoe UI Semibold", L"Segoe UI", NULL };
+    const WCHAR* faces_mono[]    = { L"JetBrains Mono", L"Cascadia Mono", L"Cascadia Code", L"Consolas", NULL };
+    const WCHAR** faces = mono ? faces_mono : (style == FONT_UI_BOLD ? faces_ui_bold : faces_ui);
 
     HFONT font = NULL;
     for (int i = 0; faces[i]; i++) {
