@@ -370,6 +370,7 @@ static void on_history_click(void* ud) { history_toggle((AppWindow*)ud); }
 static void on_results_activate(int row, void* ud) {
     AppWindow* app = (AppWindow*)ud;
     if (!app->showing_history || row < 0 || row >= app->history_count) return;
+    if (app->results->order) row = app->results->order[row];   // griglia ordinata
     const HistoryEntry* e = &app->history[app->history_count - 1 - row];
     size_t n = strlen(e->sql);
     char* text = malloc(n + 3);
@@ -651,6 +652,7 @@ static const char* bar_label(const AppWindow* app) {
         case BAR_GOTO:    return "Go to line";
         case BAR_OPEN:    return "Open file";
         case BAR_SAVE_AS: return "Save as";
+        case BAR_EXPORT:  return "Export CSV";
         default:       return NULL;
     }
 }
@@ -727,6 +729,12 @@ static void bar_open(AppWindow* app, BarMode mode, bool replace) {
         line_edit_set_text(app->bar_input, buf);
         app->bar_input->placeholder = "Line number";
         textbox_set_search(app->editor, NULL, false, false);
+    } else if (mode == BAR_EXPORT) {
+        char buf[1100];
+        join_path(buf, sizeof(buf), app->data_dir[0] ? app->data_dir : ".", "result.csv");
+        line_edit_set_text(app->bar_input, buf);
+        app->bar_input->placeholder = "Path of the .csv file";
+        textbox_set_search(app->editor, NULL, false, false);
     } else if (mode == BAR_OPEN || mode == BAR_SAVE_AS) {
         char buf[1100];
         if (app->file_path[0] && mode == BAR_SAVE_AS) {
@@ -747,7 +755,7 @@ static void bar_open(AppWindow* app, BarMode mode, bool replace) {
     textbox_focus(app->editor, false);
     line_edit_focus(app->bar_replace_input, false);
     line_edit_focus(app->bar_input, true);
-    if (mode == BAR_OPEN || mode == BAR_SAVE_AS) app->bar_input->anchor = -1;   // cursore in fondo al percorso
+    if (mode == BAR_OPEN || mode == BAR_SAVE_AS || mode == BAR_EXPORT) app->bar_input->anchor = -1; // cursore in fondo
     else line_edit_select_all(app->bar_input);
 }
 
@@ -811,6 +819,26 @@ static void bar_submit(AppWindow* app, bool shift, bool ctrl) {
             if (!pl || path[pl - 1] == '/' || path[pl - 1] == '\\') { in->error = true; return; }
             bool ok = app->bar_mode == BAR_OPEN ? open_from(app, path) : save_to(app, path);
             if (ok) bar_close(app); else in->error = true;
+            break;
+        }
+        case BAR_EXPORT: {
+            char path[1024];
+            expand_path(in->text, path, sizeof(path));
+            if (!path[0]) { in->error = true; return; }
+            char* csv = table_view_export(app->results, true);
+            if (!csv) { set_status(app, STATUS_INFO, "Nothing to export: run a query first", ""); bar_close(app); return; }
+            bool ok = write_text_file(path, csv);
+            free(csv);
+            char msg[1200];
+            if (ok) {
+                snprintf(msg, sizeof(msg), "Exported %d rows to %s", app->results->result->num_rows, path);
+                set_status(app, STATUS_OK, msg, "");
+                bar_close(app);
+            } else {
+                snprintf(msg, sizeof(msg), "Cannot write %s: %s", path, strerror(errno));
+                set_status(app, STATUS_ERROR, msg, "");
+                in->error = true;
+            }
             break;
         }
         default: break;
@@ -1225,6 +1253,11 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
                 case 'g': bar_open(app, BAR_GOTO, false); return;
                 case 'o': bar_open(app, BAR_OPEN, false); return;
                 case 'n': cmd_new(app); return;
+                case 'e':
+                    if (app->results->result && app->results->result->num_cols > 0 &&
+                        app->results->msg_kind == TABLE_MSG_NONE) bar_open(app, BAR_EXPORT, false);
+                    else set_status(app, STATUS_INFO, "Nothing to export: run a query first", "");
+                    return;
                 case 's':
                     if (shift || !app->file_path[0]) bar_open(app, BAR_SAVE_AS, false);
                     else save_to(app, app->file_path);

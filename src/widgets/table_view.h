@@ -40,6 +40,7 @@ typedef struct {
     int  rownum_w;         // larghezza colonna numeri di riga
     int  sort_col; // colonna di ordinamento : -1 = nessuna
     bool sort_asc; // di base impostato a true
+    int* order;    // permutazione delle righe visualizzate (NULL = ordine originale)
 
     // ridimensionamento colonne
     int  resize_col;       // -1 = nessun resize in corso
@@ -91,6 +92,14 @@ int  table_view_content_width(TableView* tv);  // pixel
 int  table_view_visible_rows(TableView* tv);
 int  table_view_viewport_width(TableView* tv);
 void table_view_clamp_scroll(TableView* tv);
+
+// ordina per colonna (click sull'header: crescente -> decrescente -> ordine originale)
+void table_view_sort(TableView* tv, int col, bool asc);   // col < 0 = ordine originale
+
+// esporta il risultato (nell'ordine visualizzato) come testo delimitato.
+// csv = true: separatore ',' con virgolette dove serve e NULL vuoti; false: TSV con NULL letterale.
+// Ritorna una stringa malloc'd (free() del chiamante) o NULL se non c'è una griglia.
+char* table_view_export(TableView* tv, bool csv);
 
 // true se (mx, my) è sul bordo ridimensionabile di una colonna (per il cursore)
 bool table_view_hit_resize(TableView* tv, int mx, int my);

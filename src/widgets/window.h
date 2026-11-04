@@ -42,7 +42,7 @@ typedef enum { RUN_SCRIPT, RUN_CURRENT } RunMode;
 typedef enum { STATUS_IDLE, STATUS_OK, STATUS_ERROR, STATUS_INFO } StatusKind;
 
 // barra comandi sovrapposta all'editor
-typedef enum { BAR_NONE, BAR_FIND, BAR_GOTO, BAR_OPEN, BAR_SAVE_AS } BarMode;
+typedef enum { BAR_NONE, BAR_FIND, BAR_GOTO, BAR_OPEN, BAR_SAVE_AS, BAR_EXPORT } BarMode;
 
 #define HISTORY_MAX 500
 
