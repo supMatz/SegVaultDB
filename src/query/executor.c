@@ -50,9 +50,13 @@ typedef struct {
     char        buf[64];
 } EvalVal;
 
+static void eval_aggregate(ASTExpr* e, EvalVal* out);
+
 static void eval_operand(ASTExpr* e, Tuple* t, TableSchema* schema, EvalVal* out) {
     memset(out, 0, sizeof(*out));
     out->str = "";
+    if (e && e->type == EXPR_AGG) { eval_aggregate(e, out); return; }
+    if (e && e->type == EXPR_COLUMN && !t) { out->null = true; return; }   // gruppo vuoto
     switch (e ? e->type : EXPR_NULL) {
         case EXPR_INT:
             out->is_num = out->is_int = true; out->inum = e->int_val; out->num = (double)e->int_val;
@@ -89,6 +93,80 @@ static void eval_operand(ASTExpr* e, Tuple* t, TableSchema* schema, EvalVal* out
             out->null = true;
             return;
     }
+}
+
+// ── aggregati: calcolati sulle righe del gruppo corrente ──
+
+static struct {
+    Tuple**      rows;
+    int*         idx;
+    int          n;
+    TableSchema* ts;
+    bool         active;
+} g_agg;
+
+static void agg_context_set(Tuple** rows, int* idx, int n, TableSchema* ts) {
+    g_agg.rows = rows; g_agg.idx = idx; g_agg.n = n; g_agg.ts = ts; g_agg.active = true;
+}
+static void agg_context_clear(void) { g_agg.active = false; }
+
+static int evalval_cmp(const EvalVal* a, const EvalVal* b) {
+    if (a->is_num && b->is_num) {
+        if (a->is_int && b->is_int) return a->inum < b->inum ? -1 : a->inum > b->inum;
+        return a->num < b->num ? -1 : a->num > b->num;
+    }
+    return strcmp(a->str, b->str);
+}
+
+static void evalval_set_int(EvalVal* v, int64_t x) {
+    memset(v, 0, sizeof(*v));
+    v->is_num = v->is_int = true; v->inum = x; v->num = (double)x;
+    snprintf(v->buf, sizeof(v->buf), "%lld", (long long)x); v->str = v->buf;
+}
+static void evalval_set_num(EvalVal* v, double x) {
+    memset(v, 0, sizeof(*v));
+    v->is_num = true; v->num = x;
+    snprintf(v->buf, sizeof(v->buf), "%.15g", x); v->str = v->buf;
+}
+
+static void eval_aggregate(ASTExpr* e, EvalVal* out) {
+    memset(out, 0, sizeof(*out));
+    out->str = "";
+    if (!g_agg.active) { out->null = true; return; }
+    if (strcmp(e->func, "COUNT") == 0 && strcmp(e->col_name, "*") == 0) { evalval_set_int(out, g_agg.n); return; }
+
+    ASTExpr col;
+    memset(&col, 0, sizeof(col));
+    col.type = EXPR_COLUMN;
+    snprintf(col.col_name, sizeof(col.col_name), "%s", e->col_name);
+
+    int64_t count = 0, isum = 0;
+    double sum = 0;
+    bool all_int = true;
+    EvalVal best;
+    bool have_best = false;
+    memset(&best, 0, sizeof(best));
+    for (int k = 0; k < g_agg.n; k++) {
+        EvalVal v;
+        eval_operand(&col, g_agg.rows[g_agg.idx[k]], g_agg.ts, &v);
+        if (v.null) continue;
+        count++;
+        if (v.is_num) { sum += v.num; if (v.is_int) isum += v.inum; else all_int = false; }
+        else all_int = false;
+        bool is_min = strcmp(e->func, "MIN") == 0;
+        if (!have_best || (is_min ? evalval_cmp(&v, &best) < 0 : evalval_cmp(&v, &best) > 0)) {
+            bool own = v.str == v.buf;
+            best = v;
+            if (own) best.str = best.buf;     // la copia punta al proprio buffer
+            have_best = true;
+        }
+    }
+    if (strcmp(e->func, "COUNT") == 0) { evalval_set_int(out, count); return; }
+    if (count == 0) { out->null = true; return; }   // SUM/AVG/MIN/MAX di nessun valore = NULL
+    if (strcmp(e->func, "SUM") == 0) { if (all_int) evalval_set_int(out, isum); else evalval_set_num(out, sum); return; }
+    if (strcmp(e->func, "AVG") == 0) { evalval_set_num(out, sum / (double)count); return; }
+    *out = best;                                         // MIN / MAX
+    if (best.str == best.buf) out->str = out->buf;
 }
 
 // LIKE con % (qualsiasi sequenza) e _ (un carattere), senza distinzione maiuscole/minuscole
@@ -163,7 +241,7 @@ static bool eval_where(ASTExpr* where, Tuple* t, TableSchema* schema) {
 // DELETE ... WHERE colonna_sbagliata = 1 cancellasse tutte le righe.
 static const char* where_unknown_column(ASTExpr* e, TableSchema* schema) {
     if (!e) return NULL;
-    if (e->type == EXPR_COLUMN)
+    if (e->type == EXPR_COLUMN || (e->type == EXPR_AGG && strcmp(e->col_name, "*") != 0))
         return catalog_get_col_index(schema, e->col_name) < 0 ? e->col_name : NULL;
     const char* l = where_unknown_column(e->left, schema);
     return l ? l : where_unknown_column(e->right, schema);
@@ -1448,6 +1526,14 @@ static QueryResult* exec_group_by(ExecCtx* ctx, ASTNode* n) {
     if (!ts) return result_error_msg("Table not found");
     const char* bad = where_unknown_column(n->select_stmt.where, ts);
     if (bad) return unknown_column_error(bad, "WHERE");
+    bad = where_unknown_column(n->select_stmt.having, ts);
+    if (bad) return unknown_column_error(bad, "HAVING");
+    for (int i = 0; i < n->select_stmt.num_cols; i++) {
+        ASTExpr* c = n->select_stmt.columns[i];
+        if (c->type == EXPR_STAR) continue;
+        bad = where_unknown_column(c, ts);
+        if (bad) return unknown_column_error(bad, "SELECT");
+    }
 
     // Collect all rows
     HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
@@ -1464,8 +1550,6 @@ static QueryResult* exec_group_by(ExecCtx* ctx, ASTNode* n) {
     }
     heap_scan_close(scan); free(hf);
 
-    int out_cols = n->select_stmt.num_cols > 0 ? n->select_stmt.num_cols : ts->num_columns;
-    if (out_cols < 1) out_cols = ts->num_columns;
 
     // Apply WHERE and convert Tuples to Rows
     Tuple** filtered = NULL;
@@ -1476,42 +1560,45 @@ static QueryResult* exec_group_by(ExecCtx* ctx, ASTNode* n) {
         filtered[nf++] = rows[i];
     }
 
-    // Build groups: each group is a set of rows sharing the same GROUP BY column values
+    // Gruppi: righe con gli stessi valori nelle colonne di GROUP BY.
+    // Senza GROUP BY (solo aggregati) esiste un unico gruppo con tutte le righe, anche se vuoto.
+    int gcols[64], ngc = 0;
+    for (int k = 0; k < n->select_stmt.num_group_cols && k < 64; k++) {
+        const char* gc_name = n->select_stmt.group_cols[k];
+        const char* dot = strchr(gc_name, '.');
+        if (dot) gc_name = dot + 1;
+        int col_idx = catalog_get_col_index(ts, gc_name);
+        if (col_idx < 0) {
+            for (int q = 0; q < nf; q++) tuple_free(filtered[q]);
+            free(filtered); free(rows);
+            return unknown_column_error(gc_name, "GROUP BY");
+        }
+        gcols[ngc++] = col_idx;
+    }
+
     int ng = 0;
     int* group_size = NULL;
     int** group_rows = NULL;
-
-    for (int i = 0; i < nf; i++) {
-        // Find matching group
+    if (ngc == 0) {
+        ng = 1;
+        group_size = calloc(1, sizeof(int));
+        group_rows = calloc(1, sizeof(int*));
+        group_rows[0] = nf ? malloc(nf * sizeof(int)) : NULL;
+        for (int q = 0; q < nf; q++) group_rows[0][q] = q;
+        group_size[0] = nf;
+    }
+    for (int i = 0; ngc > 0 && i < nf; i++) {
         int gi = -1;
-        for (int g = 0; g < ng; g++) {
-            bool match = true;
-            for (int k = 0; k < n->select_stmt.num_group_cols; k++) {
-                const char* gc_name = n->select_stmt.group_cols[k];
-                const char* dot = strchr(gc_name, '.');
-                if (dot) gc_name = dot + 1;
-                int col_idx = catalog_get_col_index(ts, gc_name);
-                if (col_idx < 0) continue;
-                // Compare group key using first row of group vs current row
-                Tuple* first = filtered[group_rows[g][0]];
-                if (first->values[col_idx].is_null != filtered[i]->values[col_idx].is_null) { match = false; break; }
-                if (!first->values[col_idx].is_null) {
-                    Value* va = &first->values[col_idx];
-                    Value* vb = &filtered[i]->values[col_idx];
-                    if (ts->columns[col_idx].type == SV_TYPE_INT || ts->columns[col_idx].type == SV_TYPE_BIGINT) {
-                        if (va->int_val != vb->int_val) { match = false; break; }
-                    } else if (ts->columns[col_idx].type == SV_TYPE_FLOAT) {
-                        if (va->float_val != vb->float_val) { match = false; break; }
-                    } else {
-                        const char* sa = va->str_val ? va->str_val : "";
-                        const char* sb = vb->str_val ? vb->str_val : "";
-                        if (strcmp(sa, sb) != 0) { match = false; break; }
-                    }
-                }
+        for (int g = 0; g < ng && gi < 0; g++) {
+            Tuple* first = filtered[group_rows[g][0]];
+            bool same = true;
+            for (int k = 0; k < ngc && same; k++) {
+                Value* va = &first->values[gcols[k]];
+                Value* vb = &filtered[i]->values[gcols[k]];
+                same = (va->is_null && vb->is_null) || value_equal(va, vb, ts->columns[gcols[k]].type);
             }
-            if (match) { gi = g; break; }
+            if (same) gi = g;
         }
-
         if (gi < 0) {
             gi = ng++;
             group_size = realloc(group_size, ng * sizeof(int));
@@ -1519,18 +1606,20 @@ static QueryResult* exec_group_by(ExecCtx* ctx, ASTNode* n) {
             group_size[gi] = 0;
             group_rows[gi] = NULL;
         }
-
         group_size[gi]++;
         group_rows[gi] = realloc(group_rows[gi], group_size[gi] * sizeof(int));
         group_rows[gi][group_size[gi] - 1] = i;
     }
 
-    // HAVING: filter groups using the first tuple of each group
+    // HAVING: valutato sul gruppo (gli aggregati sono calcolati sulle righe del gruppo)
     if (n->select_stmt.having) {
         int wg = 0;
         for (int g = 0; g < ng; g++) {
-            Tuple* first_t = filtered[group_rows[g][0]];
-            if (eval_where(n->select_stmt.having, first_t, ts)) {
+            agg_context_set(filtered, group_rows[g], group_size[g], ts);
+            Tuple* first_t = group_size[g] > 0 ? filtered[group_rows[g][0]] : NULL;
+            bool keep = eval_where(n->select_stmt.having, first_t, ts);
+            agg_context_clear();
+            if (keep) {
                 group_rows[wg] = group_rows[g];
                 group_size[wg] = group_size[g];
                 wg++;
@@ -1541,55 +1630,76 @@ static QueryResult* exec_group_by(ExecCtx* ctx, ASTNode* n) {
         ng = wg;
     }
 
-    // Build column map from SELECT column references
-    int* col_map = NULL;
-    bool output_all = false;
-    if (n->select_stmt.num_cols == 0) {
-        output_all = true;
-    } else if (n->select_stmt.num_cols == 1 && n->select_stmt.columns[0]->type == EXPR_STAR) {
-        output_all = true;
-    } else {
-        col_map = malloc(n->select_stmt.num_cols * sizeof(int));
-        for (int i = 0; i < n->select_stmt.num_cols; i++) {
-            if (n->select_stmt.columns[i]->type == EXPR_COLUMN) {
-                col_map[i] = catalog_get_col_index(ts, n->select_stmt.columns[i]->col_name);
-            } else {
-                col_map[i] = -1;
-            }
-        }
-    }
+    // colonne di output: SELECT * = tutte le colonne della tabella
+    bool star = n->select_stmt.num_cols == 0 ||
+                (n->select_stmt.num_cols == 1 && n->select_stmt.columns[0]->type == EXPR_STAR);
+    int out_cols = star ? ts->num_columns : n->select_stmt.num_cols;
 
-    // Build result: one row per group
     QueryResult* r = calloc(1, sizeof(QueryResult));
     r->success = true;
     r->num_cols = out_cols;
-    r->col_names = calloc(out_cols + 1, sizeof(char*));
+    r->col_names = calloc((size_t)out_cols + 1, sizeof(char*));
+    r->col_types = calloc((size_t)out_cols + 1, sizeof(char*));
     for (int i = 0; i < out_cols; i++) {
-        int ci = output_all ? i : (col_map ? col_map[i] : -1);
-        if (ci >= 0 && ci < ts->num_columns)
-            r->col_names[i] = strdup(ts->columns[ci].name);
-        else
-            r->col_names[i] = strdup("?");
+        char name[160];
+        ASTExpr* c = star ? NULL : n->select_stmt.columns[i];
+        if (star)                 snprintf(name, sizeof(name), "%s", ts->columns[i].name);
+        else if (c->alias[0])     snprintf(name, sizeof(name), "%s", c->alias);
+        else if (c->type == EXPR_AGG) snprintf(name, sizeof(name), "%s(%s)", c->func, c->col_name);
+        else                      snprintf(name, sizeof(name), "%s", c->col_name);
+        r->col_names[i] = strdup(name);
+        int ci = star ? i : (c->type == EXPR_COLUMN ? catalog_get_col_index(ts, c->col_name) : -1);
+        r->col_types[i] = strdup(ci >= 0 ? datatype_name(ts->columns[ci].type) : "");
     }
+
     r->rows = calloc(ng > 0 ? ng : 1, sizeof(Row));
     r->num_rows = ng;
-
     for (int g = 0; g < ng; g++) {
         Row* row = &r->rows[g];
         row->num_cells = out_cols;
         row->cells = calloc(out_cols, sizeof(Cell));
-        int first_i = group_rows[g][0];
+        Tuple* first = group_size[g] > 0 ? filtered[group_rows[g][0]] : NULL;
+        agg_context_set(filtered, group_rows[g], group_size[g], ts);
         for (int j = 0; j < out_cols; j++) {
-            int ci = output_all ? j : (col_map ? col_map[j] : -1);
-            if (ci >= 0 && ci < filtered[first_i]->num_values) {
-                Value* v = &filtered[first_i]->values[ci];
-                if (!v->is_null) value_to_string(v, ts->columns[ci].type, row->cells[j].value, sizeof(row->cells[j].value));
-                else snprintf(row->cells[j].value, sizeof(row->cells[j].value), "NULL");
+            Cell* cell = &row->cells[j];
+            ASTExpr* c = star ? NULL : n->select_stmt.columns[j];
+            if (c && c->type == EXPR_AGG) {
+                EvalVal v;
+                eval_operand(c, first, ts, &v);
+                cell->is_null = v.null;
+                cell->type = v.is_num ? (v.is_int ? CELL_TYPE_INT : CELL_TYPE_FLOAT) : CELL_TYPE_STRING;
+                snprintf(cell->value, sizeof(cell->value), "%s", v.null ? "NULL" : v.str);
+                continue;
             }
+            int ci = star ? j : catalog_get_col_index(ts, c->col_name);
+            if (ci < 0 || !first || first->values[ci].is_null) {
+                cell->is_null = true;
+                snprintf(cell->value, sizeof(cell->value), "NULL");
+                continue;
+            }
+            value_to_string(&first->values[ci], ts->columns[ci].type, cell->value, sizeof(cell->value));
         }
+        agg_context_clear();
     }
 
-    free(col_map);
+    // ORDER BY su una colonna di output (nome, alias o aggregato), poi LIMIT
+    if (n->select_stmt.order_col[0]) {
+        const char* oc = n->select_stmt.order_col;
+        const char* dot = strchr(oc, '.');
+        int sort_col = -1;
+        for (int i = 0; i < out_cols && sort_col < 0; i++)
+            if (strcasecmp(r->col_names[i], oc) == 0 || (dot && strcasecmp(r->col_names[i], dot + 1) == 0)) sort_col = i;
+        if (sort_col >= 0 && r->num_rows > 1) {
+            g_sort_rows.rows = r->rows;
+            g_sort_rows.sort_col = sort_col;
+            g_sort_rows.order_asc = n->select_stmt.order_asc;
+            qsort(r->rows, r->num_rows, sizeof(Row), row_compare_cells);
+        }
+    }
+    if (n->select_stmt.limit > 0 && r->num_rows > n->select_stmt.limit) {
+        for (int i = n->select_stmt.limit; i < r->num_rows; i++) free(r->rows[i].cells);
+        r->num_rows = n->select_stmt.limit;
+    }
 
     // Cleanup
     for (int i = 0; i < nf; i++) tuple_free(filtered[i]);
@@ -1609,12 +1719,19 @@ QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt) {
         case NODE_DROP_TABLE:   return exec_drop_table(ctx, stmt);
         case NODE_ALTER_TABLE:  return exec_alter_table(ctx, stmt);
         case NODE_INSERT:       return exec_insert(ctx, stmt);
-        case NODE_SELECT:
-            if (stmt->select_stmt.num_joins > 0)
+        case NODE_SELECT: {
+            bool has_agg = false;
+            for (int i = 0; i < stmt->select_stmt.num_cols; i++)
+                if (stmt->select_stmt.columns[i]->type == EXPR_AGG) has_agg = true;
+            if (stmt->select_stmt.num_joins > 0) {
+                if (has_agg || stmt->select_stmt.num_group_cols > 0)
+                    return result_error_msg("Aggregates and GROUP BY are not supported together with JOIN yet");
                 return exec_join(ctx, stmt);
-            if (stmt->select_stmt.num_group_cols > 0)
+            }
+            if (stmt->select_stmt.num_group_cols > 0 || has_agg)
                 return exec_group_by(ctx, stmt);
             return exec_select(ctx, stmt);
+        }
         case NODE_UPDATE:       return exec_update(ctx, stmt);
         case NODE_DELETE:       return exec_delete(ctx, stmt);
         case NODE_USE:          return exec_use(ctx, stmt);

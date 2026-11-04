@@ -1,6 +1,9 @@
 #include "parser.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <ctype.h>
+#include <strings.h>
 
 typedef struct {
     TokenList* tokens;
@@ -108,7 +111,42 @@ static ASTExpr* new_binary(OpType op, ASTExpr* l, ASTExpr* r) {
     return e;
 }
 
+static bool is_aggregate_name(const char* s) {
+    static const char* AGG[] = { "COUNT", "SUM", "AVG", "MIN", "MAX" };
+    for (size_t i = 0; i < sizeof(AGG) / sizeof(AGG[0]); i++)
+        if (strcasecmp(s, AGG[i]) == 0) return true;
+    return false;
+}
+
+// COUNT(*) | COUNT(col) | SUM(col) | AVG(col) | MIN(col) | MAX(col)
+static bool at_aggregate(ParserState* ps) {
+    Token t = peek(ps);
+    if (t.type != TOK_IDENTIFIER || !is_aggregate_name(t.text)) return false;
+    return ps->pos + 1 < ps->tokens->count && ps->tokens->tokens[ps->pos + 1].type == TOK_LPAREN;
+}
+
+static ASTExpr* parse_aggregate(ParserState* ps) {
+    Token fn = consume(ps);
+    consume(ps);   // '('
+    ASTExpr* e = new_expr(EXPR_AGG);
+    if (!e) return NULL;
+    for (int i = 0; fn.text[i] && i < (int)sizeof(e->func) - 1; i++) e->func[i] = (char)toupper((unsigned char)fn.text[i]);
+    if (match(ps, TOK_STAR)) {
+        if (strcmp(e->func, "COUNT") != 0) parse_fail(ps, "Only COUNT accepts *", fn);
+        strcpy(e->col_name, "*");
+    } else {
+        ASTExpr arg;
+        memset(&arg, 0, sizeof(arg));
+        parse_column_ref(ps, &arg);
+        copy_text(ps, e->col_name, sizeof(e->col_name), arg.col_name);
+        copy_text(ps, e->table_name, sizeof(e->table_name), arg.table_name);
+    }
+    if (!match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' after aggregate argument", peek(ps));
+    return e;
+}
+
 static ASTExpr* parse_operand(ParserState* ps) {
+    if (at_aggregate(ps)) return parse_aggregate(ps);
     Token t = peek(ps);
     ASTExpr* e = NULL;
     switch (t.type) {
@@ -543,11 +581,22 @@ static ASTNode* parse_select(ParserState* ps) {
 
     if (match(ps, TOK_DISTINCT)) n->select_stmt.distinct = true;
 
-    // Columns
+    // Columns: colonne, * e aggregati, con alias opzionale ("AS nome" o "nome")
     n->select_stmt.num_cols = 0;
     while (peek(ps).type != TOK_FROM && peek(ps).type != TOK_EOF) {
-        ASTExpr* e = calloc(1, sizeof(ASTExpr));
-        parse_column_ref(ps, e);
+        if (n->select_stmt.num_cols >= 64) { parse_fail(ps, "Too many columns in SELECT (max 64)", peek(ps)); break; }
+        ASTExpr* e;
+        if (at_aggregate(ps)) {
+            e = parse_aggregate(ps);
+        } else {
+            e = calloc(1, sizeof(ASTExpr));
+            if (e) parse_column_ref(ps, e);
+        }
+        if (!e) break;
+        if (match(ps, TOK_AS) || peek(ps).type == TOK_IDENTIFIER) {
+            Token al = consume(ps);
+            copy_text(ps, e->alias, sizeof(e->alias), al.text);
+        }
         n->select_stmt.columns[n->select_stmt.num_cols++] = e;
         if (!match(ps, TOK_COMMA)) break;
     }
@@ -564,6 +613,7 @@ static ASTNode* parse_select(ParserState* ps) {
             copy_text(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name), tn.text);
             first_table = false;
         } else {
+            if (n->select_stmt.num_joins >= 8) { parse_fail(ps, "Too many JOINs (max 8)", peek(ps)); break; }
             ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
             memset(j, 0, sizeof(ASTJoin));
             copy_text(ps, j->table_name, sizeof(j->table_name), tn.text);
@@ -572,6 +622,7 @@ static ASTNode* parse_select(ParserState* ps) {
 
         if (match(ps, TOK_JOIN)) {
             Token jt = consume(ps);
+            if (n->select_stmt.num_joins >= 8) { parse_fail(ps, "Too many JOINs (max 8)", peek(ps)); break; }
             ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
             memset(j, 0, sizeof(ASTJoin));
             copy_text(ps, j->table_name, sizeof(j->table_name), jt.text);
@@ -589,6 +640,7 @@ static ASTNode* parse_select(ParserState* ps) {
         } else if (match(ps, TOK_LEFT)) {
             expect(ps, TOK_JOIN);
             Token jt = consume(ps);
+            if (n->select_stmt.num_joins >= 8) { parse_fail(ps, "Too many JOINs (max 8)", peek(ps)); break; }
             ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
             memset(j, 0, sizeof(ASTJoin));
             copy_text(ps, j->table_name, sizeof(j->table_name), jt.text);
@@ -606,6 +658,7 @@ static ASTNode* parse_select(ParserState* ps) {
         } else if (match(ps, TOK_RIGHT)) {
             expect(ps, TOK_JOIN);
             Token jt = consume(ps);
+            if (n->select_stmt.num_joins >= 8) { parse_fail(ps, "Too many JOINs (max 8)", peek(ps)); break; }
             ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
             memset(j, 0, sizeof(ASTJoin));
             copy_text(ps, j->table_name, sizeof(j->table_name), jt.text);
@@ -635,6 +688,7 @@ static ASTNode* parse_select(ParserState* ps) {
         expect(ps, TOK_BY);
         n->select_stmt.num_group_cols = 0;
         while (1) {
+            if (n->select_stmt.num_group_cols >= 64) { parse_fail(ps, "Too many GROUP BY columns (max 64)", peek(ps)); break; }
             ASTExpr gc_expr;
             memset(&gc_expr, 0, sizeof(gc_expr));
             parse_column_ref(ps, &gc_expr);
