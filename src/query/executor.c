@@ -103,8 +103,8 @@ static int row_compare_cells(const void* a, const void* b) {
     if (ca->is_null && cb->is_null) return 0;
     if (ca->is_null) return g_sort_rows.order_asc ? -1 : 1;
     if (cb->is_null) return g_sort_rows.order_asc ? 1 : -1;
-    const char* sa = ca->value ? ca->value : "";
-    const char* sb = cb->value ? cb->value : "";
+    const char* sa = ca->value;   // array: mai NULL
+    const char* sb = cb->value;
     int cmp = strcmp(sa, sb);
     // Try numeric comparison if both look like numbers
     char* ea = NULL; char* eb = NULL;
@@ -281,7 +281,7 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     if (!ts) return result_error_msg("Table not found");
 
     const char* vals[64];
-    char val_bufs[64][64];
+    char val_bufs[64][sizeof(((ASTExpr*)0)->str_val)];   // stesso spazio del valore nell'AST: niente troncamenti
     memset(val_bufs, 0, sizeof(val_bufs));
     int nv = n->insert_stmt.num_values < 64 ? n->insert_stmt.num_values : 64;
 
@@ -420,7 +420,6 @@ static QueryResult* exec_select(ExecCtx* ctx, ASTNode* n) {
 
     // Try index scan if WHERE is simple equality on indexed column
     bool use_index = false;
-    BTreeScan* idx_scan = NULL;
     BTree* idx_bt = NULL;
 
     if (n->select_stmt.where && n->select_stmt.where->type == EXPR_BINARY &&
@@ -471,10 +470,9 @@ static QueryResult* exec_select(ExecCtx* ctx, ASTNode* n) {
     // Determine columns to output
     int out_cols = n->select_stmt.num_cols;
     int* col_map = NULL;
-    bool output_all = false;
 
     if (out_cols == 0 || (out_cols == 1 && n->select_stmt.columns[0]->type == EXPR_STAR)) {
-        output_all = true;
+        // SELECT *: mappa identità
         out_cols = ts->num_columns;
         col_map = malloc(out_cols * sizeof(int));
         for (int i = 0; i < out_cols; i++) col_map[i] = i;
@@ -920,8 +918,6 @@ static QueryResult* exec_explain(ExecCtx* ctx, ASTNode* n) {
     r->rows[1].cells = calloc(4, sizeof(Cell));
     snprintf(r->rows[1].cells[0].value, sizeof(r->rows[1].cells[0].value), "Projection");
     snprintf(r->rows[1].cells[1].value, sizeof(r->rows[1].cells[1].value), "columns");
-    snprintf(r->rows[1].cells[2].value, sizeof(r->rows[1].cells[2].value), "");
-    snprintf(r->rows[1].cells[3].value, sizeof(r->rows[1].cells[3].value), "");
     return r;
 }
 
@@ -1009,11 +1005,11 @@ static QueryResult* exec_join(ExecCtx* ctx, ASTNode* n) {
 
     ASTExpr* on_cond = (n->select_stmt.num_joins > 0) ? n->select_stmt.joins[0].condition : NULL;
 
-    int max_rows = n1 * n2;
+    if (out_cols < 0) out_cols = 0;
     QueryResult* r = calloc(1, sizeof(QueryResult));
     r->success = true;
     r->num_cols = out_cols;
-    r->col_names = calloc(out_cols + 1, sizeof(char*));
+    r->col_names = calloc((size_t)out_cols + 1, sizeof(char*));
 
     for (int i = 0; i < out_cols; i++) {
         int ci = output_all ? i : (col_map ? col_map[i] : -1);
@@ -1265,8 +1261,6 @@ static QueryResult* exec_group_by(ExecCtx* ctx, ASTNode* n) {
     if (out_cols < 1) out_cols = ts->num_columns;
 
     // Apply WHERE and convert Tuples to Rows
-    Row* all_rows = NULL;
-    int total = 0;
     Tuple** filtered = NULL;
     int nf = 0;
     for (int i = 0; i < num_rows; i++) {

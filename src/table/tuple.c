@@ -38,7 +38,7 @@ uint8_t* tuple_serialize(Tuple* t, TableSchema* s, size_t* out_len) {
             total += sz;
         } else {
             // VARCHAR/TEXT: lunghezza + contenuto
-            size_t slen = col->type == SV_TYPE_BLOB ? t->values[i].blob_len : strlen(t->values[i].str_val ? t->values[i].str_val : "");
+            size_t slen = col->type == SV_TYPE_BLOB ? (size_t)t->values[i].blob_len : strlen(t->values[i].str_val ? t->values[i].str_val : "");
             total += 2 + slen; // 2 byte per la lunghezza
         }
     }

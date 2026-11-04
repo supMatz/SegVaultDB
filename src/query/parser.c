@@ -31,6 +31,40 @@ static void add_stmt(ParserState* ps, ASTNode* stmt) {
     ps->result->statements[ps->result->count++] = stmt;
 }
 
+
+// copia un testo del token in un campo dell'AST; se non entra lo statement viene rifiutato
+// (troncarlo in silenzio poteva far coincidere due nomi lunghi diversi)
+static void copy_text(ParserState* ps, char* dst, size_t cap, const char* src) {
+    size_t n = strlen(src);
+    if (n >= cap) {
+        if (ps->result->success) {
+            snprintf(ps->result->error, sizeof(ps->result->error),
+                     "Name or value too long (max %d characters): %.40s...", (int)cap - 1, src);
+            ps->result->success = false;
+        }
+        n = cap - 1;
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+// "tabella.colonna" in un campo di dimensione fissa, con lo stesso controllo
+static void copy_qualified(ParserState* ps, char* dst, size_t cap, const char* table, const char* col) {
+    if (strlen(table) + 1 + strlen(col) >= cap) {
+        copy_text(ps, dst, cap, "");
+        if (ps->result->success) {
+            snprintf(ps->result->error, sizeof(ps->result->error),
+                     "Qualified name too long (max %d characters): %.30s.%.30s", (int)cap - 1, table, col);
+            ps->result->success = false;
+        }
+        return;
+    }
+    size_t tl = strlen(table), cl = strlen(col);   // lunghezza già verificata sopra
+    memcpy(dst, table, tl);
+    dst[tl] = '.';
+    memcpy(dst + tl + 1, col, cl + 1);
+}
+
 static ASTNode* parse_select(ParserState* ps);
 static void parse_column_ref(ParserState* ps, ASTExpr* e) {
     Token t = consume(ps);
@@ -40,31 +74,31 @@ static void parse_column_ref(ParserState* ps, ASTExpr* e) {
     }
     e->type = EXPR_COLUMN;
     if (peek(ps).type == TOK_DOT) {
-        snprintf(e->table_name, sizeof(e->table_name), "%s", t.text);
+        copy_text(ps, e->table_name, sizeof(e->table_name), t.text);
         consume(ps);
         Token t2 = consume(ps);
         if (t2.type == TOK_STAR) {
             e->type = EXPR_STAR;
         } else {
-            snprintf(e->col_name, sizeof(e->col_name), "%s", t2.text);
+            copy_text(ps, e->col_name, sizeof(e->col_name), t2.text);
         }
     } else {
-        snprintf(e->col_name, sizeof(e->col_name), "%s", t.text);
+        copy_text(ps, e->col_name, sizeof(e->col_name), t.text);
     }
 }
 
 static ASTNode* parse_create_trigger(ParserState* ps, ASTNode* n) {
     n->type = NODE_CREATE_TRIGGER;
     Token tg = consume(ps);
-    snprintf(n->create_trigger.name, sizeof(n->create_trigger.name), "%s", tg.text);
+    copy_text(ps, n->create_trigger.name, sizeof(n->create_trigger.name), tg.text);
     if (match(ps, TOK_BEFORE)) n->create_trigger.before = true;
     else if (match(ps, TOK_AFTER)) n->create_trigger.before = false;
     else { n->create_trigger.before = true; }
     Token ev = consume(ps);
-    snprintf(n->create_trigger.event, sizeof(n->create_trigger.event), "%s", ev.text);
+    copy_text(ps, n->create_trigger.event, sizeof(n->create_trigger.event), ev.text);
     expect(ps, TOK_ON);
     Token tbl = consume(ps);
-    snprintf(n->create_trigger.table_name, sizeof(n->create_trigger.table_name), "%s", tbl.text);
+    copy_text(ps, n->create_trigger.table_name, sizeof(n->create_trigger.table_name), tbl.text);
     match(ps, TOK_FOR);
     match(ps, TOK_EACH);
     match(ps, TOK_ROW);
@@ -79,7 +113,7 @@ static ASTNode* parse_create_trigger(ParserState* ps, ASTNode* n) {
             di += tl;
         }
     }
-    snprintf(n->create_trigger.body, sizeof(n->create_trigger.body), "%s", body);
+    copy_text(ps, n->create_trigger.body, sizeof(n->create_trigger.body), body);
     return n;
 }
 
@@ -97,7 +131,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             n->type = NODE_INSERT;
             expect(ps, TOK_INTO);
             Token tn = consume(ps);
-            snprintf(n->insert_stmt.table_name, sizeof(n->insert_stmt.table_name), "%s", tn.text);
+            copy_text(ps, n->insert_stmt.table_name, sizeof(n->insert_stmt.table_name), tn.text);
             if (match(ps, TOK_LPAREN)) {
                 n->insert_stmt.num_cols = 0;
                 while (peek(ps).type != TOK_RPAREN) {
@@ -117,7 +151,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                 Token v = consume(ps);
                 if (v.type == TOK_INTEGER) { e->type = EXPR_INT; e->int_val = atoll(v.text); }
                 else if (v.type == TOK_FLOAT) { e->type = EXPR_FLOAT; e->float_val = atof(v.text); }
-                else if (v.type == TOK_STRING) { e->type = EXPR_STRING; snprintf(e->str_val, sizeof(e->str_val), "%s", v.text); }
+                else if (v.type == TOK_STRING) { e->type = EXPR_STRING; copy_text(ps, e->str_val, sizeof(e->str_val), v.text); }
                 else if (v.type == TOK_NULL) { e->type = EXPR_INT; e->int_val = 0; }
                 n->insert_stmt.values[n->insert_stmt.num_values++] = e;
                 if (!match(ps, TOK_COMMA)) break;
@@ -129,15 +163,15 @@ static ASTNode* parse_statement(ParserState* ps) {
             consume(ps);
             n->type = NODE_UPDATE;
             Token tn = consume(ps);
-            snprintf(n->update_stmt.table_name, sizeof(n->update_stmt.table_name), "%s", tn.text);
+            copy_text(ps, n->update_stmt.table_name, sizeof(n->update_stmt.table_name), tn.text);
             expect(ps, TOK_SET);
             Token cn = consume(ps);
-            snprintf(n->update_stmt.set_col, sizeof(n->update_stmt.set_col), "%s", cn.text);
+            copy_text(ps, n->update_stmt.set_col, sizeof(n->update_stmt.set_col), cn.text);
             expect(ps, TOK_EQ);
             ASTExpr* e = calloc(1, sizeof(ASTExpr));
             Token v = consume(ps);
             if (v.type == TOK_INTEGER) { e->type = EXPR_INT; e->int_val = atoll(v.text); }
-            else if (v.type == TOK_STRING) { e->type = EXPR_STRING; snprintf(e->str_val, sizeof(e->str_val), "%s", v.text); }
+            else if (v.type == TOK_STRING) { e->type = EXPR_STRING; copy_text(ps, e->str_val, sizeof(e->str_val), v.text); }
             n->update_stmt.set_expr = e;
             if (match(ps, TOK_WHERE)) {
                 // Simple WHERE: identifier = value
@@ -149,7 +183,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                 ASTExpr* wr = calloc(1, sizeof(ASTExpr));
                 Token wv = consume(ps);
                 if (wv.type == TOK_INTEGER) { wr->type = EXPR_INT; wr->int_val = atoll(wv.text); }
-                else if (wv.type == TOK_STRING) { wr->type = EXPR_STRING; snprintf(wr->str_val, sizeof(wr->str_val), "%s", wv.text); }
+                else if (wv.type == TOK_STRING) { wr->type = EXPR_STRING; copy_text(ps, wr->str_val, sizeof(wr->str_val), wv.text); }
                 we->right = wr;
                 n->update_stmt.where = we;
             }
@@ -160,7 +194,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             n->type = NODE_DELETE;
             expect(ps, TOK_FROM);
             Token tn = consume(ps);
-            snprintf(n->delete_stmt.table_name, sizeof(n->delete_stmt.table_name), "%s", tn.text);
+            copy_text(ps, n->delete_stmt.table_name, sizeof(n->delete_stmt.table_name), tn.text);
             if (match(ps, TOK_WHERE)) {
                 ASTExpr* w = calloc(1, sizeof(ASTExpr));
                 parse_column_ref(ps, w);
@@ -170,7 +204,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                 ASTExpr* wr = calloc(1, sizeof(ASTExpr));
                 Token wv = consume(ps);
                 if (wv.type == TOK_INTEGER) { wr->type = EXPR_INT; wr->int_val = atoll(wv.text); }
-                else if (wv.type == TOK_STRING) { wr->type = EXPR_STRING; snprintf(wr->str_val, sizeof(wr->str_val), "%s", wv.text); }
+                else if (wv.type == TOK_STRING) { wr->type = EXPR_STRING; copy_text(ps, wr->str_val, sizeof(wr->str_val), wv.text); }
                 we->right = wr;
                 n->delete_stmt.where = we;
             }
@@ -182,22 +216,22 @@ static ASTNode* parse_statement(ParserState* ps) {
             if (sub.type == TOK_DATABASE) {
                 n->type = NODE_CREATE_DB;
                 Token dn = consume(ps);
-                snprintf(n->create_db.db_name, sizeof(n->create_db.db_name), "%s", dn.text);
+                copy_text(ps, n->create_db.db_name, sizeof(n->create_db.db_name), dn.text);
             } else if (sub.type == TOK_TRIGGER) {
                 return parse_create_trigger(ps, n);
             } else if (sub.type == TOK_TABLE) {
                 n->type = NODE_CREATE_TABLE;
                 Token tn = consume(ps);
-                snprintf(n->create_table.table_name, sizeof(n->create_table.table_name), "%s", tn.text);
+                copy_text(ps, n->create_table.table_name, sizeof(n->create_table.table_name), tn.text);
                 expect(ps, TOK_LPAREN);
                 n->create_table.num_columns = 0;
                 while (peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) {
                     ColumnDef* cd = &n->create_table.columns[n->create_table.num_columns];
                     memset(cd, 0, sizeof(ColumnDef));
                     Token cn = consume(ps);
-                    snprintf(cd->name, sizeof(cd->name), "%s", cn.text);
+                    copy_text(ps, cd->name, sizeof(cd->name), cn.text);
                     Token ct = consume(ps);
-                    snprintf(cd->type, sizeof(cd->type), "%s", ct.text);
+                    copy_text(ps, cd->type, sizeof(cd->type), ct.text);
                     if (ct.type == TOK_INTEGER) { /* INT type */ }
                     if (peek(ps).type == TOK_LPAREN) {
                         consume(ps);
@@ -214,7 +248,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                         else if (strcmp(mod.text, "AUTO_INCREMENT") == 0) cd->auto_increment = true;
                         else if (strcmp(mod.text, "DEFAULT") == 0) {
                             Token dv = consume(ps);
-                            snprintf(cd->default_val, sizeof(cd->default_val), "%s", dv.text);
+                            copy_text(ps, cd->default_val, sizeof(cd->default_val), dv.text);
                         }
                         else break;
                     }
@@ -225,18 +259,18 @@ static ASTNode* parse_statement(ParserState* ps) {
             } else if (sub.type == TOK_INDEX) {
                 n->type = NODE_CREATE_INDEX;
                 Token in = consume(ps);
-                snprintf(n->create_index.index_name, sizeof(n->create_index.index_name), "%s", in.text);
+                copy_text(ps, n->create_index.index_name, sizeof(n->create_index.index_name), in.text);
                 expect(ps, TOK_ON);
                 Token tn = consume(ps);
-                snprintf(n->create_index.table_name, sizeof(n->create_index.table_name), "%s", tn.text);
+                copy_text(ps, n->create_index.table_name, sizeof(n->create_index.table_name), tn.text);
                 expect(ps, TOK_LPAREN);
                 Token cn = consume(ps);
-                snprintf(n->create_index.col_name, sizeof(n->create_index.col_name), "%s", cn.text);
+                copy_text(ps, n->create_index.col_name, sizeof(n->create_index.col_name), cn.text);
                 expect(ps, TOK_RPAREN);
             } else if (sub.type == TOK_VIEW) {
                 n->type = NODE_CREATE_VIEW;
                 Token vn = consume(ps);
-                snprintf(n->create_view.view_name, sizeof(n->create_view.view_name), "%s", vn.text);
+                copy_text(ps, n->create_view.view_name, sizeof(n->create_view.view_name), vn.text);
                 expect(ps, TOK_AS);
                 // Store rest as definition
                 char def[2048] = {0};
@@ -250,7 +284,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                         di += tl;
                     }
                 }
-                snprintf(n->create_view.definition, sizeof(n->create_view.definition), "%s", def);
+                copy_text(ps, n->create_view.definition, sizeof(n->create_view.definition), def);
             }
             break;
         }
@@ -259,11 +293,11 @@ static ASTNode* parse_statement(ParserState* ps) {
             expect(ps, TOK_TABLE);
             n->type = NODE_ALTER_TABLE;
             Token tn = consume(ps);
-            snprintf(n->alter_table.table_name, sizeof(n->alter_table.table_name), "%s", tn.text);
+            copy_text(ps, n->alter_table.table_name, sizeof(n->alter_table.table_name), tn.text);
             if (match(ps, TOK_RENAME)) {
                 expect(ps, TOK_TO);
                 Token nn = consume(ps);
-                snprintf(n->alter_table.new_name, sizeof(n->alter_table.new_name), "%s", nn.text);
+                copy_text(ps, n->alter_table.new_name, sizeof(n->alter_table.new_name), nn.text);
             }
             break;
         }
@@ -273,26 +307,26 @@ static ASTNode* parse_statement(ParserState* ps) {
             if (sub.type == TOK_DATABASE) {
                 n->type = NODE_DROP_DB;
                 Token dn = consume(ps);
-                snprintf(n->drop_db.db_name, sizeof(n->drop_db.db_name), "%s", dn.text);
+                copy_text(ps, n->drop_db.db_name, sizeof(n->drop_db.db_name), dn.text);
             } else if (sub.type == TOK_TABLE) {
                 n->type = NODE_DROP_TABLE;
                 Token tn = consume(ps);
-                snprintf(n->drop_table.table_name, sizeof(n->drop_table.table_name), "%s", tn.text);
+                copy_text(ps, n->drop_table.table_name, sizeof(n->drop_table.table_name), tn.text);
             } else if (sub.type == TOK_VIEW) {
                 n->type = NODE_DROP_VIEW;
                 Token vn = consume(ps);
-                snprintf(n->drop_view.view_name, sizeof(n->drop_view.view_name), "%s", vn.text);
+                copy_text(ps, n->drop_view.view_name, sizeof(n->drop_view.view_name), vn.text);
             } else if (sub.type == TOK_INDEX) {
                 n->type = NODE_DROP_INDEX;
                 Token in = consume(ps);
-                snprintf(n->drop_index.index_name, sizeof(n->drop_index.index_name), "%s", in.text);
+                copy_text(ps, n->drop_index.index_name, sizeof(n->drop_index.index_name), in.text);
                 expect(ps, TOK_ON);
                 Token tn = consume(ps);
-                snprintf(n->drop_index.table_name, sizeof(n->drop_index.table_name), "%s", tn.text);
+                copy_text(ps, n->drop_index.table_name, sizeof(n->drop_index.table_name), tn.text);
             } else if (sub.type == TOK_TRIGGER) {
                 n->type = NODE_DROP_TRIGGER;
                 Token tg = consume(ps);
-                snprintf(n->drop_trigger.name, sizeof(n->drop_trigger.name), "%s", tg.text);
+                copy_text(ps, n->drop_trigger.name, sizeof(n->drop_trigger.name), tg.text);
             }
             break;
         }
@@ -300,7 +334,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             consume(ps);
             n->type = NODE_USE;
             Token dn = consume(ps);
-            snprintf(n->use_stmt.db_name, sizeof(n->use_stmt.db_name), "%s", dn.text);
+            copy_text(ps, n->use_stmt.db_name, sizeof(n->use_stmt.db_name), dn.text);
             break;
         }
         case TOK_SHOW: {
@@ -314,7 +348,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             Token tn = consume(ps);
             if (peek(ps).type == TOK_IDENTIFIER) {
                 // table name stored in select_stmt.table_name for convenience
-                snprintf(n->select_stmt.table_name, sizeof(n->select_stmt.table_name), "%s", tn.text);
+                copy_text(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name), tn.text);
             }
             break;
         }
@@ -339,7 +373,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             if (match(ps, TOK_TO)) {
                 n->type = NODE_ROLLBACK_TO;
                 Token sn = consume(ps);
-                snprintf(n->rollback_to.name, sizeof(n->rollback_to.name), "%s", sn.text);
+                copy_text(ps, n->rollback_to.name, sizeof(n->rollback_to.name), sn.text);
             } else {
                 n->type = NODE_ROLLBACK;
             }
@@ -349,7 +383,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             consume(ps);
             n->type = NODE_SAVEPOINT;
             Token sn = consume(ps);
-            snprintf(n->savepoint.name, sizeof(n->savepoint.name), "%s", sn.text);
+            copy_text(ps, n->savepoint.name, sizeof(n->savepoint.name), sn.text);
             break;
         }
         case TOK_TRUNCATE: {
@@ -357,12 +391,12 @@ static ASTNode* parse_statement(ParserState* ps) {
             n->type = NODE_TRUNCATE;
             expect(ps, TOK_TABLE);
             Token tn = consume(ps);
-            snprintf(n->delete_stmt.table_name, sizeof(n->delete_stmt.table_name), "%s", tn.text);
+            copy_text(ps, n->delete_stmt.table_name, sizeof(n->delete_stmt.table_name), tn.text);
             break;
         }
         default:
             snprintf(ps->result->error, sizeof(ps->result->error),
-                     "Unexpected token: %s at line %d", t.text, t.line);
+                     "Unexpected token: %.200s at line %d", t.text, t.line);
             ps->result->success = false;
             free(n);
             return NULL;
@@ -396,12 +430,12 @@ static ASTNode* parse_select(ParserState* ps) {
     while (1) {
         Token tn = consume(ps);
         if (first_table) {
-            snprintf(n->select_stmt.table_name, sizeof(n->select_stmt.table_name), "%s", tn.text);
+            copy_text(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name), tn.text);
             first_table = false;
         } else {
             ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
             memset(j, 0, sizeof(ASTJoin));
-            snprintf(j->table_name, sizeof(j->table_name), "%s", tn.text);
+            copy_text(ps, j->table_name, sizeof(j->table_name), tn.text);
             j->type = JOIN_INNER;
         }
 
@@ -409,7 +443,7 @@ static ASTNode* parse_select(ParserState* ps) {
             Token jt = consume(ps);
             ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
             memset(j, 0, sizeof(ASTJoin));
-            snprintf(j->table_name, sizeof(j->table_name), "%s", jt.text);
+            copy_text(ps, j->table_name, sizeof(j->table_name), jt.text);
             j->type = JOIN_INNER;
             if (match(ps, TOK_ON)) {
                 ASTExpr* cond = calloc(1, sizeof(ASTExpr));
@@ -426,7 +460,7 @@ static ASTNode* parse_select(ParserState* ps) {
             Token jt = consume(ps);
             ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
             memset(j, 0, sizeof(ASTJoin));
-            snprintf(j->table_name, sizeof(j->table_name), "%s", jt.text);
+            copy_text(ps, j->table_name, sizeof(j->table_name), jt.text);
             j->type = JOIN_LEFT;
             if (match(ps, TOK_ON)) {
                 ASTExpr* cond = calloc(1, sizeof(ASTExpr));
@@ -443,7 +477,7 @@ static ASTNode* parse_select(ParserState* ps) {
             Token jt = consume(ps);
             ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
             memset(j, 0, sizeof(ASTJoin));
-            snprintf(j->table_name, sizeof(j->table_name), "%s", jt.text);
+            copy_text(ps, j->table_name, sizeof(j->table_name), jt.text);
             j->type = JOIN_RIGHT;
             if (match(ps, TOK_ON)) {
                 ASTExpr* cond = calloc(1, sizeof(ASTExpr));
@@ -480,7 +514,7 @@ static ASTNode* parse_select(ParserState* ps) {
         ASTExpr* right = calloc(1, sizeof(ASTExpr));
         if (peek(ps).type == TOK_INTEGER) { Token v = consume(ps); right->type = EXPR_INT; right->int_val = atoll(v.text); }
         else if (peek(ps).type == TOK_FLOAT) { Token v = consume(ps); right->type = EXPR_FLOAT; right->float_val = atof(v.text); }
-        else if (peek(ps).type == TOK_STRING) { Token v = consume(ps); right->type = EXPR_STRING; snprintf(right->str_val, sizeof(right->str_val), "%s", v.text); }
+        else if (peek(ps).type == TOK_STRING) { Token v = consume(ps); right->type = EXPR_STRING; copy_text(ps, right->str_val, sizeof(right->str_val), v.text); }
         else { parse_column_ref(ps, right); }
         w->right = right;
         n->select_stmt.where = w;
@@ -494,8 +528,7 @@ static ASTNode* parse_select(ParserState* ps) {
             memset(&gc_expr, 0, sizeof(gc_expr));
             parse_column_ref(ps, &gc_expr);
             if (gc_expr.table_name[0])
-                snprintf(n->select_stmt.group_cols[n->select_stmt.num_group_cols++],
-                         sizeof(n->select_stmt.group_cols[0]), "%s.%s", gc_expr.table_name, gc_expr.col_name);
+                copy_qualified(ps, n->select_stmt.group_cols[n->select_stmt.num_group_cols++], sizeof(n->select_stmt.group_cols[0]), gc_expr.table_name, gc_expr.col_name);
             else
                 snprintf(n->select_stmt.group_cols[n->select_stmt.num_group_cols++],
                          sizeof(n->select_stmt.group_cols[0]), "%s", gc_expr.col_name);
@@ -517,7 +550,7 @@ static ASTNode* parse_select(ParserState* ps) {
         else h->op = OP_EQ;
         ASTExpr* right = calloc(1, sizeof(ASTExpr));
         if (peek(ps).type == TOK_INTEGER) { Token v = consume(ps); right->type = EXPR_INT; right->int_val = atoll(v.text); }
-        else if (peek(ps).type == TOK_STRING) { Token v = consume(ps); right->type = EXPR_STRING; snprintf(right->str_val, sizeof(right->str_val), "%s", v.text); }
+        else if (peek(ps).type == TOK_STRING) { Token v = consume(ps); right->type = EXPR_STRING; copy_text(ps, right->str_val, sizeof(right->str_val), v.text); }
         else { parse_column_ref(ps, right); }
         h->right = right;
         n->select_stmt.having = h;
@@ -529,9 +562,9 @@ static ASTNode* parse_select(ParserState* ps) {
         memset(&oc, 0, sizeof(oc));
         parse_column_ref(ps, &oc);
         if (oc.table_name[0])
-            snprintf(n->select_stmt.order_col, sizeof(n->select_stmt.order_col), "%s.%s", oc.table_name, oc.col_name);
+            copy_qualified(ps, n->select_stmt.order_col, sizeof(n->select_stmt.order_col), oc.table_name, oc.col_name);
         else
-            snprintf(n->select_stmt.order_col, sizeof(n->select_stmt.order_col), "%s", oc.col_name);
+            copy_text(ps, n->select_stmt.order_col, sizeof(n->select_stmt.order_col), oc.col_name);
         n->select_stmt.order_asc = true;
         if (match(ps, TOK_DESC)) n->select_stmt.order_asc = false;
     }

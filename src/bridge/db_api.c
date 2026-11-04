@@ -491,7 +491,12 @@ const char* db_current_database(void) {
 SessionInfo* db_session_info(void) {
     SessionInfo* s = SV_ALLOC(SessionInfo);
     const char* db = db_current_database();
-    if (db) strncpy(s->current_db, db, 63);
+    if (s && db) {
+        size_t n = strlen(db);
+        if (n >= sizeof(s->current_db)) n = sizeof(s->current_db) - 1;
+        memcpy(s->current_db, db, n);
+        s->current_db[n] = '\0';
+    }
     s->tx_id          = g_db.exec_ctx.tx_id;
     s->in_transaction = (s->tx_id != 0);
     s->auto_commit    = g_db.txm ? g_db.txm->autocommit : true;
