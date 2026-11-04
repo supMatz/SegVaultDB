@@ -29,4 +29,7 @@ bool sql_statement_at(const char* s, int len, int pos, SqlRange* out);
 typedef enum { SQL_WORD_IDENT, SQL_WORD_KEYWORD, SQL_WORD_TYPE, SQL_WORD_FUNC, SQL_WORD_LITERAL } SqlWordKind;
 SqlWordKind sql_classify_word(const char* w, int len);
 
+// elenco statico delle parole note di un tipo (per l'autocompletamento); ritorna quante sono
+int sql_word_list(SqlWordKind kind, const char* const** out);
+
 #endif

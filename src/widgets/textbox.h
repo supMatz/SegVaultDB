@@ -31,6 +31,21 @@ typedef struct {
     int   anchor;
 } TextSnapshot;
 
+// ── autocompletamento ──
+#define TEXTBOX_POPUP_MAX   200   // risultati massimi nel popup
+#define TEXTBOX_POPUP_ROWS    9   // righe visibili
+
+typedef enum {
+    COMP_KEYWORD, COMP_TYPE, COMP_FUNC, COMP_DATABASE, COMP_TABLE, COMP_VIEW, COMP_COLUMN
+} CompletionKind;
+
+typedef struct {
+    char name[64];
+    char detail[64];   // es. tipo della colonna
+    char parent[64];   // tabella di appartenenza (colonne)
+    CompletionKind kind;
+} CompletionItem;
+
 typedef struct {
     Widget base;
 
@@ -85,6 +100,17 @@ typedef struct {
     // riga da evidenziare come errore (-1 = nessuna)
     int error_line;
 
+    // autocompletamento: oggetti dello schema forniti dalla finestra + parole SQL
+    CompletionItem* comp_items;
+    int   comp_count;
+    CompletionItem* popup_items;   // risultati filtrati (copie)
+    int   popup_n;
+    bool  popup_open;
+    int   popup_start;     // offset di inizio della parola da completare
+    int   popup_sel;
+    int   popup_scroll;
+    Rect  popup_rect;      // area del popup (calcolata nel disegno)
+
     // ricerca (evidenziata nel testo quando search[0] != 0)
     char  search[256];
     bool  search_case;     // distingue maiuscole/minuscole
@@ -123,6 +149,11 @@ int   textbox_line_of_offset(TextBox* tb, int offset);
 int   textbox_visible_lines(TextBox* tb);
 void  textbox_set_error_line(TextBox* tb, int line);   // -1 per rimuovere
 void  textbox_scroll_to_line(TextBox* tb, int line);
+
+// ── autocompletamento ──
+void  textbox_set_completions(TextBox* tb, const CompletionItem* items, int count); // copia l'elenco
+void  textbox_draw_overlay(TextBox* tb, PlatformWindow* win, Rect area);  // popup sopra a tutto (area = finestra)
+bool  textbox_popup_contains(TextBox* tb, int x, int y);
 
 // ── ricerca e sostituzione ──
 void  textbox_set_search(TextBox* tb, const char* query, bool match_case, bool whole_word); // NULL o "" = nessuna

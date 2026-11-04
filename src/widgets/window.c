@@ -24,12 +24,67 @@ static void set_status(AppWindow* app, StatusKind kind, const char* text, const 
     snprintf(app->status_meta, sizeof(app->status_meta), "%s", meta ? meta : "");
 }
 
+// ── autocompletamento: oggetti del database corrente ─────────────
+
+typedef struct { CompletionItem* v; int n, cap; } CompList;
+
+static void comp_push(CompList* l, CompletionKind k, const char* name, const char* detail, const char* parent) {
+    if (!name || !name[0]) return;
+    if (l->n == l->cap) {
+        int cap = l->cap ? l->cap * 2 : 128;
+        CompletionItem* nv = realloc(l->v, sizeof(CompletionItem) * cap);
+        if (!nv) return;
+        l->v = nv;
+        l->cap = cap;
+    }
+    CompletionItem* it = &l->v[l->n++];
+    memset(it, 0, sizeof(*it));
+    snprintf(it->name, sizeof(it->name), "%s", name);
+    snprintf(it->detail, sizeof(it->detail), "%s", detail ? detail : "");
+    snprintf(it->parent, sizeof(it->parent), "%s", parent ? parent : "");
+    it->kind = k;
+}
+
+static void update_completions(AppWindow* app) {
+    CompList l = {0};
+    NameList* dbs = db_list_databases();
+    if (dbs) {
+        for (int i = 0; i < dbs->count; i++) comp_push(&l, COMP_DATABASE, dbs->names[i], "database", NULL);
+        db_namelist_free(dbs);
+    }
+    const char* cur = db_current_database();
+    if (cur && cur[0]) {
+        char db[128];
+        snprintf(db, sizeof(db), "%s", cur);
+        NameList* tables = db_list_tables(db);
+        if (tables) {
+            for (int i = 0; i < tables->count; i++) {
+                comp_push(&l, COMP_TABLE, tables->names[i], "table", NULL);
+                int nc = 0;
+                ColumnInfo* cols = db_list_columns(db, tables->names[i], &nc);
+                for (int c = 0; cols && c < nc; c++)
+                    comp_push(&l, COMP_COLUMN, cols[c].name, cols[c].type, tables->names[i]);
+                if (cols) db_columns_free(cols, nc);
+            }
+            db_namelist_free(tables);
+        }
+        NameList* views = db_list_views(db);
+        if (views) {
+            for (int i = 0; i < views->count; i++) comp_push(&l, COMP_VIEW, views->names[i], "view", NULL);
+            db_namelist_free(views);
+        }
+    }
+    textbox_set_completions(app->editor, l.v, l.n);
+    free(l.v);
+}
+
 static void update_session(AppWindow* app) {
     const char* db = db_current_database();
     label_set_text(app->lbl_db_name, db && db[0] ? db : "no database");
     SessionInfo* s = db_session_info();
     app->in_transaction = s ? s->in_transaction : false;
     if (s) db_session_free(s);
+    update_completions(app);
 }
 
 static void show_result(AppWindow* app, QueryResult* r) {
@@ -812,6 +867,15 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
             return;
         }
     }
+    // popup di autocompletamento: ha la precedenza sul resto (può sporgere sui risultati)
+    if ((evt->type == EVT_MOUSE_DOWN || evt->type == EVT_MOUSE_MOVE || evt->type == EVT_MOUSE_WHEEL) &&
+        textbox_popup_contains(app->editor, evt->mouse_x, evt->mouse_y)) {
+        widget_handle_event((Widget*)app->editor, evt);
+        platform_set_cursor(app->win, CURSOR_HAND);
+        return;
+    }
+    if (evt->type == EVT_MOUSE_DOWN) app->editor->popup_open = false;
+
     if (bar_handle_event(app, evt)) {
         if (evt->type == EVT_MOUSE_MOVE || evt->type == EVT_MOUSE_DOWN) {
             app->mouse_x = evt->mouse_x;
@@ -1046,6 +1110,7 @@ void app_window_draw(AppWindow* app) {
     draw_sidebar(app);
     draw_toolbar(app);
     draw_footer(app);
+    textbox_draw_overlay(app->editor, win, (Rect){0, 0, app->win_w, app->win_h});
 
     platform_present(win);
 }

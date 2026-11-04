@@ -137,3 +137,13 @@ SqlWordKind sql_classify_word(const char* w, int len) {
     if (in_list(FUNCS,    COUNT_OF(FUNCS),    w, len)) return SQL_WORD_FUNC;
     return SQL_WORD_IDENT;
 }
+
+int sql_word_list(SqlWordKind kind, const char* const** out) {
+    switch (kind) {
+        case SQL_WORD_KEYWORD: *out = KEYWORDS; return COUNT_OF(KEYWORDS);
+        case SQL_WORD_TYPE:    *out = TYPES;    return COUNT_OF(TYPES);
+        case SQL_WORD_FUNC:    *out = FUNCS;    return COUNT_OF(FUNCS);
+        case SQL_WORD_LITERAL: *out = LITERALS; return COUNT_OF(LITERALS);
+        default:               *out = NULL;     return 0;
+    }
+}

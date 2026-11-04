@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <stdio.h>
+#include <strings.h>
 
 #define INDENT 4
 
@@ -213,6 +214,7 @@ static void restore_snapshot(TextBox* tb, TextSnapshot* s) {
     update_cursor_linecol(tb);
     tb->pref_col = tb->cursor_col;
     tb->error_line = -1;
+    tb->popup_open = false;
     ensure_visible(tb);
     reset_blink(tb);
     if (tb->on_change) tb->on_change(tb->text, tb->base.user_data);
@@ -277,6 +279,7 @@ static void replace_range(TextBox* tb, int start, int end, const char* s, int sl
 
     tb->cursor_pos = start + slen;
     tb->sel_anchor = -1;
+    tb->popup_open = false;
     rebuild_lines(tb);
     update_cursor_linecol(tb);
     tb->pref_col   = tb->cursor_col;
@@ -657,6 +660,201 @@ static void paste_from_clipboard(TextBox* tb) {
 }
 
 // ═════════════════════════════════════════════════════════════════
+//  Autocompletamento
+// ═════════════════════════════════════════════════════════════════
+
+#define POPUP_ROW_H 24
+#define POPUP_PAD    4
+
+static bool in_code_at(const TextBox* tb, int pos); // definita dopo il lexer
+static char char_at(const TextBox* tb, int pos);
+
+static void popup_close(TextBox* tb) {
+    tb->popup_open = false;
+    tb->popup_n = 0;
+    tb->popup_rect = (Rect){0, 0, 0, 0};
+}
+
+static bool ieq_n(const char* a, const char* b, int n) {
+    for (int i = 0; i < n; i++) {
+        if (!b[i] || tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
+    }
+    return true;
+}
+
+static bool ieq(const char* a, const char* b) {
+    int n = (int)strlen(a);
+    return (int)strlen(b) == n && ieq_n(a, b, n);
+}
+
+static int cmp_items(const void* x, const void* y) {
+    const CompletionItem* a = x;
+    const CompletionItem* b = y;
+    int la = (int)strlen(a->name), lb = (int)strlen(b->name);
+    if (la != lb) return la - lb; // le parole più corte (più probabili) prima
+    return strcasecmp(a->name, b->name);
+}
+
+static void popup_add(TextBox* tb, const char* name, const char* detail, const char* parent, CompletionKind k) {
+    if (tb->popup_n >= TEXTBOX_POPUP_MAX) return;
+    for (int i = 0; i < tb->popup_n; i++)  // niente duplicati (es. stessa colonna in più tabelle)
+        if (tb->popup_items[i].kind == k && ieq(tb->popup_items[i].name, name)) return;
+    CompletionItem* it = &tb->popup_items[tb->popup_n++];
+    snprintf(it->name, sizeof(it->name), "%s", name);
+    snprintf(it->detail, sizeof(it->detail), "%s", detail ? detail : "");
+    snprintf(it->parent, sizeof(it->parent), "%s", parent ? parent : "");
+    it->kind = k;
+}
+
+// la parola prima di `start` introduce un nome di tabella? (FROM, JOIN, INTO, ...)
+static bool table_context(const TextBox* tb, int start) {
+    int e = start;
+    while (e > 0 && isspace((unsigned char)tb->text[e - 1])) e--;
+    if (e > 0 && tb->text[e - 1] == ',') return false;
+    int b = e;
+    while (b > 0 && is_word_char(tb->text[b - 1])) b--;
+    static const char* KW[] = { "FROM", "JOIN", "INTO", "UPDATE", "TABLE", "DESCRIBE", "DESC", "TRUNCATE" };
+    for (size_t i = 0; i < sizeof(KW) / sizeof(KW[0]); i++)
+        if ((int)strlen(KW[i]) == e - b && ieq_n(tb->text + b, KW[i], e - b)) return true;
+    return false;
+}
+
+// aggiunge le voci di un tipo che iniziano con pre (schema + parole SQL), ordinate
+static void popup_add_kind(TextBox* tb, CompletionKind k, const char* pre, int plen) {
+    int start = tb->popup_n;
+    for (int i = 0; i < tb->comp_count; i++) {
+        const CompletionItem* it = &tb->comp_items[i];
+        if (it->kind == k && ieq_n(it->name, pre, plen))
+            popup_add(tb, it->name, it->detail, it->parent, k);
+    }
+    SqlWordKind wk[2] = { SQL_WORD_IDENT, SQL_WORD_IDENT };
+    const char* dt = "";
+    if (k == COMP_KEYWORD) { wk[0] = SQL_WORD_KEYWORD; wk[1] = SQL_WORD_LITERAL; dt = "keyword"; }
+    if (k == COMP_TYPE)    { wk[0] = SQL_WORD_TYPE; dt = "type"; }
+    if (k == COMP_FUNC)    { wk[0] = SQL_WORD_FUNC; dt = "function"; }
+    for (int w = 0; w < 2; w++) {
+        if (wk[w] == SQL_WORD_IDENT) continue;
+        const char* const* list;
+        int n = sql_word_list(wk[w], &list);
+        for (int i = 0; i < n; i++)
+            if (ieq_n(list[i], pre, plen)) popup_add(tb, list[i], dt, NULL, k);
+    }
+    qsort(tb->popup_items + start, tb->popup_n - start, sizeof(CompletionItem), cmp_items);
+}
+
+// ricalcola i suggerimenti per la parola sotto il cursore.
+// force = apertura esplicita (Ctrl+Space o dopo un '.')
+static void popup_update(TextBox* tb, bool force) {
+    int cur = tb->cursor_pos;
+    if (has_sel(tb) || !in_code_at(tb, cur)) { popup_close(tb); return; }
+    int p = cur;
+    while (p > 0 && is_word_char(tb->text[p - 1])) p--;
+    int plen = cur - p;
+    bool dotted = p > 0 && tb->text[p - 1] == '.';
+    if (!dotted && plen == 0 && !force) { popup_close(tb); return; }
+    if (!dotted && plen < 2 && !force && !tb->popup_open) { popup_close(tb); return; }
+    if (plen > 60) { popup_close(tb); return; }
+
+    if (!tb->popup_items) {
+        tb->popup_items = malloc(sizeof(CompletionItem) * TEXTBOX_POPUP_MAX);
+        if (!tb->popup_items) return;
+    }
+    char pre[64];
+    memcpy(pre, tb->text + p, plen);
+    pre[plen] = '\0';
+    tb->popup_n = 0;
+
+    if (dotted) {
+        // tabella.colonna: colonne di quella tabella (o tutte, se è un alias sconosciuto)
+        int qe = p - 1, qs = qe;
+        while (qs > 0 && is_word_char(tb->text[qs - 1])) qs--;
+        if (qs == qe || qe - qs >= 64) { popup_close(tb); return; }
+        char qual[64];
+        memcpy(qual, tb->text + qs, qe - qs);
+        qual[qe - qs] = '\0';
+        bool known = false;
+        for (int i = 0; i < tb->comp_count && !known; i++)
+            known = tb->comp_items[i].kind == COMP_COLUMN && ieq(tb->comp_items[i].parent, qual);
+        int start = tb->popup_n;
+        for (int i = 0; i < tb->comp_count; i++) {
+            const CompletionItem* it = &tb->comp_items[i];
+            if (it->kind != COMP_COLUMN || !ieq_n(it->name, pre, plen)) continue;
+            if (known && !ieq(it->parent, qual)) continue;
+            popup_add(tb, it->name, it->detail, it->parent, COMP_COLUMN);
+        }
+        qsort(tb->popup_items + start, tb->popup_n - start, sizeof(CompletionItem), cmp_items);
+    } else if (table_context(tb, p)) {
+        CompletionKind order[] = { COMP_TABLE, COMP_VIEW, COMP_DATABASE, COMP_KEYWORD };
+        for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) popup_add_kind(tb, order[i], pre, plen);
+    } else {
+        CompletionKind order[] = { COMP_COLUMN, COMP_TABLE, COMP_VIEW, COMP_KEYWORD, COMP_FUNC, COMP_TYPE, COMP_DATABASE };
+        for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) popup_add_kind(tb, order[i], pre, plen);
+    }
+
+    // niente da proporre, o la parola è già completa
+    if (tb->popup_n == 0 || (tb->popup_n == 1 && ieq(tb->popup_items[0].name, pre) && !force)) {
+        popup_close(tb);
+        return;
+    }
+    tb->popup_open   = true;
+    tb->popup_start  = p;
+    tb->popup_sel    = 0;
+    tb->popup_scroll = 0;
+}
+
+static void popup_move(TextBox* tb, int delta) {
+    if (!tb->popup_n) return;
+    int s = tb->popup_sel + delta;
+    if (delta == 1 || delta == -1) s = (s + tb->popup_n) % tb->popup_n;   // ciclico con le frecce
+    tb->popup_sel = SV_CLAMP(s, 0, tb->popup_n - 1);
+    if (tb->popup_sel < tb->popup_scroll) tb->popup_scroll = tb->popup_sel;
+    if (tb->popup_sel >= tb->popup_scroll + TEXTBOX_POPUP_ROWS) tb->popup_scroll = tb->popup_sel - TEXTBOX_POPUP_ROWS + 1;
+}
+
+static void popup_accept(TextBox* tb) {
+    if (!tb->popup_open || tb->popup_sel >= tb->popup_n) return;
+    const CompletionItem* it = &tb->popup_items[tb->popup_sel];
+    char buf[80];
+    int n = snprintf(buf, sizeof(buf), "%s", it->name);
+
+    // parole SQL: rispetta lo stile dell'utente (tutto minuscolo -> minuscolo)
+    if (it->kind == COMP_KEYWORD || it->kind == COMP_TYPE || it->kind == COMP_FUNC) {
+        bool lower = false, upper = false;
+        for (int i = tb->popup_start; i < tb->cursor_pos; i++) {
+            if (islower((unsigned char)tb->text[i])) lower = true;
+            if (isupper((unsigned char)tb->text[i])) upper = true;
+        }
+        if (lower && !upper) for (int i = 0; i < n; i++) buf[i] = (char)tolower((unsigned char)buf[i]);
+    }
+    bool call = it->kind == COMP_FUNC && char_at(tb, tb->cursor_pos) != '(';
+    if (call && n + 2 < (int)sizeof(buf)) { buf[n++] = '('; buf[n++] = ')'; buf[n] = '\0'; }
+
+    int start = tb->popup_start, end = tb->cursor_pos;
+    popup_close(tb);
+    undo_push(tb, EDIT_OTHER);
+    replace_range(tb, start, end, buf, n);
+    if (call) move_cursor(tb, tb->cursor_pos - 1, false, false);
+    tb->last_edit_kind = EDIT_NONE;
+}
+
+// tasti con il popup aperto; true se consumato
+static bool popup_handle_key(TextBox* tb, sEvent* evt) {
+    if (!tb->popup_open) return false;
+    bool mods = evt->modifiers & (SV_MOD_CTRL | SV_MOD_ALT | SV_MOD_SHIFT);
+    switch (evt->key) {
+        case KEY_UP:       if (mods) break; popup_move(tb, -1); return true;
+        case KEY_DOWN:     if (mods) break; popup_move(tb, +1); return true;
+        case KEY_PAGEUP:   popup_move(tb, -TEXTBOX_POPUP_ROWS); return true;
+        case KEY_PAGEDOWN: popup_move(tb, +TEXTBOX_POPUP_ROWS); return true;
+        case KEY_ENTER:
+        case KEY_TAB:      if (mods) break; popup_accept(tb); return true;
+        case KEY_ESCAPE:   popup_close(tb); return true;
+        default: break;
+    }
+    return false;
+}
+
+// ═════════════════════════════════════════════════════════════════
 //  Input
 // ═════════════════════════════════════════════════════════════════
 
@@ -798,7 +996,30 @@ static void zoom(TextBox* tb, int delta) {
     else tb->font_size = SV_CLAMP(tb->font_size + delta, 10, 28);
 }
 
+static bool handle_key_inner(TextBox* tb, sEvent* evt);
+
 static bool handle_key(TextBox* tb, sEvent* evt) {
+    if (popup_handle_key(tb, evt)) return true;
+    if (evt->key == KEY_LETTER && (evt->modifiers & SV_MOD_CTRL) && evt->character == ' ') {
+        popup_update(tb, true);   // Ctrl+Space
+        return true;
+    }
+    bool was_open = tb->popup_open;
+    bool handled = handle_key_inner(tb, evt);
+    if (was_open) {
+        bool plain = !(evt->modifiers & (SV_MOD_CTRL | SV_MOD_ALT));
+        if (plain && (evt->key == KEY_BACKSPACE || evt->key == KEY_DELETE ||
+                      evt->key == KEY_LEFT || evt->key == KEY_RIGHT)) {
+            tb->popup_open = true;  // replace_range lo chiude: riapre filtrando di nuovo
+            popup_update(tb, false);
+        } else if (evt->key != KEY_NONE) {
+            popup_close(tb);
+        }
+    }
+    return handled;
+}
+
+static bool handle_key_inner(TextBox* tb, sEvent* evt) {
     bool ctrl  = evt->modifiers & SV_MOD_CTRL;
     bool shift = evt->modifiers & SV_MOD_SHIFT;
     bool alt   = evt->modifiers & SV_MOD_ALT;
@@ -927,6 +1148,30 @@ static bool textbox_handle_event(Widget* self, sEvent* evt) {
     TextBox* tb = (TextBox*)self;
     bool focused = self->state == WIDGET_STATE_FOCUSED;
 
+    // popup di completamento (può sporgere fuori dall'editor)
+    if (tb->popup_open && (evt->type == EVT_MOUSE_DOWN || evt->type == EVT_MOUSE_WHEEL || evt->type == EVT_MOUSE_MOVE)) {
+        Rect pr = tb->popup_rect;
+        bool in = pr.w > 0 && evt->mouse_x >= pr.x && evt->mouse_x < pr.x + pr.w &&
+                  evt->mouse_y >= pr.y && evt->mouse_y < pr.y + pr.h;
+        if (in) {
+            int row = tb->popup_scroll + (evt->mouse_y - pr.y - POPUP_PAD) / POPUP_ROW_H;
+            row = SV_CLAMP(row, 0, tb->popup_n - 1);
+            if (evt->type == EVT_MOUSE_WHEEL) {
+                int max_s = SV_MAX(0, tb->popup_n - TEXTBOX_POPUP_ROWS);
+                tb->popup_scroll = SV_CLAMP(tb->popup_scroll - evt->wheel_delta, 0, max_s);
+            } else if (evt->type == EVT_MOUSE_MOVE) {
+                if (tb->dragging) return false;
+                tb->popup_sel = row;
+            } else {
+                tb->popup_sel = row;
+                popup_accept(tb);
+                self->state = WIDGET_STATE_FOCUSED;
+            }
+            return true;
+        }
+        if (evt->type == EVT_MOUSE_DOWN) popup_close(tb);
+    }
+
     switch (evt->type) {
         case EVT_MOUSE_DOWN: {
             if (!widget_contains_point(self, evt->mouse_x, evt->mouse_y)) {
@@ -999,10 +1244,15 @@ static bool textbox_handle_event(Widget* self, sEvent* evt) {
             clamp_scroll(tb);
             return true;
 
-        case EVT_CHAR:
+        case EVT_CHAR: {
             if (!focused) return false;
-            handle_char(tb, evt->character);
+            uint32_t cp = evt->character;
+            handle_char(tb, cp);
+            if (cp == '_' || (cp < 0x80 && isalnum((int)cp))) popup_update(tb, false);
+            else if (cp == '.') popup_update(tb, true);
+            else popup_close(tb);
             return true;
+        }
 
         case EVT_KEY_DOWN:
             if (!focused) return false;
@@ -1046,6 +1296,26 @@ static LexState lex_state_at(const TextBox* tb, int upto) {
         }
     }
     return st;
+}
+
+// true se pos non è dentro una stringa o un commento
+static bool in_code_at(const TextBox* tb, int pos) {
+    if (lex_state_at(tb, pos) != LX_NORMAL) return false;
+    // commento "--" sulla stessa riga prima di pos
+    int ls = line_start(tb, line_of(tb, pos));
+    LexState st = lex_state_at(tb, ls);
+    if (st != LX_NORMAL) return false;
+    for (int i = ls; i + 1 < pos; i++) {
+        char c = tb->text[i];
+        if (c == '\'' || c == '"' || c == '`') {           // salta la stringa
+            int j = i + 1;
+            while (j < pos && tb->text[j] != c) j++;
+            i = j;
+        } else if (c == '-' && tb->text[i + 1] == '-') {
+            return false;
+        }
+    }
+    return true;
 }
 
 typedef struct {
@@ -1372,6 +1642,8 @@ static void textbox_destroy_fn(Widget* self) {
     free(tb->line_starts);
     for (int i = 0; i < tb->undo_count; i++) free(tb->undo[i].text);
     for (int i = 0; i < tb->redo_count; i++) free(tb->redo[i].text);
+    free(tb->comp_items);
+    free(tb->popup_items);
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -1652,4 +1924,126 @@ void textbox_goto_line(TextBox* tb, int line) {
     int vis = visible_lines(tb);
     tb->scroll_y = SV_MAX(0, line - vis / 3);
     clamp_scroll(tb);
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  Autocompletamento: API e disegno del popup
+// ═════════════════════════════════════════════════════════════════
+
+void textbox_set_completions(TextBox* tb, const CompletionItem* items, int count) {
+    if (!tb) return;
+    free(tb->comp_items);
+    tb->comp_items = NULL;
+    tb->comp_count = 0;
+    if (count <= 0 || !items) return;
+    tb->comp_items = malloc(sizeof(CompletionItem) * count);
+    if (!tb->comp_items) return;
+    memcpy(tb->comp_items, items, sizeof(CompletionItem) * count);
+    tb->comp_count = count;
+}
+
+bool textbox_popup_contains(TextBox* tb, int x, int y) {
+    if (!tb || !tb->popup_open) return false;
+    Rect r = tb->popup_rect;
+    return r.w > 0 && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+}
+
+static Color kind_color(CompletionKind k) {
+    switch (k) {
+        case COMP_KEYWORD:  return TH_SYN_KEYWORD;
+        case COMP_TYPE:     return TH_SYN_TYPE;
+        case COMP_FUNC:     return TH_SYN_FUNC;
+        case COMP_DATABASE: return TH_ICON_DB;
+        case COMP_TABLE:    return TH_ICON_TABLE;
+        case COMP_VIEW:     return TH_ICON_VIEW;
+        default:            return TH_ICON_COLUMN;
+    }
+}
+
+static const char* kind_letter(CompletionKind k) {
+    switch (k) {
+        case COMP_KEYWORD:  return "K";
+        case COMP_TYPE:     return "T";
+        case COMP_FUNC:     return "f";
+        case COMP_DATABASE: return "D";
+        case COMP_TABLE:    return "#";
+        case COMP_VIEW:     return "V";
+        default:            return "c";
+    }
+}
+
+void textbox_draw_overlay(TextBox* tb, PlatformWindow* win, Rect area) {
+    if (!tb) return;
+    if (!tb->popup_open || tb->popup_n == 0 || tb->base.state != WIDGET_STATE_FOCUSED) {
+        tb->popup_rect = (Rect){0, 0, 0, 0};
+        return;
+    }
+    int fs = SV_MAX(11, tb->font_size - 1);
+    int rows = SV_MIN(tb->popup_n, TEXTBOX_POPUP_ROWS);
+    int name_w = 0, det_w = 0;
+    for (int i = 0; i < tb->popup_n; i++) {
+        name_w = SV_MAX(name_w, platform_measure_text_ex(win, tb->popup_items[i].name, -1, fs, FONT_MONO));
+        det_w  = SV_MAX(det_w,  platform_measure_text_ex(win, tb->popup_items[i].detail, -1, TH_FONT_SMALL, FONT_UI));
+    }
+    int w = SV_CLAMP(34 + name_w + 24 + det_w + 14, 220, 520);
+    int h = rows * POPUP_ROW_H + POPUP_PAD * 2;
+
+    int line = line_of(tb, tb->popup_start);
+    int col  = col_of(tb, tb->popup_start);
+    Rect b = tb->base.bounds;
+    int line_top = b.y + tb->pad_top + (line - tb->scroll_y) * tb->line_height;
+    int x = text_x0(tb) - tb->scroll_x + col * tb->char_w - 30;
+    int y = line_top + tb->line_height + 2;
+    if (y + h > area.y + area.h - 4) y = line_top - h - 2;    // non c'è spazio sotto: sopra la riga
+    x = SV_CLAMP(x, area.x + 4, area.x + area.w - w - 4);
+    Rect r = {x, y, w, h};
+    tb->popup_rect = r;
+
+    platform_fill_rect_rounded(win, (Rect){r.x - 2, r.y + 3, r.w + 4, r.h + 3}, ui_alpha(TH_BG, 170), 9);
+    ui_round_box(win, r, TH_SURFACE_2, TH_BORDER_STRONG, 7);
+    platform_set_clip(win, r);
+
+    int plen = tb->cursor_pos - tb->popup_start;
+    for (int k = 0; k < rows; k++) {
+        int i = tb->popup_scroll + k;
+        if (i >= tb->popup_n) break;
+        const CompletionItem* it = &tb->popup_items[i];
+        Rect row = {r.x + POPUP_PAD, r.y + POPUP_PAD + k * POPUP_ROW_H, r.w - POPUP_PAD * 2, POPUP_ROW_H};
+        if (i == tb->popup_sel) platform_fill_rect_rounded(win, row, TH_ACCENT_SOFT, 5);
+
+        // badge del tipo
+        Color kc = kind_color(it->kind);
+        Rect badge = {row.x + 6, row.y + (POPUP_ROW_H - 16) / 2, 16, 16};
+        platform_fill_rect_rounded(win, badge, ui_alpha(kc, 40), 4);
+        const char* kl = kind_letter(it->kind);
+        int kw = platform_measure_text_ex(win, kl, -1, TH_FONT_SMALL, FONT_MONO_BOLD);
+        platform_draw_text_ex(win, kl, -1, (Point){badge.x + (16 - kw) / 2, ui_text_y(win, badge, TH_FONT_SMALL, FONT_MONO_BOLD)},
+                              kc, TH_FONT_SMALL, FONT_MONO_BOLD);
+
+        // nome: il prefisso digitato in evidenza
+        int nx = row.x + 30, ny = ui_text_y(win, row, fs, FONT_MONO);
+        int pl = SV_MIN(plen, (int)strlen(it->name));
+        int pw = platform_draw_text_ex(win, it->name, pl, (Point){nx, ny}, TH_ACCENT_TEXT, fs, FONT_MONO_BOLD);
+        platform_draw_text_ex(win, it->name + pl, -1, (Point){nx + pw, ny},
+                              i == tb->popup_sel ? TH_TEXT : TH_TEXT_MUTED, fs, FONT_MONO);
+
+        // dettaglio a destra (tipo colonna, tabella, "keyword"...)
+        char det[140];
+        if (it->kind == COMP_COLUMN && it->parent[0]) snprintf(det, sizeof(det), "%s \xc2\xb7 %s", it->detail, it->parent);
+        else snprintf(det, sizeof(det), "%s", it->detail);
+        int dw = platform_measure_text_ex(win, det, -1, TH_FONT_SMALL, FONT_UI);
+        int dx = row.x + row.w - 8 - dw;
+        if (dx > nx + name_w + 12 || dx > nx + platform_measure_text_ex(win, it->name, -1, fs, FONT_MONO) + 12)
+            platform_draw_text_ex(win, det, -1, (Point){dx, ui_text_y(win, row, TH_FONT_SMALL, FONT_UI)},
+                                  TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI);
+    }
+
+    // indicatore di scroll
+    if (tb->popup_n > rows) {
+        int track = r.h - 8;
+        int th = SV_MAX(16, track * rows / tb->popup_n);
+        int ty = r.y + 4 + (track - th) * tb->popup_scroll / SV_MAX(1, tb->popup_n - rows);
+        platform_fill_rect_rounded(win, (Rect){r.x + r.w - 5, ty, 3, th}, TH_BORDER_STRONG, 2);
+    }
+    platform_reset_clip(win);
 }
