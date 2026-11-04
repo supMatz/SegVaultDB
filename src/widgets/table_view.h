@@ -79,6 +79,8 @@ typedef struct {
 
 TableView* table_view_create(int x, int y, int w, int h);
 
+void table_view_apply_theme(TableView* tv); // ricarica i colori dal tema attivo
+
 void table_view_set_result(TableView* tv, QueryResult* result); // carica un risultato di query sulla griglia
 
 void table_view_set_message(TableView* tv, TableMessageKind kind, const char* title, const char* detail);

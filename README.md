@@ -48,7 +48,7 @@
 Tutte le query si scrivono nell'editor SQL:
 
 - **Run** (`F5`) esegue l'intero script, oppure solo il testo selezionato
-- **Run statement** (`Ctrl+Enter`) esegue solo lo statement sotto il cursore (evidenziato da una barra viola nel margine)
+- **Run statement** (`Ctrl+Enter`) esegue solo lo statement sotto il cursore (evidenziato da una barra colorata nel margine)
 
 Gli statement separati da `;` vengono eseguiti in sequenza (i `;` dentro stringhe e commenti sono ignorati). In caso di errore l'esecuzione si ferma, la riga dello statement fallito viene evidenziata in rosso nell'editor e il messaggio compare nel pannello dei risultati.
 
@@ -75,6 +75,7 @@ Gli statement separati da `;` vengono eseguiti in sequenza (i `;` dentro stringh
 | `Shift+Enter` / `Ctrl+Shift+Enter` | Nuova riga indentata sotto / sopra |
 | `Ctrl+Shift+F` | Formatta l'SQL (selezione o intero script) |
 | `F1` | Pannello con tutte le scorciatoie |
+| `Ctrl+Shift+T` | Tema successivo |
 
 L'editor chiude automaticamente parentesi e apici, mantiene l'indentazione andando a capo, evidenzia la parentesi corrispondente e le altre occorrenze dell'identificatore sotto il cursore, e colora keyword, tipi, funzioni, stringhe, numeri e commenti.
 
@@ -297,22 +298,30 @@ Ogni widget estende `Widget` (da `widget.h`) mettendolo come **primo campo** del
 | `Scrollbar` | `scrollbar.h` / `scrollbar.c` | Scrollbar verticale/orizzontale |
 | `Panel` | `panel.h` / `panel.c` | Contenitore con 128 figli, bordo, padding |
 | `Splitter` | `splitter.h` / `splitter.c` | Divisore ridimensionabile orizzontale/verticale |
-| *(tema)* | `theme.h` / `theme.c` | Palette, testo con ellissi, icone vettoriali antialiasing |
+| *(tema)* | `theme.h` / `theme.c` | Temi e palette, testo con ellissi, icone vettoriali antialiasing |
 | *(SQL)* | `sql_text.h` / `sql_text.c` | Divisione degli statement, statement sotto il cursore, keyword per highlighting e autocompletamento, formattatore SQL |
 
-### Colori di sistema (`platform.h`)
+### Temi
 
-La palette completa è in `src/widgets/theme.h` (prefisso `TH_`); i `COLOR_*` di `platform.h` restano per compatibilità.
+L'interfaccia ha 5 temi, selezionabili dalla pillola con il nome del tema nella toolbar (menu a tendina, anche con `↑`/`↓` e `Enter`) oppure con `Ctrl+Shift+T` per passare al successivo. La scelta viene salvata in `<data>/session.ini` e ripristinata all'avvio.
 
-| Costante | Hex | Uso |
+| Tema | Tipo | Accento |
 |---|---|---|
-| `TH_BG` | `#0D0F14` | Sfondo principale |
-| `TH_SURFACE` / `TH_SURFACE_2` | `#11141B` / `#151922` | Sidebar, toolbar, header |
-| `TH_ACCENT` | `#7C6AFF` | Viola elettrico — azione principale, cursore, selezione |
-| `TH_TEXT` / `TH_TEXT_DIM` | `#E2E6F2` / `#5C6480` | Testo principale / secondario |
-| `TH_BORDER` | `#212634` | Bordi |
-| `TH_SUCCESS` / `TH_ERROR` / `TH_WARNING` | `#3DD68C` / `#FF5C7A` / `#FFB547` | Stati (OK, errore, transazione aperta) |
-| `TH_SYN_*` | — | Colori del syntax highlighting SQL |
+| **Sky** *(predefinito)* | scuro | azzurro `#38BDF8` |
+| **Violet** | scuro | viola `#7C6AFF` (la palette originale) |
+| **Graphite** | scuro, grigio neutro | ambra `#F5A623` |
+| **Forest** | scuro, verde | smeraldo `#34D399` |
+| **Daylight** | chiaro | blu `#0284C7` |
+
+Tutti i colori vivono in una struct `Theme` (`src/widgets/theme.h` / `theme.c`): le macro `TH_*` leggono dal tema attivo (`g_theme`), quindi il codice di disegno non cambia. Per aggiungere un tema basta una nuova voce nell'array `THEMES[]` di `theme.c`. I widget che memorizzano i propri colori (bottoni, griglia, albero, scrollbar) li ricaricano con le funzioni `*_apply_theme()` al cambio di tema.
+
+| Costante | Uso |
+|---|---|
+| `TH_BG`, `TH_SURFACE`, `TH_SURFACE_2`, `TH_ELEVATED*` | Sfondi: app, sidebar/pannelli, toolbar/header, bottoni |
+| `TH_ACCENT*`, `TH_ON_ACCENT` | Colore principale (azione primaria, selezione, focus) e testo sopra l'accento |
+| `TH_TEXT*`, `TH_CELL_*` | Testo dell'interfaccia e delle celle |
+| `TH_SUCCESS` / `TH_ERROR` / `TH_WARNING` / `TH_INFO` | Stati (OK, errore, transazione aperta, info) |
+| `TH_SYN_*`, `TH_EDITOR_*`, `TH_CARET`, `TH_GUTTER_*` | Editor SQL e syntax highlighting |
 
 ---
 

@@ -245,15 +245,7 @@ TreeView* tree_view_create(int x, int y, int w, int h) {
     tv->hover_row  = -1;
     tv->font_size  = TH_FONT_UI;
 
-    tv->color_bg           = TH_SURFACE;
-    tv->color_row_hover    = TH_HOVER;
-    tv->color_row_selected = TH_ACCENT_SOFT;
-    tv->color_text         = (Color){205, 210, 226, 255};
-    tv->color_text_extra   = TH_TEXT_DIM;
-    tv->color_icon_db      = TH_ICON_DB;
-    tv->color_icon_table   = TH_ICON_TABLE;
-    tv->color_icon_view    = TH_ICON_VIEW;
-    tv->color_icon_proc    = TH_ICON_PROC;
+    tree_view_apply_theme(tv);
 
     return tv;
 }
@@ -336,4 +328,17 @@ int tree_view_visible_rows(TreeView* tv) {
 void tree_view_clamp_scroll(TreeView* tv) {
     int max = SV_MAX(0, count_rows(tv->root) - tree_view_visible_rows(tv));
     tv->scroll_y = SV_CLAMP(tv->scroll_y, 0, max);
+}
+
+void tree_view_apply_theme(TreeView* tv) {
+    if (!tv) return;
+    tv->color_bg           = TH_SURFACE;
+    tv->color_row_hover    = TH_HOVER;
+    tv->color_row_selected = TH_ACCENT_SOFT;
+    tv->color_text         = TH_CELL_TEXT;
+    tv->color_text_extra   = TH_TEXT_DIM;
+    tv->color_icon_db      = TH_ICON_DB;
+    tv->color_icon_table   = TH_ICON_TABLE;
+    tv->color_icon_view    = TH_ICON_VIEW;
+    tv->color_icon_proc    = TH_ICON_PROC;
 }

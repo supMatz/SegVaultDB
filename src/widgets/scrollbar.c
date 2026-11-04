@@ -135,9 +135,7 @@ Scrollbar* scrollbar_create(int x, int y, int w, int h, ScrollbarDir dir) {
     sb->step       = 3;
     sb->dragging   = false;
 
-    sb->color_track       = TH_SURFACE_2;
-    sb->color_thumb       = (Color){58,  64,  86,  255};
-    sb->color_thumb_hover = (Color){96,  104, 136, 255};
+    scrollbar_apply_theme(sb);
 
     return sb;
 }
@@ -155,3 +153,10 @@ void scrollbar_set_position(Scrollbar* sb, int pos) {
 }
 
 bool scrollbar_is_needed(Scrollbar* sb) { return sb && needed(sb); }
+
+void scrollbar_apply_theme(Scrollbar* sb) {
+    if (!sb) return;
+    sb->color_track       = TH_SURFACE_2;
+    sb->color_thumb       = TH_SCROLL_THUMB;
+    sb->color_thumb_hover = TH_SCROLL_THUMB_HOVER;
+}

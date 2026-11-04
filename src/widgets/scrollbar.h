@@ -31,6 +31,8 @@ typedef struct {
 } Scrollbar;
 
 Scrollbar* scrollbar_create(int x, int y, int w, int h, ScrollbarDir dir);
+
+void scrollbar_apply_theme(Scrollbar* sb); // ricarica i colori dal tema attivo
 void scrollbar_set_range(Scrollbar* sb, int total, int visible);
 void scrollbar_set_position(Scrollbar* sb, int pos);
 bool scrollbar_is_needed(Scrollbar* sb);

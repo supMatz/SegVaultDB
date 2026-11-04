@@ -1629,7 +1629,7 @@ static void textbox_draw(Widget* self, PlatformWindow* win) {
         int cx = x0 + tb->cursor_col * tb->char_w;
         int cy = b.y + tb->pad_top + (tb->cursor_line - first) * tb->line_height;
         if (cx >= tx_l) {
-            platform_fill_rect(win, (Rect){cx, cy + 2, 2, tb->line_height - 4}, (Color){176, 164, 255, 255});
+            platform_fill_rect(win, (Rect){cx, cy + 2, 2, tb->line_height - 4}, TH_CARET);
         }
     }
 

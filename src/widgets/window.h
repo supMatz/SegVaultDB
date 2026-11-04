@@ -111,6 +111,12 @@ typedef struct {
 
     bool         help_open;         // pannello scorciatoie (F1)
 
+    // -- selettore temi --
+    Rect         theme_btn;         // pillola nella toolbar (calcolata nel disegno)
+    bool         theme_menu_open;
+    Rect         theme_menu;        // menu a tendina
+    int          theme_hover;       // voce sotto il mouse / evidenziata da tastiera
+
     // -- stato --
     QueryResult* last_result;     // ultimo risultato (da liberare)
     int          win_w, win_h;    // dimensioni correnti finestra

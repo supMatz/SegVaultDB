@@ -79,9 +79,9 @@ static void button_draw(Widget* self, PlatformWindow* win) {
     if (hint_w) {
         x += BTN_GAP;
         Rect hr = {x, cy - 9, hint_w, 18};
-        Color hbg = (btn->style == BUTTON_STYLE_PRIMARY) ? (Color){255, 255, 255, 38} : TH_ELEVATED_PRESS;
+        Color hbg = (btn->style == BUTTON_STYLE_PRIMARY) ? ui_alpha(TH_ON_ACCENT, 38) : TH_ELEVATED_PRESS;
         platform_fill_rect_rounded(win, hr, hbg, 4);
-        Color htc = (btn->style == BUTTON_STYLE_PRIMARY) ? (Color){235, 232, 255, 230} : TH_TEXT_DIM;
+        Color htc = (btn->style == BUTTON_STYLE_PRIMARY) ? ui_alpha(TH_ON_ACCENT, 220) : TH_TEXT_DIM;
         if (!self->enabled) htc = TH_TEXT_FAINT;
         platform_draw_text_ex(win, btn->hint, -1,
                               (Point){x + 5, ui_text_y(win, hr, TH_FONT_SMALL, FONT_MONO)},
@@ -162,7 +162,7 @@ void button_set_style(Button* btn, ButtonStyle style) {
             btn->color_bg      = TH_ACCENT;
             btn->color_hover   = TH_ACCENT_HOVER;
             btn->color_pressed = TH_ACCENT_PRESS;
-            btn->color_text    = (Color){255, 255, 255, 255};
+            btn->color_text    = TH_ON_ACCENT;
             btn->color_border  = TH_ACCENT;
             break;
         case BUTTON_STYLE_GHOST:

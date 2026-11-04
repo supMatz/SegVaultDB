@@ -9,65 +9,135 @@ SCOPO: Palette colori, metriche e primitive grafiche condivise da tutti i widget
 
 #include "../platform/platform.h"
 
-// ── superfici ────────────────────────────────────────────────────
-#define TH_BG             (Color){13,  15,  20,  255}  // sfondo app
-#define TH_SURFACE        (Color){17,  20,  27,  255}  // sidebar, pannelli
-#define TH_SURFACE_2      (Color){21,  25,  34,  255}  // toolbar, header tabella
-#define TH_EDITOR_BG      (Color){15,  17,  24,  255}  // area editor SQL
-#define TH_ELEVATED       (Color){30,  35,  48,  255}  // bottoni secondari
-#define TH_ELEVATED_HOVER (Color){39,  45,  61,  255}
-#define TH_ELEVATED_PRESS (Color){25,  29,  40,  255}
-#define TH_BORDER         (Color){33,  38,  52,  255}
-#define TH_BORDER_STRONG  (Color){46,  52,  72,  255}
-#define TH_HOVER          (Color){26,  30,  42,  255}  // hover righe
+// ── temi ─────────────────────────────────────────────────────────
+// Tutti i colori vivono nel tema attivo (g_theme): le macro TH_* leggono da lì,
+// così cambiare tema a runtime aggiorna tutta l'interfaccia al frame successivo.
 
-// ── testo ────────────────────────────────────────────────────────
-#define TH_TEXT           (Color){226, 230, 242, 255}
-#define TH_TEXT_MUTED     (Color){150, 159, 186, 255}
-#define TH_TEXT_DIM       (Color){92,  100, 128, 255}
-#define TH_TEXT_FAINT     (Color){60,  67,  89,  255}
+typedef struct {
+    const char* name;
+    bool        light;          // tema chiaro
+    Color bg;
+    Color surface;
+    Color surface_2;
+    Color editor_bg;
+    Color elevated;
+    Color elevated_hover;
+    Color elevated_press;
+    Color border;
+    Color border_strong;
+    Color hover;
+    Color row_odd;
+    Color text;
+    Color text_muted;
+    Color text_dim;
+    Color text_faint;
+    Color cell_text;
+    Color cell_number;
+    Color accent;
+    Color accent_hover;
+    Color accent_press;
+    Color accent_soft;
+    Color accent_text;
+    Color on_accent;
+    Color success;
+    Color success_soft;
+    Color error;
+    Color error_soft;
+    Color error_text;
+    Color warning;
+    Color warning_soft;
+    Color info;
+    Color syn_keyword;
+    Color syn_type;
+    Color syn_func;
+    Color syn_string;
+    Color syn_number;
+    Color syn_comment;
+    Color syn_operator;
+    Color syn_punct;
+    Color syn_ident;
+    Color editor_line;
+    Color editor_select;
+    Color editor_match;
+    Color editor_occur;
+    Color editor_find;
+    Color editor_find_cur;
+    Color caret;
+    Color gutter_text;
+    Color gutter_active;
+    Color scroll_thumb;
+    Color scroll_thumb_hover;
+    Color icon_db;
+    Color icon_table;
+    Color icon_view;
+    Color icon_proc;
+    Color icon_column;
+} Theme;
 
-// ── accento e stati ──────────────────────────────────────────────
-#define TH_ACCENT         (Color){124, 106, 255, 255}  // viola elettrico
-#define TH_ACCENT_HOVER   (Color){143, 128, 255, 255}
-#define TH_ACCENT_PRESS   (Color){99,  82,  224, 255}
-#define TH_ACCENT_SOFT    (Color){38,  33,  74,  255}  // sfondo selezione
-#define TH_ACCENT_TEXT    (Color){185, 175, 255, 255}
+extern Theme g_theme;
 
-#define TH_SUCCESS        (Color){61,  214, 140, 255}
-#define TH_SUCCESS_SOFT   (Color){18,  48,  38,  255}
-#define TH_ERROR          (Color){255, 92,  122, 255}
-#define TH_ERROR_SOFT     (Color){58,  22,  34,  255}
-#define TH_WARNING        (Color){255, 181, 71,  255}
-#define TH_WARNING_SOFT   (Color){56,  40,  18,  255}
-#define TH_INFO           (Color){76,  194, 255, 255}
+int          theme_count(void);
+const Theme* theme_get(int index);
+int          theme_current(void);
+void         theme_apply(int index);            // imposta il tema attivo
+int          theme_find(const char* name);      // indice per nome (senza maiuscole), -1 se non esiste
 
-// ── editor SQL ───────────────────────────────────────────────────
-#define TH_SYN_KEYWORD    (Color){199, 146, 255, 255}  // SELECT, FROM...
-#define TH_SYN_TYPE       (Color){92,  207, 230, 255}  // INT, VARCHAR...
-#define TH_SYN_FUNC       (Color){130, 170, 255, 255}  // COUNT, SUM...
-#define TH_SYN_STRING     (Color){171, 224, 125, 255}
-#define TH_SYN_NUMBER     (Color){255, 184, 108, 255}
-#define TH_SYN_COMMENT    (Color){88,  98,  128, 255}
-#define TH_SYN_OPERATOR   (Color){137, 221, 255, 255}
-#define TH_SYN_PUNCT      (Color){150, 159, 186, 255}
-#define TH_SYN_IDENT      (Color){222, 226, 240, 255}
-
-#define TH_EDITOR_LINE    (Color){21,  24,  35,  255}  // riga corrente
-#define TH_EDITOR_SELECT  (Color){48,  43,  98,  255}  // selezione testo
-#define TH_EDITOR_MATCH   (Color){52,  60,  84,  255}  // parentesi corrispondente
-#define TH_EDITOR_OCCUR   (Color){40,  46,  66,  255}  // altre occorrenze della parola sotto il cursore
-#define TH_EDITOR_FIND    (Color){78,  62,  22,  255}  // risultati della ricerca
-#define TH_EDITOR_FIND_CUR (Color){150, 108, 30, 255}  // risultato di ricerca corrente
-#define TH_GUTTER_TEXT    (Color){58,  65,  88,  255}
-#define TH_GUTTER_ACTIVE  (Color){170, 178, 205, 255}
-
-// ── sidebar ──────────────────────────────────────────────────────
-#define TH_ICON_DB        (Color){76,  194, 255, 255}
-#define TH_ICON_TABLE     (Color){61,  214, 140, 255}
-#define TH_ICON_VIEW      (Color){255, 181, 71,  255}
-#define TH_ICON_PROC      (Color){199, 146, 255, 255}
-#define TH_ICON_COLUMN    (Color){110, 119, 150, 255}
+#define TH_BG                 (g_theme.bg)
+#define TH_SURFACE            (g_theme.surface)
+#define TH_SURFACE_2          (g_theme.surface_2)
+#define TH_EDITOR_BG          (g_theme.editor_bg)
+#define TH_ELEVATED           (g_theme.elevated)
+#define TH_ELEVATED_HOVER     (g_theme.elevated_hover)
+#define TH_ELEVATED_PRESS     (g_theme.elevated_press)
+#define TH_BORDER             (g_theme.border)
+#define TH_BORDER_STRONG      (g_theme.border_strong)
+#define TH_HOVER              (g_theme.hover)
+#define TH_ROW_ODD            (g_theme.row_odd)
+#define TH_TEXT               (g_theme.text)
+#define TH_TEXT_MUTED         (g_theme.text_muted)
+#define TH_TEXT_DIM           (g_theme.text_dim)
+#define TH_TEXT_FAINT         (g_theme.text_faint)
+#define TH_CELL_TEXT          (g_theme.cell_text)
+#define TH_CELL_NUMBER        (g_theme.cell_number)
+#define TH_ACCENT             (g_theme.accent)
+#define TH_ACCENT_HOVER       (g_theme.accent_hover)
+#define TH_ACCENT_PRESS       (g_theme.accent_press)
+#define TH_ACCENT_SOFT        (g_theme.accent_soft)
+#define TH_ACCENT_TEXT        (g_theme.accent_text)
+#define TH_ON_ACCENT          (g_theme.on_accent)
+#define TH_SUCCESS            (g_theme.success)
+#define TH_SUCCESS_SOFT       (g_theme.success_soft)
+#define TH_ERROR              (g_theme.error)
+#define TH_ERROR_SOFT         (g_theme.error_soft)
+#define TH_ERROR_TEXT         (g_theme.error_text)
+#define TH_WARNING            (g_theme.warning)
+#define TH_WARNING_SOFT       (g_theme.warning_soft)
+#define TH_INFO               (g_theme.info)
+#define TH_SYN_KEYWORD        (g_theme.syn_keyword)
+#define TH_SYN_TYPE           (g_theme.syn_type)
+#define TH_SYN_FUNC           (g_theme.syn_func)
+#define TH_SYN_STRING         (g_theme.syn_string)
+#define TH_SYN_NUMBER         (g_theme.syn_number)
+#define TH_SYN_COMMENT        (g_theme.syn_comment)
+#define TH_SYN_OPERATOR       (g_theme.syn_operator)
+#define TH_SYN_PUNCT          (g_theme.syn_punct)
+#define TH_SYN_IDENT          (g_theme.syn_ident)
+#define TH_EDITOR_LINE        (g_theme.editor_line)
+#define TH_EDITOR_SELECT      (g_theme.editor_select)
+#define TH_EDITOR_MATCH       (g_theme.editor_match)
+#define TH_EDITOR_OCCUR       (g_theme.editor_occur)
+#define TH_EDITOR_FIND        (g_theme.editor_find)
+#define TH_EDITOR_FIND_CUR    (g_theme.editor_find_cur)
+#define TH_CARET              (g_theme.caret)
+#define TH_GUTTER_TEXT        (g_theme.gutter_text)
+#define TH_GUTTER_ACTIVE      (g_theme.gutter_active)
+#define TH_SCROLL_THUMB       (g_theme.scroll_thumb)
+#define TH_SCROLL_THUMB_HOVER (g_theme.scroll_thumb_hover)
+#define TH_ICON_DB            (g_theme.icon_db)
+#define TH_ICON_TABLE         (g_theme.icon_table)
+#define TH_ICON_VIEW          (g_theme.icon_view)
+#define TH_ICON_PROC          (g_theme.icon_proc)
+#define TH_ICON_COLUMN        (g_theme.icon_column)
 
 // ── metriche ─────────────────────────────────────────────────────
 #define TH_FONT_UI        13

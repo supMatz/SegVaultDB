@@ -81,6 +81,8 @@ typedef struct {
 // crea il tree view
 TreeView* tree_view_create(int x, int y, int w, int h);
 
+void tree_view_apply_theme(TreeView* tv); // ricarica i colori dal tema attivo
+
 // aggiunge un nodo figlio a un nodo esistente
 TreeNode* tree_node_add_child(TreeNode* parent,
                                  TreeNodeType type,

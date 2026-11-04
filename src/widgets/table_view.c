@@ -210,7 +210,7 @@ static void draw_message(TableView* tv, PlatformWindow* win) {
     if (detail && detail[0]) {
         int max_w = SV_MIN(b.w - 48, 640);
         FontStyle fs = tv->msg_kind == TABLE_MSG_ERROR ? FONT_MONO : FONT_UI;
-        Color dc = tv->msg_kind == TABLE_MSG_ERROR ? (Color){255, 170, 185, 255} : TH_TEXT_DIM;
+        Color dc = tv->msg_kind == TABLE_MSG_ERROR ? TH_ERROR_TEXT : TH_TEXT_DIM;
         draw_wrapped(win, detail, cx - max_w / 2, y, max_w, 6, dc, TH_FONT_UI, fs, true, max_w);
     }
 }
@@ -264,7 +264,7 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
                 } else if (is_numeric(cell->type) || tv->col_numeric[c]) {
                     int w = platform_measure_text_ex(win, cell->value, -1, CELL_FONT, FONT_MONO);
                     int x = (w <= max_w) ? cx + cw - CELL_PAD - w : cx + CELL_PAD;
-                    ui_text_clipped(win, cell->value, x, ty, max_w, (Color){245, 200, 150, 255}, CELL_FONT, FONT_MONO);
+                    ui_text_clipped(win, cell->value, x, ty, max_w, TH_CELL_NUMBER, CELL_FONT, FONT_MONO);
                 } else if (cell->type == CELL_TYPE_BOOL) {
                     bool t = cell->value[0] == '1' || cell->value[0] == 't' || cell->value[0] == 'T';
                     ui_circle(win, cx + CELL_PAD + 4, ry + rh / 2, 3, t ? TH_SUCCESS : TH_TEXT_FAINT);
@@ -533,16 +533,21 @@ TableView* table_view_create(int x, int y, int w, int h) {
     for (int i = 0; i < TABLE_VIEW_MAX_COLS; i++)
         tv->col_widths[i] = 120;
 
+    table_view_apply_theme(tv);
+
+    return tv;
+}
+
+void table_view_apply_theme(TableView* tv) {
+    if (!tv) return;
     tv->color_header_bg    = TH_SURFACE_2;
     tv->color_header_text  = TH_TEXT;
     tv->color_row_even     = TH_BG;
-    tv->color_row_odd      = (Color){16, 18, 25, 255};
+    tv->color_row_odd      = TH_ROW_ODD;
     tv->color_row_selected = TH_ACCENT_SOFT;
-    tv->color_text         = (Color){214, 219, 234, 255};
+    tv->color_text         = TH_CELL_TEXT;
     tv->color_text_null    = TH_TEXT_FAINT;
     tv->color_border       = TH_BORDER;
-
-    return tv;
 }
 
 void table_view_set_result(TableView* tv, QueryResult* result) {

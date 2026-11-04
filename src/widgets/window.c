@@ -24,7 +24,7 @@ static void set_status(AppWindow* app, StatusKind kind, const char* text, const 
     if (kind == STATUS_OK)    c = TH_TEXT;
     if (kind == STATUS_ERROR) c = TH_ERROR;
     label_set_color(app->lbl_status, c);
-    snprintf(app->status_meta, sizeof(app->status_meta), "%s", meta ? meta : "");
+    snprintf(app->status_meta, sizeof(app->status_meta), "%.127s", meta ? meta : "");
 }
 
 // ── autocompletamento: oggetti del database corrente ─────────────
@@ -1017,6 +1017,124 @@ static void draw_bar(AppWindow* app) {
     ui_icon_cross(win, c.x + c.w / 2, c.y + c.h / 2, 9, TH_TEXT_MUTED);
 }
 
+// ── temi ─────────────────────────────────────────────────────────
+
+#define THEME_ROW_H 34
+
+// ricarica i colori dei widget che li memorizzano (gli altri leggono il tema a ogni frame)
+static void refresh_widget_colors(AppWindow* app) {
+    Button* btns[] = { app->btn_run, app->btn_run_current, app->btn_commit, app->btn_rollback,
+                       app->btn_format, app->btn_refresh, app->btn_history };
+    for (size_t i = 0; i < sizeof(btns) / sizeof(btns[0]); i++) button_set_style(btns[i], btns[i]->style);
+    button_set_icon(app->btn_run_current, BUTTON_ICON_PLAY, TH_ACCENT_TEXT);
+    button_set_icon(app->btn_commit, BUTTON_ICON_CHECK, TH_SUCCESS);
+    button_set_icon(app->btn_rollback, BUTTON_ICON_UNDO, TH_WARNING);
+    table_view_apply_theme(app->results);
+    tree_view_apply_theme(app->tree);
+    Scrollbar* sbs[] = { app->tree_scroll, app->editor_scroll, app->results_scroll_v, app->results_scroll_h };
+    for (size_t i = 0; i < sizeof(sbs) / sizeof(sbs[0]); i++) scrollbar_apply_theme(sbs[i]);
+    Color c = TH_TEXT_MUTED;
+    if (app->status_kind == STATUS_OK)    c = TH_TEXT;
+    if (app->status_kind == STATUS_ERROR) c = TH_ERROR;
+    label_set_color(app->lbl_status, c);
+    label_set_color(app->lbl_db_name, TH_TEXT);
+}
+
+static void set_theme(AppWindow* app, int index, bool announce) {
+    if (!theme_get(index)) return;
+    theme_apply(index);
+    refresh_widget_colors(app);
+    if (announce) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Theme: %s", theme_get(index)->name);
+        set_status(app, STATUS_INFO, msg, "Ctrl+Shift+T next theme");
+    }
+}
+
+// campione del tema: sfondo + accento
+static void draw_theme_swatch(PlatformWindow* win, const Theme* t, int cx, int cy, int r) {
+    ui_circle(win, cx, cy, r + 1, t->border_strong);
+    ui_circle(win, cx, cy, r, t->surface_2);
+    ui_circle(win, cx + r / 3, cy, r * 2 / 3, t->accent);
+}
+
+static void draw_theme_menu(AppWindow* app) {
+    if (!app->theme_menu_open) return;
+    PlatformWindow* win = app->win;
+    int n = theme_count();
+    int w = 230, h = n * THEME_ROW_H + 8;
+    Rect b = app->theme_btn;
+    Rect r = {SV_MAX(8, b.x + b.w - w), b.y + b.h + 6, w, h};
+    app->theme_menu = r;
+    platform_fill_rect_rounded(win, (Rect){r.x - 2, r.y + 3, r.w + 4, r.h + 4}, ui_alpha(TH_BG, 170), 10);
+    ui_round_box(win, r, TH_SURFACE_2, TH_BORDER_STRONG, 8);
+    for (int i = 0; i < n; i++) {
+        const Theme* t = theme_get(i);
+        Rect row = {r.x + 4, r.y + 4 + i * THEME_ROW_H, r.w - 8, THEME_ROW_H};
+        if (i == app->theme_hover) platform_fill_rect_rounded(win, row, TH_ELEVATED_HOVER, 6);
+        draw_theme_swatch(win, t, row.x + 18, row.y + row.h / 2, 8);
+        bool cur = i == theme_current();
+        platform_draw_text_ex(win, t->name, -1, (Point){row.x + 36, ui_text_y(win, row, TH_FONT_UI, cur ? FONT_UI_BOLD : FONT_UI)},
+                              TH_TEXT, TH_FONT_UI, cur ? FONT_UI_BOLD : FONT_UI);
+        const char* kind = t->light ? "light" : "dark";
+        int kw = platform_measure_text_ex(win, kind, -1, TH_FONT_SMALL, FONT_UI);
+        platform_draw_text_ex(win, kind, -1, (Point){row.x + row.w - 34 - kw, ui_text_y(win, row, TH_FONT_SMALL, FONT_UI)},
+                              TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI);
+        if (cur) ui_icon_check(win, row.x + row.w - 16, row.y + row.h / 2, 12, TH_ACCENT);
+    }
+}
+
+// pillola nella toolbar; x_right = bordo destro disponibile. Ritorna la x sinistra.
+static int draw_theme_button(AppWindow* app, int x_right) {
+    PlatformWindow* win = app->win;
+    const Theme* t = theme_get(theme_current());
+    int tw = platform_measure_text_ex(win, t->name, -1, TH_FONT_UI, FONT_UI);
+    Rect b = {x_right - (tw + 58), TOOLBAR_H / 2 - 15, tw + 58, 30};
+    app->theme_btn = b;
+    bool hover = rect_has(b, app->mouse_x, app->mouse_y) || app->theme_menu_open;
+    ui_round_box(win, b, hover ? TH_ELEVATED_HOVER : TH_ELEVATED, TH_BORDER_STRONG, 15);
+    draw_theme_swatch(win, t, b.x + 17, b.y + 15, 7);
+    platform_draw_text_ex(win, t->name, -1, (Point){b.x + 32, ui_text_y(win, b, TH_FONT_UI, FONT_UI)}, TH_TEXT, TH_FONT_UI, FONT_UI);
+    ui_icon_chevron(win, b.x + b.w - 15, b.y + 15, 9, app->theme_menu_open ? CHEVRON_UP : CHEVRON_DOWN, TH_TEXT_MUTED);
+    return b.x;
+}
+
+// ritorna true se l'evento è stato consumato dal selettore temi
+static bool theme_handle_event(AppWindow* app, sEvent* evt) {
+    if (evt->type == EVT_MOUSE_DOWN && evt->mouse_button == SV_MOUSE_LEFT && rect_has(app->theme_btn, evt->mouse_x, evt->mouse_y)) {
+        app->theme_menu_open = !app->theme_menu_open;
+        app->theme_hover = theme_current();
+        return true;
+    }
+    if (!app->theme_menu_open) return false;
+    Rect r = app->theme_menu;
+    int row = (evt->mouse_y - r.y - 4) / THEME_ROW_H;
+    bool in = rect_has(r, evt->mouse_x, evt->mouse_y) && row >= 0 && row < theme_count();
+    switch (evt->type) {
+        case EVT_MOUSE_MOVE:
+            if (in) app->theme_hover = row;
+            return in;
+        case EVT_MOUSE_DOWN:
+            if (in) set_theme(app, row, true);
+            app->theme_menu_open = false;
+            return true;   // il click fuori chiude il menu senza agire sotto
+        case EVT_MOUSE_WHEEL:
+            return true;
+        case EVT_KEY_DOWN:
+            switch (evt->key) {
+                case KEY_UP:     app->theme_hover = (app->theme_hover + theme_count() - 1) % theme_count(); return true;
+                case KEY_DOWN:   app->theme_hover = (app->theme_hover + 1) % theme_count(); return true;
+                case KEY_ENTER:  set_theme(app, app->theme_hover, true); app->theme_menu_open = false; return true;
+                case KEY_ESCAPE: app->theme_menu_open = false; return true;
+                default: return false;
+            }
+        case EVT_CHAR:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // ── pannello scorciatoie (F1) ───────────────────────────────────
 
 typedef struct { const char* keys; const char* what; } Shortcut;
@@ -1025,6 +1143,7 @@ typedef struct { const char* title; const Shortcut* items; int count; } Shortcut
 static const Shortcut SC_RUN[] = {
     { "F5", "Run script or selection" }, { "Ctrl+Enter", "Run statement under cursor" },
     { "Ctrl+Shift+F", "Format SQL" }, { "Ctrl+Shift+H", "Query history" },
+    { "Ctrl+Shift+T", "Next color theme" },
 };
 static const Shortcut SC_FILE[] = {
     { "Ctrl+N", "New script" }, { "Ctrl+O", "Open file" },
@@ -1307,6 +1426,7 @@ static void update_cursor_shape(AppWindow* app, int mx, int my) {
                                 (Widget*)app->btn_history };
         for (int i = 0; i < 7; i++)
             if (widget_contains_point(clickable[i], mx, my)) { k = CURSOR_HAND; break; }
+        if (rect_has(app->theme_btn, mx, my)) k = CURSOR_HAND;
     }
     platform_set_cursor(app->win, k);
 }
@@ -1329,6 +1449,14 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         if (evt->type != EVT_MOUSE_MOVE) return;
     }
 
+    if (evt->type == EVT_MOUSE_MOVE) { app->mouse_x = evt->mouse_x; app->mouse_y = evt->mouse_y; }
+    if (theme_handle_event(app, evt)) {
+        if (evt->type == EVT_MOUSE_MOVE || evt->type == EVT_MOUSE_DOWN)
+            platform_set_cursor(app->win, rect_has(app->theme_menu, evt->mouse_x, evt->mouse_y) ||
+                                          rect_has(app->theme_btn, evt->mouse_x, evt->mouse_y) ? CURSOR_HAND : CURSOR_ARROW);
+        return;
+    }
+
     // -- scorciatoie globali --
     if (evt->type == EVT_KEY_DOWN && evt->key == KEY_F1) {
         app->help_open = true;
@@ -1343,6 +1471,9 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
                 case 'f': if (shift) format_sql(app); else bar_open(app, BAR_FIND, false); return;
                 case 'h': if (shift) history_toggle(app); else bar_open(app, BAR_FIND, true); return;
                 case 'g': bar_open(app, BAR_GOTO, false); return;
+                case 't':
+                    if (shift) { set_theme(app, (theme_current() + 1) % theme_count(), true); return; }
+                    break;
                 case 'o': bar_open(app, BAR_OPEN, false); return;
                 case 'n': cmd_new(app); return;
                 case 'e':
@@ -1491,15 +1622,18 @@ static void draw_toolbar(AppWindow* app) {
     ui_text_clipped(win, db, pill.x + 32, ui_text_y(win, pill, TH_FONT_UI, FONT_UI_BOLD), tw,
                     has_db ? TH_TEXT : TH_TEXT_DIM, TH_FONT_UI, has_db ? FONT_UI_BOLD : FONT_UI);
 
+    int left = pill.x;
     if (app->in_transaction) {
         const char* t = "TRANSACTION";
         int w = platform_measure_text_ex(win, t, -1, TH_FONT_SMALL, FONT_UI_BOLD) + 26;
         Rect b = {pill.x - w - 8, TOOLBAR_H / 2 - 11, w, 22};
+        left = b.x;
         platform_fill_rect_rounded(win, b, TH_WARNING_SOFT, 11);
         ui_circle(win, b.x + 11, b.y + 11, 3, TH_WARNING);
         platform_draw_text_ex(win, t, -1, (Point){b.x + 19, ui_text_y(win, b, TH_FONT_SMALL, FONT_UI_BOLD)},
                               TH_WARNING, TH_FONT_SMALL, FONT_UI_BOLD);
     }
+    draw_theme_button(app, left - 8);
 }
 
 static void draw_sidebar(AppWindow* app) {
@@ -1633,6 +1767,7 @@ void app_window_draw(AppWindow* app) {
     draw_toolbar(app);
     draw_footer(app);
     textbox_draw_overlay(app->editor, win, (Rect){0, 0, app->win_w, app->win_h});
+    draw_theme_menu(app);
     draw_help(app);
 
     platform_present(win);
@@ -1830,6 +1965,10 @@ void app_window_set_data_dir(AppWindow* app, const char* dir) {
             else if (!strncmp(line, "cursor=", 7))   cursor = atoi(line + 7);
             else if (!strncmp(line, "modified=", 9)) modified = atoi(line + 9);
             else if (!strncmp(line, "font=", 5))     tb->font_size = SV_CLAMP(atoi(line + 5), 10, 28);
+            else if (!strncmp(line, "theme=", 6)) {
+                int ti = theme_find(line + 6);
+                if (ti >= 0) set_theme(app, ti, false);
+            }
         }
         fclose(f);
     }
@@ -1854,7 +1993,8 @@ void app_window_save_session(AppWindow* app) {
     join_path(path, sizeof(path), app->data_dir, SESSION_META);
     FILE* f = fopen(path, "wb");
     if (!f) return;
-    fprintf(f, "file=%s\ncursor=%d\nmodified=%d\nfont=%d\n",
-            app->file_path, app->editor->cursor_pos, app->modified ? 1 : 0, app->editor->font_size);
+    fprintf(f, "file=%s\ncursor=%d\nmodified=%d\nfont=%d\ntheme=%s\n",
+            app->file_path, app->editor->cursor_pos, app->modified ? 1 : 0, app->editor->font_size,
+            theme_get(theme_current())->name);
     fclose(f);
 }
