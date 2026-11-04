@@ -1,5 +1,7 @@
 #include "executor.h"
 #include <string.h>
+#include <ctype.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
 
@@ -18,9 +20,13 @@ static QueryResult* result_ok_msg(int affected) {
 }
 
 static DataType parse_type(const char* type_name) {
-    if (strcmp(type_name, "INT") == 0 || strcmp(type_name, "INTEGER") == 0) return SV_TYPE_INT;
+    if (strcmp(type_name, "INT") == 0 || strcmp(type_name, "INTEGER") == 0 ||
+        strcmp(type_name, "SMALLINT") == 0 || strcmp(type_name, "TINYINT") == 0) return SV_TYPE_INT;
     if (strcmp(type_name, "BIGINT") == 0) return SV_TYPE_BIGINT;
-    if (strcmp(type_name, "FLOAT") == 0 || strcmp(type_name, "DOUBLE") == 0) return SV_TYPE_FLOAT;
+    if (strcmp(type_name, "FLOAT") == 0 || strcmp(type_name, "DOUBLE") == 0 ||
+        strcmp(type_name, "REAL") == 0) return SV_TYPE_FLOAT;
+    if (strcmp(type_name, "NUMERIC") == 0) return SV_TYPE_DECIMAL;
+    if (strcmp(type_name, "TIMESTAMP") == 0) return SV_TYPE_DATETIME;
     if (strcmp(type_name, "VARCHAR") == 0) return SV_TYPE_VARCHAR;
     if (strcmp(type_name, "CHAR") == 0) return SV_TYPE_CHAR;
     if (strcmp(type_name, "TEXT") == 0) return SV_TYPE_TEXT;
@@ -32,46 +38,141 @@ static DataType parse_type(const char* type_name) {
     return SV_TYPE_VARCHAR;
 }
 
+// ── valutazione delle condizioni (WHERE / HAVING) ────────────────
+
+typedef struct {
+    bool        null;
+    bool        is_num;
+    double      num;
+    int64_t     inum;      // valore intero esatto (se is_int)
+    bool        is_int;
+    const char* str;       // testo (stringhe o numeri formattati)
+    char        buf[64];
+} EvalVal;
+
+static void eval_operand(ASTExpr* e, Tuple* t, TableSchema* schema, EvalVal* out) {
+    memset(out, 0, sizeof(*out));
+    out->str = "";
+    switch (e ? e->type : EXPR_NULL) {
+        case EXPR_INT:
+            out->is_num = out->is_int = true; out->inum = e->int_val; out->num = (double)e->int_val;
+            snprintf(out->buf, sizeof(out->buf), "%lld", (long long)e->int_val); out->str = out->buf;
+            return;
+        case EXPR_FLOAT:
+            out->is_num = true; out->num = e->float_val;
+            snprintf(out->buf, sizeof(out->buf), "%g", e->float_val); out->str = out->buf;
+            return;
+        case EXPR_STRING:
+            out->str = e->str_val;
+            return;
+        case EXPR_COLUMN: {
+            int ci = catalog_get_col_index(schema, e->col_name);
+            if (ci < 0 || ci >= t->num_values || t->values[ci].is_null) { out->null = true; return; }
+            Value* v = &t->values[ci];
+            switch (schema->columns[ci].type) {
+                case SV_TYPE_INT:    out->is_num = out->is_int = true; out->inum = v->int_val; break;
+                case SV_TYPE_BIGINT: out->is_num = out->is_int = true; out->inum = v->bigint_val; break;
+                case SV_TYPE_BOOL:   out->is_num = out->is_int = true; out->inum = v->bool_val ? 1 : 0; break;
+                case SV_TYPE_FLOAT:
+                    out->is_num = true; out->num = v->float_val;
+                    snprintf(out->buf, sizeof(out->buf), "%g", v->float_val); out->str = out->buf;
+                    return;
+                default:
+                    out->str = v->str_val ? v->str_val : "";
+                    return;
+            }
+            out->num = (double)out->inum;
+            snprintf(out->buf, sizeof(out->buf), "%lld", (long long)out->inum); out->str = out->buf;
+            return;
+        }
+        default:
+            out->null = true;
+            return;
+    }
+}
+
+// LIKE con % (qualsiasi sequenza) e _ (un carattere), senza distinzione maiuscole/minuscole
+static bool like_match(const char* s, const char* p) {
+    while (*p) {
+        if (*p == '%') {
+            while (*p == '%') p++;
+            if (!*p) return true;
+            for (; *s; s++) if (like_match(s, p)) return true;
+            return false;
+        }
+        if (!*s) return false;
+        if (*p != '_' && tolower((unsigned char)*p) != tolower((unsigned char)*s)) return false;
+        s++; p++;
+    }
+    return *s == '\0';
+}
+
 static bool eval_where(ASTExpr* where, Tuple* t, TableSchema* schema) {
     if (!where) return true;
-    if (where->type == EXPR_BINARY && where->op == OP_EQ) {
-        const char* col_name = where->left->col_name;
-        int ci = catalog_get_col_index(schema, col_name);
-        if (ci < 0) return true;
-        Value* v = &t->values[ci];
-        if (where->right->type == EXPR_INT)
-            return !v->is_null && v->int_val == where->right->int_val;
-        if (where->right->type == EXPR_FLOAT)
-            return !v->is_null && v->float_val == where->right->float_val;
-        if (where->right->type == EXPR_STRING) {
-            if (v->is_null || !v->str_val) return false;
-            const char* rv = where->right->str_val;
-            if (rv[0] == '\'' || rv[0] == '"') { rv++; }
-            char buf[512]; snprintf(buf, sizeof(buf), "%s", rv);
-            int blen = strlen(buf);
-            if (blen > 0 && (buf[blen-1] == '\'' || buf[blen-1] == '"')) buf[blen-1] = '\0';
-            return strcmp(v->str_val, buf) == 0;
-        }
+    if (where->type == EXPR_UNARY) {
+        if (where->op == OP_NOT) return !eval_where(where->left, t, schema);
+        EvalVal v;
+        eval_operand(where->left, t, schema, &v);
+        return where->op == OP_IS_NULL ? v.null : !v.null;
     }
-    if (where->type == EXPR_BINARY) {
-        const char* col_name = where->left->col_name;
-        int ci = catalog_get_col_index(schema, col_name);
-        if (ci < 0) return true;
-        Value* v = &t->values[ci];
-        if (v->is_null) return false;
-        int64_t val;
-        if (where->right->type == EXPR_INT) val = where->right->int_val;
-        else return true;
-        switch (where->op) {
-            case OP_LT: return v->int_val < val;
-            case OP_GT: return v->int_val > val;
-            case OP_LE: return v->int_val <= val;
-            case OP_GE: return v->int_val >= val;
-            case OP_NEQ: return v->int_val != val;
-            default: return true;
-        }
+    if (where->type != EXPR_BINARY) return false;
+    if (where->op == OP_AND) return eval_where(where->left, t, schema) && eval_where(where->right, t, schema);
+    if (where->op == OP_OR)  return eval_where(where->left, t, schema) || eval_where(where->right, t, schema);
+
+    EvalVal a, b;
+    eval_operand(where->left, t, schema, &a);
+    eval_operand(where->right, t, schema, &b);
+    if (a.null || b.null) return false;   // confronti con NULL: mai veri (usare IS NULL)
+
+    if (where->op == OP_LIKE || where->op == OP_NOT_LIKE) {
+        bool m = like_match(a.str, b.str);
+        return where->op == OP_LIKE ? m : !m;
     }
-    return true;
+
+    int cmp;
+    if (a.is_num && b.is_num) {
+        if (a.is_int && b.is_int) cmp = a.inum < b.inum ? -1 : a.inum > b.inum ? 1 : 0;
+        else                      cmp = a.num < b.num ? -1 : a.num > b.num ? 1 : 0;
+    } else if (a.is_num || b.is_num) {
+        // numero contro testo: confronto numerico se il testo è un numero, altrimenti testuale
+        const char* txt = a.is_num ? b.str : a.str;
+        char* end = NULL;
+        double d = strtod(txt, &end);
+        if (end && end != txt && *end == '\0') {
+            double x = a.is_num ? a.num : d, y = a.is_num ? d : b.num;
+            cmp = x < y ? -1 : x > y ? 1 : 0;
+        } else {
+            cmp = strcmp(a.str, b.str);
+        }
+    } else {
+        cmp = strcmp(a.str, b.str);
+    }
+    switch (where->op) {
+        case OP_EQ:  return cmp == 0;
+        case OP_NEQ: return cmp != 0;
+        case OP_LT:  return cmp < 0;
+        case OP_GT:  return cmp > 0;
+        case OP_LE:  return cmp <= 0;
+        case OP_GE:  return cmp >= 0;
+        default:     return false;
+    }
+}
+
+// prima colonna della condizione che non esiste nella tabella (NULL se tutte esistono).
+// Una colonna sbagliata deve dare errore: trattarla come "vero" faceva sì che
+// DELETE ... WHERE colonna_sbagliata = 1 cancellasse tutte le righe.
+static const char* where_unknown_column(ASTExpr* e, TableSchema* schema) {
+    if (!e) return NULL;
+    if (e->type == EXPR_COLUMN)
+        return catalog_get_col_index(schema, e->col_name) < 0 ? e->col_name : NULL;
+    const char* l = where_unknown_column(e->left, schema);
+    return l ? l : where_unknown_column(e->right, schema);
+}
+
+static QueryResult* unknown_column_error(const char* col, const char* clause) {
+    char msg[200];
+    snprintf(msg, sizeof(msg), "Unknown column '%.64s' in %s", col, clause);
+    return result_error_msg(msg);
 }
 
 // ---- Comparator for qsort ----
@@ -273,6 +374,59 @@ static QueryResult* exec_alter_table(ExecCtx* ctx, ASTNode* n) {
     return result_ok_msg(0);
 }
 
+// ── supporto all'INSERT: massimo di una colonna e ricerca di un valore ──
+
+static bool value_equal(const Value* a, const Value* b, DataType type) {
+    if (a->is_null || b->is_null) return false;
+    switch (type) {
+        case SV_TYPE_INT:    return a->int_val == b->int_val;
+        case SV_TYPE_BIGINT: return a->bigint_val == b->bigint_val;
+        case SV_TYPE_FLOAT:  return a->float_val == b->float_val;
+        case SV_TYPE_BOOL:   return a->bool_val == b->bool_val;
+        default:             return a->str_val && b->str_val && strcmp(a->str_val, b->str_val) == 0;
+    }
+}
+
+// true se una riga della tabella ha già quel valore nella colonna ci
+static bool column_has_value(ExecCtx* ctx, TableSchema* ts, int ci, const Value* v) {
+    HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
+    if (!hf) return false;
+    HeapScan* scan = heap_scan_open(hf, ts);
+    bool found = false;
+    Tuple* t;
+    RID rid;
+    while (scan && !found && (t = heap_scan_next(scan, &rid)) != NULL) {
+        if (ci < t->num_values) found = value_equal(&t->values[ci], v, ts->columns[ci].type);
+        tuple_free(t);
+    }
+    if (scan) heap_scan_close(scan);
+    free(hf);
+    return found;
+}
+
+// valore massimo (intero) della colonna ci; false se la tabella è vuota
+static bool column_max(ExecCtx* ctx, TableSchema* ts, int ci, int64_t* out) {
+    HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
+    if (!hf) return false;
+    HeapScan* scan = heap_scan_open(hf, ts);
+    bool any = false;
+    Tuple* t;
+    RID rid;
+    while (scan && (t = heap_scan_next(scan, &rid)) != NULL) {
+        if (ci < t->num_values && !t->values[ci].is_null) {
+            int64_t v = ts->columns[ci].type == SV_TYPE_BIGINT ? t->values[ci].bigint_val
+                      : ts->columns[ci].type == SV_TYPE_FLOAT  ? (int64_t)t->values[ci].float_val
+                      : t->values[ci].int_val;
+            if (!any || v > *out) *out = v;
+            any = true;
+        }
+        tuple_free(t);
+    }
+    if (scan) heap_scan_close(scan);
+    free(hf);
+    return any;
+}
+
 static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
@@ -292,11 +446,11 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
         if (n->insert_stmt.values[i]) {
             if (n->insert_stmt.values[i]->type == EXPR_INT)
                 snprintf(val_bufs[i], sizeof(val_bufs[i]), "%lld", (long long)n->insert_stmt.values[i]->int_val);
-            else if (n->insert_stmt.values[i]->type == EXPR_FLOAT)
-                snprintf(val_bufs[i], sizeof(val_bufs[i]), "%g", n->insert_stmt.values[i]->float_val);
+            else if (n->insert_stmt.values[i]->type == EXPR_FLOAT)   // precisione piena (%g ne teneva 6 cifre)
+                snprintf(val_bufs[i], sizeof(val_bufs[i]), "%.17g", n->insert_stmt.values[i]->float_val);
             else
                 snprintf(val_bufs[i], sizeof(val_bufs[i]), "%s", n->insert_stmt.values[i]->str_val);
-            vals[i] = val_bufs[i];
+            vals[i] = n->insert_stmt.values[i]->type == EXPR_NULL ? "NULL" : val_bufs[i];
             if (i < n->insert_stmt.num_cols && n->insert_stmt.columns[i]) {
                 int ci = catalog_get_col_index(ts, n->insert_stmt.columns[i]);
                 if (ci >= 0) col_specified[ci] = true;
@@ -305,6 +459,18 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
             vals[i] = "NULL";
         }
     }
+
+    // numero di valori coerente con le colonne
+    int expected = n->insert_stmt.num_cols > 0 ? n->insert_stmt.num_cols : ts->num_columns;
+    if (nv != expected) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Column count doesn't match value count: %d column%s, %d value%s",
+                 expected, expected == 1 ? "" : "s", nv, nv == 1 ? "" : "s");
+        return result_error_msg(msg);
+    }
+    for (int i = 0; i < n->insert_stmt.num_cols; i++)
+        if (catalog_get_col_index(ts, n->insert_stmt.columns[i]) < 0)
+            return unknown_column_error(n->insert_stmt.columns[i], "INSERT");
 
     // Map positional values to columns
     const char* final_vals[64];
@@ -320,13 +486,15 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
             final_vals[i] = vals[i];
     }
 
-    // Auto-increment: generate values for auto_increment columns with no value
-    static int ai_counter = 0; // simple counter for auto_increment
+    // Auto-increment: valore massimo esistente nella colonna + 1 (in precedenza un contatore
+    // statico condiviso fra tabelle e azzerato a ogni avvio generava id già usati)
     for (int i = 0; i < ts->num_columns; i++) {
-        if (ts->columns[i].auto_increment && !col_specified[i]) {
-            ai_counter++;
+        bool given = n->insert_stmt.num_cols > 0 ? col_specified[i] : strcmp(final_vals[i], "NULL") != 0;
+        if (ts->columns[i].auto_increment && !given) {
+            int64_t mx = 0;
+            column_max(ctx, ts, i, &mx);
             char ai_buf[32];
-            snprintf(ai_buf, sizeof(ai_buf), "%d", ai_counter);
+            snprintf(ai_buf, sizeof(ai_buf), "%lld", (long long)(mx + 1));
             // Use values beyond the input to avoid overlap
             int slot = nv + i;
             if (slot < 64) {
@@ -338,6 +506,24 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
 
     Tuple* t = tuple_from_strings(final_vals, ts->num_columns, ts);
     if (!t) return result_error_msg("Failed to create tuple");
+
+    // chiave primaria: obbligatoria e univoca
+    for (int i = 0; i < ts->num_columns; i++) {
+        if (!ts->columns[i].primary_key) continue;
+        char msg[200];
+        if (t->values[i].is_null) {
+            tuple_free(t);
+            snprintf(msg, sizeof(msg), "Primary key '%.64s' cannot be NULL", ts->columns[i].name);
+            return result_error_msg(msg);
+        }
+        if (column_has_value(ctx, ts, i, &t->values[i])) {
+            char vbuf[128];
+            value_to_string(&t->values[i], ts->columns[i].type, vbuf, sizeof(vbuf));
+            tuple_free(t);
+            snprintf(msg, sizeof(msg), "Duplicate entry '%.60s' for primary key '%.64s'", vbuf, ts->columns[i].name);
+            return result_error_msg(msg);
+        }
+    }
 
     HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
     if (!hf) { tuple_free(t); return result_error_msg("Failed to open heap"); }
@@ -409,6 +595,8 @@ static QueryResult* exec_select(ExecCtx* ctx, ASTNode* n) {
         }
         return result_error_msg("Table or view not found");
     }
+    const char* bad = where_unknown_column(n->select_stmt.where, ts);
+    if (bad) return unknown_column_error(bad, "WHERE");
 
     HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
     if (!hf) return result_error_msg("Failed to open heap");
@@ -422,9 +610,16 @@ static QueryResult* exec_select(ExecCtx* ctx, ASTNode* n) {
     bool use_index = false;
     BTree* idx_bt = NULL;
 
-    if (n->select_stmt.where && n->select_stmt.where->type == EXPR_BINARY &&
-        n->select_stmt.where->op == OP_EQ && n->select_stmt.where->right->type == EXPR_INT) {
-        const char* where_col = n->select_stmt.where->left->col_name;
+    // indice usato solo per "chiave_primaria_intera = costante": la chiave è univoca, quindi una
+    // sola riga. La riga trovata viene verificata; se la voce è obsoleta (riga aggiornata o
+    // cancellata) si ripiega sulla scansione completa.
+    ASTExpr* w = n->select_stmt.where;
+    int wci = (w && w->type == EXPR_BINARY && w->op == OP_EQ && w->left && w->left->type == EXPR_COLUMN &&
+               w->right && w->right->type == EXPR_INT) ? catalog_get_col_index(ts, w->left->col_name) : -1;
+    bool pk_int = wci >= 0 && ts->columns[wci].primary_key &&
+                  (ts->columns[wci].type == SV_TYPE_INT || ts->columns[wci].type == SV_TYPE_BIGINT);
+    if (pk_int) {
+        const char* where_col = w->left->col_name;
         for (int i = 0; i < ts->num_indexes && !use_index; i++) {
             if (strcmp(ts->indexes[i].col_name, where_col) == 0 && ts->indexes[i].root_page_id > 0) {
                 idx_bt = btree_open(ctx->bp, ts->indexes[i].root_page_id);
@@ -432,6 +627,7 @@ static QueryResult* exec_select(ExecCtx* ctx, ASTNode* n) {
                     BTreeValue btv;
                     if (btree_search(idx_bt, (uint64_t)n->select_stmt.where->right->int_val, &btv)) {
                         Tuple* t = heap_get(hf, (RID){btv.page_id, btv.slot_id}, ts);
+                        if (t && !eval_where(w, t, ts)) { tuple_free(t); t = NULL; }
                         if (t) {
                             rows = malloc(sizeof(Tuple*));
                             rids = malloc(sizeof(RID));
@@ -579,6 +775,9 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
 
     TableSchema* ts = catalog_get_table(ctx->catalog, db->name, n->update_stmt.table_name);
     if (!ts) return result_error_msg("Table not found");
+    if (catalog_get_col_index(ts, n->update_stmt.set_col) < 0) return unknown_column_error(n->update_stmt.set_col, "SET");
+    const char* bad = where_unknown_column(n->update_stmt.where, ts);
+    if (bad) return unknown_column_error(bad, "WHERE");
 
     HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
     if (!hf) return result_error_msg("Failed to open heap");
@@ -620,17 +819,17 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
 
         int ci = catalog_get_col_index(ts, n->update_stmt.set_col);
         if (ci >= 0) {
-            Value* v = &t->values[ci];
-            v->is_null = false;
-            if (n->update_stmt.set_expr->type == EXPR_INT)
-                v->int_val = (int32_t)n->update_stmt.set_expr->int_val;
-            else if (n->update_stmt.set_expr->type == EXPR_FLOAT)
-                v->float_val = n->update_stmt.set_expr->float_val;
-            else if (n->update_stmt.set_expr->type == EXPR_STRING) {
-                if (v->str_val) free(v->str_val);
-                v->str_val = strdup(n->update_stmt.set_expr->str_val);
-            }
-            heap_update(hf, match_rids[i], t, ts);
+            // il valore viene convertito secondo il tipo della colonna, non del letterale
+            ASTExpr* se = n->update_stmt.set_expr;
+            char text[sizeof(se->str_val)];
+            const char* src = text;
+            if (se->type == EXPR_INT)        snprintf(text, sizeof(text), "%lld", (long long)se->int_val);
+            else if (se->type == EXPR_FLOAT) snprintf(text, sizeof(text), "%.17g", se->float_val);
+            else if (se->type == EXPR_NULL)  src = NULL;
+            else                             src = se->str_val;
+            value_set_from_text(&t->values[ci], ts->columns[ci].type, src);
+            RID new_rid = match_rids[i];
+            heap_update(hf, match_rids[i], t, ts, &new_rid);
             if (ctx->wal && old_serial) {
                 size_t new_len;
                 uint8_t* new_serial = tuple_serialize(t, ts, &new_len);
@@ -641,14 +840,18 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
                     free(new_serial);
                 }
             }
+            // indici: chiave = valore della colonna dell'indice, puntata alla nuova posizione della riga
             for (int idx_i = 0; idx_i < ts->num_indexes; idx_i++) {
-                if (ts->indexes[idx_i].root_page_id > 0) {
-                    BTree* bt = btree_open(ctx->bp, ts->indexes[idx_i].root_page_id);
-                    if (bt) {
-                        uint64_t key = (uint64_t)v->int_val;
-                        btree_insert(bt, key, (BTreeValue){match_rids[i].page_id, match_rids[i].slot_id});
-                        free(bt);
-                    }
+                if (ts->indexes[idx_i].root_page_id == 0) continue;
+                int ic = catalog_get_col_index(ts, ts->indexes[idx_i].col_name);
+                if (ic < 0 || t->values[ic].is_null) continue;
+                DataType it = ts->columns[ic].type;
+                if (it != SV_TYPE_INT && it != SV_TYPE_BIGINT) continue;
+                BTree* bt = btree_open(ctx->bp, ts->indexes[idx_i].root_page_id);
+                if (bt) {
+                    uint64_t key = it == SV_TYPE_INT ? (uint64_t)t->values[ic].int_val : (uint64_t)t->values[ic].bigint_val;
+                    btree_insert(bt, key, (BTreeValue){new_rid.page_id, new_rid.slot_id});
+                    free(bt);
                 }
             }
             affected++;
@@ -668,6 +871,8 @@ static QueryResult* exec_delete(ExecCtx* ctx, ASTNode* n) {
 
     TableSchema* ts = catalog_get_table(ctx->catalog, db->name, n->delete_stmt.table_name);
     if (!ts) return result_error_msg("Table not found");
+    const char* bad = where_unknown_column(n->delete_stmt.where, ts);
+    if (bad) return unknown_column_error(bad, "WHERE");
 
     HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
     if (!hf) return result_error_msg("Failed to open heap");
@@ -1241,6 +1446,8 @@ static QueryResult* exec_group_by(ExecCtx* ctx, ASTNode* n) {
     if (!db) return result_error_msg("No database selected");
     TableSchema* ts = catalog_get_table(ctx->catalog, db->name, n->select_stmt.table_name);
     if (!ts) return result_error_msg("Table not found");
+    const char* bad = where_unknown_column(n->select_stmt.where, ts);
+    if (bad) return unknown_column_error(bad, "WHERE");
 
     // Collect all rows
     HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);

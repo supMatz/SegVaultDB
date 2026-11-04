@@ -66,6 +66,158 @@ static void copy_qualified(ParserState* ps, char* dst, size_t cap, const char* t
 }
 
 static ASTNode* parse_select(ParserState* ps);
+static void parse_column_ref(ParserState* ps, ASTExpr* e);
+
+// ═════════════════════════════════════════════════════════════════
+//  Condizioni (WHERE / HAVING)
+//    condizione := and_expr { OR and_expr }
+//    and_expr   := not_expr { AND not_expr }
+//    not_expr   := NOT not_expr | confronto
+//    confronto  := '(' condizione ')'
+//                | operando ( = | != | <> | < | > | <= | >= ) operando
+//                | operando IS [NOT] NULL
+//                | operando [NOT] LIKE stringa
+//                | operando [NOT] BETWEEN operando AND operando
+//                | operando [NOT] IN '(' operando { , operando } ')'
+//    operando   := numero | stringa | NULL | [tabella.]colonna
+// ═════════════════════════════════════════════════════════════════
+
+void ast_expr_free(ASTExpr* e) {
+    if (!e) return;
+    ast_expr_free(e->left);
+    ast_expr_free(e->right);
+    free(e);
+}
+
+static void parse_fail(ParserState* ps, const char* msg, Token at) {
+    if (!ps->result->success) return;
+    snprintf(ps->result->error, sizeof(ps->result->error), "%s near '%.60s' at line %d", msg, at.text, at.line);
+    ps->result->success = false;
+}
+
+static ASTExpr* new_expr(ExprType type) {
+    ASTExpr* e = calloc(1, sizeof(ASTExpr));
+    if (e) e->type = type;
+    return e;
+}
+
+static ASTExpr* new_binary(OpType op, ASTExpr* l, ASTExpr* r) {
+    ASTExpr* e = new_expr(EXPR_BINARY);
+    if (!e) { ast_expr_free(l); ast_expr_free(r); return NULL; }
+    e->op = op; e->left = l; e->right = r;
+    return e;
+}
+
+static ASTExpr* parse_operand(ParserState* ps) {
+    Token t = peek(ps);
+    ASTExpr* e = NULL;
+    switch (t.type) {
+        case TOK_INTEGER: consume(ps); e = new_expr(EXPR_INT);   if (e) e->int_val = atoll(t.text); break;
+        case TOK_FLOAT:   consume(ps); e = new_expr(EXPR_FLOAT); if (e) e->float_val = atof(t.text); break;
+        case TOK_STRING:  consume(ps); e = new_expr(EXPR_STRING); if (e) copy_text(ps, e->str_val, sizeof(e->str_val), t.text); break;
+        case TOK_NULL:    consume(ps); e = new_expr(EXPR_NULL); break;
+        case TOK_IDENTIFIER:
+            e = new_expr(EXPR_COLUMN);
+            if (e) parse_column_ref(ps, e);
+            break;
+        default:
+            parse_fail(ps, "Expected a value or a column", t);
+            if (t.type != TOK_EOF) consume(ps);
+            return NULL;
+    }
+    return e;
+}
+
+static ASTExpr* parse_condition(ParserState* ps);
+
+static ASTExpr* parse_comparison(ParserState* ps) {
+    if (match(ps, TOK_LPAREN)) {
+        ASTExpr* inner = parse_condition(ps);
+        if (!match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')'", peek(ps));
+        return inner;
+    }
+    ASTExpr* left = parse_operand(ps);
+    if (!left) return NULL;
+
+    if (match(ps, TOK_IS)) {
+        bool neg = match(ps, TOK_NOT);
+        if (!match(ps, TOK_NULL)) { parse_fail(ps, "Expected NULL after IS", peek(ps)); ast_expr_free(left); return NULL; }
+        ASTExpr* e = new_expr(EXPR_UNARY);
+        if (!e) { ast_expr_free(left); return NULL; }
+        e->op = neg ? OP_IS_NOT_NULL : OP_IS_NULL;
+        e->left = left;
+        return e;
+    }
+    bool neg = match(ps, TOK_NOT);
+    if (match(ps, TOK_LIKE)) {
+        ASTExpr* pat = parse_operand(ps);
+        return new_binary(neg ? OP_NOT_LIKE : OP_LIKE, left, pat);
+    }
+    if (match(ps, TOK_BETWEEN)) {
+        // x BETWEEN a AND b  ->  x >= a AND x <= b   (NOT: x < a OR x > b)
+        ASTExpr* lo = parse_operand(ps);
+        if (!match(ps, TOK_AND)) parse_fail(ps, "Expected AND in BETWEEN", peek(ps));
+        ASTExpr* hi = parse_operand(ps);
+        ASTExpr* left2 = new_expr(left->type);
+        if (left2) *left2 = *left;
+        if (neg) return new_binary(OP_OR, new_binary(OP_LT, left, lo), new_binary(OP_GT, left2, hi));
+        return new_binary(OP_AND, new_binary(OP_GE, left, lo), new_binary(OP_LE, left2, hi));
+    }
+    if (match(ps, TOK_IN)) {
+        // x IN (a, b, c)  ->  x = a OR x = b OR x = c   (NOT: x != a AND x != b ...)
+        if (!match(ps, TOK_LPAREN)) { parse_fail(ps, "Expected '(' after IN", peek(ps)); ast_expr_free(left); return NULL; }
+        ASTExpr* acc = NULL;
+        bool first = true;
+        do {
+            ASTExpr* v = parse_operand(ps);
+            if (!v) break;
+            ASTExpr* l = left;
+            if (!first) { l = new_expr(left->type); if (l) *l = *left; }
+            first = false;
+            ASTExpr* cmp = new_binary(neg ? OP_NEQ : OP_EQ, l, v);
+            acc = acc ? new_binary(neg ? OP_AND : OP_OR, acc, cmp) : cmp;
+        } while (match(ps, TOK_COMMA));
+        if (!match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' to close IN list", peek(ps));
+        if (first) ast_expr_free(left);
+        return acc;
+    }
+    if (neg) { parse_fail(ps, "Expected LIKE, BETWEEN or IN after NOT", peek(ps)); ast_expr_free(left); return NULL; }
+
+    OpType op;
+    if      (match(ps, TOK_EQ))  op = OP_EQ;
+    else if (match(ps, TOK_NEQ)) op = OP_NEQ;
+    else if (match(ps, TOK_LT))  op = OP_LT;
+    else if (match(ps, TOK_GT))  op = OP_GT;
+    else if (match(ps, TOK_LE))  op = OP_LE;
+    else if (match(ps, TOK_GE))  op = OP_GE;
+    else { parse_fail(ps, "Expected a comparison operator", peek(ps)); ast_expr_free(left); return NULL; }
+    ASTExpr* right = parse_operand(ps);
+    return new_binary(op, left, right);
+}
+
+static ASTExpr* parse_not(ParserState* ps) {
+    if (match(ps, TOK_NOT)) {
+        ASTExpr* e = new_expr(EXPR_UNARY);
+        ASTExpr* child = parse_not(ps);
+        if (!e) { ast_expr_free(child); return NULL; }
+        e->op = OP_NOT;
+        e->left = child;
+        return e;
+    }
+    return parse_comparison(ps);
+}
+
+static ASTExpr* parse_and(ParserState* ps) {
+    ASTExpr* e = parse_not(ps);
+    while (ps->result->success && match(ps, TOK_AND)) e = new_binary(OP_AND, e, parse_not(ps));
+    return e;
+}
+
+static ASTExpr* parse_condition(ParserState* ps) {
+    ASTExpr* e = parse_and(ps);
+    while (ps->result->success && match(ps, TOK_OR)) e = new_binary(OP_OR, e, parse_and(ps));
+    return e;
+}
 static void parse_column_ref(ParserState* ps, ASTExpr* e) {
     Token t = consume(ps);
     if (t.type == TOK_STAR) {
@@ -152,7 +304,8 @@ static ASTNode* parse_statement(ParserState* ps) {
                 if (v.type == TOK_INTEGER) { e->type = EXPR_INT; e->int_val = atoll(v.text); }
                 else if (v.type == TOK_FLOAT) { e->type = EXPR_FLOAT; e->float_val = atof(v.text); }
                 else if (v.type == TOK_STRING) { e->type = EXPR_STRING; copy_text(ps, e->str_val, sizeof(e->str_val), v.text); }
-                else if (v.type == TOK_NULL) { e->type = EXPR_INT; e->int_val = 0; }
+                else if (v.type == TOK_NULL) { e->type = EXPR_NULL; }
+                else parse_fail(ps, "Expected a value", v);
                 n->insert_stmt.values[n->insert_stmt.num_values++] = e;
                 if (!match(ps, TOK_COMMA)) break;
             }
@@ -171,22 +324,12 @@ static ASTNode* parse_statement(ParserState* ps) {
             ASTExpr* e = calloc(1, sizeof(ASTExpr));
             Token v = consume(ps);
             if (v.type == TOK_INTEGER) { e->type = EXPR_INT; e->int_val = atoll(v.text); }
+            else if (v.type == TOK_FLOAT) { e->type = EXPR_FLOAT; e->float_val = atof(v.text); }
             else if (v.type == TOK_STRING) { e->type = EXPR_STRING; copy_text(ps, e->str_val, sizeof(e->str_val), v.text); }
+            else if (v.type == TOK_NULL) { e->type = EXPR_NULL; }
+            else parse_fail(ps, "Expected a value after '='", v);
             n->update_stmt.set_expr = e;
-            if (match(ps, TOK_WHERE)) {
-                // Simple WHERE: identifier = value
-                ASTExpr* w = calloc(1, sizeof(ASTExpr));
-                parse_column_ref(ps, w);
-                ASTExpr* we = calloc(1, sizeof(ASTExpr));
-                we->type = EXPR_BINARY; we->op = OP_EQ; we->left = w;
-                consume(ps); /* consume the = operator */
-                ASTExpr* wr = calloc(1, sizeof(ASTExpr));
-                Token wv = consume(ps);
-                if (wv.type == TOK_INTEGER) { wr->type = EXPR_INT; wr->int_val = atoll(wv.text); }
-                else if (wv.type == TOK_STRING) { wr->type = EXPR_STRING; copy_text(ps, wr->str_val, sizeof(wr->str_val), wv.text); }
-                we->right = wr;
-                n->update_stmt.where = we;
-            }
+            if (match(ps, TOK_WHERE)) n->update_stmt.where = parse_condition(ps);
             break;
         }
         case TOK_DELETE: {
@@ -195,19 +338,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             expect(ps, TOK_FROM);
             Token tn = consume(ps);
             copy_text(ps, n->delete_stmt.table_name, sizeof(n->delete_stmt.table_name), tn.text);
-            if (match(ps, TOK_WHERE)) {
-                ASTExpr* w = calloc(1, sizeof(ASTExpr));
-                parse_column_ref(ps, w);
-                ASTExpr* we = calloc(1, sizeof(ASTExpr));
-                we->type = EXPR_BINARY; we->op = OP_EQ; we->left = w;
-                match(ps, TOK_EQ);
-                ASTExpr* wr = calloc(1, sizeof(ASTExpr));
-                Token wv = consume(ps);
-                if (wv.type == TOK_INTEGER) { wr->type = EXPR_INT; wr->int_val = atoll(wv.text); }
-                else if (wv.type == TOK_STRING) { wr->type = EXPR_STRING; copy_text(ps, wr->str_val, sizeof(wr->str_val), wv.text); }
-                we->right = wr;
-                n->delete_stmt.where = we;
-            }
+            if (match(ps, TOK_WHERE)) n->delete_stmt.where = parse_condition(ps);
             break;
         }
         case TOK_CREATE: {
@@ -498,27 +629,7 @@ static ASTNode* parse_select(ParserState* ps) {
         break;
     }
 
-    if (match(ps, TOK_WHERE)) {
-        ASTExpr* w = calloc(1, sizeof(ASTExpr));
-        w->type = EXPR_BINARY;
-        ASTExpr* left = calloc(1, sizeof(ASTExpr));
-        parse_column_ref(ps, left);
-        w->left = left;
-        if (match(ps, TOK_EQ)) w->op = OP_EQ;
-        else if (match(ps, TOK_NEQ)) w->op = OP_NEQ;
-        else if (match(ps, TOK_LT)) w->op = OP_LT;
-        else if (match(ps, TOK_GT)) w->op = OP_GT;
-        else if (match(ps, TOK_LE)) w->op = OP_LE;
-        else if (match(ps, TOK_GE)) w->op = OP_GE;
-        else w->op = OP_EQ;
-        ASTExpr* right = calloc(1, sizeof(ASTExpr));
-        if (peek(ps).type == TOK_INTEGER) { Token v = consume(ps); right->type = EXPR_INT; right->int_val = atoll(v.text); }
-        else if (peek(ps).type == TOK_FLOAT) { Token v = consume(ps); right->type = EXPR_FLOAT; right->float_val = atof(v.text); }
-        else if (peek(ps).type == TOK_STRING) { Token v = consume(ps); right->type = EXPR_STRING; copy_text(ps, right->str_val, sizeof(right->str_val), v.text); }
-        else { parse_column_ref(ps, right); }
-        w->right = right;
-        n->select_stmt.where = w;
-    }
+    if (match(ps, TOK_WHERE)) n->select_stmt.where = parse_condition(ps);
 
     if (match(ps, TOK_GROUP)) {
         expect(ps, TOK_BY);
@@ -536,25 +647,7 @@ static ASTNode* parse_select(ParserState* ps) {
         }
     }
 
-    if (match(ps, TOK_HAVING)) {
-        ASTExpr* h = calloc(1, sizeof(ASTExpr));
-        ASTExpr* left = calloc(1, sizeof(ASTExpr));
-        parse_column_ref(ps, left);
-        h->type = EXPR_BINARY; h->left = left;
-        if (match(ps, TOK_EQ)) h->op = OP_EQ;
-        else if (match(ps, TOK_NEQ)) h->op = OP_NEQ;
-        else if (match(ps, TOK_LT)) h->op = OP_LT;
-        else if (match(ps, TOK_GT)) h->op = OP_GT;
-        else if (match(ps, TOK_LE)) h->op = OP_LE;
-        else if (match(ps, TOK_GE)) h->op = OP_GE;
-        else h->op = OP_EQ;
-        ASTExpr* right = calloc(1, sizeof(ASTExpr));
-        if (peek(ps).type == TOK_INTEGER) { Token v = consume(ps); right->type = EXPR_INT; right->int_val = atoll(v.text); }
-        else if (peek(ps).type == TOK_STRING) { Token v = consume(ps); right->type = EXPR_STRING; copy_text(ps, right->str_val, sizeof(right->str_val), v.text); }
-        else { parse_column_ref(ps, right); }
-        h->right = right;
-        n->select_stmt.having = h;
-    }
+    if (match(ps, TOK_HAVING)) n->select_stmt.having = parse_condition(ps);
 
     if (match(ps, TOK_ORDER)) {
         expect(ps, TOK_BY);
@@ -609,11 +702,8 @@ void parse_result_free(ParseResult* r) {
         if (n->type == NODE_SELECT) {
             for (int j = 0; j < n->select_stmt.num_cols; j++)
                 free(n->select_stmt.columns[j]);
-            if (n->select_stmt.where) {
-                free(n->select_stmt.where->left);
-                free(n->select_stmt.where->right);
-                free(n->select_stmt.where);
-            }
+            ast_expr_free(n->select_stmt.where);
+            ast_expr_free(n->select_stmt.having);
         } else if (n->type == NODE_INSERT) {
             for (int j = 0; j < n->insert_stmt.num_cols; j++)
                 free(n->insert_stmt.columns[j]);
@@ -621,17 +711,9 @@ void parse_result_free(ParseResult* r) {
                 free(n->insert_stmt.values[j]);
         } else if (n->type == NODE_UPDATE) {
             free(n->update_stmt.set_expr);
-            if (n->update_stmt.where) {
-                free(n->update_stmt.where->left);
-                free(n->update_stmt.where->right);
-                free(n->update_stmt.where);
-            }
+            ast_expr_free(n->update_stmt.where);
         } else if (n->type == NODE_DELETE) {
-            if (n->delete_stmt.where) {
-                free(n->delete_stmt.where->left);
-                free(n->delete_stmt.where->right);
-                free(n->delete_stmt.where);
-            }
+            ast_expr_free(n->delete_stmt.where);
         }
         free(n);
     }

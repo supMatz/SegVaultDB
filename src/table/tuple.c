@@ -1,4 +1,5 @@
 #include "tuple.h"
+#include <strings.h>
 #include <stdio.h>
 
 Tuple* tuple_create(int num_cols) {
@@ -12,6 +13,8 @@ Tuple* tuple_create(int num_cols) {
 
 void tuple_free(Tuple* t) {
     if (!t) return;
+    for (int i = 0; t->values && i < t->num_values; i++)
+        if (t->values[i].owns_str) free(t->values[i].str_val);
     free(t->values);
     free(t);
 }
@@ -38,7 +41,8 @@ uint8_t* tuple_serialize(Tuple* t, TableSchema* s, size_t* out_len) {
             total += sz;
         } else {
             // VARCHAR/TEXT: lunghezza + contenuto
-            size_t slen = col->type == SV_TYPE_BLOB ? (size_t)t->values[i].blob_len : strlen(t->values[i].str_val ? t->values[i].str_val : "");
+            size_t slen = strlen(t->values[i].str_val ? t->values[i].str_val : "");
+            if (slen > 65535) slen = 65535;
             total += 2 + slen; // 2 byte per la lunghezza
         }
     }
@@ -62,25 +66,21 @@ uint8_t* tuple_serialize(Tuple* t, TableSchema* s, size_t* out_len) {
                 memcpy(buf + pos, &v->int_val, 4);
                 pos += 4; break;
             case SV_TYPE_BIGINT:
-            case SV_TYPE_DATETIME:
                 memcpy(buf + pos, &v->bigint_val, 8);
                 pos += 8; break;
             case SV_TYPE_FLOAT:
                 memcpy(buf + pos, &v->float_val, 8);
                 pos += 8; break;
             case SV_TYPE_BOOL:
-            case SV_TYPE_DATE:
                 buf[pos++] = v->bool_val ? 1 : 0; break;
-            case SV_TYPE_VARCHAR:
-            case SV_TYPE_CHAR:
-            case SV_TYPE_TEXT: {
+            default: {   // testo: VARCHAR, CHAR, TEXT, DATE, DATETIME, DECIMAL, BLOB
                 const char* s = v->str_val ? v->str_val : "";
-                uint16_t slen = (uint16_t)strlen(s);
+                size_t full = strlen(s);
+                uint16_t slen = (uint16_t)(full > 65535 ? 65535 : full);
                 memcpy(buf + pos, &slen, 2); pos += 2;
                 memcpy(buf + pos, s, slen);  pos += slen;
                 break;
             }
-            default: break;
         }
     }
 
@@ -107,23 +107,24 @@ Tuple* tuple_deserialize(const uint8_t* data, size_t len,
         Value*  v   = &t->values[i];
         v->is_null = false;
 
+        // ogni lettura verifica i limiti: una riga danneggiata viene scartata invece di
+        // leggere oltre la fine del buffer
+        #define NEED(n) do { if (pos + (size_t)(n) > len) { tuple_free_with_schema(t, s); return NULL; } } while (0)
         switch (col->type) {
             case SV_TYPE_INT:
-                memcpy(&v->int_val, data + pos, 4); pos += 4; break;
+                NEED(4); memcpy(&v->int_val, data + pos, 4); pos += 4; break;
             case SV_TYPE_BIGINT:
-            case SV_TYPE_DATETIME:
-                memcpy(&v->bigint_val, data + pos, 8); pos += 8; break;
+                NEED(8); memcpy(&v->bigint_val, data + pos, 8); pos += 8; break;
             case SV_TYPE_FLOAT:
-                memcpy(&v->float_val, data + pos, 8); pos += 8; break;
+                NEED(8); memcpy(&v->float_val, data + pos, 8); pos += 8; break;
             case SV_TYPE_BOOL:
-            case SV_TYPE_DATE:
-                v->bool_val = data[pos++]; break;
-            case SV_TYPE_VARCHAR:
-            case SV_TYPE_CHAR:
-            case SV_TYPE_TEXT: {
+                NEED(1); v->bool_val = data[pos++]; break;
+            default: {   // testo con prefisso di lunghezza
                 uint16_t slen;
-                memcpy(&slen, data + pos, 2); pos += 2;
+                NEED(2); memcpy(&slen, data + pos, 2); pos += 2;
+                NEED(slen);
                 v->str_val = (char*)malloc(slen + 1);
+                v->owns_str = v->str_val != NULL;
                 if (v->str_val) {
                     memcpy(v->str_val, data + pos, slen);
                     v->str_val[slen] = '\0';
@@ -131,38 +132,36 @@ Tuple* tuple_deserialize(const uint8_t* data, size_t len,
                 pos += slen;
                 break;
             }
-            default: break;
         }
+        #undef NEED
     }
     return t;
+}
+
+void value_set_from_text(Value* v, DataType type, const char* text) {
+    if (v->owns_str) free(v->str_val);
+    memset(v, 0, sizeof(*v));
+    if (!text || strcmp(text, "NULL") == 0) { v->is_null = true; return; }
+    switch (type) {
+        case SV_TYPE_INT:    v->int_val = atoi(text); break;
+        case SV_TYPE_BIGINT: v->bigint_val = atoll(text); break;
+        case SV_TYPE_FLOAT:  v->float_val = atof(text); break;
+        case SV_TYPE_BOOL:
+            v->bool_val = strcmp(text, "1") == 0 || strcasecmp(text, "true") == 0;
+            break;
+        default:
+            v->str_val = strdup(text);
+            v->owns_str = v->str_val != NULL;
+            break;
+    }
 }
 
 Tuple* tuple_from_strings(const char** values, int count,
                               TableSchema* s) {
     Tuple* t = tuple_create(count);
     if (!t) return NULL;
-    for (int i = 0; i < count && i < s->num_columns; i++) {
-        Column* col = &s->columns[i];
-        Value*  v   = &t->values[i];
-        if (!values[i] || strcmp(values[i], "NULL") == 0) {
-            v->is_null = true;
-            continue;
-        }
-        v->is_null = false;
-        switch (col->type) {
-            case SV_TYPE_INT:
-                v->int_val = atoi(values[i]); break;
-            case SV_TYPE_BIGINT:
-                v->bigint_val = atoll(values[i]); break;
-            case SV_TYPE_FLOAT:
-                v->float_val = atof(values[i]); break;
-            case SV_TYPE_BOOL:
-                v->bool_val = (strcmp(values[i], "1") == 0 ||
-                               strcmp(values[i], "true") == 0); break;
-            default:
-                v->str_val = strdup(values[i]); break;
-        }
-    }
+    for (int i = 0; i < count && i < s->num_columns; i++)
+        value_set_from_text(&t->values[i], s->columns[i].type, values[i]);
     return t;
 }
 
@@ -172,13 +171,9 @@ void value_to_string(Value* v, DataType type,
     switch (type) {
         case SV_TYPE_INT:    snprintf(buf, buf_len, "%d",  v->int_val);   break;
         case SV_TYPE_BIGINT: snprintf(buf, buf_len, "%lld", (long long)v->bigint_val); break;
-        case SV_TYPE_FLOAT:  snprintf(buf, buf_len, "%g",  v->float_val); break;
+        case SV_TYPE_FLOAT:  snprintf(buf, buf_len, "%.15g", v->float_val); break;   // %g teneva solo 6 cifre
         case SV_TYPE_BOOL:   snprintf(buf, buf_len, "%s",  v->bool_val ? "1" : "0"); break;
-        case SV_TYPE_VARCHAR:
-        case SV_TYPE_CHAR:
-        case SV_TYPE_TEXT:
-            snprintf(buf, buf_len, "%s", v->str_val ? v->str_val : ""); break;
-        default:             snprintf(buf, buf_len, "?"); break;
+        default:             snprintf(buf, buf_len, "%s", v->str_val ? v->str_val : ""); break;   // testo
     }
 }
 

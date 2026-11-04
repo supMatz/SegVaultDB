@@ -138,10 +138,29 @@ TokenList* lexer_tokenize(const char* sql) {
             continue;
         }
 
-        // Numbers
-        if (isdigit((unsigned char)*lx.pos)) {
-            while (isdigit((unsigned char)*lx.pos) || *lx.pos == '.') lx.pos++;
-            add_token(list, make_token(&lx, TOK_INTEGER));
+        // Numbers: interi e decimali (un '-' iniziale fa parte del numero quando non può
+        // essere una sottrazione, es. VALUES (1, -5) o WHERE x = -3)
+        bool neg = false;
+        if (*lx.pos == '-' && isdigit((unsigned char)lx.pos[1])) {
+            TokenType pt = list->count > 0 ? list->tokens[list->count - 1].type : TOK_EOF;
+            neg = !(pt == TOK_IDENTIFIER || pt == TOK_INTEGER || pt == TOK_FLOAT ||
+                    pt == TOK_STRING || pt == TOK_RPAREN);
+        }
+        if (isdigit((unsigned char)*lx.pos) || neg) {
+            bool is_float = false;
+            if (neg) lx.pos++;
+            while (isdigit((unsigned char)*lx.pos) || (*lx.pos == '.' && !is_float)) {
+                if (*lx.pos == '.') is_float = true;
+                lx.pos++;
+            }
+            if ((*lx.pos == 'e' || *lx.pos == 'E') &&
+                (isdigit((unsigned char)lx.pos[1]) ||
+                 ((lx.pos[1] == '-' || lx.pos[1] == '+') && isdigit((unsigned char)lx.pos[2])))) {
+                is_float = true;
+                lx.pos += 2;
+                while (isdigit((unsigned char)*lx.pos)) lx.pos++;
+            }
+            add_token(list, make_token(&lx, is_float ? TOK_FLOAT : TOK_INTEGER));
             continue;
         }
 
@@ -168,7 +187,8 @@ TokenList* lexer_tokenize(const char* sql) {
             case '/': tt = TOK_SLASH; break;
             case '=': tt = TOK_EQ; break;
             case '!': if (*(lx.pos+1) == '=') { tt = TOK_NEQ; advance = 2; } break;
-            case '<': tt = *(lx.pos+1) == '=' ? (advance=2,TOK_LE) : TOK_LT; break;
+            case '<': tt = *(lx.pos+1) == '=' ? (advance=2,TOK_LE)
+                         : *(lx.pos+1) == '>' ? (advance=2,TOK_NEQ) : TOK_LT; break;
             case '>': tt = *(lx.pos+1) == '=' ? (advance=2,TOK_GE) : TOK_GT; break;
         }
         if (tt != TOK_ERROR) {

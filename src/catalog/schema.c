@@ -10,9 +10,8 @@ int datatype_size(DataType t) {
         case SV_TYPE_BIGINT:   return 8;
         case SV_TYPE_FLOAT:    return 8;
         case SV_TYPE_BOOL:     return 1;
-        case SV_TYPE_DATE:     return 4;
-        case SV_TYPE_DATETIME: return 8;
-        case SV_TYPE_DECIMAL:  return 16;
+        // DATE, DATETIME, DECIMAL, BLOB, VARCHAR, CHAR, TEXT: memorizzati come testo
+        // con prefisso di lunghezza (dimensione variabile)
         default:               return 0;
     }
 }

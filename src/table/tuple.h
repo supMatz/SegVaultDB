@@ -27,6 +27,7 @@ typedef struct {
         uint8_t* blob_val;
     };
     int blob_len; // Solo per BLOB
+    bool owns_str; // str_val allocata da questa tuple: liberata da tuple_free
 } Value;
 
 // Una riga completa
@@ -48,6 +49,10 @@ Tuple* tuple_deserialize(const uint8_t* data, size_t len, TableSchema* s);
 
 // Crea una tuple da un array di stringhe (usato dall'executor)
 Tuple* tuple_from_strings(const char** values, int count, TableSchema* s);
+
+// Imposta un valore a partire dal suo testo, convertito secondo il tipo della colonna
+// (text == NULL -> NULL). Libera l'eventuale stringa precedente.
+void value_set_from_text(Value* v, DataType type, const char* text);
 
 // Converte un valore in stringa (per la GUI)
 void value_to_string(Value* v, DataType type, char* buf, size_t buf_len);

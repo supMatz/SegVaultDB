@@ -139,12 +139,12 @@ int heap_delete(HeapFile* hf, RID rid) {
     return rc;
 }
 
-int heap_update(HeapFile* hf, RID rid, Tuple* t, TableSchema* schema) {
+int heap_update(HeapFile* hf, RID rid, Tuple* t, TableSchema* schema, RID* out_new_rid) {
     if (!hf || !t || !schema) return SV_ERR;
     // For simplicity: delete + re-insert
     int rc = heap_delete(hf, rid);
     if (rc != SV_OK) return rc;
-    return heap_insert(hf, t, schema, NULL);
+    return heap_insert(hf, t, schema, out_new_rid);
 }
 
 HeapScan* heap_scan_open(HeapFile* hf, TableSchema* schema) {

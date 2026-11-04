@@ -17,10 +17,11 @@ typedef enum {
 typedef enum { JOIN_INNER, JOIN_LEFT, JOIN_RIGHT, JOIN_CROSS } JoinType;
 
 typedef enum { EXPR_COLUMN, EXPR_INT, EXPR_FLOAT, EXPR_STRING, EXPR_STAR,
-               EXPR_BINARY, EXPR_UNARY } ExprType;
+               EXPR_BINARY, EXPR_UNARY, EXPR_NULL } ExprType;
 
 typedef enum { OP_EQ, OP_NEQ, OP_LT, OP_GT, OP_LE, OP_GE,
-               OP_AND, OP_OR, OP_NOT, OP_PLUS, OP_MINUS, OP_MUL, OP_DIV } OpType;
+               OP_AND, OP_OR, OP_NOT, OP_PLUS, OP_MINUS, OP_MUL, OP_DIV,
+               OP_IS_NULL, OP_IS_NOT_NULL, OP_LIKE, OP_NOT_LIKE } OpType;
 
 typedef struct ASTExpr {
     ExprType type;
@@ -35,6 +36,9 @@ typedef struct ASTExpr {
     struct ASTExpr* left;
     struct ASTExpr* right;
 } ASTExpr;
+
+// libera un'espressione e tutti i suoi figli
+void ast_expr_free(ASTExpr* e);
 
 typedef struct {
     char     name[64];
