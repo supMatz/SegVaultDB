@@ -115,6 +115,29 @@ static void on_rollback_click(void* ud) {
     set_status(app, ok ? STATUS_OK : STATUS_ERROR, ok ? "ROLLBACK executed" : "ROLLBACK failed", "");
 }
 
+// formatta la selezione (estesa a righe intere) o l'intero script
+static void format_sql(AppWindow* app) {
+    TextBox* tb = app->editor;
+    int a = 0, b = tb->text_len;
+    bool sel = textbox_has_selection(tb);
+    if (sel) {
+        textbox_get_selection_range(tb, &a, &b);
+        while (a > 0 && tb->text[a - 1] != '\n') a--;
+    }
+    char* out = sql_format(tb->text + a, b - a);
+    if (!out) { set_status(app, STATUS_ERROR, "Format failed (out of memory)", ""); return; }
+    if ((int)strlen(out) == b - a && memcmp(out, tb->text + a, b - a) == 0) {
+        set_status(app, STATUS_INFO, "Already formatted", "");
+    } else {
+        textbox_replace_text(tb, a, b, out, sel);
+        set_status(app, STATUS_OK, sel ? "Selection formatted" : "Script formatted", "Ctrl+Z to undo");
+    }
+    free(out);
+    textbox_focus(tb, true);
+}
+
+static void on_format_click(void* ud) { format_sql((AppWindow*)ud); }
+
 static void on_refresh_click(void* ud) {
     AppWindow* app = (AppWindow*)ud;
     refresh_tree(app);
@@ -643,11 +666,11 @@ static void layout_widgets(AppWindow* app) {
     // toolbar
     int bh = 32, by = (TOOLBAR_H - bh) / 2;
     int x = SIDEBAR_W + 14;
-    Button* btns[] = { app->btn_run, app->btn_run_current, app->btn_commit, app->btn_rollback };
-    for (int i = 0; i < 4; i++) {
+    Button* btns[] = { app->btn_run, app->btn_run_current, app->btn_commit, app->btn_rollback, app->btn_format };
+    for (int i = 0; i < 5; i++) {
         int w = button_preferred_width(btns[i], app->win);
         btns[i]->base.bounds = (Rect){x, by, w, bh};
-        x += w + (i == 1 ? 22 : 8); // spazio extra tra "esecuzione" e "transazione"
+        x += w + ((i == 1 || i == 3) ? 22 : 8); // spazio extra tra i gruppi
     }
     app->lbl_db_name->base.bounds = (Rect){W - 210, by, 196, bh};
 
@@ -712,6 +735,9 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
 
     app->btn_rollback = button_create(0, 0, 0, 0, "Rollback", on_rollback_click, app);
     button_set_icon(app->btn_rollback, BUTTON_ICON_UNDO, TH_WARNING);
+
+    app->btn_format = button_create(0, 0, 0, 0, "Format", on_format_click, app);
+    button_set_hint(app->btn_format, "Ctrl+Shift+F");
 
     app->lbl_db_name = label_create(0, 0, 0, 0, "", TH_FONT_UI, TH_TEXT);
     app->lbl_db_name->align = LABEL_ALIGN_RIGHT;
@@ -825,8 +851,8 @@ static void update_cursor_shape(AppWindow* app, int mx, int my) {
         k = CURSOR_IBEAM;
     } else {
         Widget* clickable[] = { (Widget*)app->btn_run, (Widget*)app->btn_run_current, (Widget*)app->btn_commit,
-                                (Widget*)app->btn_rollback, (Widget*)app->btn_refresh };
-        for (int i = 0; i < 5; i++)
+                                (Widget*)app->btn_rollback, (Widget*)app->btn_refresh, (Widget*)app->btn_format };
+        for (int i = 0; i < 6; i++)
             if (widget_contains_point(clickable[i], mx, my)) { k = CURSOR_HAND; break; }
     }
     platform_set_cursor(app->win, k);
@@ -851,7 +877,7 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         if (evt->key == KEY_F5) { app_window_run(app, RUN_SCRIPT); return; }
         if (evt->key == KEY_LETTER && ctrl && !(evt->modifiers & SV_MOD_ALT)) {
             switch (evt->character) {
-                case 'f': if (!shift) { bar_open(app, BAR_FIND, false); return; } break;
+                case 'f': if (shift) format_sql(app); else bar_open(app, BAR_FIND, false); return;
                 case 'h': if (!shift) { bar_open(app, BAR_FIND, true);  return; } break;
                 case 'g': bar_open(app, BAR_GOTO, false); return;
                 default: break;
@@ -918,7 +944,7 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
 
     Widget* order[] = {
         (Widget*)app->btn_run, (Widget*)app->btn_run_current, (Widget*)app->btn_commit,
-        (Widget*)app->btn_rollback, (Widget*)app->btn_refresh,
+        (Widget*)app->btn_rollback, (Widget*)app->btn_refresh, (Widget*)app->btn_format,
         (Widget*)app->tree_scroll, (Widget*)app->editor_scroll,
         (Widget*)app->results_scroll_v, (Widget*)app->results_scroll_h,
         (Widget*)app->tree, (Widget*)app->editor, (Widget*)app->results,
@@ -970,6 +996,9 @@ static void draw_toolbar(AppWindow* app) {
     // separatore tra gruppo "esecuzione" e "transazione"
     Rect rc = app->btn_run_current->base.bounds;
     platform_fill_rect(win, (Rect){rc.x + rc.w + 11, 14, 1, TOOLBAR_H - 28}, TH_BORDER_STRONG);
+    Rect rb = app->btn_rollback->base.bounds;
+    platform_fill_rect(win, (Rect){rb.x + rb.w + 11, 14, 1, TOOLBAR_H - 28}, TH_BORDER_STRONG);
+    widget_draw((Widget*)app->btn_format, win);
 
     widget_draw((Widget*)app->btn_run, win);
     widget_draw((Widget*)app->btn_run_current, win);
@@ -1254,6 +1283,7 @@ void app_window_destroy(AppWindow* app) {
     widget_destroy((Widget*)app->btn_commit);
     widget_destroy((Widget*)app->btn_rollback);
     widget_destroy((Widget*)app->btn_refresh);
+    widget_destroy((Widget*)app->btn_format);
     widget_destroy((Widget*)app->lbl_db_name);
     widget_destroy((Widget*)app->tree);
     widget_destroy((Widget*)app->tree_scroll);

@@ -57,6 +57,7 @@ typedef struct {
     Button* btn_run_current;    // esegui statement sotto il cursore (Ctrl+Enter)
     Button* btn_commit;         // COMMIT transazione
     Button* btn_rollback;       // ROLLBACK transazione
+    Button* btn_format;         // formatta lo script (Ctrl+Shift+F)
     Label*  lbl_db_name;        // nome database corrente
 
     // -- sidebar --

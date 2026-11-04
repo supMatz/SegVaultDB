@@ -147,3 +147,251 @@ int sql_word_list(SqlWordKind kind, const char* const** out) {
         default:               *out = NULL;     return 0;
     }
 }
+
+// ═════════════════════════════════════════════════════════════════
+//  Formattazione
+// ═════════════════════════════════════════════════════════════════
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <strings.h>
+
+#define SV_MIN_INT(a, b) ((a) < (b) ? (a) : (b))
+
+typedef struct { char* b; int len, cap; bool ok; } SBuf;
+
+static void sb_put(SBuf* sb, const char* s, int n) {
+    if (!sb->ok) return;
+    if (sb->len + n + 1 > sb->cap) {
+        int cap = sb->cap * 2 + n + 64;
+        char* nb = realloc(sb->b, cap);
+        if (!nb) { sb->ok = false; return; }
+        sb->b = nb;
+        sb->cap = cap;
+    }
+    memcpy(sb->b + sb->len, s, n);
+    sb->len += n;
+    sb->b[sb->len] = '\0';
+}
+
+static char sb_last(const SBuf* sb) { return sb->len ? sb->b[sb->len - 1] : '\n'; }
+
+static void sb_trim_spaces(SBuf* sb) {
+    while (sb->len && sb->b[sb->len - 1] == ' ') sb->b[--sb->len] = '\0';
+}
+
+// va a capo (se non lo è già) e indenta
+static void sb_newline(SBuf* sb, int indent) {
+    sb_trim_spaces(sb);
+    if (sb->len && sb_last(sb) != '\n') sb_put(sb, "\n", 1);
+    for (int i = 0; i < indent; i++) sb_put(sb, " ", 1);
+}
+
+// riga vuota di separazione tra istruzioni
+static void sb_blank_line(SBuf* sb) {
+    sb_trim_spaces(sb);
+    if (!sb->len) return;
+    if (sb_last(sb) != '\n') sb_put(sb, "\n", 1);
+    if (sb->len < 2 || sb->b[sb->len - 2] != '\n') sb_put(sb, "\n", 1);
+}
+
+static void sb_space(SBuf* sb) {
+    char c = sb_last(sb);
+    if (c != ' ' && c != '\n' && sb->len) sb_put(sb, " ", 1);
+}
+
+static bool word_is(const char* w, int n, const char* kw) {
+    return (int)strlen(kw) == n && strncasecmp(w, kw, n) == 0;
+}
+
+static bool word_in(const char* w, int n, const char* const* list) {
+    for (int i = 0; list[i]; i++) if (word_is(w, n, list[i])) return true;
+    return false;
+}
+
+enum { TK_NONE, TK_WORD, TK_KEYWORD, TK_OPEN, TK_CLOSE, TK_COMMA, TK_OP, TK_DOT, TK_SEMI, TK_VALUE, TK_STAR };
+
+char* sql_format(const char* s, int len) {
+    static const char* const CLAUSES[] = { "FROM", "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "VALUES",
+                                           "SET", "UNION", "SELECT", NULL };
+    static const char* const JOIN_MODS[] = { "LEFT", "RIGHT", "INNER", "OUTER", "CROSS", "FULL", "NATURAL", NULL };
+
+    SBuf sb = { malloc(len + 64), 0, len + 64, true };
+    if (!sb.b) return NULL;
+    sb.b[0] = '\0';
+
+    int depth = 0, ct_depth = -1;          // profondità parentesi; lista colonne di CREATE TABLE
+    int prev = TK_NONE;
+    char prev_kw[16] = "";                 // ultima keyword (maiuscola)
+    bool create_seen = false, create_table = false;
+    bool cond_clause = false;              // dentro WHERE / HAVING / ON: AND/OR vanno a capo
+    bool between = false;                  // il prossimo AND appartiene a BETWEEN
+    bool stmt_break = false;               // serve una riga vuota prima del prossimo token
+    bool src_nl = false;                   // c'era un a capo nel sorgente prima del token
+    bool obj_name = false;                 // l'ultima parola è il nome di un oggetto (TABLE x, INTO x...)
+    static const char* const OBJ_KW[] = { "TABLE", "INTO", "REFERENCES", "VIEW", "INDEX", "EXISTS", "TRIGGER", NULL };
+
+    int i = 0;
+    while (i < len) {
+        char c = s[i];
+        if (isspace((unsigned char)c)) { if (c == '\n') src_nl = true; i++; continue; }
+
+        // -- commenti --
+        if ((c == '-' && i + 1 < len && s[i + 1] == '-') || (c == '/' && i + 1 < len && s[i + 1] == '*')) {
+            int j = skip_quoted_or_comment(s, len, i);
+            bool line = c == '-';
+            if (stmt_break && src_nl) { sb_blank_line(&sb); stmt_break = false; }
+            else if (src_nl && sb.len && sb_last(&sb) != '\n') sb_newline(&sb, ct_depth >= 0 ? 4 : 0);
+            else sb_space(&sb);
+            int e = j;
+            while (e > i && (s[e - 1] == '\n' || s[e - 1] == '\r')) e--;
+            sb_put(&sb, s + i, e - i);
+            if (line) sb_newline(&sb, ct_depth >= 0 ? 4 : (stmt_break || prev == TK_NONE ? 0 : 4));
+            i = j;
+            src_nl = line;
+            continue;
+        }
+
+        // nuova istruzione dopo ';': riga vuota
+        if (stmt_break) { sb_blank_line(&sb); stmt_break = false; }
+        src_nl = false;
+
+        // -- stringhe e identificatori quotati --
+        if (c == '\'' || c == '"' || c == '`') {
+            int j = skip_quoted_or_comment(s, len, i);
+            if (prev != TK_OPEN && prev != TK_DOT) sb_space(&sb);
+            sb_put(&sb, s + i, j - i);
+            prev = c == '\'' ? TK_VALUE : TK_WORD;
+            i = j;
+            continue;
+        }
+
+        // -- numeri --
+        if (isdigit((unsigned char)c) || (c == '.' && i + 1 < len && isdigit((unsigned char)s[i + 1]) && prev != TK_WORD)) {
+            int j = i;
+            while (j < len && (isalnum((unsigned char)s[j]) || s[j] == '.' || s[j] == '_')) j++;
+            if (prev != TK_OPEN && prev != TK_DOT && !(prev == TK_OP && sb_last(&sb) != ' ')) sb_space(&sb);
+            sb_put(&sb, s + i, j - i);
+            prev = TK_VALUE;
+            i = j;
+            continue;
+        }
+
+        // -- parole --
+        if (isalpha((unsigned char)c) || c == '_' || (unsigned char)c >= 0x80) {
+            int j = i;
+            while (j < len && (isalnum((unsigned char)s[j]) || s[j] == '_' || (unsigned char)s[j] >= 0x80)) j++;
+            const char* w = s + i;
+            int n = j - i;
+            SqlWordKind k = prev == TK_DOT ? SQL_WORD_IDENT : sql_classify_word(w, n);
+            bool kw = k == SQL_WORD_KEYWORD;
+
+            if (kw && depth == 0) {
+                bool after_mod = word_in(prev_kw, (int)strlen(prev_kw), JOIN_MODS) && prev == TK_KEYWORD;
+                bool brk = false;
+                if (word_in(w, n, CLAUSES)) brk = true;
+                if (word_in(w, n, JOIN_MODS) && !after_mod) brk = true;
+                if (word_is(w, n, "JOIN") && !after_mod) brk = true;
+                if (word_is(w, n, "SET") && word_is(prev_kw, (int)strlen(prev_kw), "TRANSACTION")) brk = false;
+                if ((word_is(w, n, "AND") || word_is(w, n, "OR")) && cond_clause) {
+                    if (between && word_is(w, n, "AND")) between = false;
+                    else { sb_newline(&sb, 4); brk = false; prev = TK_NONE; }
+                }
+                if (brk) sb_newline(&sb, 0);
+
+                if (word_is(w, n, "WHERE") || word_is(w, n, "HAVING") || word_is(w, n, "ON")) cond_clause = true;
+                else if (word_in(w, n, CLAUSES) || word_is(w, n, "JOIN")) cond_clause = false;
+            }
+            if (kw && word_is(w, n, "BETWEEN")) between = true;
+            if (kw && word_is(w, n, "CREATE")) create_seen = true;
+            else if (kw && create_seen && word_is(w, n, "TABLE")) create_table = true;
+            else if (kw) create_seen = false;
+
+            if (prev != TK_OPEN && prev != TK_DOT && !(prev == TK_OP && sb_last(&sb) != ' ')) sb_space(&sb);
+            if (k == SQL_WORD_IDENT) {
+                sb_put(&sb, w, n);
+            } else {
+                char up[64];
+                int m = SV_MIN_INT(n, 63);
+                for (int q = 0; q < m; q++) up[q] = (char)toupper((unsigned char)w[q]);
+                sb_put(&sb, up, m);
+                if (n > 63) sb_put(&sb, w + 63, n - 63);
+            }
+            if (kw) { snprintf(prev_kw, sizeof(prev_kw), "%.*s", SV_MIN_INT(n, 15), w);
+                      for (char* p = prev_kw; *p; p++) *p = (char)toupper((unsigned char)*p); }
+            obj_name = !kw && prev == TK_KEYWORD && word_in(prev_kw, (int)strlen(prev_kw), OBJ_KW);
+            prev = (kw || k == SQL_WORD_LITERAL) ? TK_KEYWORD : TK_WORD;
+            i = j;
+            continue;
+        }
+
+        // -- punteggiatura e operatori --
+        switch (c) {
+            case '(': {
+                bool call = prev == TK_WORD && !obj_name;
+                if (!call && prev != TK_OPEN && prev != TK_NONE) sb_space(&sb);
+                sb_put(&sb, "(", 1);
+                depth++;
+                if (create_table && depth == 1 && ct_depth < 0) { ct_depth = 1; sb_newline(&sb, 4); }
+                prev = TK_OPEN;
+                break;
+            }
+            case ')':
+                if (ct_depth == depth && depth == 1) { sb_newline(&sb, 0); ct_depth = -1; create_table = false; }
+                else sb_trim_spaces(&sb);
+                sb_put(&sb, ")", 1);
+                if (depth > 0) depth--;
+                prev = TK_CLOSE;
+                break;
+            case ',':
+                sb_trim_spaces(&sb);
+                sb_put(&sb, ",", 1);
+                if (ct_depth >= 0 && depth == ct_depth) sb_newline(&sb, 4);
+                prev = TK_COMMA;
+                break;
+            case '.':
+                sb_trim_spaces(&sb);
+                sb_put(&sb, ".", 1);
+                prev = TK_DOT;
+                break;
+            case ';':
+                sb_trim_spaces(&sb);
+                sb_put(&sb, ";", 1);
+                depth = 0; ct_depth = -1;
+                create_seen = create_table = cond_clause = between = false;
+                prev_kw[0] = '\0';
+                prev = TK_SEMI;
+                stmt_break = true;
+                break;
+            case '*':
+                if (prev != TK_OPEN && prev != TK_DOT) sb_space(&sb);
+                sb_put(&sb, "*", 1);
+                prev = TK_STAR;
+                break;
+            default: {
+                if (!strchr("=<>!+-/%|&^~?:", c)) {   // carattere sconosciuto: copiato com'è
+                    sb_space(&sb);
+                    sb_put(&sb, s + i, 1);
+                    prev = TK_WORD;
+                    break;
+                }
+                int j = i + 1;
+                while (j < len && strchr("=<>!|&", s[j]) && strchr("=<>!|&", c)) j++;
+                bool unary = (c == '-' || c == '+') && j == i + 1 &&
+                             (prev == TK_NONE || prev == TK_OP || prev == TK_OPEN || prev == TK_COMMA ||
+                              prev == TK_KEYWORD || prev == TK_SEMI);
+                if (prev != TK_OPEN || !unary) sb_space(&sb);
+                sb_put(&sb, s + i, j - i);
+                if (!unary) sb_put(&sb, " ", 1);
+                prev = TK_OP;
+                i = j;
+                continue;
+            }
+        }
+        i++;
+    }
+    sb_trim_spaces(&sb);
+    if (len > 0 && s[len - 1] == '\n' && sb_last(&sb) != '\n') sb_put(&sb, "\n", 1);
+    if (!sb.ok) { free(sb.b); return NULL; }
+    return sb.b;
+}

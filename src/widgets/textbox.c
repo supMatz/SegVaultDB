@@ -1705,6 +1705,22 @@ void textbox_insert(TextBox* tb, const char* text) {
     tb->last_edit_kind = EDIT_NONE;
 }
 
+void textbox_replace_text(TextBox* tb, int start, int end, const char* text, bool select) {
+    if (!tb || !text) return;
+    start = SV_CLAMP(start, 0, tb->text_len);
+    end   = SV_CLAMP(end, start, tb->text_len);
+    int top = tb->scroll_y;
+    undo_push(tb, EDIT_OTHER);
+    replace_range(tb, start, end, text, -1);
+    if (select) {
+        tb->sel_anchor = start;
+        update_cursor_linecol(tb);
+    }
+    tb->scroll_y = top;   // mantiene la vista (ensure_visible la corregge se serve)
+    ensure_visible(tb);
+    tb->last_edit_kind = EDIT_NONE;
+}
+
 bool textbox_tick(TextBox* tb, uint64_t now_ms) {
     if (!tb || tb->base.state != WIDGET_STATE_FOCUSED) return false;
     if (now_ms - tb->cursor_blink >= 530) {

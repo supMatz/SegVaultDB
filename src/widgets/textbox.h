@@ -133,6 +133,9 @@ void textbox_clear(TextBox* tb); // pulizia contenuto tb
 
 void textbox_insert(TextBox* tb, const char* text); // inserisce testo al cursore (sostituisce la selezione)
 
+// sostituisce [start, end) con text in un unico passo annullabile; select = seleziona il testo inserito
+void textbox_replace_text(TextBox* tb, int start, int end, const char* text, bool select);
+
 bool textbox_tick(TextBox* tb, uint64_t now_ms); // blink del cursore; true se serve ridisegnare
 
 void textbox_focus(TextBox* tb, bool focused);
