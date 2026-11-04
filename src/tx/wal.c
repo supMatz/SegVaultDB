@@ -55,18 +55,26 @@ static void replay_entry(int db_fd, uint8_t type, uint32_t page_id,
     }
     if (!p) return;
 
+    // REDO idempotente: gli slot di una pagina sono solo aggiunti (mai riusati), quindi lo
+    // stato dello slot registrato dice se l'operazione è già su disco. Rieseguirla alla cieca
+    // duplicava le righe a ogni riavvio.
     switch (type) {
         case LOG_INSERT:
-            page_insert(p, data, data_len);
+            if (slot_id == p->num_slots) page_insert(p, data, data_len);   // < num_slots: già applicato
             break;
         case LOG_DELETE:
-            page_delete_slot(p, slot_id);
+            page_delete_slot(p, slot_id);                                   // no-op se già eliminato
             break;
-        case LOG_UPDATE:
-            // Delete old slot, insert new data
-            page_delete_slot(p, slot_id);
-            page_insert(p, data, data_len);
+        case LOG_UPDATE: {
+            // ancora da applicare solo se lo slot contiene la versione precedente
+            uint16_t len = 0;
+            const void* cur = page_get_slot(p, slot_id, &len);
+            if (cur && old_data && len == old_data_len && memcmp(cur, old_data, len) == 0) {
+                page_delete_slot(p, slot_id);
+                page_insert(p, data, data_len);
+            }
             break;
+        }
     }
     page_write(p, db_fd);
     page_free(p);

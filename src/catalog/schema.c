@@ -1,5 +1,7 @@
 #include "schema.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "platform_compat.h"
 
 int datatype_size(DataType t) {
@@ -41,6 +43,44 @@ Catalog* catalog_create(void) {
     return c;
 }
 
+// ── persistenza del catalogo ─────────────────────────────────────
+// Formato v2 (compatto): solo database e oggetti presenti.
+//   "SVCAT2\0\0"  uint32 versione  int32 num_databases  int32 current_db  uint32 next_page_id
+//   per ogni database: name[SV_MAX_NAME_LEN]  int32 num_tables num_views num_routines num_triggers
+//                      seguiti dalle strutture TableSchema / ViewSchema / RoutineSchema / TriggerSchema
+// Il formato precedente era la struct Catalog intera (~1,3 GB, quasi tutta vuota): viene ancora
+// letto e alla prima chiusura riscritto nel formato v2.
+
+#define CAT_MAGIC   "SVCAT2\0\0"
+#define CAT_VERSION 2u
+
+// lettura/scrittura complete (read/write possono trasferire meno byte del richiesto)
+static bool read_all(int fd, void* buf, size_t n) {
+    uint8_t* p = (uint8_t*)buf;
+    while (n > 0) {
+        unsigned int chunk = n > (1u << 24) ? (1u << 24) : (unsigned int)n;
+        int r = (int)sv_read(fd, p, chunk);
+        if (r <= 0) return false;
+        p += r;
+        n -= (size_t)r;
+    }
+    return true;
+}
+
+static bool write_all(int fd, const void* buf, size_t n) {
+    const uint8_t* p = (const uint8_t*)buf;
+    while (n > 0) {
+        unsigned int chunk = n > (1u << 24) ? (1u << 24) : (unsigned int)n;
+        int w = (int)sv_write(fd, p, chunk);
+        if (w <= 0) return false;
+        p += w;
+        n -= (size_t)w;
+    }
+    return true;
+}
+
+static bool read_i32(int fd, int32_t* v) { return read_all(fd, v, sizeof(*v)); }
+
 Catalog* catalog_load(const char* path) {
     int fd = sv_open(path, SV_O_RDONLY, 0);
     if (fd < 0) return catalog_create();
@@ -48,10 +88,42 @@ Catalog* catalog_load(const char* path) {
     Catalog* c = SV_ALLOC(Catalog);
     if (!c) { sv_close(fd); return NULL; }
 
-    ssize_t n = sv_read(fd, c, sizeof(Catalog));
+    char magic[8];
+    bool ok = read_all(fd, magic, sizeof(magic));
+    if (ok && memcmp(magic, CAT_MAGIC, 8) == 0) {
+        uint32_t version = 0, next_page = 1;
+        int32_t ndb = 0, cur = -1;
+        ok = read_all(fd, &version, 4) && version == CAT_VERSION &&
+             read_i32(fd, &ndb) && read_i32(fd, &cur) && read_all(fd, &next_page, 4) &&
+             ndb >= 0 && ndb <= SV_MAX_DATABASES;
+        if (ok) {
+            c->num_databases = ndb;
+            c->current_db    = (cur >= -1 && cur < ndb) ? cur : -1;
+            c->next_page_id  = next_page;
+        }
+        for (int d = 0; ok && d < ndb; d++) {
+            Database* db = &c->databases[d];
+            int32_t nt, nv, nr, ntr;
+            ok = read_all(fd, db->name, sizeof(db->name)) &&
+                 read_i32(fd, &nt) && read_i32(fd, &nv) && read_i32(fd, &nr) && read_i32(fd, &ntr) &&
+                 nt >= 0 && nt <= SV_MAX_TABLES && nv >= 0 && nv <= 64 &&
+                 nr >= 0 && nr <= 64 && ntr >= 0 && ntr <= 64;
+            if (!ok) break;
+            db->num_tables = nt; db->num_views = nv; db->num_routines = nr; db->num_triggers = ntr;
+            ok = read_all(fd, db->tables,   sizeof(TableSchema)   * (size_t)nt) &&
+                 read_all(fd, db->views,    sizeof(ViewSchema)    * (size_t)nv) &&
+                 read_all(fd, db->routines, sizeof(RoutineSchema) * (size_t)nr) &&
+                 read_all(fd, db->triggers, sizeof(TriggerSchema) * (size_t)ntr);
+        }
+    } else if (ok) {
+        // formato precedente: la struct Catalog intera
+        memcpy(c, magic, sizeof(magic));
+        ok = read_all(fd, (uint8_t*)c + sizeof(magic), sizeof(Catalog) - sizeof(magic));
+    }
     sv_close(fd);
 
-    if (n != (ssize_t)sizeof(Catalog)) {
+    if (!ok) {
+        fprintf(stderr, "[SegVault] catalog '%s' is unreadable or truncated: starting with an empty catalog\n", path);
         free(c);
         return catalog_create();
     }
@@ -60,12 +132,33 @@ Catalog* catalog_load(const char* path) {
 
 int catalog_save(Catalog* c, const char* path) {
     if (!c || !path) return SV_ERR;
-    int fd = sv_open(path, SV_O_WRONLY | SV_O_CREAT | SV_O_TRUNC, 0644);
+    // scrittura su file temporaneo e sostituzione: un errore a metà non rovina il catalogo esistente
+    char tmp[1100];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    int fd = sv_open(tmp, SV_O_WRONLY | SV_O_CREAT | SV_O_TRUNC, 0644);
     if (fd < 0) return SV_IO_ERROR;
 
-    ssize_t n = sv_write(fd, c, sizeof(Catalog));
+    uint32_t version = CAT_VERSION, next_page = c->next_page_id;
+    int32_t ndb = c->num_databases, cur = c->current_db;
+    bool ok = write_all(fd, CAT_MAGIC, 8) && write_all(fd, &version, 4) &&
+              write_all(fd, &ndb, 4) && write_all(fd, &cur, 4) && write_all(fd, &next_page, 4);
+    for (int d = 0; ok && d < c->num_databases; d++) {
+        Database* db = &c->databases[d];
+        int32_t n[4] = { db->num_tables, db->num_views, db->num_routines, db->num_triggers };
+        ok = write_all(fd, db->name, sizeof(db->name)) && write_all(fd, n, sizeof(n)) &&
+             write_all(fd, db->tables,   sizeof(TableSchema)   * (size_t)db->num_tables) &&
+             write_all(fd, db->views,    sizeof(ViewSchema)    * (size_t)db->num_views) &&
+             write_all(fd, db->routines, sizeof(RoutineSchema) * (size_t)db->num_routines) &&
+             write_all(fd, db->triggers, sizeof(TriggerSchema) * (size_t)db->num_triggers);
+    }
+    if (ok) ok = sv_fsync(fd) == 0;
     sv_close(fd);
-    return (n == (ssize_t)sizeof(Catalog)) ? SV_OK : SV_IO_ERROR;
+    if (!ok) { remove(tmp); return SV_IO_ERROR; }
+#ifdef _WIN32
+    remove(path);   // su Windows rename non sostituisce un file esistente
+#endif
+    if (rename(tmp, path) != 0) { remove(tmp); return SV_IO_ERROR; }
+    return SV_OK;
 }
 
 void catalog_free(Catalog* c) { free(c); }

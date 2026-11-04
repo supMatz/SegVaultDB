@@ -76,6 +76,23 @@ bool db_init(const char* data_directory) {
     return true;
 }
 
+// ── annullamento ─────────────────────────────────────────────────
+
+static atomic_int g_cancel_requested = 0;
+static atomic_int g_read_running = 0;   // una SELECT è in esecuzione: si può interrompere
+
+void db_request_cancel(void) {
+    atomic_store(&g_cancel_requested, 1);
+    if (atomic_load(&g_read_running)) atomic_store(&g_sv_scan_cancel, 1);
+}
+
+void db_clear_cancel(void) {
+    atomic_store(&g_cancel_requested, 0);
+    atomic_store(&g_sv_scan_cancel, 0);
+}
+
+bool db_cancel_requested(void) { return atomic_load(&g_cancel_requested) != 0; }
+
 QueryResult* db_execute(const char* sql) {
     if (!g_db.initialized) return result_error("DB non inizializzato");
     if (!sql || !sql[0])   return result_error("Query vuota");
@@ -108,6 +125,17 @@ QueryResult* db_execute(const char* sql) {
             result = db_savepoint(stmt->savepoint.name) ? result_ok(0) : result_error("Failed to set savepoint");
         } else if (stmt->type == NODE_ROLLBACK_TO) {
             result = db_rollback_to(stmt->rollback_to.name) ? result_ok(0) : result_error("Failed to rollback to savepoint");
+        } else if (stmt->type == NODE_SELECT) {
+            // sola lettura: interrompibile a metà
+            atomic_store(&g_read_running, 1);
+            if (atomic_load(&g_cancel_requested)) atomic_store(&g_sv_scan_cancel, 1);
+            result = atomic_load(&g_sv_scan_cancel) ? NULL : executor_run(&g_db.exec_ctx, stmt);
+            atomic_store(&g_read_running, 0);
+            if (atomic_load(&g_sv_scan_cancel)) {   // risultato parziale: scartato
+                if (result) db_result_free(result);
+                result = result_error("Query cancelled");
+                atomic_store(&g_sv_scan_cancel, 0);
+            }
         } else {
             result = executor_run(&g_db.exec_ctx, stmt);
         }
@@ -116,6 +144,20 @@ QueryResult* db_execute(const char* sql) {
     }
 
     if (result) result->exec_time_ms = get_time_ms() - t_start;
+
+    // le modifiche allo schema vanno subito su disco: dopo un arresto anomalo le tabelle
+    // create non devono sparire (il catalogo è piccolo, salvarlo costa poco)
+    if (result && result->success && parsed->count > 0) {
+        switch (parsed->statements[0]->type) {
+            case NODE_CREATE_DB: case NODE_CREATE_TABLE: case NODE_CREATE_INDEX: case NODE_CREATE_VIEW:
+            case NODE_DROP_DB: case NODE_DROP_TABLE: case NODE_DROP_VIEW: case NODE_DROP_INDEX:
+            case NODE_ALTER_TABLE: case NODE_TRUNCATE: case NODE_CREATE_TRIGGER: case NODE_DROP_TRIGGER:
+                bp_flush_all(g_db.bp);
+                catalog_save(g_db.catalog, g_db.cat_path);
+                break;
+            default: break;
+        }
+    }
 
     parse_result_free(parsed);
     lexer_free(tokens);
@@ -463,10 +505,16 @@ void db_free_string(char* s) { free(s); }
 
 void db_shutdown(void) {
     if (!g_db.initialized) return;
+    // una transazione lasciata aperta viene annullata (le sue pagine sono già nel buffer)
+    if (g_db.exec_ctx.tx_id) db_rollback();
     bp_flush_all(g_db.bp);
     catalog_save(g_db.catalog, g_db.cat_path);
+    sv_fsync(g_db.db_fd);
     wal_flush(g_db.wal);
     wal_destroy(g_db.wal);
+    // checkpoint: tutte le modifiche sono su disco, il log non serve più.
+    // Al prossimo avvio il recovery lavora solo dopo un arresto anomalo.
+    remove(g_db.log_path);
     bp_destroy(g_db.bp);
     txm_destroy(g_db.txm);
     catalog_free(g_db.catalog);

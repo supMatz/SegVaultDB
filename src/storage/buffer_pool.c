@@ -82,13 +82,24 @@ void bp_unpin(BufferPool* bp, uint32_t page_id, bool dirty) {
 }
 
 int bp_new_page(BufferPool* bp, uint32_t* out_page_id) {
-    uint32_t max_id = 0;
-    for (int i = 0; i < bp->capacity; i++) {
-        if (bp->frames[i].page &&
-            bp->frames[i].page->page_id > max_id)
-            max_id = bp->frames[i].page->page_id;
+    // La nuova pagina va sempre in fondo al file. (In precedenza l'id era "massimo id nel
+    // buffer pool + 1": con pagine espulse o dopo un riavvio poteva coincidere con una pagina
+    // esistente e sovrascriverla.)
+    long end = sv_lseek(bp->db_fd, 0, SEEK_END);
+    uint32_t new_id = end > 0 ? (uint32_t)((end + SV_PAGE_SIZE - 1) / SV_PAGE_SIZE) : 0;
+    if (new_id == 0) {
+        // la pagina 0 è riservata: 0 indica "fine catena" nelle pagine di heap
+        Page* zero = page_create(0);
+        if (!zero) return SV_ERR;
+        page_write(zero, bp->db_fd);
+        page_free(zero);
+        new_id = 1;
     }
-    uint32_t new_id = max_id + 1;
+    // pagine presenti solo in memoria (per sicurezza: bp_new_page le scrive subito su disco)
+    for (int i = 0; i < bp->capacity; i++)
+        if (bp->frames[i].page && bp->frames[i].page->page_id >= new_id)
+            new_id = bp->frames[i].page->page_id + 1;
+    if (new_id > SV_MAX_PAGE_ID) return SV_FULL;
 
     int idx = bp_evict(bp);
     if (idx < 0) return SV_ERR;

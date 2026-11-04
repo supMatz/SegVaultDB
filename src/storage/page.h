@@ -18,6 +18,7 @@ SCOPO: Struttura e operazioni su una pagina disco (4 KB).
 // Flag di stato della pagina
 #define PAGE_FLAG_DIRTY   0x01  // Pagina modificata ma non scritta su disco
 #define PAGE_FLAG_DELETED 0x02  // Pagina marcata per eliminazione
+#define PAGE_FLAG_CHAINED 0x04  // Pagina di heap collegata alla successiva tramite next (vedi page_next)
 
 #pragma pack(push, 1)  // evita padding: la struttura deve essere esattamente PAGE_SIZE byte
 typedef struct {
@@ -35,6 +36,19 @@ typedef struct {
     uint16_t offset;  // Offset della tuple dentro data[]
     uint16_t length;  // Lunghezza della tuple in byte (0 = slot eliminato)
 } SlotEntry;
+
+// ── catena delle pagine di una tabella ───────────────────────────
+// L'id della pagina successiva (0 = fine catena; la pagina 0 non è mai una pagina dati)
+// usa i 16 bit di next_page_id più gli 8 bit alti di flags (i flag usano solo il byte basso):
+// id fino a 2^24 pagine (64 GB) senza cambiare il formato su disco.
+static inline uint32_t page_next(const Page* p) {
+    return (uint32_t)p->next_page_id | ((uint32_t)(p->flags >> 8) << 16);
+}
+static inline void page_set_next(Page* p, uint32_t id) {
+    p->next_page_id = (uint16_t)(id & 0xFFFF);
+    p->flags = (uint16_t)((p->flags & 0x00FF) | (((id >> 16) & 0xFF) << 8));
+}
+#define SV_MAX_PAGE_ID 0xFFFFFFu   // massimo id rappresentabile nella catena
 
 // ── API ──────────────────────────────────────────────────────────
 

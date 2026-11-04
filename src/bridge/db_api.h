@@ -144,6 +144,13 @@ QueryResult* db_execute(const char* sql);
 // esecuzione di più statement separati da ";" in sequenza, ritorna un array di QueryResult, uno per statement
 QueryResult** db_execute_multi(const char* sql, int* out_count);
 
+// ── annullamento (chiamabile da un altro thread mentre db_execute è in corso) ──
+// Le SELECT vengono interrotte subito; gli statement che modificano dati non vengono
+// mai interrotti a metà: l'annullamento vale per gli statement successivi.
+void db_request_cancel(void);
+void db_clear_cancel(void);
+bool db_cancel_requested(void);
+
 // liberazione mem
 void db_result_free(QueryResult* r); // statement singolo / query singola
 void db_result_free_multi(QueryResult** results, int count); // statement multiplo / query multipla

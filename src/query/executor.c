@@ -1034,6 +1034,7 @@ static QueryResult* exec_join(ExecCtx* ctx, ASTNode* n) {
 
     bool* right_matched = join_type == JOIN_RIGHT ? calloc(n2, sizeof(bool)) : NULL;
     for (int i = 0; i < n1; i++) {
+        if (atomic_load(&g_sv_scan_cancel)) break;   // SELECT annullata dall'utente
         bool matched = false;
         for (int j = 0; j < n2; j++) {
             if (!eval_on_cond(on_cond, rows1[i], rows2[j], ts1, ts2)) continue;
