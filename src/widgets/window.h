@@ -30,7 +30,9 @@ SCOPO: Layout principale dell'applicazione SegVault.
 #include "../bridge/db_api.h"
 
 #define TOOLBAR_H         52   // Altezza toolbar in pixel
-#define SIDEBAR_W        264   // Larghezza sidebar in pixel
+#define SIDEBAR_W        264   // Larghezza predefinita della sidebar in pixel
+#define SIDEBAR_MIN_W    170   // la sidebar si restringe fino a qui nelle finestre strette
+#define CENTER_MIN_W     420   // larghezza minima garantita all'area editor/risultati
 #define SIDEBAR_HEADER_H  38   // Intestazione "EXPLORER"
 #define STATUSBAR_H       38   // Intestazione dei risultati (stato ultima query)
 #define FOOTER_H          26   // Barra di stato in basso
@@ -110,6 +112,17 @@ typedef struct {
     Button*      btn_history;
 
     bool         help_open;         // pannello scorciatoie (F1)
+
+    // -- layout adattivo --
+    int          sidebar_w;         // larghezza scelta dall'utente (trascinando il bordo)
+    int          side_w;            // larghezza effettiva (ridotta se la finestra è stretta)
+    bool         sidebar_drag, sidebar_hover;
+    int          compact;           // 0 = toolbar completa, 1 = senza scorciatoie, 2 = solo icone, 3 = minima
+
+    // -- tooltip --
+    int          tip_target;        // elemento sotto il mouse (-1 = nessuno)
+    uint64_t     tip_since;         // da quando il mouse è fermo sull'elemento
+    bool         tip_visible;
 
     // -- selettore temi --
     Rect         theme_btn;         // pillola nella toolbar (calcolata nel disegno)

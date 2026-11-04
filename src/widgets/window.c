@@ -662,7 +662,7 @@ static void layout_bar(AppWindow* app) {
     app->bar_input->base.visible = app->bar_replace_input->base.visible = false;
     if (!bar_visible(app)) { app->bar_rect = (Rect){0, 0, 0, 0}; return; }
 
-    int center_w = app->win_w - SIDEBAR_W;
+    int center_w = app->win_w - app->side_w;
     int bw = SV_MIN(560, center_w - 40);
     bool two_rows = app->bar_mode == BAR_FIND && app->bar_replace;
     int bh = (two_rows ? 2 : 1) * BAR_ROW_H + 12 + (two_rows ? 4 : 0);
@@ -762,6 +762,7 @@ static void bar_open(AppWindow* app, BarMode mode, bool replace) {
 static void bar_close(AppWindow* app) {
     if (!bar_visible(app)) return;
     app->bar_mode = BAR_NONE;
+    app->tip_target = -1;
     textbox_set_search(app->editor, NULL, false, false);
     line_edit_focus(app->bar_input, false);
     line_edit_focus(app->bar_replace_input, false);
@@ -1022,6 +1023,8 @@ static void draw_bar(AppWindow* app) {
 #define THEME_ROW_H 34
 
 // ricarica i colori dei widget che li memorizzano (gli altri leggono il tema a ogni frame)
+static int theme_pill_w(AppWindow* app);
+
 static void refresh_widget_colors(AppWindow* app) {
     Button* btns[] = { app->btn_run, app->btn_run_current, app->btn_commit, app->btn_rollback,
                        app->btn_format, app->btn_refresh, app->btn_history };
@@ -1088,13 +1091,14 @@ static void draw_theme_menu(AppWindow* app) {
 static int draw_theme_button(AppWindow* app, int x_right) {
     PlatformWindow* win = app->win;
     const Theme* t = theme_get(theme_current());
-    int tw = platform_measure_text_ex(win, t->name, -1, TH_FONT_UI, FONT_UI);
-    Rect b = {x_right - (tw + 58), TOOLBAR_H / 2 - 15, tw + 58, 30};
+    int pw = theme_pill_w(app);
+    Rect b = {x_right - pw, TOOLBAR_H / 2 - 15, pw, 30};
     app->theme_btn = b;
     bool hover = rect_has(b, app->mouse_x, app->mouse_y) || app->theme_menu_open;
     ui_round_box(win, b, hover ? TH_ELEVATED_HOVER : TH_ELEVATED, TH_BORDER_STRONG, 15);
     draw_theme_swatch(win, t, b.x + 17, b.y + 15, 7);
-    platform_draw_text_ex(win, t->name, -1, (Point){b.x + 32, ui_text_y(win, b, TH_FONT_UI, FONT_UI)}, TH_TEXT, TH_FONT_UI, FONT_UI);
+    if (app->compact < 2)
+        platform_draw_text_ex(win, t->name, -1, (Point){b.x + 32, ui_text_y(win, b, TH_FONT_UI, FONT_UI)}, TH_TEXT, TH_FONT_UI, FONT_UI);
     ui_icon_chevron(win, b.x + b.w - 15, b.y + 15, 9, app->theme_menu_open ? CHEVRON_UP : CHEVRON_DOWN, TH_TEXT_MUTED);
     return b.x;
 }
@@ -1220,28 +1224,148 @@ static void draw_help(AppWindow* app) {
 
 // ── layout ───────────────────────────────────────────────────────
 
+// ── toolbar adattiva ─────────────────────────────────────────────
+
+// testo dei pulsanti per livello di compattezza: completo, senza scorciatoia, solo icona
+typedef struct { const char* label; const char* hint; bool has_icon; } ToolbarText;
+
+static const ToolbarText TOOLBAR_TEXT[] = {
+    { "Run", "F5", true }, { "Run statement", "Ctrl+Enter", true }, { "Commit", NULL, true },
+    { "Rollback", NULL, true }, { "Format", "Ctrl+Shift+F", false },
+};
+
+static void toolbar_buttons(AppWindow* app, Button** out) {
+    out[0] = app->btn_run; out[1] = app->btn_run_current; out[2] = app->btn_commit;
+    out[3] = app->btn_rollback; out[4] = app->btn_format;
+}
+
+static void apply_toolbar_level(AppWindow* app, int level) {
+    Button* b[5];
+    toolbar_buttons(app, b);
+    for (int i = 0; i < 5; i++) {
+        const ToolbarText* t = &TOOLBAR_TEXT[i];
+        const char* label = t->label;
+        if (level >= 2 && t->has_icon) label = "";
+        if (level >= 3 && !t->has_icon) label = "Fmt";
+        button_set_label(b[i], label);
+        button_set_hint(b[i], level == 0 ? t->hint : NULL);
+    }
+}
+
+// larghezza del testo nella pillola del database
+static int db_pill_text_w(AppWindow* app) {
+    const char* db = app->lbl_db_name->text;
+    bool has_db = strcmp(db, "no database") != 0;
+    int cap = app->compact >= 3 ? 80 : app->compact >= 1 ? 140 : 220;
+    return SV_MIN(platform_measure_text_ex(app->win, db, -1, TH_FONT_UI, has_db ? FONT_UI_BOLD : FONT_UI), cap);
+}
+
+static int theme_pill_w(AppWindow* app) {
+    if (app->compact >= 2) return 44;   // solo campione + freccia
+    const Theme* t = theme_get(theme_current());
+    return platform_measure_text_ex(app->win, t->name, -1, TH_FONT_UI, FONT_UI) + 58;
+}
+
+// spazio occupato a destra (tema, transazione, database) con il livello corrente
+static int toolbar_right_w(AppWindow* app) {
+    int w = 16 + db_pill_text_w(app) + 46 + 8 + theme_pill_w(app) + 12;
+    if (app->in_transaction) w += (app->compact >= 2 ? 22 : 104) + 8;
+    return w;
+}
+
+static void layout_toolbar(AppWindow* app) {
+    int bh = 32, by = (TOOLBAR_H - bh) / 2;
+    Button* b[5];
+    toolbar_buttons(app, b);
+    for (int level = 0; level <= 3; level++) {
+        app->compact = level;
+        apply_toolbar_level(app, level);
+        int x = app->side_w + 14;
+        for (int i = 0; i < 5; i++) {
+            int w = button_preferred_width(b[i], app->win);
+            if (level >= 2 && TOOLBAR_TEXT[i].has_icon) w = bh + 2;   // pulsante quadrato con sola icona
+            b[i]->base.bounds = (Rect){x, by, w, bh};
+            x += w + ((i == 1 || i == 3) ? 22 : 8); // spazio extra tra i gruppi
+        }
+        if (x + toolbar_right_w(app) <= app->win_w) break;
+    }
+}
+
+// ── tooltip ──────────────────────────────────────────────────────
+
+#define TIP_DELAY_MS 450
+enum { TIP_RUN, TIP_RUN_CURRENT, TIP_COMMIT, TIP_ROLLBACK, TIP_FORMAT, TIP_REFRESH, TIP_THEME, TIP_COUNT };
+
+static const char* TIP_TEXT[TIP_COUNT] = {
+    "Run script or selection  \xc2\xb7  F5", "Run statement under cursor  \xc2\xb7  Ctrl+Enter",
+    "Commit transaction", "Rollback transaction", "Format SQL  \xc2\xb7  Ctrl+Shift+F",
+    "Refresh explorer", "Color theme  \xc2\xb7  Ctrl+Shift+T",
+};
+
+static Rect tip_rect_of(AppWindow* app, int t) {
+    switch (t) {
+        case TIP_RUN:         return app->btn_run->base.bounds;
+        case TIP_RUN_CURRENT: return app->btn_run_current->base.bounds;
+        case TIP_COMMIT:      return app->btn_commit->base.bounds;
+        case TIP_ROLLBACK:    return app->btn_rollback->base.bounds;
+        case TIP_FORMAT:      return app->btn_format->base.bounds;
+        case TIP_REFRESH:     return app->btn_refresh->base.bounds;
+        default:              return app->theme_btn;
+    }
+}
+
+// i pulsanti con testo e scorciatoia visibili non hanno bisogno del tooltip
+static bool tip_needed(AppWindow* app, int t) {
+    if (t <= TIP_FORMAT) return app->compact >= 1;
+    return true;
+}
+
+static void tip_update(AppWindow* app, int mx, int my) {
+    int target = -1;
+    if (!app->theme_menu_open && !app->help_open)
+        for (int t = 0; t < TIP_COUNT && target < 0; t++)
+            if (tip_needed(app, t) && rect_has(tip_rect_of(app, t), mx, my)) target = t;
+    if (target != app->tip_target) {
+        app->tip_target  = target;
+        app->tip_since   = platform_time_ms();
+        app->tip_visible = false;
+    }
+}
+
+static void draw_tooltip(AppWindow* app) {
+    if (!app->tip_visible || app->tip_target < 0) return;
+    PlatformWindow* win = app->win;
+    const char* text = TIP_TEXT[app->tip_target];
+    Rect a = tip_rect_of(app, app->tip_target);
+    int tw = platform_measure_text_ex(win, text, -1, TH_FONT_SMALL + 1, FONT_UI);
+    Rect r = {a.x + a.w / 2 - (tw + 20) / 2, a.y + a.h + 6, tw + 20, 26};
+    r.x = SV_CLAMP(r.x, 6, app->win_w - r.w - 6);
+    platform_fill_rect_rounded(win, (Rect){r.x - 1, r.y + 2, r.w + 2, r.h + 2}, ui_alpha(TH_BG, 150), 7);
+    ui_round_box(win, r, TH_ELEVATED, TH_BORDER_STRONG, 6);
+    platform_draw_text_ex(win, text, -1, (Point){r.x + 10, ui_text_y(win, r, TH_FONT_SMALL + 1, FONT_UI)},
+                          TH_TEXT, TH_FONT_SMALL + 1, FONT_UI);
+}
+
 // ricalcola la posizione e dimensione di tutti i widget in base alle dimensioni correnti della finestra
 static void layout_widgets(AppWindow* app) {
     int W = app->win_w;
     int H = app->win_h;
 
+    // sidebar: larghezza scelta dall'utente, ridotta se la finestra è stretta
+    if (app->sidebar_w <= 0) app->sidebar_w = SIDEBAR_W;
+    app->side_w = SV_CLAMP(app->sidebar_w, SIDEBAR_MIN_W, SV_MAX(SIDEBAR_MIN_W, W - CENTER_MIN_W));
+
     // toolbar
     int bh = 32, by = (TOOLBAR_H - bh) / 2;
-    int x = SIDEBAR_W + 14;
-    Button* btns[] = { app->btn_run, app->btn_run_current, app->btn_commit, app->btn_rollback, app->btn_format };
-    for (int i = 0; i < 5; i++) {
-        int w = button_preferred_width(btns[i], app->win);
-        btns[i]->base.bounds = (Rect){x, by, w, bh};
-        x += w + ((i == 1 || i == 3) ? 22 : 8); // spazio extra tra i gruppi
-    }
+    layout_toolbar(app);
     app->lbl_db_name->base.bounds = (Rect){W - 210, by, 196, bh};
 
     // sidebar
     int side_top = TOOLBAR_H + SIDEBAR_HEADER_H;
     int side_h   = H - side_top - FOOTER_H;
-    app->tree->base.bounds        = (Rect){0, side_top, SIDEBAR_W - 1, side_h};
-    app->tree_scroll->base.bounds = (Rect){SIDEBAR_W - 1 - SCROLLBAR_W, side_top, SCROLLBAR_W, side_h};
-    app->btn_refresh->base.bounds = (Rect){SIDEBAR_W - 38, TOOLBAR_H + 5, 28, 28};
+    app->tree->base.bounds        = (Rect){0, side_top, app->side_w - 1, side_h};
+    app->tree_scroll->base.bounds = (Rect){app->side_w - 1 - SCROLLBAR_W, side_top, SCROLLBAR_W, side_h};
+    app->btn_refresh->base.bounds = (Rect){app->side_w - 38, TOOLBAR_H + 5, 28, 28};
 
     // area centrale: divisa dallo splitter
     int min_y = TOOLBAR_H + 90;
@@ -1249,8 +1373,8 @@ static void layout_widgets(AppWindow* app) {
     if (max_y < min_y) max_y = min_y;
     app->splitter_y = SV_CLAMP(app->splitter_y, min_y, max_y);
 
-    int center_x  = SIDEBAR_W;
-    int center_w  = W - SIDEBAR_W;
+    int center_x  = app->side_w;
+    int center_w  = W - app->side_w;
     int editor_h  = app->splitter_y - TOOLBAR_H;
     int status_y  = app->splitter_y + SPLITTER_H;
     int results_y = status_y + STATUSBAR_H;
@@ -1367,6 +1491,7 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
 
     // -- status bar --
     app->lbl_status = label_create(0, 0, 0, 0, "", TH_FONT_UI, TH_TEXT_MUTED);
+    app->lbl_status->clip = true;   // testo lungo troncato con "…"
     set_status(app, STATUS_IDLE, "Ready", "");
 
     // -- risultati --
@@ -1412,6 +1537,8 @@ static void update_cursor_shape(AppWindow* app, int mx, int my) {
             (app->bar_replace_input->base.visible && widget_contains_point((Widget*)app->bar_replace_input, mx, my)))
             k = CURSOR_IBEAM;
         for (int i = 0; i < BAR_BTN_COUNT; i++) if (rect_has(app->bar_btn[i], mx, my)) k = CURSOR_HAND;
+    } else if (app->sidebar_drag || app->sidebar_hover) {
+        k = CURSOR_RESIZE_H;
     } else if (app->splitter_drag || app->splitter_hover) {
         k = CURSOR_RESIZE_V;
     } else if (table_view_hit_resize(app->results, mx, my)) {
@@ -1449,7 +1576,15 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         if (evt->type != EVT_MOUSE_MOVE) return;
     }
 
-    if (evt->type == EVT_MOUSE_MOVE) { app->mouse_x = evt->mouse_x; app->mouse_y = evt->mouse_y; }
+    if (evt->type == EVT_MOUSE_MOVE) {
+        app->mouse_x = evt->mouse_x;
+        app->mouse_y = evt->mouse_y;
+        tip_update(app, evt->mouse_x, evt->mouse_y);
+    }
+    if (evt->type == EVT_MOUSE_DOWN || evt->type == EVT_KEY_DOWN) {   // qualsiasi azione nasconde il tooltip
+        app->tip_visible = false;
+        app->tip_since = platform_time_ms() + 100000;
+    }
     if (theme_handle_event(app, evt)) {
         if (evt->type == EVT_MOUSE_MOVE || evt->type == EVT_MOUSE_DOWN)
             platform_set_cursor(app->win, rect_has(app->theme_menu, evt->mouse_x, evt->mouse_y) ||
@@ -1523,8 +1658,28 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         }
     }
 
+    // -- bordo della sidebar (trascinabile) --
+    if (evt->type == EVT_MOUSE_MOVE) {
+        app->sidebar_hover = abs(evt->mouse_x - app->side_w) <= 3 &&
+                             evt->mouse_y > TOOLBAR_H && evt->mouse_y < app->win_h - FOOTER_H;
+        if (app->sidebar_drag) {
+            app->sidebar_w = SV_CLAMP(evt->mouse_x, SIDEBAR_MIN_W, SV_MAX(SIDEBAR_MIN_W, app->win_w - CENTER_MIN_W));
+            layout_widgets(app);
+            platform_set_cursor(app->win, CURSOR_RESIZE_H);
+            return;
+        }
+    }
+    if (evt->type == EVT_MOUSE_DOWN && evt->mouse_button == SV_MOUSE_LEFT && app->sidebar_hover) {
+        app->sidebar_drag = true;
+        return;
+    }
+    if (evt->type == EVT_MOUSE_UP && app->sidebar_drag) {
+        app->sidebar_drag = false;
+        return;
+    }
+
     // -- splitter --
-    int center_x = SIDEBAR_W;
+    int center_x = app->side_w;
     if (evt->type == EVT_MOUSE_MOVE) {
         app->mouse_x = evt->mouse_x;
         app->mouse_y = evt->mouse_y;
@@ -1575,7 +1730,12 @@ bool app_window_tick(AppWindow* app, uint64_t now_ms) {
     bool a = textbox_tick(app->editor, now_ms);
     bool b = line_edit_tick(app->bar_input, now_ms);
     bool c = line_edit_tick(app->bar_replace_input, now_ms);
-    return a || b || c;
+    bool d = false;
+    if (app->tip_target >= 0 && !app->tip_visible && now_ms >= app->tip_since + TIP_DELAY_MS) {
+        app->tip_visible = true;
+        d = true;
+    }
+    return a || b || c || d;
 }
 
 // ── disegno ──────────────────────────────────────────────────────
@@ -1615,7 +1775,7 @@ static void draw_toolbar(AppWindow* app) {
     const char* db = app->lbl_db_name->text;
     bool has_db = strcmp(db, "no database") != 0;
     int tw = platform_measure_text_ex(win, db, -1, TH_FONT_UI, has_db ? FONT_UI_BOLD : FONT_UI);
-    tw = SV_MIN(tw, 220);
+    tw = db_pill_text_w(app);
     Rect pill = {W - 16 - (tw + 46), TOOLBAR_H / 2 - 15, tw + 46, 30};
     ui_round_box(win, pill, TH_ELEVATED, TH_BORDER_STRONG, 15);
     ui_icon_database(win, pill.x + 18, pill.y + 15, 14, has_db ? TH_ICON_DB : TH_TEXT_FAINT);
@@ -1625,20 +1785,22 @@ static void draw_toolbar(AppWindow* app) {
     int left = pill.x;
     if (app->in_transaction) {
         const char* t = "TRANSACTION";
-        int w = platform_measure_text_ex(win, t, -1, TH_FONT_SMALL, FONT_UI_BOLD) + 26;
+        bool small = app->compact >= 2;   // solo il pallino
+        int w = small ? 22 : platform_measure_text_ex(win, t, -1, TH_FONT_SMALL, FONT_UI_BOLD) + 26;
         Rect b = {pill.x - w - 8, TOOLBAR_H / 2 - 11, w, 22};
         left = b.x;
         platform_fill_rect_rounded(win, b, TH_WARNING_SOFT, 11);
         ui_circle(win, b.x + 11, b.y + 11, 3, TH_WARNING);
-        platform_draw_text_ex(win, t, -1, (Point){b.x + 19, ui_text_y(win, b, TH_FONT_SMALL, FONT_UI_BOLD)},
-                              TH_WARNING, TH_FONT_SMALL, FONT_UI_BOLD);
+        if (!small)
+            platform_draw_text_ex(win, t, -1, (Point){b.x + 19, ui_text_y(win, b, TH_FONT_SMALL, FONT_UI_BOLD)},
+                                  TH_WARNING, TH_FONT_SMALL, FONT_UI_BOLD);
     }
     draw_theme_button(app, left - 8);
 }
 
 static void draw_sidebar(AppWindow* app) {
     PlatformWindow* win = app->win;
-    Rect hdr = {0, TOOLBAR_H, SIDEBAR_W - 1, SIDEBAR_HEADER_H};
+    Rect hdr = {0, TOOLBAR_H, app->side_w - 1, SIDEBAR_HEADER_H};
     platform_fill_rect(win, hdr, TH_SURFACE);
     platform_draw_text_ex(win, "EXPLORER", -1,
                           (Point){18, ui_text_y(win, hdr, TH_FONT_SMALL, FONT_UI_BOLD)},
@@ -1647,13 +1809,15 @@ static void draw_sidebar(AppWindow* app) {
     widget_draw((Widget*)app->tree, win);
     widget_draw((Widget*)app->tree_scroll, win);
 
-    // bordo destro della sidebar
-    platform_fill_rect(win, (Rect){SIDEBAR_W - 1, TOOLBAR_H, 1, app->win_h - TOOLBAR_H - FOOTER_H}, TH_BORDER);
+    // bordo destro della sidebar (evidenziato quando si può trascinare)
+    bool active = app->sidebar_drag || app->sidebar_hover;
+    platform_fill_rect(win, (Rect){app->side_w - (active ? 2 : 1), TOOLBAR_H, active ? 2 : 1,
+                                   app->win_h - TOOLBAR_H - FOOTER_H}, active ? TH_ACCENT : TH_BORDER);
 }
 
 static void draw_splitter_and_status(AppWindow* app) {
     PlatformWindow* win = app->win;
-    int cx = SIDEBAR_W, cw = app->win_w - SIDEBAR_W;
+    int cx = app->side_w, cw = app->win_w - app->side_w;
     int sy = app->splitter_y;
 
     // splitter con "maniglia"
@@ -1677,20 +1841,28 @@ static void draw_splitter_and_status(AppWindow* app) {
     if (app->status_kind == STATUS_ERROR) dot = TH_ERROR;
     if (app->status_kind == STATUS_INFO)  dot = TH_INFO;
     ui_circle(win, cx + 100, st.y + st.h / 2, 4, dot);
-    widget_draw((Widget*)app->lbl_status, win);
 
     widget_draw((Widget*)app->btn_history, win);
     if (app->showing_history) {
         Rect hb = app->btn_history->base.bounds;
         platform_fill_rect(win, (Rect){hb.x + 8, hb.y + hb.h, hb.w - 16, 2}, TH_ACCENT);
     }
+
+    // il messaggio ha la precedenza sui dettagli (righe, tempo): se manca spazio i dettagli spariscono
+    Rect* lb = &app->lbl_status->base.bounds;
+    int right = app->btn_history->base.bounds.x - 14;
     if (app->status_meta[0]) {
         int mw = platform_measure_text_ex(win, app->status_meta, -1, TH_FONT_SMALL + 1, FONT_MONO);
-        int mx = app->btn_history->base.bounds.x - 14 - mw;
-        platform_draw_text_ex(win, app->status_meta, -1,
-                              (Point){mx, ui_text_y(win, st, TH_FONT_SMALL + 1, FONT_MONO)},
-                              TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_MONO);
+        int msg_w = platform_measure_text_ex(win, app->lbl_status->text, -1, TH_FONT_UI, FONT_UI);
+        if (right - mw - 16 - lb->x >= SV_MIN(msg_w, 160)) {
+            platform_draw_text_ex(win, app->status_meta, -1,
+                                  (Point){right - mw, ui_text_y(win, st, TH_FONT_SMALL + 1, FONT_MONO)},
+                                  TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_MONO);
+            right -= mw + 16;
+        }
     }
+    lb->w = SV_MAX(0, right - lb->x);
+    widget_draw((Widget*)app->lbl_status, win);
 }
 
 static void draw_footer(AppWindow* app) {
@@ -1702,48 +1874,63 @@ static void draw_footer(AppWindow* app) {
 
     int fs = TH_FONT_SMALL + 1;
     int ty = ui_text_y(win, f, fs, FONT_UI);
-    int x = 16;
-
-    ui_circle(win, x + 3, f.y + FOOTER_H / 2, 3, TH_SUCCESS);
-    x += 12;
+    int cy = f.y + FOOTER_H / 2;
     char buf[256];
-    snprintf(buf, sizeof(buf), "%s engine %s", SV_NAME, SV_VERSION_STR);
-    x += platform_draw_text_ex(win, buf, -1, (Point){x, ty}, TH_TEXT_DIM, fs, FONT_UI) + 18;
 
-    ui_icon_database(win, x + 6, f.y + FOOTER_H / 2, 11, TH_TEXT_DIM);
-    x += 16;
-    x += platform_draw_text_ex(win, app->lbl_db_name->text, -1, (Point){x, ty}, TH_TEXT_MUTED, fs, FONT_UI) + 18;
-
-    // file corrente (● = modifiche non salvate)
-    const char* fname = app->file_path[0] ? base_name(app->file_path) : "untitled.sql";
-    x += platform_draw_text_ex(win, fname, -1, (Point){x, ty}, app->file_path[0] ? TH_TEXT_MUTED : TH_TEXT_DIM, fs, FONT_UI);
-    if (app->modified) {
-        ui_circle(win, x + 8, f.y + FOOTER_H / 2, 3, TH_ACCENT_TEXT);
-        x += 14;
-    }
-    x += 18;
-
-    if (app->in_transaction) {
-        ui_circle(win, x + 3, f.y + FOOTER_H / 2, 3, TH_WARNING);
-        x += 12;
-        platform_draw_text_ex(win, "Transaction open", -1, (Point){x, ty}, TH_WARNING, fs, FONT_UI);
-    }
-
-    // destra: posizione del cursore
+    // -- destra: la variante più ricca che lascia almeno ~45% della larghezza alla parte sinistra --
     TextBox* tb = app->editor;
     int sa, se;
     textbox_get_selection_range(tb, &sa, &se);
-    if (se > sa)
-        snprintf(buf, sizeof(buf), "Ln %d, Col %d (%d selected)    %d lines    UTF-8    SQL",
-                 tb->cursor_line + 1, tb->cursor_col + 1, se - sa, tb->num_lines);
-    else
-        snprintf(buf, sizeof(buf), "Ln %d, Col %d    %d lines    UTF-8    SQL",
-                 tb->cursor_line + 1, tb->cursor_col + 1, tb->num_lines);
-    const char* help = "F1 Shortcuts";
+    char sel[48] = "";
+    if (se > sa) snprintf(sel, sizeof(sel), " (%d selected)", se - sa);
+    char variants[3][160];
+    snprintf(variants[0], sizeof(variants[0]), "Ln %d, Col %d%s    %d lines    UTF-8    SQL",
+             tb->cursor_line + 1, tb->cursor_col + 1, sel, tb->num_lines);
+    snprintf(variants[1], sizeof(variants[1]), "Ln %d, Col %d%s", tb->cursor_line + 1, tb->cursor_col + 1, sel);
+    snprintf(variants[2], sizeof(variants[2]), "%d:%d", tb->cursor_line + 1, tb->cursor_col + 1);
+    const char* help = W >= 700 ? "F1 Shortcuts" : "F1";
     int hw = platform_measure_text_ex(win, help, -1, fs, FONT_UI_BOLD);
+    int budget = W - 32 - hw - 22 - W * 45 / 100;
+    int v = 0;
+    while (v < 2 && platform_measure_text_ex(win, variants[v], -1, fs, FONT_UI) > budget) v++;
+    int rw = platform_measure_text_ex(win, variants[v], -1, fs, FONT_UI);
     platform_draw_text_ex(win, help, -1, (Point){W - 16 - hw, ty}, TH_ACCENT_TEXT, fs, FONT_UI_BOLD);
-    int w = platform_measure_text_ex(win, buf, -1, fs, FONT_UI);
-    platform_draw_text_ex(win, buf, -1, (Point){W - 16 - hw - 22 - w, ty}, TH_TEXT_DIM, fs, FONT_UI);
+    int right_x = W - 16 - hw - 22 - rw;
+    platform_draw_text_ex(win, variants[v], -1, (Point){right_x, ty}, TH_TEXT_DIM, fs, FONT_UI);
+    int limit = right_x - 18;   // la parte sinistra non deve superare questo punto
+
+    // -- sinistra, in ordine di importanza: database, file, transazione; il nome del motore solo se c'è posto --
+    const char* db = app->lbl_db_name->text;
+    const char* fname = app->file_path[0] ? base_name(app->file_path) : "untitled.sql";
+    snprintf(buf, sizeof(buf), "%s engine %s", SV_NAME, SV_VERSION_STR);
+    int engine_w = 12 + platform_measure_text_ex(win, buf, -1, fs, FONT_UI) + 18;
+    int db_w   = 16 + platform_measure_text_ex(win, db, -1, fs, FONT_UI) + 18;
+    int file_w = platform_measure_text_ex(win, fname, -1, fs, FONT_UI) + (app->modified ? 14 : 0) + 18;
+    int tx_w   = app->in_transaction ? 12 + platform_measure_text_ex(win, "Transaction open", -1, fs, FONT_UI) : 0;
+    bool show_engine = 16 + engine_w + db_w + file_w + tx_w <= limit;
+
+    int x = 16;
+    if (show_engine) {
+        ui_circle(win, x + 3, cy, 3, TH_SUCCESS);
+        x += 12;
+        x += platform_draw_text_ex(win, buf, -1, (Point){x, ty}, TH_TEXT_DIM, fs, FONT_UI) + 18;
+    }
+    ui_icon_database(win, x + 6, cy, 11, TH_TEXT_DIM);
+    x += 16;
+    x += ui_text_clipped(win, db, x, ty, SV_MAX(0, SV_MIN(160, limit - x)), TH_TEXT_MUTED, fs, FONT_UI) + 18;
+
+    // file corrente (● = modifiche non salvate)
+    int room = limit - x - (app->modified ? 14 : 0) - (app->in_transaction ? 30 : 0);
+    if (room > 30) {
+        x += ui_text_clipped(win, fname, x, ty, room, app->file_path[0] ? TH_TEXT_MUTED : TH_TEXT_DIM, fs, FONT_UI);
+        if (app->modified) { ui_circle(win, x + 8, cy, 3, TH_ACCENT_TEXT); x += 14; }
+        x += 18;
+    }
+    if (app->in_transaction && x + 12 < limit) {
+        ui_circle(win, x + 3, cy, 3, TH_WARNING);
+        x += 12;
+        ui_text_clipped(win, "Transaction open", x, ty, SV_MAX(0, limit - x), TH_WARNING, fs, FONT_UI);
+    }
 }
 
 void app_window_draw(AppWindow* app) {
@@ -1751,6 +1938,7 @@ void app_window_draw(AppWindow* app) {
     PlatformWindow* win = app->win;
 
     sync_scrollbars(app);
+    layout_toolbar(app);   // nome del DB, transazione e tema cambiano lo spazio disponibile
 
     // sfondo generale
     platform_clear(win, TH_BG);
@@ -1768,6 +1956,7 @@ void app_window_draw(AppWindow* app) {
     draw_footer(app);
     textbox_draw_overlay(app->editor, win, (Rect){0, 0, app->win_w, app->win_h});
     draw_theme_menu(app);
+    draw_tooltip(app);
     draw_help(app);
 
     platform_present(win);
@@ -1965,6 +2154,7 @@ void app_window_set_data_dir(AppWindow* app, const char* dir) {
             else if (!strncmp(line, "cursor=", 7))   cursor = atoi(line + 7);
             else if (!strncmp(line, "modified=", 9)) modified = atoi(line + 9);
             else if (!strncmp(line, "font=", 5))     tb->font_size = SV_CLAMP(atoi(line + 5), 10, 28);
+            else if (!strncmp(line, "sidebar=", 8)) { app->sidebar_w = atoi(line + 8); layout_widgets(app); }
             else if (!strncmp(line, "theme=", 6)) {
                 int ti = theme_find(line + 6);
                 if (ti >= 0) set_theme(app, ti, false);
@@ -1993,8 +2183,8 @@ void app_window_save_session(AppWindow* app) {
     join_path(path, sizeof(path), app->data_dir, SESSION_META);
     FILE* f = fopen(path, "wb");
     if (!f) return;
-    fprintf(f, "file=%s\ncursor=%d\nmodified=%d\nfont=%d\ntheme=%s\n",
+    fprintf(f, "file=%s\ncursor=%d\nmodified=%d\nfont=%d\ntheme=%s\nsidebar=%d\n",
             app->file_path, app->editor->cursor_pos, app->modified ? 1 : 0, app->editor->font_size,
-            theme_get(theme_current())->name);
+            theme_get(theme_current())->name, app->sidebar_w);
     fclose(f);
 }
