@@ -12,6 +12,11 @@ SCOPO: Entry point di SegVault.
 #include "widgets/window.h"
 #include "bridge/db_api.h"
 #include <stdio.h>
+#include <signal.h>
+
+// Ctrl+C / SIGTERM: chiusura ordinata (salva sessione, flush WAL) invece di terminare di colpo
+static volatile sig_atomic_t g_quit_requested = 0;
+static void on_quit_signal(int sig) { (void)sig; g_quit_requested = 1; }
 
 #ifdef _WIN32
     #include <windows.h> // per Sleep
@@ -81,17 +86,22 @@ int main(int argc, char** argv) {
         return 1;
     }
     app_window_resize(app, INITIAL_W, INITIAL_H);
+    app_window_set_data_dir(app, data_dir);   // ripristina l'ultima sessione e la cronologia
 
     printf("[SegVault] Started correctly. Window opened.\n");
 
     // loop principale //
     // ridisegna solo quando serve (eventi o blink del cursore) e attende
     // gli eventi senza consumare CPU a vuoto
+    signal(SIGINT, on_quit_signal);
+    signal(SIGTERM, on_quit_signal);
+
     sEvent evt;
     int running = 1;
     bool dirty = true;
 
     while (running) {
+        if (g_quit_requested) break;
         while (platform_poll_event(win, &evt)) {
             if (evt.type == EVT_QUIT) { running = 0; break; }
             app_window_handle_event(app, &evt);
@@ -111,6 +121,7 @@ int main(int argc, char** argv) {
     printf("[SegVault] Closing...\n");
 
     // shutdown in ordine inverso all'inizializzazione //
+    app_window_save_session(app);
     app_window_destroy(app);
     platform_window_destroy(win);
     platform_shutdown();

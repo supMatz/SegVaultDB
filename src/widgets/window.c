@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
+#include <errno.h>
+#include <time.h>
 
 #define MAX_STATEMENTS 512
 
@@ -91,8 +94,305 @@ static void show_result(AppWindow* app, QueryResult* r) {
     // il vecchio risultato si libera solo dopo aver aggiornato la griglia
     QueryResult* old = app->last_result;
     app->last_result = r;
+    app->showing_history = false;
     table_view_set_result(app->results, r);
     if (old && old != r) db_result_free(old);
+}
+
+// ── file ─────────────────────────────────────────────────────────
+
+// legge un file di testo (max SV_MAX_SQL_LEN - 1 byte); malloc'd o NULL
+static char* read_text_file(const char* path, bool* truncated) {
+    if (truncated) *truncated = false;
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    size_t cap = SV_MAX_SQL_LEN;
+    char* buf = malloc(cap);
+    if (!buf) { fclose(f); return NULL; }
+    size_t n = fread(buf, 1, cap - 1, f);
+    if (truncated && n == cap - 1 && fgetc(f) != EOF) *truncated = true;
+    fclose(f);
+    buf[n] = '\0';
+    // salta il BOM UTF-8
+    if (n >= 3 && (unsigned char)buf[0] == 0xEF && (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF)
+        memmove(buf, buf + 3, n - 2);
+    return buf;
+}
+
+static bool write_text_file(const char* path, const char* text) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    size_t n = strlen(text);
+    bool ok = fwrite(text, 1, n, f) == n;
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+
+// espande "~/" e toglie gli spazi ai bordi
+static void expand_path(const char* in, char* out, size_t n) {
+    while (*in == ' ') in++;
+    const char* home = getenv("HOME");
+#ifdef _WIN32
+    if (!home) home = getenv("USERPROFILE");
+#endif
+    if (in[0] == '~' && (in[1] == '/' || in[1] == '\\' || in[1] == '\0') && home)
+        snprintf(out, n, "%s%s", home, in + 1);
+    else
+        snprintf(out, n, "%s", in);
+    size_t l = strlen(out);
+    while (l > 0 && out[l - 1] == ' ') out[--l] = '\0';
+}
+
+static const char* base_name(const char* p) {
+    const char* b = p;
+    for (const char* s = p; *s; s++) if (*s == '/' || *s == '\\') b = s + 1;
+    return b;
+}
+
+static void join_path(char* out, size_t n, const char* dir, const char* name) {
+    size_t l = strlen(dir);
+    bool sep = l > 0 && (dir[l - 1] == '/' || dir[l - 1] == '\\');
+    snprintf(out, n, "%s%s%s", dir, (sep || l == 0) ? "" : "/", name);
+}
+
+static void now_str(char* buf, size_t n) {
+    time_t t = time(NULL);
+    struct tm* tm = localtime(&t);
+    if (tm) strftime(buf, n, "%Y-%m-%d %H:%M:%S", tm);
+    else snprintf(buf, n, "-");
+}
+
+// sostituisce il testo dell'editor (annullabile con Ctrl+Z) e porta il cursore in cima
+static void editor_load_text(AppWindow* app, const char* text) {
+    TextBox* tb = app->editor;
+    textbox_replace_text(tb, 0, tb->text_len, text, false);
+    tb->cursor_pos = 0;
+    tb->sel_anchor = -1;
+    tb->cursor_line = tb->cursor_col = tb->pref_col = 0;
+    tb->scroll_x = tb->scroll_y = 0;
+    textbox_set_error_line(tb, -1);
+    app->modified = false;
+}
+
+static bool save_to(AppWindow* app, const char* path) {
+    char msg[1200];
+    if (!write_text_file(path, textbox_get_text(app->editor))) {
+        snprintf(msg, sizeof(msg), "Cannot save %s: %s", path, strerror(errno));
+        set_status(app, STATUS_ERROR, msg, "");
+        return false;
+    }
+    if (path != app->file_path) snprintf(app->file_path, sizeof(app->file_path), "%s", path);
+    app->modified = false;
+    snprintf(msg, sizeof(msg), "Saved %s", path);
+    set_status(app, STATUS_OK, msg, "");
+    return true;
+}
+
+static bool open_from(AppWindow* app, const char* path) {
+    char msg[1200];
+    bool trunc = false;
+    char* text = read_text_file(path, &trunc);
+    if (!text) {
+        snprintf(msg, sizeof(msg), "Cannot open %s: %s", path, strerror(errno));
+        set_status(app, STATUS_ERROR, msg, "");
+        return false;
+    }
+    editor_load_text(app, text);
+    free(text);
+    snprintf(app->file_path, sizeof(app->file_path), "%s", path);
+    snprintf(msg, sizeof(msg), trunc ? "Opened %s (truncated to 64 KB)" : "Opened %s", path);
+    set_status(app, trunc ? STATUS_INFO : STATUS_OK, msg, "Ctrl+Z restores the previous text");
+    return true;
+}
+
+static void cmd_new(AppWindow* app) {
+    editor_load_text(app, "");
+    app->file_path[0] = '\0';
+    set_status(app, STATUS_INFO, "New script", "Ctrl+Z restores the previous text");
+    textbox_focus(app->editor, true);
+}
+
+// ── cronologia delle query ───────────────────────────────────────
+
+#define HISTORY_FILE  "history.sql"
+#define HISTORY_MARK  "-- @run "
+
+static void history_push(AppWindow* app, char* sql, const char* when, bool ok, int rows, double ms) {
+    if (app->history_count == HISTORY_MAX) {
+        free(app->history[0].sql);
+        memmove(app->history, app->history + 1, sizeof(HistoryEntry) * (HISTORY_MAX - 1));
+        app->history_count--;
+    }
+    HistoryEntry* e = &app->history[app->history_count++];
+    e->sql = sql;
+    snprintf(e->when, sizeof(e->when), "%s", when);
+    e->ok = ok;
+    e->rows = rows;
+    e->ms = ms;
+}
+
+static void history_add(AppWindow* app, const char* sql, bool ok, int rows, double ms) {
+    // testo senza spazi ai bordi
+    while (*sql && isspace((unsigned char)*sql)) sql++;
+    size_t n = strlen(sql);
+    while (n > 0 && isspace((unsigned char)sql[n - 1])) n--;
+    if (n == 0) return;
+    char* copy = malloc(n + 1);
+    if (!copy) return;
+    memcpy(copy, sql, n);
+    copy[n] = '\0';
+    char when[20];
+    now_str(when, sizeof(when));
+    history_push(app, copy, when, ok, rows, ms);
+
+    if (!app->data_dir[0]) return;
+    char path[1100];
+    join_path(path, sizeof(path), app->data_dir, HISTORY_FILE);
+    FILE* f = fopen(path, "ab");
+    if (!f) return;
+    fprintf(f, HISTORY_MARK "%s | %s | %d | %.2f\n%s\n", when, ok ? "ok" : "error", rows, ms, copy);
+    fclose(f);
+}
+
+static void history_load(AppWindow* app) {
+    char path[1100];
+    join_path(path, sizeof(path), app->data_dir, HISTORY_FILE);
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    // legge solo la coda del file: bastano le ultime HISTORY_MAX voci
+    long start = size > 512 * 1024 ? size - 512 * 1024 : 0;
+    fseek(f, start, SEEK_SET);
+    char* buf = malloc(size - start + 1);
+    if (!buf) { fclose(f); return; }
+    size_t n = fread(buf, 1, size - start, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    size_t ml = strlen(HISTORY_MARK);
+    char* p = strstr(buf, HISTORY_MARK);
+    while (p) {
+        char* hdr = p + ml;
+        char* body = strchr(hdr, '\n');
+        if (!body) break;
+        *body++ = '\0';
+        char* next = strstr(body, "\n" HISTORY_MARK);
+        char* end = next ? next : body + strlen(body);
+        while (end > body && isspace((unsigned char)end[-1])) end--;
+
+        char when[20] = "", status[16] = "";
+        int rows = 0;
+        double ms = 0;
+        if (sscanf(hdr, "%19[^|] | %15[^ |] | %d | %lf", when, status, &rows, &ms) >= 2 && end > body) {
+            size_t wl = strlen(when);
+            while (wl > 0 && when[wl - 1] == ' ') when[--wl] = '\0';
+            char* sql = malloc(end - body + 1);
+            if (sql) {
+                memcpy(sql, body, end - body);
+                sql[end - body] = '\0';
+                history_push(app, sql, when, strcmp(status, "ok") == 0, rows, ms);
+            }
+        }
+        p = next ? next + 1 : NULL;
+    }
+    free(buf);
+}
+
+// risultato sintetico (stesse regole di allocazione di db_result_free)
+static QueryResult* make_grid(const char* const* cols, const char* const* types, int ncols, int nrows) {
+    QueryResult* r = calloc(1, sizeof(QueryResult));
+    if (!r) return NULL;
+    r->success   = true;
+    r->col_names = calloc(ncols, sizeof(char*));
+    r->col_types = calloc(ncols, sizeof(char*));
+    r->rows      = calloc(nrows > 0 ? nrows : 1, sizeof(Row));
+    if (!r->col_names || !r->col_types || !r->rows) { db_result_free(r); return NULL; }
+    r->num_cols = ncols;
+    for (int c = 0; c < ncols; c++) {
+        r->col_names[c] = strdup(cols[c]);
+        r->col_types[c] = strdup(types[c]);
+    }
+    for (int i = 0; i < nrows; i++) {
+        r->rows[i].cells = calloc(ncols, sizeof(Cell));
+        if (!r->rows[i].cells) { db_result_free(r); return NULL; }
+        r->rows[i].num_cells = ncols;
+        r->num_rows++;
+    }
+    return r;
+}
+
+static void history_show(AppWindow* app) {
+    static const char* const cols[]  = { "time", "status", "rows", "ms", "statement" };
+    static const char* const types[] = { "", "", "", "", "" };
+    int n = app->history_count;
+    QueryResult* r = make_grid(cols, types, 5, n);
+    if (!r) return;
+    for (int i = 0; i < n; i++) {
+        const HistoryEntry* e = &app->history[n - 1 - i];   // più recente in alto
+        Cell* c = r->rows[i].cells;
+        snprintf(c[0].value, sizeof(c[0].value), "%s", e->when);
+        snprintf(c[1].value, sizeof(c[1].value), "%s", e->ok ? "ok" : "error");
+        snprintf(c[2].value, sizeof(c[2].value), "%d", e->rows);
+        snprintf(c[3].value, sizeof(c[3].value), "%.1f", e->ms);
+        c[0].type = c[1].type = c[4].type = CELL_TYPE_STRING;
+        c[2].type = CELL_TYPE_INT;
+        c[3].type = CELL_TYPE_FLOAT;
+        // statement su una riga sola
+        int k = 0;
+        bool sp = false;
+        for (const char* s = e->sql; *s && k < (int)sizeof(c[4].value) - 4; s++) {
+            if (isspace((unsigned char)*s)) { if (!sp && k) c[4].value[k++] = ' '; sp = true; }
+            else { c[4].value[k++] = *s; sp = false; }
+        }
+        c[4].value[k] = '\0';
+    }
+    show_result(app, r);
+    app->showing_history = true;
+    char meta[64];
+    snprintf(meta, sizeof(meta), "%d entr%s", n, n == 1 ? "y" : "ies");
+    set_status(app, STATUS_INFO, n ? "Query history \xc2\xb7 double-click or Enter inserts the statement into the editor"
+                                   : "Query history is empty", meta);
+}
+
+static void history_toggle(AppWindow* app) {
+    if (app->showing_history) {
+        show_result(app, NULL);
+        set_status(app, STATUS_IDLE, "Ready", "");
+    } else {
+        history_show(app);
+    }
+}
+
+static void on_history_click(void* ud) { history_toggle((AppWindow*)ud); }
+
+// doppio click su una riga della cronologia: inserisce lo statement nell'editor
+static void on_results_activate(int row, void* ud) {
+    AppWindow* app = (AppWindow*)ud;
+    if (!app->showing_history || row < 0 || row >= app->history_count) return;
+    const HistoryEntry* e = &app->history[app->history_count - 1 - row];
+    size_t n = strlen(e->sql);
+    char* text = malloc(n + 3);
+    if (!text) return;
+    memcpy(text, e->sql, n);
+    if (n == 0 || e->sql[n - 1] != ';') text[n++] = ';';
+    text[n] = '\0';
+    TextBox* tb = app->editor;
+    // accoda in fondo allo script (separato da una riga vuota) e lo seleziona:
+    // inserirlo al cursore rischierebbe di spezzare lo statement corrente
+    int end = tb->text_len;
+    while (end > 0 && (tb->text[end - 1] == ' ' || tb->text[end - 1] == '\n')) end--;
+    char* full = malloc(n + 4);
+    if (!full) { free(text); return; }
+    snprintf(full, n + 4, "%s%s", end > 0 ? "\n\n" : "", text);
+    textbox_replace_text(tb, end, tb->text_len, full, false);
+    int stmt_start = end + (end > 0 ? 2 : 0);
+    tb->sel_anchor = stmt_start;
+    textbox_scroll_to_line(tb, textbox_line_of_offset(tb, stmt_start));
+    free(full);
+    free(text);
+    textbox_focus(tb, true);
+    set_status(app, STATUS_OK, "Statement inserted into the editor", "");
 }
 
 // ── callbacks dei bottoni ────────────────────────────────────────
@@ -145,6 +445,11 @@ static void on_refresh_click(void* ud) {
 }
 
 // callback dell'editor: Ctrl+Enter esegue lo statement corrente (o la selezione)
+static void on_editor_change(const char* text, void* ud) {
+    (void)text;
+    ((AppWindow*)ud)->modified = true;
+}
+
 static void on_editor_execute(const char* text, void* ud) {
     (void)text;
     app_window_run((AppWindow*)ud, RUN_CURRENT);
@@ -343,7 +648,9 @@ static bool bar_visible(const AppWindow* app) { return app->bar_mode != BAR_NONE
 
 static const char* bar_label(const AppWindow* app) {
     switch (app->bar_mode) {
-        case BAR_GOTO: return "Go to line";
+        case BAR_GOTO:    return "Go to line";
+        case BAR_OPEN:    return "Open file";
+        case BAR_SAVE_AS: return "Save as";
         default:       return NULL;
     }
 }
@@ -420,12 +727,28 @@ static void bar_open(AppWindow* app, BarMode mode, bool replace) {
         line_edit_set_text(app->bar_input, buf);
         app->bar_input->placeholder = "Line number";
         textbox_set_search(app->editor, NULL, false, false);
+    } else if (mode == BAR_OPEN || mode == BAR_SAVE_AS) {
+        char buf[1100];
+        if (app->file_path[0] && mode == BAR_SAVE_AS) {
+            snprintf(buf, sizeof(buf), "%s", app->file_path);
+        } else if (app->file_path[0]) {
+            snprintf(buf, sizeof(buf), "%s", app->file_path);
+            char* b = (char*)base_name(buf);
+            *b = '\0';                               // solo la cartella
+        } else {
+            join_path(buf, sizeof(buf), app->data_dir[0] ? app->data_dir : ".",
+                      mode == BAR_SAVE_AS ? "script.sql" : "");
+        }
+        line_edit_set_text(app->bar_input, buf);
+        app->bar_input->placeholder = "Path of the .sql file";
+        textbox_set_search(app->editor, NULL, false, false);
     }
     layout_bar(app);
     textbox_focus(app->editor, false);
     line_edit_focus(app->bar_replace_input, false);
     line_edit_focus(app->bar_input, true);
-    line_edit_select_all(app->bar_input);
+    if (mode == BAR_OPEN || mode == BAR_SAVE_AS) app->bar_input->anchor = -1;   // cursore in fondo al percorso
+    else line_edit_select_all(app->bar_input);
 }
 
 static void bar_close(AppWindow* app) {
@@ -478,6 +801,16 @@ static void bar_submit(AppWindow* app, bool shift, bool ctrl) {
             if (!in->text[0] || (end && *end) || l < 1) { in->error = true; return; }
             textbox_goto_line(app->editor, (int)l - 1);
             bar_close(app);
+            break;
+        }
+        case BAR_OPEN:
+        case BAR_SAVE_AS: {
+            char path[1024];
+            expand_path(in->text, path, sizeof(path));
+            size_t pl = strlen(path);
+            if (!pl || path[pl - 1] == '/' || path[pl - 1] == '\\') { in->error = true; return; }
+            bool ok = app->bar_mode == BAR_OPEN ? open_from(app, path) : save_to(app, path);
+            if (ok) bar_close(app); else in->error = true;
             break;
         }
         default: break;
@@ -698,6 +1031,8 @@ static void layout_widgets(AppWindow* app) {
     app->editor_scroll->base.bounds = (Rect){W - SCROLLBAR_W, TOOLBAR_H, SCROLLBAR_W, editor_h};
 
     app->lbl_status->base.bounds = (Rect){center_x + 112, status_y, center_w - 112 - 260, STATUSBAR_H};
+    int hw = button_preferred_width(app->btn_history, app->win);
+    app->btn_history->base.bounds = (Rect){W - 12 - hw, status_y + (STATUSBAR_H - 26) / 2, hw, 26};
 
     app->results->base.bounds          = (Rect){center_x, results_y, center_w, results_h};
     app->results_scroll_v->base.bounds = (Rect){W - SCROLLBAR_W, results_y + TABLE_VIEW_HEADER_H,
@@ -794,6 +1129,8 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
     app->editor->cursor_line = app->editor->cursor_col = 0;
     app->editor->scroll_x = app->editor->scroll_y = 0;
     textbox_focus(app->editor, true);
+    app->editor->on_change = on_editor_change;
+    app->modified = false;
 
     app->editor_scroll = scrollbar_create(0, 0, 0, 0, SCROLLBAR_VERTICAL);
     app->editor_scroll->base.user_data = app;
@@ -805,6 +1142,11 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
 
     // -- risultati --
     app->results = table_view_create(0, 0, 0, 0);
+    app->results->base.user_data = app;
+    app->results->on_row_activate = on_results_activate;
+
+    app->btn_history = button_create(0, 0, 0, 0, "History", on_history_click, app);
+    button_set_style(app->btn_history, BUTTON_STYLE_GHOST);
 
     app->results_scroll_v = scrollbar_create(0, 0, 0, 0, SCROLLBAR_VERTICAL);
     app->results_scroll_v->base.user_data = app;
@@ -851,8 +1193,9 @@ static void update_cursor_shape(AppWindow* app, int mx, int my) {
         k = CURSOR_IBEAM;
     } else {
         Widget* clickable[] = { (Widget*)app->btn_run, (Widget*)app->btn_run_current, (Widget*)app->btn_commit,
-                                (Widget*)app->btn_rollback, (Widget*)app->btn_refresh, (Widget*)app->btn_format };
-        for (int i = 0; i < 6; i++)
+                                (Widget*)app->btn_rollback, (Widget*)app->btn_refresh, (Widget*)app->btn_format,
+                                (Widget*)app->btn_history };
+        for (int i = 0; i < 7; i++)
             if (widget_contains_point(clickable[i], mx, my)) { k = CURSOR_HAND; break; }
     }
     platform_set_cursor(app->win, k);
@@ -878,8 +1221,14 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         if (evt->key == KEY_LETTER && ctrl && !(evt->modifiers & SV_MOD_ALT)) {
             switch (evt->character) {
                 case 'f': if (shift) format_sql(app); else bar_open(app, BAR_FIND, false); return;
-                case 'h': if (!shift) { bar_open(app, BAR_FIND, true);  return; } break;
+                case 'h': if (shift) history_toggle(app); else bar_open(app, BAR_FIND, true); return;
                 case 'g': bar_open(app, BAR_GOTO, false); return;
+                case 'o': bar_open(app, BAR_OPEN, false); return;
+                case 'n': cmd_new(app); return;
+                case 's':
+                    if (shift || !app->file_path[0]) bar_open(app, BAR_SAVE_AS, false);
+                    else save_to(app, app->file_path);
+                    return;
                 default: break;
             }
         }
@@ -945,6 +1294,7 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
     Widget* order[] = {
         (Widget*)app->btn_run, (Widget*)app->btn_run_current, (Widget*)app->btn_commit,
         (Widget*)app->btn_rollback, (Widget*)app->btn_refresh, (Widget*)app->btn_format,
+        (Widget*)app->btn_history,
         (Widget*)app->tree_scroll, (Widget*)app->editor_scroll,
         (Widget*)app->results_scroll_v, (Widget*)app->results_scroll_h,
         (Widget*)app->tree, (Widget*)app->editor, (Widget*)app->results,
@@ -1070,10 +1420,16 @@ static void draw_splitter_and_status(AppWindow* app) {
     ui_circle(win, cx + 100, st.y + st.h / 2, 4, dot);
     widget_draw((Widget*)app->lbl_status, win);
 
+    widget_draw((Widget*)app->btn_history, win);
+    if (app->showing_history) {
+        Rect hb = app->btn_history->base.bounds;
+        platform_fill_rect(win, (Rect){hb.x + 8, hb.y + hb.h, hb.w - 16, 2}, TH_ACCENT);
+    }
     if (app->status_meta[0]) {
         int mw = platform_measure_text_ex(win, app->status_meta, -1, TH_FONT_SMALL + 1, FONT_MONO);
+        int mx = app->btn_history->base.bounds.x - 14 - mw;
         platform_draw_text_ex(win, app->status_meta, -1,
-                              (Point){app->win_w - 18 - mw, ui_text_y(win, st, TH_FONT_SMALL + 1, FONT_MONO)},
+                              (Point){mx, ui_text_y(win, st, TH_FONT_SMALL + 1, FONT_MONO)},
                               TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_MONO);
     }
 }
@@ -1098,6 +1454,15 @@ static void draw_footer(AppWindow* app) {
     ui_icon_database(win, x + 6, f.y + FOOTER_H / 2, 11, TH_TEXT_DIM);
     x += 16;
     x += platform_draw_text_ex(win, app->lbl_db_name->text, -1, (Point){x, ty}, TH_TEXT_MUTED, fs, FONT_UI) + 18;
+
+    // file corrente (● = modifiche non salvate)
+    const char* fname = app->file_path[0] ? base_name(app->file_path) : "untitled.sql";
+    x += platform_draw_text_ex(win, fname, -1, (Point){x, ty}, app->file_path[0] ? TH_TEXT_MUTED : TH_TEXT_DIM, fs, FONT_UI);
+    if (app->modified) {
+        ui_circle(win, x + 8, f.y + FOOTER_H / 2, 3, TH_ACCENT_TEXT);
+        x += 14;
+    }
+    x += 18;
 
     if (app->in_transaction) {
         ui_circle(win, x + 3, f.y + FOOTER_H / 2, 3, TH_WARNING);
@@ -1205,6 +1570,9 @@ void app_window_run(AppWindow* app, RunMode mode) {
         stmt[slen] = '\0';
 
         QueryResult* res = db_execute(stmt);
+        history_add(app, stmt, res && res->success,
+                    res ? (res->num_cols > 0 ? res->num_rows : res->rows_affected) : 0,
+                    res ? res->exec_time_ms : 0);
         free(stmt);
         executed++;
 
@@ -1284,6 +1652,8 @@ void app_window_destroy(AppWindow* app) {
     widget_destroy((Widget*)app->btn_rollback);
     widget_destroy((Widget*)app->btn_refresh);
     widget_destroy((Widget*)app->btn_format);
+    widget_destroy((Widget*)app->btn_history);
+    for (int i = 0; i < app->history_count; i++) free(app->history[i].sql);
     widget_destroy((Widget*)app->lbl_db_name);
     widget_destroy((Widget*)app->tree);
     widget_destroy((Widget*)app->tree_scroll);
@@ -1296,4 +1666,66 @@ void app_window_destroy(AppWindow* app) {
     widget_destroy((Widget*)app->bar_input);
     widget_destroy((Widget*)app->bar_replace_input);
     free(app);
+}
+
+// ── sessione ─────────────────────────────────────────────────────
+
+#define SESSION_TEXT "session.sql"
+#define SESSION_META "session.ini"
+
+void app_window_set_data_dir(AppWindow* app, const char* dir) {
+    if (!app || !dir) return;
+    snprintf(app->data_dir, sizeof(app->data_dir), "%s", dir);
+    history_load(app);
+
+    char path[1100];
+    join_path(path, sizeof(path), dir, SESSION_TEXT);
+    char* text = read_text_file(path, NULL);
+    if (!text) return;   // prima esecuzione: resta lo script di benvenuto
+
+    TextBox* tb = app->editor;
+    textbox_replace_text(tb, 0, tb->text_len, text, false);
+    free(text);
+    // il testo ripristinato non deve essere annullabile
+    for (int i = 0; i < tb->undo_count; i++) free(tb->undo[i].text);
+    tb->undo_count = 0;
+
+    int cursor = 0, modified = 0;
+    join_path(path, sizeof(path), dir, SESSION_META);
+    FILE* f = fopen(path, "rb");
+    if (f) {
+        char line[1200];
+        while (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (!strncmp(line, "file=", 5))     snprintf(app->file_path, sizeof(app->file_path), "%.1023s", line + 5);
+            else if (!strncmp(line, "cursor=", 7))   cursor = atoi(line + 7);
+            else if (!strncmp(line, "modified=", 9)) modified = atoi(line + 9);
+            else if (!strncmp(line, "font=", 5))     tb->font_size = SV_CLAMP(atoi(line + 5), 10, 28);
+        }
+        fclose(f);
+    }
+    tb->cursor_pos = SV_CLAMP(cursor, 0, tb->text_len);
+    tb->sel_anchor = -1;
+    tb->cursor_line = textbox_line_of_offset(tb, tb->cursor_pos);
+    tb->cursor_col = 0;
+    for (int i = tb->line_starts[tb->cursor_line]; i < tb->cursor_pos; i++)
+        if (((unsigned char)tb->text[i] & 0xC0) != 0x80) tb->cursor_col++;
+    tb->pref_col = tb->cursor_col;
+    tb->scroll_x = 0;
+    tb->scroll_y = SV_MAX(0, tb->cursor_line - 5);
+    app->modified = modified != 0;
+    set_status(app, STATUS_IDLE, "Previous session restored", "");
+}
+
+void app_window_save_session(AppWindow* app) {
+    if (!app || !app->data_dir[0]) return;
+    char path[1100];
+    join_path(path, sizeof(path), app->data_dir, SESSION_TEXT);
+    write_text_file(path, textbox_get_text(app->editor));
+    join_path(path, sizeof(path), app->data_dir, SESSION_META);
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "file=%s\ncursor=%d\nmodified=%d\nfont=%d\n",
+            app->file_path, app->editor->cursor_pos, app->modified ? 1 : 0, app->editor->font_size);
+    fclose(f);
 }

@@ -42,7 +42,18 @@ typedef enum { RUN_SCRIPT, RUN_CURRENT } RunMode;
 typedef enum { STATUS_IDLE, STATUS_OK, STATUS_ERROR, STATUS_INFO } StatusKind;
 
 // barra comandi sovrapposta all'editor
-typedef enum { BAR_NONE, BAR_FIND, BAR_GOTO } BarMode;
+typedef enum { BAR_NONE, BAR_FIND, BAR_GOTO, BAR_OPEN, BAR_SAVE_AS } BarMode;
+
+#define HISTORY_MAX 500
+
+// una query eseguita (cronologia)
+typedef struct {
+    char*  sql;
+    char   when[20];        // "YYYY-MM-DD HH:MM:SS"
+    bool   ok;
+    int    rows;            // righe restituite o modificate
+    double ms;
+} HistoryEntry;
 
 typedef enum {
     BAR_BTN_TOGGLE_REPLACE, BAR_BTN_CASE, BAR_BTN_WORD, BAR_BTN_PREV, BAR_BTN_NEXT, BAR_BTN_CLOSE,
@@ -89,6 +100,15 @@ typedef struct {
     Rect       bar_btn[BAR_BTN_COUNT];
     int        bar_label_w;          // larghezza dell'etichetta a sinistra (modalità non-find)
 
+    // -- file, sessione e cronologia --
+    char         data_dir[512];     // directory dei dati (sessione e cronologia)
+    char         file_path[1024];   // script aperto ("" = senza nome)
+    bool         modified;          // modifiche non salvate
+    HistoryEntry history[HISTORY_MAX];
+    int          history_count;
+    bool         showing_history;   // la griglia mostra la cronologia
+    Button*      btn_history;
+
     // -- stato --
     QueryResult* last_result;     // ultimo risultato (da liberare)
     int          win_w, win_h;    // dimensioni correnti finestra
@@ -117,6 +137,12 @@ void app_window_resize(AppWindow* app, int new_w, int new_h);
 // esegue la query nell'editor e aggiorna i risultati
 void app_window_run_query(AppWindow* app);              // = RUN_SCRIPT
 void app_window_run(AppWindow* app, RunMode mode);
+
+// imposta la directory dei dati: ripristina l'ultima sessione dell'editor e la cronologia
+void app_window_set_data_dir(AppWindow* app, const char* dir);
+
+// salva il contenuto dell'editor per la prossima sessione (da chiamare prima di chiudere)
+void app_window_save_session(AppWindow* app);
 
 // dealloca tutto
 void app_window_destroy(AppWindow* app);

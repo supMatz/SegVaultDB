@@ -435,6 +435,14 @@ static bool table_view_handle_event(Widget* self, sEvent* evt) {
                 tv->selected_row = clicked_row;
                 tv->selected_col = col;
                 if (tv->on_row_select) tv->on_row_select(clicked_row, self->user_data);
+                uint64_t now = platform_time_ms();
+                if (tv->on_row_activate && tv->last_row_clicked == clicked_row && now - tv->last_row_click < 400) {
+                    tv->last_row_click = 0;
+                    tv->on_row_activate(clicked_row, self->user_data);
+                    return true;
+                }
+                tv->last_row_click   = now;
+                tv->last_row_clicked = clicked_row;
             }
             return true;
         }
@@ -458,6 +466,10 @@ static bool table_view_handle_event(Widget* self, sEvent* evt) {
                 case KEY_LEFT:     tv->selected_col = SV_MAX(0, tv->selected_col - 1); break;
                 case KEY_RIGHT:    tv->selected_col = SV_MIN(num_cols(tv) - 1, tv->selected_col + 1); break;
                 case KEY_ESCAPE:   tv->selected_row = tv->selected_col = -1; return true;
+                case KEY_ENTER:
+                    if (!tv->on_row_activate) return false;
+                    tv->on_row_activate(tv->selected_row, self->user_data);
+                    return true;
                 default: return false;
             }
             ensure_selection_visible(tv);

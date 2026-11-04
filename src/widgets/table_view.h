@@ -71,6 +71,9 @@ typedef struct {
 
     // callback
     void (*on_row_select) (int row_index, void* user_data);
+    void (*on_row_activate)(int row_index, void* user_data);   // doppio click o Invio su una riga
+    uint64_t last_row_click;
+    int      last_row_clicked;
 } TableView ;
 
 TableView* table_view_create(int x, int y, int w, int h);
