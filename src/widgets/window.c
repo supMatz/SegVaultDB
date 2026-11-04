@@ -5,6 +5,7 @@
 #include "sql_text.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #define MAX_STATEMENTS 512
 
@@ -255,6 +256,328 @@ static void on_tree_activate(TreeNode* node, void* ud) {
     }
 }
 
+// ── barra comandi: trova / sostituisci / vai alla riga ───────────
+
+#define BAR_ROW_H  32
+#define BAR_BTN_W  26
+
+static bool bar_visible(const AppWindow* app) { return app->bar_mode != BAR_NONE; }
+
+static const char* bar_label(const AppWindow* app) {
+    switch (app->bar_mode) {
+        case BAR_GOTO: return "Go to line";
+        default:       return NULL;
+    }
+}
+
+static void layout_bar(AppWindow* app) {
+    for (int i = 0; i < BAR_BTN_COUNT; i++) app->bar_btn[i] = (Rect){0, 0, 0, 0};
+    app->bar_input->base.visible = app->bar_replace_input->base.visible = false;
+    if (!bar_visible(app)) { app->bar_rect = (Rect){0, 0, 0, 0}; return; }
+
+    int center_w = app->win_w - SIDEBAR_W;
+    int bw = SV_MIN(560, center_w - 40);
+    bool two_rows = app->bar_mode == BAR_FIND && app->bar_replace;
+    int bh = (two_rows ? 2 : 1) * BAR_ROW_H + 12 + (two_rows ? 4 : 0);
+    Rect r = {app->win_w - SCROLLBAR_W - 14 - bw, TOOLBAR_H + 8, bw, bh};
+    app->bar_rect = r;
+
+    int y1 = r.y + 6, y2 = y1 + BAR_ROW_H + 4;
+    int ih = BAR_ROW_H - 4;
+    int right = r.x + r.w - 6;
+    Rect* b = app->bar_btn;
+
+    b[BAR_BTN_CLOSE] = (Rect){right - BAR_BTN_W, y1 + 2, BAR_BTN_W, ih};
+    int in_x = r.x + 8;
+    int in_r;
+    if (app->bar_mode == BAR_FIND) {
+        b[BAR_BTN_TOGGLE_REPLACE] = (Rect){r.x + 6, y1 + 2, 20, two_rows ? ih * 2 + 4 + 4 : ih};
+        in_x = r.x + 30;
+        b[BAR_BTN_NEXT] = (Rect){b[BAR_BTN_CLOSE].x - 2 - BAR_BTN_W, y1 + 2, BAR_BTN_W, ih};
+        b[BAR_BTN_PREV] = (Rect){b[BAR_BTN_NEXT].x - 2 - BAR_BTN_W, y1 + 2, BAR_BTN_W, ih};
+        int info_w = 84;
+        b[BAR_BTN_WORD] = (Rect){b[BAR_BTN_PREV].x - 6 - info_w - BAR_BTN_W, y1 + 2, BAR_BTN_W, ih};
+        b[BAR_BTN_CASE] = (Rect){b[BAR_BTN_WORD].x - 2 - BAR_BTN_W, y1 + 2, BAR_BTN_W, ih};
+        in_r = b[BAR_BTN_CASE].x - 6;
+        if (two_rows) {
+            int aw = 44, rw = 72;
+            b[BAR_BTN_REPLACE_ALL] = (Rect){right - aw, y2 + 2, aw, ih};
+            b[BAR_BTN_REPLACE]     = (Rect){b[BAR_BTN_REPLACE_ALL].x - 4 - rw, y2 + 2, rw, ih};
+            app->bar_replace_input->base.bounds  = (Rect){in_x, y2 + 2, in_r - in_x, ih};
+            app->bar_replace_input->base.visible = true;
+        }
+    } else {
+        in_x = r.x + 12 + app->bar_label_w + 10;
+        in_r = b[BAR_BTN_CLOSE].x - 96;
+    }
+    app->bar_input->base.bounds  = (Rect){in_x, y1 + 2, SV_MAX(60, in_r - in_x), ih};
+    app->bar_input->base.visible = true;
+}
+
+static void bar_apply_search(AppWindow* app, bool select_first) {
+    LineEdit* in = app->bar_input;
+    textbox_set_search(app->editor, in->text, app->find_case, app->find_word);
+    if (!in->text[0]) { in->error = false; return; }
+    bool found = select_first ? textbox_find_next(app->editor, false, true) : textbox_search_count(app->editor, NULL) > 0;
+    in->error = !found;
+}
+
+static void bar_open(AppWindow* app, BarMode mode, bool replace) {
+    bool was_find = app->bar_mode == BAR_FIND;
+    app->bar_mode = mode;
+    if (mode == BAR_FIND) app->bar_replace = replace || (was_find && app->bar_replace);
+    const char* lbl = bar_label(app);
+    app->bar_label_w = lbl ? platform_measure_text_ex(app->win, lbl, -1, TH_FONT_UI, FONT_UI_BOLD) : 0;
+
+    if (mode == BAR_FIND) {
+        // precompila con la selezione o la parola sotto il cursore
+        char* w = textbox_word_or_selection(app->editor);
+        if (w && w[0]) line_edit_set_text(app->bar_input, w);
+        free(w);
+        app->bar_input->placeholder = "Find";
+        bar_apply_search(app, false);
+    } else if (mode == BAR_GOTO) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", app->editor->cursor_line + 1);
+        line_edit_set_text(app->bar_input, buf);
+        app->bar_input->placeholder = "Line number";
+        textbox_set_search(app->editor, NULL, false, false);
+    }
+    layout_bar(app);
+    textbox_focus(app->editor, false);
+    line_edit_focus(app->bar_replace_input, false);
+    line_edit_focus(app->bar_input, true);
+    line_edit_select_all(app->bar_input);
+}
+
+static void bar_close(AppWindow* app) {
+    if (!bar_visible(app)) return;
+    app->bar_mode = BAR_NONE;
+    textbox_set_search(app->editor, NULL, false, false);
+    line_edit_focus(app->bar_input, false);
+    line_edit_focus(app->bar_replace_input, false);
+    app->bar_input->error = false;
+    layout_bar(app);
+    textbox_focus(app->editor, true);
+}
+
+static void bar_find(AppWindow* app, bool backwards) {
+    if (!app->bar_input->text[0]) return;
+    textbox_set_search(app->editor, app->bar_input->text, app->find_case, app->find_word);
+    app->bar_input->error = !textbox_find_next(app->editor, backwards, false);
+}
+
+static void bar_replace_one(AppWindow* app) {
+    if (!app->bar_input->text[0]) return;
+    bar_apply_search(app, false);
+    textbox_replace_current(app->editor, app->bar_replace_input->text);
+}
+
+static void bar_replace_all(AppWindow* app) {
+    if (!app->bar_input->text[0]) return;
+    bar_apply_search(app, false);
+    int n = textbox_replace_all(app->editor, app->bar_replace_input->text);
+    char msg[96];
+    snprintf(msg, sizeof(msg), n ? "Replaced %d occurrence%s" : "No occurrences to replace", n, n == 1 ? "" : "s");
+    set_status(app, n ? STATUS_OK : STATUS_INFO, msg, "");
+}
+
+// Invio nel campo principale: dipende dalla modalità
+static void bar_submit(AppWindow* app, bool shift, bool ctrl) {
+    LineEdit* in = app->bar_input;
+    switch (app->bar_mode) {
+        case BAR_FIND:
+            if (line_edit_focused(app->bar_replace_input)) {
+                if (ctrl) bar_replace_all(app); else bar_replace_one(app);
+            } else {
+                bar_find(app, shift);
+            }
+            break;
+        case BAR_GOTO: {
+            char* end = NULL;
+            long l = strtol(in->text, &end, 10);
+            while (end && *end == ' ') end++;
+            if (!in->text[0] || (end && *end) || l < 1) { in->error = true; return; }
+            textbox_goto_line(app->editor, (int)l - 1);
+            bar_close(app);
+            break;
+        }
+        default: break;
+    }
+}
+
+static void on_bar_input_change(LineEdit* le, void* ud) {
+    AppWindow* app = (AppWindow*)ud;
+    (void)le;
+    if (app->bar_mode == BAR_FIND) bar_apply_search(app, true);
+}
+
+static void bar_click(AppWindow* app, BarButton btn) {
+    switch (btn) {
+        case BAR_BTN_TOGGLE_REPLACE:
+            app->bar_replace = !app->bar_replace;
+            layout_bar(app);
+            break;
+        case BAR_BTN_CASE: app->find_case = !app->find_case; bar_apply_search(app, false); break;
+        case BAR_BTN_WORD: app->find_word = !app->find_word; bar_apply_search(app, false); break;
+        case BAR_BTN_PREV: bar_find(app, true);  break;
+        case BAR_BTN_NEXT: bar_find(app, false); break;
+        case BAR_BTN_CLOSE: bar_close(app); break;
+        case BAR_BTN_REPLACE: bar_replace_one(app); break;
+        case BAR_BTN_REPLACE_ALL: bar_replace_all(app); break;
+        default: break;
+    }
+}
+
+static bool rect_has(Rect r, int x, int y) {
+    return r.w > 0 && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+}
+
+// ritorna true se l'evento è stato consumato dalla barra
+static bool bar_handle_event(AppWindow* app, sEvent* evt) {
+    if (!bar_visible(app)) return false;
+    LineEdit* in = app->bar_input;
+    LineEdit* rp = app->bar_replace_input;
+    bool focused = line_edit_focused(in) || line_edit_focused(rp);
+
+    switch (evt->type) {
+        case EVT_MOUSE_DOWN: {
+            bool inside = rect_has(app->bar_rect, evt->mouse_x, evt->mouse_y);
+            // i campi gestiscono da soli acquisizione/perdita del focus
+            bool hit_in = widget_handle_event((Widget*)in, evt);
+            bool hit_rp = rp->base.visible && widget_handle_event((Widget*)rp, evt);
+            if (!inside) return false;
+            if (hit_in || hit_rp) { textbox_focus(app->editor, false); return true; }
+            for (int i = 0; i < BAR_BTN_COUNT; i++)
+                if (rect_has(app->bar_btn[i], evt->mouse_x, evt->mouse_y)) { bar_click(app, (BarButton)i); break; }
+            return true;
+        }
+        case EVT_MOUSE_MOVE:
+        case EVT_MOUSE_UP: {
+            bool a = widget_handle_event((Widget*)in, evt);
+            bool b = rp->base.visible && widget_handle_event((Widget*)rp, evt);
+            return a || b;
+        }
+        case EVT_MOUSE_WHEEL:
+            return rect_has(app->bar_rect, evt->mouse_x, evt->mouse_y);
+
+        case EVT_KEY_DOWN: {
+            bool shift = evt->modifiers & SV_MOD_SHIFT;
+            bool ctrl  = evt->modifiers & SV_MOD_CTRL;
+            bool alt   = evt->modifiers & SV_MOD_ALT;
+            if (evt->key == KEY_ESCAPE && (focused || app->editor->base.state == WIDGET_STATE_FOCUSED)) {
+                bar_close(app);
+                return true;
+            }
+            if (!focused) return false;
+            if (evt->key == KEY_ENTER) { bar_submit(app, shift, ctrl); return true; }
+            if (evt->key == KEY_TAB && app->bar_mode == BAR_FIND && app->bar_replace) {
+                bool to_rp = line_edit_focused(in);
+                line_edit_focus(in, !to_rp);
+                line_edit_focus(rp, to_rp);
+                line_edit_select_all(to_rp ? rp : in);
+                return true;
+            }
+            if (app->bar_mode == BAR_FIND && evt->key == KEY_LETTER && alt) {
+                if (evt->character == 'c') { bar_click(app, BAR_BTN_CASE); return true; }
+                if (evt->character == 'w') { bar_click(app, BAR_BTN_WORD); return true; }
+                if (evt->character == 'r') { bar_replace_one(app); return true; }
+                if (evt->character == 'a') { bar_replace_all(app); return true; }
+            }
+            if (app->bar_mode == BAR_FIND && (evt->key == KEY_UP || evt->key == KEY_DOWN)) {
+                bar_find(app, evt->key == KEY_UP);
+                return true;
+            }
+            LineEdit* target = line_edit_focused(rp) ? rp : in;
+            widget_handle_event((Widget*)target, evt);
+            return true; // con il focus nella barra, i tasti non arrivano all'editor
+        }
+        case EVT_CHAR:
+            if (!focused) return false;
+            widget_handle_event((Widget*)(line_edit_focused(rp) ? rp : in), evt);
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void draw_bar_button(AppWindow* app, Rect r, const char* text, bool active) {
+    PlatformWindow* win = app->win;
+    bool hover = rect_has(r, app->mouse_x, app->mouse_y);
+    Color bg = active ? TH_ACCENT_SOFT : hover ? TH_ELEVATED_HOVER : (text && strlen(text) > 2) ? TH_ELEVATED
+                                                                         : (Color){0, 0, 0, 0};
+    if (bg.a) ui_round_box(win, r, bg, active ? TH_ACCENT : bg, 4);
+    if (text) {
+        int tw = platform_measure_text_ex(win, text, -1, TH_FONT_SMALL + 1, FONT_UI_BOLD);
+        platform_draw_text_ex(win, text, -1, (Point){r.x + (r.w - tw) / 2, ui_text_y(win, r, TH_FONT_SMALL + 1, FONT_UI_BOLD)},
+                              active ? TH_ACCENT_TEXT : TH_TEXT_MUTED, TH_FONT_SMALL + 1, FONT_UI_BOLD);
+    }
+}
+
+static void draw_bar(AppWindow* app) {
+    if (!bar_visible(app)) return;
+    PlatformWindow* win = app->win;
+    Rect r = app->bar_rect;
+    Rect* b = app->bar_btn;
+
+    // ombra + pannello
+    platform_fill_rect_rounded(win, (Rect){r.x - 1, r.y + 2, r.w + 2, r.h + 2}, ui_alpha(TH_BG, 160), 8);
+    ui_round_box(win, r, TH_SURFACE_2, TH_BORDER_STRONG, 7);
+
+    if (app->bar_mode == BAR_FIND) {
+        Rect t = b[BAR_BTN_TOGGLE_REPLACE];
+        bool hv = rect_has(t, app->mouse_x, app->mouse_y);
+        if (hv) platform_fill_rect_rounded(win, t, TH_ELEVATED_HOVER, 4);
+        ui_icon_chevron(win, t.x + t.w / 2, t.y + BAR_ROW_H / 2 - 2, 10,
+                        app->bar_replace ? CHEVRON_DOWN : CHEVRON_RIGHT, TH_TEXT_MUTED);
+
+        draw_bar_button(app, b[BAR_BTN_CASE], "Aa", app->find_case);
+        draw_bar_button(app, b[BAR_BTN_WORD], "W", app->find_word);
+
+        // contatore risultati
+        char info[64] = "";
+        if (app->bar_input->text[0]) {
+            int cur = 0, n = textbox_search_count(app->editor, &cur);
+            if (n == 0)      snprintf(info, sizeof(info), "No results");
+            else if (cur)    snprintf(info, sizeof(info), "%d of %d", cur, n);
+            else             snprintf(info, sizeof(info), "%d found", n);
+        }
+        int ix = b[BAR_BTN_WORD].x + BAR_BTN_W + 8;
+        Rect ir = {ix, b[BAR_BTN_WORD].y, b[BAR_BTN_PREV].x - ix - 4, b[BAR_BTN_WORD].h};
+        if (info[0])
+            ui_text_clipped(win, info, ir.x, ui_text_y(win, ir, TH_FONT_SMALL + 1, FONT_UI), ir.w,
+                            app->bar_input->error ? TH_ERROR : TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_UI);
+
+        for (int k = 0; k < 2; k++) {
+            Rect br = b[k ? BAR_BTN_NEXT : BAR_BTN_PREV];
+            draw_bar_button(app, br, NULL, false);
+            ui_icon_chevron(win, br.x + br.w / 2, br.y + br.h / 2, 10, k ? CHEVRON_DOWN : CHEVRON_UP, TH_TEXT_MUTED);
+        }
+        if (app->bar_replace) {
+            draw_bar_button(app, b[BAR_BTN_REPLACE], "Replace", false);
+            draw_bar_button(app, b[BAR_BTN_REPLACE_ALL], "All", false);
+            widget_draw((Widget*)app->bar_replace_input, win);
+        }
+    } else {
+        const char* lbl = bar_label(app);
+        if (lbl) {
+            Rect lr = {r.x + 12, r.y + 6, app->bar_label_w, BAR_ROW_H};
+            platform_draw_text_ex(win, lbl, -1, (Point){lr.x, ui_text_y(win, lr, TH_FONT_UI, FONT_UI_BOLD)},
+                                  TH_TEXT_MUTED, TH_FONT_UI, FONT_UI_BOLD);
+        }
+        Rect ib = app->bar_input->base.bounds;
+        const char* hint = app->bar_input->error ? "Invalid" : "Enter to confirm";
+        Rect hr = {ib.x + ib.w + 8, ib.y, b[BAR_BTN_CLOSE].x - (ib.x + ib.w + 8) - 4, ib.h};
+        ui_text_clipped(win, hint, hr.x, ui_text_y(win, hr, TH_FONT_SMALL + 1, FONT_UI), hr.w,
+                        app->bar_input->error ? TH_ERROR : TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_UI);
+    }
+
+    widget_draw((Widget*)app->bar_input, win);
+    Rect c = b[BAR_BTN_CLOSE];
+    draw_bar_button(app, c, NULL, false);
+    ui_icon_cross(win, c.x + c.w / 2, c.y + c.h / 2, 9, TH_TEXT_MUTED);
+}
+
 // ── layout ───────────────────────────────────────────────────────
 
 // ricalcola la posizione e dimensione di tutti i widget in base alle dimensioni correnti della finestra
@@ -303,6 +626,7 @@ static void layout_widgets(AppWindow* app) {
                                                 SCROLLBAR_W, results_h - TABLE_VIEW_HEADER_H - SCROLLBAR_W};
     app->results_scroll_h->base.bounds = (Rect){center_x + app->results->rownum_w, H - FOOTER_H - SCROLLBAR_W,
                                                 center_w - app->results->rownum_w - SCROLLBAR_W, SCROLLBAR_W};
+    layout_bar(app);
 }
 
 // ── API pubblica ─────────────────────────────────────────────────
@@ -410,6 +734,15 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
     app->results_scroll_h->on_scroll = on_results_scroll_h;
     app->results_scroll_h->step = 60;
 
+    // -- barra comandi --
+    app->bar_input = line_edit_create("Find");
+    app->bar_input->base.user_data = app;
+    app->bar_input->on_change = on_bar_input_change;
+    app->bar_input->win = win;
+    app->bar_replace_input = line_edit_create("Replace");
+    app->bar_replace_input->win = win;
+    app->bar_mode = BAR_NONE;
+
     update_session(app);
 
     // applica il layout iniziale
@@ -421,7 +754,13 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
 static void update_cursor_shape(AppWindow* app, int mx, int my) {
     CursorKind k = CURSOR_ARROW;
     Rect eb = app->editor->base.bounds;
-    if (app->splitter_drag || app->splitter_hover) {
+    if (bar_visible(app) && rect_has(app->bar_rect, mx, my)) {
+        k = CURSOR_ARROW;
+        if (widget_contains_point((Widget*)app->bar_input, mx, my) ||
+            (app->bar_replace_input->base.visible && widget_contains_point((Widget*)app->bar_replace_input, mx, my)))
+            k = CURSOR_IBEAM;
+        for (int i = 0; i < BAR_BTN_COUNT; i++) if (rect_has(app->bar_btn[i], mx, my)) k = CURSOR_HAND;
+    } else if (app->splitter_drag || app->splitter_hover) {
         k = CURSOR_RESIZE_V;
     } else if (table_view_hit_resize(app->results, mx, my)) {
         k = CURSOR_RESIZE_H;
@@ -452,7 +791,36 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
 
     // -- scorciatoie globali --
     if (evt->type == EVT_KEY_DOWN) {
+        bool ctrl  = evt->modifiers & SV_MOD_CTRL;
+        bool shift = evt->modifiers & SV_MOD_SHIFT;
         if (evt->key == KEY_F5) { app_window_run(app, RUN_SCRIPT); return; }
+        if (evt->key == KEY_LETTER && ctrl && !(evt->modifiers & SV_MOD_ALT)) {
+            switch (evt->character) {
+                case 'f': if (!shift) { bar_open(app, BAR_FIND, false); return; } break;
+                case 'h': if (!shift) { bar_open(app, BAR_FIND, true);  return; } break;
+                case 'g': bar_open(app, BAR_GOTO, false); return;
+                default: break;
+            }
+        }
+        if (evt->key == KEY_F3) {
+            if (app->bar_input->text[0]) {
+                bar_find(app, shift);
+                if (!bar_visible(app)) textbox_set_search(app->editor, NULL, false, false);
+            } else {
+                bar_open(app, BAR_FIND, false);
+            }
+            return;
+        }
+    }
+    if (bar_handle_event(app, evt)) {
+        if (evt->type == EVT_MOUSE_MOVE || evt->type == EVT_MOUSE_DOWN) {
+            app->mouse_x = evt->mouse_x;
+            app->mouse_y = evt->mouse_y;
+            update_cursor_shape(app, evt->mouse_x, evt->mouse_y);
+        }
+        return;
+    }
+    if (evt->type == EVT_KEY_DOWN) {
         bool editor_focused = app->editor->base.state == WIDGET_STATE_FOCUSED;
         if (evt->key == KEY_ENTER && (evt->modifiers & SV_MOD_CTRL) && !editor_focused) {
             app_window_run(app, RUN_CURRENT);
@@ -508,7 +876,10 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
 
 bool app_window_tick(AppWindow* app, uint64_t now_ms) {
     if (!app) return false;
-    return textbox_tick(app->editor, now_ms);
+    bool a = textbox_tick(app->editor, now_ms);
+    bool b = line_edit_tick(app->bar_input, now_ms);
+    bool c = line_edit_tick(app->bar_replace_input, now_ms);
+    return a || b || c;
 }
 
 // ── disegno ──────────────────────────────────────────────────────
@@ -669,6 +1040,7 @@ void app_window_draw(AppWindow* app) {
     widget_draw((Widget*)app->results,          win);
     widget_draw((Widget*)app->results_scroll_v, win);
     widget_draw((Widget*)app->results_scroll_h, win);
+    draw_bar(app);
 
     draw_splitter_and_status(app);
     draw_sidebar(app);
@@ -826,5 +1198,7 @@ void app_window_destroy(AppWindow* app) {
     widget_destroy((Widget*)app->results);
     widget_destroy((Widget*)app->results_scroll_v);
     widget_destroy((Widget*)app->results_scroll_h);
+    widget_destroy((Widget*)app->bar_input);
+    widget_destroy((Widget*)app->bar_replace_input);
     free(app);
 }

@@ -85,6 +85,11 @@ typedef struct {
     // riga da evidenziare come errore (-1 = nessuna)
     int error_line;
 
+    // ricerca (evidenziata nel testo quando search[0] != 0)
+    char  search[256];
+    bool  search_case;     // distingue maiuscole/minuscole
+    bool  search_word;     // solo parole intere
+
     PlatformWindow* win;   // per appunti e misura del testo
 
     // -- callback --
@@ -118,5 +123,15 @@ int   textbox_line_of_offset(TextBox* tb, int offset);
 int   textbox_visible_lines(TextBox* tb);
 void  textbox_set_error_line(TextBox* tb, int line);   // -1 per rimuovere
 void  textbox_scroll_to_line(TextBox* tb, int line);
+
+// ── ricerca e sostituzione ──
+void  textbox_set_search(TextBox* tb, const char* query, bool match_case, bool whole_word); // NULL o "" = nessuna
+bool  textbox_find_next(TextBox* tb, bool backwards, bool from_selection_start); // seleziona il risultato; false se nessuno
+int   textbox_search_count(TextBox* tb, int* current);  // totale risultati; current = indice 1-based di quello selezionato (0 = nessuno)
+bool  textbox_replace_current(TextBox* tb, const char* repl); // sostituisce il risultato selezionato e passa al successivo
+int   textbox_replace_all(TextBox* tb, const char* repl);     // ritorna quante sostituzioni
+char* textbox_word_or_selection(TextBox* tb);                 // malloc'd: selezione su una riga o parola sotto il cursore
+
+void  textbox_goto_line(TextBox* tb, int line);               // 0-based, porta il cursore all'inizio della riga
 
 #endif

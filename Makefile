@@ -28,6 +28,7 @@ WIDGET_SRCS = \
 	src/widgets/button.c \
 	src/widgets/label.c \
 	src/widgets/textbox.c \
+	src/widgets/line_edit.c \
 	src/widgets/table_view.c \
 	src/widgets/tree_view.c \
 	src/widgets/scrollbar.c \

@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <stdio.h>
 
 #define INDENT 4
 
@@ -1016,6 +1017,8 @@ static bool textbox_handle_event(Widget* self, sEvent* evt) {
 //  Disegno con syntax highlighting
 // ═════════════════════════════════════════════════════════════════
 
+static bool search_match_at(const TextBox* tb, int i);
+
 typedef enum { LX_NORMAL, LX_BLOCK_COMMENT, LX_STRING_SQ, LX_STRING_DQ, LX_STRING_BT } LexState;
 
 // stato del lexer all'inizio dell'offset `upto` (commenti /* */ e stringhe su più righe)
@@ -1257,8 +1260,23 @@ static void textbox_draw(Widget* self, PlatformWindow* win) {
 
         platform_set_clip(win, (Rect){tx_l, b.y, b.w - tb->gutter_w, b.h});
 
+        // risultati della ricerca
+        int slen = tb->search[0] ? (int)strlen(tb->search) : 0;
+        if (slen) {
+            for (int i = ls; i + slen <= le; i++) {
+                if (!search_match_at(tb, i)) continue;
+                bool cur = sel && i == sa && se - sa == slen;
+                int c0 = count_chars(tb->text + ls, i - ls);
+                Rect mr = {x0 + c0 * tb->char_w, y + 1, count_chars(tb->text + i, slen) * tb->char_w, tb->line_height - 2};
+                if (cur) ui_round_box(win, mr, TH_EDITOR_FIND_CUR, TH_WARNING, 3);
+                else     platform_fill_rect_rounded(win, mr, TH_EDITOR_FIND, 3);
+                i += slen - 1;
+            }
+        }
+
         // selezione
-        if (sel && sa <= le && se > ls) {
+        bool sel_is_match = slen && sel && se - sa == slen && search_match_at(tb, sa);
+        if (sel && !sel_is_match && sa <= le && se > ls) {
             int a = SV_MAX(sa, ls), e = SV_MIN(se, le);
             int c0 = count_chars(tb->text + ls, a - ls);
             int c1 = c0 + count_chars(tb->text + a, e - a);
@@ -1484,5 +1502,154 @@ void textbox_scroll_to_line(TextBox* tb, int line) {
     int vis = visible_lines(tb);
     if (line < tb->scroll_y || line >= tb->scroll_y + vis)
         tb->scroll_y = SV_MAX(0, line - vis / 3);
+    clamp_scroll(tb);
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  Ricerca e sostituzione
+// ═════════════════════════════════════════════════════════════════
+
+// true se la ricerca corrente corrisponde a partire dall'offset i
+static bool search_match_at(const TextBox* tb, int i) {
+    int n = (int)strlen(tb->search);
+    if (n == 0 || i < 0 || i + n > tb->text_len) return false;
+    for (int k = 0; k < n; k++) {
+        unsigned char a = (unsigned char)tb->text[i + k], b = (unsigned char)tb->search[k];
+        if (a != b && (tb->search_case || a >= 0x80 || tolower(a) != tolower(b))) return false;
+    }
+    if (tb->search_word) {
+        if (i > 0 && is_word_char(tb->text[i - 1])) return false;
+        if (i + n < tb->text_len && is_word_char(tb->text[i + n])) return false;
+    }
+    return true;
+}
+
+void textbox_set_search(TextBox* tb, const char* query, bool match_case, bool whole_word) {
+    if (!tb) return;
+    snprintf(tb->search, sizeof(tb->search), "%s", query ? query : "");
+    // la ricerca è su una sola riga: tronca a capo eventuali
+    char* nl = strchr(tb->search, '\n');
+    if (nl) *nl = '\0';
+    tb->search_case = match_case;
+    tb->search_word = whole_word;
+}
+
+static void select_match(TextBox* tb, int at) {
+    int n = (int)strlen(tb->search);
+    tb->sel_anchor = at;
+    tb->cursor_pos = at + n;
+    update_cursor_linecol(tb);
+    tb->pref_col = tb->cursor_col;
+    tb->last_edit_kind = EDIT_NONE;
+    // centra il risultato se è fuori vista
+    int vis = visible_lines(tb);
+    if (tb->cursor_line < tb->scroll_y || tb->cursor_line >= tb->scroll_y + vis)
+        tb->scroll_y = SV_MAX(0, tb->cursor_line - vis / 3);
+    ensure_visible(tb);
+    reset_blink(tb);
+}
+
+bool textbox_find_next(TextBox* tb, bool backwards, bool from_selection_start) {
+    if (!tb || !tb->search[0]) return false;
+    int a, b;
+    sel_range(tb, &a, &b);
+    int n = tb->text_len;
+    if (!backwards) {
+        int start = from_selection_start ? a : b;
+        for (int k = 0; k <= n; k++) {
+            int i = (start + k) % (n + 1);
+            if (search_match_at(tb, i)) { select_match(tb, i); return true; }
+        }
+    } else {
+        int start = a - 1;
+        for (int k = 0; k <= n; k++) {
+            int i = ((start - k) % (n + 1) + (n + 1)) % (n + 1);
+            if (search_match_at(tb, i)) { select_match(tb, i); return true; }
+        }
+    }
+    return false;
+}
+
+int textbox_search_count(TextBox* tb, int* current) {
+    if (current) *current = 0;
+    if (!tb || !tb->search[0]) return 0;
+    int n = (int)strlen(tb->search), count = 0;
+    int a, b;
+    sel_range(tb, &a, &b);
+    for (int i = 0; i + n <= tb->text_len; i++) {
+        if (!search_match_at(tb, i)) continue;
+        count++;
+        if (current && i == a && b - a == n) *current = count;
+        i += n - 1;
+    }
+    return count;
+}
+
+bool textbox_replace_current(TextBox* tb, const char* repl) {
+    if (!tb || !tb->search[0]) return false;
+    int a, b;
+    sel_range(tb, &a, &b);
+    int n = (int)strlen(tb->search);
+    if (!(b - a == n && search_match_at(tb, a))) return textbox_find_next(tb, false, true);
+    undo_push(tb, EDIT_OTHER);
+    replace_range(tb, a, b, repl ? repl : "", -1);
+    textbox_find_next(tb, false, false);
+    return true;
+}
+
+int textbox_replace_all(TextBox* tb, const char* repl) {
+    if (!tb || !tb->search[0]) return 0;
+    if (!repl) repl = "";
+    int n = (int)strlen(tb->search), rl = (int)strlen(repl);
+    int count = 0;
+    for (int i = 0; i + n <= tb->text_len; i++)
+        if (search_match_at(tb, i)) { count++; i += n - 1; }
+    if (count == 0) return 0;
+
+    int out_len = tb->text_len + count * (rl - n);
+    char* out = malloc(out_len + 1);
+    if (!out) return 0;
+    int j = 0, cursor = tb->cursor_pos, new_cursor = -1;
+    for (int i = 0; i < tb->text_len; ) {
+        if (i == cursor && new_cursor < 0) new_cursor = j;
+        if (i + n <= tb->text_len && search_match_at(tb, i)) {
+            memcpy(out + j, repl, rl); j += rl; i += n;
+        } else {
+            out[j++] = tb->text[i++];
+        }
+    }
+    if (new_cursor < 0) new_cursor = j;
+    undo_push(tb, EDIT_OTHER);
+    replace_range(tb, 0, tb->text_len, out, j);
+    free(out);
+    move_cursor(tb, new_cursor, false, false);
+    return count;
+}
+
+char* textbox_word_or_selection(TextBox* tb) {
+    if (!tb) return NULL;
+    int a, b;
+    if (has_sel(tb)) {
+        sel_range(tb, &a, &b);
+        if (line_of(tb, a) != line_of(tb, b) || b - a > 200) return NULL;
+    } else {
+        a = b = tb->cursor_pos;
+        while (a > 0 && is_word_char(tb->text[a - 1])) a--;
+        while (b < tb->text_len && is_word_char(tb->text[b])) b++;
+        if (a == b) return NULL;
+    }
+    char* s = malloc(b - a + 1);
+    if (!s) return NULL;
+    memcpy(s, tb->text + a, b - a);
+    s[b - a] = '\0';
+    return s;
+}
+
+void textbox_goto_line(TextBox* tb, int line) {
+    if (!tb) return;
+    line = SV_CLAMP(line, 0, tb->num_lines - 1);
+    move_cursor(tb, first_non_space(tb, line), false, false);
+    int vis = visible_lines(tb);
+    tb->scroll_y = SV_MAX(0, line - vis / 3);
     clamp_scroll(tb);
 }

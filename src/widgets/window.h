@@ -21,6 +21,7 @@ SCOPO: Layout principale dell'applicazione SegVault.
 #include "button.h"
 #include "label.h"
 #include "textbox.h"
+#include "line_edit.h"
 #include "table_view.h"
 #include "tree_view.h"
 #include "scrollbar.h"
@@ -39,6 +40,14 @@ SCOPO: Layout principale dell'applicazione SegVault.
 typedef enum { RUN_SCRIPT, RUN_CURRENT } RunMode;
 
 typedef enum { STATUS_IDLE, STATUS_OK, STATUS_ERROR, STATUS_INFO } StatusKind;
+
+// barra comandi sovrapposta all'editor
+typedef enum { BAR_NONE, BAR_FIND, BAR_GOTO } BarMode;
+
+typedef enum {
+    BAR_BTN_TOGGLE_REPLACE, BAR_BTN_CASE, BAR_BTN_WORD, BAR_BTN_PREV, BAR_BTN_NEXT, BAR_BTN_CLOSE,
+    BAR_BTN_REPLACE, BAR_BTN_REPLACE_ALL, BAR_BTN_COUNT
+} BarButton;
 
 typedef struct {
     PlatformWindow* win;        // Finestra OS sottostante
@@ -68,6 +77,16 @@ typedef struct {
     TableView* results;          // griglia risultati
     Scrollbar* results_scroll_v; // scrollbar verticale risultati
     Scrollbar* results_scroll_h; // scrollbar orizzontale risultati
+
+    // -- barra comandi (trova / sostituisci / vai alla riga) --
+    BarMode    bar_mode;
+    bool       bar_replace;          // riga "sostituisci" visibile
+    bool       find_case, find_word; // opzioni di ricerca
+    LineEdit*  bar_input;
+    LineEdit*  bar_replace_input;
+    Rect       bar_rect;
+    Rect       bar_btn[BAR_BTN_COUNT];
+    int        bar_label_w;          // larghezza dell'etichetta a sinistra (modalità non-find)
 
     // -- stato --
     QueryResult* last_result;     // ultimo risultato (da liberare)
