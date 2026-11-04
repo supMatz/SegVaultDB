@@ -1,6 +1,7 @@
 #include "sql_text.h"
 #include <ctype.h>
 #include <string.h>
+#include <stdlib.h>
 
 // salta stringhe e commenti a partire da i; ritorna il nuovo indice (o i se non c'è nulla da saltare)
 static int skip_quoted_or_comment(const char* s, int len, int i) {
@@ -63,6 +64,8 @@ int sql_split(const char* s, int len, SqlRange* out, int max_out) {
     return n;
 }
 
+static bool sql_statement_in(const char* s, int pos, SqlRange* ranges, int n, SqlRange* out);
+
 static int line_of(const char* s, int pos) {
     int l = 0;
     for (int i = 0; i < pos; i++) if (s[i] == '\n') l++;
@@ -70,8 +73,18 @@ static int line_of(const char* s, int pos) {
 }
 
 bool sql_statement_at(const char* s, int len, int pos, SqlRange* out) {
-    SqlRange ranges[512];
-    int n = sql_split(s, len, ranges, 512);
+    // al massimo un intervallo per ';' più uno finale
+    int cap = 2;
+    for (int i = 0; i < len; i++) if (s[i] == ';') cap++;
+    SqlRange stack_ranges[64];
+    SqlRange* ranges = cap <= 64 ? stack_ranges : malloc(sizeof(SqlRange) * cap);
+    if (!ranges) return false;
+    bool found = sql_statement_in(s, pos, ranges, sql_split(s, len, ranges, cap), out);
+    if (ranges != stack_ranges) free(ranges);
+    return found;
+}
+
+static bool sql_statement_in(const char* s, int pos, SqlRange* ranges, int n, SqlRange* out) {
     int prev = -1;
     for (int k = 0; k < n; k++) {
         SqlRange* r = &ranges[k];

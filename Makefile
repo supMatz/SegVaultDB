@@ -9,7 +9,7 @@ else
     PLATFORM_SRC = src/platform/xlib.c
     XFT_CFLAGS  := $(shell pkg-config --cflags xft 2>/dev/null || echo -I/usr/include/freetype2)
     XFT_LIBS    := $(shell pkg-config --libs xft xrender fontconfig 2>/dev/null || echo -lXft -lXrender -lfontconfig)
-    LIBS         = -lX11 $(XFT_LIBS) -lm
+    LIBS         = -lX11 $(XFT_LIBS) -lm -pthread
     OUT          = segvault
     MKDIR        = mkdir -p
     RM           = rm -f

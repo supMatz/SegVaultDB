@@ -21,6 +21,11 @@ static void draw_icon(PlatformWindow* win, ButtonIcon icon, int cx, int cy, Colo
         case BUTTON_ICON_UNDO:    ui_icon_undo(win, cx, cy, BTN_ICON, c);     break;
         case BUTTON_ICON_REFRESH: ui_icon_refresh(win, cx, cy, BTN_ICON, c);  break;
         case BUTTON_ICON_TRASH:   ui_icon_trash(win, cx, cy, BTN_ICON, c);    break;
+        case BUTTON_ICON_STOP: {
+            int s = BTN_ICON - 6;
+            platform_fill_rect_rounded(win, (Rect){cx - s / 2, cy - s / 2, s, s}, c, 2);
+            break;
+        }
         default: break;
     }
 }

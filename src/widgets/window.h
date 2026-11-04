@@ -62,6 +62,8 @@ typedef enum {
     BAR_BTN_REPLACE, BAR_BTN_REPLACE_ALL, BAR_BTN_COUNT
 } BarButton;
 
+struct RunJob;   // esecuzione in corso nel thread di lavoro (window.c)
+
 typedef struct {
     PlatformWindow* win;        // Finestra OS sottostante
 
@@ -113,6 +115,13 @@ typedef struct {
 
     bool         help_open;         // pannello scorciatoie (F1)
 
+    // -- esecuzione in background --
+    struct RunJob*  job;            // != NULL mentre una query è in esecuzione
+    PlatformThread* job_thread;
+    int             job_base_line;  // riga dell'editor da cui inizia il testo eseguito
+    uint64_t        job_started;
+    uint64_t        job_last_status;
+
     // -- layout adattivo --
     int          sidebar_w;         // larghezza scelta dall'utente (trascinando il bordo)
     int          side_w;            // larghezza effettiva (ridotta se la finestra è stretta)
@@ -158,6 +167,8 @@ void app_window_resize(AppWindow* app, int new_w, int new_h);
 // esegue la query nell'editor e aggiorna i risultati
 void app_window_run_query(AppWindow* app);              // = RUN_SCRIPT
 void app_window_run(AppWindow* app, RunMode mode);
+void app_window_cancel(AppWindow* app);                // ferma la query in esecuzione
+bool app_window_busy(AppWindow* app);                  // true se una query è in esecuzione
 
 // imposta la directory dei dati: ripristina l'ultima sessione dell'editor e la cronologia
 void app_window_set_data_dir(AppWindow* app, const char* dir);

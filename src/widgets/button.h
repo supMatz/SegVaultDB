@@ -23,6 +23,7 @@ typedef enum {
     BUTTON_ICON_UNDO,
     BUTTON_ICON_REFRESH,
     BUTTON_ICON_TRASH,
+    BUTTON_ICON_STOP,
 } ButtonIcon;
 
 typedef struct {

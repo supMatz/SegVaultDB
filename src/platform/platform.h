@@ -167,6 +167,11 @@ void platform_set_cursor(PlatformWindow* win, CursorKind kind);
 void  platform_set_clipboard(PlatformWindow* win, const char* text);
 char* platform_get_clipboard(PlatformWindow* win);   // stringa malloc'd (free() del chiamante) o NULL
 
+// thread di lavoro (usato per eseguire le query senza bloccare l'interfaccia)
+typedef struct PlatformThread PlatformThread;
+PlatformThread* platform_thread_start(void (*fn)(void* arg), void* arg);  // NULL se non riesce
+void            platform_thread_join(PlatformThread* t);                 // attende la fine e libera
+
 // cleanup finale
 void platform_window_destroy(PlatformWindow* win);
 void platform_shutdown(void);

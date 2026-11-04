@@ -671,3 +671,34 @@ void platform_window_destroy(PlatformWindow* win) {
 void platform_shutdown(void) {
     // Niente da fare a livello globale su Win32
 }
+
+// -- thread --
+
+struct PlatformThread {
+    HANDLE handle;
+    void (*fn)(void*);
+    void* arg;
+};
+
+static DWORD WINAPI thread_entry(LPVOID p) {
+    PlatformThread* t = (PlatformThread*)p;
+    t->fn(t->arg);
+    return 0;
+}
+
+PlatformThread* platform_thread_start(void (*fn)(void* arg), void* arg) {
+    PlatformThread* t = calloc(1, sizeof(PlatformThread));
+    if (!t) return NULL;
+    t->fn = fn;
+    t->arg = arg;
+    t->handle = CreateThread(NULL, 0, thread_entry, t, 0, NULL);
+    if (!t->handle) { free(t); return NULL; }
+    return t;
+}
+
+void platform_thread_join(PlatformThread* t) {
+    if (!t) return;
+    WaitForSingleObject(t->handle, INFINITE);
+    CloseHandle(t->handle);
+    free(t);
+}

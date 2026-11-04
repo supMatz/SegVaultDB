@@ -18,6 +18,7 @@ SCOPO: Stessa interfaccia di win32.c ma usa Xlib (Linux/X11).
 #include <X11/extensions/Xrender.h>
 #include <sys/select.h>
 #include <unistd.h>      // readlink
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -726,4 +727,33 @@ void platform_window_destroy(PlatformWindow* win) {
 
 void platform_shutdown(void) {
     // Niente da fare a livello globale su Xlib
+}
+
+// -- thread --
+
+struct PlatformThread {
+    pthread_t id;
+    void (*fn)(void*);
+    void* arg;
+};
+
+static void* thread_entry(void* p) {
+    PlatformThread* t = (PlatformThread*)p;
+    t->fn(t->arg);
+    return NULL;
+}
+
+PlatformThread* platform_thread_start(void (*fn)(void* arg), void* arg) {
+    PlatformThread* t = calloc(1, sizeof(PlatformThread));
+    if (!t) return NULL;
+    t->fn = fn;
+    t->arg = arg;
+    if (pthread_create(&t->id, NULL, thread_entry, t) != 0) { free(t); return NULL; }
+    return t;
+}
+
+void platform_thread_join(PlatformThread* t) {
+    if (!t) return;
+    pthread_join(t->id, NULL);
+    free(t);
 }

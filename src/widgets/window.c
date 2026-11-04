@@ -9,11 +9,35 @@
 #include <ctype.h>
 #include <errno.h>
 #include <time.h>
-
-#define MAX_STATEMENTS 512
+#include <stdatomic.h>
 
 static void refresh_tree(AppWindow* app);
 static void update_session(AppWindow* app);
+static bool busy_guard(AppWindow* app);
+static void finish_run(AppWindow* app);
+static void style_run_button(AppWindow* app);
+
+// esecuzione in background (vedi app_window_run)
+typedef struct { char* sql; bool ok; int rows; double ms; } RunLog;
+
+typedef struct RunJob {
+    char*        text;            // copia del testo eseguito
+    SqlRange*    ranges;
+    int          n;
+    int          total_code;      // statement con codice
+    RunLog*      log;             // uno per statement eseguito (per la cronologia)
+    int          log_n;
+    QueryResult* grid;            // ultimo risultato tabellare
+    QueryResult* failed;
+    int          failed_idx, failed_offset;
+    int          executed, affected;
+    double       total_ms;
+    bool         changed;         // DDL/DML eseguito: albero e completamento da aggiornare
+    bool         cancelled;       // fermato prima di uno statement
+    atomic_int   done;
+    atomic_int   cancel;
+    atomic_int   current;         // statement in esecuzione (1-based)
+} RunJob;
 
 // ── stato / status bar ───────────────────────────────────────────
 
@@ -398,11 +422,17 @@ static void on_results_activate(int row, void* ud) {
 
 // ── callbacks dei bottoni ────────────────────────────────────────
 
-static void on_run_click(void* ud)         { app_window_run((AppWindow*)ud, RUN_SCRIPT); }
+// mentre una query è in esecuzione il pulsante Run diventa Stop
+static void on_run_click(void* ud) {
+    AppWindow* app = (AppWindow*)ud;
+    if (app->job) app_window_cancel(app);
+    else          app_window_run(app, RUN_SCRIPT);
+}
 static void on_run_current_click(void* ud) { app_window_run((AppWindow*)ud, RUN_CURRENT); }
 
 static void on_commit_click(void* ud) {
     AppWindow* app = (AppWindow*)ud;
+    if (busy_guard(app)) return;
     bool ok = db_commit();
     update_session(app);
     set_status(app, ok ? STATUS_OK : STATUS_ERROR, ok ? "COMMIT executed" : "COMMIT failed", "");
@@ -410,6 +440,7 @@ static void on_commit_click(void* ud) {
 
 static void on_rollback_click(void* ud) {
     AppWindow* app = (AppWindow*)ud;
+    if (busy_guard(app)) return;
     bool ok = db_rollback();
     update_session(app);
     refresh_tree(app);
@@ -441,6 +472,7 @@ static void on_format_click(void* ud) { format_sql((AppWindow*)ud); }
 
 static void on_refresh_click(void* ud) {
     AppWindow* app = (AppWindow*)ud;
+    if (busy_guard(app)) return;
     refresh_tree(app);
     set_status(app, STATUS_INFO, "Explorer refreshed", "");
 }
@@ -571,7 +603,7 @@ static void refresh_tree(AppWindow* app) {
 
 // click su un nodo: caricamento lazy dei figli quando viene espanso
 static void on_tree_select(TreeNode* node, void* ud) {
-    (void)ud;
+    if (busy_guard((AppWindow*)ud)) return;   // il motore è occupato dal thread di lavoro
     if (!node || !node->expanded) return;
     if (node->type == TREE_NODE_DATABASE && !node->loaded) {
         load_db_children(node);
@@ -598,6 +630,7 @@ static bool use_database(AppWindow* app, const char* db) {
 // doppio click: azione rapida sul nodo
 static void on_tree_activate(TreeNode* node, void* ud) {
     AppWindow* app = (AppWindow*)ud;
+    if (busy_guard(app)) return;
     if (!node) return;
 
     switch (node->type) {
@@ -1041,6 +1074,7 @@ static void refresh_widget_colors(AppWindow* app) {
     if (app->status_kind == STATUS_ERROR) c = TH_ERROR;
     label_set_color(app->lbl_status, c);
     label_set_color(app->lbl_db_name, TH_TEXT);
+    style_run_button(app);
 }
 
 static void set_theme(AppWindow* app, int index, bool announce) {
@@ -1147,7 +1181,7 @@ typedef struct { const char* title; const Shortcut* items; int count; } Shortcut
 static const Shortcut SC_RUN[] = {
     { "F5", "Run script or selection" }, { "Ctrl+Enter", "Run statement under cursor" },
     { "Ctrl+Shift+F", "Format SQL" }, { "Ctrl+Shift+H", "Query history" },
-    { "Ctrl+Shift+T", "Next color theme" },
+    { "Ctrl+Shift+T", "Next color theme" }, { "Esc / Stop", "Cancel the running query" },
 };
 static const Shortcut SC_FILE[] = {
     { "Ctrl+N", "New script" }, { "Ctrl+O", "Open file" },
@@ -1245,10 +1279,12 @@ static void apply_toolbar_level(AppWindow* app, int level) {
     for (int i = 0; i < 5; i++) {
         const ToolbarText* t = &TOOLBAR_TEXT[i];
         const char* label = t->label;
+        const char* hint  = t->hint;
+        if (i == 0 && app->job) { label = "Stop"; hint = "Esc"; }
         if (level >= 2 && t->has_icon) label = "";
         if (level >= 3 && !t->has_icon) label = "Fmt";
         button_set_label(b[i], label);
-        button_set_hint(b[i], level == 0 ? t->hint : NULL);
+        button_set_hint(b[i], level == 0 ? hint : NULL);
     }
 }
 
@@ -1336,6 +1372,7 @@ static void draw_tooltip(AppWindow* app) {
     if (!app->tip_visible || app->tip_target < 0) return;
     PlatformWindow* win = app->win;
     const char* text = TIP_TEXT[app->tip_target];
+    if (app->tip_target == TIP_RUN && app->job) text = "Stop the running query  \xc2\xb7  Esc";
     Rect a = tip_rect_of(app, app->tip_target);
     int tw = platform_measure_text_ex(win, text, -1, TH_FONT_SMALL + 1, FONT_UI);
     Rect r = {a.x + a.w / 2 - (tw + 20) / 2, a.y + a.h + 6, tw + 20, 26};
@@ -1600,6 +1637,12 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
     if (evt->type == EVT_KEY_DOWN) {
         bool ctrl  = evt->modifiers & SV_MOD_CTRL;
         bool shift = evt->modifiers & SV_MOD_SHIFT;
+        // Esc ferma la query in esecuzione (se non serve a chiudere popup, barra o selezione)
+        if (evt->key == KEY_ESCAPE && app->job && !bar_visible(app) && !app->editor->popup_open &&
+            !textbox_has_selection(app->editor)) {
+            app_window_cancel(app);
+            return;
+        }
         if (evt->key == KEY_F5) { app_window_run(app, RUN_SCRIPT); return; }
         if (evt->key == KEY_LETTER && ctrl && !(evt->modifiers & SV_MOD_ALT)) {
             switch (evt->character) {
@@ -1730,6 +1773,25 @@ bool app_window_tick(AppWindow* app, uint64_t now_ms) {
     bool a = textbox_tick(app->editor, now_ms);
     bool b = line_edit_tick(app->bar_input, now_ms);
     bool c = line_edit_tick(app->bar_replace_input, now_ms);
+    // esecuzione in background: completamento e stato con il tempo trascorso
+    if (app->job) {
+        if (atomic_load(&app->job->done)) {
+            finish_run(app);
+            return true;
+        }
+        if (now_ms - app->job_last_status >= 100) {
+            app->job_last_status = now_ms;
+            char msg[96], meta[48];
+            int cur = atomic_load(&app->job->current);
+            if (atomic_load(&app->job->cancel))  snprintf(msg, sizeof(msg), "Cancelling\xe2\x80\xa6");
+            else if (app->job->total_code > 1)   snprintf(msg, sizeof(msg), "Running statement %d of %d\xe2\x80\xa6",
+                                                          SV_MAX(cur, 1), app->job->total_code);
+            else                                 snprintf(msg, sizeof(msg), "Running\xe2\x80\xa6");
+            snprintf(meta, sizeof(meta), "%.1f s", (now_ms - app->job_started) / 1000.0);
+            set_status(app, STATUS_INFO, msg, meta);
+            return true;
+        }
+    }
     bool d = false;
     if (app->tip_target >= 0 && !app->tip_visible && now_ms >= app->tip_since + TIP_DELAY_MS) {
         app->tip_visible = true;
@@ -1979,117 +2041,214 @@ void app_window_run_query(AppWindow* app) {
     app_window_run(app, RUN_SCRIPT);
 }
 
-void app_window_run(AppWindow* app, RunMode mode) {
-    if (!app) return;
-    TextBox* tb = app->editor;
+// ── esecuzione in background ─────────────────────────────────────
+// Il worker esegue gli statement e accumula i risultati in RunJob senza toccare
+// lo stato della GUI; il thread principale (app_window_tick) li mostra a fine corsa.
+// Durante l'esecuzione la GUI non chiama il motore (explorer, commit/rollback bloccati).
 
-    // 1. testo da eseguire e suo offset nel documento (per mappare gli errori)
-    char* owned = NULL;
-    const char* text;
-    int base = 0;
-    if (mode == RUN_CURRENT || textbox_has_selection(tb)) {
-        base = textbox_get_run_text(tb, &owned);
-        if (base < 0 || !owned) {
-            set_status(app, STATUS_INFO, "Nothing to run: the cursor is not on a statement", "");
-            return;
-        }
-        text = owned;
-    } else {
-        text = textbox_get_text(tb);
-    }
-    int len = (int)strlen(text);
 
-    // 2. divisione in statement (i ';' dentro stringhe e commenti sono ignorati)
-    SqlRange* ranges = malloc(sizeof(SqlRange) * MAX_STATEMENTS);
-    if (!ranges) { free(owned); return; }
-    int n = sql_split(text, len, ranges, MAX_STATEMENTS);
-
-    int executed = 0, total_code = 0, affected = 0;
-    double total_ms = 0;
-    QueryResult* grid = NULL;          // ultimo risultato tabellare
-    QueryResult* failed = NULL;
-    int failed_idx = -1, failed_offset = 0;
-    bool changed = false;
-
-    for (int i = 0; i < n; i++) if (ranges[i].has_code) total_code++;
-
-    for (int i = 0; i < n; i++) {
-        SqlRange* r = &ranges[i];
+static void run_worker(void* arg) {
+    RunJob* j = (RunJob*)arg;
+    for (int i = 0; i < j->n; i++) {
+        SqlRange* r = &j->ranges[i];
         if (!r->has_code) continue;
+        if (atomic_load(&j->cancel)) { j->cancelled = true; break; }
         int slen = r->end_semi - r->code_start;
         char* stmt = malloc(slen + 1);
         if (!stmt) break;
-        memcpy(stmt, text + r->code_start, slen);
+        memcpy(stmt, j->text + r->code_start, slen);
         stmt[slen] = '\0';
+        atomic_store(&j->current, j->executed + 1);
 
         QueryResult* res = db_execute(stmt);
-        history_add(app, stmt, res && res->success,
-                    res ? (res->num_cols > 0 ? res->num_rows : res->rows_affected) : 0,
-                    res ? res->exec_time_ms : 0);
-        free(stmt);
-        executed++;
-
+        j->executed++;
+        j->log[j->log_n++] = (RunLog){ stmt, res && res->success,
+                                       res ? (res->num_cols > 0 ? res->num_rows : res->rows_affected) : 0,
+                                       res ? res->exec_time_ms : 0 };
         if (!res || !res->success) {
-            failed = res;
-            failed_idx = executed;
-            failed_offset = r->code_start;
+            j->failed = res;
+            j->failed_idx = j->executed;
+            j->failed_offset = r->code_start;
             break;
         }
-        total_ms += res->exec_time_ms;
+        j->total_ms += res->exec_time_ms;
         if (res->num_cols > 0) {
-            if (grid) db_result_free(grid);
-            grid = res;
+            if (j->grid) db_result_free(j->grid);
+            j->grid = res;
         } else {
-            affected += res->rows_affected;
-            changed = true;
+            j->affected += res->rows_affected;
+            j->changed = true;
             db_result_free(res);
         }
     }
-    free(ranges);
+    atomic_store(&j->done, 1);
+}
 
-    char msg[1200], meta[160];
+static void job_free(RunJob* j) {
+    if (!j) return;
+    for (int i = 0; i < j->log_n; i++) free(j->log[i].sql);
+    free(j->log);
+    free(j->ranges);
+    free(j->text);
+    if (j->grid) db_result_free(j->grid);
+    if (j->failed) db_result_free(j->failed);
+    free(j);
+}
+
+// aspetto dei comandi mentre una query è in esecuzione
+static void style_run_button(AppWindow* app) {
+    Button* b = app->btn_run;
+    button_set_style(b, BUTTON_STYLE_PRIMARY);
+    if (app->job) {
+        button_set_icon(b, BUTTON_ICON_STOP, (Color){0, 0, 0, 0});
+        b->color_bg = b->color_border = TH_ERROR;
+        b->color_hover   = ui_mix(TH_ERROR, (Color){255, 255, 255, 255}, 0.15f);
+        b->color_pressed = ui_mix(TH_ERROR, (Color){0, 0, 0, 255}, 0.15f);
+        b->color_text    = (Color){255, 255, 255, 255};
+    } else {
+        button_set_icon(b, BUTTON_ICON_PLAY, (Color){0, 0, 0, 0});
+    }
+    bool idle = app->job == NULL;
+    button_set_enabled(app->btn_run_current, idle);
+    button_set_enabled(app->btn_commit, idle);
+    button_set_enabled(app->btn_rollback, idle);
+    button_set_enabled(app->btn_refresh, idle);
+}
+
+bool app_window_busy(AppWindow* app) { return app && app->job; }
+
+// messaggio standard quando si prova a usare il motore durante un'esecuzione
+static bool busy_guard(AppWindow* app) {
+    if (!app->job) return false;
+    set_status(app, STATUS_INFO, "A query is running \xc2\xb7 press Stop (or Esc) to cancel it", "");
+    return true;
+}
+
+void app_window_cancel(AppWindow* app) {
+    if (!app || !app->job) return;
+    atomic_store(&app->job->cancel, 1);
+    db_request_cancel();
+    set_status(app, STATUS_INFO, "Cancelling\xe2\x80\xa6", "SELECT stops now, other statements finish first");
+}
+
+void app_window_run(AppWindow* app, RunMode mode) {
+    if (!app) return;
+    if (busy_guard(app)) return;
+    TextBox* tb = app->editor;
+
+    // 1. testo da eseguire e suo offset nel documento (per mappare gli errori)
+    char* text = NULL;
+    int base = 0;
+    if (mode == RUN_CURRENT || textbox_has_selection(tb)) {
+        base = textbox_get_run_text(tb, &text);
+        if (base < 0 || !text) {
+            set_status(app, STATUS_INFO, "Nothing to run: the cursor is not on a statement", "");
+            return;
+        }
+    } else {
+        text = strdup(textbox_get_text(tb));
+        if (!text) return;
+    }
+
+    // 2. divisione in statement (i ';' dentro stringhe e commenti sono ignorati)
+    // al massimo un intervallo per ';' più uno finale: nessun limite fisso al numero di statement
+    int max_ranges = 2;
+    for (const char* c = text; *c; c++) if (*c == ';') max_ranges++;
+    RunJob* j = calloc(1, sizeof(RunJob));
+    SqlRange* ranges = malloc(sizeof(SqlRange) * max_ranges);
+    if (!j || !ranges) { free(j); free(ranges); free(text); return; }
+    j->text = text;
+    j->ranges = ranges;
+    j->n = sql_split(text, (int)strlen(text), ranges, max_ranges);
+    for (int i = 0; i < j->n; i++) if (ranges[i].has_code) j->total_code++;
+    if (j->total_code == 0) {
+        job_free(j);
+        set_status(app, STATUS_INFO, "Nothing to run", "");
+        return;
+    }
+    j->log = calloc(j->total_code, sizeof(RunLog));
+    if (!j->log) { job_free(j); return; }
+
+    // 3. avvio del thread di lavoro
     textbox_set_error_line(tb, -1);
+    db_clear_cancel();
+    app->job = j;
+    app->job_base_line = textbox_line_of_offset(tb, base);
+    app->job_started = app->job_last_status = platform_time_ms();
+    app->job_thread = platform_thread_start(run_worker, j);
+    if (!app->job_thread) {          // impossibile creare il thread: esecuzione diretta
+        run_worker(j);
+    }
+    style_run_button(app);
+    set_status(app, STATUS_INFO, "Running\xe2\x80\xa6", "");
+}
 
-    if (failed_idx > 0) {
+// a esecuzione terminata (thread principale): cronologia, risultati, errori
+static void finish_run(AppWindow* app) {
+    RunJob* j = app->job;
+    if (app->job_thread) platform_thread_join(app->job_thread);
+    app->job_thread = NULL;
+    app->job = NULL;
+    style_run_button(app);
+
+    TextBox* tb = app->editor;
+    for (int i = 0; i < j->log_n; i++) history_add(app, j->log[i].sql, j->log[i].ok, j->log[i].rows, j->log[i].ms);
+
+    double wall = (double)(platform_time_ms() - app->job_started);
+    char msg[1200], meta[160];
+    // annullata davvero solo se uno statement è stato interrotto o saltato: se lo Stop arriva
+    // quando tutto è già finito, si mostrano normalmente i risultati
+    bool cancelled_select = j->failed && strcmp(j->failed->error, "Query cancelled") == 0;
+
+    if (j->failed_idx > 0 && !cancelled_select) {
         // errore: evidenzia la riga dello statement nell'editor
-        int line = textbox_line_of_offset(tb, base + failed_offset);
+        int line = app->job_base_line;
+        for (int k = 0; k < j->failed_offset && j->text[k]; k++) if (j->text[k] == '\n') line++;
         textbox_set_error_line(tb, line);
         textbox_scroll_to_line(tb, line);
-        const char* err = failed ? failed->error : "No response from the engine";
+        const char* err = j->failed ? j->failed->error : "No response from the engine";
 
         char title[128];
-        if (total_code > 1) snprintf(title, sizeof(title), "Statement %d of %d failed", failed_idx, total_code);
-        else                snprintf(title, sizeof(title), "Query failed");
+        if (j->total_code > 1) snprintf(title, sizeof(title), "Statement %d of %d failed", j->failed_idx, j->total_code);
+        else                   snprintf(title, sizeof(title), "Query failed");
         snprintf(msg, sizeof(msg), "Line %d: %s", line + 1, err);
-        snprintf(meta, sizeof(meta), "%d of %d executed", failed_idx - 1, total_code);
-
-        if (grid) db_result_free(grid);
+        snprintf(meta, sizeof(meta), "%d of %d executed", j->failed_idx - 1, j->total_code);
         show_result(app, NULL);
         table_view_set_message(app->results, TABLE_MSG_ERROR, title, err);
         set_status(app, STATUS_ERROR, msg, meta);
-        if (failed) db_result_free(failed);
-    } else if (executed == 0) {
-        set_status(app, STATUS_INFO, "Nothing to run", "");
-    } else if (grid) {
+    } else if (j->cancelled || cancelled_select) {
+        int done_ok = j->executed - (cancelled_select ? 1 : 0);
+        snprintf(msg, sizeof(msg), "Cancelled after %d of %d statement%s", done_ok, j->total_code,
+                 j->total_code == 1 ? "" : "s");
+        snprintf(meta, sizeof(meta), "%.1f s", wall / 1000.0);
+        show_result(app, NULL);
+        table_view_set_message(app->results, TABLE_MSG_ERROR, "Execution cancelled",
+                               "Statements already completed were applied; the rest was not executed.");
+        set_status(app, STATUS_INFO, msg, meta);
+    } else if (j->grid) {
+        QueryResult* grid = j->grid;
+        j->grid = NULL;
         show_result(app, grid);
-        if (executed > 1) snprintf(msg, sizeof(msg), "%d statements executed, showing last result", executed);
-        else              snprintf(msg, sizeof(msg), "%d row%s returned", grid->num_rows, grid->num_rows == 1 ? "" : "s");
+        if (j->executed > 1) snprintf(msg, sizeof(msg), "%d statements executed, showing last result", j->executed);
+        else                 snprintf(msg, sizeof(msg), "%d row%s returned", grid->num_rows, grid->num_rows == 1 ? "" : "s");
         snprintf(meta, sizeof(meta), "%d rows  \xc2\xb7  %d cols  \xc2\xb7  %.1f ms",
-                 grid->num_rows, grid->num_cols, total_ms);
+                 grid->num_rows, grid->num_cols, j->total_ms);
         set_status(app, STATUS_OK, msg, meta);
     } else {
         show_result(app, NULL);
         char detail[160];
         snprintf(detail, sizeof(detail), "%d row%s affected  \xc2\xb7  %.1f ms",
-                 affected, affected == 1 ? "" : "s", total_ms);
-        if (executed > 1) snprintf(msg, sizeof(msg), "%d statements executed", executed);
-        else              snprintf(msg, sizeof(msg), "Query OK");
+                 j->affected, j->affected == 1 ? "" : "s", j->total_ms);
+        if (j->executed > 1) snprintf(msg, sizeof(msg), "%d statements executed", j->executed);
+        else                 snprintf(msg, sizeof(msg), "Query OK");
         table_view_set_message(app->results, TABLE_MSG_OK, msg, detail);
-        snprintf(meta, sizeof(meta), "%.1f ms", total_ms);
+        snprintf(meta, sizeof(meta), "%.1f ms", j->total_ms);
         set_status(app, STATUS_OK, msg, meta);
     }
 
-    free(owned);
+    bool changed = j->changed;
+    job_free(j);
+    db_clear_cancel();
 
     // aggiornamento nome DB (potrebbe essere cambiato con USE) e albero se il DDL ha modificato la struttura
     update_session(app);
@@ -2098,6 +2257,13 @@ void app_window_run(AppWindow* app, RunMode mode) {
 
 void app_window_destroy(AppWindow* app) {
     if (!app) return;
+    if (app->job) {   // chiusura durante un'esecuzione: annulla e attende il thread prima di chiudere il motore
+        atomic_store(&app->job->cancel, 1);
+        db_request_cancel();
+        if (app->job_thread) platform_thread_join(app->job_thread);
+        app->job_thread = NULL;
+        finish_run(app);
+    }
     if (app->last_result) db_result_free(app->last_result);
     widget_destroy((Widget*)app->btn_run);
     widget_destroy((Widget*)app->btn_run_current);
