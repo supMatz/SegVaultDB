@@ -103,6 +103,9 @@ void table_view_sort(TableView* tv, int col, bool asc);   // col < 0 = ordine or
 // Ritorna una stringa malloc'd (free() del chiamante) o NULL se non c'è una griglia.
 char* table_view_export(TableView* tv, bool csv);
 
+void table_view_fit_column(TableView* tv, int col);   // adatta la larghezza al contenuto
+void table_view_ensure_visible(TableView* tv);        // scrolla fino alla cella selezionata
+
 // true se (mx, my) è sul bordo ridimensionabile di una colonna (per il cursore)
 bool table_view_hit_resize(TableView* tv, int mx, int my);
 

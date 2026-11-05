@@ -639,7 +639,10 @@ void platform_present(PlatformWindow *win) {
     // copio il backbuffer sulla finestra principale (equivalente a BitBlt)
     XCopyArea(win->display, win->backbuf, win->window, win->gc,
               0, 0, win->w, win->h, 0, 0);
-    XFlush(win->display); // invio al server X
+    // XSync (non solo XFlush): aspetta che il server abbia eseguito il disegno. Su un server
+    // lento (desktop remoto, X senza accelerazione) altrimenti i fotogrammi si accumulano e
+    // l'interfaccia resta indietro di secondi rispetto all'input
+    XSync(win->display, False);
 }
 
 void platform_draw_bitmap(PlatformWindow* win, Rect dest, uint32_t* pixels, int pw, int ph) {

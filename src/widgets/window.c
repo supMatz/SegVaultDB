@@ -16,6 +16,7 @@ static void update_session(AppWindow* app);
 static bool busy_guard(AppWindow* app);
 static void finish_run(AppWindow* app);
 static void style_run_button(AppWindow* app);
+static void cell_view_open(AppWindow* app);
 
 // esecuzione in background (vedi app_window_run)
 typedef struct { char* sql; bool ok; int rows; double ms; } RunLog;
@@ -129,6 +130,8 @@ static void set_result_tabs(AppWindow* app, QueryResult** rs, int n, int select)
     app->cur_tab  = n ? SV_CLAMP(select, 0, n - 1) : 0;
     app->last_result = n ? app->tabs[app->cur_tab] : NULL;
     app->showing_history = false;
+    app->cell_open = false;
+    app->ctx_kind  = 0;
     table_view_set_result(app->results, app->last_result);
     for (int i = 0; i < nold; i++) {
         bool kept = false;
@@ -420,9 +423,11 @@ static void history_toggle(AppWindow* app) {
 static void on_history_click(void* ud) { history_toggle((AppWindow*)ud); }
 
 // doppio click su una riga della cronologia: inserisce lo statement nell'editor
+// sugli altri risultati apre il visualizzatore della cella
 static void on_results_activate(int row, void* ud) {
     AppWindow* app = (AppWindow*)ud;
-    if (!app->showing_history || row < 0 || row >= app->history_count) return;
+    if (!app->showing_history) { cell_view_open(app); return; }
+    if (row < 0 || row >= app->history_count) return;
     if (app->results->order) row = app->results->order[row];   // griglia ordinata
     const HistoryEntry* e = &app->history[app->history_count - 1 - row];
     size_t n = strlen(e->sql);
@@ -1202,6 +1207,556 @@ static bool theme_handle_event(AppWindow* app, sEvent* evt) {
     }
 }
 
+// ── griglia: cella selezionata, visualizzatore di cella, menu contestuale ──
+
+static bool grid_ready(const AppWindow* app) {
+    const TableView* tv = app->results;
+    return tv->result && tv->result->num_cols > 0 && tv->msg_kind == TABLE_MSG_NONE;
+}
+
+// riga visualizzata in posizione i (tiene conto dell'ordinamento)
+static Row* grid_row(AppWindow* app, int i) {
+    TableView* tv = app->results;
+    return &tv->result->rows[tv->order ? tv->order[i] : i];
+}
+
+static bool grid_has_row(AppWindow* app) {
+    TableView* tv = app->results;
+    return grid_ready(app) && tv->selected_row >= 0 && tv->selected_row < tv->result->num_rows;
+}
+
+static bool grid_has_col(AppWindow* app) {
+    TableView* tv = app->results;
+    return grid_ready(app) && tv->selected_col >= 0 && tv->selected_col < tv->result->num_cols;
+}
+
+static Cell* grid_cell(AppWindow* app) {
+    if (!grid_has_row(app) || !grid_has_col(app)) return NULL;
+    Row* row = grid_row(app, app->results->selected_row);
+    int c = app->results->selected_col;
+    return c < row->num_cells ? &row->cells[c] : NULL;
+}
+
+static const char* cell_text(const Cell* c) { return c->is_null ? "NULL" : c->value; }
+
+// buffer di testo che cresce
+typedef struct { char* p; size_t n, cap; } SBuf;
+
+static void sb_add(SBuf* b, const char* s) {
+    size_t n = strlen(s);
+    if (b->n + n + 1 > b->cap) {
+        size_t cap = SV_MAX(b->cap * 2, b->n + n + 256);
+        char* p = realloc(b->p, cap);
+        if (!p) return;
+        b->p = p;
+        b->cap = cap;
+    }
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = '\0';
+}
+
+// valore della cella come letterale SQL ('testo' con apici raddoppiati, numeri così come sono)
+static char* sql_literal(const Cell* c) {
+    if (c->is_null) return strdup("NULL");
+    if (c->type == CELL_TYPE_INT || c->type == CELL_TYPE_FLOAT) return strdup(c->value);
+    SBuf b = {0};
+    sb_add(&b, "'");
+    char one[2] = {0, 0};
+    for (const char* s = c->value; *s; s++) {
+        one[0] = *s;
+        sb_add(&b, *s == '\'' ? "''" : one);
+    }
+    sb_add(&b, "'");
+    return b.p;
+}
+
+static void copy_and_report(AppWindow* app, const char* text, const char* what) {
+    if (!text) return;
+    platform_set_clipboard(app->win, text);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Copied %s to the clipboard", what);
+    set_status(app, STATUS_OK, msg, "");
+}
+
+// ── visualizzatore di cella ──────────────────────────────────────
+
+#define CELL_VIEW_MAX_LINES 4096
+#define CELL_VIEW_LINE_H    20
+
+static void cell_view_open(AppWindow* app) {
+    TableView* tv = app->results;
+    if (!grid_has_row(app)) return;
+    if (tv->selected_col < 0) tv->selected_col = 0;
+    if (!grid_cell(app)) return;
+    app->cell_open   = true;
+    app->cell_scroll = 0;
+    app->ctx_kind    = 0;
+}
+
+// spezza il testo in righe larghe al massimo max_w (a capo sugli spazi quando possibile)
+static int wrap_lines(PlatformWindow* win, const char* s, int max_w, int size, FontStyle st,
+                      int* starts, int* lens, int max_lines) {
+    int n = 0, i = 0, len = (int)strlen(s);
+    while (n < max_lines) {
+        int j = i, last_space = -1;
+        while (j < len && s[j] != '\n') {
+            int k = j + 1;
+            while (k < len && ((unsigned char)s[k] & 0xC0) == 0x80) k++;   // carattere UTF-8 intero
+            if (j > i && platform_measure_text_ex(win, s + i, k - i, size, st) > max_w) break;
+            if (s[j] == ' ') last_space = k;
+            j = k;
+        }
+        starts[n] = i;
+        if (j < len && s[j] != '\n') {                 // riga troppo lunga: a capo sull'ultimo spazio
+            int end = last_space > i ? last_space : j;
+            lens[n++] = end - i;
+            i = end;
+            continue;
+        }
+        lens[n++] = j - i;
+        if (j >= len) break;
+        i = j + 1;                                      // salta il '\n'
+    }
+    return SV_MAX(n, 1);
+}
+
+static void draw_cell_view(AppWindow* app) {
+    if (!app->cell_open) return;
+    Cell* cell = grid_cell(app);
+    if (!cell) { app->cell_open = false; return; }
+    PlatformWindow* win = app->win;
+    TableView* tv = app->results;
+    QueryResult* res = tv->result;
+    int W = app->win_w, H = app->win_h;
+    int c = tv->selected_col;
+
+    platform_fill_rect(win, (Rect){0, 0, W, H}, ui_alpha(TH_BG, 170));
+    int pw = SV_MIN(760, W - 32), ph = SV_MIN(500, H - 32);
+    Rect r = {(W - pw) / 2, (H - ph) / 2, pw, ph};
+    app->cell_rect = r;
+    platform_fill_rect_rounded(win, (Rect){r.x - 2, r.y + 4, r.w + 4, r.h + 4}, ui_alpha(TH_BG, 200), 12);
+    ui_round_box(win, r, TH_SURFACE_2, TH_BORDER_STRONG, 10);
+    platform_set_clip(win, r);
+
+    // intestazione: colonna, tipo, posizione
+    const char* name = res->col_names && res->col_names[c] ? res->col_names[c] : "?";
+    const char* type = res->col_types && res->col_types[c] ? res->col_types[c] : "";
+    if (!type[0] && !cell->is_null) {   // il motore non sempre riporta il tipo della colonna
+        static const char* const NAMES[] = { [CELL_TYPE_INT] = "INT", [CELL_TYPE_FLOAT] = "FLOAT",
+            [CELL_TYPE_STRING] = "TEXT", [CELL_TYPE_BOOL] = "BOOLEAN", [CELL_TYPE_DATE] = "DATE", [CELL_TYPE_BLOB] = "BLOB" };
+        if ((int)cell->type >= 0 && (int)cell->type < (int)(sizeof(NAMES) / sizeof(NAMES[0])) && NAMES[cell->type])
+            type = NAMES[cell->type];
+    }
+    char pos[96];
+    snprintf(pos, sizeof(pos), "Row %d of %d  \xc2\xb7  Column %d of %d", tv->selected_row + 1, res->num_rows,
+             c + 1, res->num_cols);
+    int pos_w = platform_measure_text_ex(win, pos, -1, TH_FONT_SMALL + 1, FONT_UI);
+    Rect hr = {r.x + 20, r.y + 14, r.w - 40, 26};
+    int tw = ui_text_clipped(win, name, hr.x, ui_text_y(win, hr, 16, FONT_UI_BOLD), SV_MAX(60, hr.w - pos_w - 120),
+                             TH_TEXT, 16, FONT_UI_BOLD);
+    if (type[0]) {
+        int bw = platform_measure_text_ex(win, type, -1, TH_FONT_SMALL, FONT_MONO) + 14;
+        Rect badge = {hr.x + tw + 10, hr.y + 3, bw, 20};
+        ui_round_box(win, badge, TH_ACCENT_SOFT, TH_ACCENT_SOFT, 10);
+        platform_draw_text_ex(win, type, -1, (Point){badge.x + 7, ui_text_y(win, badge, TH_FONT_SMALL, FONT_MONO)},
+                              TH_ACCENT_TEXT, TH_FONT_SMALL, FONT_MONO);
+    }
+    platform_draw_text_ex(win, pos, -1, (Point){hr.x + hr.w - pos_w, ui_text_y(win, hr, TH_FONT_SMALL + 1, FONT_UI)},
+                          TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_UI);
+
+    // corpo: il valore, a capo automatico e scrollabile
+    Rect body = {r.x + 20, r.y + 52, r.w - 40, r.h - 52 - 60};
+    ui_round_box(win, body, TH_EDITOR_BG, TH_BORDER, 6);
+    static int starts[CELL_VIEW_MAX_LINES], lens[CELL_VIEW_MAX_LINES];
+    int inner_w = body.w - 32;
+    int vis = SV_MAX(1, (body.h - 20) / CELL_VIEW_LINE_H);
+    if (cell->is_null) {
+        app->cell_lines = 1;
+        platform_draw_text_ex(win, "NULL", -1, (Point){body.x + 14, body.y + 12}, TH_TEXT_FAINT, TH_FONT_MONO, FONT_MONO);
+    } else {
+        int n = wrap_lines(win, cell->value, inner_w, TH_FONT_MONO, FONT_MONO, starts, lens, CELL_VIEW_MAX_LINES);
+        app->cell_lines  = n;
+        app->cell_scroll = SV_CLAMP(app->cell_scroll, 0, SV_MAX(0, n - vis));
+        platform_set_clip(win, (Rect){body.x + 1, body.y + 1, body.w - 2, body.h - 2});
+        for (int i = app->cell_scroll; i < n && i < app->cell_scroll + vis + 1; i++) {
+            int y = body.y + 10 + (i - app->cell_scroll) * CELL_VIEW_LINE_H;
+            if (lens[i] > 0)
+                platform_draw_text_ex(win, cell->value + starts[i], lens[i], (Point){body.x + 14, y + 2},
+                                      TH_CELL_TEXT, TH_FONT_MONO, FONT_MONO);
+        }
+        platform_set_clip(win, r);
+        if (n > vis) {   // indicatore di scroll
+            int track = body.h - 12;
+            int th = SV_MAX(24, track * vis / n);
+            int ty = body.y + 6 + (track - th) * app->cell_scroll / SV_MAX(1, n - vis);
+            platform_fill_rect_rounded(win, (Rect){body.x + body.w - 9, ty, 4, th}, TH_BORDER_STRONG, 2);
+        }
+    }
+
+    // piede: statistiche e pulsanti
+    Rect fr = {r.x + 20, r.y + r.h - 46, r.w - 40, 30};
+    char info[128];
+    if (cell->is_null) snprintf(info, sizeof(info), "NULL value  \xc2\xb7  arrows move  \xc2\xb7  Esc closes");
+    else {
+        int chars = 0;
+        for (const char* s = cell->value; *s; s++) if (((unsigned char)*s & 0xC0) != 0x80) chars++;
+        snprintf(info, sizeof(info), "%d character%s  \xc2\xb7  %d line%s  \xc2\xb7  arrows move  \xc2\xb7  Esc closes",
+                 chars, chars == 1 ? "" : "s", app->cell_lines, app->cell_lines == 1 ? "" : "s");
+    }
+    app->cell_btn_close = (Rect){fr.x + fr.w - 76, fr.y, 76, fr.h};
+    app->cell_btn_copy  = (Rect){app->cell_btn_close.x - 8 - 76, fr.y, 76, fr.h};
+    ui_text_clipped(win, info, fr.x, ui_text_y(win, fr, TH_FONT_SMALL + 1, FONT_UI), app->cell_btn_copy.x - fr.x - 12,
+                    TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_UI);
+    draw_bar_button(app, app->cell_btn_copy, "Copy", false);
+    draw_bar_button(app, app->cell_btn_close, "Close", true);
+    platform_reset_clip(win);
+}
+
+static void cell_view_move(AppWindow* app, int drow, int dcol) {
+    TableView* tv = app->results;
+    tv->selected_row = SV_CLAMP(tv->selected_row + drow, 0, tv->result->num_rows - 1);
+    tv->selected_col = SV_CLAMP(tv->selected_col + dcol, 0, tv->result->num_cols - 1);
+    app->cell_scroll = 0;
+    table_view_ensure_visible(tv);
+}
+
+// il visualizzatore è modale: consuma tutti gli eventi tranne il rilascio del mouse
+static void cell_view_handle_event(AppWindow* app, sEvent* evt) {
+    Cell* cell = grid_cell(app);
+    if (!cell) { app->cell_open = false; return; }
+    switch (evt->type) {
+        case EVT_MOUSE_MOVE:
+            app->mouse_x = evt->mouse_x;
+            app->mouse_y = evt->mouse_y;
+            platform_set_cursor(app->win, rect_has(app->cell_btn_copy, evt->mouse_x, evt->mouse_y) ||
+                                          rect_has(app->cell_btn_close, evt->mouse_x, evt->mouse_y) ? CURSOR_HAND : CURSOR_ARROW);
+            break;
+        case EVT_MOUSE_WHEEL:
+            app->cell_scroll = SV_MAX(0, app->cell_scroll - evt->wheel_delta * 3);
+            break;
+        case EVT_MOUSE_DOWN:
+            if (rect_has(app->cell_btn_copy, evt->mouse_x, evt->mouse_y)) copy_and_report(app, cell_text(cell), "the value");
+            else if (rect_has(app->cell_btn_close, evt->mouse_x, evt->mouse_y) ||
+                     !rect_has(app->cell_rect, evt->mouse_x, evt->mouse_y)) app->cell_open = false;
+            break;
+        case EVT_KEY_DOWN: {
+            bool ctrl = evt->modifiers & SV_MOD_CTRL;
+            switch (evt->key) {
+                case KEY_ESCAPE: case KEY_ENTER: app->cell_open = false; break;
+                case KEY_LETTER:
+                    if (ctrl && evt->character == 'c') copy_and_report(app, cell_text(cell), "the value");
+                    break;
+                case KEY_UP:       cell_view_move(app, -1, 0); break;
+                case KEY_DOWN:     cell_view_move(app, +1, 0); break;
+                case KEY_LEFT:     cell_view_move(app, 0, -1); break;
+                case KEY_RIGHT:    cell_view_move(app, 0, +1); break;
+                case KEY_TAB:      cell_view_move(app, 0, (evt->modifiers & SV_MOD_SHIFT) ? -1 : 1); break;
+                case KEY_PAGEUP:   app->cell_scroll = SV_MAX(0, app->cell_scroll - 10); break;
+                case KEY_PAGEDOWN: app->cell_scroll += 10; break;
+                case KEY_HOME:     app->cell_scroll = 0; break;
+                case KEY_END:      app->cell_scroll = app->cell_lines; break;
+                default: break;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// ── menu contestuale ─────────────────────────────────────────────
+
+typedef enum {
+    CTX_SEP = 0,
+    // griglia
+    CTX_VIEW, CTX_COPY_VALUE, CTX_COPY_LITERAL, CTX_INSERT_VALUE, CTX_COPY_ROW, CTX_COPY_COLUMN, CTX_COPY_COL_NAME,
+    CTX_SORT_ASC, CTX_SORT_DESC, CTX_SORT_CLEAR, CTX_FIT_COL, CTX_COPY_ALL, CTX_EXPORT,
+    // editor
+    CTX_CUT, CTX_COPY, CTX_PASTE, CTX_SELECT_ALL, CTX_RUN, CTX_RUN_STMT, CTX_FORMAT, CTX_COMMENT,
+    CTX_ACTION_COUNT
+} CtxAction;
+
+typedef struct { const char* label; const char* keys; } CtxInfo;
+
+static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
+    [CTX_VIEW]          = { "View value",                "Enter" },
+    [CTX_COPY_VALUE]    = { "Copy value",                "Ctrl+C" },
+    [CTX_COPY_LITERAL]  = { "Copy as SQL literal",       NULL },
+    [CTX_INSERT_VALUE]  = { "Insert value into editor",  NULL },
+    [CTX_COPY_ROW]      = { "Copy row",                  NULL },
+    [CTX_COPY_COLUMN]   = { "Copy column values",        NULL },
+    [CTX_COPY_COL_NAME] = { "Copy column name",          NULL },
+    [CTX_SORT_ASC]      = { "Sort ascending",            NULL },
+    [CTX_SORT_DESC]     = { "Sort descending",           NULL },
+    [CTX_SORT_CLEAR]    = { "Original order",            NULL },
+    [CTX_FIT_COL]       = { "Fit column width",          NULL },
+    [CTX_COPY_ALL]      = { "Copy all as TSV",           "Ctrl+Shift+C" },
+    [CTX_EXPORT]        = { "Export CSV\xe2\x80\xa6",    "Ctrl+E" },
+    [CTX_CUT]           = { "Cut",                       "Ctrl+X" },
+    [CTX_COPY]          = { "Copy",                      "Ctrl+C" },
+    [CTX_PASTE]         = { "Paste",                     "Ctrl+V" },
+    [CTX_SELECT_ALL]    = { "Select all",                "Ctrl+A" },
+    [CTX_RUN]           = { "Run script",                "F5" },
+    [CTX_RUN_STMT]      = { "Run statement",             "Ctrl+Enter" },
+    [CTX_FORMAT]        = { "Format SQL",                "Ctrl+Shift+F" },
+    [CTX_COMMENT]       = { "Toggle comment",            "Ctrl+/" },
+};
+
+#define CTX_ROW_H 28
+#define CTX_SEP_H 9
+#define CTX_W     272
+
+static bool ctx_enabled(AppWindow* app, int a) {
+    TableView* tv = app->results;
+    switch (a) {
+        case CTX_SEP: return false;
+        case CTX_VIEW: case CTX_COPY_VALUE: case CTX_COPY_LITERAL: case CTX_INSERT_VALUE:
+            return grid_cell(app) != NULL;
+        case CTX_COPY_ROW: return grid_has_row(app);
+        case CTX_COPY_COLUMN: case CTX_COPY_COL_NAME: case CTX_FIT_COL: return grid_has_col(app);
+        case CTX_SORT_ASC:  return grid_has_col(app) && !(tv->sort_col == tv->selected_col && tv->sort_asc);
+        case CTX_SORT_DESC: return grid_has_col(app) && !(tv->sort_col == tv->selected_col && !tv->sort_asc);
+        case CTX_SORT_CLEAR: return grid_ready(app) && tv->sort_col >= 0;
+        case CTX_COPY_ALL: case CTX_EXPORT: return grid_ready(app);
+        case CTX_CUT: case CTX_COPY: return textbox_has_selection(app->editor);
+        case CTX_RUN: case CTX_RUN_STMT: return app->job == NULL;
+        default: return true;
+    }
+}
+
+static const char* ctx_label(AppWindow* app, int a) {
+    if (a == CTX_RUN && textbox_has_selection(app->editor)) return "Run selection";
+    return CTX_INFO[a].label;
+}
+
+static void ctx_open(AppWindow* app, int kind, int x, int y) {
+    static const int GRID[] = {
+        CTX_VIEW, CTX_COPY_VALUE, CTX_COPY_LITERAL, CTX_INSERT_VALUE, CTX_SEP,
+        CTX_COPY_ROW, CTX_COPY_COLUMN, CTX_COPY_COL_NAME, CTX_SEP,
+        CTX_SORT_ASC, CTX_SORT_DESC, CTX_SORT_CLEAR, CTX_FIT_COL, CTX_SEP,
+        CTX_COPY_ALL, CTX_EXPORT,
+    };
+    static const int EDITOR[] = {
+        CTX_CUT, CTX_COPY, CTX_PASTE, CTX_SELECT_ALL, CTX_SEP,
+        CTX_RUN, CTX_RUN_STMT, CTX_SEP, CTX_FORMAT, CTX_COMMENT,
+    };
+    const int* items = kind == 1 ? GRID : EDITOR;
+    int n = kind == 1 ? (int)(sizeof(GRID) / sizeof(GRID[0])) : (int)(sizeof(EDITOR) / sizeof(EDITOR[0]));
+    app->ctx_count = 0;
+    int h = 8;
+    for (int i = 0; i < n; i++) {
+        app->ctx_items[app->ctx_count++] = items[i];
+        h += items[i] == CTX_SEP ? CTX_SEP_H : CTX_ROW_H;
+    }
+    app->ctx_kind  = kind;
+    app->ctx_hover = -1;
+    app->ctx_x = x;
+    app->ctx_y = y;
+    int w = CTX_W;
+    int rx = x + w > app->win_w - 4 ? SV_MAX(4, x - w) : x;
+    int ry = y + h > app->win_h - 4 ? SV_MAX(4, app->win_h - 4 - h) : y;
+    app->ctx_rect = (Rect){rx, ry, w, h};
+}
+
+static Rect ctx_item_rect(AppWindow* app, int i) {
+    int y = app->ctx_rect.y + 4;
+    for (int k = 0; k < i; k++) y += app->ctx_items[k] == CTX_SEP ? CTX_SEP_H : CTX_ROW_H;
+    int h = app->ctx_items[i] == CTX_SEP ? CTX_SEP_H : CTX_ROW_H;
+    return (Rect){app->ctx_rect.x + 4, y, app->ctx_rect.w - 8, h};
+}
+
+static int ctx_item_at(AppWindow* app, int x, int y) {
+    if (!rect_has(app->ctx_rect, x, y)) return -1;
+    for (int i = 0; i < app->ctx_count; i++)
+        if (rect_has(ctx_item_rect(app, i), x, y)) return i;
+    return -1;
+}
+
+static void draw_ctx_menu(AppWindow* app) {
+    if (!app->ctx_kind) return;
+    PlatformWindow* win = app->win;
+    Rect r = app->ctx_rect;
+    platform_fill_rect_rounded(win, (Rect){r.x - 2, r.y + 3, r.w + 4, r.h + 4}, ui_alpha(TH_BG, 170), 10);
+    ui_round_box(win, r, TH_SURFACE_2, TH_BORDER_STRONG, 8);
+    for (int i = 0; i < app->ctx_count; i++) {
+        int a = app->ctx_items[i];
+        Rect ir = ctx_item_rect(app, i);
+        if (a == CTX_SEP) {
+            platform_fill_rect(win, (Rect){ir.x + 6, ir.y + ir.h / 2, ir.w - 12, 1}, TH_BORDER);
+            continue;
+        }
+        bool en = ctx_enabled(app, a);
+        if (i == app->ctx_hover && en) platform_fill_rect_rounded(win, ir, TH_ELEVATED_HOVER, 6);
+        Color tc = en ? TH_TEXT : TH_TEXT_FAINT;
+        const char* keys = CTX_INFO[a].keys;
+        int kw = keys ? platform_measure_text_ex(win, keys, -1, TH_FONT_SMALL, FONT_UI) : 0;
+        ui_text_clipped(win, ctx_label(app, a), ir.x + 12, ui_text_y(win, ir, TH_FONT_UI, FONT_UI),
+                        ir.w - 24 - kw - 12, tc, TH_FONT_UI, FONT_UI);
+        if (keys)
+            platform_draw_text_ex(win, keys, -1, (Point){ir.x + ir.w - 12 - kw, ui_text_y(win, ir, TH_FONT_SMALL, FONT_UI)},
+                                  en ? TH_TEXT_DIM : TH_TEXT_FAINT, TH_FONT_SMALL, FONT_UI);
+    }
+}
+
+// invia all'editor una scorciatoia Ctrl+lettera (taglia, copia, incolla, ...)
+static void editor_ctrl_key(AppWindow* app, char ch) {
+    sEvent k;
+    memset(&k, 0, sizeof(k));
+    k.type      = EVT_KEY_DOWN;
+    k.key       = KEY_LETTER;
+    k.character = (uint32_t)ch;
+    k.modifiers = SV_MOD_CTRL;
+    textbox_focus(app->editor, true);
+    widget_handle_event((Widget*)app->editor, &k);
+}
+
+static void ctx_run(AppWindow* app, int a) {
+    TableView* tv = app->results;
+    if (!ctx_enabled(app, a)) return;
+    switch (a) {
+        case CTX_VIEW: cell_view_open(app); break;
+        case CTX_COPY_VALUE: copy_and_report(app, cell_text(grid_cell(app)), "the value"); break;
+        case CTX_COPY_LITERAL: {
+            char* lit = sql_literal(grid_cell(app));
+            copy_and_report(app, lit, "the SQL literal");
+            free(lit);
+            break;
+        }
+        case CTX_INSERT_VALUE: {
+            char* lit = sql_literal(grid_cell(app));
+            if (lit) {
+                textbox_focus(app->editor, true);
+                textbox_insert(app->editor, lit);
+                set_status(app, STATUS_OK, "Value inserted into the editor", "");
+            }
+            free(lit);
+            break;
+        }
+        case CTX_COPY_ROW: {
+            Row* row = grid_row(app, tv->selected_row);
+            SBuf b = {0};
+            for (int c = 0; c < row->num_cells; c++) {
+                if (c) sb_add(&b, "\t");
+                sb_add(&b, cell_text(&row->cells[c]));
+            }
+            copy_and_report(app, b.p ? b.p : "", "the row");
+            free(b.p);
+            break;
+        }
+        case CTX_COPY_COLUMN: {
+            SBuf b = {0};
+            int c = tv->selected_col;
+            for (int i = 0; i < tv->result->num_rows; i++) {
+                Row* row = grid_row(app, i);
+                if (i) sb_add(&b, "\n");
+                if (c < row->num_cells) sb_add(&b, cell_text(&row->cells[c]));
+            }
+            char what[64];
+            snprintf(what, sizeof(what), "%d value%s", tv->result->num_rows, tv->result->num_rows == 1 ? "" : "s");
+            copy_and_report(app, b.p ? b.p : "", what);
+            free(b.p);
+            break;
+        }
+        case CTX_COPY_COL_NAME: copy_and_report(app, tv->result->col_names[tv->selected_col], "the column name"); break;
+        case CTX_SORT_ASC:   table_view_sort(tv, tv->selected_col, true);  break;
+        case CTX_SORT_DESC:  table_view_sort(tv, tv->selected_col, false); break;
+        case CTX_SORT_CLEAR: table_view_sort(tv, -1, true); break;
+        case CTX_FIT_COL:    table_view_fit_column(tv, tv->selected_col); break;
+        case CTX_COPY_ALL: {
+            char* t = table_view_export(tv, false);
+            copy_and_report(app, t, "the whole result");
+            free(t);
+            break;
+        }
+        case CTX_EXPORT:     bar_open(app, BAR_EXPORT, false); break;
+        case CTX_CUT:        editor_ctrl_key(app, 'x'); break;
+        case CTX_COPY:       editor_ctrl_key(app, 'c'); break;
+        case CTX_PASTE:      editor_ctrl_key(app, 'v'); break;
+        case CTX_SELECT_ALL: editor_ctrl_key(app, 'a'); break;
+        case CTX_COMMENT:    editor_ctrl_key(app, '/'); break;
+        case CTX_RUN:        app_window_run(app, RUN_SCRIPT); break;
+        case CTX_RUN_STMT:   app_window_run(app, RUN_CURRENT); break;
+        case CTX_FORMAT:     format_sql(app); break;
+        default: break;
+    }
+}
+
+static void ctx_move_hover(AppWindow* app, int dir) {
+    for (int step = 0; step < app->ctx_count; step++) {
+        int i = app->ctx_hover < 0 ? (dir > 0 ? 0 : app->ctx_count - 1)
+                                   : (app->ctx_hover + dir + app->ctx_count) % app->ctx_count;
+        app->ctx_hover = i;
+        if (ctx_enabled(app, app->ctx_items[i])) return;
+    }
+}
+
+// true se l'evento è stato consumato dal menu aperto
+static bool ctx_handle_event(AppWindow* app, sEvent* evt) {
+    if (!app->ctx_kind) return false;
+    switch (evt->type) {
+        case EVT_MOUSE_MOVE: {
+            app->mouse_x = evt->mouse_x;
+            app->mouse_y = evt->mouse_y;
+            int i = ctx_item_at(app, evt->mouse_x, evt->mouse_y);
+            app->ctx_hover = i;
+            bool en = i >= 0 && ctx_enabled(app, app->ctx_items[i]);
+            platform_set_cursor(app->win, en ? CURSOR_HAND : CURSOR_ARROW);
+            return true;
+        }
+        case EVT_MOUSE_DOWN: {
+            int i = ctx_item_at(app, evt->mouse_x, evt->mouse_y);
+            if (i >= 0) {
+                if (!ctx_enabled(app, app->ctx_items[i])) return true;   // voce disabilitata: il menu resta
+                app->ctx_kind = 0;
+                ctx_run(app, app->ctx_items[i]);
+                return true;
+            }
+            app->ctx_kind = 0;
+            // un altro tasto destro riapre il menu nel nuovo punto: lascia passare l'evento
+            return evt->mouse_button != SV_MOUSE_RIGHT;
+        }
+        case EVT_MOUSE_WHEEL: case EVT_CHAR:
+            return true;
+        case EVT_KEY_DOWN:
+            switch (evt->key) {
+                case KEY_UP:     ctx_move_hover(app, -1); break;
+                case KEY_DOWN:   ctx_move_hover(app, +1); break;
+                case KEY_ENTER:
+                    if (app->ctx_hover >= 0) {
+                        int a = app->ctx_items[app->ctx_hover];
+                        app->ctx_kind = 0;
+                        ctx_run(app, a);
+                    }
+                    break;
+                case KEY_ESCAPE: app->ctx_kind = 0; break;
+                default: break;
+            }
+            return true;
+        default:
+            return false;
+    }
+}
+
+// tasto destro: seleziona la cella sotto il mouse e apre il menu della griglia, oppure quello dell'editor
+static bool ctx_try_open(AppWindow* app, sEvent* evt) {
+    if (evt->type != EVT_MOUSE_DOWN || evt->mouse_button != SV_MOUSE_RIGHT) return false;
+    int x = evt->mouse_x, y = evt->mouse_y;
+    if (grid_ready(app) && widget_contains_point((Widget*)app->results, x, y)) {
+        textbox_focus(app->editor, false);
+        widget_handle_event((Widget*)app->results, evt);
+        ctx_open(app, 1, x, y);
+        return true;
+    }
+    if (widget_contains_point((Widget*)app->editor, x, y) && x < app->editor->base.bounds.x + app->editor->base.bounds.w - SCROLLBAR_W) {
+        app->results->base.state = WIDGET_STATE_NORMAL;
+        textbox_focus(app->editor, true);
+        ctx_open(app, 2, x, y);
+        return true;
+    }
+    return false;
+}
+
 // ── pannello scorciatoie (F1) ───────────────────────────────────
 
 typedef struct { const char* keys; const char* what; } Shortcut;
@@ -1228,7 +1783,8 @@ static const Shortcut SC_EDIT[] = {
     { "Ctrl + wheel, Ctrl+0", "Zoom / reset" },
 };
 static const Shortcut SC_GRID[] = {
-    { "Click header", "Sort asc / desc / off" }, { "Ctrl+C", "Copy cell (or row)" },
+    { "Click header", "Sort asc / desc / off" }, { "Double-click / Enter", "View cell value" },
+    { "Right-click", "Cell and editor menu" }, { "Ctrl+C", "Copy cell (or row)" },
     { "Ctrl+Shift+C", "Copy all as TSV" }, { "Ctrl+E", "Export CSV" },
     { "Ctrl+Tab", "Next result tab" },
     { "Double-click border", "Fit column width" },
@@ -1643,6 +2199,13 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         if (evt->type != EVT_MOUSE_MOVE) return;
     }
 
+    // visualizzatore di cella (modale) e menu contestuale
+    if (app->cell_open && evt->type != EVT_MOUSE_UP) {
+        cell_view_handle_event(app, evt);
+        return;
+    }
+    if (ctx_handle_event(app, evt)) return;
+
     if (evt->type == EVT_MOUSE_MOVE) {
         app->mouse_x = evt->mouse_x;
         app->mouse_y = evt->mouse_y;
@@ -1783,6 +2346,11 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         app->splitter_y = evt->mouse_y - SPLITTER_H / 2;
         layout_widgets(app);
         update_cursor_shape(app, evt->mouse_x, evt->mouse_y);
+        return;
+    }
+
+    if (ctx_try_open(app, evt)) {
+        platform_set_cursor(app->win, CURSOR_ARROW);
         return;
     }
 
@@ -2088,7 +2656,9 @@ void app_window_draw(AppWindow* app) {
     draw_footer(app);
     textbox_draw_overlay(app->editor, win, (Rect){0, 0, app->win_w, app->win_h});
     draw_theme_menu(app);
+    draw_ctx_menu(app);
     draw_tooltip(app);
+    draw_cell_view(app);
     draw_help(app);
 
     platform_present(win);
@@ -2278,9 +2848,26 @@ static void finish_run(AppWindow* app) {
         // errore: evidenzia la riga dello statement nell'editor
         int line = app->job_base_line;
         for (int k = 0; k < j->failed_offset && j->text[k]; k++) if (j->text[k] == '\n') line++;
+        const char* err_raw = j->failed ? j->failed->error : "No response from the engine";
+        // il motore numera le righe dallo statement ("... (line N)" / "... at line N"):
+        // si converte nella riga dell'editor e si toglie dal messaggio
+        char err[1024];
+        snprintf(err, sizeof(err), "%s", err_raw);
+        const char* pats[] = { " (line ", " at line " };
+        for (int p = 0; p < 2; p++) {
+            char* at = strstr(err, pats[p]);
+            int n;
+            if (at && sscanf(at + strlen(pats[p]), "%d", &n) == 1 && n >= 1) {
+                line += n - 1;
+                char* after = at + strlen(pats[p]);
+                while (*after >= '0' && *after <= '9') after++;
+                if (p == 0 && *after == ')') after++;
+                memmove(at, after, strlen(after) + 1);
+                break;
+            }
+        }
         textbox_set_error_line(tb, line);
         textbox_scroll_to_line(tb, line);
-        const char* err = j->failed ? j->failed->error : "No response from the engine";
 
         char title[128];
         if (j->total_code > 1) snprintf(title, sizeof(title), "Statement %d of %d failed", j->failed_idx, j->total_code);

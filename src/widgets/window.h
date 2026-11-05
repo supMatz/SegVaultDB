@@ -117,6 +117,20 @@ typedef struct {
 
     bool         help_open;         // pannello scorciatoie (F1)
 
+    // -- menu contestuale (tasto destro su griglia o editor) --
+    int          ctx_kind;          // 0 = chiuso, 1 = griglia, 2 = editor
+    int          ctx_items[24];     // azioni (CtxAction in window.c)
+    int          ctx_count;
+    int          ctx_hover;
+    int          ctx_x, ctx_y;      // punto del click
+    Rect         ctx_rect;
+
+    // -- visualizzatore di cella (doppio click / Invio su una cella) --
+    bool         cell_open;
+    int          cell_scroll;       // righe di testo scrollate
+    int          cell_lines;        // righe totali (calcolate nel disegno)
+    Rect         cell_rect, cell_btn_copy, cell_btn_close;
+
     // -- esecuzione in background --
     struct RunJob*  job;            // != NULL mentre una query è in esecuzione
     PlatformThread* job_thread;

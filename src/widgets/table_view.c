@@ -421,6 +421,20 @@ static bool table_view_handle_event(Widget* self, sEvent* evt) {
             self->state = WIDGET_STATE_FOCUSED;
             if (!has_grid(tv)) return true;
 
+            if (evt->mouse_button != SV_MOUSE_LEFT) {
+                // tasto destro / centrale: seleziona solo la cella sotto il mouse (il menu lo apre la finestra)
+                int ry = evt->mouse_y - self->bounds.y - TABLE_VIEW_HEADER_H;
+                int cc = col_at(tv, evt->mouse_x);
+                if (ry < 0) { tv->selected_col = cc; return true; }
+                int rr = tv->scroll_y + ry / TABLE_VIEW_ROW_H;
+                if (rr < tv->result->num_rows) {
+                    tv->selected_row = rr;
+                    tv->selected_col = cc;
+                    if (tv->on_row_select) tv->on_row_select(rr, self->user_data);
+                }
+                return true;
+            }
+
             int rc = resize_col_at(tv, evt->mouse_x, evt->mouse_y);
             if (rc >= 0) {
                 uint64_t now = platform_time_ms();
@@ -705,4 +719,14 @@ char* table_view_export(TableView* tv, bool csv) {
     }
     if (!t.ok) { free(t.b); return NULL; }
     return t.b;
+}
+
+void table_view_fit_column(TableView* tv, int col) {
+    if (!tv || !tv->win || !has_grid(tv) || col < 0 || col >= num_cols(tv)) return;
+    tv->col_widths[col] = measure_col(tv, tv->win, col);
+    table_view_clamp_scroll(tv);
+}
+
+void table_view_ensure_visible(TableView* tv) {
+    if (tv && has_grid(tv)) ensure_selection_visible(tv);
 }
