@@ -132,6 +132,8 @@ static void set_result_tabs(AppWindow* app, QueryResult** rs, int n, int select)
     app->showing_history = false;
     app->cell_open = false;
     app->ctx_kind  = 0;
+    if (app->filter_input && app->filter_input->text[0]) line_edit_set_text(app->filter_input, "");
+    table_view_set_filter(app->results, "", -1, false);
     table_view_set_result(app->results, app->last_result);
     for (int i = 0; i < nold; i++) {
         bool kept = false;
@@ -427,8 +429,8 @@ static void on_history_click(void* ud) { history_toggle((AppWindow*)ud); }
 static void on_results_activate(int row, void* ud) {
     AppWindow* app = (AppWindow*)ud;
     if (!app->showing_history) { cell_view_open(app); return; }
+    row = table_view_source_row(app->results, row);              // griglia filtrata / ordinata
     if (row < 0 || row >= app->history_count) return;
-    if (app->results->order) row = app->results->order[row];   // griglia ordinata
     const HistoryEntry* e = &app->history[app->history_count - 1 - row];
     size_t n = strlen(e->sql);
     char* text = malloc(n + 3);
@@ -542,7 +544,7 @@ static void sync_scrollbars(AppWindow* app) {
     TableView* tv = app->results;
     table_view_clamp_scroll(tv);
     bool grid = tv->msg_kind == TABLE_MSG_NONE && tv->result && tv->result->success && tv->result->num_cols > 0;
-    scrollbar_set_range(app->results_scroll_v, grid ? tv->result->num_rows : 0, table_view_visible_rows(tv));
+    scrollbar_set_range(app->results_scroll_v, grid ? table_view_row_count(tv) : 0, table_view_visible_rows(tv));
     scrollbar_set_position(app->results_scroll_v, tv->scroll_y);
     scrollbar_set_range(app->results_scroll_h, grid ? table_view_content_width(tv) : 0, table_view_viewport_width(tv));
     scrollbar_set_position(app->results_scroll_h, tv->scroll_x);
@@ -899,7 +901,7 @@ static void bar_submit(AppWindow* app, bool shift, bool ctrl) {
             free(csv);
             char msg[1200];
             if (ok) {
-                snprintf(msg, sizeof(msg), "Exported %d rows to %s", app->results->result->num_rows, path);
+                snprintf(msg, sizeof(msg), "Exported %d rows to %s", table_view_row_count(app->results), path);
                 set_status(app, STATUS_OK, msg, "");
                 bar_close(app);
             } else {
@@ -1222,7 +1224,7 @@ static Row* grid_row(AppWindow* app, int i) {
 
 static bool grid_has_row(AppWindow* app) {
     TableView* tv = app->results;
-    return grid_ready(app) && tv->selected_row >= 0 && tv->selected_row < tv->result->num_rows;
+    return grid_ready(app) && tv->selected_row >= 0 && tv->selected_row < table_view_row_count(tv);
 }
 
 static bool grid_has_col(AppWindow* app) {
@@ -1349,7 +1351,7 @@ static void draw_cell_view(AppWindow* app) {
             type = NAMES[cell->type];
     }
     char pos[96];
-    snprintf(pos, sizeof(pos), "Row %d of %d  \xc2\xb7  Column %d of %d", tv->selected_row + 1, res->num_rows,
+    snprintf(pos, sizeof(pos), "Row %d of %d  \xc2\xb7  Column %d of %d", tv->selected_row + 1, table_view_row_count(tv),
              c + 1, res->num_cols);
     int pos_w = platform_measure_text_ex(win, pos, -1, TH_FONT_SMALL + 1, FONT_UI);
     Rect hr = {r.x + 20, r.y + 14, r.w - 40, 26};
@@ -1415,7 +1417,7 @@ static void draw_cell_view(AppWindow* app) {
 
 static void cell_view_move(AppWindow* app, int drow, int dcol) {
     TableView* tv = app->results;
-    tv->selected_row = SV_CLAMP(tv->selected_row + drow, 0, tv->result->num_rows - 1);
+    tv->selected_row = SV_CLAMP(tv->selected_row + drow, 0, table_view_row_count(tv) - 1);
     tv->selected_col = SV_CLAMP(tv->selected_col + dcol, 0, tv->result->num_cols - 1);
     app->cell_scroll = 0;
     table_view_ensure_visible(tv);
@@ -1465,6 +1467,104 @@ static void cell_view_handle_event(AppWindow* app, sEvent* evt) {
     }
 }
 
+// ── filtro delle righe ───────────────────────────────────────────
+
+// testo del filtro: "valore" cerca in tutte le colonne; "colonna: valore" solo in quella colonna;
+// "colonna = valore" vuole il valore esatto (apici facoltativi, NULL per i valori nulli)
+static void apply_filter_text(AppWindow* app, const char* text) {
+    TableView* tv = app->results;
+    int col = -1;
+    bool exact = false;
+    const char* val = text;
+    char buf[LINE_EDIT_MAX];
+    const char* sep = strpbrk(text, ":=");
+    if (sep && grid_ready(app)) {
+        const char* a = text;
+        while (*a == ' ') a++;
+        const char* b = sep;
+        while (b > a && b[-1] == ' ') b--;
+        for (int c = 0; c < tv->result->num_cols && col < 0; c++) {
+            const char* name = tv->result->col_names[c];
+            if (!name) continue;
+            const char* dot = strrchr(name, '.');   // "tabella.colonna" accetta anche "colonna"
+            if (((int)strlen(name) == b - a && strncasecmp(name, a, b - a) == 0) ||
+                (dot && (int)strlen(dot + 1) == b - a && strncasecmp(dot + 1, a, b - a) == 0)) col = c;
+        }
+        if (col >= 0) {
+            exact = *sep == '=';
+            const char* v = sep + 1;
+            while (*v == ' ') v++;
+            snprintf(buf, sizeof(buf), "%s", v);
+            int n = (int)strlen(buf);
+            while (n > 0 && buf[n - 1] == ' ') buf[--n] = '\0';
+            if (n >= 2 && (buf[0] == '\'' || buf[0] == '"') && buf[n - 1] == buf[0]) {
+                memmove(buf, buf + 1, n - 2);
+                buf[n - 2] = '\0';
+            }
+            val = buf;
+            if (!val[0]) { table_view_set_filter(tv, "", -1, false); return; }   // "colonna:" ancora senza valore
+        }
+    }
+    if (col < 0) table_view_set_filter(tv, text, -1, false);
+    else         table_view_set_filter(tv, val, col, exact);
+}
+
+static void on_filter_change(LineEdit* le, void* ud) {
+    AppWindow* app = (AppWindow*)ud;
+    apply_filter_text(app, le->text);
+    table_view_ensure_visible(app->results);
+}
+
+static void filter_focus(AppWindow* app) {
+    if (!app->filter_input->base.visible) return;
+    textbox_focus(app->editor, false);
+    app->results->base.state = WIDGET_STATE_NORMAL;
+    line_edit_focus(app->filter_input, true);
+    line_edit_select_all(app->filter_input);
+}
+
+// true se l'evento è stato consumato dalla casella del filtro
+static bool filter_handle_event(AppWindow* app, sEvent* evt) {
+    LineEdit* le = app->filter_input;
+    if (!le->base.visible) {
+        if (line_edit_focused(le)) line_edit_focus(le, false);
+        return false;
+    }
+    bool focused = line_edit_focused(le);
+    switch (evt->type) {
+        case EVT_MOUSE_DOWN:
+            if (widget_contains_point((Widget*)le, evt->mouse_x, evt->mouse_y)) {
+                textbox_focus(app->editor, false);
+                app->results->base.state = WIDGET_STATE_NORMAL;
+                widget_handle_event((Widget*)le, evt);
+                return true;
+            }
+            if (focused) line_edit_focus(le, false);
+            return false;
+        case EVT_MOUSE_MOVE: case EVT_MOUSE_UP:
+            return widget_handle_event((Widget*)le, evt);
+        case EVT_CHAR:
+            return focused && widget_handle_event((Widget*)le, evt);
+        case EVT_KEY_DOWN:
+            if (!focused) return false;
+            if (evt->key == KEY_ESCAPE) {             // prima svuota, poi torna alla griglia
+                if (le->text[0]) { line_edit_set_text(le, ""); on_filter_change(le, app); }
+                else { line_edit_focus(le, false); app->results->base.state = WIDGET_STATE_FOCUSED; }
+                return true;
+            }
+            if (evt->key == KEY_ENTER || evt->key == KEY_DOWN) {   // passa alla griglia, sulla prima riga
+                line_edit_focus(le, false);
+                TableView* tv = app->results;
+                tv->base.state = WIDGET_STATE_FOCUSED;
+                if (table_view_row_count(tv) > 0 && tv->selected_row < 0) { tv->selected_row = 0; table_view_ensure_visible(tv); }
+                return true;
+            }
+            return widget_handle_event((Widget*)le, evt);
+        default:
+            return false;
+    }
+}
+
 // ── menu contestuale ─────────────────────────────────────────────
 
 typedef enum {
@@ -1472,6 +1572,7 @@ typedef enum {
     // griglia
     CTX_VIEW, CTX_COPY_VALUE, CTX_COPY_LITERAL, CTX_INSERT_VALUE, CTX_COPY_ROW, CTX_COPY_COLUMN, CTX_COPY_COL_NAME,
     CTX_SORT_ASC, CTX_SORT_DESC, CTX_SORT_CLEAR, CTX_FIT_COL, CTX_COPY_ALL, CTX_EXPORT,
+    CTX_FILTER_VALUE, CTX_FILTER_ROWS, CTX_FILTER_CLEAR,
     // editor
     CTX_CUT, CTX_COPY, CTX_PASTE, CTX_SELECT_ALL, CTX_RUN, CTX_RUN_STMT, CTX_FORMAT, CTX_COMMENT,
     CTX_ACTION_COUNT
@@ -1493,6 +1594,9 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
     [CTX_FIT_COL]       = { "Fit column width",          NULL },
     [CTX_COPY_ALL]      = { "Copy all as TSV",           "Ctrl+Shift+C" },
     [CTX_EXPORT]        = { "Export CSV\xe2\x80\xa6",    "Ctrl+E" },
+    [CTX_FILTER_VALUE]  = { "Show only this value",      NULL },
+    [CTX_FILTER_ROWS]   = { "Filter rows\xe2\x80\xa6",    "Ctrl+F" },
+    [CTX_FILTER_CLEAR]  = { "Clear filter",              NULL },
     [CTX_CUT]           = { "Cut",                       "Ctrl+X" },
     [CTX_COPY]          = { "Copy",                      "Ctrl+C" },
     [CTX_PASTE]         = { "Paste",                     "Ctrl+V" },
@@ -1518,7 +1622,9 @@ static bool ctx_enabled(AppWindow* app, int a) {
         case CTX_SORT_ASC:  return grid_has_col(app) && !(tv->sort_col == tv->selected_col && tv->sort_asc);
         case CTX_SORT_DESC: return grid_has_col(app) && !(tv->sort_col == tv->selected_col && !tv->sort_asc);
         case CTX_SORT_CLEAR: return grid_ready(app) && tv->sort_col >= 0;
-        case CTX_COPY_ALL: case CTX_EXPORT: return grid_ready(app);
+        case CTX_COPY_ALL: case CTX_EXPORT: case CTX_FILTER_ROWS: return grid_ready(app);
+        case CTX_FILTER_VALUE: return grid_cell(app) != NULL;
+        case CTX_FILTER_CLEAR: return table_view_filtered(tv);
         case CTX_CUT: case CTX_COPY: return textbox_has_selection(app->editor);
         case CTX_RUN: case CTX_RUN_STMT: return app->job == NULL;
         default: return true;
@@ -1534,6 +1640,7 @@ static void ctx_open(AppWindow* app, int kind, int x, int y) {
     static const int GRID[] = {
         CTX_VIEW, CTX_COPY_VALUE, CTX_COPY_LITERAL, CTX_INSERT_VALUE, CTX_SEP,
         CTX_COPY_ROW, CTX_COPY_COLUMN, CTX_COPY_COL_NAME, CTX_SEP,
+        CTX_FILTER_VALUE, CTX_FILTER_ROWS, CTX_FILTER_CLEAR, CTX_SEP,
         CTX_SORT_ASC, CTX_SORT_DESC, CTX_SORT_CLEAR, CTX_FIT_COL, CTX_SEP,
         CTX_COPY_ALL, CTX_EXPORT,
     };
@@ -1647,13 +1754,14 @@ static void ctx_run(AppWindow* app, int a) {
         case CTX_COPY_COLUMN: {
             SBuf b = {0};
             int c = tv->selected_col;
-            for (int i = 0; i < tv->result->num_rows; i++) {
+            int nr = table_view_row_count(tv);
+            for (int i = 0; i < nr; i++) {
                 Row* row = grid_row(app, i);
                 if (i) sb_add(&b, "\n");
                 if (c < row->num_cells) sb_add(&b, cell_text(&row->cells[c]));
             }
             char what[64];
-            snprintf(what, sizeof(what), "%d value%s", tv->result->num_rows, tv->result->num_rows == 1 ? "" : "s");
+            snprintf(what, sizeof(what), "%d value%s", nr, nr == 1 ? "" : "s");
             copy_and_report(app, b.p ? b.p : "", what);
             free(b.p);
             break;
@@ -1670,6 +1778,21 @@ static void ctx_run(AppWindow* app, int a) {
             break;
         }
         case CTX_EXPORT:     bar_open(app, BAR_EXPORT, false); break;
+        case CTX_FILTER_VALUE: {
+            Cell* c = grid_cell(app);
+            const char* name = tv->result->col_names[tv->selected_col];
+            const char* dot = name ? strrchr(name, '.') : NULL;
+            char text[LINE_EDIT_MAX];
+            snprintf(text, sizeof(text), "%.60s = %.400s", dot ? dot + 1 : (name ? name : ""), cell_text(c));
+            line_edit_set_text(app->filter_input, text);
+            apply_filter_text(app, text);
+            break;
+        }
+        case CTX_FILTER_ROWS: filter_focus(app); break;
+        case CTX_FILTER_CLEAR:
+            line_edit_set_text(app->filter_input, "");
+            table_view_set_filter(tv, "", -1, false);
+            break;
         case CTX_CUT:        editor_ctrl_key(app, 'x'); break;
         case CTX_COPY:       editor_ctrl_key(app, 'c'); break;
         case CTX_PASTE:      editor_ctrl_key(app, 'v'); break;
@@ -1784,7 +1907,8 @@ static const Shortcut SC_EDIT[] = {
 };
 static const Shortcut SC_GRID[] = {
     { "Click header", "Sort asc / desc / off" }, { "Double-click / Enter", "View cell value" },
-    { "Right-click", "Cell and editor menu" }, { "Ctrl+C", "Copy cell (or row)" },
+    { "Right-click", "Cell and editor menu" }, { "Ctrl+F (on grid)", "Filter rows" },
+    { "Ctrl+C", "Copy cell (or row)" },
     { "Ctrl+Shift+C", "Copy all as TSV" }, { "Ctrl+E", "Export CSV" },
     { "Ctrl+Tab", "Next result tab" },
     { "Double-click border", "Fit column width" },
@@ -2009,6 +2133,8 @@ static void layout_widgets(AppWindow* app) {
     app->lbl_status->base.bounds = (Rect){center_x + 112, status_y, center_w - 112 - 260, STATUSBAR_H};
     int hw = button_preferred_width(app->btn_history, app->win);
     app->btn_history->base.bounds = (Rect){W - 12 - hw, status_y + (STATUSBAR_H - 26) / 2, hw, 26};
+    int fw = SV_CLAMP(center_w / 4, 150, 230);
+    app->filter_input->base.bounds = (Rect){W - 12 - hw - 10 - fw, status_y + (STATUSBAR_H - 26) / 2, fw, 26};
 
     app->results->base.bounds          = (Rect){center_x, results_y, center_w, results_h};
     app->results_scroll_v->base.bounds = (Rect){W - SCROLLBAR_W, results_y + TABLE_VIEW_HEADER_H,
@@ -2143,6 +2269,12 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
     app->bar_replace_input->win = win;
     app->bar_mode = BAR_NONE;
 
+    app->filter_input = line_edit_create("Filter rows");
+    app->filter_input->base.user_data = app;
+    app->filter_input->on_change = on_filter_change;
+    app->filter_input->win = win;
+    app->filter_input->base.visible = false;
+
     update_session(app);
 
     // applica il layout iniziale
@@ -2250,7 +2382,13 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         if (evt->key == KEY_F5) { app_window_run(app, RUN_SCRIPT); return; }
         if (evt->key == KEY_LETTER && ctrl && !(evt->modifiers & SV_MOD_ALT)) {
             switch (evt->character) {
-                case 'f': if (shift) format_sql(app); else bar_open(app, BAR_FIND, false); return;
+                case 'f':
+                    if (shift) format_sql(app);
+                    else if (app->filter_input->base.visible &&
+                             (app->results->base.state == WIDGET_STATE_FOCUSED || line_edit_focused(app->filter_input)))
+                        filter_focus(app);
+                    else bar_open(app, BAR_FIND, false);
+                    return;
                 case 'h': if (shift) history_toggle(app); else bar_open(app, BAR_FIND, true); return;
                 case 'g': bar_open(app, BAR_GOTO, false); return;
                 case 't':
@@ -2295,6 +2433,12 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
             app->mouse_y = evt->mouse_y;
             update_cursor_shape(app, evt->mouse_x, evt->mouse_y);
         }
+        return;
+    }
+    if (filter_handle_event(app, evt)) {
+        if (evt->type == EVT_MOUSE_MOVE || evt->type == EVT_MOUSE_DOWN)
+            platform_set_cursor(app->win, widget_contains_point((Widget*)app->filter_input, evt->mouse_x, evt->mouse_y)
+                                          ? CURSOR_IBEAM : CURSOR_ARROW);
         return;
     }
     if (evt->type == EVT_KEY_DOWN) {
@@ -2382,6 +2526,7 @@ bool app_window_tick(AppWindow* app, uint64_t now_ms) {
     bool a = textbox_tick(app->editor, now_ms);
     bool b = line_edit_tick(app->bar_input, now_ms);
     bool c = line_edit_tick(app->bar_replace_input, now_ms);
+    c = line_edit_tick(app->filter_input, now_ms) || c;
     // esecuzione in background: completamento e stato con il tempo trascorso
     if (app->job) {
         if (atomic_load(&app->job->done)) {
@@ -2522,13 +2667,29 @@ static void draw_splitter_and_status(AppWindow* app) {
     // il messaggio ha la precedenza sui dettagli (righe, tempo): se manca spazio i dettagli spariscono
     Rect* lb = &app->lbl_status->base.bounds;
     int right = app->btn_history->base.bounds.x - 14;
-    if (app->status_meta[0]) {
-        int mw = platform_measure_text_ex(win, app->status_meta, -1, TH_FONT_SMALL + 1, FONT_MONO);
+
+    // filtro delle righe: solo con una griglia e abbastanza spazio
+    LineEdit* fe = app->filter_input;
+    fe->base.visible = grid_ready(app) && cw >= 600;
+    if (fe->base.visible) {
+        widget_draw((Widget*)fe, win);
+        right = fe->base.bounds.x - 14;
+    }
+    char meta_buf[160];
+    const char* meta = app->status_meta;
+    bool filtered = table_view_filtered(app->results) && grid_ready(app);
+    if (filtered) {
+        snprintf(meta_buf, sizeof(meta_buf), "%d of %d rows", table_view_row_count(app->results),
+                 app->results->result->num_rows);
+        meta = meta_buf;
+    }
+    if (meta[0]) {
+        int mw = platform_measure_text_ex(win, meta, -1, TH_FONT_SMALL + 1, FONT_MONO);
         int msg_w = platform_measure_text_ex(win, app->lbl_status->text, -1, TH_FONT_UI, FONT_UI);
         if (right - mw - 16 - lb->x >= SV_MIN(msg_w, 160)) {
-            platform_draw_text_ex(win, app->status_meta, -1,
+            platform_draw_text_ex(win, meta, -1,
                                   (Point){right - mw, ui_text_y(win, st, TH_FONT_SMALL + 1, FONT_MONO)},
-                                  TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_MONO);
+                                  filtered ? TH_ACCENT_TEXT : TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_MONO);
             right -= mw + 16;
         }
     }

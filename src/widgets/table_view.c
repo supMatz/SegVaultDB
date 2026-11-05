@@ -8,6 +8,8 @@
 #define CELL_PAD 10
 #define CELL_FONT 13
 
+static void rebuild_view(TableView* tv);
+
 // ── geometria ────────────────────────────────────────────────────
 
 static bool has_grid(const TableView* tv) {
@@ -18,10 +20,25 @@ static int num_cols(const TableView* tv) {
     return SV_MIN(tv->result->num_cols, TABLE_VIEW_MAX_COLS);
 }
 
-// riga visualizzata in posizione i (tiene conto dell'ordinamento)
+// riga visualizzata in posizione i (tiene conto di filtro e ordinamento)
 static Row* row_at(const TableView* tv, int i) {
     return &tv->result->rows[tv->order ? tv->order[i] : i];
 }
+
+// righe visualizzate
+static int nrows(const TableView* tv) {
+    if (!tv->result) return 0;
+    return tv->order ? tv->view_rows : tv->result->num_rows;
+}
+
+int table_view_row_count(const TableView* tv) { return tv && has_grid(tv) ? nrows(tv) : 0; }
+
+int table_view_source_row(const TableView* tv, int i) {
+    if (!tv || !has_grid(tv) || i < 0 || i >= nrows(tv)) return -1;
+    return tv->order ? tv->order[i] : i;
+}
+
+bool table_view_filtered(const TableView* tv) { return tv && tv->filter[0]; }
 
 int table_view_visible_rows(TableView* tv) {
     return SV_MAX(1, (tv->base.bounds.h - TABLE_VIEW_HEADER_H) / TABLE_VIEW_ROW_H);
@@ -40,7 +57,7 @@ int table_view_viewport_width(TableView* tv) {
 
 void table_view_clamp_scroll(TableView* tv) {
     if (!has_grid(tv)) { tv->scroll_x = tv->scroll_y = 0; return; }
-    int max_y = SV_MAX(0, tv->result->num_rows - table_view_visible_rows(tv));
+    int max_y = SV_MAX(0, nrows(tv) - table_view_visible_rows(tv));
     int max_x = SV_MAX(0, table_view_content_width(tv) - table_view_viewport_width(tv));
     tv->scroll_y = SV_CLAMP(tv->scroll_y, 0, max_y);
     tv->scroll_x = SV_CLAMP(tv->scroll_x, 0, max_x);
@@ -238,7 +255,7 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
 
     int visible_rows = table_view_visible_rows(tv) + 1;
     int first_row = tv->scroll_y;
-    int last_row  = SV_MIN(first_row + visible_rows, r->num_rows);
+    int last_row  = SV_MIN(first_row + visible_rows, nrows(tv));
     int content_right = col_x(tv, ncols);
 
     // -- righe --
@@ -296,8 +313,8 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
     }
 
     // nessuna riga
-    if (r->num_rows == 0) {
-        const char* t = "Query returned no rows";
+    if (nrows(tv) == 0) {
+        const char* t = r->num_rows == 0 ? "Query returned no rows" : "No rows match the filter";
         int tw = platform_measure_text_ex(win, t, -1, TH_FONT_UI, FONT_UI);
         platform_draw_text_ex(win, t, -1, (Point){b.x + (b.w - tw) / 2, b.y + hh + 32}, TH_TEXT_DIM, TH_FONT_UI, FONT_UI);
     }
@@ -349,8 +366,7 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
 
 static void copy_cell(TableView* tv) {
     if (!tv->win || !has_grid(tv) || tv->selected_row < 0) return;
-    QueryResult* r = tv->result;
-    if (tv->selected_row >= r->num_rows) return;
+    if (tv->selected_row >= nrows(tv)) return;
     if (tv->selected_col >= 0) {
         Cell* cell = &row_at(tv, tv->selected_row)->cells[tv->selected_col];
         platform_set_clipboard(tv->win, cell->is_null ? "NULL" : cell->value);
@@ -397,7 +413,7 @@ static bool table_view_handle_event(Widget* self, sEvent* evt) {
                 int rel = evt->mouse_y - self->bounds.y - TABLE_VIEW_HEADER_H;
                 if (rel >= 0) {
                     int row = tv->scroll_y + rel / TABLE_VIEW_ROW_H;
-                    if (row < tv->result->num_rows) tv->hover_row = row;
+                    if (row < nrows(tv)) tv->hover_row = row;
                 }
             }
             return false;
@@ -427,7 +443,7 @@ static bool table_view_handle_event(Widget* self, sEvent* evt) {
                 int cc = col_at(tv, evt->mouse_x);
                 if (ry < 0) { tv->selected_col = cc; return true; }
                 int rr = tv->scroll_y + ry / TABLE_VIEW_ROW_H;
-                if (rr < tv->result->num_rows) {
+                if (rr < nrows(tv)) {
                     tv->selected_row = rr;
                     tv->selected_col = cc;
                     if (tv->on_row_select) tv->on_row_select(rr, self->user_data);
@@ -462,7 +478,7 @@ static bool table_view_handle_event(Widget* self, sEvent* evt) {
                 return true;
             }
             int clicked_row = tv->scroll_y + rel_y / TABLE_VIEW_ROW_H;
-            if (clicked_row < tv->result->num_rows) {
+            if (clicked_row < nrows(tv)) {
                 tv->selected_row = clicked_row;
                 tv->selected_col = col;
                 if (tv->on_row_select) tv->on_row_select(clicked_row, self->user_data);
@@ -480,7 +496,7 @@ static bool table_view_handle_event(Widget* self, sEvent* evt) {
 
         case EVT_KEY_DOWN: {
             if (self->state != WIDGET_STATE_FOCUSED || !has_grid(tv)) return false;
-            int nrows = tv->result->num_rows;
+            int nr = nrows(tv);
             if (evt->key == KEY_LETTER && (evt->modifiers & SV_MOD_CTRL) && evt->character == 'c') {
                 if (evt->modifiers & SV_MOD_SHIFT) {     // tutto il risultato come TSV
                     char* t = table_view_export(tv, false);
@@ -491,15 +507,15 @@ static bool table_view_handle_event(Widget* self, sEvent* evt) {
                 }
                 return true;
             }
-            if (nrows == 0) return false;
+            if (nr == 0) return false;
             if (tv->selected_row < 0) tv->selected_row = 0;
             switch (evt->key) {
                 case KEY_UP:       tv->selected_row = SV_MAX(0, tv->selected_row - 1); break;
-                case KEY_DOWN:     tv->selected_row = SV_MIN(nrows - 1, tv->selected_row + 1); break;
+                case KEY_DOWN:     tv->selected_row = SV_MIN(nr - 1, tv->selected_row + 1); break;
                 case KEY_PAGEUP:   tv->selected_row = SV_MAX(0, tv->selected_row - table_view_visible_rows(tv)); break;
-                case KEY_PAGEDOWN: tv->selected_row = SV_MIN(nrows - 1, tv->selected_row + table_view_visible_rows(tv)); break;
+                case KEY_PAGEDOWN: tv->selected_row = SV_MIN(nr - 1, tv->selected_row + table_view_visible_rows(tv)); break;
                 case KEY_HOME:     tv->selected_row = 0; break;
-                case KEY_END:      tv->selected_row = nrows - 1; break;
+                case KEY_END:      tv->selected_row = nr - 1; break;
                 case KEY_LEFT:     tv->selected_col = SV_MAX(0, tv->selected_col - 1); break;
                 case KEY_RIGHT:    tv->selected_col = SV_MIN(num_cols(tv) - 1, tv->selected_col + 1); break;
                 case KEY_ESCAPE:   tv->selected_row = tv->selected_col = -1; return true;
@@ -541,6 +557,7 @@ TableView* table_view_create(int x, int y, int w, int h) {
     tv->resize_col   = -1;
     tv->sort_col     = -1;
     tv->sort_asc     = true;
+    tv->filter_col   = -1;
     tv->rownum_w     = 44;
     tv->font_size    = CELL_FONT;
 
@@ -579,6 +596,8 @@ void table_view_set_result(TableView* tv, QueryResult* result) {
     tv->sort_asc     = true;
     free(tv->order);
     tv->order = NULL;
+    tv->view_rows = 0;
+    if (tv->filter[0] && has_grid(tv)) rebuild_view(tv);   // il filtro attivo vale anche per il nuovo risultato
 }
 
 void table_view_set_message(TableView* tv, TableMessageKind kind, const char* title, const char* detail) {
@@ -592,6 +611,7 @@ void table_view_clear(TableView* tv) {
     if (!tv) return;
     free(tv->order);
     tv->order        = NULL;
+    tv->view_rows    = 0;
     tv->sort_col     = -1;
     tv->result       = NULL;
     tv->selected_row = -1;
@@ -629,34 +649,67 @@ static int cmp_rows(const void* a, const void* b) {
     return r ? r : ia - ib;   // a parità mantiene l'ordine originale (stabile)
 }
 
+static bool contains_ci(const char* hay, const char* needle) {
+    size_t n = strlen(needle);
+    for (; *hay; hay++)
+        if (strncasecmp(hay, needle, n) == 0) return true;
+    return n == 0;
+}
+
+static bool row_matches(const TableView* tv, const Row* row) {
+    for (int c = 0; c < row->num_cells; c++) {
+        if (tv->filter_col >= 0 && c != tv->filter_col) continue;
+        const Cell* cell = &row->cells[c];
+        const char* v = cell->is_null ? "NULL" : cell->value;
+        if (tv->filter_exact ? strcasecmp(v, tv->filter) == 0 : contains_ci(v, tv->filter)) return true;
+    }
+    return false;
+}
+
+// ricalcola le righe visualizzate (filtro + ordinamento) mantenendo la riga selezionata
+static void rebuild_view(TableView* tv) {
+    QueryResult* r = tv->result;
+    int sel_orig = table_view_source_row(tv, tv->selected_row);
+    free(tv->order);
+    tv->order = NULL;
+    tv->view_rows = 0;
+    if (!has_grid(tv)) return;
+
+    if (tv->filter[0] || tv->sort_col >= 0) {
+        tv->order = malloc(sizeof(int) * (size_t)SV_MAX(1, r->num_rows));
+        if (!tv->order) return;
+        for (int i = 0; i < r->num_rows; i++)
+            if (!tv->filter[0] || row_matches(tv, &r->rows[i])) tv->order[tv->view_rows++] = i;
+        if (tv->sort_col >= 0 && tv->view_rows > 1) {
+            g_sort_tv  = tv;
+            g_sort_col = tv->sort_col;
+            g_sort_asc = tv->sort_asc;
+            g_sort_num = tv->col_numeric[tv->sort_col] || column_is_numeric(r, tv->sort_col);
+            qsort(tv->order, tv->view_rows, sizeof(int), cmp_rows);
+        }
+    }
+    tv->selected_row = -1;
+    if (sel_orig >= 0) {
+        for (int i = 0; i < nrows(tv); i++)
+            if (table_view_source_row(tv, i) == sel_orig) { tv->selected_row = i; break; }
+    }
+    tv->hover_row = -1;
+    table_view_clamp_scroll(tv);
+}
+
 void table_view_sort(TableView* tv, int col, bool asc) {
     if (!tv || !has_grid(tv)) return;
-    QueryResult* r = tv->result;
-    // la riga selezionata resta selezionata dopo l'ordinamento
-    int sel_orig = (tv->selected_row >= 0 && tv->selected_row < r->num_rows)
-                 ? (tv->order ? tv->order[tv->selected_row] : tv->selected_row) : -1;
+    if (col < 0 || col >= num_cols(tv)) { tv->sort_col = -1; tv->sort_asc = true; }
+    else                                { tv->sort_col = col; tv->sort_asc = asc; }
+    rebuild_view(tv);
+}
 
-    if (col < 0 || col >= num_cols(tv) || r->num_rows == 0) {
-        free(tv->order);
-        tv->order = NULL;
-        tv->sort_col = -1;
-        tv->sort_asc = true;
-    } else {
-        if (!tv->order) tv->order = malloc(sizeof(int) * r->num_rows);
-        if (!tv->order) return;
-        for (int i = 0; i < r->num_rows; i++) tv->order[i] = i;
-        g_sort_tv  = tv;
-        g_sort_col = col;
-        g_sort_asc = asc;
-        g_sort_num = tv->col_numeric[col] || column_is_numeric(r, col);
-        qsort(tv->order, r->num_rows, sizeof(int), cmp_rows);
-        tv->sort_col = col;
-        tv->sort_asc = asc;
-    }
-    if (sel_orig >= 0) {
-        for (int i = 0; i < r->num_rows; i++)
-            if ((tv->order ? tv->order[i] : i) == sel_orig) { tv->selected_row = i; break; }
-    }
+void table_view_set_filter(TableView* tv, const char* text, int col, bool exact) {
+    if (!tv) return;
+    snprintf(tv->filter, sizeof(tv->filter), "%s", text ? text : "");
+    tv->filter_col   = tv->filter[0] ? col : -1;
+    tv->filter_exact = tv->filter[0] && exact;
+    if (tv->result) rebuild_view(tv);
 }
 
 // ── esportazione ─────────────────────────────────────────────────
@@ -707,7 +760,7 @@ char* table_view_export(TableView* tv, bool csv) {
         tb_field(&t, r->col_names[c] ? r->col_names[c] : "", csv);
     }
     tb_put(&t, eol, strlen(eol));
-    for (int i = 0; i < r->num_rows; i++) {
+    for (int i = 0; i < nrows(tv); i++) {
         Row* row = row_at(tv, i);
         for (int c = 0; c < nc && c < row->num_cells; c++) {
             if (c) tb_put(&t, sep, 1);

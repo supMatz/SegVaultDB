@@ -117,6 +117,8 @@ typedef struct {
 
     bool         help_open;         // pannello scorciatoie (F1)
 
+    LineEdit*    filter_input;      // filtro delle righe nell'intestazione dei risultati
+
     // -- menu contestuale (tasto destro su griglia o editor) --
     int          ctx_kind;          // 0 = chiuso, 1 = griglia, 2 = editor
     int          ctx_items[24];     // azioni (CtxAction in window.c)

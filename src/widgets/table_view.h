@@ -40,7 +40,13 @@ typedef struct {
     int  rownum_w;         // larghezza colonna numeri di riga
     int  sort_col; // colonna di ordinamento : -1 = nessuna
     bool sort_asc; // di base impostato a true
-    int* order;    // permutazione delle righe visualizzate (NULL = ordine originale)
+    int* order;    // righe visualizzate (filtrate e ordinate) -> indici del risultato; NULL = tutte, in ordine
+    int  view_rows; // quante righe ci sono in order (se order != NULL)
+
+    // filtro: mostra solo le righe che contengono il testo (senza maiuscole)
+    char filter[512];
+    int  filter_col;    // -1 = qualsiasi colonna
+    bool filter_exact;  // true = valore uguale (non "contiene")
 
     // ridimensionamento colonne
     int  resize_col;       // -1 = nessun resize in corso
@@ -97,6 +103,12 @@ void table_view_clamp_scroll(TableView* tv);
 
 // ordina per colonna (click sull'header: crescente -> decrescente -> ordine originale)
 void table_view_sort(TableView* tv, int col, bool asc);   // col < 0 = ordine originale
+
+// filtro sulle righe: text "" = nessun filtro; col -1 = qualsiasi colonna; exact = uguaglianza
+void table_view_set_filter(TableView* tv, const char* text, int col, bool exact);
+bool table_view_filtered(const TableView* tv);
+int  table_view_row_count(const TableView* tv);        // righe visualizzate (dopo il filtro)
+int  table_view_source_row(const TableView* tv, int i); // indice nel risultato della riga visualizzata i
 
 // esporta il risultato (nell'ordine visualizzato) come testo delimitato.
 // csv = true: separatore ',' con virgolette dove serve e NULL vuoti; false: TSV con NULL letterale.
