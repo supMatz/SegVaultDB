@@ -1720,7 +1720,7 @@ TextBox* textbox_create(int x, int y, int w, int h) {
     tb->show_line_nums = true;
     tb->opt_highlight_line = tb->opt_auto_close = tb->opt_auto_popup = tb->opt_blink = true;
     tb->error_line  = -1;
-    tb->placeholder = "-- Write SQL here. Ctrl+Enter runs the statement under the cursor, F5 runs everything";
+    tb->placeholder = "-- Type your SQL here.  F5 runs the script, Ctrl+Enter the statement under the cursor, F1 lists all shortcuts.";
     rebuild_lines(tb);
 
     return tb;
