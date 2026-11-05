@@ -15,10 +15,10 @@ SCOPO: Header incluso da TUTTI i moduli del progetto.
 #include <string.h>
 
 // versioni
-#define SV_VERSION_MAJOR 0
+#define SV_VERSION_MAJOR 1
 #define SV_VERSION_MINOR 0
-#define SV_VERSION_PATCH 0
-#define SV_VERSION_STR  "0.1.0"
+#define SV_VERSION_PATCH 2
+#define SV_VERSION_STR  "1.0.2"
 #define SV_NAME         "SegVault"
 
 // codici di ritorno
