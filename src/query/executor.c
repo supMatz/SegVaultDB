@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include <strings.h>
+#include <limits.h>
+#include <errno.h>
 
 static QueryResult* result_error_msg(const char* msg) {
     QueryResult* r = calloc(1, sizeof(QueryResult));
@@ -505,6 +508,87 @@ static bool column_max(ExecCtx* ctx, TableSchema* ts, int ci, int64_t* out) {
     return any;
 }
 
+// ── validazione dei valori (INSERT / UPDATE) ─────────────────────
+
+static int utf8_len(const char* s) {
+    int n = 0;
+    for (; *s; s++) if (((unsigned char)*s & 0xC0) != 0x80) n++;
+    return n;
+}
+
+static bool valid_date(const char* s, const char** rest) {
+    int y, m, d, k = 0;
+    if (sscanf(s, "%4d-%2d-%2d%n", &y, &m, &d, &k) != 3 || k != 10) return false;
+    static const int DAYS[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (m < 1 || m > 12 || d < 1) return false;
+    int md = DAYS[m - 1] + (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0));
+    if (d > md) return false;
+    if (rest) *rest = s + 10;
+    return true;
+}
+
+// NULL se il testo è un valore valido per la colonna, altrimenti scrive il motivo in msg
+static const char* check_value(const Column* c, const char* v, char* msg, size_t n) {
+    const char* p = v;
+    while (isspace((unsigned char)*p)) p++;
+    switch (c->type) {
+        case SV_TYPE_INT: case SV_TYPE_BIGINT: {
+            char* end = NULL;
+            errno = 0;
+            long long x = strtoll(p, &end, 10);
+            bool range = errno == ERANGE;
+            if (end != p && (*end == '.' || *end == 'e' || *end == 'E')) {   // 3.0 va bene, 3.5 no
+                double d = strtod(p, &end);
+                if (d != (double)(long long)d) { snprintf(msg, n, "Column '%s' expects an integer, got '%.40s'", c->name, v); return msg; }
+                x = (long long)d;
+            }
+            while (end && isspace((unsigned char)*end)) end++;
+            if (end == p || !end || *end) { snprintf(msg, n, "Column '%s' expects an integer, got '%.40s'", c->name, v); return msg; }
+            if (range || (c->type == SV_TYPE_INT && (x < INT_MIN || x > INT_MAX))) {
+                snprintf(msg, n, "Value %.40s is out of range for column '%s' (%s)", v, c->name, datatype_name(c->type));
+                return msg;
+            }
+            return NULL;
+        }
+        case SV_TYPE_FLOAT: case SV_TYPE_DECIMAL: {
+            char* end = NULL;
+            double d = strtod(p, &end);
+            while (end && isspace((unsigned char)*end)) end++;
+            if (end == p || !end || *end || d != d) { snprintf(msg, n, "Column '%s' expects a number, got '%.40s'", c->name, v); return msg; }
+            return NULL;
+        }
+        case SV_TYPE_BOOL:
+            if (!strcmp(p, "0") || !strcmp(p, "1") || !strcasecmp(p, "true") || !strcasecmp(p, "false")) return NULL;
+            snprintf(msg, n, "Column '%s' expects TRUE, FALSE, 1 or 0, got '%.40s'", c->name, v);
+            return msg;
+        case SV_TYPE_VARCHAR: case SV_TYPE_CHAR:
+            if (c->size > 0 && utf8_len(v) > c->size) {
+                snprintf(msg, n, "Value too long for column '%s' (%d characters, maximum %d)", c->name, utf8_len(v), c->size);
+                return msg;
+            }
+            return NULL;
+        case SV_TYPE_DATE: {
+            const char* rest = NULL;
+            if (valid_date(p, &rest) && !*rest) return NULL;
+            snprintf(msg, n, "Column '%s' expects a valid date YYYY-MM-DD, got '%.40s'", c->name, v);
+            return msg;
+        }
+        case SV_TYPE_DATETIME: {
+            const char* rest = NULL;
+            int hh = 0, mm = 0, ss = 0, k = 0;
+            if (valid_date(p, &rest) &&
+                (!*rest || ((sscanf(rest, " %2d:%2d:%2d%n", &hh, &mm, &ss, &k) == 3 ||
+                             (ss = 0, sscanf(rest, " %2d:%2d%n", &hh, &mm, &k) == 2)) && !rest[k] &&
+                            hh >= 0 && hh < 24 && mm >= 0 && mm < 60 && ss >= 0 && ss < 60)))
+                return NULL;
+            snprintf(msg, n, "Column '%s' expects a date-time YYYY-MM-DD HH:MM:SS, got '%.40s'", c->name, v);
+            return msg;
+        }
+        default:
+            return NULL;
+    }
+}
+
 static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
@@ -528,13 +612,13 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
                 snprintf(val_bufs[i], sizeof(val_bufs[i]), "%.17g", n->insert_stmt.values[i]->float_val);
             else
                 snprintf(val_bufs[i], sizeof(val_bufs[i]), "%s", n->insert_stmt.values[i]->str_val);
-            vals[i] = n->insert_stmt.values[i]->type == EXPR_NULL ? "NULL" : val_bufs[i];
+            vals[i] = n->insert_stmt.values[i]->type == EXPR_NULL ? NULL : val_bufs[i];
             if (i < n->insert_stmt.num_cols && n->insert_stmt.columns[i]) {
                 int ci = catalog_get_col_index(ts, n->insert_stmt.columns[i]);
                 if (ci >= 0) col_specified[ci] = true;
             }
         } else {
-            vals[i] = "NULL";
+            vals[i] = NULL;
         }
     }
 
@@ -551,8 +635,8 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
             return unknown_column_error(n->insert_stmt.columns[i], "INSERT");
 
     // Map positional values to columns
-    const char* final_vals[64];
-    for (int i = 0; i < ts->num_columns; i++) final_vals[i] = "NULL";
+    const char* final_vals[64];   // NULL = valore SQL NULL
+    for (int i = 0; i < ts->num_columns; i++) final_vals[i] = NULL;
 
     if (n->insert_stmt.num_cols > 0) {
         for (int i = 0; i < n->insert_stmt.num_cols && i < nv; i++) {
@@ -564,22 +648,30 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
             final_vals[i] = vals[i];
     }
 
+    // DEFAULT per le colonne non indicate nell'INSERT (prima ricevevano sempre NULL)
+    if (n->insert_stmt.num_cols > 0)
+        for (int i = 0; i < ts->num_columns; i++)
+            if (!col_specified[i] && ts->columns[i].default_val[0] && strcasecmp(ts->columns[i].default_val, "NULL") != 0)
+                final_vals[i] = ts->columns[i].default_val;
+
     // Auto-increment: valore massimo esistente nella colonna + 1 (in precedenza un contatore
-    // statico condiviso fra tabelle e azzerato a ogni avvio generava id già usati)
+    // statico condiviso fra tabelle e azzerato a ogni avvio generava id già usati).
+    // Anche un NULL esplicito genera il valore, come in MySQL.
+    char ai_bufs[64][24];
     for (int i = 0; i < ts->num_columns; i++) {
-        bool given = n->insert_stmt.num_cols > 0 ? col_specified[i] : strcmp(final_vals[i], "NULL") != 0;
-        if (ts->columns[i].auto_increment && !given) {
+        if (ts->columns[i].auto_increment && !final_vals[i]) {
             int64_t mx = 0;
             column_max(ctx, ts, i, &mx);
-            char ai_buf[32];
-            snprintf(ai_buf, sizeof(ai_buf), "%lld", (long long)(mx + 1));
-            // Use values beyond the input to avoid overlap
-            int slot = nv + i;
-            if (slot < 64) {
-                snprintf(val_bufs[slot], sizeof(val_bufs[slot]), "%s", ai_buf);
-                final_vals[i] = val_bufs[slot];
-            }
+            snprintf(ai_bufs[i], sizeof(ai_bufs[i]), "%lld", (long long)(mx + 1));
+            final_vals[i] = ai_bufs[i];
         }
+    }
+
+    // tipo, intervallo, lunghezza, date
+    for (int i = 0; i < ts->num_columns; i++) {
+        char msg[200];
+        if (final_vals[i] && check_value(&ts->columns[i], final_vals[i], msg, sizeof(msg)))
+            return result_error_msg(msg);
     }
 
     Tuple* t = tuple_from_strings(final_vals, ts->num_columns, ts);
@@ -698,6 +790,14 @@ static QueryResult* exec_select(ExecCtx* ctx, ASTNode* n) {
     if (!ts) {
         ViewSchema* view = catalog_get_view(ctx->catalog, db->name, n->select_stmt.table_name);
         if (view) {
+            // la query esterna sulla vista non viene ancora applicata: meglio un errore chiaro
+            // di un risultato sbagliato (prima WHERE, ORDER BY, LIMIT e colonne venivano ignorati)
+            bool star = n->select_stmt.num_cols == 0 ||
+                        (n->select_stmt.num_cols == 1 && n->select_stmt.columns[0]->type == EXPR_STAR);
+            if (!star || n->select_stmt.where || n->select_stmt.order_col[0] || n->select_stmt.has_limit ||
+                n->select_stmt.distinct || n->select_stmt.num_group_cols > 0 || n->select_stmt.num_joins > 0)
+                return result_error_msg("Only SELECT * FROM view is supported: filtering, sorting or joining a "
+                                        "view is not implemented yet");
             // Parse and execute the view definition
             TokenList* vtokens = lexer_tokenize(view->definition);
             if (!vtokens) return result_error_msg("Failed to tokenize view definition");
@@ -716,6 +816,22 @@ static QueryResult* exec_select(ExecCtx* ctx, ASTNode* n) {
     }
     const char* bad = where_unknown_column(n->select_stmt.where, ts);
     if (bad) return unknown_column_error(bad, "WHERE");
+    for (int i = 0; i < n->select_stmt.num_cols; i++) {
+        ASTExpr* c = n->select_stmt.columns[i];
+        if (c->type == EXPR_COLUMN && catalog_get_col_index(ts, c->col_name) < 0)
+            return unknown_column_error(c->col_name, "SELECT");
+    }
+    // ORDER BY: una colonna della tabella oppure l'alias di una colonna selezionata
+    int order_ci = -1;
+    if (n->select_stmt.order_col[0]) {
+        order_ci = catalog_get_col_index(ts, n->select_stmt.order_col);
+        for (int i = 0; i < n->select_stmt.num_cols && order_ci < 0; i++) {
+            ASTExpr* c = n->select_stmt.columns[i];
+            if (c->type == EXPR_COLUMN && c->alias[0] && strcasecmp(c->alias, n->select_stmt.order_col) == 0)
+                order_ci = catalog_get_col_index(ts, c->col_name);
+        }
+        if (order_ci < 0) return unknown_column_error(n->select_stmt.order_col, "ORDER BY");
+    }
 
     HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
     if (!hf) return result_error_msg("Failed to open heap");
@@ -810,7 +926,7 @@ static QueryResult* exec_select(ExecCtx* ctx, ASTNode* n) {
 
     // ORDER BY
     if (n->select_stmt.order_col[0] && num_valid > 0) {
-        int sort_col = catalog_get_col_index(ts, n->select_stmt.order_col);
+        int sort_col = order_ci;
         if (sort_col >= 0) {
             g_sort_ctx.rows = rows;
             g_sort_ctx.col_map = col_map;
@@ -832,25 +948,23 @@ static QueryResult* exec_select(ExecCtx* ctx, ASTNode* n) {
         r->col_names[i] = (ci >= 0 && ci < ts->num_columns) ? strdup(ts->columns[ci].name) : strdup("?");
     }
 
-    // Determine final row count (apply LIMIT and DISTINCT)
-    int max_rows = (n->select_stmt.limit > 0 && n->select_stmt.limit < num_valid) ? n->select_stmt.limit : num_valid;
-    r->rows = calloc(max_rows, sizeof(Row));
+    // Righe finali: DISTINCT confronta con tutte le righe già emesse (non solo la precedente),
+    // LIMIT conta le righe emesse dopo DISTINCT; ogni tupla viene liberata
+    int limit = n->select_stmt.has_limit ? n->select_stmt.limit : num_valid;
+    r->rows = calloc(num_valid > 0 ? num_valid : 1, sizeof(Row));
     int out_idx = 0;
-    Tuple* prev_distinct = NULL;
+    bool distinct = n->select_stmt.distinct;
+    Tuple** kept = distinct ? calloc(num_valid > 0 ? num_valid : 1, sizeof(Tuple*)) : NULL;
+    int nkept = 0;
 
-    for (int vi = 0; vi < max_rows; vi++) {
-        int i = valid_idx[vi];
-        Tuple* tp = rows[i];
-
-        // DISTINCT: skip if same as previous non-duplicate row
-        if (n->select_stmt.distinct && prev_distinct) {
-            if (rows_equal(tp, prev_distinct, col_map, out_cols, ts)) {
-                tuple_free(tp);
-                continue;
-            }
+    for (int vi = 0; vi < num_valid; vi++) {
+        Tuple* tp = rows[valid_idx[vi]];
+        if (out_idx >= limit) { tuple_free(tp); continue; }
+        if (distinct) {
+            bool dup = false;
+            for (int k = 0; k < nkept && !dup; k++) dup = rows_equal(tp, kept[k], col_map, out_cols, ts);
+            if (dup) { tuple_free(tp); continue; }
         }
-        if (prev_distinct) tuple_free(prev_distinct);
-        prev_distinct = NULL;
 
         Row* row = &r->rows[out_idx++];
         row->num_cells = out_cols;
@@ -872,12 +986,11 @@ static QueryResult* exec_select(ExecCtx* ctx, ASTNode* n) {
                 snprintf(cell->value, sizeof(cell->value), "NULL");
             }
         }
-        if (n->select_stmt.distinct)
-            prev_distinct = tp;
-        else
-            tuple_free(tp);
+        if (distinct) kept[nkept++] = tp;
+        else          tuple_free(tp);
     }
-    if (prev_distinct) tuple_free(prev_distinct);
+    for (int k = 0; k < nkept; k++) tuple_free(kept[k]);
+    free(kept);
 
     r->num_rows = out_idx;
 
@@ -914,6 +1027,15 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
             char msg[160];
             snprintf(msg, sizeof(msg), "Column '%.64s' cannot be NULL", ts->columns[sc].name);
             return result_error_msg(msg);
+        }
+        // il valore è lo stesso per tutte le righe: si controlla una volta, prima di modificarle
+        ASTExpr* se = n->update_stmt.set_expr;
+        if (se && se->type != EXPR_NULL) {
+            char text[sizeof(se->str_val)], msg[200];
+            if (se->type == EXPR_INT)        snprintf(text, sizeof(text), "%lld", (long long)se->int_val);
+            else if (se->type == EXPR_FLOAT) snprintf(text, sizeof(text), "%.17g", se->float_val);
+            else                             snprintf(text, sizeof(text), "%s", se->str_val);
+            if (check_value(&ts->columns[sc], text, msg, sizeof(msg))) return result_error_msg(msg);
         }
     }
     const char* bad = where_unknown_column(n->update_stmt.where, ts);
@@ -1083,12 +1205,13 @@ static QueryResult* exec_use(ExecCtx* ctx, ASTNode* n) {
 }
 
 static QueryResult* exec_show(ExecCtx* ctx, ASTNode* n) {
-    (void)n;
+    bool tables = strcmp(n->select_stmt.table_name, "TABLES") == 0;
+    Database* db = catalog_current_db(ctx->catalog);
+    if (tables && !db) return result_error_msg("No database selected");
     QueryResult* r = calloc(1, sizeof(QueryResult));
     r->success = true;
 
-    Database* db = catalog_current_db(ctx->catalog);
-    if (!db) {
+    if (!tables) {
         r->num_cols = 1;
         r->col_names = calloc(1, sizeof(char*));
         r->col_names[0] = strdup("Database");
@@ -1558,20 +1681,26 @@ static QueryResult* exec_join(ExecCtx* ctx, ASTNode* n) {
                 break;
             }
         }
-        if (sort_col >= 0) {
-            g_sort_rows.rows = r->rows;
-            g_sort_rows.sort_col = sort_col;
-            g_sort_rows.order_asc = n->select_stmt.order_asc;
-            qsort(r->rows, r->num_rows, sizeof(Row), row_compare_cells);
+        if (sort_col < 0) {
+            char col[64];
+            snprintf(col, sizeof(col), "%s", n->select_stmt.order_col);
+            for (int i = 0; i < n1; i++) tuple_free(rows1[i]);
+            for (int i = 0; i < n2; i++) tuple_free(rows2[i]);
+            free(rows1); free(rows2); free(col_map);
+            db_result_free(r);
+            return unknown_column_error(col, "ORDER BY");
         }
+        g_sort_rows.rows = r->rows;
+        g_sort_rows.sort_col = sort_col;
+        g_sort_rows.order_asc = n->select_stmt.order_asc;
+        qsort(r->rows, r->num_rows, sizeof(Row), row_compare_cells);
     }
 
     // LIMIT for JOIN
-    if (n->select_stmt.limit > 0 && r->num_rows > n->select_stmt.limit) {
+    if (n->select_stmt.has_limit && r->num_rows > n->select_stmt.limit) {
         for (int i = n->select_stmt.limit; i < r->num_rows; i++)
             free(r->rows[i].cells);
         r->num_rows = n->select_stmt.limit;
-        r->rows = realloc(r->rows, r->num_rows * sizeof(Row));
     }
 
     {
@@ -1773,14 +1902,23 @@ static QueryResult* exec_group_by(ExecCtx* ctx, ASTNode* n) {
         int sort_col = -1;
         for (int i = 0; i < out_cols && sort_col < 0; i++)
             if (strcasecmp(r->col_names[i], oc) == 0 || (dot && strcasecmp(r->col_names[i], dot + 1) == 0)) sort_col = i;
-        if (sort_col >= 0 && r->num_rows > 1) {
+        if (sort_col < 0) {
+            char col[64];
+            snprintf(col, sizeof(col), "%s", oc);
+            for (int i = 0; i < nf; i++) tuple_free(filtered[i]);
+            for (int i = 0; i < ng; i++) free(group_rows[i]);
+            free(group_rows); free(group_size); free(filtered); free(rows);
+            db_result_free(r);
+            return unknown_column_error(col, "ORDER BY");
+        }
+        if (r->num_rows > 1) {
             g_sort_rows.rows = r->rows;
             g_sort_rows.sort_col = sort_col;
             g_sort_rows.order_asc = n->select_stmt.order_asc;
             qsort(r->rows, r->num_rows, sizeof(Row), row_compare_cells);
         }
     }
-    if (n->select_stmt.limit > 0 && r->num_rows > n->select_stmt.limit) {
+    if (n->select_stmt.has_limit && r->num_rows > n->select_stmt.limit) {
         for (int i = n->select_stmt.limit; i < r->num_rows; i++) free(r->rows[i].cells);
         r->num_rows = n->select_stmt.limit;
     }

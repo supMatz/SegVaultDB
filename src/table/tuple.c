@@ -141,7 +141,7 @@ Tuple* tuple_deserialize(const uint8_t* data, size_t len,
 void value_set_from_text(Value* v, DataType type, const char* text) {
     if (v->owns_str) free(v->str_val);
     memset(v, 0, sizeof(*v));
-    if (!text || strcmp(text, "NULL") == 0) { v->is_null = true; return; }
+    if (!text) { v->is_null = true; return; }   // NULL SQL = puntatore nullo (la stringa 'NULL' è testo)
     switch (type) {
         case SV_TYPE_INT:    v->int_val = atoi(text); break;
         case SV_TYPE_BIGINT: v->bigint_val = atoll(text); break;

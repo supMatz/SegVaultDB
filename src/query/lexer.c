@@ -1,6 +1,8 @@
 #include "lexer.h"
 #include <ctype.h>
 #include <string.h>
+#include <strings.h>
+#include <stdbool.h>
 #include <stdio.h>
 
 typedef struct {
@@ -194,7 +196,13 @@ TokenList* lexer_tokenize(const char* sql) {
         if (isalpha((unsigned char)*lx.pos) || *lx.pos == '_') {
             while (isalnum((unsigned char)*lx.pos) || *lx.pos == '_') lx.pos++;
             TokenType tt = keyword_or_id(lx.start, (int)(lx.pos - lx.start));
-            add_token(list, make_token(&lx, tt));
+            Token kt = make_token(&lx, tt);
+            if (tt == TOK_IDENTIFIER && (!strcasecmp(kt.text, "TRUE") || !strcasecmp(kt.text, "FALSE"))) {
+                bool on = (kt.text[0] | 0x20) == 't';   // letterali booleani = 1 / 0
+                kt.type = TOK_INTEGER;
+                snprintf(kt.text, sizeof(kt.text), "%d", on ? 1 : 0);
+            }
+            add_token(list, kt);
             continue;
         }
 

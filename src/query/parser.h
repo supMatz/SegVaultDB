@@ -73,6 +73,7 @@ typedef struct {
             char       order_col[64];
             bool       order_asc;
             int        limit;
+            bool       has_limit;      // LIMIT presente (LIMIT 0 = nessuna riga)
             bool       distinct;
             char       group_cols[64][64];
             int        num_group_cols;

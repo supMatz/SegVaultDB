@@ -10,6 +10,11 @@
 #define BTREE_SET_LEAF(node) ((node)->hdr.header |= 0x01)
 #define BTREE_CLEAR_LEAF(node) ((node)->hdr.header &= ~0x01)
 
+// Il nodo vive in Page.data, che inizia all'offset 12 di una struttura impacchettata: le chiavi
+// uint64_t non sono allineate a 8 byte. Con pack(1) il compilatore genera accessi sicuri anche
+// su CPU che non tollerano letture disallineate (ARM); gli offset dei campi non cambiano
+// (0, 8, 520, 1032), quindi i file esistenti restano compatibili.
+#pragma pack(push, 1)
 typedef struct {
     uint32_t header;
     uint16_t num_keys;
@@ -29,8 +34,13 @@ typedef struct {
         BTreeValue values[BTREE_ORDER];
     } u;
     uint32_t next_leaf;
-    uint8_t  _pad[SV_PAGE_SIZE - sizeof(BTreeNodeHeader) - (BTREE_ORDER * 8) - sizeof(uint32_t) - (BTREE_ORDER + 1) * 4];
+    // riempie esattamente lo spazio dati della pagina (prima il calcolo dava 4348 byte su 4084)
+    uint8_t  _pad[SV_PAGE_SIZE - SV_PAGE_HEADER_SIZE - sizeof(BTreeNodeHeader) - BTREE_ORDER * 8
+                  - BTREE_ORDER * sizeof(BTreeValue) - sizeof(uint32_t)];
 } BTreeNode;
+#pragma pack(pop)
+
+_Static_assert(sizeof(BTreeNode) == SV_PAGE_SIZE - SV_PAGE_HEADER_SIZE, "BTreeNode deve occupare esattamente Page.data");
 
 typedef struct {
     BufferPool* bp;

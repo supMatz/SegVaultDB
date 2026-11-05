@@ -211,6 +211,45 @@ int main() {
     }
     test_sql("DROP TABLE lc", "DROP TABLE lc", -1);
 
+    // DISTINCT su duplicati non adiacenti e con LIMIT
+    test_sql("CREATE TABLE dd", "CREATE TABLE dd (id INT PRIMARY KEY, k VARCHAR(5))", -1);
+    test_sql("dd 1", "INSERT INTO dd VALUES (1, 'a')", -1);
+    test_sql("dd 2", "INSERT INTO dd VALUES (2, 'b')", -1);
+    test_sql("dd 3", "INSERT INTO dd VALUES (3, 'a')", -1);
+    test_sql("dd 4", "INSERT INTO dd VALUES (4, 'a')", -1);
+    test_sql("DISTINCT non-adjacent", "SELECT DISTINCT k FROM dd", 2);
+    test_sql("DISTINCT then LIMIT", "SELECT DISTINCT k FROM dd LIMIT 2", 2);
+    test_sql("LIMIT", "SELECT * FROM dd LIMIT 3", 3);
+    test_sql("DROP TABLE dd", "DROP TABLE dd", -1);
+
+    // Validazione dei valori, DEFAULT, NULL, LIMIT, colonne sconosciute
+    test_sql("CREATE TABLE vv", "CREATE TABLE vv (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(5), n INT, "
+             "f FLOAT, ok BOOLEAN, d DATE, st VARCHAR(10) DEFAULT 'new')", -1);
+    test_fail("text into INT", "INSERT INTO vv (n) VALUES ('abc')", "expects an integer");
+    test_fail("INT out of range", "INSERT INTO vv (n) VALUES (99999999999)", "out of range");
+    test_fail("text into FLOAT", "INSERT INTO vv (f) VALUES ('notanumber')", "expects a number");
+    test_fail("VARCHAR too long", "INSERT INTO vv (name) VALUES ('toolong')", "too long");
+    test_fail("impossible date", "INSERT INTO vv (d) VALUES ('2024-02-30')", "valid date");
+    test_sql("leap day ok", "INSERT INTO vv (name, d, ok) VALUES ('a', '2024-02-29', TRUE)", -1);
+    test_value("TRUE literal", "SELECT ok FROM vv WHERE name = 'a'", "1");
+    test_value("DEFAULT applied", "SELECT st FROM vv WHERE name = 'a'", "new");
+    test_sql("string 'NULL' is text", "INSERT INTO vv (id, name) VALUES (NULL, 'NULL')", -1);
+    test_sql("'NULL' not null", "SELECT * FROM vv WHERE name IS NULL", 0);
+    test_value("NULL id auto-incremented", "SELECT id FROM vv WHERE name = 'NULL'", "2");
+    test_fail("UPDATE type checked", "UPDATE vv SET n = 'x' WHERE id = 1", "expects an integer");
+    test_sql("LIMIT 0", "SELECT * FROM vv LIMIT 0", 0);
+    test_fail("LIMIT negative", "SELECT * FROM vv LIMIT -1", "LIMIT expects");
+    test_fail("unknown SELECT column", "SELECT nope FROM vv", "Unknown column");
+    test_fail("unknown ORDER BY", "SELECT * FROM vv ORDER BY nope", "Unknown column");
+    test_value("ORDER BY alias", "SELECT name AS who FROM vv ORDER BY who DESC", "a");
+    test_fail("missing table name", "SELECT * FROM", "Expected");
+    test_sql("DROP TABLE vv", "DROP TABLE vv", -1);
+
+    test_sql("SHOW DATABASES", "SHOW DATABASES", 1);
+    test_fail("SHOW nonsense", "SHOW FOO", "Expected DATABASES or TABLES");
+
+    test_fail("ALTER unsupported form", "ALTER TABLE t1 ADD COLUMN x INT", "Only ALTER TABLE");
+
     // Cleanup
     test_sql("DROP VIEW", "DROP VIEW v1", -1);
     test_sql("DROP TABLE", "DROP TABLE people", -1);

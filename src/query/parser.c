@@ -11,8 +11,17 @@ typedef struct {
     ParseResult* result;
 } ParserState;
 
-static Token peek(ParserState* ps) { return ps->tokens->tokens[ps->pos]; }
-static Token consume(ParserState* ps) { return ps->tokens->tokens[ps->pos++]; }
+// l'ultimo token è sempre TOK_EOF: non si va mai oltre (prima consume() avanzava fuori
+// dall'array e i messaggi d'errore leggevano memoria non inizializzata)
+static Token peek(ParserState* ps) {
+    int last = ps->tokens->count - 1;
+    return ps->tokens->tokens[ps->pos < last ? ps->pos : last];
+}
+static Token consume(ParserState* ps) {
+    Token t = peek(ps);
+    if (ps->pos < ps->tokens->count - 1) ps->pos++;
+    return t;
+}
 static bool match(ParserState* ps, TokenType tt) {
     if (peek(ps).type == tt) { consume(ps); return true; }
     return false;
@@ -464,6 +473,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             n->type = NODE_DELETE;
             expect(ps, TOK_FROM);
             Token tn = consume(ps);
+            if (tn.type != TOK_IDENTIFIER) parse_fail(ps, "Expected a table name after DELETE FROM", tn);
             copy_text(ps, n->delete_stmt.table_name, sizeof(n->delete_stmt.table_name), tn.text);
             if (match(ps, TOK_WHERE)) n->delete_stmt.where = parse_condition(ps);
             break;
@@ -556,7 +566,10 @@ static ASTNode* parse_statement(ParserState* ps) {
             if (match(ps, TOK_RENAME)) {
                 expect(ps, TOK_TO);
                 Token nn = consume(ps);
+                if (nn.type != TOK_IDENTIFIER) parse_fail(ps, "Expected the new table name after RENAME TO", nn);
                 copy_text(ps, n->alter_table.new_name, sizeof(n->alter_table.new_name), nn.text);
+            } else {
+                parse_fail(ps, "Only ALTER TABLE name RENAME TO new_name is supported", peek(ps));
             }
             break;
         }
@@ -599,6 +612,13 @@ static ASTNode* parse_statement(ParserState* ps) {
         case TOK_SHOW: {
             consume(ps);
             n->type = NODE_SHOW;
+            // SHOW DATABASES | SHOW TABLES (l'oggetto va in table_name)
+            Token what = consume(ps);
+            if (!strcasecmp(what.text, "DATABASES") || !strcasecmp(what.text, "TABLES"))
+                snprintf(n->select_stmt.table_name, sizeof(n->select_stmt.table_name), "%s",
+                         (what.text[0] | 0x20) == 'd' ? "DATABASES" : "TABLES");
+            else
+                parse_fail(ps, "Expected DATABASES or TABLES after SHOW", what);
             break;
         }
         case TOK_DESCRIBE: {
@@ -704,6 +724,7 @@ static ASTNode* parse_select(ParserState* ps) {
     memset(aliases, 0, sizeof(aliases));
 
     Token first = consume(ps);
+    if (first.type != TOK_IDENTIFIER) parse_fail(ps, "Expected a table name after FROM", first);
     copy_text(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name), first.text);
     parse_table_alias(ps, n->select_stmt.table_name, aliases, &nal);
 
@@ -773,7 +794,9 @@ static ASTNode* parse_select(ParserState* ps) {
 
     if (match(ps, TOK_LIMIT)) {
         Token lv = consume(ps);
+        if (lv.type != TOK_INTEGER || lv.text[0] == '-') parse_fail(ps, "LIMIT expects a number >= 0", lv);
         n->select_stmt.limit = atoi(lv.text);
+        n->select_stmt.has_limit = true;
     }
 
     // gli alias di tabella vengono sostituiti dal nome reale in tutte le espressioni
@@ -833,6 +856,7 @@ void parse_result_free(ParseResult* r) {
                 free(n->select_stmt.columns[j]);
             ast_expr_free(n->select_stmt.where);
             ast_expr_free(n->select_stmt.having);
+            for (int j = 0; j < n->select_stmt.num_joins; j++) ast_expr_free(n->select_stmt.joins[j].condition);
         } else if (n->type == NODE_INSERT) {
             for (int j = 0; j < n->insert_stmt.num_cols; j++)
                 free(n->insert_stmt.columns[j]);
