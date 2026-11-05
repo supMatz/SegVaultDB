@@ -952,7 +952,7 @@ static void bar_submit(AppWindow* app, bool shift, bool ctrl) {
             expand_path(in->text, path, sizeof(path));
             size_t pl = strlen(path);
             if (!pl || path[pl - 1] == '/' || path[pl - 1] == '\\') { in->error = true; return; }
-            if (app->bar_mode != BAR_DUMP && busy_guard(app)) return;
+            if (busy_guard(app)) return;   // il motore non è thread-safe: niente accessi durante una query
             bool ok = app->bar_mode == BAR_IMPORT_CSV ? import_csv(app, path)
                     : app->bar_mode == BAR_RUN_FILE   ? run_file(app, path)
                                                       : dump_database(app, path);
