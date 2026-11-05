@@ -357,6 +357,7 @@ static void build_index_for_table(ExecCtx* ctx, TableSchema* ts, int idx_i) {
     if (bp_new_page(ctx->bp, &root_id) != SV_OK) return;
     idx->root_page_id = root_id;
     BTree* bt = btree_create(ctx->bp, root_id);
+    bp_unpin(ctx->bp, root_id, false);   // pin lasciato da bp_new_page
     if (!bt) return;
     HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
     if (!hf) { free(bt); return; }

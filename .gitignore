@@ -18,3 +18,5 @@ data/
 test_engine
 *.d
 test_engine_asan
+test_btree
+test_btree_asan
