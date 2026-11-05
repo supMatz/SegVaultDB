@@ -18,12 +18,15 @@ typedef enum { JOIN_INNER, JOIN_LEFT, JOIN_RIGHT, JOIN_CROSS } JoinType;
 
 typedef enum { EXPR_COLUMN, EXPR_INT, EXPR_FLOAT, EXPR_STRING, EXPR_STAR,
                EXPR_BINARY, EXPR_UNARY, EXPR_NULL,
-               EXPR_AGG     // funzione di aggregazione: func = COUNT/SUM/AVG/MIN/MAX, col_name = argomento ("*" per COUNT(*))
+               EXPR_AGG,    // aggregato: func = COUNT/SUM/AVG/MIN/MAX; args[0] = argomento, col_name "*" per COUNT(*)
+               EXPR_FUNC    // funzione scalare: func = nome (UPPER, LENGTH, COALESCE, ...), args = argomenti
 } ExprType;
 
 typedef enum { OP_EQ, OP_NEQ, OP_LT, OP_GT, OP_LE, OP_GE,
                OP_AND, OP_OR, OP_NOT, OP_PLUS, OP_MINUS, OP_MUL, OP_DIV,
-               OP_IS_NULL, OP_IS_NOT_NULL, OP_LIKE, OP_NOT_LIKE } OpType;
+               OP_IS_NULL, OP_IS_NOT_NULL, OP_LIKE, OP_NOT_LIKE,
+               OP_NEG       // meno unario (EXPR_UNARY)
+} OpType;
 
 typedef struct ASTExpr {
     ExprType type;
@@ -37,12 +40,23 @@ typedef struct ASTExpr {
     };
     struct ASTExpr* left;
     struct ASTExpr* right;
-    char     func[8];         // EXPR_AGG: nome della funzione (maiuscolo)
+    struct ASTExpr** args;    // EXPR_FUNC / EXPR_AGG: argomenti
+    int      nargs;
+    bool     agg_distinct;    // COUNT(DISTINCT x)
+    char     func[16];        // EXPR_AGG / EXPR_FUNC: nome della funzione (maiuscolo)
     char     alias[64];       // SELECT ... AS alias
+    // risoluzione fatta dall'executor prima di eseguire (EXPR_COLUMN):
+    //   > 0  sorgente * 1024 + colonna + 1      < 0  alias della SELECT numero -(bound + 1)
+    int      bound;
+    int      depth;           // profondità dell'albero (limitata: valutazione e liberazione sono ricorsive)
 } ASTExpr;
 
 // libera un'espressione e tutti i suoi figli
 void ast_expr_free(ASTExpr* e);
+// copia profonda (NULL se e è NULL o manca memoria)
+ASTExpr* ast_expr_clone(const ASTExpr* e);
+// testo SQL dell'espressione (intestazioni delle colonne calcolate, EXPLAIN)
+void ast_expr_format(const ASTExpr* e, char* out, size_t n);
 
 typedef struct {
     char     name[64];
@@ -55,12 +69,15 @@ typedef struct {
 } ColumnDef;
 
 typedef struct {
-    ASTExpr*   left;
-    ASTExpr*   right;
-    ASTExpr*   condition;
+    ASTExpr*   condition;      // ON (NULL = prodotto cartesiano)
     JoinType   type;
     char       table_name[64];
+    char       alias[64];      // "" = nessun alias
 } ASTJoin;
+
+#define SV_MAX_ORDER   8
+#define SV_MAX_GROUP   16
+#define SV_MAX_SETS    64
 
 typedef struct {
     StmtType type;
@@ -69,14 +86,17 @@ typedef struct {
             ASTExpr*   columns[64];
             int        num_cols;
             char       table_name[64];
+            char       table_alias[64];  // "" = nessun alias
             ASTExpr*   where;
-            char       order_col[64];
-            bool       order_asc;
+            ASTExpr*   order_exprs[SV_MAX_ORDER];
+            bool       order_desc[SV_MAX_ORDER];
+            int        num_order;
             int        limit;
+            int        offset;
             bool       has_limit;      // LIMIT presente (LIMIT 0 = nessuna riga)
             bool       distinct;
-            char       group_cols[64][64];
-            int        num_group_cols;
+            ASTExpr*   group_exprs[SV_MAX_GROUP];
+            int        num_group;
             ASTExpr*   having;
             ASTJoin    joins[8];
             int        num_joins;
@@ -85,13 +105,15 @@ typedef struct {
             char       table_name[64];
             char*      columns[64];
             int        num_cols;
-            ASTExpr*   values[64];
-            int        num_values;
+            ASTExpr**  values;         // num_rows * num_values espressioni (riga per riga)
+            int        num_values;     // valori per riga
+            int        num_rows;
         } insert_stmt;
         struct {
             char       table_name[64];
-            char       set_col[64];
-            ASTExpr*   set_expr;
+            char       set_cols[SV_MAX_SETS][64];
+            ASTExpr*   set_exprs[SV_MAX_SETS];
+            int        num_sets;
             ASTExpr*   where;
         } update_stmt;
         struct {
@@ -151,6 +173,9 @@ typedef struct {
         struct {
             char       name[64];
         } drop_trigger;
+        struct {
+            void*      stmt;           // ASTNode* della SELECT da spiegare
+        } explain;
     };
 } ASTNode;
 

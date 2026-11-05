@@ -20,4 +20,7 @@ typedef struct {
 
 QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt);
 
+// scarta gli indici in memoria (da chiamare dopo ROLLBACK o modifiche alle pagine fuori dall'executor)
+void executor_invalidate_indexes(void);
+
 #endif

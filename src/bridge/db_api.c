@@ -16,6 +16,50 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
 #include <stdio.h>
 #include <string.h>
 
+// ── mutex del motore e lock della cartella dati ─────────────────
+// Il motore non è rientrante: ogni funzione pubblica che tocca catalogo, pagine o
+// transazioni passa da un mutex ricorsivo (la GUI chiama il motore da due thread).
+// Il file del database viene bloccato in modo esclusivo: due processi sulla stessa
+// cartella dati la corromperebbero.
+#ifdef _WIN32
+  // windows.h non si può includere qui (TokenType del lexer va in conflitto con quello di
+  // Windows): bastano le tre funzioni della CRITICAL_SECTION, su un buffer allineato più
+  // grande della struttura reale (40 byte a 64 bit)
+  #include <io.h>
+  #include <sys/locking.h>
+  __declspec(dllimport) void __stdcall InitializeCriticalSection(void* cs);
+  __declspec(dllimport) void __stdcall EnterCriticalSection(void* cs);
+  __declspec(dllimport) void __stdcall LeaveCriticalSection(void* cs);
+  static _Alignas(16) unsigned char g_db_mutex[64];
+  static void db_mutex_init(void)   { InitializeCriticalSection(g_db_mutex); }
+  static void db_lock(void)         { EnterCriticalSection(g_db_mutex); }
+  static void db_unlock(void)       { LeaveCriticalSection(g_db_mutex); }
+  static int  db_lock_file(int fd) {
+      long cur = _lseek(fd, 0, SEEK_CUR);
+      _lseek(fd, 0, SEEK_SET);
+      int r = _locking(fd, _LK_NBLCK, 1);   // primo byte del file
+      _lseek(fd, cur, SEEK_SET);
+      return r;
+  }
+#else
+  #include <pthread.h>
+  #include <sys/file.h>
+  static pthread_mutex_t g_db_mutex;
+  static void db_mutex_init(void) {
+      pthread_mutexattr_t a;
+      pthread_mutexattr_init(&a);
+      pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+      pthread_mutex_init(&g_db_mutex, &a);
+      pthread_mutexattr_destroy(&a);
+  }
+  static void db_lock(void)        { pthread_mutex_lock(&g_db_mutex); }
+  static void db_unlock(void)      { pthread_mutex_unlock(&g_db_mutex); }
+  static int  db_lock_file(int fd) { return flock(fd, LOCK_EX | LOCK_NB); }
+#endif
+
+static char g_init_error[256];
+const char* db_init_error(void) { return g_init_error; }
+
 // ── Forward declarations ─────────────────────────────────────────
 static QueryResult* result_error(const char* msg);
 static QueryResult* result_ok(int rows_affected);
@@ -46,7 +90,7 @@ static double get_time_ms(void) { return sv_get_time_ms(); }
 
 // ── API principale ───────────────────────────────────────────────
 
-bool db_init(const char* data_directory) {
+static bool db_init_impl(const char* data_directory) {
     if (g_db.initialized) return true;
 
     strncpy(g_db.data_dir, data_directory, sizeof(g_db.data_dir)-1);
@@ -54,12 +98,21 @@ bool db_init(const char* data_directory) {
     snprintf(g_db.cat_path, sizeof(g_db.cat_path), "%s" SV_PATH_SEP "segvault.cat", data_directory);
     snprintf(g_db.log_path, sizeof(g_db.log_path), "%s" SV_PATH_SEP "segvault.wal", data_directory);
 
-    // Recovery prima di aprire qualsiasi cosa
-    wal_recovery(g_db.log_path, g_db.db_path, g_db.cat_path);
-
-    // Apri il file del database
+    // Apri il file del database e bloccalo: un'altra istanza sulla stessa cartella lo corromperebbe
     g_db.db_fd = sv_open(g_db.db_path, SV_O_RDWR | SV_O_CREAT, 0644);
-    if (g_db.db_fd < 0) return false;
+    if (g_db.db_fd < 0) {
+        snprintf(g_init_error, sizeof(g_init_error), "cannot open %.200s", g_db.db_path);
+        return false;
+    }
+    if (db_lock_file(g_db.db_fd) != 0) {
+        snprintf(g_init_error, sizeof(g_init_error),
+                 "the data directory is already in use by another SegVault instance");
+        sv_close(g_db.db_fd);
+        return false;
+    }
+
+    // recovery dopo un arresto anomalo (con il lock già preso)
+    wal_recovery(g_db.log_path, g_db.db_path, g_db.cat_path);
 
     // Inizializza i componenti
     g_db.catalog = catalog_load(g_db.cat_path);
@@ -93,7 +146,7 @@ void db_clear_cancel(void) {
 
 bool db_cancel_requested(void) { return atomic_load(&g_cancel_requested) != 0; }
 
-QueryResult* db_execute(const char* sql) {
+static QueryResult* db_execute_impl(const char* sql) {
     if (!g_db.initialized) return result_error("DB non inizializzato");
     if (!sql || !sql[0])   return result_error("Query vuota");
 
@@ -164,7 +217,7 @@ QueryResult* db_execute(const char* sql) {
     return result;
 }
 
-QueryResult** db_execute_multi(const char* sql, int* out_count) {
+static QueryResult** db_execute_multi_impl(const char* sql, int* out_count) {
     *out_count = 0;
     if (!g_db.initialized) return NULL;
 
@@ -213,7 +266,7 @@ void db_result_free_multi(QueryResult** results, int count) {
 
 // ── Transazioni ──────────────────────────────────────────────────
 
-bool db_begin(void) {
+static bool db_begin_impl(void) {
     if (!g_db.initialized) return false;
     Transaction* tx = txm_begin(g_db.txm);
     if (!tx) return false;
@@ -223,7 +276,7 @@ bool db_begin(void) {
     return true;
 }
 
-bool db_commit(void) {
+static bool db_commit_impl(void) {
     if (!g_db.initialized || !g_db.exec_ctx.tx_id) return false;
     wal_write(g_db.wal, LOG_COMMIT, g_db.exec_ctx.tx_id, 0,
               (SVRID){0,0}, NULL, 0, NULL, 0);
@@ -233,7 +286,7 @@ bool db_commit(void) {
     return true;
 }
 
-bool db_rollback(void) {
+static bool db_rollback_impl(void) {
     if (!g_db.initialized || !g_db.exec_ctx.tx_id) return false;
     // Scrivi LOG_ABORT prima dell'undo per segnare la transazione
     wal_write(g_db.wal, LOG_ABORT, g_db.exec_ctx.tx_id, 0,
@@ -250,6 +303,7 @@ bool db_rollback(void) {
     }
     txm_abort(g_db.txm, g_db.exec_ctx.tx_id);
     g_db.exec_ctx.tx_id = 0;
+    executor_invalidate_indexes();   // le righe sono tornate indietro (e possono aver cambiato posizione)
     return true;
 }
 
@@ -257,7 +311,7 @@ bool db_rollback(void) {
 static struct { char name[64]; off_t offset; } g_savepoints[64];
 static int g_num_savepoints = 0;
 
-bool db_savepoint(const char* name) {
+static bool db_savepoint_impl(const char* name) {
     if (!g_db.initialized) return false;
     if (!g_db.exec_ctx.tx_id) return false;
     // Write LOG_SAVEPOINT to WAL
@@ -274,7 +328,7 @@ bool db_savepoint(const char* name) {
     return true;
 }
 
-bool db_rollback_to(const char* name) {
+static bool db_rollback_to_impl(const char* name) {
     if (!g_db.initialized || !g_db.exec_ctx.tx_id) return false;
     int sp_idx = -1;
     for (int i = g_num_savepoints - 1; i >= 0; i--) {
@@ -360,12 +414,13 @@ bool db_rollback_to(const char* name) {
         if (g_db.bp->frames[i].page)
             bp_remove_page(g_db.bp, g_db.bp->frames[i].page->page_id);
     }
+    executor_invalidate_indexes();
     return true;
 }
 
 // ── Sidebar API ──────────────────────────────────────────────────
 
-NameList* db_list_databases(void) {
+static NameList* db_list_databases_impl(void) {
     if (!g_db.initialized || !g_db.catalog) return NULL;
     Catalog* c  = g_db.catalog;
     NameList*  nl = SV_ALLOC(NameList);
@@ -378,7 +433,7 @@ NameList* db_list_databases(void) {
     return nl;
 }
 
-NameList* db_list_tables(const char* db_name) {
+static NameList* db_list_tables_impl(const char* db_name) {
     if (!g_db.initialized) return NULL;
     Database* db = catalog_get_db(g_db.catalog, db_name);
     if (!db) return NULL;
@@ -391,7 +446,7 @@ NameList* db_list_tables(const char* db_name) {
     return nl;
 }
 
-NameList* db_list_views(const char* db_name) {
+static NameList* db_list_views_impl(const char* db_name) {
     if (!g_db.initialized) return NULL;
     Database* db = catalog_get_db(g_db.catalog, db_name);
     if (!db) return NULL;
@@ -404,7 +459,7 @@ NameList* db_list_views(const char* db_name) {
     return nl;
 }
 
-NameList* db_list_procedures(const char* db_name) {
+static NameList* db_list_procedures_impl(const char* db_name) {
     if (!g_db.initialized) return NULL;
     Database* db = catalog_get_db(g_db.catalog, db_name);
     if (!db) return NULL;
@@ -418,7 +473,7 @@ NameList* db_list_procedures(const char* db_name) {
     return nl;
 }
 
-NameList* db_list_functions(const char* db_name) {
+static NameList* db_list_functions_impl(const char* db_name) {
     if (!g_db.initialized) return NULL;
     Database* db = catalog_get_db(g_db.catalog, db_name);
     if (!db) return NULL;
@@ -432,7 +487,7 @@ NameList* db_list_functions(const char* db_name) {
     return nl;
 }
 
-NameList* db_list_triggers(const char* db_name, const char* table) {
+static NameList* db_list_triggers_impl(const char* db_name, const char* table) {
     if (!g_db.initialized) return NULL;
     Database* db = catalog_get_db(g_db.catalog, db_name);
     if (!db) return NULL;
@@ -447,7 +502,7 @@ NameList* db_list_triggers(const char* db_name, const char* table) {
     return nl;
 }
 
-ColumnInfo* db_list_columns(const char* db_name, const char* table,
+static ColumnInfo* db_list_columns_impl(const char* db_name, const char* table,
                               int* out_count) {
     *out_count = 0;
     TableSchema* t = catalog_get_table(g_db.catalog, db_name, table);
@@ -477,18 +532,18 @@ void db_namelist_free(NameList* nl) {
     free(nl);
 }
 
-bool db_use(const char* name) {
+static bool db_use_impl(const char* name) {
     if (!g_db.initialized) return false;
     return catalog_use_db(g_db.catalog, name) == SV_OK;
 }
 
-const char* db_current_database(void) {
+static const char* db_current_database_impl(void) {
     if (!g_db.initialized) return NULL;
     Database* db = catalog_current_db(g_db.catalog);
     return db ? db->name : NULL;
 }
 
-SessionInfo* db_session_info(void) {
+static SessionInfo* db_session_info_impl(void) {
     SessionInfo* s = SV_ALLOC(SessionInfo);
     const char* db = db_current_database();
     if (s && db) {
@@ -507,7 +562,7 @@ SessionInfo* db_session_info(void) {
 void db_session_free(SessionInfo* s) { free(s); }
 
 // CREATE TABLE che ricrea la struttura della tabella (dump, "Copy as SQL")
-char* db_get_create_statement(const char* db_name, const char* table) {
+static char* db_get_create_statement_impl(const char* db_name, const char* table) {
     TableSchema* t = catalog_get_table(g_db.catalog, db_name, table);
     if (!t) return NULL;
     size_t cap = 256 + (size_t)t->num_columns * 400;
@@ -537,7 +592,7 @@ char* db_get_create_statement(const char* db_name, const char* table) {
 
 void db_free_string(char* s) { free(s); }
 
-void db_shutdown(void) {
+static void db_shutdown_impl(void) {
     if (!g_db.initialized) return;
     // una transazione lasciata aperta viene annullata (le sue pagine sono già nel buffer)
     if (g_db.exec_ctx.tx_id) db_rollback();
@@ -552,7 +607,8 @@ void db_shutdown(void) {
     bp_destroy(g_db.bp);
     txm_destroy(g_db.txm);
     catalog_free(g_db.catalog);
-    sv_close(g_db.db_fd);
+    executor_invalidate_indexes();
+    sv_close(g_db.db_fd);   // rilascia anche il lock del file
     g_db.initialized = false;
 }
 
@@ -569,5 +625,148 @@ static QueryResult* result_ok(int rows_affected) {
     QueryResult* r = make_result();
     r->success      = true;
     r->rows_affected = rows_affected;
+    return r;
+}
+
+// ── API pubblica: ogni chiamata tiene il mutex del motore ───────
+
+QueryResult* db_execute(const char* sql) {
+    db_lock();
+    QueryResult* r = db_execute_impl(sql);
+    db_unlock();
+    return r;
+}
+
+QueryResult** db_execute_multi(const char* sql, int* out_count) {
+    db_lock();
+    QueryResult** r = db_execute_multi_impl(sql, out_count);
+    db_unlock();
+    return r;
+}
+
+bool db_begin(void) {
+    db_lock();
+    bool r = db_begin_impl();
+    db_unlock();
+    return r;
+}
+
+bool db_commit(void) {
+    db_lock();
+    bool r = db_commit_impl();
+    db_unlock();
+    return r;
+}
+
+bool db_rollback(void) {
+    db_lock();
+    bool r = db_rollback_impl();
+    db_unlock();
+    return r;
+}
+
+bool db_savepoint(const char* name) {
+    db_lock();
+    bool r = db_savepoint_impl(name);
+    db_unlock();
+    return r;
+}
+
+bool db_rollback_to(const char* name) {
+    db_lock();
+    bool r = db_rollback_to_impl(name);
+    db_unlock();
+    return r;
+}
+
+NameList* db_list_databases(void) {
+    db_lock();
+    NameList* r = db_list_databases_impl();
+    db_unlock();
+    return r;
+}
+
+NameList* db_list_tables(const char* db_name) {
+    db_lock();
+    NameList* r = db_list_tables_impl(db_name);
+    db_unlock();
+    return r;
+}
+
+NameList* db_list_views(const char* db_name) {
+    db_lock();
+    NameList* r = db_list_views_impl(db_name);
+    db_unlock();
+    return r;
+}
+
+NameList* db_list_procedures(const char* db_name) {
+    db_lock();
+    NameList* r = db_list_procedures_impl(db_name);
+    db_unlock();
+    return r;
+}
+
+NameList* db_list_functions(const char* db_name) {
+    db_lock();
+    NameList* r = db_list_functions_impl(db_name);
+    db_unlock();
+    return r;
+}
+
+NameList* db_list_triggers(const char* db_name, const char* table) {
+    db_lock();
+    NameList* r = db_list_triggers_impl(db_name, table);
+    db_unlock();
+    return r;
+}
+
+ColumnInfo* db_list_columns(const char* db_name, const char* table, int* out_count) {
+    db_lock();
+    ColumnInfo* r = db_list_columns_impl(db_name, table, out_count);
+    db_unlock();
+    return r;
+}
+
+bool db_use(const char* name) {
+    db_lock();
+    bool r = db_use_impl(name);
+    db_unlock();
+    return r;
+}
+
+const char* db_current_database(void) {
+    db_lock();
+    const char* r = db_current_database_impl();
+    db_unlock();
+    return r;
+}
+
+SessionInfo* db_session_info(void) {
+    db_lock();
+    SessionInfo* r = db_session_info_impl();
+    db_unlock();
+    return r;
+}
+
+char* db_get_create_statement(const char* db_name, const char* table) {
+    db_lock();
+    char* r = db_get_create_statement_impl(db_name, table);
+    db_unlock();
+    return r;
+}
+
+void db_shutdown(void) {
+    db_lock();
+    db_shutdown_impl();
+    db_unlock();
+}
+
+bool db_init(const char* data_directory) {
+    static int once = 0;
+    if (!once) { db_mutex_init(); once = 1; }
+    db_lock();
+    bool r = db_init_impl(data_directory);
+    db_unlock();
     return r;
 }

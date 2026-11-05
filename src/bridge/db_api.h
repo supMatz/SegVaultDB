@@ -137,6 +137,7 @@ typedef struct {
 
 // inizializzazione db engine
 bool db_init(const char* data_directory);
+const char* db_init_error(void);   // motivo dell'ultimo db_init fallito
 
 // esecuzione di qualsiasi statement
 QueryResult* db_execute(const char* sql);

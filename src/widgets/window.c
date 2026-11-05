@@ -1791,7 +1791,11 @@ static bool ctx_enabled(AppWindow* app, int a) {
         case CTX_STOP: return !idle;
         case CTX_BEGIN: return idle && !app->in_transaction;
         case CTX_COMMIT: case CTX_ROLLBACK: return idle;
-        case CTX_DUMP_DB: { const char* db = db_current_database(); return idle && db && db[0]; }
+        case CTX_DUMP_DB: {   // il motore si interroga solo se libero (il thread di lavoro lo tiene occupato)
+            if (!idle) return false;
+            const char* db = db_current_database();
+            return db && db[0];
+        }
         default: return true;
     }
 }
@@ -2546,31 +2550,33 @@ static const char* const ABOUT_LINES[] = {
 
 static const char* const SQL_LINES[] = {
     "#Databases and tables",
-    "CREATE DATABASE db;  USE db;  DROP DATABASE db;  SHOW DATABASES;  SHOW TABLES;",
-    "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(50) NOT NULL, price FLOAT);",
-    "ALTER TABLE t RENAME TO t2;  DROP TABLE t;  TRUNCATE TABLE t;  DESCRIBE t;",
-    "CREATE INDEX i ON t (col);  DROP INDEX i ON t;  CREATE VIEW v AS SELECT ...;  (views: SELECT * only)",
-    "Types: INT BIGINT FLOAT DOUBLE DECIMAL VARCHAR(n) CHAR TEXT BOOLEAN DATE DATETIME BLOB",
+    "CREATE DATABASE db;  USE db;  DROP DATABASE db;  SHOW DATABASES;  SHOW TABLES;  DESCRIBE t;",
+    "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(50) NOT NULL, qty INT DEFAULT 0);",
+    "ALTER TABLE t RENAME TO t2;  DROP TABLE t;  TRUNCATE TABLE t;",
+    "CREATE INDEX i ON t (col);  DROP INDEX i ON t;  CREATE VIEW v AS SELECT ...;  DROP VIEW v;",
+    "Types: INT BIGINT FLOAT DOUBLE DECIMAL VARCHAR(n) CHAR(n) TEXT BOOLEAN DATE DATETIME BLOB",
     "",
     "#Reading data",
-    "SELECT [DISTINCT] cols | * FROM t [alias] [JOIN t2 ON a.x = b.y] [WHERE ...]",
-    "       [GROUP BY cols [HAVING ...]] [ORDER BY col [ASC|DESC]] [LIMIT n];",
-    "WHERE: = != <> < > <= >=  AND OR NOT ( )  LIKE 'a%'  BETWEEN a AND b  IN (1, 2)  IS [NOT] NULL",
-    "Aggregates: COUNT(*) COUNT(col) SUM AVG MIN MAX  \xc2\xb7  aliases with AS  \xc2\xb7  TRUE / FALSE",
-    "JOIN: INNER, LEFT [OUTER], RIGHT  \xc2\xb7  EXPLAIN SELECT ... shows the plan",
+    "SELECT [DISTINCT] expressions [AS alias] FROM t [alias] [JOIN t2 [alias] ON condition] [WHERE ...]",
+    "       [GROUP BY ...] [HAVING ...] [ORDER BY expr [ASC|DESC], ...] [LIMIT n [OFFSET m]];",
+    "JOIN: INNER, LEFT, RIGHT, CROSS or comma; any ON condition; self-joins with aliases; views as tables",
+    "Operators: + - * /  = != <> < > <= >=  AND OR NOT  LIKE  BETWEEN  IN (...)  IS [NOT] NULL  TRUE FALSE",
+    "Aggregates: COUNT(*) COUNT([DISTINCT] x) SUM AVG MIN MAX (also on expressions)",
+    "Functions: UPPER LOWER LENGTH CHAR_LENGTH TRIM CONCAT CONCAT_WS SUBSTRING LEFT RIGHT REPLACE REVERSE",
+    "           ABS ROUND FLOOR CEIL MOD POWER SQRT SIGN COALESCE IFNULL NULLIF IF NOW CURDATE YEAR MONTH DAY",
+    "SELECT without FROM: SELECT 1;  SELECT NOW();      EXPLAIN SELECT ... shows the query plan",
     "",
     "#Changing data",
-    "INSERT INTO t (a, b) VALUES (1, 'x');   one row per statement, up to 64 values",
-    "UPDATE t SET col = value WHERE ...;     DELETE FROM t WHERE ...;",
+    "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y'), ...;   all rows or none",
+    "UPDATE t SET a = a + 1, b = 'z' WHERE ...;   DELETE FROM t WHERE ...;",
     "Strings: 'It''s' or 'It\\'s'  \xc2\xb7  escapes \\n \\t \\\\",
     "",
     "#Transactions",
     "BEGIN;  COMMIT;  ROLLBACK;  SAVEPOINT s;  ROLLBACK TO s;",
     "",
-    "#Current limits",
-    "JOIN conditions must be  a = b; aggregates cannot be combined with JOIN.",
-    "UPDATE sets one column per statement; no subqueries, no multi-row INSERT, no ALTER ... ADD COLUMN.",
-    "Values are checked: integers, numbers, VARCHAR(n) length, valid dates; text values up to 511 bytes.",
+    "#Checks and limits",
+    "Values are validated (integers, numbers, VARCHAR(n) length, real dates); NOT NULL and PRIMARY KEY enforced.",
+    "Text values up to 511 bytes. Not yet: subqueries, ALTER TABLE ADD/DROP COLUMN.",
 };
 
 static void draw_info(AppWindow* app) {

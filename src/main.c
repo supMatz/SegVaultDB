@@ -50,7 +50,9 @@ int main(int argc, char** argv) {
     printf("[SegVault %s] DB engine initialization...\n", SV_VERSION_STR);
 
     if (!db_init(data_dir)) {
-        fprintf(stderr, "[ERROR] Impossible to open '%s'\n", data_dir);
+        char msg[700];
+        snprintf(msg, sizeof(msg), "Cannot open the data directory '%.300s': %.300s", data_dir, db_init_error());
+        platform_error_box(SV_NAME " cannot start", msg);
         return 1;
     }
 

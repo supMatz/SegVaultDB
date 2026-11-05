@@ -20,3 +20,5 @@ test_engine
 test_engine_asan
 test_btree
 test_btree_asan
+test_sql
+test_sql_asan

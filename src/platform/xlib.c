@@ -751,7 +751,12 @@ PlatformThread* platform_thread_start(void (*fn)(void* arg), void* arg) {
     if (!t) return NULL;
     t->fn = fn;
     t->arg = arg;
-    if (pthread_create(&t->id, NULL, thread_entry, t) != 0) { free(t); return NULL; }
+    pthread_attr_t attr;                                   // stack 16 MB per il motore (query molto annidate)
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, (size_t)16 << 20);
+    int rc = pthread_create(&t->id, &attr, thread_entry, t);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) { free(t); return NULL; }
     return t;
 }
 
@@ -759,4 +764,38 @@ void platform_thread_join(PlatformThread* t) {
     if (!t) return;
     pthread_join(t->id, NULL);
     free(t);
+}
+
+// finestrella con il messaggio: si chiude con un click, un tasto o la X della finestra
+void platform_error_box(const char* title, const char* message) {
+    fprintf(stderr, "[%s] %s\n", title, message);
+    Display* d = XOpenDisplay(NULL);
+    if (!d) return;
+    int scr = DefaultScreen(d);
+    int w = 520, h = 130;
+    Window win = XCreateSimpleWindow(d, RootWindow(d, scr), 100, 100, (unsigned)w, (unsigned)h, 1,
+                                     BlackPixel(d, scr), WhitePixel(d, scr));
+    XStoreName(d, win, title);
+    Atom del = XInternAtom(d, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(d, win, &del, 1);
+    XSelectInput(d, win, ExposureMask | KeyPressMask | ButtonPressMask);
+    XMapWindow(d, win);
+    GC gc = XCreateGC(d, win, 0, NULL);
+    XSetForeground(d, gc, BlackPixel(d, scr));
+    for (;;) {
+        XEvent e;
+        XNextEvent(d, &e);
+        if (e.type == Expose) {
+            XDrawString(d, win, gc, 20, 40, title, (int)strlen(title));
+            XDrawString(d, win, gc, 20, 70, message, (int)strlen(message));
+            const char* hint = "Click or press a key to close.";
+            XDrawString(d, win, gc, 20, 105, hint, (int)strlen(hint));
+        } else if (e.type == KeyPress || e.type == ButtonPress ||
+                   (e.type == ClientMessage && (Atom)e.xclient.data.l[0] == del)) {
+            break;
+        }
+    }
+    XFreeGC(d, gc);
+    XDestroyWindow(d, win);
+    XCloseDisplay(d);
 }

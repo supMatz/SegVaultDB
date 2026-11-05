@@ -691,7 +691,7 @@ PlatformThread* platform_thread_start(void (*fn)(void* arg), void* arg) {
     if (!t) return NULL;
     t->fn = fn;
     t->arg = arg;
-    t->handle = CreateThread(NULL, 0, thread_entry, t, 0, NULL);
+    t->handle = CreateThread(NULL, 16u << 20, thread_entry, t, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);   // stack 16 MB
     if (!t->handle) { free(t); return NULL; }
     return t;
 }
@@ -701,4 +701,8 @@ void platform_thread_join(PlatformThread* t) {
     WaitForSingleObject(t->handle, INFINITE);
     CloseHandle(t->handle);
     free(t);
+}
+
+void platform_error_box(const char* title, const char* message) {
+    MessageBoxA(NULL, message, title, MB_OK | MB_ICONERROR);
 }

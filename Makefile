@@ -82,9 +82,15 @@ full: $(FULL_OBJS)
 BTREE_TEST_SRCS = tests/test_btree.c src/index/btree.c src/storage/buffer_pool.c src/storage/page.c \
                   src/table/tuple.c src/catalog/schema.c
 
-test: test_engine test_btree
+SQL_TEST_SRCS = tests/test_sql.c $(ENGINE_SRCS)
+
+test: test_engine test_btree test_sql
 	./test_btree
 	./test_engine
+	./test_sql
+
+test_sql: $(SQL_TEST_SRCS)
+	$(CC) $(CFLAGS) -I. $(INCLUDES) -o test_sql $(SQL_TEST_SRCS) -lm -pthread
 
 test_btree: $(BTREE_TEST_SRCS)
 	$(CC) $(CFLAGS) -I. $(INCLUDES) -o test_btree $(BTREE_TEST_SRCS) -lm
@@ -93,14 +99,17 @@ test_btree: $(BTREE_TEST_SRCS)
 # memoria, use-after-free, leak e comportamenti indefiniti (es. letture disallineate)
 test-asan: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
 	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
-		$(INCLUDES) -o test_engine_asan test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c -lm
+		$(INCLUDES) -o test_engine_asan test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c -lm -pthread
 	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
 		-I. $(INCLUDES) -o test_btree_asan $(BTREE_TEST_SRCS) -lm
 	ASAN_OPTIONS=detect_leaks=1 ./test_btree_asan
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
+		-I. $(INCLUDES) -o test_sql_asan $(SQL_TEST_SRCS) -lm -pthread
 	ASAN_OPTIONS=detect_leaks=1 ./test_engine_asan
+	ASAN_OPTIONS=detect_leaks=1 ./test_sql_asan
 
 test_engine: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
-	$(CC) $(CFLAGS) $(INCLUDES) -o test_engine test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c -lm
+	$(CC) $(CFLAGS) $(INCLUDES) -o test_engine test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c -lm -pthread
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
@@ -120,7 +129,7 @@ build-win/%.o: %.c
 	$(WIN_CC) $(CFLAGS) $(DEPFLAGS) $(BASE_INCLUDES) -c $< -o $@
 
 clean:
-	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(GUI_OBJS:.o=.d) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan
+	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(GUI_OBJS:.o=.d) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan
 	$(RM) -r obj build-win
 
 -include $(FULL_OBJS:.o=.d) $(GUI_OBJS:.o=.d) $(WIN_OBJS:.o=.d)

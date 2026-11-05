@@ -100,6 +100,9 @@ typedef enum {
 // connessione al sistema grafico del sistema grafico dell'OS.
 bool platform_init(void);
 
+// messaggio d'errore bloccante, utilizzabile anche prima di platform_init (es. avvio fallito)
+void platform_error_box(const char* title, const char* message);
+
 // creazione finestra con titolo
 // ritorna NULL in caso di errore
 PlatformWindow* platform_window_create(const char* title, int w, int h);
