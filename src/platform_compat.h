@@ -105,4 +105,30 @@
   }
 #endif
 
+
+// lettura / scrittura complete (read e write possono trasferire meno byte del richiesto);
+// false su errore o fine file prima di count byte
+static inline bool sv_read_full(int fd, void* buf, size_t count) {
+    unsigned char* p = (unsigned char*)buf;
+    while (count > 0) {
+        unsigned int chunk = count > (1u << 24) ? (1u << 24) : (unsigned int)count;
+        long r = (long)sv_read(fd, p, chunk);
+        if (r <= 0) return false;
+        p += r;
+        count -= (size_t)r;
+    }
+    return true;
+}
+static inline bool sv_write_full(int fd, const void* buf, size_t count) {
+    const unsigned char* p = (const unsigned char*)buf;
+    while (count > 0) {
+        unsigned int chunk = count > (1u << 24) ? (1u << 24) : (unsigned int)count;
+        long w = (long)sv_write(fd, p, chunk);
+        if (w <= 0) return false;
+        p += w;
+        count -= (size_t)w;
+    }
+    return true;
+}
+
 #endif

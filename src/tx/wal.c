@@ -27,11 +27,32 @@ int wal_write(WAL* wal, uint8_t type, uint64_t tx_id, uint32_t page_id,
     memcpy(hdr + 15, &data_len, 4);
     memcpy(hdr + 19, &old_data_len, 4);
 
-    sv_write(wal->fd, hdr, 23);
-    if (data && data_len > 0) sv_write(wal->fd, data, data_len);
-    if (old_data && old_data_len > 0) sv_write(wal->fd, old_data, old_data_len);
+    // le lunghezze nell'intestazione devono corrispondere ai byte scritti davvero
+    if (!data) data_len = 0;
+    if (!old_data) old_data_len = 0;
+    memcpy(hdr + 15, &data_len, 4);
+    memcpy(hdr + 19, &old_data_len, 4);
+    if (!sv_write_full(wal->fd, hdr, 23) ||
+        (data_len > 0 && !sv_write_full(wal->fd, data, data_len)) ||
+        (old_data_len > 0 && !sv_write_full(wal->fd, old_data, old_data_len))) {
+        fprintf(stderr, "[SegVault] cannot write the transaction log (disk full?)\n");
+        return SV_ERR;
+    }
     wal->sequence++;
     return SV_OK;
+}
+
+// legge il contenuto di una voce del log (len byte); false se il file finisce prima o la
+// lunghezza è assurda (intestazione danneggiata)
+static bool read_payload(int fd, uint32_t len, uint8_t** out) {
+    *out = NULL;
+    if (len == 0) return true;
+    if (len > (64u << 20)) return false;
+    uint8_t* b = malloc(len);
+    if (!b) return false;
+    if (!sv_read_full(fd, b, len)) { free(b); return false; }
+    *out = b;
+    return true;
 }
 
 int wal_flush(WAL* wal) {
@@ -151,13 +172,11 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
         e->data = NULL;
         e->old_data = NULL;
 
-        if (e->data_len > 0) {
-            e->data = malloc(e->data_len);
-            sv_read(log_fd, e->data, e->data_len);
-        }
-        if (e->old_data_len > 0) {
-            e->old_data = malloc(e->old_data_len);
-            sv_read(log_fd, e->old_data, e->old_data_len);
+        // voce troncata (arresto durante la scrittura): è la fine del log
+        if (!read_payload(log_fd, e->data_len, &e->data) || !read_payload(log_fd, e->old_data_len, &e->old_data)) {
+            free(e->data);
+            e->data = NULL;
+            break;
         }
 
         // Track transaction state
@@ -256,13 +275,10 @@ int wal_undo_tx(const char* log_path, const char* db_path, uint64_t tx_id) {
             continue;
         }
 
-        if (e->data_len > 0) {
-            e->data = malloc(e->data_len);
-            sv_read(log_fd, e->data, e->data_len);
-        }
-        if (e->old_data_len > 0) {
-            e->old_data = malloc(e->old_data_len);
-            sv_read(log_fd, e->old_data, e->old_data_len);
+        if (!read_payload(log_fd, e->data_len, &e->data) || !read_payload(log_fd, e->old_data_len, &e->old_data)) {
+            free(e->data);
+            e->data = NULL;
+            break;                                       // voce troncata: fine del log
         }
         num_entries++;
     }

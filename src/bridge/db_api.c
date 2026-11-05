@@ -366,10 +366,17 @@ static bool db_rollback_to_impl(const char* name) {
                 UndoEntry* e = &undo[n_undo++];
                 e->type = hdr[0]; e->page_id = page_id; e->slot_id = slot_id;
                 e->data_len = dlen; e->old_data_len = oldlen;
-                e->data = dlen > 0 ? malloc(dlen) : NULL;
-                e->old_data = oldlen > 0 ? malloc(oldlen) : NULL;
-                sv_read(log_fd, e->data, dlen);
-                sv_read(log_fd, e->old_data, oldlen);
+                e->data = NULL;
+                e->old_data = NULL;
+                bool ok = dlen <= (64u << 20) && oldlen <= (64u << 20);
+                if (ok && dlen > 0)   ok = (e->data = malloc(dlen)) && sv_read_full(log_fd, e->data, dlen);
+                if (ok && oldlen > 0) ok = (e->old_data = malloc(oldlen)) && sv_read_full(log_fd, e->old_data, oldlen);
+                if (!ok) {                                   // voce troncata o illeggibile: fine del log
+                    free(e->data);
+                    free(e->old_data);
+                    n_undo--;
+                    break;
+                }
             } else {
                 if (dlen > 0) sv_lseek(log_fd, dlen, SEEK_CUR);
                 if (oldlen > 0) sv_lseek(log_fd, oldlen, SEEK_CUR);
@@ -406,7 +413,8 @@ static bool db_rollback_to_impl(const char* name) {
         }
     }
 
-    sv_ftruncate(g_db.wal->fd, sp_off);
+    if (sv_ftruncate(g_db.wal->fd, sp_off) != 0)
+        fprintf(stderr, "[SegVault] cannot shorten the transaction log after ROLLBACK TO\n");
     sv_lseek(g_db.wal->fd, 0, SEEK_END);
     g_num_savepoints = sp_idx;
 

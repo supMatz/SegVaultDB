@@ -81,7 +81,7 @@ static void test_csv(const char* label, const char* csv, const char* table, int 
 }
 
 int main() {
-    system("rm -rf /tmp/svtest && mkdir -p /tmp/svtest");
+    if (system("rm -rf /tmp/svtest && mkdir -p /tmp/svtest") != 0) { printf("FAIL: setup\n"); return 1; }
     if (!db_init("/tmp/svtest")) { printf("FAIL: db_init\n"); return 1; }
 
     test_sql("CREATE DATABASE", "CREATE DATABASE testdb", -1);

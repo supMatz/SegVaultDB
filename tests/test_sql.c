@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 static int tests = 0, failed = 0;
 
@@ -64,6 +66,43 @@ static double now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+// arresto anomalo: un processo figlio inserisce righe e termina senza chiudere il database;
+// poi il log viene troncato a metà dell'ultima voce (crash durante la scrittura).
+// Alla riapertura ci devono essere tutte le righe complete e nessun dato spazzatura.
+static void crash_recovery_test(void) {
+    const char* dir = "/tmp/sv_crash_test";
+    if (system("rm -rf /tmp/sv_crash_test && mkdir -p /tmp/sv_crash_test") != 0) return;
+    pid_t pid = fork();                              // (il chiamante ha già chiuso il motore)
+    if (pid == 0) {
+        if (!db_init(dir)) _exit(2);
+        const char* q[] = { "CREATE DATABASE c", "USE c", "CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(20))" };
+        for (int i = 0; i < 3; i++) db_result_free(db_execute(q[i]));
+        char sql[100];
+        for (int i = 1; i <= 50; i++) {
+            snprintf(sql, sizeof(sql), "INSERT INTO t VALUES (%d, 'row %d')", i, i);
+            db_result_free(db_execute(sql));
+        }
+        _exit(0);                                   // niente db_shutdown: pagine non scritte, log aperto
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    tests++;
+    // tronca l'ultima voce del log a metà
+    FILE* f = fopen("/tmp/sv_crash_test/segvault.wal", "rb+");
+    long size = 0;
+    if (f) { fseek(f, 0, SEEK_END); size = ftell(f); fclose(f); }
+    if (size > 10 && truncate("/tmp/sv_crash_test/segvault.wal", size - 10) != 0) size = 0;
+    if (!size) { failed++; printf("FAIL: crash test setup (no log)\n"); return; }
+
+    if (!db_init(dir)) { failed++; printf("FAIL: reopen after crash\n"); return; }
+    t("USE c", "OK:0");
+    t("SELECT COUNT(*), MIN(id), MAX(id) FROM t", "49|1|49");   // l'ultima riga era nella voce troncata
+    t("SELECT v FROM t WHERE id = 49", "row 49");
+    t("INSERT INTO t VALUES (50, 'again')", "OK:1");
+    db_shutdown();
+    if (system("rm -rf /tmp/sv_crash_test") != 0) { /* nulla */ }
 }
 
 int main(void) {
@@ -332,6 +371,7 @@ int main(void) {
     t("INSERT INTO perf VALUES (777, 'dup')", "ERR:Duplicate entry '777'");
 
     db_shutdown();
+    crash_recovery_test();
     if (system("rm -rf /tmp/sv_sql_test") != 0) { /* nulla */ }
     printf("%s: %d/%d SQL tests passed\n", failed ? "FAIL" : "OK", tests - failed, tests);
     return failed ? 1 : 0;
