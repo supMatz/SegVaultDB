@@ -16,3 +16,4 @@ data/
 *~
 .DS_Store
 test_engine
+*.d

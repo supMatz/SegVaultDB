@@ -18,6 +18,7 @@ endif
 
 CC       = gcc
 CFLAGS   = -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -g -O2
+DEPFLAGS = -MMD -MP   # file .d: un header modificato ricompila chi lo include
 BASE_INCLUDES = -Iinclude -Isrc -Isrc/platform -Isrc/widgets -Isrc/catalog -Isrc/storage -Isrc/table -Isrc/index -Isrc/query -Isrc/tx -Isrc/bridge
 INCLUDES = $(XFT_CFLAGS) -Iinclude -Isrc -Isrc/platform -Isrc/widgets -Isrc/catalog -Isrc/storage -Isrc/table -Isrc/index -Isrc/query -Isrc/tx -Isrc/bridge
 
@@ -82,7 +83,7 @@ test_engine: test_engine.c $(ENGINE_SRCS)
 	$(CC) $(CFLAGS) $(INCLUDES) -o test_engine test_engine.c $(ENGINE_SRCS) -lm
 
 %.o: %.c
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 
 # ── Cross-compilazione Windows da Linux (MinGW-w64) ──
 #   make windows  ->  segvault.exe (statico: basta copiarlo con la cartella assets/)
@@ -96,8 +97,10 @@ windows: $(WIN_OBJS)
 
 build-win/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(WIN_CC) $(CFLAGS) $(BASE_INCLUDES) -c $< -o $@
+	$(WIN_CC) $(CFLAGS) $(DEPFLAGS) $(BASE_INCLUDES) -c $< -o $@
 
 clean:
-	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(OUT) test_engine
+	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(GUI_OBJS:.o=.d) $(FULL_OBJS:.o=.d) $(OUT) test_engine
 	$(RM) -r obj build-win
+
+-include $(FULL_OBJS:.o=.d) $(GUI_OBJS:.o=.d) $(WIN_OBJS:.o=.d)
