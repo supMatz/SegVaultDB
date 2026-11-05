@@ -33,6 +33,8 @@ SqlWordKind sql_classify_word(const char* w, int len);
 // colonne di CREATE TABLE una per riga, spaziatura normalizzata. Stringhe e commenti
 // restano invariati. Ritorna una stringa malloc'd (free() del chiamante) o NULL.
 char* sql_format(const char* s, int len);
+extern int  g_sql_format_indent;   // spazi per livello (Settings)
+extern bool g_sql_format_lower;    // parole chiave in minuscolo (Settings)
 
 // elenco statico delle parole note di un tipo (per l'autocompletamento); ritorna quante sono
 int sql_word_list(SqlWordKind kind, const char* const** out);

@@ -81,6 +81,7 @@ const Theme* theme_get(int index);
 int          theme_current(void);
 void         theme_apply(int index);            // imposta il tema attivo
 int          theme_find(const char* name);      // indice per nome (senza maiuscole), -1 se non esiste
+void         theme_set_accent(bool custom, Color base);   // accento personalizzato (vale per tutti i temi)
 
 #define TH_BG                 (g_theme.bg)
 #define TH_SURFACE            (g_theme.surface)
@@ -140,8 +141,9 @@ int          theme_find(const char* name);      // indice per nome (senza maiusc
 #define TH_ICON_COLUMN        (g_theme.icon_column)
 
 // ── metriche ─────────────────────────────────────────────────────
-#define TH_FONT_UI        13
-#define TH_FONT_SMALL     11
+extern int g_ui_font;                       // dimensione del testo dell'interfaccia (Settings, 11..16)
+#define TH_FONT_UI        (g_ui_font)
+#define TH_FONT_SMALL     (g_ui_font - 2)
 #define TH_FONT_MONO      14
 #define TH_RADIUS         6
 

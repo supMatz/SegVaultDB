@@ -38,6 +38,10 @@ typedef struct {
     bool needs_autosize;   // misura le colonne al prossimo draw (serve la finestra)
     bool col_numeric[TABLE_VIEW_MAX_COLS]; // colonna con soli valori numerici (allineata a destra)
     int  rownum_w;         // larghezza colonna numeri di riga
+    int  row_h;            // altezza delle righe (Settings: compatta / normale / ampia)
+    bool show_rownum;      // colonna con i numeri di riga
+    bool zebra;            // righe alterne
+    const char* null_text; // come mostrare i NULL ("NULL", "(null)", ...)
     int  sort_col; // colonna di ordinamento : -1 = nessuna
     bool sort_asc; // di base impostato a true
     int* order;    // righe visualizzate (filtrate e ordinate) -> indici del risultato; NULL = tutte, in ordine

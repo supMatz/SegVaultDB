@@ -93,8 +93,13 @@ typedef struct {
     int gutter_w;          // larghezza colonna numeri di riga
     int pad_top;
 
-    // stile
+    // stile e opzioni (Settings)
     bool show_line_nums;
+    bool opt_highlight_line;   // sfondo sulla riga del cursore
+    bool opt_auto_close;       // ( ' " ` inseriscono anche la chiusura
+    bool opt_auto_popup;       // suggerimenti mentre si scrive (false = solo Ctrl+Space)
+    bool opt_blink;            // cursore lampeggiante
+    bool opt_kw_lower;         // parole chiave suggerite in minuscolo
     const char* placeholder;
 
     // riga da evidenziare come errore (-1 = nessuna)
@@ -139,6 +144,9 @@ void textbox_replace_text(TextBox* tb, int start, int end, const char* text, boo
 bool textbox_tick(TextBox* tb, uint64_t now_ms); // blink del cursore; true se serve ridisegnare
 
 void textbox_focus(TextBox* tb, bool focused);
+
+void textbox_set_indent(int spaces);   // spazi per livello di indentazione (2, 4, 8)
+int  textbox_indent(void);
 
 bool  textbox_has_selection(TextBox* tb);
 char* textbox_get_selection(TextBox* tb);      // malloc'd, free() del chiamante; NULL se vuota

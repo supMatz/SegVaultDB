@@ -593,6 +593,7 @@ static const Theme THEMES[] = {
 
 #define THEME_COUNT ((int)(sizeof(THEMES) / sizeof(THEMES[0])))
 
+int   g_ui_font = 13;
 Theme g_theme = THEMES[0];       // Sky: tema predefinito
 static int g_theme_index = 0;
 
@@ -604,10 +605,40 @@ const Theme* theme_get(int index) {
 
 int theme_current(void) { return g_theme_index; }
 
+static bool  g_accent_custom;
+static Color g_accent_base;
+
+static Color mixc(Color a, Color b, float t) {
+    return (Color){ (uint8_t)(a.r + (b.r - a.r) * t), (uint8_t)(a.g + (b.g - a.g) * t),
+                    (uint8_t)(a.b + (b.b - a.b) * t), 255 };
+}
+
+// ricava dall'accento scelto tutte le sue varianti, adattate a tema chiaro o scuro
+static void apply_accent(Theme* t, Color base) {
+    Color white = {255, 255, 255, 255}, black = {0, 0, 0, 255};
+    t->accent       = base;
+    t->accent_hover = t->light ? mixc(base, black, 0.12f) : mixc(base, white, 0.30f);
+    t->accent_press = mixc(base, black, 0.20f);
+    t->accent_soft  = mixc(t->bg, base, t->light ? 0.14f : 0.24f);
+    t->accent_text  = t->light ? mixc(base, black, 0.35f) : mixc(base, white, 0.45f);
+    int lum = (base.r * 299 + base.g * 587 + base.b * 114) / 1000;
+    t->on_accent    = lum > 150 ? mixc(base, black, 0.85f) : white;
+    t->caret        = t->light ? t->accent_press : t->accent_hover;
+    t->editor_select = mixc(t->editor_bg, base, t->light ? 0.22f : 0.32f);
+    t->gutter_active = t->accent_text;
+}
+
 void theme_apply(int index) {
     if (index < 0 || index >= THEME_COUNT) return;
     g_theme_index = index;
     g_theme = THEMES[index];
+    if (g_accent_custom) apply_accent(&g_theme, g_accent_base);
+}
+
+void theme_set_accent(bool custom, Color base) {
+    g_accent_custom = custom;
+    g_accent_base   = base;
+    theme_apply(g_theme_index);
 }
 
 int theme_find(const char* name) {

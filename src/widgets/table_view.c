@@ -41,7 +41,7 @@ int table_view_source_row(const TableView* tv, int i) {
 bool table_view_filtered(const TableView* tv) { return tv && tv->filter[0]; }
 
 int table_view_visible_rows(TableView* tv) {
-    return SV_MAX(1, (tv->base.bounds.h - TABLE_VIEW_HEADER_H) / TABLE_VIEW_ROW_H);
+    return SV_MAX(1, (tv->base.bounds.h - TABLE_VIEW_HEADER_H) / tv->row_h);
 }
 
 int table_view_content_width(TableView* tv) {
@@ -115,6 +115,10 @@ static bool looks_numeric(const char* v) {
 }
 
 static bool column_is_numeric(const QueryResult* r, int c) {
+    // tipo dichiarato dal motore: vale quello (un VARCHAR con "00184" resta testo)
+    const char* t = (r->col_types && r->col_types[c]) ? r->col_types[c] : "";
+    if (t[0]) return !strcasecmp(t, "INT") || !strcasecmp(t, "BIGINT") || !strcasecmp(t, "FLOAT") ||
+                     !strcasecmp(t, "DECIMAL") || !strcasecmp(t, "DOUBLE");
     int rows = SV_MIN(r->num_rows, TABLE_VIEW_AUTOSIZE_SCAN_LIMIT), seen = 0;
     for (int row = 0; row < rows; row++) {
         const Cell* cell = &r->rows[row].cells[c];
@@ -133,7 +137,7 @@ static int measure_col(TableView* tv, PlatformWindow* win, int c) {
     int rows = SV_MIN(r->num_rows, TABLE_VIEW_AUTOSIZE_SCAN_LIMIT);
     for (int row = 0; row < rows; row++) {
         Cell* cell = &r->rows[row].cells[c];
-        int cw = platform_measure_text_ex(win, cell->is_null ? "NULL" : cell->value, -1, CELL_FONT, FONT_MONO);
+        int cw = platform_measure_text_ex(win, cell->is_null ? tv->null_text : cell->value, -1, CELL_FONT, FONT_MONO);
         if (cw > w) w = cw;
     }
     return SV_CLAMP(w + CELL_PAD * 2 + 4, 64, 380);
@@ -148,7 +152,7 @@ static void autosize(TableView* tv, PlatformWindow* win) {
     }
     char buf[16];
     snprintf(buf, sizeof(buf), "%d", tv->result->num_rows);
-    tv->rownum_w = SV_MAX(44, platform_measure_text_ex(win, buf, -1, TH_FONT_SMALL, FONT_MONO) + 24);
+    tv->rownum_w = tv->show_rownum ? SV_MAX(44, platform_measure_text_ex(win, buf, -1, TH_FONT_SMALL, FONT_MONO) + 24) : 0;
 }
 
 // ── disegno ──────────────────────────────────────────────────────
@@ -248,7 +252,7 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
 
     QueryResult* r = tv->result;
     int ncols = num_cols(tv);
-    int hh = TABLE_VIEW_HEADER_H, rh = TABLE_VIEW_ROW_H;
+    int hh = TABLE_VIEW_HEADER_H, rh = tv->row_h;
     int data_x = b.x + tv->rownum_w;
     Rect data_clip = {data_x, b.y, b.w - tv->rownum_w, b.h};
     bool focused = self->state == WIDGET_STATE_FOCUSED;
@@ -263,7 +267,7 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
         int ry = b.y + hh + (row - first_row) * rh;
         Color bg = (row == tv->selected_row) ? tv->color_row_selected
                  : (row == tv->hover_row)    ? TH_HOVER
-                 : (row % 2 == 0)            ? tv->color_row_even : tv->color_row_odd;
+                 : (row % 2 == 0 || !tv->zebra) ? tv->color_row_even : tv->color_row_odd;
         platform_fill_rect(win, (Rect){b.x, ry, b.w, rh}, bg);
 
         platform_set_clip(win, data_clip);
@@ -275,10 +279,10 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
                 int ty = ui_text_y(win, (Rect){0, ry, 0, rh}, CELL_FONT, FONT_MONO);
                 int max_w = cw - CELL_PAD * 2;
                 if (cell->is_null) {
-                    ui_text_clipped(win, "NULL", cx + CELL_PAD,
+                    ui_text_clipped(win, tv->null_text, cx + CELL_PAD,
                                     ui_text_y(win, (Rect){0, ry, 0, rh}, TH_FONT_SMALL, FONT_MONO),
                                     max_w, tv->color_text_null, TH_FONT_SMALL, FONT_MONO);
-                } else if (is_numeric(cell->type) || tv->col_numeric[c]) {
+                } else if (tv->col_numeric[c]) {
                     int w = platform_measure_text_ex(win, cell->value, -1, CELL_FONT, FONT_MONO);
                     int x = (w <= max_w) ? cx + cw - CELL_PAD - w : cx + CELL_PAD;
                     ui_text_clipped(win, cell->value, x, ty, max_w, TH_CELL_NUMBER, CELL_FONT, FONT_MONO);
@@ -302,6 +306,7 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
         platform_reset_clip(win);
 
         // numero di riga
+        if (!tv->show_rownum) continue;
         char num[16];
         snprintf(num, sizeof(num), "%d", row + 1);
         int nw = platform_measure_text_ex(win, num, -1, TH_FONT_SMALL, FONT_MONO);
@@ -352,6 +357,8 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
     (void)content_right;
 
     // angolo "#"
+    platform_fill_rect(win, (Rect){b.x, b.y + hh - 1, b.w, 1}, TH_BORDER_STRONG);
+    if (!tv->show_rownum) return;
     platform_fill_rect(win, (Rect){b.x, b.y, tv->rownum_w, hh}, tv->color_header_bg);
     platform_draw_text_ex(win, "#", -1,
         (Point){b.x + tv->rownum_w - 12 - platform_measure_text_ex(win, "#", -1, TH_FONT_SMALL, FONT_MONO),
@@ -412,7 +419,7 @@ static bool table_view_handle_event(Widget* self, sEvent* evt) {
             if (inside && has_grid(tv)) {
                 int rel = evt->mouse_y - self->bounds.y - TABLE_VIEW_HEADER_H;
                 if (rel >= 0) {
-                    int row = tv->scroll_y + rel / TABLE_VIEW_ROW_H;
+                    int row = tv->scroll_y + rel / tv->row_h;
                     if (row < nrows(tv)) tv->hover_row = row;
                 }
             }
@@ -442,7 +449,7 @@ static bool table_view_handle_event(Widget* self, sEvent* evt) {
                 int ry = evt->mouse_y - self->bounds.y - TABLE_VIEW_HEADER_H;
                 int cc = col_at(tv, evt->mouse_x);
                 if (ry < 0) { tv->selected_col = cc; return true; }
-                int rr = tv->scroll_y + ry / TABLE_VIEW_ROW_H;
+                int rr = tv->scroll_y + ry / tv->row_h;
                 if (rr < nrows(tv)) {
                     tv->selected_row = rr;
                     tv->selected_col = cc;
@@ -477,7 +484,7 @@ static bool table_view_handle_event(Widget* self, sEvent* evt) {
                 }
                 return true;
             }
-            int clicked_row = tv->scroll_y + rel_y / TABLE_VIEW_ROW_H;
+            int clicked_row = tv->scroll_y + rel_y / tv->row_h;
             if (clicked_row < nrows(tv)) {
                 tv->selected_row = clicked_row;
                 tv->selected_col = col;
@@ -559,6 +566,10 @@ TableView* table_view_create(int x, int y, int w, int h) {
     tv->sort_asc     = true;
     tv->filter_col   = -1;
     tv->rownum_w     = 44;
+    tv->row_h        = 28;
+    tv->show_rownum  = true;
+    tv->zebra        = true;
+    tv->null_text    = "NULL";
     tv->font_size    = CELL_FONT;
 
     for (int i = 0; i < TABLE_VIEW_MAX_COLS; i++)

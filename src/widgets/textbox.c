@@ -11,7 +11,11 @@
 #include <stdio.h>
 #include <strings.h>
 
-#define INDENT 4
+static int g_indent = 4;   // spazi per livello (Settings)
+#define INDENT g_indent
+
+void textbox_set_indent(int spaces) { if (spaces >= 1 && spaces <= 8) g_indent = spaces; }
+int  textbox_indent(void) { return g_indent; }
 
 enum { EDIT_NONE, EDIT_TYPE, EDIT_DELETE, EDIT_OTHER };
 
@@ -861,7 +865,7 @@ static void popup_accept(TextBox* tb) {
             if (islower((unsigned char)tb->text[i])) lower = true;
             if (isupper((unsigned char)tb->text[i])) upper = true;
         }
-        if (lower && !upper) for (int i = 0; i < n; i++) buf[i] = (char)tolower((unsigned char)buf[i]);
+        if ((lower && !upper) || tb->opt_kw_lower) for (int i = 0; i < n; i++) buf[i] = (char)tolower((unsigned char)buf[i]);
     }
     bool call = it->kind == COMP_FUNC && char_at(tb, tb->cursor_pos) != '(';
     if (call && n + 2 < (int)sizeof(buf)) { buf[n++] = '('; buf[n++] = ')'; buf[n] = '\0'; }
@@ -929,6 +933,8 @@ static void handle_char(TextBox* tb, uint32_t cp) {
     char prev = char_at(tb, tb->cursor_pos - 1);
     bool sel  = has_sel(tb);
 
+    if (!tb->opt_auto_close) goto plain;
+
     // sovrascrittura della chiusura già inserita automaticamente
     if (!sel && (cp == ')' || cp == ']') && next == (char)cp) {
         move_cursor(tb, tb->cursor_pos + 1, false, false);
@@ -948,6 +954,7 @@ static void handle_char(TextBox* tb, uint32_t cp) {
         }
     }
 
+plain:;
     char buf[5] = {0};
     utf8_encode(cp, buf);
     insert_text(tb, buf, EDIT_TYPE);
@@ -1142,7 +1149,7 @@ static bool handle_key_inner(TextBox* tb, sEvent* evt) {
                 if (line_of(tb, a) != line_of(tb, b)) { indent_lines(tb, false); return true; }
             }
             int spaces = INDENT - (tb->cursor_col % INDENT);
-            char buf[INDENT + 1] = "    ";
+            char buf[9] = "        ";
             buf[spaces] = '\0';
             insert_text(tb, buf, EDIT_OTHER);
             return true;
@@ -1285,7 +1292,8 @@ static bool textbox_handle_event(Widget* self, sEvent* evt) {
             if (!focused) return false;
             uint32_t cp = evt->character;
             handle_char(tb, cp);
-            if (cp == '_' || (cp < 0x80 && isalnum((int)cp))) popup_update(tb, false);
+            if (!tb->opt_auto_popup && !tb->popup_open) { /* solo con Ctrl+Space */ }
+            else if (cp == '_' || (cp < 0x80 && isalnum((int)cp))) popup_update(tb, false);
             else if (cp == '.') popup_update(tb, true);
             else popup_close(tb);
             return true;
@@ -1561,7 +1569,7 @@ static void textbox_draw(Widget* self, PlatformWindow* win) {
         // sfondo riga corrente / errore
         if (l == tb->error_line) {
             platform_fill_rect(win, (Rect){b.x, y, b.w, tb->line_height}, TH_ERROR_SOFT);
-        } else if (focused && !sel && l == tb->cursor_line) {
+        } else if (focused && !sel && l == tb->cursor_line && tb->opt_highlight_line) {
             platform_fill_rect(win, (Rect){b.x, y, b.w, tb->line_height}, TH_EDITOR_LINE);
         }
 
@@ -1710,6 +1718,7 @@ TextBox* textbox_create(int x, int y, int w, int h) {
     tb->gutter_w    = 44;
     tb->pad_top     = 8;
     tb->show_line_nums = true;
+    tb->opt_highlight_line = tb->opt_auto_close = tb->opt_auto_popup = tb->opt_blink = true;
     tb->error_line  = -1;
     tb->placeholder = "-- Write SQL here. Ctrl+Enter runs the statement under the cursor, F5 runs everything";
     rebuild_lines(tb);
@@ -1760,6 +1769,11 @@ void textbox_replace_text(TextBox* tb, int start, int end, const char* text, boo
 
 bool textbox_tick(TextBox* tb, uint64_t now_ms) {
     if (!tb || tb->base.state != WIDGET_STATE_FOCUSED) return false;
+    if (!tb->opt_blink) {
+        if (tb->cursor_visible) return false;
+        tb->cursor_visible = true;
+        return true;
+    }
     if (now_ms - tb->cursor_blink >= 530) {
         tb->cursor_visible = !tb->cursor_visible;
         tb->cursor_blink   = now_ms;

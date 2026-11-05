@@ -29,7 +29,9 @@ SCOPO: Layout principale dell'applicazione SegVault.
 #include "splitter.h"
 #include "../bridge/db_api.h"
 
+#define MENUBAR_H         30   // barra dei menu (File, Edit, ...) sopra la toolbar
 #define TOOLBAR_H         52   // Altezza toolbar in pixel
+#define TOP_H             (MENUBAR_H + TOOLBAR_H)   // dove inizia il contenuto
 #define SIDEBAR_W        264   // Larghezza predefinita della sidebar in pixel
 #define SIDEBAR_MIN_W    170   // la sidebar si restringe fino a qui nelle finestre strette
 #define CENTER_MIN_W     420   // larghezza minima garantita all'area editor/risultati
@@ -46,7 +48,8 @@ typedef enum { RUN_SCRIPT, RUN_CURRENT } RunMode;
 typedef enum { STATUS_IDLE, STATUS_OK, STATUS_ERROR, STATUS_INFO } StatusKind;
 
 // barra comandi sovrapposta all'editor
-typedef enum { BAR_NONE, BAR_FIND, BAR_GOTO, BAR_OPEN, BAR_SAVE_AS, BAR_EXPORT } BarMode;
+typedef enum { BAR_NONE, BAR_FIND, BAR_GOTO, BAR_OPEN, BAR_SAVE_AS, BAR_EXPORT,
+               BAR_IMPORT_CSV, BAR_RUN_FILE, BAR_DUMP } BarMode;
 
 #define HISTORY_MAX 500
 
@@ -121,11 +124,31 @@ typedef struct {
 
     // -- menu contestuale (tasto destro su griglia o editor) --
     int          ctx_kind;          // 0 = chiuso, 1 = griglia, 2 = editor
-    int          ctx_items[24];     // azioni (CtxAction in window.c)
+    int          ctx_items[40];     // azioni (CtxAction in window.c)
     int          ctx_count;
     int          ctx_hover;
     int          ctx_x, ctx_y;      // punto del click
     Rect         ctx_rect;
+
+    // -- barra dei menu --
+    int          menu_open;         // menu aperto (-1 = nessuno)
+    Rect         menu_rects[10];    // titoli dei menu (calcolati nel disegno)
+    int          menu_hover;        // titolo sotto il mouse (-1 = nessuno)
+
+    // -- pannello Settings (Ctrl+,) --
+    bool         settings_open;
+    int          settings_section;  // sezione selezionata
+    int          settings_sel;      // riga selezionata nella sezione
+    Rect         settings_rect;
+    char         settings_path[1100];
+
+    // -- pannello informativo (About, riferimento SQL) --
+    int          info_page;         // 0 = chiuso
+    int          info_scroll;
+
+    int          footer_h;          // 0 se la barra di stato è nascosta
+    bool         quit_requested;    // File > Exit
+    char         export_table[64];  // tabella per l'export SQL INSERT
 
     // -- visualizzatore di cella (doppio click / Invio su una cella) --
     bool         cell_open;
@@ -193,6 +216,9 @@ bool app_window_busy(AppWindow* app);                  // true se una query è i
 
 // imposta la directory dei dati: ripristina l'ultima sessione dell'editor e la cronologia
 void app_window_set_data_dir(AppWindow* app, const char* dir);
+
+// true dopo File > Exit: il main loop chiude l'applicazione
+bool app_window_quit_requested(AppWindow* app);
 
 // salva il contenuto dell'editor per la prossima sessione (da chiamare prima di chiudere)
 void app_window_save_session(AppWindow* app);

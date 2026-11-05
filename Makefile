@@ -26,6 +26,9 @@ INCLUDES = $(XFT_CFLAGS) -Iinclude -Isrc -Isrc/platform -Isrc/widgets -Isrc/cata
 WIDGET_SRCS = \
 	src/widgets/widget.c \
 	src/widgets/theme.c \
+	src/widgets/settings.c \
+	src/widgets/result_export.c \
+	src/widgets/csv_import.c \
 	src/widgets/sql_text.c \
 	src/widgets/button.c \
 	src/widgets/label.c \
@@ -79,8 +82,8 @@ full: $(FULL_OBJS)
 test: test_engine
 	./test_engine
 
-test_engine: test_engine.c $(ENGINE_SRCS)
-	$(CC) $(CFLAGS) $(INCLUDES) -o test_engine test_engine.c $(ENGINE_SRCS) -lm
+test_engine: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
+	$(CC) $(CFLAGS) $(INCLUDES) -o test_engine test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c -lm
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@

@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
             app_window_handle_event(app, &evt);
             dirty = true;
         }
-        if (!running) break;
+        if (!running || app_window_quit_requested(app)) break;
 
         if (app_window_tick(app, platform_time_ms())) dirty = true;
 

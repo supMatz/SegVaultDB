@@ -194,7 +194,11 @@ static void sb_trim_spaces(SBuf* sb) {
 }
 
 // va a capo (se non lo è già) e indenta
+int  g_sql_format_indent = 4;      // spazi di indentazione (Settings)
+bool g_sql_format_lower  = false;  // parole chiave in minuscolo (Settings)
+
 static void sb_newline(SBuf* sb, int indent) {
+    if (indent > 0) indent = g_sql_format_indent;
     sb_trim_spaces(sb);
     if (sb->len && sb_last(sb) != '\n') sb_put(sb, "\n", 1);
     for (int i = 0; i < indent; i++) sb_put(sb, " ", 1);
@@ -326,7 +330,8 @@ char* sql_format(const char* s, int len) {
             } else {
                 char up[64];
                 int m = SV_MIN_INT(n, 63);
-                for (int q = 0; q < m; q++) up[q] = (char)toupper((unsigned char)w[q]);
+                for (int q = 0; q < m; q++)
+                    up[q] = (char)(g_sql_format_lower ? tolower((unsigned char)w[q]) : toupper((unsigned char)w[q]));
                 sb_put(&sb, up, m);
                 if (n > 63) sb_put(&sb, w + 63, n - 63);
             }
