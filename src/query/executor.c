@@ -20,21 +20,21 @@ static QueryResult* result_ok_msg(int affected) {
 }
 
 static DataType parse_type(const char* type_name) {
-    if (strcmp(type_name, "INT") == 0 || strcmp(type_name, "INTEGER") == 0 ||
-        strcmp(type_name, "SMALLINT") == 0 || strcmp(type_name, "TINYINT") == 0) return SV_TYPE_INT;
-    if (strcmp(type_name, "BIGINT") == 0) return SV_TYPE_BIGINT;
-    if (strcmp(type_name, "FLOAT") == 0 || strcmp(type_name, "DOUBLE") == 0 ||
-        strcmp(type_name, "REAL") == 0) return SV_TYPE_FLOAT;
-    if (strcmp(type_name, "NUMERIC") == 0) return SV_TYPE_DECIMAL;
-    if (strcmp(type_name, "TIMESTAMP") == 0) return SV_TYPE_DATETIME;
-    if (strcmp(type_name, "VARCHAR") == 0) return SV_TYPE_VARCHAR;
-    if (strcmp(type_name, "CHAR") == 0) return SV_TYPE_CHAR;
-    if (strcmp(type_name, "TEXT") == 0) return SV_TYPE_TEXT;
-    if (strcmp(type_name, "BOOL") == 0 || strcmp(type_name, "BOOLEAN") == 0) return SV_TYPE_BOOL;
-    if (strcmp(type_name, "DATE") == 0) return SV_TYPE_DATE;
-    if (strcmp(type_name, "DATETIME") == 0) return SV_TYPE_DATETIME;
-    if (strcmp(type_name, "BLOB") == 0) return SV_TYPE_BLOB;
-    if (strcmp(type_name, "DECIMAL") == 0) return SV_TYPE_DECIMAL;
+    if (strcasecmp(type_name, "INT") == 0 || strcasecmp(type_name, "INTEGER") == 0 ||
+        strcasecmp(type_name, "SMALLINT") == 0 || strcasecmp(type_name, "TINYINT") == 0) return SV_TYPE_INT;
+    if (strcasecmp(type_name, "BIGINT") == 0) return SV_TYPE_BIGINT;
+    if (strcasecmp(type_name, "FLOAT") == 0 || strcasecmp(type_name, "DOUBLE") == 0 ||
+        strcasecmp(type_name, "REAL") == 0) return SV_TYPE_FLOAT;
+    if (strcasecmp(type_name, "NUMERIC") == 0) return SV_TYPE_DECIMAL;
+    if (strcasecmp(type_name, "TIMESTAMP") == 0) return SV_TYPE_DATETIME;
+    if (strcasecmp(type_name, "VARCHAR") == 0) return SV_TYPE_VARCHAR;
+    if (strcasecmp(type_name, "CHAR") == 0) return SV_TYPE_CHAR;
+    if (strcasecmp(type_name, "TEXT") == 0) return SV_TYPE_TEXT;
+    if (strcasecmp(type_name, "BOOL") == 0 || strcasecmp(type_name, "BOOLEAN") == 0) return SV_TYPE_BOOL;
+    if (strcasecmp(type_name, "DATE") == 0) return SV_TYPE_DATE;
+    if (strcasecmp(type_name, "DATETIME") == 0) return SV_TYPE_DATETIME;
+    if (strcasecmp(type_name, "BLOB") == 0) return SV_TYPE_BLOB;
+    if (strcasecmp(type_name, "DECIMAL") == 0) return SV_TYPE_DECIMAL;
     return SV_TYPE_VARCHAR;
 }
 
@@ -585,6 +585,15 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     Tuple* t = tuple_from_strings(final_vals, ts->num_columns, ts);
     if (!t) return result_error_msg("Failed to create tuple");
 
+    // NOT NULL (le colonne AUTO_INCREMENT ricevono il valore generato)
+    for (int i = 0; i < ts->num_columns; i++) {
+        if (ts->columns[i].nullable || ts->columns[i].primary_key || !t->values[i].is_null) continue;
+        char msg[160];
+        snprintf(msg, sizeof(msg), "Column '%.64s' cannot be NULL", ts->columns[i].name);
+        tuple_free(t);
+        return result_error_msg(msg);
+    }
+
     // chiave primaria: obbligatoria e univoca
     for (int i = 0; i < ts->num_columns; i++) {
         if (!ts->columns[i].primary_key) continue;
@@ -898,6 +907,15 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
     TableSchema* ts = catalog_get_table(ctx->catalog, db->name, n->update_stmt.table_name);
     if (!ts) return result_error_msg("Table not found");
     if (catalog_get_col_index(ts, n->update_stmt.set_col) < 0) return unknown_column_error(n->update_stmt.set_col, "SET");
+    {
+        int sc = catalog_get_col_index(ts, n->update_stmt.set_col);
+        if (n->update_stmt.set_expr && n->update_stmt.set_expr->type == EXPR_NULL &&
+            (!ts->columns[sc].nullable || ts->columns[sc].primary_key)) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "Column '%.64s' cannot be NULL", ts->columns[sc].name);
+            return result_error_msg(msg);
+        }
+    }
     const char* bad = where_unknown_column(n->update_stmt.where, ts);
     if (bad) return unknown_column_error(bad, "WHERE");
 

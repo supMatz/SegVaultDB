@@ -1,4 +1,5 @@
 #include "src/bridge/db_api.h"
+#include "src/widgets/csv_import.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +55,29 @@ static void test_value(const char* label, const char* sql, const char* want) {
     else if (strcmp(r->rows[0].cells[0].value, want)) printf("FAIL: got \"%s\", want \"%s\"\n", r->rows[0].cells[0].value, want);
     else { printf("OK (%s)\n", want); passed++; }
     db_result_free(r);
+}
+
+// importa un CSV con csv_to_sql ed esegue lo script statement per statement
+static void test_csv(const char* label, const char* csv, const char* table, int expect_rows) {
+    tests++;
+    printf("TEST %d: %-30s ", tests, label);
+    CsvImportInfo info;
+    char* sql = csv_to_sql(csv, table, true, 0, &info);
+    if (!sql) { printf("FAIL: %s\n", info.error); return; }
+    int ok = 1;
+    char* p = sql;
+    while (*p && ok) {
+        char* end = strstr(p, ";\n");
+        if (!end) break;
+        *end = '\0';
+        QueryResult* r = db_execute(p);
+        if (!r || !r->success) { printf("FAIL: %s\n  in: %.120s\n", r ? r->error : "NULL", p); ok = 0; }
+        db_result_free(r);
+        p = end + 2;
+    }
+    if (ok && info.rows != expect_rows) { printf("FAIL: %d rows, want %d\n", info.rows, expect_rows); ok = 0; }
+    if (ok) { printf("OK (%d rows, delimiter '%c')\n", info.rows, info.delimiter == '\t' ? 'T' : info.delimiter); passed++; }
+    free(sql);
 }
 
 int main() {
@@ -157,6 +181,35 @@ int main() {
     test_fail("Unterminated string", "INSERT INTO s VALUES (3, 'abc)", "Unterminated string");
     test_fail("Readable syntax error", "INSERT INTO s VALUES (3, 'x'", "Expected ')'");
     test_sql("DROP TABLE s", "DROP TABLE s", -1);
+    test_fail("INSERT > 64 values", "INSERT INTO s VALUES (1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)", "Too many values");
+
+    // Import CSV: virgolette, a capo nei campi, separatore ';', tipi dedotti, zeri iniziali, NULL
+    test_csv("CSV import", "id;Nome Cliente;Citt\xc3\xa0;amount;cap\r\n1;\"Rossi; Mario\";Roma;12.5;00184\r\n"
+             "2;\"Line\nbreak \"\"quoted\"\"\";;7;20100\r\n3;O'Brien;Milano;-3;\r\n", "clienti", 3);
+    test_value("CSV quoted delimiter", "SELECT nome_cliente FROM clienti WHERE id = 1", "Rossi; Mario");
+    test_value("CSV leading zero kept", "SELECT cap FROM clienti WHERE id = 1", "00184");
+    test_value("CSV apostrophe", "SELECT nome_cliente FROM clienti WHERE id = 3", "O'Brien");
+    test_sql("CSV empty -> NULL", "SELECT * FROM clienti WHERE citta IS NULL", 1);
+    test_sql("CSV float column", "SELECT * FROM clienti WHERE amount > 5", 2);
+    test_sql("DROP TABLE clienti", "DROP TABLE clienti", -1);
+
+    // NOT NULL, tipi e modificatori in minuscolo
+    test_sql("create lowercase", "create table lc (id int primary key auto_increment, name varchar(20) not null, note text)", -1);
+    test_value("lowercase int type", "DESCRIBE lc", "id");
+    test_fail("NOT NULL on insert", "INSERT INTO lc (name, note) VALUES (NULL, 'x')", "cannot be NULL");
+    test_sql("nullable by default", "INSERT INTO lc (name, note) VALUES ('a', NULL)", -1);
+    test_value("auto_increment lower", "SELECT id FROM lc WHERE name = 'a'", "1");
+    test_fail("NOT NULL on update", "UPDATE lc SET name = NULL WHERE id = 1", "cannot be NULL");
+    {
+        tests++;
+        char* ddl = db_get_create_statement("testdb", "lc");
+        printf("TEST %d: %-30s ", tests, "CREATE statement");
+        if (ddl && strstr(ddl, "id INT PRIMARY KEY AUTO_INCREMENT") && strstr(ddl, "name VARCHAR(20) NOT NULL") &&
+            strstr(ddl, "note TEXT")) { printf("OK\n"); passed++; }
+        else printf("FAIL: %s\n", ddl ? ddl : "NULL");
+        db_free_string(ddl);
+    }
+    test_sql("DROP TABLE lc", "DROP TABLE lc", -1);
 
     // Cleanup
     test_sql("DROP VIEW", "DROP VIEW v1", -1);

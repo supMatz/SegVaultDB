@@ -37,6 +37,7 @@ static const char* token_name(TokenType tt) {
 
 static bool expect(ParserState* ps, TokenType tt) {
     if (match(ps, tt)) return true;
+    if (!ps->result->success) return false;   // vale il primo errore (il più preciso)
     Token t = peek(ps);
     if (t.type == TOK_ERROR && strchr(t.text, ' '))      // messaggio del lexer (stringa troppo lunga, ...)
         snprintf(ps->result->error, sizeof(ps->result->error), "%.200s (line %d)", t.text, t.line);
@@ -410,7 +411,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                 n->insert_stmt.num_cols = 0;
                 while (peek(ps).type != TOK_RPAREN) {
                     Token c = consume(ps);
-                    if (n->insert_stmt.num_cols >= 64) break;
+                    if (n->insert_stmt.num_cols >= 64) { parse_fail(ps, "Too many columns in INSERT (max 64)", c); break; }
                     n->insert_stmt.columns[n->insert_stmt.num_cols] = strdup(c.text);
                     n->insert_stmt.num_cols++;
                     if (!match(ps, TOK_COMMA)) break;
@@ -421,6 +422,10 @@ static ASTNode* parse_statement(ParserState* ps) {
             expect(ps, TOK_LPAREN);
             n->insert_stmt.num_values = 0;
             while (peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) {
+                if (n->insert_stmt.num_values >= 64) {   // values[64]: oltre si scriverebbe fuori dall'array
+                    parse_fail(ps, "Too many values in INSERT (max 64)", peek(ps));
+                    break;
+                }
                 ASTExpr* e = calloc(1, sizeof(ASTExpr));
                 Token v = consume(ps);
                 if (v.type == TOK_INTEGER) { e->type = EXPR_INT; e->int_val = atoll(v.text); }
@@ -481,6 +486,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                 while (peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) {
                     ColumnDef* cd = &n->create_table.columns[n->create_table.num_columns];
                     memset(cd, 0, sizeof(ColumnDef));
+                    cd->nullable = true;                       // come in SQL standard: NULL ammesso se non dichiarato
                     Token cn = consume(ps);
                     copy_text(ps, cd->name, sizeof(cd->name), cn.text);
                     Token ct = consume(ps);
@@ -495,11 +501,11 @@ static ASTNode* parse_statement(ParserState* ps) {
                     while (peek(ps).type == TOK_NOT || peek(ps).type == TOK_NULL ||
                            peek(ps).type == TOK_IDENTIFIER) {
                         Token mod = consume(ps);
-                        if (strcmp(mod.text, "NOT") == 0 && match(ps, TOK_NULL)) cd->nullable = false;
-                        else if (strcmp(mod.text, "NULL") == 0) cd->nullable = true;
-                        else if (strcmp(mod.text, "PRIMARY") == 0 && match(ps, TOK_KEY)) cd->primary_key = true;
-                        else if (strcmp(mod.text, "AUTO_INCREMENT") == 0) cd->auto_increment = true;
-                        else if (strcmp(mod.text, "DEFAULT") == 0) {
+                        if (strcasecmp(mod.text, "NOT") == 0 && match(ps, TOK_NULL)) cd->nullable = false;
+                        else if (strcasecmp(mod.text, "NULL") == 0) cd->nullable = true;
+                        else if (strcasecmp(mod.text, "PRIMARY") == 0 && match(ps, TOK_KEY)) { cd->primary_key = true; cd->nullable = false; }
+                        else if (strcasecmp(mod.text, "AUTO_INCREMENT") == 0) cd->auto_increment = true;
+                        else if (strcasecmp(mod.text, "DEFAULT") == 0) {
                             Token dv = consume(ps);
                             copy_text(ps, cd->default_val, sizeof(cd->default_val), dv.text);
                         }
@@ -598,10 +604,13 @@ static ASTNode* parse_statement(ParserState* ps) {
         case TOK_DESCRIBE: {
             consume(ps);
             n->type = NODE_DESCRIBE;
+            if (peek(ps).type == TOK_TABLE) consume(ps);          // DESCRIBE TABLE t
             Token tn = consume(ps);
-            if (peek(ps).type == TOK_IDENTIFIER) {
+            if (tn.type == TOK_IDENTIFIER) {
                 // table name stored in select_stmt.table_name for convenience
                 copy_text(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name), tn.text);
+            } else {
+                parse_fail(ps, "Expected a table name after DESCRIBE", tn);
             }
             break;
         }

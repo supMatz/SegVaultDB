@@ -506,6 +506,35 @@ SessionInfo* db_session_info(void) {
 
 void db_session_free(SessionInfo* s) { free(s); }
 
+// CREATE TABLE che ricrea la struttura della tabella (dump, "Copy as SQL")
+char* db_get_create_statement(const char* db_name, const char* table) {
+    TableSchema* t = catalog_get_table(g_db.catalog, db_name, table);
+    if (!t) return NULL;
+    size_t cap = 256 + (size_t)t->num_columns * 400;
+    char* out = malloc(cap);
+    if (!out) return NULL;
+    size_t n = (size_t)snprintf(out, cap, "CREATE TABLE %s (", t->name);
+    for (int i = 0; i < t->num_columns && n < cap; i++) {
+        const Column* c = &t->columns[i];
+        char type[48];
+        if ((c->type == SV_TYPE_VARCHAR || c->type == SV_TYPE_CHAR) && c->size > 0)
+            snprintf(type, sizeof(type), "%s(%d)", datatype_name(c->type), c->size);
+        else
+            snprintf(type, sizeof(type), "%s", datatype_name(c->type));
+        n += (size_t)snprintf(out + n, cap - n, "%s\n    %s %s%s%s%s", i ? "," : "", c->name, type,
+                              c->primary_key ? " PRIMARY KEY" : "",
+                              c->auto_increment ? " AUTO_INCREMENT" : "",
+                              (!c->nullable && !c->primary_key) ? " NOT NULL" : "");
+        if (c->default_val[0] && n < cap) {
+            bool num = c->type == SV_TYPE_INT || c->type == SV_TYPE_BIGINT || c->type == SV_TYPE_FLOAT ||
+                       c->type == SV_TYPE_DECIMAL;
+            n += (size_t)snprintf(out + n, cap - n, num ? " DEFAULT %s" : " DEFAULT '%s'", c->default_val);
+        }
+    }
+    if (n < cap) snprintf(out + n, cap - n, "\n);");
+    return out;
+}
+
 void db_free_string(char* s) { free(s); }
 
 void db_shutdown(void) {

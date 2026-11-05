@@ -51,7 +51,7 @@ Catalog* catalog_create(void) {
 // letto e alla prima chiusura riscritto nel formato v2.
 
 #define CAT_MAGIC   "SVCAT2\0\0"
-#define CAT_VERSION 2u
+#define CAT_VERSION 3u   // v3: il flag "nullable" delle colonne è significativo (NOT NULL applicato)
 
 // lettura/scrittura complete (read/write possono trasferire meno byte del richiesto)
 static bool read_all(int fd, void* buf, size_t n) {
@@ -88,14 +88,16 @@ Catalog* catalog_load(const char* path) {
     if (!c) { sv_close(fd); return NULL; }
 
     char magic[8];
+    bool migrate_nullable = false;
     bool ok = read_all(fd, magic, sizeof(magic));
     if (ok && memcmp(magic, CAT_MAGIC, 8) == 0) {
         uint32_t version = 0, next_page = 1;
         int32_t ndb = 0, cur = -1;
-        ok = read_all(fd, &version, 4) && version == CAT_VERSION &&
+        ok = read_all(fd, &version, 4) && (version == 2u || version == CAT_VERSION) &&
              read_i32(fd, &ndb) && read_i32(fd, &cur) && read_all(fd, &next_page, 4) &&
              ndb >= 0 && ndb <= SV_MAX_DATABASES;
         if (ok) {
+            migrate_nullable = version < 3u;
             c->num_databases = ndb;
             c->current_db    = (cur >= -1 && cur < ndb) ? cur : -1;
             c->next_page_id  = next_page;
@@ -118,8 +120,19 @@ Catalog* catalog_load(const char* path) {
         // formato precedente: la struct Catalog intera
         memcpy(c, magic, sizeof(magic));
         ok = read_all(fd, (uint8_t*)c + sizeof(magic), sizeof(Catalog) - sizeof(magic));
+        migrate_nullable = true;
     }
     sv_close(fd);
+
+    // fino alla v2 "nullable" restava sempre false (NOT NULL non era applicato): ogni colonna
+    // ammette NULL tranne la chiave primaria, come si comportava il database in pratica
+    if (ok && migrate_nullable) {
+        for (int d = 0; d < c->num_databases; d++)
+            for (int t = 0; t < c->databases[d].num_tables; t++) {
+                TableSchema* ts = &c->databases[d].tables[t];
+                for (int k = 0; k < ts->num_columns; k++) ts->columns[k].nullable = !ts->columns[k].primary_key;
+            }
+    }
 
     if (!ok) {
         fprintf(stderr, "[SegVault] catalog '%s' is unreadable or truncated: starting with an empty catalog\n", path);
