@@ -646,6 +646,38 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
 }
 
 // Forward declaration for view recursion
+
+// ── tipi del risultato ───────────────────────────────────────────
+
+static CellType cell_type_of(DataType t) {
+    switch (t) {
+        case SV_TYPE_INT: case SV_TYPE_BIGINT:     return CELL_TYPE_INT;
+        case SV_TYPE_FLOAT: case SV_TYPE_DECIMAL:  return CELL_TYPE_FLOAT;
+        case SV_TYPE_BOOL:                         return CELL_TYPE_BOOL;
+        case SV_TYPE_DATE: case SV_TYPE_DATETIME:  return CELL_TYPE_DATE;
+        case SV_TYPE_BLOB:                         return CELL_TYPE_BLOB;
+        default:                                   return CELL_TYPE_STRING;
+    }
+}
+
+// imposta il tipo di ogni colonna (nome per l'intestazione della griglia) e delle sue celle
+// a partire dai tipi dello schema; dt[i] < 0 = colonna calcolata, si lascia com'è
+static void apply_result_types(QueryResult* r, const int* dt) {
+    if (!r || r->num_cols <= 0) return;
+    if (!r->col_types) r->col_types = calloc((size_t)r->num_cols + 1, sizeof(char*));
+    if (!r->col_types) return;
+    for (int i = 0; i < r->num_cols; i++)
+        if (!r->col_types[i]) r->col_types[i] = strdup(dt[i] >= 0 ? datatype_name((DataType)dt[i]) : "");
+    for (int k = 0; k < r->num_rows; k++) {
+        Row* row = &r->rows[k];
+        for (int i = 0; i < r->num_cols && i < row->num_cells; i++) {
+            Cell* c = &row->cells[i];
+            if (c->is_null) c->type = CELL_TYPE_NULL;
+            else if (dt[i] >= 0) c->type = cell_type_of((DataType)dt[i]);
+        }
+    }
+}
+
 static QueryResult* exec_select(ExecCtx* ctx, ASTNode* n);
 
 static QueryResult* exec_select(ExecCtx* ctx, ASTNode* n) {
@@ -839,6 +871,18 @@ static QueryResult* exec_select(ExecCtx* ctx, ASTNode* n) {
     if (prev_distinct) tuple_free(prev_distinct);
 
     r->num_rows = out_idx;
+
+    {
+        int* dt = calloc((size_t)out_cols + 1, sizeof(int));
+        if (dt) {
+            for (int i = 0; i < out_cols; i++) {
+                int ci = col_map[i];
+                dt[i] = (ci >= 0 && ci < ts->num_columns) ? (int)ts->columns[ci].type : -1;
+            }
+            apply_result_types(r, dt);
+            free(dt);
+        }
+    }
 
     free(col_map);
     free(valid_idx);
@@ -1512,6 +1556,20 @@ static QueryResult* exec_join(ExecCtx* ctx, ASTNode* n) {
         r->rows = realloc(r->rows, r->num_rows * sizeof(Row));
     }
 
+    {
+        int* dt = calloc((size_t)out_cols + 1, sizeof(int));
+        if (dt) {
+            for (int i = 0; i < out_cols; i++) {
+                int ci = output_all ? i : (col_map ? col_map[i] : -1);
+                dt[i] = ci < 0 ? -1
+                      : ci < ts1->num_columns ? (int)ts1->columns[ci].type
+                      : ci - ts1->num_columns < ts2->num_columns ? (int)ts2->columns[ci - ts1->num_columns].type : -1;
+            }
+            apply_result_types(r, dt);
+            free(dt);
+        }
+    }
+
     for (int i = 0; i < n1; i++) tuple_free(rows1[i]);
     for (int i = 0; i < n2; i++) tuple_free(rows2[i]);
     free(rows1); free(rows2);
@@ -1649,7 +1707,14 @@ static QueryResult* exec_group_by(ExecCtx* ctx, ASTNode* n) {
         else                      snprintf(name, sizeof(name), "%s", c->col_name);
         r->col_names[i] = strdup(name);
         int ci = star ? i : (c->type == EXPR_COLUMN ? catalog_get_col_index(ts, c->col_name) : -1);
-        r->col_types[i] = strdup(ci >= 0 ? datatype_name(ts->columns[ci].type) : "");
+        const char* tn = ci >= 0 ? datatype_name(ts->columns[ci].type) : "";
+        if (c && c->type == EXPR_AGG) {
+            int ai = catalog_get_col_index(ts, c->col_name);
+            if (!strcasecmp(c->func, "COUNT"))    tn = "INT";
+            else if (!strcasecmp(c->func, "AVG")) tn = "FLOAT";
+            else if (ai >= 0)                     tn = datatype_name(ts->columns[ai].type);
+        }
+        r->col_types[i] = strdup(tn);
     }
 
     r->rows = calloc(ng > 0 ? ng : 1, sizeof(Row));
@@ -1678,6 +1743,7 @@ static QueryResult* exec_group_by(ExecCtx* ctx, ASTNode* n) {
                 continue;
             }
             value_to_string(&first->values[ci], ts->columns[ci].type, cell->value, sizeof(cell->value));
+            cell->type = cell_type_of(ts->columns[ci].type);
         }
         agg_context_clear();
     }

@@ -1,6 +1,7 @@
 #include "src/bridge/db_api.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int tests = 0, passed = 0;
 
@@ -27,6 +28,31 @@ static void test_sql(const char* label, const char* sql, int expect_rows) {
             printf("\n");
         }
     }
+    db_result_free(r);
+}
+
+
+// lo statement deve fallire e il messaggio deve contenere "needle"
+static void test_fail(const char* label, const char* sql, const char* needle) {
+    tests++;
+    printf("TEST %d: %-30s ", tests, label);
+    QueryResult* r = db_execute(sql);
+    if (!r) { printf("FAIL (NULL result)\n"); return; }
+    if (r->success) printf("FAIL: expected an error\n");
+    else if (!strstr(r->error, needle)) printf("FAIL: error \"%s\" lacks \"%s\"\n", r->error, needle);
+    else { printf("OK (%s)\n", r->error); passed++; }
+    db_result_free(r);
+}
+
+// la prima cella del risultato deve valere "want"
+static void test_value(const char* label, const char* sql, const char* want) {
+    tests++;
+    printf("TEST %d: %-30s ", tests, label);
+    QueryResult* r = db_execute(sql);
+    if (!r || !r->success) { printf("FAIL: %s\n", r ? r->error : "NULL result"); db_result_free(r); return; }
+    if (r->num_rows < 1 || r->num_cols < 1) printf("FAIL: no rows\n");
+    else if (strcmp(r->rows[0].cells[0].value, want)) printf("FAIL: got \"%s\", want \"%s\"\n", r->rows[0].cells[0].value, want);
+    else { printf("OK (%s)\n", want); passed++; }
     db_result_free(r);
 }
 
@@ -120,6 +146,17 @@ int main() {
     test_sql("UPDATE QUALIFIED", "UPDATE t4 SET y = 99 WHERE t4.x = 1", -1);
     test_sql("DELETE QUALIFIED", "DELETE FROM t4 WHERE t4.x = 2", -1);
     test_sql("SELECT AFTER UPD/DEL", "SELECT * FROM t4", 1);
+
+    // Stringhe: apici raddoppiati, escape, errori leggibili
+    test_sql("CREATE TABLE s", "CREATE TABLE s (id INT, v VARCHAR(100))", -1);
+    test_sql("INSERT doubled quote", "INSERT INTO s VALUES (1, 'It''s ok')", -1);
+    test_value("SELECT doubled quote", "SELECT v FROM s WHERE id = 1", "It's ok");
+    test_sql("INSERT backslash esc", "INSERT INTO s VALUES (2, 'a\\'b\\\\c')", -1);
+    test_value("SELECT backslash esc", "SELECT v FROM s WHERE id = 2", "a'b\\c");
+    test_value("WHERE with quote", "SELECT id FROM s WHERE v = 'It''s ok'", "1");
+    test_fail("Unterminated string", "INSERT INTO s VALUES (3, 'abc)", "Unterminated string");
+    test_fail("Readable syntax error", "INSERT INTO s VALUES (3, 'x'", "Expected ')'");
+    test_sql("DROP TABLE s", "DROP TABLE s", -1);
 
     // Cleanup
     test_sql("DROP VIEW", "DROP VIEW v1", -1);

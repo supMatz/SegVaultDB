@@ -17,10 +17,37 @@ static bool match(ParserState* ps, TokenType tt) {
     if (peek(ps).type == tt) { consume(ps); return true; }
     return false;
 }
+// nome leggibile di un tipo di token (per i messaggi d'errore)
+static const char* token_name(TokenType tt) {
+    static const char* const NAMES[] = {
+        "SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "CREATE",
+        "TABLE", "DATABASE", "DROP", "ALTER", "INDEX", "VIEW", "AND", "OR", "NOT", "IN", "IS",
+        "NULL", "LIKE", "BETWEEN", "ORDER", "BY", "ASC", "DESC", "LIMIT", "JOIN", "LEFT",
+        "RIGHT", "ON", "AS", "DISTINCT", "GROUP", "HAVING", "UNION", "ALL", "EXISTS", "CASE",
+        "WHEN", "THEN", "ELSE", "END", "BEGIN", "COMMIT", "ROLLBACK", "TRANSACTION", "USE",
+        "SHOW", "DESCRIBE", "EXPLAIN", "TRUNCATE", "KEY", "SAVEPOINT", "TO", "TRIGGER", "BEFORE", "AFTER",
+        "FOR", "EACH", "ROW", "RENAME", "BOOLEAN",
+        "an integer", "a number", "a string", "a name", "'*'", "','", "';'", "'.'",
+        "'('", "')'", "'='", "'!='", "'<'", "'>'", "'<='", "'>='", "'+'", "'-'",
+        "'/'", "end of statement", "invalid token",
+    };
+    _Static_assert(sizeof(NAMES) / sizeof(NAMES[0]) == TOK_ERROR + 1, "token_name non allineato a TokenType");
+    return (tt >= 0 && tt <= TOK_ERROR) ? NAMES[tt] : "?";
+}
+
 static bool expect(ParserState* ps, TokenType tt) {
     if (match(ps, tt)) return true;
-    snprintf(ps->result->error, sizeof(ps->result->error),
-             "Expected token type %d at line %d", tt, peek(ps).line);
+    Token t = peek(ps);
+    if (t.type == TOK_ERROR && strchr(t.text, ' '))      // messaggio del lexer (stringa troppo lunga, ...)
+        snprintf(ps->result->error, sizeof(ps->result->error), "%.200s (line %d)", t.text, t.line);
+    else if (t.type == TOK_ERROR)
+        snprintf(ps->result->error, sizeof(ps->result->error), "Unexpected character '%.8s' (line %d)", t.text, t.line);
+    else if (t.type == TOK_EOF)
+        snprintf(ps->result->error, sizeof(ps->result->error), "Expected %s but the statement ended (line %d)",
+                 token_name(tt), t.line);
+    else
+        snprintf(ps->result->error, sizeof(ps->result->error), "Expected %s near '%.40s' (line %d)",
+                 token_name(tt), t.text, t.line);
     ps->result->success = false;
     return false;
 }
@@ -765,6 +792,16 @@ ParseResult* parser_parse(TokenList* tokens) {
     ps.tokens = tokens;
     ps.pos = 0;
     ps.result = r;
+
+    // errori del lexer (stringa non chiusa o troppo lunga): sono più precisi di quelli del parser
+    for (int i = 0; i < tokens->count; i++) {
+        Token* t = &tokens->tokens[i];
+        if (t->type == TOK_ERROR && strchr(t->text, ' ')) {
+            snprintf(r->error, sizeof(r->error), "%.200s (line %d)", t->text, t->line);
+            r->success = false;
+            return r;
+        }
+    }
 
     while (peek(&ps).type != TOK_EOF) {
         ASTNode* stmt = parse_statement(&ps);

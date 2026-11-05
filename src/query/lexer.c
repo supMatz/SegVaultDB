@@ -1,6 +1,7 @@
 #include "lexer.h"
 #include <ctype.h>
 #include <string.h>
+#include <stdio.h>
 
 typedef struct {
     const char* start;
@@ -119,20 +120,45 @@ TokenList* lexer_tokenize(const char* sql) {
             continue;
         }
 
-        // String literals
+        // String literals: '' (o "") dentro la stringa vale un apice; \\ \' \" \n \t \r sono escape
         if (*lx.pos == '\'' || *lx.pos == '"') {
             char quote = *lx.pos;
+            Token t = {TOK_STRING, "", lx.line, lx.col};
+            int n = 0;
+            bool overflow = false;
             lx.pos++;
-            lx.start = lx.pos;
-            while (*lx.pos && *lx.pos != quote) {
-                if (*lx.pos == '\\') lx.pos++;
-                lx.pos++;
+            while (*lx.pos) {
+                char ch = *lx.pos;
+                if (ch == quote) {
+                    if (lx.pos[1] != quote) break;            // fine stringa
+                    lx.pos += 2;                              // apice raddoppiato
+                } else if (ch == '\\' && lx.pos[1]) {
+                    char e = lx.pos[1];
+                    lx.pos += 2;
+                    switch (e) {
+                        case 'n': ch = '\n'; break;
+                        case 't': ch = '\t'; break;
+                        case 'r': ch = '\r'; break;
+                        case '\\': case '\'': case '"': ch = e; break;
+                        default:                              // escape sconosciuto: resta com'è
+                            if (n < (int)sizeof(t.text) - 1) t.text[n++] = '\\'; else overflow = true;
+                            ch = e;
+                            break;
+                    }
+                } else {
+                    if (ch == '\n') lx.line++;
+                    lx.pos++;
+                }
+                if (n < (int)sizeof(t.text) - 1) t.text[n++] = ch;
+                else overflow = true;
             }
-            Token t = make_token(&lx, TOK_STRING);
-            int slen = strlen(t.text);
-            if (slen > 0 && (t.text[slen-1] == '\'' || t.text[slen-1] == '"'))
-                t.text[slen-1] = '\0';
-            if (*lx.pos) lx.pos++;
+            t.text[n] = '\0';
+            if (*lx.pos) lx.pos++;                            // apice di chiusura
+            else snprintf(t.text, sizeof(t.text), "Unterminated string literal"), t.type = TOK_ERROR;
+            if (overflow) {
+                t.type = TOK_ERROR;
+                snprintf(t.text, sizeof(t.text), "String literal is longer than %d bytes", (int)sizeof(t.text) - 1);
+            }
             lx.start = lx.pos;
             add_token(list, t);
             continue;
