@@ -67,7 +67,7 @@ GUI_OBJS  = $(GUI_SRCS:.c=.o)
 FULL_SRCS = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) $(ENGINE_SRCS)
 FULL_OBJS = $(FULL_SRCS:.c=.o)
 
-.PHONY: all gui full clean test windows
+.PHONY: all gui full clean test test-asan windows
 
 all: full
 
@@ -81,6 +81,13 @@ full: $(FULL_OBJS)
 
 test: test_engine
 	./test_engine
+
+# test del motore con AddressSanitizer + UndefinedBehaviorSanitizer: fallisce su accessi fuori
+# memoria, use-after-free, leak e comportamenti indefiniti (es. letture disallineate)
+test-asan: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
+		$(INCLUDES) -o test_engine_asan test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c -lm
+	ASAN_OPTIONS=detect_leaks=1 ./test_engine_asan
 
 test_engine: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o test_engine test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c -lm
@@ -103,7 +110,7 @@ build-win/%.o: %.c
 	$(WIN_CC) $(CFLAGS) $(DEPFLAGS) $(BASE_INCLUDES) -c $< -o $@
 
 clean:
-	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(GUI_OBJS:.o=.d) $(FULL_OBJS:.o=.d) $(OUT) test_engine
+	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(GUI_OBJS:.o=.d) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan
 	$(RM) -r obj build-win
 
 -include $(FULL_OBJS:.o=.d) $(GUI_OBJS:.o=.d) $(WIN_OBJS:.o=.d)

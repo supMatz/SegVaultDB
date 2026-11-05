@@ -17,3 +17,4 @@ data/
 .DS_Store
 test_engine
 *.d
+test_engine_asan

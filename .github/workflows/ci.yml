@@ -30,6 +30,9 @@ jobs:
       - name: Engine tests
         run: make test
 
+      - name: Engine tests under AddressSanitizer + UBSan
+        run: make test-asan
+
       - name: Build (Windows, MinGW-w64)
         run: make -j"$(nproc)" windows 2>&1 | tee build-win.log
 
