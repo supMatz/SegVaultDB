@@ -602,7 +602,7 @@ static void load_table_children(TreeNode* tbl_node) {
     if (!cols) return;
     for (int i = 0; i < ncols; i++) {
         char extra[64];
-        snprintf(extra, sizeof(extra), "%s%s", cols[i].type, cols[i].primary_key ? " PK" : "");
+        snprintf(extra, sizeof(extra), "%.56s%s", cols[i].type, cols[i].primary_key ? " PK" : "");
         tree_node_add_child(tbl_node, TREE_NODE_COLUMN, cols[i].name, extra);
     }
     db_columns_free(cols, ncols);
@@ -4110,6 +4110,7 @@ void app_window_destroy(AppWindow* app) {
     widget_destroy((Widget*)app->results_scroll_h);
     widget_destroy((Widget*)app->bar_input);
     widget_destroy((Widget*)app->bar_replace_input);
+    widget_destroy((Widget*)app->filter_input);
     free(app);
 }
 
