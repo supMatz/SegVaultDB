@@ -69,6 +69,9 @@ const void* page_get_slot(Page* p, uint16_t slot_id, uint16_t* out_len);
 // Marca uno slot come eliminato (len = 0)
 int     page_delete_slot(Page* p, uint16_t slot_id);
 
+// Spazio utilizzabile per un inserimento: libero + recuperabile compattando
+uint16_t page_usable_space(const Page* p);
+
 // Compatta la pagina: rimuove i slot eliminati e compatta il payload
 void    page_compact(Page* p);
 

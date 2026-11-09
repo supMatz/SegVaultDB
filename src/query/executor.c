@@ -155,6 +155,8 @@ static QueryResult* exec_drop_table(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
     mi_invalidate_table(db->name, n->drop_table.table_name);
+    TableSchema* dts = catalog_get_table(ctx->catalog, db->name, n->drop_table.table_name);
+    if (dts) heap_cache_forget(ctx->bp, dts->root_page_id);
     if (catalog_drop_table(ctx->catalog, db->name, n->drop_table.table_name) != SV_OK)
         return result_error_msg("Table not found");
     return result_ok_msg(0);
@@ -462,6 +464,7 @@ static void mi_free(MemIndex* ix) {
 }
 
 void executor_invalidate_indexes(void) {
+    heap_cache_clear();
     while (g_mem_indexes) {
         MemIndex* nx = g_mem_indexes->next;
         mi_free(g_mem_indexes);

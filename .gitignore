@@ -22,3 +22,4 @@ test_btree
 test_btree_asan
 test_sql
 test_sql_asan
+bench_sql

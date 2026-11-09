@@ -1,75 +1,116 @@
 #include "buffer_pool.h"
 #include "platform_compat.h"
 
+static unsigned bp_hash(const BufferPool* bp, uint32_t page_id) {
+    return (unsigned)((page_id * 2654435761u) >> 7) & (unsigned)(bp->nbuckets - 1);   // Knuth
+}
+
 BufferPool* bp_create(int capacity, int db_fd) {
+    if (capacity < 4) capacity = 4;
     BufferPool* bp = SV_ALLOC(BufferPool);
     if (!bp) return NULL;
+    int nb = 1;
+    while (nb < capacity * 2) nb <<= 1;
     bp->frames   = SV_ALLOC_N(Frame, capacity);
+    bp->buckets  = malloc(sizeof(int) * (size_t)nb);
+    if (!bp->frames || !bp->buckets) { free(bp->frames); free(bp->buckets); free(bp); return NULL; }
+    for (int i = 0; i < nb; i++) bp->buckets[i] = -1;
+    for (int i = 0; i < capacity; i++) bp->frames[i].hnext = -1;
+    bp->nbuckets = nb;
     bp->capacity = capacity;
-    bp->num_used = 0;
     bp->db_fd    = db_fd;
-    bp->tick     = 0;
     return bp;
 }
 
 // Cerca un page_id nella cache, ritorna l'indice del frame o -1
 static int bp_find(BufferPool* bp, uint32_t page_id) {
-    for (int i = 0; i < bp->capacity; i++) {
-        if (bp->frames[i].page &&
-            bp->frames[i].page->page_id == page_id)
-            return i;
-    }
+    for (int i = bp->buckets[bp_hash(bp, page_id)]; i >= 0; i = bp->frames[i].hnext)
+        if (bp->frames[i].page->page_id == page_id) return i;
     return -1;
 }
 
-// Trova il frame da rimpiazzare (LRU non pinned)
-static int bp_evict(BufferPool* bp) {
-    int    lru_idx  = -1;
-    uint64_t lru_ts = UINT64_MAX;
+static void hash_insert(BufferPool* bp, int idx) {
+    unsigned h = bp_hash(bp, bp->frames[idx].page->page_id);
+    bp->frames[idx].hnext = bp->buckets[h];
+    bp->buckets[h] = idx;
+}
 
-    for (int i = 0; i < bp->capacity; i++) {
-        Frame* f = &bp->frames[i];
-        if (!f->page) return i;            // Frame vuoto: usa direttamente
-        if (f->pinned || f->pin_count > 0) continue; // Non evictable
-        if (f->last_access < lru_ts) {
-            lru_ts  = f->last_access;
-            lru_idx = i;
+static void hash_remove(BufferPool* bp, int idx) {
+    unsigned h = bp_hash(bp, bp->frames[idx].page->page_id);
+    int* pp = &bp->buckets[h];
+    while (*pp >= 0 && *pp != idx) pp = &bp->frames[*pp].hnext;
+    if (*pp == idx) *pp = bp->frames[idx].hnext;
+    bp->frames[idx].hnext = -1;
+}
+
+// libera il frame (scrivendo la pagina se modificata)
+static void frame_release(BufferPool* bp, int idx) {
+    Frame* f = &bp->frames[idx];
+    if (!f->page) return;
+    if (f->dirty && page_write(f->page, bp->db_fd) == SV_OK) bp->stats.dirty_writes++;
+    hash_remove(bp, idx);
+    page_free(f->page);
+    f->page      = NULL;
+    f->dirty     = false;
+    f->ref       = false;
+    f->pin_count = 0;
+    bp->num_used--;
+}
+
+// Trova un frame da usare: uno libero, oppure la vittima scelta da CLOCK
+static int bp_evict(BufferPool* bp) {
+    if (bp->num_used < bp->capacity) {
+        for (int k = 0; k < bp->capacity; k++) {
+            int i = (bp->hand + k) % bp->capacity;
+            if (!bp->frames[i].page) { bp->hand = (i + 1) % bp->capacity; return i; }
         }
     }
-    if (lru_idx < 0) return -1; // Tutti i frame sono pinnati
+    // al massimo due giri: il primo azzera i bit di riferimento, il secondo trova la vittima
+    for (int k = 0; k < 2 * bp->capacity; k++) {
+        int i = bp->hand;
+        bp->hand = (bp->hand + 1) % bp->capacity;
+        Frame* f = &bp->frames[i];
+        if (f->pin_count > 0) continue;            // in uso: non sostituibile
+        if (f->ref) { f->ref = false; continue; }  // seconda possibilità
+        frame_release(bp, i);
+        bp->stats.evictions++;
+        return i;
+    }
+    return -1;   // tutti i frame sono pinnati
+}
 
-    // Scrivi su disco se dirty prima di rimuovere
-    Frame* victim = &bp->frames[lru_idx];
-    if (victim->dirty) page_write(victim->page, bp->db_fd);
-    page_free(victim->page);
-    victim->page      = NULL;
-    victim->dirty     = false;
-    victim->pin_count = 0;
-    return lru_idx;
+static void frame_install(BufferPool* bp, int idx, Page* p) {
+    Frame* f = &bp->frames[idx];
+    f->page        = p;
+    f->dirty       = false;
+    f->pinned      = false;
+    f->ref         = true;
+    f->pin_count   = 1;
+    f->last_access = ++bp->tick;
+    hash_insert(bp, idx);
+    bp->num_used++;
 }
 
 Page* bp_fetch(BufferPool* bp, uint32_t page_id) {
-    // Cerca in cache
+    bp->stats.requests++;
     int idx = bp_find(bp, page_id);
     if (idx >= 0) {
-        bp->frames[idx].last_access = ++bp->tick;
-        bp->frames[idx].pin_count++;
-        return bp->frames[idx].page;
+        Frame* f = &bp->frames[idx];
+        f->last_access = ++bp->tick;
+        f->ref = true;
+        f->pin_count++;
+        bp->stats.hits++;
+        return f->page;
     }
 
     // Non in cache: trova un frame libero
     idx = bp_evict(bp);
     if (idx < 0) return NULL; // Cache piena e tutto pinnato
 
-    // Leggi dal disco
     Page* p = page_read(page_id, bp->db_fd);
     if (!p) return NULL;
-
-    bp->frames[idx].page        = p;
-    bp->frames[idx].dirty       = false;
-    bp->frames[idx].pinned      = false;
-    bp->frames[idx].pin_count   = 1;
-    bp->frames[idx].last_access = ++bp->tick;
+    bp->stats.misses++;
+    frame_install(bp, idx, p);
     return p;
 }
 
@@ -82,9 +123,8 @@ void bp_unpin(BufferPool* bp, uint32_t page_id, bool dirty) {
 }
 
 int bp_new_page(BufferPool* bp, uint32_t* out_page_id) {
-    // La nuova pagina va sempre in fondo al file. (In precedenza l'id era "massimo id nel
-    // buffer pool + 1": con pagine espulse o dopo un riavvio poteva coincidere con una pagina
-    // esistente e sovrascriverla.)
+    // La nuova pagina va sempre in fondo al file (le pagine non vengono riusate: il WAL
+    // identifica le righe con page_id + slot).
     long end = sv_lseek(bp->db_fd, 0, SEEK_END);
     uint32_t new_id = end > 0 ? (uint32_t)((end + SV_PAGE_SIZE - 1) / SV_PAGE_SIZE) : 0;
     if (new_id == 0) {
@@ -95,10 +135,7 @@ int bp_new_page(BufferPool* bp, uint32_t* out_page_id) {
         page_free(zero);
         new_id = 1;
     }
-    // pagine presenti solo in memoria (per sicurezza: bp_new_page le scrive subito su disco)
-    for (int i = 0; i < bp->capacity; i++)
-        if (bp->frames[i].page && bp->frames[i].page->page_id >= new_id)
-            new_id = bp->frames[i].page->page_id + 1;
+    if (bp->next_new_id > new_id) new_id = bp->next_new_id;
     if (new_id > SV_MAX_PAGE_ID) return SV_FULL;
 
     int idx = bp_evict(bp);
@@ -109,11 +146,9 @@ int bp_new_page(BufferPool* bp, uint32_t* out_page_id) {
 
     // Scrivi immediatamente sul disco per "registrare" la pagina
     page_write(p, bp->db_fd);
-
-    bp->frames[idx].page        = p;
-    bp->frames[idx].dirty       = false;
-    bp->frames[idx].pin_count   = 1;
-    bp->frames[idx].last_access = ++bp->tick;
+    bp->next_new_id = new_id + 1;
+    bp->stats.new_pages++;
+    frame_install(bp, idx, p);
 
     if (out_page_id) *out_page_id = new_id;
     return SV_OK;
@@ -124,16 +159,36 @@ int bp_flush_page(BufferPool* bp, uint32_t page_id) {
     if (idx < 0) return SV_NOT_FOUND;
     if (!bp->frames[idx].dirty) return SV_OK;
     int r = page_write(bp->frames[idx].page, bp->db_fd);
-    if (r == SV_OK) bp->frames[idx].dirty = false;
+    if (r == SV_OK) { bp->frames[idx].dirty = false; bp->stats.dirty_writes++; }
     return r;
 }
 
+// ordine di page_id per il flush (il buffer pool è usato sotto il mutex del motore)
+static const BufferPool* g_sort_bp;
+static int cmp_frame_page(const void* a, const void* b) {
+    uint32_t x = g_sort_bp->frames[*(const int*)a].page->page_id, y = g_sort_bp->frames[*(const int*)b].page->page_id;
+    return x < y ? -1 : x > y;
+}
+
 int bp_flush_all(BufferPool* bp) {
+    int* dirty = malloc(sizeof(int) * (size_t)bp->capacity);
+    int n = 0;
     for (int i = 0; i < bp->capacity; i++) {
-        if (bp->frames[i].page && bp->frames[i].dirty) {
-            page_write(bp->frames[i].page, bp->db_fd);
+        if (!bp->frames[i].page || !bp->frames[i].dirty) continue;
+        if (dirty) dirty[n++] = i;
+        else if (page_write(bp->frames[i].page, bp->db_fd) == SV_OK) {   // senza memoria: in ordine di frame
             bp->frames[i].dirty = false;
+            bp->stats.dirty_writes++;
         }
+    }
+    if (dirty) {
+        g_sort_bp = bp;
+        qsort(dirty, (size_t)n, sizeof(int), cmp_frame_page);   // scrittura sequenziale sul file
+        for (int k = 0; k < n; k++) {
+            Frame* f = &bp->frames[dirty[k]];
+            if (page_write(f->page, bp->db_fd) == SV_OK) { f->dirty = false; bp->stats.dirty_writes++; }
+        }
+        free(dirty);
     }
     sv_fsync(bp->db_fd);
     return SV_OK;
@@ -141,16 +196,13 @@ int bp_flush_all(BufferPool* bp) {
 
 void bp_remove_page(BufferPool* bp, uint32_t page_id) {
     if (!bp) return;
-    for (int i = 0; i < bp->capacity; i++) {
-        if (bp->frames[i].page && bp->frames[i].page->page_id == page_id) {
-            if (bp->frames[i].dirty) page_write(bp->frames[i].page, bp->db_fd);
-            page_free(bp->frames[i].page);
-            bp->frames[i].page = NULL;
-            bp->frames[i].dirty = false;
-            bp->frames[i].pin_count = 0;
-            return;
-        }
-    }
+    int idx = bp_find(bp, page_id);
+    if (idx >= 0) frame_release(bp, idx);
+}
+
+void bp_remove_all(BufferPool* bp) {
+    if (!bp) return;
+    for (int i = 0; i < bp->capacity; i++) frame_release(bp, i);
 }
 
 void bp_destroy(BufferPool* bp) {
@@ -159,5 +211,6 @@ void bp_destroy(BufferPool* bp) {
     for (int i = 0; i < bp->capacity; i++)
         if (bp->frames[i].page) page_free(bp->frames[i].page);
     free(bp->frames);
+    free(bp->buckets);
     free(bp);
 }

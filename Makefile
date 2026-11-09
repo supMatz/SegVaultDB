@@ -67,7 +67,7 @@ GUI_OBJS  = $(GUI_SRCS:.c=.o)
 FULL_SRCS = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) $(ENGINE_SRCS)
 FULL_OBJS = $(FULL_SRCS:.c=.o)
 
-.PHONY: all gui full clean test test-asan windows
+.PHONY: all gui full clean test test-asan windows bench
 
 all: full
 
@@ -129,7 +129,14 @@ build-win/%.o: %.c
 	$(WIN_CC) $(CFLAGS) $(DEPFLAGS) $(BASE_INCLUDES) -c $< -o $@
 
 clean:
-	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(GUI_OBJS:.o=.d) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan
+	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(GUI_OBJS:.o=.d) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql
 	$(RM) -r obj build-win
 
 -include $(FULL_OBJS:.o=.d) $(GUI_OBJS:.o=.d) $(WIN_OBJS:.o=.d)
+
+# ── benchmark del motore (schema universitario, righe configurabili: ./bench_sql 100000) ──
+bench_sql: bench/bench.c $(ENGINE_SRCS)
+	$(CC) $(CFLAGS) -I. $(INCLUDES) -o bench_sql bench/bench.c $(ENGINE_SRCS) -lm -pthread
+
+bench: bench_sql
+	./bench_sql 100000

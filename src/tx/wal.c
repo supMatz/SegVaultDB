@@ -139,7 +139,6 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
     if (db_fd < 0) { sv_close(log_fd); return SV_ERR; }
 
     // Phase 1: Read all entries, track transaction state
-    #define MAX_ENTRIES 65536
     typedef struct {
         uint8_t  type;
         uint64_t tx_id;
@@ -152,7 +151,8 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
         off_t    offset; // unused but kept for structure
     } LogEntry;
 
-    LogEntry* entries = calloc(MAX_ENTRIES, sizeof(LogEntry));
+    int cap_entries = 1024;
+    LogEntry* entries = calloc((size_t)cap_entries, sizeof(LogEntry));
     if (!entries) { close(log_fd); close(db_fd); return SV_ERR; }
     int num_entries = 0;
 
@@ -160,7 +160,13 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
     int num_active = 0;
 
     uint8_t hdr[23];
-    while (sv_read(log_fd, hdr, 23) == 23 && num_entries < MAX_ENTRIES) {
+    while (sv_read(log_fd, hdr, 23) == 23) {
+        if (num_entries >= cap_entries) {
+            LogEntry* ne = realloc(entries, sizeof(LogEntry) * (size_t)cap_entries * 2);
+            if (!ne) break;
+            entries = ne;
+            cap_entries *= 2;
+        }
         LogEntry* e = &entries[num_entries];
         e->type = hdr[0];
         memcpy(&e->tx_id, hdr + 1, 8);
@@ -240,7 +246,6 @@ int wal_undo_tx(const char* log_path, const char* db_path, uint64_t tx_id) {
     int db_fd = sv_open(db_path, SV_O_RDWR, 0);
     if (db_fd < 0) { sv_close(log_fd); return SV_ERR; }
 
-    #define MAX_ENTRIES 65536
     typedef struct {
         uint8_t  type;
         uint32_t page_id;
@@ -251,12 +256,19 @@ int wal_undo_tx(const char* log_path, const char* db_path, uint64_t tx_id) {
         uint8_t* old_data;
     } LogEntry;
 
-    LogEntry* entries = calloc(MAX_ENTRIES, sizeof(LogEntry));
+    int cap_entries = 256;
+    LogEntry* entries = calloc((size_t)cap_entries, sizeof(LogEntry));
     if (!entries) { close(log_fd); close(db_fd); return SV_ERR; }
     int num_entries = 0;
 
     uint8_t hdr[23];
-    while (sv_read(log_fd, hdr, 23) == 23 && num_entries < MAX_ENTRIES) {
+    while (sv_read(log_fd, hdr, 23) == 23) {
+        if (num_entries >= cap_entries) {
+            LogEntry* ne = realloc(entries, sizeof(LogEntry) * (size_t)cap_entries * 2);
+            if (!ne) break;
+            entries = ne;
+            cap_entries *= 2;
+        }
         LogEntry* e = &entries[num_entries];
         e->type = hdr[0];
         uint64_t entry_tx_id;
@@ -295,6 +307,21 @@ int wal_undo_tx(const char* log_path, const char* db_path, uint64_t tx_id) {
 
     free(entries);
     sv_close(db_fd);
+    return SV_OK;
+}
+
+long wal_size(WAL* wal) {
+    if (!wal) return 0;
+    long cur = sv_lseek(wal->fd, 0, SEEK_END);
+    return cur < 0 ? 0 : cur;
+}
+
+int wal_truncate(WAL* wal) {
+    if (!wal) return SV_ERR;
+    if (sv_ftruncate(wal->fd, 0) != 0) return SV_IO_ERROR;
+    sv_lseek(wal->fd, 0, SEEK_SET);
+    sv_fsync(wal->fd);
+    wal->checkpoints++;
     return SV_OK;
 }
 

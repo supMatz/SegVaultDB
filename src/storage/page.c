@@ -30,9 +30,25 @@ Page* page_read(uint32_t id, int fd) {
     return p;
 }
 
+uint16_t page_usable_space(const Page* p) {
+    // spazio libero contiguo + byte delle tuple cancellate (recuperabili compattando)
+    uint32_t live = 0;
+    const SlotEntry* e = (const SlotEntry*)p->data;
+    for (uint16_t i = 0; i < p->num_slots; i++) live += e[i].length;
+    uint32_t total = (uint32_t)sizeof(p->data) - (uint32_t)p->num_slots * SV_SLOT_ENTRY_SIZE;
+    return live >= total ? 0 : (uint16_t)(total - live);
+}
+
 int page_insert(Page* p, const void* data, uint16_t len) {
-    uint16_t needed = len + SV_SLOT_ENTRY_SIZE;
-    if (p->free_space < needed) return SV_FULL;
+    uint32_t needed = (uint32_t)len + SV_SLOT_ENTRY_SIZE;
+    if (p->num_slots >= SV_MAX_SLOTS) return SV_FULL;
+    if (p->free_space < needed) {
+        // le tuple cancellate lasciano buchi: se compattando lo spazio basta, si compatta
+        // (gli slot non cambiano numero, solo posizione: i RID restano validi)
+        if (page_usable_space(p) < needed) return SV_FULL;
+        page_compact(p);
+        if (p->free_space < needed) return SV_FULL;
+    }
 
     // slot directory: cresce dall'inizio di data[]
     uint16_t slot_dir_size = p->num_slots * SV_SLOT_ENTRY_SIZE;
@@ -52,7 +68,7 @@ int page_insert(Page* p, const void* data, uint16_t len) {
     slot->length = len;
 
     p->num_slots++;
-    p->free_space -= needed;
+    p->free_space = (uint16_t)(p->free_space - needed);
     p->flags |= PAGE_FLAG_DIRTY;
 
     return p->num_slots - 1; // Ritorna slot_id

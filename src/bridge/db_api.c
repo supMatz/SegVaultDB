@@ -146,6 +146,23 @@ void db_clear_cancel(void) {
 
 bool db_cancel_requested(void) { return atomic_load(&g_cancel_requested) != 0; }
 
+// ── checkpoint ───────────────────────────────────────────────────
+// Senza transazioni aperte tutte le modifiche sono definitive: scritte le pagine e il
+// catalogo su disco (fsync), il log non serve più per il recovery e viene svuotato.
+// Automatico quando il log supera SV_WAL_CHECKPOINT_BYTES, oppure con CHECKPOINT.
+#define SV_WAL_CHECKPOINT_BYTES (16L << 20)
+
+static bool do_checkpoint(void) {
+    if (!g_db.initialized || g_db.exec_ctx.tx_id) return false;
+    bp_flush_all(g_db.bp);
+    if (catalog_save(g_db.catalog, g_db.cat_path) != SV_OK) return false;
+    return wal_truncate(g_db.wal) == SV_OK;
+}
+
+static void maybe_checkpoint(void) {
+    if (g_db.initialized && !g_db.exec_ctx.tx_id && wal_size(g_db.wal) > SV_WAL_CHECKPOINT_BYTES) do_checkpoint();
+}
+
 static QueryResult* db_execute_impl(const char* sql) {
     if (!g_db.initialized) return result_error("DB non inizializzato");
     if (!sql || !sql[0])   return result_error("Query vuota");
@@ -214,6 +231,7 @@ static QueryResult* db_execute_impl(const char* sql) {
 
     parse_result_free(parsed);
     lexer_free(tokens);
+    maybe_checkpoint();
     return result;
 }
 
@@ -239,6 +257,7 @@ static QueryResult** db_execute_multi_impl(const char* sql, int* out_count) {
             results[i]->exec_time_ms = get_time_ms() - t_start;
     }
     *out_count = parsed->count;
+    maybe_checkpoint();
 
     parse_result_free(parsed);
     lexer_free(tokens);
@@ -297,10 +316,7 @@ static bool db_rollback_impl(void) {
     // Applica le before-image dal WAL per annullare
     wal_undo_tx(g_db.log_path, g_db.db_path, g_db.exec_ctx.tx_id);
     // Invalida tutte le pagine in cache per forzare la rilettura dal disco
-    for (int i = 0; i < g_db.bp->capacity; i++) {
-        if (g_db.bp->frames[i].page)
-            bp_remove_page(g_db.bp, g_db.bp->frames[i].page->page_id);
-    }
+    bp_remove_all(g_db.bp);
     txm_abort(g_db.txm, g_db.exec_ctx.tx_id);
     g_db.exec_ctx.tx_id = 0;
     executor_invalidate_indexes();   // le righe sono tornate indietro (e possono aver cambiato posizione)
@@ -418,10 +434,7 @@ static bool db_rollback_to_impl(const char* name) {
     sv_lseek(g_db.wal->fd, 0, SEEK_END);
     g_num_savepoints = sp_idx;
 
-    for (int i = 0; i < g_db.bp->capacity; i++) {
-        if (g_db.bp->frames[i].page)
-            bp_remove_page(g_db.bp, g_db.bp->frames[i].page->page_id);
-    }
+    bp_remove_all(g_db.bp);
     executor_invalidate_indexes();
     return true;
 }
