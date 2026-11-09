@@ -1510,6 +1510,7 @@ static ASTNode* parse_statement(ParserState* ps) {
         case TOK_EXPLAIN: {
             consume(ps);
             n->type = NODE_EXPLAIN;
+            if (ident_is(ps, "ANALYZE")) { consume(ps); n->explain.analyze = true; }
             if (!query_starts(ps, 0)) { parse_fail(ps, "EXPLAIN works with SELECT statements", peek(ps)); break; }
             n->explain.stmt = parse_query(ps);
             break;

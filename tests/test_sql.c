@@ -447,6 +447,20 @@ int main(void) {
         }
         db_result_free(r);
     }
+    {
+        tests++;
+        QueryResult* r = db_execute("EXPLAIN ANALYZE SELECT nome FROM studente s WHERE NOT EXISTS "
+                                    "(SELECT * FROM esame e WHERE e.matricola = s.matricola)");
+        char got[4096];
+        if (r && r->success) render(r, got, sizeof(got)); else snprintf(got, sizeof(got), "ERR");
+        if (!r || !r->success || r->num_cols != 5 || !strstr(got, "Table scan|s (about 5 rows)|5|5") ||
+            !strstr(got, "executed 5 times") || !strstr(got, "lookup by matricola in a hash table built once") ||
+            !strstr(got, "Result|1 rows in")) {
+            failed++;
+            printf("FAIL %d: EXPLAIN ANALYZE\n   got: %s\n", tests, got);
+        }
+        db_result_free(r);
+    }
     t("SELECT s.nome FROM studente s LEFT JOIN esame e ON e.matricola = s.matricola WHERE e.matricola IS NULL", "Elena");
     t("SELECT s.nome, COUNT(e.voto) FROM studente s LEFT JOIN esame e ON e.matricola = s.matricola AND e.voto = 30 "
       "GROUP BY s.nome ORDER BY s.nome", "Anna|1;Bruno|1;Carla|1;Dario|0;Elena|0");

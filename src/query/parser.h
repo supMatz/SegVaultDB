@@ -237,6 +237,7 @@ typedef struct ASTNode {
         } drop_trigger;
         struct {
             void*      stmt;           // ASTNode* della SELECT da spiegare
+            bool       analyze;        // EXPLAIN ANALYZE: esegue la query e mostra le righe reali
         } explain;
     };
 } ASTNode;

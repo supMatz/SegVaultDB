@@ -1642,6 +1642,13 @@ struct SelectPlan {
     bool      inset_null;
     bool      inset_built;
     long      execs;                    // esecuzioni (EXPLAIN delle subquery)
+    // righe reali per EXPLAIN ANALYZE (sommate su tutte le esecuzioni)
+    long      st_scanned[MAX_SOURCES];  // righe lette dalla tabella
+    long      st_loaded[MAX_SOURCES];   // righe dopo i filtri della lettura
+    long      st_dyn[MAX_SOURCES];      // righe dopo i filtri correlati
+    long      st_join[MAX_SOURCES];     // combinazioni dopo il join con la sorgente k
+    long      st_resid, st_groups, st_having, st_out;
+    double    st_ms;
     char      err[300];
 };
 
@@ -2127,6 +2134,7 @@ static bool plan_load(SelectPlan* p) {
                     for (int i = 0; l && i < l->n; i++) {
                         Tuple* t = heap_get(hf, l->r[i], S->ts);
                         if (!t) continue;
+                        p->st_scanned[s]++;
                         cur[s] = t;
                         if (!xv_all_true(f, &ec)) { tuple_free(t); continue; }
                         if (!source_push(S, t, l->r[i], &cap)) { tuple_free(t); free(hf); snprintf(p->err, sizeof(p->err), "Out of memory"); return false; }
@@ -2144,6 +2152,7 @@ static bool plan_load(SelectPlan* p) {
                 const uint8_t* data;
                 while (ok && (data = heap_scan_next_raw(scan, &rid, &len)) != NULL) {
                     if (!tuple_view(view, data, len, S->ts, sbuf, SV_PAGE_SIZE + 64)) continue;
+                    p->st_scanned[s]++;
                     if (f->n) {
                         cur[s] = view;
                         bool keep = xv_all_true(f, &ec);
@@ -2164,6 +2173,8 @@ static bool plan_load(SelectPlan* p) {
             cur[s] = NULL;
         }
         if (ec.err[0]) { snprintf(p->err, sizeof(p->err), "%s", ec.err); return false; }
+        if (S->is_view && !p->st_scanned[s]) p->st_scanned[s] = S->n;
+        p->st_loaded[s] = S->n;
         // subquery correlata: tabella hash sulla colonna di ricerca, costruita una volta
         if (p->probe_col[s] >= 0 && p->probe_dyn[s]) {
             int col = p->probe_col[s];
@@ -2376,6 +2387,7 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
         }
         cur[s] = NULL;
         ec.cur = NULL;
+        p->st_dyn[s] += st.fn[s];
         if (ec.err[0]) AFAIL("%s", ec.err);
     }
 
@@ -2391,6 +2403,7 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
                                   st.frows[j + 1], st.fn[j + 1]);
         combos_free(&st.combos);
         st.combos = next;
+        p->st_join[j + 1] += next.n;
         if (f) AFAIL("%s", f);
         if (ec.err[0]) AFAIL("%s", ec.err);
     }
@@ -2409,6 +2422,7 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
         ec.cur = NULL;
         if (ec.err[0]) AFAIL("%s", ec.err);
     }
+    p->st_resid += st.combos.n;
 
     // 3. unità di output: combinazioni o gruppi
     st.null_combo = calloc((size_t)w, sizeof(Tuple*));
@@ -2459,6 +2473,7 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
         st.units = malloc(sizeof(int) * (size_t)(ngroups ? ngroups : 1));
         if (!st.units) AFAIL("Out of memory");
         for (int u = 0; u < ngroups; u++) st.units[nunits++] = u;
+        p->st_groups += ngroups;
     } else {
         st.units = malloc(sizeof(int) * (size_t)(st.combos.n ? st.combos.n : 1));
         if (!st.units) AFAIL("Out of memory");
@@ -2484,6 +2499,7 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
         nunits = kept;
         if (ec.err[0]) AFAIL("%s", ec.err);
     }
+    p->st_having += nunits;
 
     // 4. DISTINCT, ORDER BY, OFFSET / LIMIT; le colonne si calcolano solo per le righe che restano
     int nkeys = apply_order ? n->select_stmt.num_order : 0;
@@ -2570,6 +2586,7 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
     if (atomic_load(&g_sv_scan_cancel)) AFAIL("Query cancelled");
     #undef SET_UNIT
     #undef AFAIL
+    p->st_out += res->nrows;
     arm_state_free(&st, p->nsrc);
     return true;
 }
@@ -2634,7 +2651,22 @@ static int compound_cmp(const void* pa, const void* pb) {
     return ia < ib ? -1 : ia > ib;
 }
 
+static double now_ms_exec(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec * 1000.0 + (double)t.tv_nsec / 1e6;
+}
+
+static bool query_exec_inner(SelectPlan* p, EvalCtx* outer, int stop_after, ORows* res);
+
 static bool query_exec(SelectPlan* p, EvalCtx* outer, int stop_after, ORows* res) {
+    double t0 = now_ms_exec();
+    bool ok = query_exec_inner(p, outer, stop_after, res);
+    p->st_ms += now_ms_exec() - t0;
+    return ok;
+}
+
+static bool query_exec_inner(SelectPlan* p, EvalCtx* outer, int stop_after, ORows* res) {
     if (!p->compound) return arm_exec(p, outer, stop_after, true, res);
     ASTNode* n = p->n;
     // INTERSECT lega più di UNION ed EXCEPT: prima i tratti di INTERSECT, poi da sinistra a destra
@@ -2847,14 +2879,20 @@ static void xv_format(const ExprVec* xv, char* buf, size_t n) {
     }
 }
 
-typedef struct { QueryResult* r; } PlanOut;
+typedef struct { QueryResult* r; bool analyze; } PlanOut;
+
+static void plan_row_a(PlanOut* po, const char* indent, const char* op, const char* detail, double est, long actual);
 
 static void plan_row(PlanOut* po, const char* indent, const char* op, const char* detail, double est) {
+    plan_row_a(po, indent, op, detail, est, -1);
+}
+
+static void plan_row_a(PlanOut* po, const char* indent, const char* op, const char* detail, double est, long actual) {
     QueryResult* r = po->r;
     if (r->num_rows >= 256) return;
     Row* pr = &r->rows[r->num_rows++];
-    pr->num_cells = 4;
-    pr->cells = calloc(4, sizeof(Cell));
+    pr->num_cells = r->num_cols;
+    pr->cells = calloc((size_t)r->num_cols, sizeof(Cell));
     if (!pr->cells) { r->num_rows--; return; }
     snprintf(pr->cells[0].value, sizeof(pr->cells[0].value), "%d", r->num_rows);
     pr->cells[0].type = CELL_TYPE_INT;
@@ -2863,6 +2901,10 @@ static void plan_row(PlanOut* po, const char* indent, const char* op, const char
     pr->cells[1].type = pr->cells[2].type = CELL_TYPE_STRING;
     if (est < 0) { pr->cells[3].is_null = true; pr->cells[3].type = CELL_TYPE_NULL; snprintf(pr->cells[3].value, sizeof(pr->cells[3].value), "NULL"); }
     else { snprintf(pr->cells[3].value, sizeof(pr->cells[3].value), "%.0f", est < 1 && est > 0 ? 1 : est); pr->cells[3].type = CELL_TYPE_INT; }
+    if (r->num_cols > 4) {
+        if (actual < 0) { pr->cells[4].is_null = true; pr->cells[4].type = CELL_TYPE_NULL; snprintf(pr->cells[4].value, sizeof(pr->cells[4].value), "NULL"); }
+        else { snprintf(pr->cells[4].value, sizeof(pr->cells[4].value), "%ld", actual); pr->cells[4].type = CELL_TYPE_INT; }
+    }
 }
 
 static void explain_subqueries(PlanOut* po, const ASTExpr* e, const char* indent, int depth);
@@ -2872,13 +2914,15 @@ static void explain_subqueries(PlanOut* po, const ASTExpr* e, const char* indent
     if (!e || depth > 8) return;
     if (e->type == EXPR_SUBQUERY && e->subq && e->subq->plan) {
         SelectPlan* sp = e->subq->plan;
-        char d[300], f[200];
+        char d[600], f[200];
         ast_expr_format(e, f, sizeof(f));
         const char* how = sp->correlated ? "correlated: executed again for every row of the outer query"
                                          : (e->subkind == SUBQ_ANY && e->op == OP_EQ) || (e->subkind == SUBQ_ALL && e->op == OP_NEQ)
                                            ? "computed once, values kept in a hash table"
                                            : "computed once";
-        snprintf(d, sizeof(d), "%s (%s)", f, how);
+        if (po->analyze) snprintf(d, sizeof(d), "%s (%s; executed %ld time%s in %.2f ms, actual rows are totals)", f, how,
+                                  sp->execs, sp->execs == 1 ? "" : "s", sp->st_ms);
+        else             snprintf(d, sizeof(d), "%s (%s)", f, how);
         plan_row(po, indent, "Subquery", d, -1);
         char ind[64];
         snprintf(ind, sizeof(ind), "%s    ", indent);
@@ -2900,16 +2944,16 @@ static double explain_arm(PlanOut* po, SelectPlan* p, const char* indent, int de
         if (S->is_view) {
             est = (double)S->n;
             snprintf(det, sizeof(det), "%.64s (%d rows, computed)", S->name, S->n);
-            plan_row(po, indent, "View", det, est);
+            plan_row_a(po, indent, "View", det, est, po->analyze ? p->st_scanned[s] : -1);
         } else if (p->probe_col[s] >= 0 && !p->probe_dyn[s] && col_is_indexed(S->ts, p->probe_col[s])) {
             bool unique = S->ts->columns[p->probe_col[s]].primary_key;
             est = unique ? 1 : (double)S->ts->num_rows * 0.1;
             snprintf(det, sizeof(det), "%.64s using %.64s.%.64s (in-memory index)", S->name, S->table, S->ts->columns[p->probe_col[s]].name);
-            plan_row(po, indent, "Index lookup", det, est);
+            plan_row_a(po, indent, "Index lookup", det, est, po->analyze ? p->st_scanned[s] : -1);
         } else {
             est = (double)S->ts->num_rows;
             snprintf(det, sizeof(det), "%.64s (about %llu rows)", S->name, (unsigned long long)S->ts->num_rows);
-            plan_row(po, indent, "Table scan", det, est);
+            plan_row_a(po, indent, "Table scan", det, est, po->analyze ? p->st_scanned[s] : -1);
         }
         ExprVec* pf[2] = { &p->pre_static[s], &p->pre_dyn[s] };
         for (int q = 0; q < 2; q++) {
@@ -2921,7 +2965,7 @@ static double explain_arm(PlanOut* po, SelectPlan* p, const char* indent, int de
                          S->ts->columns[p->probe_col[s]].name);
             else
                 snprintf(det, sizeof(det), "WHERE %s (on %.64s, before the joins)", buf, S->name);
-            plan_row(po, indent, "Filter", det, est);
+            plan_row_a(po, indent, "Filter", det, est, !po->analyze ? -1 : q == 0 ? p->st_loaded[s] : p->st_dyn[s]);
         }
         if (s == 0) { rows = est; continue; }
         ASTJoin* j = &n->select_stmt.joins[s - 1];
@@ -2936,13 +2980,13 @@ static double explain_arm(PlanOut* po, SelectPlan* p, const char* indent, int de
         if (j->type == JOIN_LEFT && jr < rows) jr = rows;
         if (j->type == JOIN_RIGHT && jr < est) jr = est;
         rows = jr;
-        plan_row(po, indent, hashed ? "Hash join" : "Nested loop join", det, rows);
+        plan_row_a(po, indent, hashed ? "Hash join" : "Nested loop join", det, rows, po->analyze ? p->st_join[s] : -1);
     }
     if (p->resid.n) {
         rows *= xv_selectivity(&p->resid);
         xv_format(&p->resid, buf, sizeof(buf));
         snprintf(det, sizeof(det), "WHERE %s", buf);
-        plan_row(po, indent, "Filter", det, rows);
+        plan_row_a(po, indent, "Filter", det, rows, po->analyze ? p->st_resid : -1);
     }
     if (p->grouped) {
         buf[0] = '\0';
@@ -2952,18 +2996,20 @@ static double explain_arm(PlanOut* po, SelectPlan* p, const char* indent, int de
             snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s%s", i ? ", " : "", g);
         }
         rows = n->select_stmt.num_group ? (rows > 10 ? rows / 10 : rows) : 1;
-        plan_row(po, indent, "Aggregate", n->select_stmt.num_group ? buf : "all rows as one group", rows);
+        plan_row_a(po, indent, "Aggregate", n->select_stmt.num_group ? buf : "all rows as one group", rows, po->analyze ? p->st_groups : -1);
     }
     if (n->select_stmt.having) {
         ast_expr_format(n->select_stmt.having, buf, sizeof(buf));
         rows *= cond_selectivity(n->select_stmt.having);
         snprintf(det, sizeof(det), "HAVING %s", buf);
-        plan_row(po, indent, "Filter groups", det, rows);
+        plan_row_a(po, indent, "Filter groups", det, rows, po->analyze ? p->st_having : -1);
     }
     buf[0] = '\0';
     for (int i = 0; i < p->nout; i++) snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s%s", i ? ", " : "", p->out[i].name);
-    plan_row(po, indent, "Projection", buf, rows);
-    if (n->select_stmt.distinct) plan_row(po, indent, "Distinct", "remove duplicate rows", rows);
+    // le colonne si calcolano per tutte le righe solo con DISTINCT; altrimenti dopo ORDER BY / LIMIT
+    long projected = n->select_stmt.distinct ? (p->grouped ? p->st_having : p->st_resid) : p->st_out;
+    plan_row_a(po, indent, "Projection", buf, rows, po->analyze ? projected : -1);
+    if (n->select_stmt.distinct) plan_row_a(po, indent, "Distinct", "remove duplicate rows", rows, po->analyze && !p->compound ? p->st_out : -1);
     // subquery usate nella query
     for (int i = 0; i < p->nout; i++) if (!p->out[i].owned) explain_subqueries(po, p->out[i].e, indent, depth);
     explain_subqueries(po, n->select_stmt.where, indent, depth);
@@ -2977,31 +3023,38 @@ static double explain_arm(PlanOut* po, SelectPlan* p, const char* indent, int de
                 ast_expr_format(n->select_stmt.order_exprs[i], o, sizeof(o));
                 snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s%s%s", i ? ", " : "", o, n->select_stmt.order_desc[i] ? " DESC" : "");
             }
-            plan_row(po, indent, "Sort", buf, rows);
+            plan_row_a(po, indent, "Sort", buf, rows, -1);
         }
         if (n->select_stmt.has_limit) {
             snprintf(det, sizeof(det), "%d rows, skipping %d", n->select_stmt.limit, n->select_stmt.offset);
             if (n->select_stmt.limit < rows) rows = n->select_stmt.limit;
-            plan_row(po, indent, "Limit", det, rows);
+            plan_row_a(po, indent, "Limit", det, rows, po->analyze ? p->st_out : -1);
         }
     }
     return rows;
 }
 
-static QueryResult* plan_explain(SelectPlan* p) {
+static QueryResult* plan_explain(SelectPlan* p, bool analyze, long result_rows) {
     QueryResult* r = calloc(1, sizeof(QueryResult));
     if (!r) return NULL;
+    int nc = analyze ? 5 : 4;
     r->success = true;
-    r->num_cols = 4;
-    r->col_names = calloc(4, sizeof(char*));
-    r->col_types = calloc(4, sizeof(char*));
+    r->num_cols = nc;
+    r->col_names = calloc(5, sizeof(char*));
+    r->col_types = calloc(5, sizeof(char*));
     r->rows = calloc(256, sizeof(Row));
     if (!r->col_names || !r->col_types || !r->rows) { db_result_free(r); return NULL; }
-    const char* names[4] = { "Step", "Operation", "Details", "Est. rows" };
-    const char* types[4] = { "INT", "VARCHAR", "VARCHAR", "INT" };
-    for (int i = 0; i < 4; i++) { r->col_names[i] = strdup(names[i]); r->col_types[i] = strdup(types[i]); }
-    PlanOut po = { r };
-    if (!p->compound) { explain_arm(&po, p, "", 0); return r; }
+    const char* names[5] = { "Step", "Operation", "Details", "Est. rows", "Actual rows" };
+    const char* types[5] = { "INT", "VARCHAR", "VARCHAR", "INT", "INT" };
+    for (int i = 0; i < nc; i++) { r->col_names[i] = strdup(names[i]); r->col_types[i] = strdup(types[i]); }
+    PlanOut po = { r, analyze };
+    char tm[160];
+    snprintf(tm, sizeof(tm), "%ld rows in %.3f ms", result_rows, p->st_ms);
+    if (!p->compound) {
+        explain_arm(&po, p, "", 0);
+        if (analyze) plan_row_a(&po, "", "Result", tm, -1, result_rows);
+        return r;
+    }
     double total = 0;
     int k = 0;
     for (SelectPlan* a = p; a; a = a->next_arm, k++) {
@@ -3029,17 +3082,30 @@ static QueryResult* plan_explain(SelectPlan* p) {
         snprintf(buf, sizeof(buf), "%d rows, skipping %d", n->select_stmt.limit, n->select_stmt.offset);
         plan_row(&po, "", "Limit", buf, n->select_stmt.limit < total ? n->select_stmt.limit : total);
     }
+    if (analyze) plan_row_a(&po, "", "Result", tm, -1, result_rows);
     return r;
 }
 
 // ── SELECT di primo livello: risultato per la GUI ──
 
-static QueryResult* run_select(ExecCtx* ctx, ASTNode* n, int depth, bool explain) {
+static QueryResult* run_select_ex(ExecCtx* ctx, ASTNode* n, int depth, bool explain, bool analyze) {
     char err[300] = "";
     SelectPlan* p = plan_prepare(ctx, n, depth, NULL, NULL, err, sizeof(err));
     if (!p) return result_error_msg(err);
     if (explain) {
-        QueryResult* r = plan_explain(p);
+        long nr = -1;
+        if (analyze) {                          // esegue la query: righe reali di ogni passo
+            ORows rows = {0};
+            if (!query_exec(p, NULL, 0, &rows)) {
+                snprintf(err, sizeof(err), "%s", p->err[0] ? p->err : "Query failed");
+                orows_free(&rows);
+                plan_free(p);
+                return result_error_msg(err);
+            }
+            nr = rows.nrows;
+            orows_free(&rows);
+        }
+        QueryResult* r = plan_explain(p, analyze, nr);
         plan_free(p);
         return r ? r : result_error_msg("Out of memory");
     }
@@ -3082,6 +3148,10 @@ static QueryResult* run_select(ExecCtx* ctx, ASTNode* n, int depth, bool explain
     plan_free(p);
     if (!ok) { db_result_free(r); return result_error_msg("Out of memory"); }
     return r;
+}
+
+static QueryResult* run_select(ExecCtx* ctx, ASTNode* n, int depth, bool explain) {
+    return run_select_ex(ctx, n, depth, explain, false);
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -4608,7 +4678,7 @@ static QueryResult* exec_truncate(ExecCtx* ctx, ASTNode* n) {
 static QueryResult* exec_explain(ExecCtx* ctx, ASTNode* n) {
     ASTNode* stmt = (ASTNode*)n->explain.stmt;
     if (!stmt || stmt->type != NODE_SELECT) return result_error_msg("EXPLAIN works with SELECT statements");
-    return run_select(ctx, stmt, 0, true);
+    return run_select_ex(ctx, stmt, 0, true, n->explain.analyze);
 }
 
 QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt) {
