@@ -451,6 +451,26 @@ int main(void) {
     t("SELECT voto FROM esame WHERE ROW_NUMBER() OVER () = 1", "ERR:not allowed in WHERE");
     t("SELECT ROW_NUMBER() FROM esame", "ERR:Unknown function");
     t("SELECT UPPER(corso) OVER () FROM esame", "ERR:cannot be used with OVER");
+    // frame delle funzioni finestra
+    t("SELECT voto, SUM(voto) OVER (ORDER BY voto ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM esame WHERE corso = 'BD1' ORDER BY voto",
+      "18|45;27|75;30|57");
+    t("SELECT voto, MAX(voto) OVER (ORDER BY voto ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM esame WHERE corso = 'BD1' ORDER BY voto",
+      "18|27;27|30;30|30");
+    t("SELECT voto, MIN(voto) OVER (ORDER BY voto DESC ROWS 1 PRECEDING) FROM esame WHERE corso = 'BD1' ORDER BY voto DESC",
+      "30|30;27|27;18|18");
+    t("SELECT voto, COUNT(*) OVER (ORDER BY voto ROWS 1 PRECEDING) FROM esame WHERE corso = 'BD1' ORDER BY voto", "18|1;27|2;30|2");
+    t("SELECT voto, SUM(voto) OVER (ORDER BY voto ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING) FROM esame WHERE corso = 'BD1' ORDER BY voto",
+      "18|NULL;27|18;30|45");
+    t("SELECT voto, LAST_VALUE(voto) OVER (ORDER BY voto ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM esame WHERE corso = 'BD1' ORDER BY voto",
+      "18|30;27|30;30|30");
+    t("SELECT DISTINCT voto, COUNT(*) OVER (ORDER BY voto DESC RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM esame ORDER BY voto DESC",
+      "30|9;28|6;27|5;25|4;24|3;22|2;18|1");
+    t("SELECT DISTINCT voto, COUNT(*) OVER (ORDER BY voto DESC RANGE UNBOUNDED PRECEDING) FROM esame ORDER BY voto DESC LIMIT 2", "30|3;28|4");
+    t("SELECT corso, voto, ROUND(AVG(voto) OVER (PARTITION BY corso ORDER BY voto ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), 1) FROM esame "
+      "WHERE corso <> 'BD2' ORDER BY corso, voto", "AN1|24|24;AN1|25|24.5;AN1|30|27.5;BD1|18|18;BD1|27|22.5;BD1|30|28.5");
+    t("SELECT SUM(voto) OVER (ORDER BY voto RANGE 1 PRECEDING) FROM esame", "ERR:RANGE frames support only");
+    t("SELECT SUM(voto) OVER (ORDER BY voto ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM esame", "ERR:must start before it ends");
+    t("SELECT SUM(voto) OVER (ROWS BETWEEN 1 PRECEDING) FROM esame", "ERR:Expected AND");
     // CASE
     t("SELECT nome, CASE WHEN citta = 'Milano' THEN 'MI' WHEN citta IS NULL THEN '?' ELSE 'altro' END FROM studente ORDER BY matricola",
       "Anna|MI;Bruno|altro;Carla|MI;Dario|altro;Elena|?");
@@ -485,6 +505,43 @@ int main(void) {
             printf("FAIL %d: EXPLAIN ANALYZE\n   got: %s\n", tests, got);
         }
         db_result_free(r);
+    }
+    // scansioni per intervallo con l'indice ordinato
+    t("CREATE TABLE cifre (d INT)", "OK:0");
+    t("INSERT INTO cifre VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)", "OK:10");
+    t("CREATE TABLE rg (id INT PRIMARY KEY, cod VARCHAR(10), v INT)", "OK:0");
+    t("INSERT INTO rg SELECT a.d * 100 + b.d * 10 + c.d, CONCAT('k', a.d, b.d, c.d), MOD(a.d * 100 + b.d * 10 + c.d, 7) "
+      "FROM cifre a, cifre b, cifre c", "OK:1000");
+    t("CREATE INDEX rg_cod ON rg (cod)", "OK:0");
+    t("SELECT COUNT(*), MIN(id), MAX(id) FROM rg WHERE id BETWEEN 100 AND 149", "50|100|149");
+    t("SELECT id FROM rg WHERE id > 995", "996;997;998;999");
+    t("SELECT id FROM rg WHERE 3 >= id", "0;1;2;3");
+    t("SELECT id FROM rg WHERE id >= 10 AND id < 13 AND v <> 4", "10;12");
+    t("SELECT id FROM rg WHERE id > 997.5", "998;999");
+    t("SELECT cod FROM rg WHERE cod >= 'k997'", "k997;k998;k999");
+    t("SELECT cod FROM rg WHERE cod < 'k002'", "k000;k001");
+    t("SELECT COUNT(*) FROM rg WHERE id < NULL", "0");
+    t("SELECT COUNT(*) FROM rg WHERE id > 'abc'", "0");
+    t("SELECT COUNT(*) FROM rg WHERE id > 100", "899");
+    t("DELETE FROM rg WHERE id BETWEEN 990 AND 994", "OK:5");
+    t("INSERT INTO rg VALUES (5000, 'z', 0), (-7, 'a', 0)", "OK:2");
+    t("SELECT id FROM rg WHERE id > 988 AND id < 996 OR id > 4000", "989;995;5000");
+    t("SELECT id FROM rg WHERE id > 988 AND id < 996", "989;995");
+    t("SELECT id FROM rg WHERE id < 1", "0;-7");
+    {
+        tests++;
+        QueryResult* r = db_execute("EXPLAIN ANALYZE SELECT * FROM rg WHERE id BETWEEN 200 AND 219");
+        QueryResult* r2 = db_execute("EXPLAIN SELECT * FROM rg WHERE id > 10");
+        char got[4096], got2[4096];
+        if (r && r->success) render(r, got, sizeof(got)); else snprintf(got, sizeof(got), "ERR");
+        if (r2 && r2->success) render(r2, got2, sizeof(got2)); else snprintf(got2, sizeof(got2), "ERR");
+        if (!strstr(got, "Index range scan|rg using rg.id (ordered in-memory index: 20 rows in the range") ||
+            !strstr(got, "|20|20") || !strstr(got2, "Table scan") || !strstr(got2, "too many")) {
+            failed++;
+            printf("FAIL %d: index range scan plan\n   got: %s\n   got: %s\n", tests, got, got2);
+        }
+        db_result_free(r);
+        db_result_free(r2);
     }
     t("SELECT s.nome FROM studente s LEFT JOIN esame e ON e.matricola = s.matricola WHERE e.matricola IS NULL", "Elena");
     t("SELECT s.nome, COUNT(e.voto) FROM studente s LEFT JOIN esame e ON e.matricola = s.matricola AND e.voto = 30 "

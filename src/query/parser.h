@@ -27,13 +27,20 @@ typedef enum { EXPR_COLUMN, EXPR_INT, EXPR_FLOAT, EXPR_STRING, EXPR_STAR,
                EXPR_WINDOW  // funzione finestra: func(args) OVER (win)
 } ExprType;
 
-// OVER ( [PARTITION BY ...] [ORDER BY ...] )
+// estremi del frame: ROWS / RANGE BETWEEN inizio AND fine
+enum { FB_UNB_PREC, FB_PREC, FB_CURRENT, FB_FOLL, FB_UNB_FOLL };
+enum { FRAME_NONE, FRAME_ROWS, FRAME_RANGE };
+
+// OVER ( [PARTITION BY ...] [ORDER BY ...] [ROWS | RANGE frame] )
 typedef struct WindowSpec {
     struct ASTExpr* part[8];
     int             npart;
     struct ASTExpr* ord[8];
     bool            desc[8];
     int             nord;
+    int             frame;         // FRAME_*
+    int             fs, fe;        // FB_* di inizio e fine
+    int64_t         fs_off, fe_off;// n di "n PRECEDING / n FOLLOWING"
     int             slot;          // posizione fra le funzioni finestra della query (executor)
 } WindowSpec;
 
@@ -93,6 +100,8 @@ void ast_expr_free(ASTExpr* e);
 ASTExpr* ast_expr_clone(const ASTExpr* e);
 // testo SQL dell'espressione (intestazioni delle colonne calcolate, EXPLAIN)
 void ast_expr_format(const ASTExpr* e, char* out, size_t n);
+// testo del frame di una funzione finestra ("ROWS BETWEEN 2 PRECEDING AND CURRENT ROW")
+void frame_text(const WindowSpec* w, char* buf, size_t n);
 
 typedef struct {
     char     name[64];

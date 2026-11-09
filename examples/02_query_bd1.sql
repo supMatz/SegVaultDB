@@ -195,3 +195,9 @@ ORDER BY e.studente, e.data;
 -- 35. Scarto dalla media del corso, senza GROUP BY
 SELECT corso, studente, voto, ROUND(voto - AVG(voto) OVER (PARTITION BY corso), 2) AS scarto
 FROM esame WHERE corso = 'BD1' ORDER BY scarto DESC;
+
+-- 36. Media mobile: ogni voto con la media dei due esami precedenti e di quello attuale
+--     (il frame ROWS BETWEEN sceglie le righe della finestra intorno alla riga corrente)
+SELECT studente, data, corso, voto,
+       ROUND(AVG(voto) OVER (PARTITION BY studente ORDER BY data ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 2) AS media_mobile
+FROM esame WHERE studente = 1001 ORDER BY data;

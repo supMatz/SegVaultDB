@@ -63,6 +63,8 @@ int main(int argc, char** argv) {
     run("scan + filtro", "SELECT * FROM esame WHERE voto = 30");
     run("scan + filtro composto", "SELECT matricola, voto FROM esame WHERE voto >= 28 AND corso < 10");
     run("lookup chiave primaria", "SELECT * FROM studente WHERE matricola = 4242");
+    run("intervallo su chiave primaria (BETWEEN)", "SELECT COUNT(*), AVG(anno) FROM studente WHERE matricola BETWEEN 2000 AND 2499");
+    run("funzione finestra con frame (ROWS)", "SELECT matricola, AVG(voto) OVER (PARTITION BY corso ORDER BY data ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM esame WHERE corso < 5");
     run("GROUP BY + AVG", "SELECT corso, COUNT(*), AVG(voto) FROM esame GROUP BY corso");
     run("ORDER BY + LIMIT", "SELECT * FROM esame ORDER BY voto DESC, matricola LIMIT 10");
     run("JOIN 2 tabelle + filtro", "SELECT s.nome, e.voto FROM esame e JOIN studente s ON e.matricola = s.matricola WHERE e.voto = 30");

@@ -50,6 +50,14 @@ CREATE INDEX idx_ordine_cliente ON ordine (cliente);
 EXPLAIN ANALYZE SELECT * FROM ordine WHERE cliente = 42;
 SHOW INDEXES FROM ordine;
 
+-- Un intervallo sulla chiave: l'indice tiene anche le chiavi in ordine (come un B+-albero),
+-- trova le 50 righe con una ricerca binaria e le legge pagina per pagina
+EXPLAIN ANALYZE SELECT * FROM ordine WHERE id BETWEEN 5001 AND 5050;
+
+-- Se l'intervallo contiene quasi tutta la tabella l'indice non conviene: ogni riga
+-- costerebbe un accesso alla sua pagina, la scansione legge le pagine in sequenza
+EXPLAIN SELECT * FROM ordine WHERE id > 100;
+
 -- ── 2. Selettività e stime ────────────────────────────────────────
 -- Le stime usano le selettività di default di System R:
 --   colonna = costante -> 1/10, confronto di intervallo -> 1/3, altro -> 1/2.

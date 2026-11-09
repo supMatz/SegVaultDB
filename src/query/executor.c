@@ -785,6 +785,13 @@ typedef struct MemIndex {
     int       nlists, caplists;
     bool      has_max;      // massimo intero (AUTO_INCREMENT)
     int64_t   max_int;
+    // vista ordinata delle chiavi (scansioni per intervallo): costruita al primo uso,
+    // da rifare solo quando compare una chiave nuova
+    char**    lkeys;        // testo della chiave di ogni lista
+    int*      ord;          // liste in ordine di chiave
+    int64_t*  okey;         // chiave numerica di ogni lista (colonne intere)
+    int       nord;
+    bool      ord_ok;
     struct MemIndex* next;
 } MemIndex;
 
@@ -792,8 +799,11 @@ static MemIndex* g_mem_indexes;
 
 static void mi_free(MemIndex* ix) {
     sm_free(&ix->map);
-    for (int i = 0; i < ix->nlists; i++) free(ix->lists[i].r);
+    for (int i = 0; i < ix->nlists; i++) { free(ix->lists[i].r); free(ix->lkeys[i]); }
     free(ix->lists);
+    free(ix->lkeys);
+    free(ix->ord);
+    free(ix->okey);
     free(ix);
 }
 
@@ -844,10 +854,17 @@ static bool mi_add_key(MemIndex* ix, const char* key, RID rid) {
             RidList* nl = realloc(ix->lists, sizeof(RidList) * (size_t)nc);
             if (!nl) return false;
             ix->lists = nl;
+            char** nk = realloc(ix->lkeys, sizeof(char*) * (size_t)nc);
+            if (!nk) return false;
+            ix->lkeys = nk;
             ix->caplists = nc;
         }
+        char* kc = strdup(key);
+        if (!kc) return false;
         ix->lists[ix->nlists] = (RidList){ NULL, 0, 0 };
+        ix->lkeys[ix->nlists] = kc;
         s->val = ix->nlists++;
+        ix->ord_ok = false;
     }
     RidList* l = &ix->lists[s->val];
     if (l->n >= l->cap) {
@@ -890,6 +907,91 @@ static void mi_remove_tuple(MemIndex* ix, const TableSchema* ts, const Tuple* t,
 static const RidList* mi_lookup(MemIndex* ix, const char* key) {
     SMSlot* s = sm_slot(&ix->map, key, false);
     return (s && s->val >= 0) ? &ix->lists[s->val] : NULL;
+}
+
+// ── vista ordinata dell'indice: scansione per intervallo ──
+//  Un indice hash trova solo chiavi uguali. Per "colonna < costante" o BETWEEN serve
+//  l'ordine delle chiavi, come in un B+-albero: qui le chiavi distinte vengono ordinate
+//  una volta (e di nuovo solo se ne arrivano di nuove) e l'intervallo si trova con una
+//  ricerca binaria. I RID trovati vengono poi ordinati per pagina, così ogni pagina
+//  della tabella viene letta una volta sola e nell'ordine del file.
+
+static const MemIndex* g_ord_ix;
+
+static int ord_cmp(const void* a, const void* b) {
+    int x = *(const int*)a, y = *(const int*)b;
+    if (g_ord_ix->okey) { int64_t p = g_ord_ix->okey[x], q = g_ord_ix->okey[y]; return p < q ? -1 : p > q; }
+    return strcmp(g_ord_ix->lkeys[x], g_ord_ix->lkeys[y]);
+}
+
+static bool mi_ordered(MemIndex* ix, bool numeric) {
+    if (ix->ord_ok) return true;
+    free(ix->ord);
+    free(ix->okey);
+    ix->okey = NULL;
+    ix->ord = malloc(sizeof(int) * (size_t)(ix->nlists ? ix->nlists : 1));
+    if (!ix->ord) return false;
+    if (numeric) {
+        ix->okey = malloc(sizeof(int64_t) * (size_t)(ix->nlists ? ix->nlists : 1));
+        if (!ix->okey) { free(ix->ord); ix->ord = NULL; return false; }
+        for (int i = 0; i < ix->nlists; i++) ix->okey[i] = strtoll(ix->lkeys[i], NULL, 10);
+    }
+    for (int i = 0; i < ix->nlists; i++) ix->ord[i] = i;
+    g_ord_ix = ix;
+    qsort(ix->ord, (size_t)ix->nlists, sizeof(int), ord_cmp);
+    ix->nord = ix->nlists;
+    ix->ord_ok = true;
+    return true;
+}
+
+// confronto fra la chiave della lista li e un estremo dell'intervallo
+static int ord_key_cmp(const MemIndex* ix, int li, const EvalVal* b) {
+    if (ix->okey) {
+        int64_t k = ix->okey[li];
+        if (b->is_int) return k < b->inum ? -1 : k > b->inum;
+        double d = (double)k;
+        return d < b->num ? -1 : d > b->num;
+    }
+    int c = strcmp(ix->lkeys[li], ev_s(b));
+    return c < 0 ? -1 : c > 0;
+}
+
+static int rid_cmp(const void* a, const void* b) {
+    const RID* x = a; const RID* y = b;
+    if (x->page_id != y->page_id) return x->page_id < y->page_id ? -1 : 1;
+    return x->slot_id < y->slot_id ? -1 : x->slot_id > y->slot_id;
+}
+
+// RID delle righe con chiave in [lo, hi] (estremo NULL = illimitato), in ordine fisico.
+// Gli estremi sono sempre inclusi: chi chiama riapplica le condizioni esatte.
+static bool mi_range(MemIndex* ix, bool numeric, const EvalVal* lo, const EvalVal* hi, RID** out, int* nout) {
+    *out = NULL;
+    *nout = 0;
+    if (!mi_ordered(ix, numeric)) return false;
+    int a = 0, b = ix->nord;
+    if (lo) {                                   // prima chiave >= lo
+        while (a < b) { int m = a + (b - a) / 2; if (ord_key_cmp(ix, ix->ord[m], lo) < 0) a = m + 1; else b = m; }
+    }
+    int end = ix->nord;
+    if (hi) {                                   // prima chiave > hi
+        int l = a, r = ix->nord;
+        while (l < r) { int m = l + (r - l) / 2; if (ord_key_cmp(ix, ix->ord[m], hi) <= 0) l = m + 1; else r = m; }
+        end = l;
+    }
+    size_t n = 0;
+    for (int i = a; i < end; i++) n += (size_t)ix->lists[ix->ord[i]].n;
+    RID* r = malloc(sizeof(RID) * (n ? n : 1));
+    if (!r) return false;
+    n = 0;
+    for (int i = a; i < end; i++) {
+        const RidList* l = &ix->lists[ix->ord[i]];
+        memcpy(r + n, l->r, sizeof(RID) * (size_t)l->n);
+        n += (size_t)l->n;
+    }
+    qsort(r, n, sizeof(RID), rid_cmp);
+    *out = r;
+    *nout = (int)n;
+    return true;
 }
 
 // la colonna ha un indice (chiave primaria, AUTO_INCREMENT, UNIQUE o CREATE INDEX)?
@@ -2031,6 +2133,11 @@ struct SelectPlan {
     ASTExpr*  probe_key[MAX_SOURCES];
     bool      probe_dyn[MAX_SOURCES];
     bool      used_index[MAX_SOURCES];
+    // scansione per intervallo con l'indice: colonna >, >=, <, <=, BETWEEN costanti
+    int       range_col[MAX_SOURCES];
+    ASTExpr*  range_lo[MAX_SOURCES];
+    ASTExpr*  range_hi[MAX_SOURCES];
+    long      range_rows[MAX_SOURCES];   // righe trovate con l'indice (-1 = indice non usato)
     StrMap    pmap[MAX_SOURCES];
     int*      pnext[MAX_SOURCES];
     bool      loaded;
@@ -2493,6 +2600,66 @@ static void find_probe(SelectPlan* p, int s, ExprVec* conds, bool dyn) {
     }
 }
 
+// "colonna indicizzata di s  <, <=, >, >=  espressione costante" (BETWEEN è già diventato
+// due confronti): estremi per una scansione dell'indice ordinato
+static void find_range(SelectPlan* p, int s, ExprVec* conds) {
+    const TableSchema* ts = p->src[s].ts;
+    for (int i = 0; i < conds->n; i++) {
+        ASTExpr* w = conds->v[i];
+        if (w->type != EXPR_BINARY || (w->op != OP_LT && w->op != OP_LE && w->op != OP_GT && w->op != OP_GE)) continue;
+        for (int side = 0; side < 2; side++) {
+            ASTExpr* col = side ? w->right : w->left;
+            ASTExpr* key = side ? w->left : w->right;
+            if (col->type != EXPR_COLUMN || col->bound <= 0 || col->outer || (col->bound - 1) / 1024 != s) continue;
+            unsigned m = 0; bool o = false, op = false;
+            expr_refs(key, &m, &o, &op);
+            if (m || o || op) continue;
+            int ci = (col->bound - 1) % 1024;
+            if (p->range_col[s] >= 0 && p->range_col[s] != ci) continue;
+            DataType t = ts->columns[ci].type;
+            if ((!is_int_type(t) && !is_text_type(t)) || !col_is_indexed(ts, ci)) continue;
+            // colonna < chiave (o chiave > colonna): estremo superiore
+            bool upper = (w->op == OP_LT || w->op == OP_LE) != (side == 1);
+            ASTExpr** slot = upper ? &p->range_hi[s] : &p->range_lo[s];
+            if (*slot) continue;
+            *slot = key;
+            p->range_col[s] = ci;
+        }
+    }
+}
+
+// valuta gli estremi dell'intervallo e prende i RID dall'indice; false = indice non utilizzabile
+// (tipo dell'estremo non confrontabile con quello della colonna, memoria, lettura annullata)
+static bool range_rids(SelectPlan* p, int s, EvalCtx* ec, RID** rids, int* n) {
+    Database* db = catalog_current_db(p->x->catalog);
+    Source* S = &p->src[s];
+    int ci = p->range_col[s];
+    if (!db || ci < 0) return false;
+    bool numeric = is_int_type(S->ts->columns[ci].type);
+    EvalVal lo, hi;
+    ASTExpr* bx[2] = { p->range_lo[s], p->range_hi[s] };
+    EvalVal* bv[2] = { &lo, &hi };
+    char keep[2][EV_STR_MAX + 1];
+    for (int k = 0; k < 2; k++) {
+        if (!bx[k]) continue;
+        eval_expr(bx[k], ec, bv[k]);
+        if (bv[k]->null) { *rids = NULL; *n = 0; return true; }       // confronto con NULL: nessuna riga
+        if (numeric ? !bv[k]->is_num : bv[k]->is_num) return false;
+        if (!bv[k]->is_num) {                                          // il testo deve sopravvivere alla prossima eval
+            snprintf(keep[k], sizeof(keep[k]), "%s", ev_s(bv[k]));
+            bv[k]->str = keep[k];
+        }
+    }
+    MemIndex* ix = mi_get(p->x, db->name, S->ts, ci);
+    return ix && mi_range(ix, numeric, bx[0] ? &lo : NULL, bx[1] ? &hi : NULL, rids, n);
+}
+
+// conviene leggere le righe con l'indice? Ogni riga trovata costa un accesso alla sua
+// pagina; la scansione legge tutte le pagine in sequenza. Sopra 1/4 della tabella vince la scansione.
+static bool range_worth(const Source* S, int n) {
+    return (uint64_t)n * 4 <= S->ts->num_rows + 4;
+}
+
 // chiave di ricerca dal valore calcolato; false se il tipo non è confrontabile esattamente
 static bool probe_text(const EvalVal* v, DataType col, char* buf, size_t n) {
     if (v->null) return false;
@@ -2526,7 +2693,7 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
     p->scope.ctes = n->select_stmt.ctes;
     p->scope.n = n->select_stmt.num_ctes;
     p->scope.parent = ctes;
-    for (int s = 0; s < MAX_SOURCES; s++) p->probe_col[s] = -1;
+    for (int s = 0; s < MAX_SOURCES; s++) { p->probe_col[s] = -1; p->range_col[s] = -1; p->range_rows[s] = -1; }
     Database* db = catalog_current_db(x->catalog);
     const CteScope* scope = p->scope.n ? &p->scope : ctes;
     p->compound = !arm && n->select_stmt.set_next != NULL;
@@ -2773,6 +2940,7 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
         if (p->src[s].is_view) continue;
         find_probe(p, s, &p->pre_dyn[s], true);
         find_probe(p, s, &p->pre_static[s], false);
+        if (p->probe_col[s] < 0 || p->probe_dyn[s]) find_range(p, s, &p->pre_static[s]);
     }
 
     // 5. rami di UNION / INTERSECT / EXCEPT
@@ -2857,6 +3025,32 @@ static bool plan_load(SelectPlan* p) {
                         if (!xv_all_true(f, &ec)) { tuple_free(t); continue; }
                         if (!source_push(S, t, l->r[i], &cap)) { tuple_free(t); free(hf); snprintf(p->err, sizeof(p->err), "Out of memory"); return false; }
                     }
+                }
+            }
+            // scansione per intervallo con l'indice ordinato
+            if (!done && p->range_col[s] >= 0) {
+                RID* rids = NULL;
+                int nr = 0;
+                if (range_rids(p, s, &ec, &rids, &nr)) {
+                    p->range_rows[s] = nr;
+                    if (range_worth(S, nr)) {
+                        done = true;
+                        p->used_index[s] = true;
+                        for (int i = 0; i < nr; i++) {
+                            Tuple* t = heap_get(hf, rids[i], S->ts);
+                            if (!t) continue;
+                            p->st_scanned[s]++;
+                            cur[s] = t;
+                            if (!xv_all_true(f, &ec)) { tuple_free(t); continue; }
+                            if (!source_push(S, t, rids[i], &cap)) {
+                                tuple_free(t); free(rids); free(hf);
+                                snprintf(p->err, sizeof(p->err), "Out of memory");
+                                return false;
+                            }
+                        }
+                        cur[s] = NULL;
+                    }
+                    free(rids);
                 }
             }
             if (!done) {
@@ -3159,6 +3353,94 @@ static void wacc_result(const WinAcc* a, const char* f, SortKey* out) {
     else out->null = true;
 }
 
+// Funzione finestra con un frame esplicito su una partizione [start, end) (posizioni in idx).
+// Gli estremi del frame [lo, hi] non diminuiscono mai passando alla riga successiva: il
+// frame "scorre" e ogni riga entra ed esce una volta sola (somme e conteggi aggiornati,
+// MIN / MAX con una coda monotona), quindi il costo è lineare anche con frame grandi.
+static bool window_frame(const WindowSpec* ws, const char* f, bool star, int start, int end, const int* idx,
+                         const SortKey* keys, int K, const SortKey* argv, const int* units, SortKey* vals, int* dq) {
+    #define KEY(r) (&keys[(size_t)idx[r] * (size_t)K])
+    #define ARG(r) (&argv[(size_t)idx[r] * 3])
+    bool is_min = !strcmp(f, "MIN"), is_max = !strcmp(f, "MAX");
+    int64_t count = 0, isum = 0;
+    double dsum = 0;
+    int nonint = 0;
+    bool overflow = false;
+    int qh = 0, qt = 0;                         // coda monotona di MIN / MAX: dq[qh..qt)
+    int cl = start, ch = start - 1;             // frame attuale [cl, ch]
+    int pg = start, pge = start;                // gruppo di pari della riga (RANGE)
+    for (int r = start; r < end; r++) {
+        if (r >= pge) {
+            pg = r;
+            pge = r + 1;
+            while (pge < end && keys_equal(KEY(pg), KEY(pge), ws->npart, K)) pge++;
+        }
+        int64_t lo, hi;
+        switch (ws->fs) {
+            case FB_UNB_PREC: lo = start; break;
+            case FB_PREC:     lo = (int64_t)r - ws->fs_off; break;
+            case FB_FOLL:     lo = (int64_t)r + ws->fs_off; break;
+            default:          lo = ws->frame == FRAME_RANGE ? pg : r; break;
+        }
+        switch (ws->fe) {
+            case FB_UNB_FOLL: hi = end - 1; break;
+            case FB_PREC:     hi = (int64_t)r - ws->fe_off; break;
+            case FB_FOLL:     hi = (int64_t)r + ws->fe_off; break;
+            default:          hi = ws->frame == FRAME_RANGE ? pge - 1 : r; break;
+        }
+        if (lo < start) lo = start;
+        if (hi > end - 1) hi = end - 1;
+        if (lo > end) lo = end;
+        if (hi < start - 1) hi = start - 1;
+        while (ch < hi) {                       // righe che entrano
+            const SortKey* v = ARG(++ch);
+            if (star) { count++; continue; }
+            if (v->null) continue;
+            count++;
+            if (v->is_num) dsum += v->num;
+            if (v->is_int) { if (!overflow && __builtin_add_overflow(isum, v->inum, &isum)) overflow = true; }
+            else nonint++;
+            if (is_min || is_max) {
+                while (qt > qh) {
+                    int c = key_cmp(ARG(dq[qt - 1]), v);
+                    if (is_min ? c > 0 : c < 0) qt--; else break;
+                }
+                dq[qt++] = ch;
+            }
+        }
+        while (cl < lo) {                       // righe che escono
+            if (cl <= ch) {
+                const SortKey* v = ARG(cl);
+                if (star) count--;
+                else if (!v->null) {
+                    count--;
+                    if (v->is_num) dsum -= v->num;
+                    if (v->is_int) { if (!overflow && __builtin_sub_overflow(isum, v->inum, &isum)) overflow = true; }
+                    else nonint--;
+                    if (qt > qh && dq[qh] == cl) qh++;
+                }
+            }
+            cl++;
+        }
+        if (ch < cl - 1) ch = cl - 1;           // frame vuoto oltre la riga attuale
+        SortKey* o = &vals[units[idx[r]]];
+        free(o->str);
+        memset(o, 0, sizeof(*o));
+        bool empty = lo > hi;
+        if (!strcmp(f, "COUNT")) { o->is_num = o->is_int = true; o->inum = count; o->num = (double)count; }
+        else if (!strcmp(f, "FIRST_VALUE")) { if (empty) o->null = true; else oval_copy(o, ARG(lo)); }
+        else if (!strcmp(f, "LAST_VALUE"))  { if (empty) o->null = true; else oval_copy(o, ARG(hi)); }
+        else if (count == 0) o->null = true;
+        else if (is_min || is_max) oval_copy(o, ARG(dq[qh]));
+        else if (!strcmp(f, "SUM") && !nonint && !overflow) { o->is_num = o->is_int = true; o->inum = isum; o->num = (double)isum; }
+        else if (!strcmp(f, "SUM")) { o->is_num = true; o->num = dsum; }
+        else { o->is_num = true; o->num = dsum / (double)count; }   // AVG
+    }
+    #undef KEY
+    #undef ARG
+    return true;
+}
+
 static bool window_compute(SelectPlan* p, ArmState* st, EvalCtx* ec, ASTExpr* w, const int* units, int n, SortKey* vals) {
     WindowSpec* ws = w->win;
     const char* f = w->func;
@@ -3191,9 +3473,18 @@ static bool window_compute(SelectPlan* p, ArmState* st, EvalCtx* ec, ASTExpr* w,
     #define OUT(r) (&vals[units[idx[r]]])
     bool star = !strcmp(f, "COUNT") && w->nargs == 0;
     bool aggregate = !strcmp(f, "COUNT") || !strcmp(f, "SUM") || !strcmp(f, "AVG") || !strcmp(f, "MIN") || !strcmp(f, "MAX");
+    // frame esplicito (ROWS / RANGE BETWEEN ...): aggregati e FIRST_VALUE / LAST_VALUE
+    bool framed = ws->frame && (aggregate || !strcmp(f, "FIRST_VALUE") || !strcmp(f, "LAST_VALUE"));
+    int* dq = framed ? malloc(sizeof(int) * (size_t)(n ? n : 1)) : NULL;
+    if (framed && !dq) ok = false;
     for (int start = 0; ok && start < n; ) {
         int end = start + 1;
         while (end < n && keys_equal(KEY(start), KEY(end), 0, ws->npart)) end++;
+        if (framed) {
+            if (!window_frame(ws, f, star, start, end, idx, keys, K, argv, units, vals, dq)) { ok = false; break; }
+            start = end;
+            continue;
+        }
         int dense = 0;
         WinAcc acc = { 0, 0, 0, true, false, NULL };
         if (aggregate && ws->nord == 0) {                     // tutta la partizione
@@ -3244,6 +3535,7 @@ static bool window_compute(SelectPlan* p, ArmState* st, EvalCtx* ec, ASTExpr* w,
     #undef KEY
     #undef ARG
     #undef OUT
+    free(dq);
     for (size_t i = 0; keys && i < (size_t)n * (size_t)K; i++) free(keys[i].str);
     for (size_t i = 0; argv && i < (size_t)n * 3; i++) free(argv[i].str);
     free(keys);
@@ -3891,6 +4183,38 @@ static void explain_subqueries(PlanOut* po, const ASTExpr* e, const char* indent
     for (int i = 0; i < e->nargs; i++) explain_subqueries(po, e->args[i], indent, depth);
 }
 
+// riga del piano per una sorgente con un intervallo su una colonna indicizzata: con EXPLAIN
+// l'indice viene interrogato per sapere quante righe trova, come farà l'esecuzione
+static bool range_explain(PlanOut* po, SelectPlan* p, int s, const char* indent, double* est) {
+    Source* S = &p->src[s];
+    long found = p->range_rows[s];
+    if (found < 0) {
+        EvalCtx ec;
+        Tuple* cur[MAX_SOURCES] = {0};
+        memset(&ec, 0, sizeof(ec));
+        ec.src = p->src; ec.nsrc = p->nsrc; ec.cur = cur; ec.x = p->x;
+        RID* rids = NULL;
+        int n = 0;
+        if (!range_rids(p, s, &ec, &rids, &n)) return false;
+        free(rids);
+        found = n;
+    }
+    const char* col = S->ts->columns[p->range_col[s]].name;
+    char det[400];
+    if (range_worth(S, (int)found)) {
+        *est = (double)found;
+        snprintf(det, sizeof(det), "%.64s using %.64s.%.64s (ordered in-memory index: %ld row%s in the range, read in page order)",
+                 S->name, S->table, col, found, found == 1 ? "" : "s");
+        plan_row_a(po, indent, "Index range scan", det, *est, po->analyze ? p->st_scanned[s] : -1);
+    } else {
+        *est = (double)S->ts->num_rows;
+        snprintf(det, sizeof(det), "%.64s (about %llu rows; the index on %.64s finds %ld, too many: reading every page in order is cheaper)",
+                 S->name, (unsigned long long)S->ts->num_rows, col, found);
+        plan_row_a(po, indent, "Table scan", det, *est, po->analyze ? p->st_scanned[s] : -1);
+    }
+    return true;
+}
+
 static double explain_arm(PlanOut* po, SelectPlan* p, const char* indent, int depth) {
     ASTNode* n = p->n;
     char buf[400], det[700];
@@ -3907,6 +4231,8 @@ static double explain_arm(PlanOut* po, SelectPlan* p, const char* indent, int de
             est = unique ? 1 : (double)S->ts->num_rows * 0.1;
             snprintf(det, sizeof(det), "%.64s using %.64s.%.64s (in-memory index)", S->name, S->table, S->ts->columns[p->probe_col[s]].name);
             plan_row_a(po, indent, "Index lookup", det, est, po->analyze ? p->st_scanned[s] : -1);
+        } else if (p->range_col[s] >= 0 && range_explain(po, p, s, indent, &est)) {
+            // scansione per intervallo (righe e scelta dell'accesso in range_explain)
         } else {
             est = (double)S->ts->num_rows;
             snprintf(det, sizeof(det), "%.64s (about %llu rows)", S->name, (unsigned long long)S->ts->num_rows);

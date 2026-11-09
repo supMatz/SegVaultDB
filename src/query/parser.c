@@ -190,6 +190,8 @@ ASTExpr* ast_expr_clone(const ASTExpr* e) {
         c->win = calloc(1, sizeof(WindowSpec));
         if (!c->win) { ast_expr_free(c); return NULL; }
         c->win->slot = e->win->slot;
+        c->win->frame = e->win->frame; c->win->fs = e->win->fs; c->win->fe = e->win->fe;
+        c->win->fs_off = e->win->fs_off; c->win->fe_off = e->win->fe_off;
         for (int i = 0; i < e->win->npart; i++) { c->win->part[i] = ast_expr_clone(e->win->part[i]); c->win->npart = i + 1; if (!c->win->part[i]) { ast_expr_free(c); return NULL; } }
         for (int i = 0; i < e->win->nord; i++) {
             c->win->ord[i] = ast_expr_clone(e->win->ord[i]); c->win->desc[i] = e->win->desc[i]; c->win->nord = i + 1;
@@ -276,6 +278,12 @@ static void fmt_rec(const ASTExpr* e, char* out, size_t n, size_t* len, bool top
                     fmt_put(out, n, len, i ? ", " : (e->win->npart ? " ORDER BY " : "ORDER BY "));
                     fmt_rec(e->win->ord[i], out, n, len, true);
                     if (e->win->desc[i]) fmt_put(out, n, len, " DESC");
+                }
+                if (e->win->frame) {
+                    char fb[96];
+                    frame_text(e->win, fb, sizeof(fb));
+                    fmt_put(out, n, len, " ");
+                    fmt_put(out, n, len, fb);
                 }
                 fmt_put(out, n, len, ")");
             }
@@ -410,7 +418,71 @@ static bool next_is(ParserState* ps, int ahead, TokenType tt) {
 static ASTExpr* parse_expr(ParserState* ps);
 static ASTExpr* parse_additive(ParserState* ps);
 
+
 static bool ident_is(ParserState* ps, const char* word);
+
+// testo di un frame: "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW"
+void frame_text(const WindowSpec* w, char* buf, size_t n) {
+    char b[2][40];
+    int k[2] = { w->fs, w->fe };
+    int64_t off[2] = { w->fs_off, w->fe_off };
+    for (int i = 0; i < 2; i++) {
+        switch (k[i]) {
+            case FB_UNB_PREC: snprintf(b[i], sizeof(b[i]), "UNBOUNDED PRECEDING"); break;
+            case FB_PREC:     snprintf(b[i], sizeof(b[i]), "%lld PRECEDING", (long long)off[i]); break;
+            case FB_CURRENT:  snprintf(b[i], sizeof(b[i]), "CURRENT ROW"); break;
+            case FB_FOLL:     snprintf(b[i], sizeof(b[i]), "%lld FOLLOWING", (long long)off[i]); break;
+            default:          snprintf(b[i], sizeof(b[i]), "UNBOUNDED FOLLOWING"); break;
+        }
+    }
+    snprintf(buf, n, "%s BETWEEN %s AND %s", w->frame == FRAME_ROWS ? "ROWS" : "RANGE", b[0], b[1]);
+}
+
+// un estremo del frame; end = true per quello dopo AND
+static bool parse_frame_bound(ParserState* ps, int* kind, int64_t* off) {
+    Token t = peek(ps);
+    if (ident_is(ps, "UNBOUNDED")) {
+        consume(ps);
+        if (ident_is(ps, "PRECEDING")) { consume(ps); *kind = FB_UNB_PREC; return true; }
+        if (ident_is(ps, "FOLLOWING")) { consume(ps); *kind = FB_UNB_FOLL; return true; }
+        parse_fail(ps, "Expected PRECEDING or FOLLOWING after UNBOUNDED", peek(ps));
+        return false;
+    }
+    if (ident_is(ps, "CURRENT")) {
+        consume(ps);
+        if (peek(ps).type != TOK_ROW && !ident_is(ps, "ROW")) { parse_fail(ps, "Expected ROW after CURRENT", peek(ps)); return false; }
+        consume(ps);
+        *kind = FB_CURRENT;
+        return true;
+    }
+    if (t.type == TOK_INTEGER) {
+        consume(ps);
+        *off = strtoll(t.text, NULL, 10);
+        if (ident_is(ps, "PRECEDING")) { consume(ps); *kind = FB_PREC; return true; }
+        if (ident_is(ps, "FOLLOWING")) { consume(ps); *kind = FB_FOLL; return true; }
+        parse_fail(ps, "Expected PRECEDING or FOLLOWING after the number of rows", peek(ps));
+        return false;
+    }
+    parse_fail(ps, "Expected UNBOUNDED, CURRENT ROW or a number in the window frame", t);
+    return false;
+}
+
+// ROWS | RANGE { inizio | BETWEEN inizio AND fine }   (solo inizio: la fine è CURRENT ROW)
+static void parse_frame(ParserState* ps, WindowSpec* w) {
+    Token t = peek(ps);
+    w->frame = ident_is(ps, "ROWS") ? FRAME_ROWS : FRAME_RANGE;
+    consume(ps);
+    w->fe = FB_CURRENT;
+    if (match(ps, TOK_BETWEEN)) {
+        if (!parse_frame_bound(ps, &w->fs, &w->fs_off)) return;
+        if (!match(ps, TOK_AND)) { parse_fail(ps, "Expected AND in the window frame", peek(ps)); return; }
+        if (!parse_frame_bound(ps, &w->fe, &w->fe_off)) return;
+    } else if (!parse_frame_bound(ps, &w->fs, &w->fs_off)) return;
+    if (w->fs == FB_UNB_FOLL || w->fe == FB_UNB_PREC || w->fs > w->fe)
+        parse_fail(ps, "The window frame must start before it ends", t);
+    else if (w->frame == FRAME_RANGE && (w->fs == FB_PREC || w->fs == FB_FOLL || w->fe == FB_PREC || w->fe == FB_FOLL))
+        parse_fail(ps, "RANGE frames support only UNBOUNDED and CURRENT ROW (use ROWS for n PRECEDING / FOLLOWING)", t);
+}
 
 // all'offset ahead inizia una query (SELECT ... o WITH ...)?
 static bool query_starts(ParserState* ps, int ahead) {
@@ -541,7 +613,8 @@ static ASTExpr* parse_call(ParserState* ps) {
                 w->nord++;
             } while (ps->result->success && match(ps, TOK_COMMA));
         }
-        if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' to close OVER (window frames are not supported)", peek(ps));
+        if (ps->result->success && (ident_is(ps, "ROWS") || ident_is(ps, "RANGE"))) parse_frame(ps, w);
+        if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' to close OVER", peek(ps));
         if (!ps->result->success) { ast_expr_free(e); return NULL; }
     }
     return e;

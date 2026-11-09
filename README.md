@@ -42,9 +42,9 @@ Pensato per i corsi di **Basi di Dati 1 e 2** di ingegneria informatica: lo stes
 | **Font** | JetBrains Mono (editor e dati) · Inter / Fira Sans (interfaccia), con fallback automatico |
 | **SQL** | Lexer e parser a discesa ricorsiva scritti a mano; subquery (anche correlate), `UNION` / `INTERSECT` / `EXCEPT`, `WITH [RECURSIVE]`, funzioni finestra, `FULL` / `NATURAL` / `USING` join, `CASE`, viste, vincoli, trigger, `ALTER TABLE ... COLUMN` |
 | **Vincoli** | `PRIMARY KEY` (anche composta), `UNIQUE`, `NOT NULL`, `CHECK`, `FOREIGN KEY` con `ON DELETE` / `ON UPDATE` `CASCADE`, `SET NULL`, `SET DEFAULT`, `RESTRICT` |
-| **Storage** | Heap file a pagine da 4 KB con slot directory e free-space map; indici hash in memoria (anche su più colonne) |
+| **Storage** | Heap file a pagine da 4 KB con slot directory e free-space map; indici in memoria (anche su più colonne): tabella hash per le uguaglianze, chiavi ordinate per gli intervalli |
 | **Buffer pool** | 1024 frame, tabella hash per la ricerca, sostituzione **CLOCK**; statistiche con `SHOW STATUS` |
-| **Ottimizzatore** | Pushdown delle selezioni, hash join (anche per `FROM a, b WHERE a.x = b.y`), accesso con indice, subquery decorrelate per chiave; `EXPLAIN` con stime alla System R e `EXPLAIN ANALYZE` con le righe reali |
+| **Ottimizzatore** | Pushdown delle selezioni, hash join (anche per `FROM a, b WHERE a.x = b.y`), accesso con indice per uguaglianza o per intervallo (`<`, `BETWEEN`, scelto solo se conviene), subquery decorrelate per chiave; `EXPLAIN` con stime alla System R e `EXPLAIN ANALYZE` con le righe reali |
 | **Transazioni** | Write-Ahead Log con undo/redo, `BEGIN` / `COMMIT` / `ROLLBACK`, `SAVEPOINT`, recovery dopo un crash, `CHECKPOINT` (anche automatico) |
 | **Basi di dati attive** | Trigger `BEFORE` / `AFTER`, `FOR EACH ROW` / `FOR EACH STATEMENT`, `NEW` / `OLD`, `WHEN`, `SET NEW.col`, `SIGNAL`, `IF` |
 | **Cross-compilation** | MinGW-w64 — `make windows` produce `segvault.exe` da Linux |
@@ -58,9 +58,9 @@ La cartella [`examples/`](examples/) contiene script pronti da aprire nell'edito
 | Script | Argomenti |
 |---|---|
 | [`01_universita.sql`](examples/01_universita.sql) | Schema relazionale con chiavi primarie (anche composte), chiavi esterne con azioni referenziali, `UNIQUE`, `CHECK`, `DEFAULT` — il database usato dagli esercizi |
-| [`02_query_bd1.sql`](examples/02_query_bd1.sql) | 35 esercizi: selezione e proiezione, join impliciti ed espliciti, outer join (anche `FULL`), self join, `USING`, aggregati con `GROUP BY` / `HAVING`, `IN` / `EXISTS` / `ANY` / `ALL`, subquery correlate, **divisione relazionale** (doppio `NOT EXISTS` e conteggio), `UNION` / `INTERSECT` / `EXCEPT`, viste, `WITH`, tabelle derivate, `CASE`, **chiusura transitiva** con `WITH RECURSIVE` (propedeuticità), classifiche e somme cumulative con le **funzioni finestra** |
+| [`02_query_bd1.sql`](examples/02_query_bd1.sql) | 36 esercizi: selezione e proiezione, join impliciti ed espliciti, outer join (anche `FULL`), self join, `USING`, aggregati con `GROUP BY` / `HAVING`, `IN` / `EXISTS` / `ANY` / `ALL`, subquery correlate, **divisione relazionale** (doppio `NOT EXISTS` e conteggio), `UNION` / `INTERSECT` / `EXCEPT`, viste, `WITH`, tabelle derivate, `CASE`, **chiusura transitiva** con `WITH RECURSIVE` (propedeuticità), classifiche, somme cumulative e medie mobili con le **funzioni finestra** |
 | [`03_vincoli.sql`](examples/03_vincoli.sql) | Ogni vincolo violato apposta (le istruzioni marcate *errore atteso*), `CASCADE`, `SET NULL`, `ON UPDATE CASCADE`, `ALTER TABLE ADD/DROP CONSTRAINT`, `ADD / RENAME / DROP COLUMN`, `SHOW CREATE TABLE` |
-| [`04_bd2_ottimizzazione.sql`](examples/04_bd2_ottimizzazione.sql) | Generazione di 10.000 righe con un prodotto cartesiano, scansione sequenziale contro accesso con indice, `CREATE INDEX`, selettività e stime, pushdown e hash join, subquery correlate, `ORDER BY` + `LIMIT`, buffer pool e checkpoint |
+| [`04_bd2_ottimizzazione.sql`](examples/04_bd2_ottimizzazione.sql) | Generazione di 10.000 righe con un prodotto cartesiano, scansione sequenziale contro accesso con indice (per chiave e per intervallo), `CREATE INDEX`, selettività e stime, pushdown e hash join, subquery correlate, `ORDER BY` + `LIMIT`, buffer pool e checkpoint |
 | [`05_bd2_transazioni_trigger.sql`](examples/05_bd2_transazioni_trigger.sql) | Atomicità con `COMMIT` / `ROLLBACK`, `SAVEPOINT`, log WAL; trigger evento-condizione-azione, trigger a cascata, rifiuto con `SIGNAL`, trigger per riga e per istruzione |
 
 **Basi di Dati 1** — modello relazionale e SQL: tutto il linguaggio di interrogazione dei corsi (compresi gli operatori insiemistici e le interrogazioni annidate con la logica a tre valori di SQL: `NOT IN` con un `NULL` non è mai vero, `ALL` su un insieme vuoto è vero), viste, vincoli di integrità di dominio, di tupla, di chiave e referenziali, con controllo prima di ogni scrittura: uno statement che viola un vincolo non modifica nulla.
@@ -211,7 +211,7 @@ LIMIT n [OFFSET m];
 | Tabelle derivate | `FROM (SELECT ...) AS t`, `JOIN (SELECT ...) AS t ON ...` |
 | `WITH` | `WITH medie (studente, media) AS (SELECT ...), migliori AS (SELECT ... FROM medie) SELECT ...` |
 | `WITH RECURSIVE` | `WITH RECURSIVE sotto AS (SELECT id FROM persona WHERE id = 1 UNION SELECT p.id FROM persona p JOIN sotto s ON p.capo = s.id) SELECT ...` — con `UNION` i cicli terminano; una ricorsione senza fine viene fermata dopo 1000 passi |
-| Funzioni finestra | `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `NTILE(n)`, `LAG(x [, k [, def]])`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `COUNT/SUM/AVG/MIN/MAX(...)` con `OVER ([PARTITION BY ...] [ORDER BY ...])` |
+| Funzioni finestra | `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `NTILE(n)`, `LAG(x [, k [, def]])`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `COUNT/SUM/AVG/MIN/MAX(...)` con `OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS \| RANGE BETWEEN ... AND ...])`: frame con `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`, `UNBOUNDED FOLLOWING` |
 | `CASE` | `CASE WHEN voto >= 28 THEN 'alto' ELSE 'basso' END`, `CASE cfu WHEN 6 THEN ... END` |
 | Funzioni | `UPPER`, `LOWER`, `LENGTH`, `CHAR_LENGTH`, `TRIM`, `CONCAT`, `CONCAT_WS`, `SUBSTRING`, `LEFT`, `RIGHT`, `REPLACE`, `REVERSE`, `ABS`, `ROUND`, `FLOOR`, `CEIL`, `MOD`, `POWER`, `SQRT`, `SIGN`, `COALESCE`, `IFNULL`, `NULLIF`, `IF`, `NOW`, `CURDATE`, `YEAR`, `MONTH`, `DAY` |
 
@@ -274,7 +274,7 @@ DROP TRIGGER [IF EXISTS] nome;   SHOW TRIGGERS [FROM tabella];
 
 ### Non supportato
 
-Frame espliciti delle funzioni finestra (`ROWS BETWEEN ...`), `ALTER COLUMN` per cambiare il tipo di una colonna, stored procedure, controllo della concorrenza fra più utenti (il motore è embedded: una sessione alla volta).
+Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), `ALTER COLUMN` per cambiare il tipo di una colonna, stored procedure, controllo della concorrenza fra più utenti (il motore è embedded: una sessione alla volta).
 
 ---
 
@@ -400,8 +400,10 @@ Tutti i colori vivono in una struct `Theme` (`src/widgets/theme.h` / `theme.c`):
 | `NOT EXISTS` correlata, 10.000 × 100.000 righe | 9 ms |
 | divisione relazionale (doppio `NOT EXISTS`) | 22 ms |
 | ricerca per chiave primaria | 0,01 ms |
+| intervallo sulla chiave primaria (`BETWEEN`, 500 righe) | 0,4 ms |
+| funzione finestra con frame `ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING`, 10.000 righe | 13 ms |
 
-Da dove viene la velocità: free-space map dell'heap (un `INSERT` non legge più tutta la tabella), buffer pool con tabella hash, log scritto una volta per statement, token e nodi del parser leggeri, scansioni senza allocare le righe scartate dai filtri e righe tenute in un'arena, numeri formattati come testo solo per il risultato, `GROUP BY` e hash join con hash tipizzati, subquery correlate risolte con una ricerca per chiave sulle righe lette una volta sola, `ORDER BY` + `LIMIT` con un heap top-k che calcola le colonne solo delle righe tenute.
+Da dove viene la velocità: free-space map dell'heap (un `INSERT` non legge più tutta la tabella), buffer pool con tabella hash, log scritto una volta per statement, token e nodi del parser leggeri, scansioni senza allocare le righe scartate dai filtri e righe tenute in un'arena, numeri formattati come testo solo per il risultato, `GROUP BY` e hash join con hash tipizzati, subquery correlate risolte con una ricerca per chiave sulle righe lette una volta sola, `ORDER BY` + `LIMIT` con un heap top-k che calcola le colonne solo delle righe tenute, intervalli trovati con una ricerca binaria sulle chiavi ordinate dell'indice e righe lette in ordine di pagina, frame delle funzioni finestra che scorrono in tempo lineare.
 
 ---
 
