@@ -3612,11 +3612,7 @@ static int compound_cmp(const void* pa, const void* pb) {
     return ia < ib ? -1 : ia > ib;
 }
 
-static double now_ms_exec(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (double)t.tv_sec * 1000.0 + (double)t.tv_nsec / 1e6;
-}
+static double now_ms_exec(void) { return sv_get_time_ms(); }   // portabile (MinGW senza clock_gettime)
 
 static bool query_exec_inner(SelectPlan* p, EvalCtx* outer, int stop_after, ORows* res);
 
