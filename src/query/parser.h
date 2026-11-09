@@ -16,7 +16,7 @@ typedef enum {
     NODE_CHECKPOINT,
 } StmtType;
 
-typedef enum { JOIN_INNER, JOIN_LEFT, JOIN_RIGHT, JOIN_CROSS } JoinType;
+typedef enum { JOIN_INNER, JOIN_LEFT, JOIN_RIGHT, JOIN_CROSS, JOIN_FULL } JoinType;
 
 typedef enum { EXPR_COLUMN, EXPR_INT, EXPR_FLOAT, EXPR_STRING, EXPR_STAR,
                EXPR_BINARY, EXPR_UNARY, EXPR_NULL,
@@ -112,6 +112,10 @@ typedef struct {
     char       table_name[64];
     char       alias[64];      // "" = nessun alias
     struct ASTNode* sub;       // JOIN (SELECT ...) alias: tabella derivata
+    bool       natural;        // NATURAL JOIN: uguaglianza sulle colonne con lo stesso nome
+    char       using_cols[8][64];   // JOIN ... USING (colonne)
+    int        nusing;
+    bool       using_built;    // condizione ON già costruita da NATURAL / USING
 } ASTJoin;
 
 // WITH nome AS (SELECT ...)

@@ -677,7 +677,7 @@ static bool ident_is(ParserState* ps, const char* word) {
 
 // parole che dopo un nome di tabella non possono essere un alias
 static bool alias_forbidden(ParserState* ps) {
-    static const char* const W[] = { "INNER", "CROSS", "OUTER", "OFFSET", "INTERSECT", "EXCEPT", "MINUS", "NATURAL" };
+    static const char* const W[] = { "INNER", "CROSS", "OUTER", "OFFSET", "INTERSECT", "EXCEPT", "MINUS", "NATURAL", "FULL", "USING", "WINDOW" };
     for (size_t i = 0; i < sizeof(W) / sizeof(W[0]); i++) if (ident_is(ps, W[i])) return true;
     return false;
 }
@@ -770,13 +770,16 @@ static ASTNode* parse_select_core(ParserState* ps) {
     while (ps->result->success) {
         JoinType jt;
         bool on_allowed = true;
-        if (match(ps, TOK_COMMA))       { jt = JOIN_CROSS; on_allowed = false; }
+        bool natural = false;
+        if (ident_is(ps, "NATURAL")) { consume(ps); natural = true; }
+        if (!natural && match(ps, TOK_COMMA)) { jt = JOIN_CROSS; on_allowed = false; }
         else if (match(ps, TOK_JOIN))   jt = JOIN_INNER;
         else if (ident_is(ps, "INNER")) { consume(ps); expect(ps, TOK_JOIN); jt = JOIN_INNER; }
-        else if (ident_is(ps, "CROSS")) { consume(ps); expect(ps, TOK_JOIN); jt = JOIN_CROSS; on_allowed = false; }
+        else if (!natural && ident_is(ps, "CROSS")) { consume(ps); expect(ps, TOK_JOIN); jt = JOIN_CROSS; on_allowed = false; }
         else if (match(ps, TOK_LEFT))   { if (ident_is(ps, "OUTER")) consume(ps); expect(ps, TOK_JOIN); jt = JOIN_LEFT; }
         else if (match(ps, TOK_RIGHT))  { if (ident_is(ps, "OUTER")) consume(ps); expect(ps, TOK_JOIN); jt = JOIN_RIGHT; }
-        else break;
+        else if (ident_is(ps, "FULL"))  { consume(ps); if (ident_is(ps, "OUTER")) consume(ps); expect(ps, TOK_JOIN); jt = JOIN_FULL; }
+        else { if (natural) parse_fail(ps, "Expected JOIN after NATURAL", peek(ps)); break; }
 
         if (n->select_stmt.num_joins >= 8) { parse_fail(ps, "Too many JOINs (max 8)", peek(ps)); break; }
         ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
@@ -792,8 +795,21 @@ static ASTNode* parse_select_core(ParserState* ps) {
             copy_text(ps, j->table_name, sizeof(j->table_name), tt.text);
             parse_table_alias(ps, j->alias, sizeof(j->alias));
         }
-        if (on_allowed && match(ps, TOK_ON)) j->condition = parse_expr(ps);
-        else if (jt == JOIN_LEFT || jt == JOIN_RIGHT) parse_fail(ps, "LEFT and RIGHT JOIN need an ON condition", peek(ps));
+        j->natural = natural;
+        if (natural) { /* le colonne comuni si trovano dopo, conoscendo le tabelle */ }
+        else if (on_allowed && match(ps, TOK_ON)) j->condition = parse_expr(ps);
+        else if (on_allowed && ident_is(ps, "USING")) {
+            consume(ps);
+            if (!match(ps, TOK_LPAREN)) { parse_fail(ps, "Expected '(' after USING", peek(ps)); break; }
+            do {
+                Token c = consume(ps);
+                if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name in USING", c); break; }
+                if (j->nusing >= 8) { parse_fail(ps, "Too many columns in USING (max 8)", c); break; }
+                copy_text(ps, j->using_cols[j->nusing++], 64, c.text);
+            } while (match(ps, TOK_COMMA));
+            if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' after the USING columns", peek(ps));
+        }
+        else if (jt == JOIN_LEFT || jt == JOIN_RIGHT || jt == JOIN_FULL) parse_fail(ps, "LEFT, RIGHT and FULL JOIN need ON, USING or NATURAL", peek(ps));
     }
 
 clauses:

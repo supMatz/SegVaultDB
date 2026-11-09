@@ -206,7 +206,7 @@ int main(void) {
     t("SELECT id FROM customers c JOIN orders o ON o.customer_id = c.id", "ERR:ambiguous");
     t("SELECT x.id FROM customers c", "ERR:Unknown table 'x'");
     t("SELECT * FROM customers JOIN customers ON 1 = 1", "ERR:used twice");
-    t("SELECT * FROM customers c LEFT JOIN orders o", "ERR:need an ON condition");
+    t("SELECT * FROM customers c LEFT JOIN orders o", "ERR:need ON, USING or NATURAL");
     cols("SELECT * FROM customers c JOIN orders o ON o.customer_id = c.id LIMIT 1",
          "c.id|c.name|c.city|o.id|o.customer_id|o.total", "INT|VARCHAR|VARCHAR|INT|INT|FLOAT");
     t("CREATE TABLE items (order_id INT, sku VARCHAR(10))", "OK:0");
@@ -468,6 +468,20 @@ int main(void) {
       "GROUP BY s.nome ORDER BY s.nome", "Anna|1;Bruno|1;Carla|1;Dario|0;Elena|0");
     t("SELECT c.codice, s.nome FROM esame e RIGHT JOIN corso c ON c.codice = e.corso AND e.voto = 18 LEFT JOIN studente s ON s.matricola = e.matricola ORDER BY c.codice",
       "AN1|NULL;BD1|Bruno;BD2|NULL");
+    // FULL OUTER JOIN, NATURAL JOIN, USING
+    t("CREATE TABLE iscritto (matricola INT, corso VARCHAR(5))", "OK:0");
+    t("INSERT INTO iscritto VALUES (1, 'BD1'), (5, 'BD1'), (9, 'XX')", "OK:3");
+    t("SELECT s.nome, i.corso FROM studente s FULL OUTER JOIN iscritto i ON i.matricola = s.matricola ORDER BY s.matricola, i.corso",
+      "NULL|XX;Anna|BD1;Bruno|NULL;Carla|NULL;Dario|NULL;Elena|BD1");
+    t("SELECT COUNT(*) FROM studente s FULL JOIN iscritto i ON i.matricola = s.matricola WHERE s.matricola IS NULL OR i.corso IS NULL", "4");
+    t("SELECT * FROM studente NATURAL JOIN iscritto ORDER BY matricola", "1|Anna|Milano|BD1;5|Elena|NULL|BD1");
+    t("SELECT nome, corso FROM studente JOIN iscritto USING (matricola) ORDER BY matricola", "Anna|BD1;Elena|BD1");
+    t("SELECT matricola, nome FROM studente LEFT JOIN iscritto USING (matricola) WHERE corso IS NULL ORDER BY matricola", "2|Bruno;3|Carla;4|Dario");
+    t("SELECT * FROM studente s FULL JOIN iscritto i USING (matricola) ORDER BY matricola", "1|Anna|Milano|BD1;2|Bruno|Roma|NULL;3|Carla|Milano|NULL;"
+      "4|Dario|Torino|NULL;5|Elena|NULL|BD1;9|NULL|NULL|XX");
+    t("SELECT * FROM studente JOIN iscritto USING (pippo)", "ERR:USING");
+    cols("SELECT matricola, corso FROM studente FULL JOIN iscritto USING (matricola) WHERE matricola = 9", "matricola|iscritto.corso", "INT|VARCHAR");
+    cols("SELECT * FROM studente NATURAL JOIN iscritto", "matricola|studente.nome|studente.citta|iscritto.corso", "INT|VARCHAR|VARCHAR|VARCHAR");
     // INSERT ... SELECT, UPDATE e DELETE con subquery
     t("CREATE TABLE lodati (matricola INT, voto INT)", "OK:0");
     t("INSERT INTO lodati SELECT matricola, voto FROM esame WHERE voto = 30", "OK:3");

@@ -839,6 +839,9 @@ static SelectPlan* plan_prepare(ExecCtx* x, ASTNode* n, int depth, BindCtx* oute
                                 char* err, size_t errn);
 static void plan_free_void(void* p);
 static int plan_width(const SelectPlan* p);
+static int plan_using_left(const SelectPlan* p, int s, int c);
+static int plan_join_type(const SelectPlan* p, int s);
+static int plan_joined_copy(const SelectPlan* p, int s, int c, int* rk, int* rc);
 static void plan_mark_correlated(SelectPlan* p);
 
 static void bind_error(BindCtx* b, const char* msg) {
@@ -875,6 +878,14 @@ static int find_column(BindCtx* b, const char* qual, const char* col, int* out_s
         if (qual[0] && strcasecmp(qual, src->name)) continue;
         for (int c = 0; c < src->ts->num_columns; c++) {
             if (strcasecmp(src->ts->columns[c].name, col)) continue;
+            if (found && !qual[0] && b->plan) {
+                // colonna di NATURAL JOIN / USING: le due copie sono la stessa colonna
+                int l = plan_using_left(b->plan, s, c);
+                if (l == *out_src * 1024 + *out_col + 1) {
+                    if (plan_join_type(b->plan, s) == JOIN_RIGHT) { *out_src = s; *out_col = c; }   // il lato che non manca
+                    continue;
+                }
+            }
             if (found) return -1;
             found = 1;
             *out_src = s;
@@ -900,6 +911,26 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
             e->outer = 0;
             int s = 0, c = 0;
             int r = find_column(b, e->table_name, e->col_name, &s, &c);
+            int rk, rc;
+            if (r == 1 && !e->table_name[0] && b->plan && plan_joined_copy(b->plan, s, c, &rk, &rc) == JOIN_FULL) {
+                // colonna di USING / NATURAL in un FULL JOIN: vale COALESCE(sinistra, destra)
+                ASTExpr* l = calloc(1, sizeof(ASTExpr));
+                ASTExpr* rr = calloc(1, sizeof(ASTExpr));
+                ASTExpr** args = calloc(2, sizeof(ASTExpr*));
+                if (!l || !rr || !args) { free(l); free(rr); free(args); bind_error(b, "Out of memory"); return; }
+                l->type = rr->type = EXPR_COLUMN;
+                snprintf(l->col_name, sizeof(l->col_name), "%s", e->col_name);
+                snprintf(rr->col_name, sizeof(rr->col_name), "%s", e->col_name);
+                snprintf(l->table_name, sizeof(l->table_name), "%s", b->src[s].name);
+                snprintf(rr->table_name, sizeof(rr->table_name), "%s", b->src[rk].name);
+                l->bound = s * 1024 + c + 1;
+                rr->bound = rk * 1024 + rc + 1;
+                args[0] = l; args[1] = rr;
+                e->type = EXPR_FUNC;
+                snprintf(e->func, sizeof(e->func), "COALESCE");
+                e->args = args; e->nargs = 2; e->depth = 2;
+                return;
+            }
             if (r == 1) { e->bound = s * 1024 + c + 1; return; }
             if (r == 0) {
                 // colonna di una query esterna: la subquery è correlata
@@ -1644,6 +1675,8 @@ struct SelectPlan {
     bool      inset_null;
     bool      inset_built;
     long      execs;                    // esecuzioni (EXPLAIN delle subquery)
+    // NATURAL / USING: copia di destra di una colonna unita -> colonna di sinistra (s*1024+c+1)
+    int       using_left[MAX_SOURCES][SV_MAX_COLUMNS];
     // righe reali per EXPLAIN ANALYZE (sommate su tutte le esecuzioni)
     long      st_scanned[MAX_SOURCES];  // righe lette dalla tabella
     long      st_loaded[MAX_SOURCES];   // righe dopo i filtri della lettura
@@ -1655,6 +1688,21 @@ struct SelectPlan {
 };
 
 static int plan_width(const SelectPlan* p) { return p->nout; }
+static int plan_using_left(const SelectPlan* p, int s, int c) {
+    return (s >= 0 && s < MAX_SOURCES && c >= 0 && c < SV_MAX_COLUMNS) ? p->using_left[s][c] : 0;
+}
+// la colonna (s, c) è unita (NATURAL / USING) a una colonna di una tabella successiva?
+// restituisce il tipo di quel join (-1 = no)
+static int plan_joined_copy(const SelectPlan* p, int s, int c, int* rk, int* rc) {
+    for (int q = s + 1; q < p->nsrc; q++)
+        for (int cc = 0; cc < p->src[q].ts->num_columns && cc < SV_MAX_COLUMNS; cc++)
+            if (p->using_left[q][cc] == s * 1024 + c + 1) { if (rk) *rk = q; if (rc) *rc = cc; return (int)p->n->select_stmt.joins[q - 1].type; }
+    return -1;
+}
+
+static int plan_join_type(const SelectPlan* p, int s) {
+    return (s >= 1 && s < p->nsrc) ? (int)p->n->select_stmt.joins[s - 1].type : JOIN_INNER;
+}
 static void plan_mark_correlated(SelectPlan* p) { for (; p; p = p->next_arm) p->correlated = true; }
 
 static void plan_free(SelectPlan* p) {
@@ -1828,8 +1876,9 @@ static void expr_refs(const ASTExpr* e, unsigned* mask, bool* outer, bool* opaqu
 // la sorgente s può ricevere righe NULL da un outer join?
 static bool src_nullable(const SelectPlan* p, int s) {
     const ASTNode* n = p->n;
-    if (s >= 1 && n->select_stmt.joins[s - 1].type == JOIN_LEFT) return true;
-    for (int j = s + 1; j < p->nsrc; j++) if (n->select_stmt.joins[j - 1].type == JOIN_RIGHT) return true;
+    if (s >= 1 && (n->select_stmt.joins[s - 1].type == JOIN_LEFT || n->select_stmt.joins[s - 1].type == JOIN_FULL)) return true;
+    for (int j = s + 1; j < p->nsrc; j++)
+        if (n->select_stmt.joins[j - 1].type == JOIN_RIGHT || n->select_stmt.joins[j - 1].type == JOIN_FULL) return true;
     return false;
 }
 
@@ -1915,7 +1964,62 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
             if (!strcasecmp(p->src[a].name, p->src[b].name))
                 FAIL("Table '%.64s' is used twice: give each one an alias", p->src[a].name);
 
-    // 2. colonne di output (* espanso)
+    // 1b. NATURAL JOIN / USING: uguaglianze sulle colonne comuni con le tabelle precedenti
+    for (int j = 0; j < n->select_stmt.num_joins; j++) {
+        ASTJoin* jn = &n->select_stmt.joins[j];
+        if (!jn->natural && !jn->nusing) continue;
+        int k = j + 1;
+        Source* R = &p->src[k];
+        char names[SV_MAX_COLUMNS][64];
+        int nn = 0;
+        if (jn->natural) {
+            for (int c = 0; c < R->ts->num_columns && nn < SV_MAX_COLUMNS; c++)
+                for (int q = 0; q < k; q++)
+                    if (catalog_get_col_index(p->src[q].ts, R->ts->columns[c].name) >= 0) {
+                        snprintf(names[nn++], 64, "%s", R->ts->columns[c].name);
+                        break;
+                    }
+        } else {
+            for (int u = 0; u < jn->nusing; u++) snprintf(names[nn++], 64, "%s", jn->using_cols[u]);
+        }
+        ASTExpr* cond = NULL;
+        for (int u = 0; u < nn; u++) {
+            int rc = catalog_get_col_index(R->ts, names[u]);
+            if (rc < 0) FAIL("Column '%.64s' of USING is not in '%.64s'", names[u], R->name);
+            int ls = -1, lc = -1;
+            for (int q = 0; q < k; q++) {
+                int c = catalog_get_col_index(p->src[q].ts, names[u]);
+                if (c < 0) continue;
+                if (ls >= 0) FAIL("Column '%.64s' of the join is in more than one table before it", names[u]);
+                ls = q; lc = c;
+            }
+            if (ls < 0) FAIL("Column '%.64s' of USING is not in the tables before the JOIN", names[u]);
+            p->using_left[k][rc] = ls * 1024 + lc + 1;
+            if (!jn->using_built) {
+                ASTExpr* a = calloc(1, sizeof(ASTExpr));
+                ASTExpr* b2 = calloc(1, sizeof(ASTExpr));
+                ASTExpr* eq = calloc(1, sizeof(ASTExpr));
+                if (!a || !b2 || !eq) { free(a); free(b2); free(eq); ast_expr_free(cond); FAIL("Out of memory"); }
+                a->type = b2->type = EXPR_COLUMN;
+                snprintf(a->table_name, sizeof(a->table_name), "%s", p->src[ls].name);
+                snprintf(a->col_name, sizeof(a->col_name), "%.63s", names[u]);
+                snprintf(b2->table_name, sizeof(b2->table_name), "%s", R->name);
+                snprintf(b2->col_name, sizeof(b2->col_name), "%.63s", names[u]);
+                eq->type = EXPR_BINARY; eq->op = OP_EQ; eq->left = a; eq->right = b2; eq->depth = 1;
+                if (!cond) cond = eq;
+                else {
+                    ASTExpr* and = calloc(1, sizeof(ASTExpr));
+                    if (!and) { ast_expr_free(eq); ast_expr_free(cond); FAIL("Out of memory"); }
+                    and->type = EXPR_BINARY; and->op = OP_AND; and->left = cond; and->right = eq;
+                    and->depth = 1 + (cond->depth > 1 ? cond->depth : 1);
+                    cond = and;
+                }
+            }
+        }
+        if (!jn->using_built) { jn->condition = cond; jn->using_built = true; }
+    }
+
+    // 2. colonne di output (* espanso; le colonne unite da NATURAL / USING compaiono una volta)
     for (int i = 0; i < n->select_stmt.num_cols; i++) {
         ASTExpr* e = n->select_stmt.columns[i];
         if (e->type == EXPR_STAR) {
@@ -1925,17 +2029,44 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
                 if (e->table_name[0] && strcasecmp(e->table_name, sr->name) && strcasecmp(e->table_name, sr->table)) continue;
                 any = true;
                 for (int c = 0; c < sr->ts->num_columns; c++) {
+                    if (!e->table_name[0] && p->using_left[s][c]) continue;    // copia di destra di una colonna unita
                     if (p->nout >= SV_MAX_COLUMNS) FAIL("Too many columns in the result (max %d)", SV_MAX_COLUMNS);
                     ASTExpr* col = calloc(1, sizeof(ASTExpr));
                     if (!col) FAIL("Out of memory");
                     col->type = EXPR_COLUMN;
                     snprintf(col->col_name, sizeof(col->col_name), "%s", sr->ts->columns[c].name);
                     col->bound = s * 1024 + c + 1;
+                    // colonna unita con un RIGHT / FULL JOIN successivo: COALESCE(sinistra, destra)
+                    int rk = -1, rcol = -1;
+                    for (int q = s + 1; !e->table_name[0] && q < p->nsrc && rk < 0; q++)
+                        for (int cc = 0; cc < p->src[q].ts->num_columns; cc++)
+                            if (p->using_left[q][cc] == s * 1024 + c + 1 &&
+                                (n->select_stmt.joins[q - 1].type == JOIN_RIGHT || n->select_stmt.joins[q - 1].type == JOIN_FULL)) { rk = q; rcol = cc; break; }
+                    if (rk >= 0) {
+                        ASTExpr* other = calloc(1, sizeof(ASTExpr));
+                        ASTExpr* co = calloc(1, sizeof(ASTExpr));
+                        ASTExpr** args = calloc(2, sizeof(ASTExpr*));
+                        if (!other || !co || !args) { free(other); free(co); free(args); free(col); FAIL("Out of memory"); }
+                        *other = *col;
+                        other->bound = rk * 1024 + rcol + 1;
+                        co->type = EXPR_FUNC;
+                        snprintf(co->func, sizeof(co->func), "COALESCE");
+                        co->args = args; co->nargs = 2; args[0] = col; args[1] = other;
+                        co->depth = 2;
+                        snprintf(co->col_name, sizeof(co->col_name), "%s", col->col_name);
+                        OutCol* oc = &p->out[p->nout++];
+                        oc->e = co;
+                        oc->owned = true;
+                        oc->src_type = (int)sr->ts->columns[c].type;
+                        snprintf(oc->name, sizeof(oc->name), "%s", col->col_name);
+                        continue;
+                    }
                     OutCol* oc = &p->out[p->nout++];
                     oc->e = col;
                     oc->owned = true;
                     oc->src_type = (int)sr->ts->columns[c].type;
-                    if (p->nsrc > 1) snprintf(oc->name, sizeof(oc->name), "%.64s.%.64s", sr->name, col->col_name);
+                    if (p->nsrc > 1 && (e->table_name[0] || plan_joined_copy(p, s, c, NULL, NULL) < 0))
+                        snprintf(oc->name, sizeof(oc->name), "%.64s.%.64s", sr->name, col->col_name);
                     else             snprintf(oc->name, sizeof(oc->name), "%s", col->col_name);
                 }
             }
@@ -2011,7 +2142,8 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
         if (e->alias[0])                                                   snprintf(oc->name, sizeof(oc->name), "%s", e->alias);
         else if (e->type == EXPR_COLUMN && p->nsrc > 1 && e->outer == 0 && e->bound > 0)
             snprintf(oc->name, sizeof(oc->name), "%.64s.%.64s", p->src[(e->bound - 1) / 1024].name, e->col_name);
-        else if (e->type == EXPR_COLUMN)                                   snprintf(oc->name, sizeof(oc->name), "%s", e->col_name);
+        else if (e->type == EXPR_COLUMN || (e->type == EXPR_FUNC && e->col_name[0]))   // (colonna di USING in un FULL JOIN)
+            snprintf(oc->name, sizeof(oc->name), "%s", e->col_name);
         else                                                               ast_expr_format(e, oc->name, sizeof(oc->name));
     }
     p->grouped = has_agg || n->select_stmt.num_group > 0 || n->select_stmt.having;
@@ -2040,7 +2172,7 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
     free(conj.v);
     for (int k = 1; k < p->nsrc; k++) {
         ASTJoin* j = &n->select_stmt.joins[k - 1];
-        if (j->type == JOIN_RIGHT) { if (j->condition) xv_push(&p->jcond[k], j->condition); continue; }
+        if (j->type == JOIN_RIGHT || j->type == JOIN_FULL) { if (j->condition) xv_push(&p->jcond[k], j->condition); continue; }
         ExprVec on = {0};
         collect_conj(j->condition, &on);
         for (int i = 0; i < on.n; i++) {
@@ -2245,8 +2377,9 @@ static bool find_hash_cond(ExprVec* conds, int k, Source* src, int* nk_col, int*
 // unisce le righe rows (della sorgente k) alle combinazioni correnti
 static const char* join_step(EvalCtx* ec, Combos* in, Combos* out, int k, JoinType jt, ExprVec* conds,
                              Tuple** rows, int nrows) {
-    bool* right_hit = (jt == JOIN_RIGHT && nrows) ? calloc((size_t)nrows, sizeof(bool)) : NULL;
-    if (jt == JOIN_RIGHT && nrows && !right_hit) return "Out of memory";
+    bool keep_right = jt == JOIN_RIGHT || jt == JOIN_FULL, keep_left = jt == JOIN_LEFT || jt == JOIN_FULL;
+    bool* right_hit = (keep_right && nrows) ? calloc((size_t)nrows, sizeof(bool)) : NULL;
+    if (keep_right && nrows && !right_hit) return "Out of memory";
 
     // hash join quando le condizioni contengono un'uguaglianza fra colonne confrontabili
     int kc, os, oc;
@@ -2290,7 +2423,7 @@ static const char* join_step(EvalCtx* ec, Combos* in, Combos* out, int k, JoinTy
             if (!combos_push(out, base, k, rows[r])) { fail = out->n >= MAX_JOIN_ROWS ? "The JOIN produces too many rows (over 10 million)" : "Out of memory"; break; }
             base = COMBO(in, i);
         }
-        if (!fail && !matched && jt == JOIN_LEFT && !combos_push(out, base, k, NULL)) fail = "Out of memory";
+        if (!fail && !matched && keep_left && !combos_push(out, base, k, NULL)) fail = "Out of memory";
     }
     if (!fail && right_hit)
         for (int r = 0; r < nrows && !fail; r++)
@@ -2972,7 +3105,8 @@ static double explain_arm(PlanOut* po, SelectPlan* p, const char* indent, int de
         if (s == 0) { rows = est; continue; }
         ASTJoin* j = &n->select_stmt.joins[s - 1];
         int a1, a2, a3;
-        const char* kind = j->type == JOIN_LEFT ? "LEFT" : j->type == JOIN_RIGHT ? "RIGHT" : j->type == JOIN_CROSS ? "CROSS" : "INNER";
+        const char* kind = j->type == JOIN_LEFT ? "LEFT" : j->type == JOIN_RIGHT ? "RIGHT" : j->type == JOIN_FULL ? "FULL" :
+                           j->type == JOIN_CROSS ? "CROSS" : "INNER";
         bool hashed = find_hash_cond(&p->jcond[s], s, p->src, &a1, &a2, &a3);
         if (p->jcond[s].n) xv_format(&p->jcond[s], buf, sizeof(buf)); else snprintf(buf, sizeof(buf), "every combination");
         if (j->type == JOIN_CROSS && p->jcond[s].n) kind = "INNER";
@@ -2980,7 +3114,8 @@ static double explain_arm(PlanOut* po, SelectPlan* p, const char* indent, int de
         double jr = hashed ? rows * est / (rows > est ? (rows > 0 ? rows : 1) : (est > 0 ? est : 1))
                            : rows * est * xv_selectivity(&p->jcond[s]);
         if (j->type == JOIN_LEFT && jr < rows) jr = rows;
-        if (j->type == JOIN_RIGHT && jr < est) jr = est;
+        if ((j->type == JOIN_RIGHT || j->type == JOIN_FULL) && jr < est) jr = est;
+        if (j->type == JOIN_FULL && jr < rows + est) jr = jr < rows ? rows + est : jr;
         rows = jr;
         plan_row_a(po, indent, hashed ? "Hash join" : "Nested loop join", det, rows, po->analyze ? p->st_join[s] : -1);
     }
