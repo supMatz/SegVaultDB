@@ -162,6 +162,7 @@ static void win_free(WindowSpec* w) {
 
 void ast_expr_free(ASTExpr* e) {
     if (!e) return;
+    if (e->type == EXPR_STRING) free(e->str_val);
     subq_release(e->subq);
     win_free(e->win);
     ast_expr_free(e->left);
@@ -176,6 +177,10 @@ ASTExpr* ast_expr_clone(const ASTExpr* e) {
     ASTExpr* c = malloc(sizeof(ASTExpr));
     if (!c) return NULL;
     *c = *e;
+    if (e->type == EXPR_STRING) {
+        c->str_val = e->str_val ? strdup(e->str_val) : NULL;
+        if (e->str_val && !c->str_val) { free(c); return NULL; }
+    }
     c->left = c->right = NULL;
     c->args = NULL;
     c->nargs = 0;
@@ -235,7 +240,7 @@ static void fmt_rec(const ASTExpr* e, char* out, size_t n, size_t* len, bool top
         case EXPR_NULL:   fmt_put(out, n, len, "NULL"); break;
         case EXPR_STRING: {
             fmt_put(out, n, len, "'");
-            for (const char* p = e->str_val; *p; p++) {
+            for (const char* p = e->str_val ? e->str_val : ""; *p; p++) {
                 char one[3] = { *p, 0, 0 };
                 if (*p == '\'') { one[1] = '\''; }
                 fmt_put(out, n, len, one);
@@ -560,7 +565,11 @@ static ASTExpr* parse_primary(ParserState* ps) {
             return e;
         }
         case TOK_FLOAT:   consume(ps); e = new_expr(EXPR_FLOAT); if (e) e->float_val = strtod(t.text, NULL); return e;
-        case TOK_STRING:  consume(ps); e = new_expr(EXPR_STRING); if (e) copy_text(ps, e->str_val, sizeof(e->str_val), t.text); return e;
+        case TOK_STRING:
+            consume(ps);
+            e = new_expr(EXPR_STRING);
+            if (e && !(e->str_val = strdup(t.text))) { free(e); e = NULL; parse_fail(ps, "Out of memory", t); }
+            return e;
         case TOK_NULL:    consume(ps); return new_expr(EXPR_NULL);
         case TOK_EXISTS:
             consume(ps);
@@ -713,7 +722,14 @@ static ASTExpr* parse_not(ParserState* ps) {
 }
 
 static ASTExpr* parse_and(ParserState* ps) {
+    ASTExpr* first = parse_not(ps);                   // caso comune: un solo termine, nessuna lista
+    if (!first || !ps->result->success || peek(ps).type != TOK_AND) {
+        if (!ps->result->success) { ast_expr_free(first); return NULL; }
+        return first;
+    }
     ExprList terms = {0};
+    if (!elist_push(&terms, first)) { ast_expr_free(first); return NULL; }
+    match(ps, TOK_AND);
     do {
         ASTExpr* e = parse_not(ps);
         if (!e || !elist_push(&terms, e)) { ast_expr_free(e); elist_free(&terms); return NULL; }
@@ -723,7 +739,14 @@ static ASTExpr* parse_and(ParserState* ps) {
 }
 
 static ASTExpr* parse_expr(ParserState* ps) {
+    ASTExpr* first = parse_and(ps);                   // caso comune: un solo termine, nessuna lista
+    if (!first || !ps->result->success || peek(ps).type != TOK_OR) {
+        if (!ps->result->success) { ast_expr_free(first); return NULL; }
+        return first;
+    }
     ExprList terms = {0};
+    if (!elist_push(&terms, first)) { ast_expr_free(first); return NULL; }
+    match(ps, TOK_OR);
     do {
         ASTExpr* e = parse_and(ps);
         if (!e || !elist_push(&terms, e)) { ast_expr_free(e); elist_free(&terms); return NULL; }
@@ -1220,7 +1243,7 @@ static TrigStmt* parse_trig_stmt(ParserState* ps) {
         t->kind = TS_SIGNAL;
         if (peek(ps).type == TOK_SEMICOLON || peek(ps).type == TOK_END) {
             t->expr = new_expr(EXPR_STRING);
-            if (t->expr) snprintf(t->expr->str_val, sizeof(t->expr->str_val), "Error raised by a trigger");
+            if (t->expr) t->expr->str_val = strdup("Error raised by a trigger");
         } else {
             t->expr = parse_expr(ps);
         }

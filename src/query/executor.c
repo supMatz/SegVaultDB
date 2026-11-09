@@ -1583,7 +1583,7 @@ static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         case EXPR_NULL:   ev_null(out); return;
         case EXPR_INT:    ev_int(out, e->int_val); return;
         case EXPR_FLOAT:  ev_num(out, e->float_val); return;
-        case EXPR_STRING: out->null = false; out->is_num = out->is_int = false; out->str = e->str_val; return;
+        case EXPR_STRING: out->null = false; out->is_num = out->is_int = false; out->str = e->str_val ? e->str_val : ""; return;
         case EXPR_COLUMN: {
             if (e->bound < 0) {                                  // alias della SELECT
                 int k = -e->bound - 1;
@@ -5213,6 +5213,8 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     for (int r = 0; r < nrows && !fail; r++) {
         const char* text[64];
         bool given[64] = {0};
+        bool direct[64] = {0};                    // numero già pronto (niente conversione in testo e ritorno)
+        Value dv[64];
         for (int i = 0; i < nc; i++) text[i] = NULL;
         for (int k = 0; k < ncols; k++) {
             EvalVal v;
@@ -5222,6 +5224,21 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
             int ci = map[k];
             given[ci] = true;
             if (v.null) { text[ci] = NULL; continue; }
+            DataType ty = ts->columns[ci].type;
+            if (v.is_int && (ty == SV_TYPE_BIGINT || (ty == SV_TYPE_INT && v.inum >= INT32_MIN && v.inum <= INT32_MAX))) {
+                memset(&dv[ci], 0, sizeof(Value));
+                if (ty == SV_TYPE_INT) dv[ci].int_val = (int32_t)v.inum; else dv[ci].bigint_val = v.inum;
+                direct[ci] = true;
+                text[ci] = "";                    // (non NULL)
+                continue;
+            }
+            if (v.is_num && ty == SV_TYPE_FLOAT) {
+                memset(&dv[ci], 0, sizeof(Value));
+                dv[ci].float_val = v.num;
+                direct[ci] = true;
+                text[ci] = "";
+                continue;
+            }
             snprintf(vals[ci], sizeof(vals[ci]), "%s", ev_s(&v));
             text[ci] = vals[ci];
         }
@@ -5229,7 +5246,11 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
         for (int i = 0; i < nc; i++) {
             Column* c = &ts->columns[i];
             if (!given[i] && c->default_val[0] && strcasecmp(c->default_val, "NULL") != 0) text[i] = c->default_val;
-            if (i == ai) {
+            if (!given[i] && direct[i]) direct[i] = false;
+            if (i == ai && direct[i]) {
+                int64_t x = c->type == SV_TYPE_INT ? dv[i].int_val : dv[i].bigint_val;
+                if (x > auto_next) auto_next = x;
+            } else if (i == ai) {
                 if (!text[i]) {                                   // valore generato (anche per un NULL esplicito)
                     if (auto_next == INT64_MAX) { fail = "AUTO_INCREMENT value out of range"; break; }
                     snprintf(ai_buf, sizeof(ai_buf), "%lld", (long long)++auto_next);
@@ -5248,11 +5269,15 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
                 }
                 continue;
             }
-            if (check_value(c, text[i], msg, sizeof(msg))) { fail = msg; break; }
+            if (!direct[i] && check_value(c, text[i], msg, sizeof(msg))) { fail = msg; break; }
         }
         if (fail) break;
-        tuples[r] = tuple_from_strings(text, nc, ts);
+        tuples[r] = tuple_create(nc);
         if (!tuples[r]) { fail = "Out of memory"; break; }
+        for (int i = 0; i < nc; i++) {
+            if (direct[i]) tuples[r]->values[i] = dv[i];
+            else value_set_from_text(&tuples[r]->values[i], ts->columns[i].type, text[i]);
+        }
     }
     // trigger BEFORE (possono cambiare NEW o rifiutare la riga), poi i vincoli: CHECK,
     // PRIMARY KEY / UNIQUE (anche fra le righe dello statement), FOREIGN KEY

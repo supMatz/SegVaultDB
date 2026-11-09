@@ -4,6 +4,7 @@
 #include <strings.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdint.h>
 
 typedef struct {
     const char* start;
@@ -12,23 +13,51 @@ typedef struct {
     int col;
 } Lexer;
 
-static Token make_token(Lexer* lx, TokenType type) {
-    Token t = {type, "", lx->line, lx->col};
+// token in costruzione, con il testo in un buffer (diventa un Token con il testo nel pool)
+typedef struct {
+    TokenType type;
+    char      text[512];
+    int       line;
+    int       col;
+} LexTok;
+
+// riempie t (senza azzerare tutto il buffer: un token è lungo pochi byte)
+static void make_token_into(LexTok* t, Lexer* lx, TokenType type) {
+    t->type = type; t->line = lx->line; t->col = lx->col;
+    t->text[0] = '\0';
     int len = (int)(lx->pos - lx->start);
     if (len > 0 && len < 512) {
-        memcpy(t.text, lx->start, len);
-        t.text[len] = '\0';
+        memcpy(t->text, lx->start, (size_t)len);
+        t->text[len] = '\0';
     }
-    return t;
 }
 
-static int add_token(TokenList* list, Token t) {
+// durante la scansione text contiene l'offset nel pool (il pool può spostarsi): i puntatori
+// vengono sistemati alla fine
+static int add_token(TokenList* list, const LexTok* t) {
     if (list->count >= list->capacity) {
-        list->capacity = list->capacity ? list->capacity * 2 : 256;
-        list->tokens = realloc(list->tokens, list->capacity * sizeof(Token));
-        if (!list->tokens) return 0;
+        int nc = list->capacity ? list->capacity * 2 : 256;
+        Token* nt = realloc(list->tokens, (size_t)nc * sizeof(Token));
+        if (!nt) return 0;
+        list->tokens = nt;
+        list->capacity = nc;
     }
-    list->tokens[list->count++] = t;
+    size_t l = strlen(t->text) + 1;
+    if (list->plen + l > list->pcap) {
+        size_t nc = list->pcap ? list->pcap * 2 : 4096;
+        while (nc < list->plen + l) nc *= 2;
+        char* np = realloc(list->pool, nc);
+        if (!np) return 0;
+        list->pool = np;
+        list->pcap = nc;
+    }
+    memcpy(list->pool + list->plen, t->text, l);
+    Token* d = &list->tokens[list->count++];
+    d->type = t->type;
+    d->line = t->line;
+    d->col = t->col;
+    d->text = (const char*)(uintptr_t)list->plen;
+    list->plen += l;
     return 1;
 }
 
@@ -42,7 +71,7 @@ static void skip_whitespace(Lexer* lx) {
 }
 
 static TokenType keyword_or_id(const char* word, int len) {
-    struct { const char* kw; TokenType type; } kws[] = {
+    static const struct { const char* kw; TokenType type; } kws[] = {
         {"SELECT",TOK_SELECT},{"FROM",TOK_FROM},{"WHERE",TOK_WHERE},
         {"INSERT",TOK_INSERT},{"INTO",TOK_INTO},{"VALUES",TOK_VALUES},
         {"UPDATE",TOK_UPDATE},{"SET",TOK_SET},{"DELETE",TOK_DELETE},
@@ -65,14 +94,31 @@ static TokenType keyword_or_id(const char* word, int len) {
         {"BOOLEAN",TOK_BOOLEAN},{"CASE",TOK_CASE},{"WHEN",TOK_WHEN},{"THEN",TOK_THEN},
         {"ELSE",TOK_ELSE},{"END",TOK_END},
     };
-    char buf[64];
-    int n = len < 63 ? len : 63;
-    memcpy(buf, word, n); buf[n] = '\0';
-    for (int i = 0; i < n; i++) buf[i] = toupper((unsigned char)buf[i]);
-
-    for (int i = 0; i < (int)(sizeof(kws)/sizeof(kws[0])); i++)
-        if (strcmp(buf, kws[i].kw) == 0)
-            return kws[i].type;
+    // tabella hash delle parole chiave (costruita al primo uso; il motore è usato sotto un mutex)
+    enum { KW_SLOTS = 256 };
+    static short slot[KW_SLOTS];
+    static bool built = false;
+    const int nkw = (int)(sizeof(kws) / sizeof(kws[0]));
+    #define KW_HASH(h, s, l) do { h = 2166136261u; for (int q_ = 0; q_ < (l); q_++) { h ^= (unsigned)toupper((unsigned char)(s)[q_]); h *= 16777619u; } } while (0)
+    if (!built) {
+        for (int i = 0; i < KW_SLOTS; i++) slot[i] = -1;
+        for (int i = 0; i < nkw; i++) {
+            unsigned h;
+            KW_HASH(h, kws[i].kw, (int)strlen(kws[i].kw));
+            unsigned j = h & (KW_SLOTS - 1);
+            while (slot[j] >= 0) j = (j + 1) & (KW_SLOTS - 1);
+            slot[j] = (short)i;
+        }
+        built = true;
+    }
+    if (len > 16) return TOK_IDENTIFIER;               // nessuna parola chiave è così lunga
+    unsigned h;
+    KW_HASH(h, word, len);
+    #undef KW_HASH
+    for (unsigned j = h & (KW_SLOTS - 1); slot[j] >= 0; j = (j + 1) & (KW_SLOTS - 1)) {
+        const char* k = kws[slot[j]].kw;
+        if ((int)strlen(k) == len && strncasecmp(k, word, (size_t)len) == 0) return kws[slot[j]].type;
+    }
     return TOK_IDENTIFIER;
 }
 
@@ -81,6 +127,7 @@ TokenList* lexer_tokenize(const char* sql) {
     if (!list) return NULL;
 
     Lexer lx;
+    LexTok tok;                       // token in costruzione (riusato)
     lx.start = lx.pos = sql;
     lx.line = 1; lx.col = 1;
 
@@ -112,21 +159,21 @@ TokenList* lexer_tokenize(const char* sql) {
         if (*lx.pos == '`') {
             lx.pos++;
             while (*lx.pos && *lx.pos != '`') { lx.pos++; }
-            Token bt = make_token(&lx, TOK_IDENTIFIER);
-            int blen = strlen(bt.text);
-            if (blen > 0 && bt.text[0] == '`') memmove(bt.text, bt.text + 1, blen);
-            blen = strlen(bt.text);
-            if (blen > 0 && bt.text[blen-1] == '`') bt.text[blen-1] = '\0';
+            make_token_into(&tok, &lx, TOK_IDENTIFIER);
+            int blen = strlen(tok.text);
+            if (blen > 0 && tok.text[0] == '`') memmove(tok.text, tok.text + 1, blen);
+            blen = strlen(tok.text);
+            if (blen > 0 && tok.text[blen-1] == '`') tok.text[blen-1] = '\0';
             if (*lx.pos) lx.pos++;
             lx.start = lx.pos;
-            add_token(list, bt);
+            add_token(list, &tok);
             continue;
         }
 
         // String literals: '' (o "") dentro la stringa vale un apice; \\ \' \" \n \t \r sono escape
         if (*lx.pos == '\'' || *lx.pos == '"') {
             char quote = *lx.pos;
-            Token t = {TOK_STRING, "", lx.line, lx.col};
+            tok.type = TOK_STRING; tok.line = lx.line; tok.col = lx.col; tok.text[0] = '\0';
             int n = 0;
             bool overflow = false;
             lx.pos++;
@@ -144,7 +191,7 @@ TokenList* lexer_tokenize(const char* sql) {
                         case 'r': ch = '\r'; break;
                         case '\\': case '\'': case '"': ch = e; break;
                         default:                              // escape sconosciuto: resta com'è
-                            if (n < (int)sizeof(t.text) - 1) t.text[n++] = '\\'; else overflow = true;
+                            if (n < (int)sizeof(tok.text) - 1) tok.text[n++] = '\\'; else overflow = true;
                             ch = e;
                             break;
                     }
@@ -152,18 +199,18 @@ TokenList* lexer_tokenize(const char* sql) {
                     if (ch == '\n') lx.line++;
                     lx.pos++;
                 }
-                if (n < (int)sizeof(t.text) - 1) t.text[n++] = ch;
+                if (n < (int)sizeof(tok.text) - 1) tok.text[n++] = ch;
                 else overflow = true;
             }
-            t.text[n] = '\0';
+            tok.text[n] = '\0';
             if (*lx.pos) lx.pos++;                            // apice di chiusura
-            else snprintf(t.text, sizeof(t.text), "Unterminated string literal"), t.type = TOK_ERROR;
+            else snprintf(tok.text, sizeof(tok.text), "Unterminated string literal"), tok.type = TOK_ERROR;
             if (overflow) {
-                t.type = TOK_ERROR;
-                snprintf(t.text, sizeof(t.text), "String literal is longer than %d bytes", (int)sizeof(t.text) - 1);
+                tok.type = TOK_ERROR;
+                snprintf(tok.text, sizeof(tok.text), "String literal is longer than %d bytes", (int)sizeof(tok.text) - 1);
             }
             lx.start = lx.pos;
-            add_token(list, t);
+            add_token(list, &tok);
             continue;
         }
 
@@ -189,7 +236,8 @@ TokenList* lexer_tokenize(const char* sql) {
                 lx.pos += 2;
                 while (isdigit((unsigned char)*lx.pos)) lx.pos++;
             }
-            add_token(list, make_token(&lx, is_float ? TOK_FLOAT : TOK_INTEGER));
+            make_token_into(&tok, &lx, is_float ? TOK_FLOAT : TOK_INTEGER);
+            add_token(list, &tok);
             continue;
         }
 
@@ -197,13 +245,13 @@ TokenList* lexer_tokenize(const char* sql) {
         if (isalpha((unsigned char)*lx.pos) || *lx.pos == '_') {
             while (isalnum((unsigned char)*lx.pos) || *lx.pos == '_') lx.pos++;
             TokenType tt = keyword_or_id(lx.start, (int)(lx.pos - lx.start));
-            Token kt = make_token(&lx, tt);
-            if (tt == TOK_IDENTIFIER && (!strcasecmp(kt.text, "TRUE") || !strcasecmp(kt.text, "FALSE"))) {
-                bool on = (kt.text[0] | 0x20) == 't';   // letterali booleani = 1 / 0
-                kt.type = TOK_INTEGER;
-                snprintf(kt.text, sizeof(kt.text), "%d", on ? 1 : 0);
+            make_token_into(&tok, &lx, tt);
+            if (tt == TOK_IDENTIFIER && (!strcasecmp(tok.text, "TRUE") || !strcasecmp(tok.text, "FALSE"))) {
+                bool on = (tok.text[0] | 0x20) == 't';   // letterali booleani = 1 / 0
+                tok.type = TOK_INTEGER;
+                snprintf(tok.text, sizeof(tok.text), "%d", on ? 1 : 0);
             }
-            add_token(list, kt);
+            add_token(list, &tok);
             continue;
         }
 
@@ -229,20 +277,26 @@ TokenList* lexer_tokenize(const char* sql) {
         }
         if (tt != TOK_ERROR) {
             lx.pos += advance;
-            add_token(list, make_token(&lx, tt));
+            make_token_into(&tok, &lx, tt);
+            add_token(list, &tok);
             continue;
         }
 
         lx.pos++;
-        add_token(list, make_token(&lx, TOK_ERROR));
+        make_token_into(&tok, &lx, TOK_ERROR);
+        add_token(list, &tok);
     }
 
-    add_token(list, make_token(&lx, TOK_EOF));
+    make_token_into(&tok, &lx, TOK_EOF);
+    add_token(list, &tok);
+    for (int i = 0; i < list->count; i++)
+        list->tokens[i].text = list->pool + (uintptr_t)list->tokens[i].text;
     return list;
 }
 
 void lexer_free(TokenList* list) {
     if (!list) return;
     free(list->tokens);
+    free(list->pool);
     free(list);
 }

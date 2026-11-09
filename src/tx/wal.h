@@ -28,13 +28,16 @@ typedef struct {
     char     path[512];
     uint64_t sequence;
     uint64_t checkpoints;   // checkpoint eseguiti in questa sessione
+    uint8_t* buf;           // voci non ancora scritte nel file (una write per gruppo, non per riga)
+    size_t   blen, bcap;
 } WAL;
 
 WAL* wal_create(const char* path);
 int  wal_write(WAL* wal, uint8_t type, uint64_t tx_id, uint32_t page_id,
                SVRID rid, const uint8_t* data, uint32_t data_len,
                const uint8_t* old_data, uint32_t old_data_len);
-int  wal_flush(WAL* wal);
+int  wal_flush(WAL* wal);            // scrive il buffer e fa fsync (COMMIT)
+int  wal_write_buffer(WAL* wal);     // scrive il buffer senza fsync (fine statement, prima di una pagina)
 int  wal_recovery(const char* log_path, const char* db_path, const char* cat_path);
 int  wal_undo_tx(const char* log_path, const char* db_path, uint64_t tx_id);
 // annulla le voci della transazione a partire dall'offset 'from' del log (ROLLBACK TO)

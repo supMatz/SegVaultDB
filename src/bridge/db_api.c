@@ -90,6 +90,8 @@ static double get_time_ms(void) { return sv_get_time_ms(); }
 
 // ── API principale ───────────────────────────────────────────────
 
+static void wal_before_page_write(void* w) { wal_write_buffer((WAL*)w); }
+
 static bool db_init_impl(const char* data_directory) {
     if (g_db.initialized) return true;
 
@@ -119,6 +121,11 @@ static bool db_init_impl(const char* data_directory) {
     g_db.bp      = bp_create(SV_BUFFER_POOL_CAP, g_db.db_fd);
     g_db.txm     = txm_create();
     g_db.wal     = wal_create(g_db.log_path);
+
+    if (g_db.bp && g_db.wal) {                     // prima di scrivere una pagina, il log
+        g_db.bp->before_write = wal_before_page_write;
+        g_db.bp->before_write_ctx = g_db.wal;
+    }
 
     g_db.exec_ctx.catalog = g_db.catalog;
     g_db.exec_ctx.bp      = g_db.bp;
@@ -256,6 +263,7 @@ static QueryResult* db_execute_impl(const char* sql) {
 
     parse_result_free(parsed);
     lexer_free(tokens);
+    wal_write_buffer(g_db.wal);       // a fine statement il log è nel file (sopravvive a un crash del processo)
     maybe_checkpoint();
     return result;
 }
@@ -282,6 +290,7 @@ static QueryResult** db_execute_multi_impl(const char* sql, int* out_count) {
             results[i]->exec_time_ms = get_time_ms() - t_start;
     }
     *out_count = parsed->count;
+    wal_write_buffer(g_db.wal);
     maybe_checkpoint();
 
     parse_result_free(parsed);
@@ -566,6 +575,7 @@ static void db_shutdown_impl(void) {
     catalog_save(g_db.catalog, g_db.cat_path);
     sv_fsync(g_db.db_fd);
     wal_flush(g_db.wal);
+    g_db.bp->before_write = NULL;          // il log sta per essere chiuso
     wal_destroy(g_db.wal);
     // checkpoint: tutte le modifiche sono su disco, il log non serve più.
     // Al prossimo avvio il recovery lavora solo dopo un arresto anomalo.

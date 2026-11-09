@@ -68,7 +68,7 @@ typedef struct ASTExpr {
     union {
         int64_t  int_val;
         double   float_val;
-        char     str_val[512];
+        char*    str_val;     // EXPR_STRING: testo allocato (liberato con il nodo)
     };
     struct ASTExpr* left;
     struct ASTExpr* right;

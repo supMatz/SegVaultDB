@@ -44,9 +44,14 @@ static void hash_remove(BufferPool* bp, int idx) {
 }
 
 // libera il frame (scrivendo la pagina se modificata)
+static void before_write(BufferPool* bp) {
+    if (bp->before_write) bp->before_write(bp->before_write_ctx);
+}
+
 static void frame_release(BufferPool* bp, int idx) {
     Frame* f = &bp->frames[idx];
     if (!f->page) return;
+    if (f->dirty) before_write(bp);
     if (f->dirty && page_write(f->page, bp->db_fd) == SV_OK) bp->stats.dirty_writes++;
     hash_remove(bp, idx);
     page_free(f->page);
@@ -158,6 +163,7 @@ int bp_flush_page(BufferPool* bp, uint32_t page_id) {
     int idx = bp_find(bp, page_id);
     if (idx < 0) return SV_NOT_FOUND;
     if (!bp->frames[idx].dirty) return SV_OK;
+    before_write(bp);
     int r = page_write(bp->frames[idx].page, bp->db_fd);
     if (r == SV_OK) { bp->frames[idx].dirty = false; bp->stats.dirty_writes++; }
     return r;
@@ -171,6 +177,7 @@ static int cmp_frame_page(const void* a, const void* b) {
 }
 
 int bp_flush_all(BufferPool* bp) {
+    before_write(bp);
     int* dirty = malloc(sizeof(int) * (size_t)bp->capacity);
     int n = 0;
     for (int i = 0; i < bp->capacity; i++) {

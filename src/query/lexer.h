@@ -25,17 +25,20 @@ typedef enum {
     TOK_SLASH, TOK_PERCENT, TOK_EOF, TOK_ERROR,
 } TokenType;
 
+// token leggero (si copia per valore nel parser): il testo sta nel pool della TokenList
 typedef struct {
-    TokenType type;
-    char      text[512];
-    int       line;
-    int       col;
+    TokenType   type;
+    const char* text;
+    int         line;
+    int         col;
 } Token;
 
 typedef struct {
     Token* tokens;
     int    count;
     int    capacity;
+    char*  pool;       // testi dei token, uno dopo l'altro
+    size_t plen, pcap;
 } TokenList;
 
 TokenList* lexer_tokenize(const char* sql);

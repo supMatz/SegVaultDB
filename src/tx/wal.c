@@ -12,6 +12,9 @@ WAL* wal_create(const char* path) {
         free(wal);
         return NULL;
     }
+    wal->bcap = 1u << 20;
+    wal->buf = malloc(wal->bcap);
+    if (!wal->buf) wal->bcap = 0;               // senza buffer: ogni voce scritta subito
     return wal;
 }
 
@@ -32,11 +35,20 @@ int wal_write(WAL* wal, uint8_t type, uint64_t tx_id, uint32_t page_id,
     if (!old_data) old_data_len = 0;
     memcpy(hdr + 15, &data_len, 4);
     memcpy(hdr + 19, &old_data_len, 4);
-    if (!sv_write_full(wal->fd, hdr, 23) ||
-        (data_len > 0 && !sv_write_full(wal->fd, data, data_len)) ||
-        (old_data_len > 0 && !sv_write_full(wal->fd, old_data, old_data_len))) {
-        fprintf(stderr, "[SegVault] cannot write the transaction log (disk full?)\n");
-        return SV_ERR;
+    size_t need = 23 + (size_t)data_len + (size_t)old_data_len;
+    if (wal->blen + need > wal->bcap && wal_write_buffer(wal) != SV_OK) return SV_ERR;
+    if (need > wal->bcap) {                       // voce più grande del buffer: scritta subito
+        if (!sv_write_full(wal->fd, hdr, 23) ||
+            (data_len > 0 && !sv_write_full(wal->fd, data, data_len)) ||
+            (old_data_len > 0 && !sv_write_full(wal->fd, old_data, old_data_len))) {
+            fprintf(stderr, "[SegVault] cannot write the transaction log (disk full?)\n");
+            return SV_ERR;
+        }
+    } else {
+        memcpy(wal->buf + wal->blen, hdr, 23);
+        if (data_len) memcpy(wal->buf + wal->blen + 23, data, data_len);
+        if (old_data_len) memcpy(wal->buf + wal->blen + 23 + data_len, old_data, old_data_len);
+        wal->blen += need;
     }
     wal->sequence++;
     return SV_OK;
@@ -55,10 +67,22 @@ static bool read_payload(int fd, uint32_t len, uint8_t** out) {
     return true;
 }
 
+int wal_write_buffer(WAL* wal) {
+    if (!wal) return SV_ERR;
+    if (!wal->blen) return SV_OK;
+    if (!sv_write_full(wal->fd, wal->buf, wal->blen)) {
+        fprintf(stderr, "[SegVault] cannot write the transaction log (disk full?)\n");
+        return SV_ERR;
+    }
+    wal->blen = 0;
+    return SV_OK;
+}
+
 int wal_flush(WAL* wal) {
     if (!wal) return SV_ERR;
+    int r = wal_write_buffer(wal);
     sv_fsync(wal->fd);
-    return SV_OK;
+    return r;
 }
 
 // LOG_UPDATE_MOVE: posizione nuova all'inizio di data
@@ -368,11 +392,12 @@ int wal_undo_tx_from(const char* log_path, const char* db_path, uint64_t tx_id, 
 long wal_size(WAL* wal) {
     if (!wal) return 0;
     long cur = sv_lseek(wal->fd, 0, SEEK_END);
-    return cur < 0 ? 0 : cur;
+    return (cur < 0 ? 0 : cur) + (long)wal->blen;
 }
 
 int wal_truncate(WAL* wal) {
     if (!wal) return SV_ERR;
+    wal->blen = 0;
     if (sv_ftruncate(wal->fd, 0) != 0) return SV_IO_ERROR;
     sv_lseek(wal->fd, 0, SEEK_SET);
     sv_fsync(wal->fd);
@@ -382,6 +407,8 @@ int wal_truncate(WAL* wal) {
 
 void wal_destroy(WAL* wal) {
     if (!wal) return;
+    wal_write_buffer(wal);
+    free(wal->buf);
     if (wal->fd >= 0) sv_close(wal->fd);
     free(wal);
 }

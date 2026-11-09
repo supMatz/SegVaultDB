@@ -45,6 +45,9 @@ typedef struct {
     int       hand;        // lancetta di CLOCK
     uint32_t  next_new_id; // prossima pagina da allocare in fondo al file (0 = da calcolare)
     BufferStats stats;
+    // chiamata prima di scrivere una pagina su disco (regola del WAL: prima il log)
+    void      (*before_write)(void* ctx);
+    void*     before_write_ctx;
 } BufferPool;
 
 BufferPool* bp_create(int capacity, int db_fd);
