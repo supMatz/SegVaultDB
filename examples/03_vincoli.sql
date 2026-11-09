@@ -66,5 +66,19 @@ ALTER TABLE studente ADD CONSTRAINT nome_cognome_unici UNIQUE (nome, cognome);
 SHOW CONSTRAINTS FROM studente;
 ALTER TABLE studente DROP CONSTRAINT nome_cognome_unici;
 
+-- ── Modifiche allo schema: ALTER TABLE ... COLUMN ─────────────────
+-- le righe esistenti ricevono il valore di DEFAULT
+ALTER TABLE studente ADD COLUMN email VARCHAR(60) DEFAULT 'non indicata';
+SELECT matricola, email FROM studente ORDER BY matricola LIMIT 3;
+
+-- errore atteso: una colonna NOT NULL senza DEFAULT non si può aggiungere a una tabella con righe
+ALTER TABLE studente ADD COLUMN telefono VARCHAR(20) NOT NULL;
+
+ALTER TABLE studente RENAME COLUMN email TO posta;
+ALTER TABLE studente DROP COLUMN posta;
+
+-- errore atteso: la colonna fa parte della chiave primaria
+ALTER TABLE esame DROP COLUMN corso;
+
 -- lo schema completo, rigenerato dal catalogo
 SHOW CREATE TABLE esame;

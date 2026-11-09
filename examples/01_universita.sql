@@ -52,6 +52,14 @@ CREATE TABLE esame (
     CONSTRAINT lode_solo_30 CHECK (lode = 0 OR voto = 30)
 );
 
+-- PROPEDEUTICO(corso → CORSO, richiede → CORSO): per seguire "corso" bisogna aver superato "richiede"
+CREATE TABLE propedeutico (
+    corso    VARCHAR(6) REFERENCES corso ON DELETE CASCADE,
+    richiede VARCHAR(6) REFERENCES corso ON DELETE CASCADE,
+    PRIMARY KEY (corso, richiede),
+    CHECK (corso <> richiede)
+);
+
 INSERT INTO dipartimento VALUES
     ('DEIB', 'Elettronica, Informazione e Bioingegneria'),
     ('DMAT', 'Matematica'),
@@ -103,6 +111,12 @@ INSERT INTO esame VALUES
     (1005, 'INF1', '2025-01-21', 26, 0),
     (1008, 'BD1',  '2023-02-11', 25, 0),
     (1008, 'AN1',  '2022-02-16', 23, 0);
+
+INSERT INTO propedeutico VALUES
+    ('BD1', 'INF1'),
+    ('BD2', 'BD1'),
+    ('SO',  'INF1'),
+    ('FIS1', 'AN1');
 
 -- Controllo: righe per tabella
 SELECT 'studenti' AS tabella, COUNT(*) AS righe FROM studente

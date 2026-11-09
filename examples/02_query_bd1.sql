@@ -151,3 +151,47 @@ FROM esame GROUP BY corso ORDER BY corso;
 
 -- 28. Classifica: i 3 voti migliori (ORDER BY + LIMIT)
 SELECT studente, corso, voto FROM esame ORDER BY voto DESC, data LIMIT 3;
+
+-- ── Join: altre forme ─────────────────────────────────────────────
+-- 29. Docenti e corsi, compresi i docenti senza corsi e i corsi senza docente (FULL OUTER JOIN)
+SELECT d.cognome, c.titolo
+FROM docente d FULL OUTER JOIN corso c ON c.docente = d.matricola
+ORDER BY d.cognome, c.titolo;
+
+-- 30. JOIN ... USING: la colonna comune compare una volta sola
+CREATE VIEW esame_corso AS SELECT studente, corso AS codice, voto FROM esame;
+SELECT studente, codice, titolo, voto FROM esame_corso JOIN corso USING (codice) WHERE voto = 30 ORDER BY studente;
+DROP VIEW esame_corso;
+
+-- ── Interrogazioni ricorsive ──────────────────────────────────────
+-- 31. Tutti i corsi da superare (direttamente o indirettamente) prima di Basi di dati 2:
+--     chiusura transitiva della relazione PROPEDEUTICO
+WITH RECURSIVE prima(codice, livello) AS (
+    SELECT richiede, 1 FROM propedeutico WHERE corso = 'BD2'
+    UNION
+    SELECT p.richiede, pr.livello + 1 FROM propedeutico p JOIN prima pr ON p.corso = pr.codice
+)
+SELECT pr.codice, c.titolo, pr.livello FROM prima pr JOIN corso c ON c.codice = pr.codice ORDER BY pr.livello;
+
+-- ── Funzioni finestra ─────────────────────────────────────────────
+-- 32. Posizione di ogni esame nella classifica del proprio corso
+SELECT corso, studente, voto,
+       RANK() OVER (PARTITION BY corso ORDER BY voto DESC) AS posizione
+FROM esame ORDER BY corso, posizione;
+
+-- 33. Il migliore di ogni corso (top-1 per gruppo, con una tabella derivata)
+SELECT corso, studente, voto FROM (
+    SELECT corso, studente, voto, ROW_NUMBER() OVER (PARTITION BY corso ORDER BY voto DESC, data) AS r FROM esame
+) AS t
+WHERE r = 1 ORDER BY corso;
+
+-- 34. CFU accumulati da ogni studente esame dopo esame (somma cumulativa)
+SELECT e.studente, e.data, e.corso,
+       SUM(c.cfu) OVER (PARTITION BY e.studente ORDER BY e.data) AS cfu_accumulati
+FROM esame e JOIN corso c ON c.codice = e.corso
+WHERE e.studente IN (1001, 1003)
+ORDER BY e.studente, e.data;
+
+-- 35. Scarto dalla media del corso, senza GROUP BY
+SELECT corso, studente, voto, ROUND(voto - AVG(voto) OVER (PARTITION BY corso), 2) AS scarto
+FROM esame WHERE corso = 'BD1' ORDER BY scarto DESC;

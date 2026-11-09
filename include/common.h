@@ -16,9 +16,9 @@ SCOPO: Header incluso da TUTTI i moduli del progetto.
 
 // versioni
 #define SV_VERSION_MAJOR 1
-#define SV_VERSION_MINOR 1
+#define SV_VERSION_MINOR 2
 #define SV_VERSION_PATCH 0
-#define SV_VERSION_STR  "1.1.0"
+#define SV_VERSION_STR  "1.2.0"
 #define SV_NAME         "SegVault"
 
 // codici di ritorno

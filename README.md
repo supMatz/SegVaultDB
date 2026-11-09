@@ -37,10 +37,10 @@ Pensato per i corsi di **Basi di Dati 1 e 2** di ingegneria informatica: lo stes
 | Feature | Details |
 |---|---|
 | **Language** | C (C11), zero dipendenze per il motore |
-| **Version** | 1.1.0 |
+| **Version** | 1.2.0 |
 | **GUI** | Win32 / GDI (Windows) · Xlib/X11 + Xft (Linux) |
 | **Font** | JetBrains Mono (editor e dati) · Inter / Fira Sans (interfaccia), con fallback automatico |
-| **SQL** | Lexer e parser a discesa ricorsiva scritti a mano; subquery (anche correlate), `UNION` / `INTERSECT` / `EXCEPT`, `WITH`, `CASE`, viste, vincoli, trigger |
+| **SQL** | Lexer e parser a discesa ricorsiva scritti a mano; subquery (anche correlate), `UNION` / `INTERSECT` / `EXCEPT`, `WITH [RECURSIVE]`, funzioni finestra, `FULL` / `NATURAL` / `USING` join, `CASE`, viste, vincoli, trigger, `ALTER TABLE ... COLUMN` |
 | **Vincoli** | `PRIMARY KEY` (anche composta), `UNIQUE`, `NOT NULL`, `CHECK`, `FOREIGN KEY` con `ON DELETE` / `ON UPDATE` `CASCADE`, `SET NULL`, `SET DEFAULT`, `RESTRICT` |
 | **Storage** | Heap file a pagine da 4 KB con slot directory e free-space map; indici hash in memoria (anche su più colonne) |
 | **Buffer pool** | 1024 frame, tabella hash per la ricerca, sostituzione **CLOCK**; statistiche con `SHOW STATUS` |
@@ -58,8 +58,8 @@ La cartella [`examples/`](examples/) contiene script pronti da aprire nell'edito
 | Script | Argomenti |
 |---|---|
 | [`01_universita.sql`](examples/01_universita.sql) | Schema relazionale con chiavi primarie (anche composte), chiavi esterne con azioni referenziali, `UNIQUE`, `CHECK`, `DEFAULT` — il database usato dagli esercizi |
-| [`02_query_bd1.sql`](examples/02_query_bd1.sql) | 28 esercizi: selezione e proiezione, join impliciti ed espliciti, outer join, self join, aggregati con `GROUP BY` / `HAVING`, `IN` / `EXISTS` / `ANY` / `ALL`, subquery correlate, **divisione relazionale** (doppio `NOT EXISTS` e conteggio), `UNION` / `INTERSECT` / `EXCEPT`, viste, `WITH`, tabelle derivate, `CASE` |
-| [`03_vincoli.sql`](examples/03_vincoli.sql) | Ogni vincolo violato apposta (le istruzioni marcate *errore atteso*), `CASCADE`, `SET NULL`, `ON UPDATE CASCADE`, `ALTER TABLE ADD/DROP CONSTRAINT`, `SHOW CREATE TABLE` |
+| [`02_query_bd1.sql`](examples/02_query_bd1.sql) | 35 esercizi: selezione e proiezione, join impliciti ed espliciti, outer join (anche `FULL`), self join, `USING`, aggregati con `GROUP BY` / `HAVING`, `IN` / `EXISTS` / `ANY` / `ALL`, subquery correlate, **divisione relazionale** (doppio `NOT EXISTS` e conteggio), `UNION` / `INTERSECT` / `EXCEPT`, viste, `WITH`, tabelle derivate, `CASE`, **chiusura transitiva** con `WITH RECURSIVE` (propedeuticità), classifiche e somme cumulative con le **funzioni finestra** |
+| [`03_vincoli.sql`](examples/03_vincoli.sql) | Ogni vincolo violato apposta (le istruzioni marcate *errore atteso*), `CASCADE`, `SET NULL`, `ON UPDATE CASCADE`, `ALTER TABLE ADD/DROP CONSTRAINT`, `ADD / RENAME / DROP COLUMN`, `SHOW CREATE TABLE` |
 | [`04_bd2_ottimizzazione.sql`](examples/04_bd2_ottimizzazione.sql) | Generazione di 10.000 righe con un prodotto cartesiano, scansione sequenziale contro accesso con indice, `CREATE INDEX`, selettività e stime, pushdown e hash join, subquery correlate, `ORDER BY` + `LIMIT`, buffer pool e checkpoint |
 | [`05_bd2_transazioni_trigger.sql`](examples/05_bd2_transazioni_trigger.sql) | Atomicità con `COMMIT` / `ROLLBACK`, `SAVEPOINT`, log WAL; trigger evento-condizione-azione, trigger a cascata, rifiuto con `SIGNAL`, trigger per riga e per istruzione |
 
@@ -161,6 +161,9 @@ DROP TABLE [IF EXISTS] esame;
 TRUNCATE TABLE esame;
 
 ALTER TABLE esame RENAME TO esami;
+ALTER TABLE studente ADD [COLUMN] email VARCHAR(60) DEFAULT 'n/d';      -- le righe esistenti ricevono il DEFAULT
+ALTER TABLE studente RENAME COLUMN email TO posta;                       -- aggiorna anche CHECK, FK e trigger
+ALTER TABLE studente DROP [COLUMN] posta;
 ALTER TABLE studente ADD CONSTRAINT nome_unico UNIQUE (nome, cognome);   -- i dati esistenti vengono controllati
 ALTER TABLE studente DROP CONSTRAINT nome_unico;
 SHOW CONSTRAINTS FROM esame;
@@ -191,7 +194,8 @@ DELETE FROM esame WHERE voto < (SELECT AVG(e2.voto) FROM esame e2 WHERE e2.corso
 
 ```sql
 SELECT [DISTINCT] espressioni [AS alias]
-FROM t1 [alias] { , t2 | [INNER | LEFT [OUTER] | RIGHT [OUTER] | CROSS] JOIN t2 [alias] [ON condizione] }
+FROM t1 [alias] { , t2 | [NATURAL] [INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER] | CROSS] JOIN t2 [alias]
+                  [ON condizione | USING (colonne)] }
 WHERE condizione
 GROUP BY espressioni HAVING condizione
 ORDER BY espressioni [ASC | DESC]
@@ -200,12 +204,14 @@ LIMIT n [OFFSET m];
 
 | Costrutto | Esempio |
 |---|---|
-| Operatori | `+ - * /`, `= <> != < > <= >=`, `AND OR NOT` (logica a tre valori), `IS [NOT] NULL`, `[NOT] LIKE 'a%_'`, `[NOT] BETWEEN`, `[NOT] IN (lista)` |
+| Operatori | `+ - * / %`, `= <> != < > <= >=`, `AND OR NOT` (logica a tre valori), `IS [NOT] NULL`, `[NOT] LIKE 'a%_'`, `[NOT] BETWEEN`, `[NOT] IN (lista)` |
 | Aggregati | `COUNT(*)`, `COUNT([DISTINCT] x)`, `SUM`, `AVG`, `MIN`, `MAX` (anche su espressioni) |
 | Subquery | `x IN (SELECT ...)`, `NOT IN`, `EXISTS`, `NOT EXISTS`, `x > ALL (SELECT ...)`, `x = ANY / SOME (...)`, subquery scalari `(SELECT MAX(voto) FROM esame)` in `SELECT`, `WHERE`, `HAVING`, `SET`; correlate a qualunque profondità |
 | Insiemi | `UNION [ALL]`, `INTERSECT`, `EXCEPT` (`INTERSECT` lega più degli altri), `ORDER BY` / `LIMIT` sul risultato |
 | Tabelle derivate | `FROM (SELECT ...) AS t`, `JOIN (SELECT ...) AS t ON ...` |
-| `WITH` | `WITH medie AS (SELECT ...), migliori AS (SELECT ... FROM medie) SELECT ...` |
+| `WITH` | `WITH medie (studente, media) AS (SELECT ...), migliori AS (SELECT ... FROM medie) SELECT ...` |
+| `WITH RECURSIVE` | `WITH RECURSIVE sotto AS (SELECT id FROM persona WHERE id = 1 UNION SELECT p.id FROM persona p JOIN sotto s ON p.capo = s.id) SELECT ...` — con `UNION` i cicli terminano; una ricorsione senza fine viene fermata dopo 1000 passi |
+| Funzioni finestra | `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `NTILE(n)`, `LAG(x [, k [, def]])`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `COUNT/SUM/AVG/MIN/MAX(...)` con `OVER ([PARTITION BY ...] [ORDER BY ...])` |
 | `CASE` | `CASE WHEN voto >= 28 THEN 'alto' ELSE 'basso' END`, `CASE cfu WHEN 6 THEN ... END` |
 | Funzioni | `UPPER`, `LOWER`, `LENGTH`, `CHAR_LENGTH`, `TRIM`, `CONCAT`, `CONCAT_WS`, `SUBSTRING`, `LEFT`, `RIGHT`, `REPLACE`, `REVERSE`, `ABS`, `ROUND`, `FLOOR`, `CEIL`, `MOD`, `POWER`, `SQRT`, `SIGN`, `COALESCE`, `IFNULL`, `NULLIF`, `IF`, `NOW`, `CURDATE`, `YEAR`, `MONTH`, `DAY` |
 
@@ -248,7 +254,7 @@ END;
 DROP TRIGGER [IF EXISTS] nome;   SHOW TRIGGERS [FROM tabella];
 ```
 
-`NEW` e `OLD` si usano nel corpo come le colonne di una query esterna (`WHERE id = NEW.conto`). Un trigger può attivarne altri fino a 16 livelli; se fallisce, l'intero statement che lo ha attivato viene annullato. I trigger non scattano per le modifiche fatte dalle azioni `CASCADE` / `SET NULL` delle chiavi esterne.
+`NEW` e `OLD` si usano nel corpo come le colonne di una query esterna (`WHERE id = NEW.conto`). Un trigger può attivarne altri fino a 16 livelli; se fallisce, l'intero statement che lo ha attivato viene annullato. Scattano anche per le righe modificate dalle azioni `CASCADE` / `SET NULL` / `SET DEFAULT` delle chiavi esterne.
 
 ### Tipi di dato supportati
 
@@ -268,7 +274,7 @@ DROP TRIGGER [IF EXISTS] nome;   SHOW TRIGGERS [FROM tabella];
 
 ### Non supportato
 
-`FULL OUTER JOIN`, `NATURAL JOIN`, `WITH RECURSIVE`, funzioni finestra (`OVER`), `ALTER TABLE ADD/DROP COLUMN`, stored procedure, controllo della concorrenza fra più utenti (il motore è embedded: una sessione alla volta).
+Frame espliciti delle funzioni finestra (`ROWS BETWEEN ...`), `ALTER COLUMN` per cambiare il tipo di una colonna, stored procedure, controllo della concorrenza fra più utenti (il motore è embedded: una sessione alla volta).
 
 ---
 
@@ -384,16 +390,18 @@ Tutti i colori vivono in una struct `Theme` (`src/widgets/theme.h` / `theme.c`):
 
 | Operazione | Tempo |
 |---|---|
-| 110.050 `INSERT` (blocchi da 500 righe) | 0,33 s |
+| 110.050 `INSERT` (blocchi da 500 righe) | 0,11 s |
+| `COUNT(*)` su 100.000 righe | 9 ms |
 | `SELECT ... WHERE voto = 30` su 100.000 righe | 10 ms |
-| `GROUP BY` + `AVG` su 100.000 righe | 19 ms |
-| `ORDER BY ... LIMIT 10` su 100.000 righe | 36 ms |
-| join di 2 tabelle (hash join) + filtro | 10 ms |
-| `NOT EXISTS` correlata, 10.000 × 100.000 righe | 10 ms |
-| divisione relazionale (doppio `NOT EXISTS`) | 24 ms |
+| `GROUP BY` + `AVG` su 100.000 righe | 10 ms |
+| `ORDER BY ... LIMIT 10` su 100.000 righe | 11 ms |
+| join di 2 tabelle (hash join) + filtro | 8 ms |
+| join di 3 tabelle + `GROUP BY` | 19 ms |
+| `NOT EXISTS` correlata, 10.000 × 100.000 righe | 9 ms |
+| divisione relazionale (doppio `NOT EXISTS`) | 22 ms |
 | ricerca per chiave primaria | 0,01 ms |
 
-Da dove viene la velocità: free-space map dell'heap (un `INSERT` non legge più tutta la tabella), buffer pool con tabella hash, scansioni senza allocare le righe scartate dai filtri, numeri formattati come testo solo per il risultato, hash join, subquery correlate risolte con una ricerca per chiave sulle righe lette una volta sola, `ORDER BY` + `LIMIT` che calcola le colonne solo delle righe tenute.
+Da dove viene la velocità: free-space map dell'heap (un `INSERT` non legge più tutta la tabella), buffer pool con tabella hash, log scritto una volta per statement, token e nodi del parser leggeri, scansioni senza allocare le righe scartate dai filtri e righe tenute in un'arena, numeri formattati come testo solo per il risultato, `GROUP BY` e hash join con hash tipizzati, subquery correlate risolte con una ricerca per chiave sulle righe lette una volta sola, `ORDER BY` + `LIMIT` con un heap top-k che calcola le colonne solo delle righe tenute.
 
 ---
 
@@ -620,7 +628,7 @@ make
 # GUI-only build (uses db_api_test.c stub, no engine) — same binary name
 make gui
 
-# Test: motore (128), SQL end-to-end (389, con crash e recovery), script di examples/ (142 istruzioni)
+# Test: motore (128), SQL end-to-end (469, con crash e recovery), script di examples/ (159 istruzioni)
 make test
 
 # Gli stessi test con AddressSanitizer + UndefinedBehaviorSanitizer
