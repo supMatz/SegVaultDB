@@ -370,6 +370,9 @@ int main(void) {
     printf("perf: 20000 INSERT in %.0f ms, 2000 lookups by key in %.0f ms\n", t1 - t0, t2 - t1);
     if (t1 - t0 > 20000 || t2 - t1 > 5000) { failed++; printf("FAIL: too slow\n"); }
     t("SELECT COUNT(*) FROM perf", "20000");
+    t("SELECT id FROM perf ORDER BY id DESC LIMIT 3 OFFSET 2", "19998;19997;19996");           // top-k con heap
+    t("SELECT id % 7, id FROM perf ORDER BY id % 7 DESC, id LIMIT 4", "6|6;6|13;6|20;6|27");  // pareggi: ordine stabile
+    t("SELECT MAX(id), COUNT(DISTINCT id % 10) FROM perf GROUP BY id % 2 ORDER BY 1", "19999|5;20000|5");
     t("INSERT INTO perf VALUES (777, 'dup')", "ERR:Duplicate entry '777'");
 
     // ── Basi di Dati 1: subquery, operatori insiemistici, CASE, WITH (schema universitario) ──

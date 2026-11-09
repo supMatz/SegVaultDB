@@ -975,6 +975,28 @@ static void mi_on_delete(const char* db, TableSchema* ts, const Tuple* t, RID ri
 
 #define MAX_SOURCES 9            // FROM + 8 JOIN
 
+// arena: righe lette da una tabella allocate a blocchi e liberate tutte insieme
+typedef struct ArenaBlk { struct ArenaBlk* next; size_t used, cap; } ArenaBlk;
+typedef struct { ArenaBlk* head; } Arena;
+
+static void* arena_alloc(Arena* a, size_t n) {
+    n = (n + 7) & ~(size_t)7;
+    if (!a->head || a->head->used + n > a->head->cap) {
+        size_t cap = n > 65536 - sizeof(ArenaBlk) ? n : 65536 - sizeof(ArenaBlk);
+        ArenaBlk* b = malloc(sizeof(ArenaBlk) + cap);
+        if (!b) return NULL;
+        b->next = a->head; b->used = 0; b->cap = cap;
+        a->head = b;
+    }
+    void* p = (char*)(a->head + 1) + a->head->used;
+    a->head->used += n;
+    return p;
+}
+
+static void arena_free(Arena* a) {
+    while (a->head) { ArenaBlk* n = a->head->next; free(a->head); a->head = n; }
+}
+
 typedef struct {
     char         name[SV_MAX_NAME_LEN];    // nome con cui la si qualifica (alias o nome)
     char         table[SV_MAX_NAME_LEN];   // nome reale
@@ -985,10 +1007,13 @@ typedef struct {
     int          n;
     bool         is_view;
     bool         loaded;
+    bool         arena_rows;               // righe nell'arena (non si liberano una per una)
+    Arena        arena;
 } Source;
 
 static void source_free(Source* s) {
-    for (int i = 0; i < s->n; i++) tuple_free(s->rows[i]);
+    for (int i = 0; !s->arena_rows && i < s->n; i++) tuple_free(s->rows[i]);
+    arena_free(&s->arena);
     free(s->rows);
     free(s->rids);
     free(s->own_ts);
@@ -1661,6 +1686,17 @@ static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out) {
                     ev_num(out, e->op == OP_PLUS ? x + y : e->op == OP_MINUS ? x - y : x * y);
                     return;
                 }
+                case OP_MOD: {                                   // come MOD(a, b)
+                    if (a.is_int && b.is_int) {
+                        if (b.inum == 0) { ev_null(out); return; }
+                        ev_int(out, b.inum == -1 ? 0 : a.inum % b.inum);
+                        return;
+                    }
+                    double y = ev_as_num(&b);
+                    if (y == 0) { ev_null(out); return; }
+                    ev_num(out, fmod(ev_as_num(&a), y));
+                    return;
+                }
                 case OP_DIV: {
                     double y = ev_as_num(&b);
                     if (y == 0) { ev_null(out); return; }            // divisione per zero: NULL (come MySQL)
@@ -1694,6 +1730,8 @@ static bool is_text_type(DataType t) {
     return t == SV_TYPE_VARCHAR || t == SV_TYPE_CHAR || t == SV_TYPE_TEXT || t == SV_TYPE_DATE || t == SV_TYPE_DATETIME;
 }
 static bool is_int_type(DataType t) { return t == SV_TYPE_INT || t == SV_TYPE_BIGINT; }
+// tipi conservati come numeri nella tupla (gli altri sono testo)
+static bool is_num_storage(DataType t) { return t == SV_TYPE_INT || t == SV_TYPE_BIGINT || t == SV_TYPE_FLOAT || t == SV_TYPE_BOOL; }
 
 static Tuple* tuple_clone(const Tuple* t, const TableSchema* ts);
 
@@ -1785,10 +1823,86 @@ static void ev_from_oval(EvalVal* v, const OVal* o) {
 
 static int key_cmp(const SortKey* a, const SortKey* b) {
     if (a->null || b->null) return a->null == b->null ? 0 : a->null ? -1 : 1;   // NULL per primi
+    if (a->is_int && b->is_int) return a->inum < b->inum ? -1 : a->inum > b->inum;
+    if (a->is_num && b->is_num) return a->num < b->num ? -1 : a->num > b->num;
+    if (!a->is_num && !b->is_num) { int c = strcmp(a->str ? a->str : "", b->str ? b->str : ""); return c < 0 ? -1 : c > 0; }
     EvalVal x, y;
     ev_from_oval(&x, a);
     ev_from_oval(&y, b);
     return ev_cmp(&x, &y);
+}
+
+// ── hash tipizzati (GROUP BY, hash join) ──
+
+static uint64_t mix64(uint64_t x) {
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33;
+    return x;
+}
+
+static uint64_t str_hash(const char* s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ULL; }
+    return h;
+}
+
+// valori uguali per il raggruppamento hanno lo stesso hash (5 e 5.0 compresi)
+static uint64_t ev_hash(const EvalVal* v) {
+    if (v->null) return 0x9e3779b97f4a7c15ULL;
+    if (v->is_num) {
+        if (v->is_int) return mix64((uint64_t)v->inum);
+        double d = v->num;
+        if (d == floor(d) && fabs(d) < 9e18) return mix64((uint64_t)(int64_t)d);
+        uint64_t b;
+        memcpy(&b, &d, 8);
+        return mix64(b ^ 0x5bd1e995ULL);
+    }
+    return str_hash(ev_s(v)) ^ 0x27d4eb2f165667c5ULL;
+}
+
+// stessa chiave di raggruppamento? (NULL con NULL sì, numeri per valore, testi per contenuto)
+static bool ev_eq_key(const EvalVal* a, const SortKey* b) {
+    if (a->null || b->null) return a->null && b->null;
+    if (a->is_num != b->is_num) return false;
+    if (a->is_num) return (a->is_int && b->is_int) ? a->inum == b->inum : a->num == b->num;
+    return strcmp(ev_s(a), b->str ? b->str : "") == 0;
+}
+
+typedef struct { uint64_t* h; int* v; size_t cap, n; } HMap;
+
+static void hmap_free(HMap* m) { free(m->h); free(m->v); memset(m, 0, sizeof(*m)); }
+
+// inserisce un elemento (anche con hash già presente: le collisioni si risolvono confrontando)
+static bool hmap_put(HMap* m, uint64_t h, int val) {
+    if ((m->n + 1) * 2 > m->cap) {
+        size_t nc = m->cap ? m->cap * 2 : 64;
+        uint64_t* nh = malloc(sizeof(uint64_t) * nc);
+        int* nv = malloc(sizeof(int) * nc);
+        if (!nh || !nv) { free(nh); free(nv); return false; }
+        for (size_t i = 0; i < nc; i++) nv[i] = -1;
+        for (size_t i = 0; i < m->cap; i++) {
+            if (m->v[i] < 0) continue;
+            size_t j = m->h[i] & (nc - 1);
+            while (nv[j] >= 0) j = (j + 1) & (nc - 1);
+            nh[j] = m->h[i]; nv[j] = m->v[i];
+        }
+        free(m->h); free(m->v);
+        m->h = nh; m->v = nv; m->cap = nc;
+    }
+    size_t j = h & (m->cap - 1);
+    while (m->v[j] >= 0) j = (j + 1) & (m->cap - 1);
+    m->h[j] = h; m->v[j] = val;
+    m->n++;
+    return true;
+}
+
+// hash del valore di una colonna (interi come numero, testi come testo); false per NULL
+static bool col_hash(const Tuple* t, int col, DataType type, uint64_t* h) {
+    if (!t || col >= t->num_values || t->values[col].is_null) return false;
+    const Value* v = &t->values[col];
+    if (type == SV_TYPE_INT) *h = mix64((uint64_t)(int64_t)v->int_val);
+    else if (type == SV_TYPE_BIGINT) *h = mix64((uint64_t)v->bigint_val);
+    else *h = str_hash(v->str_val ? v->str_val : "");
+    return true;
 }
 
 // chiave canonica (DISTINCT, UNION, INTERSECT, EXCEPT): numeri uguali hanno la stessa chiave
@@ -2763,10 +2877,27 @@ static bool plan_load(SelectPlan* p) {
                         cur[s] = NULL;
                         if (!keep) continue;
                     }
-                    Tuple* t = tuple_clone(view, S->ts);
-                    if (!t) { ok = false; break; }
+                    // copia nell'arena della sorgente: nessuna malloc per riga
+                    Tuple* t = arena_alloc(&S->arena, sizeof(Tuple));
+                    Value* vals = t ? arena_alloc(&S->arena, sizeof(Value) * (size_t)view->num_values) : NULL;
+                    if (!vals) { ok = false; break; }
+                    S->arena_rows = true;
+                    t->values = vals;
+                    t->num_values = view->num_values;
+                    for (int c = 0; c < view->num_values; c++) {
+                        vals[c] = view->values[c];
+                        vals[c].owns_str = false;
+                        if (!vals[c].is_null && view->values[c].str_val && !is_num_storage(S->ts->columns[c].type)) {
+                            size_t l = strlen(view->values[c].str_val) + 1;
+                            char* cp = arena_alloc(&S->arena, l);
+                            if (!cp) { ok = false; break; }
+                            memcpy(cp, view->values[c].str_val, l);
+                            vals[c].str_val = cp;
+                        }
+                    }
+                    if (!ok) break;
                     t->rid = rid;
-                    if (!source_push(S, t, rid, &cap)) { tuple_free(t); ok = false; }
+                    if (!source_push(S, t, rid, &cap)) ok = false;
                 }
                 if (view) { for (int c = 0; c < view->num_values; c++) view->values[c].owns_str = false; tuple_free(view); }
                 free(sbuf);
@@ -2851,23 +2982,24 @@ static const char* join_step(EvalCtx* ec, Combos* in, Combos* out, int k, JoinTy
     bool* right_hit = (keep_right && nrows) ? calloc((size_t)nrows, sizeof(bool)) : NULL;
     if (keep_right && nrows && !right_hit) return "Out of memory";
 
-    // hash join quando le condizioni contengono un'uguaglianza fra colonne confrontabili
+    // hash join quando le condizioni contengono un'uguaglianza fra colonne confrontabili: tabella
+    // hash -> prima riga, righe con lo stesso hash in catena (l'uguaglianza la verificano le condizioni)
     int kc, os, oc;
-    StrMap map = {0};
-    int* next = NULL;                     // catena delle righe con la stessa chiave
+    HMap map = {0};
+    int* next = NULL;
     bool hashed = find_hash_cond(conds, k, ec->src, &kc, &os, &oc);
     if (hashed) {
         next = malloc(sizeof(int) * (size_t)(nrows ? nrows : 1));
         if (!next) { free(right_hit); return "Out of memory"; }
         DataType kt = ec->src[k].ts->columns[kc].type;
         for (int r = nrows - 1; r >= 0; r--) {          // in ordine: la catena parte dalla prima riga
-            char key[EV_STR_MAX + 1];
+            uint64_t h;
             next[r] = -1;
-            if (!join_key(rows[r], kc, kt, key, sizeof(key))) continue;
-            SMSlot* sl = sm_slot(&map, key, true);
-            if (!sl) { sm_free(&map); free(next); free(right_hit); return "Out of memory"; }
-            next[r] = sl->val;
-            sl->val = r;
+            if (!col_hash(rows[r], kc, kt, &h)) continue;
+            size_t j = map.cap ? h & (map.cap - 1) : 0;
+            while (map.cap && map.v[j] >= 0 && map.h[j] != h) j = (j + 1) & (map.cap - 1);
+            if (map.cap && map.v[j] >= 0) { next[r] = map.v[j]; map.v[j] = r; continue; }
+            if (!hmap_put(&map, h, r)) { hmap_free(&map); free(next); free(right_hit); return "Out of memory"; }
         }
     }
     const char* fail = NULL;
@@ -2879,9 +3011,13 @@ static const char* join_step(EvalCtx* ec, Combos* in, Combos* out, int k, JoinTy
         bool matched = false;
         int r = 0;
         if (hashed) {
-            char key[EV_STR_MAX + 1];
-            SMSlot* sl = join_key(base[os], oc, ot, key, sizeof(key)) ? sm_slot(&map, key, false) : NULL;
-            r = sl ? sl->val : -1;
+            uint64_t h;
+            r = -1;
+            if (col_hash(base[os], oc, ot, &h) && map.cap) {
+                size_t j = h & (map.cap - 1);
+                while (map.v[j] >= 0 && map.h[j] != h) j = (j + 1) & (map.cap - 1);
+                r = map.v[j];
+            }
         }
         for (; hashed ? r >= 0 : r < nrows; r = hashed ? next[r] : r + 1) {
             base[k] = rows[r];
@@ -2898,7 +3034,7 @@ static const char* join_step(EvalCtx* ec, Combos* in, Combos* out, int k, JoinTy
     if (!fail && right_hit)
         for (int r = 0; r < nrows && !fail; r++)
             if (!right_hit[r] && !combos_push(out, NULL, k, rows[r])) fail = "Out of memory";
-    sm_free(&map);
+    hmap_free(&map);
     free(next);
     free(right_hit);
     ec->cur = NULL;
@@ -3205,30 +3341,46 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
     int nunits = 0, nunits_total = 0;
     if (p->grouped) {
         int ngroups = 0;
+        // gruppi con una tabella hash sui valori (tipizzati: niente conversione in testo per riga)
+        int ng = n->select_stmt.num_group;
         int* group_of = malloc(sizeof(int) * (size_t)(st.combos.n ? st.combos.n : 1));
-        StrMap gm = {0};
-        bool ok = group_of != NULL;
-        char* sig = malloc(SV_MAX_GROUP * (EV_STR_MAX + 8) + 1);
-        if (!sig) ok = false;
+        EvalVal* kv = malloc(sizeof(EvalVal) * (size_t)(ng ? ng : 1));
+        HMap gm = {0};
+        SortKey* gk = NULL;                       // chiavi di ogni gruppo
+        int capg = 0;
+        bool ok = group_of && kv;
         for (int i = 0; ok && i < st.combos.n; i++) {
             ec.cur = COMBO(&st.combos, i);
-            size_t len = 0;
-            sig[0] = '\0';
-            for (int g = 0; g < n->select_stmt.num_group; g++) {
-                EvalVal v;
-                OVal o;
-                eval_expr(n->select_stmt.group_exprs[g], &ec, &v);
-                o.null = v.null; o.is_num = v.is_num; o.is_int = v.is_int; o.inum = v.inum; o.num = v.num;
-                o.str = (char*)(v.null || v.is_num ? NULL : ev_s(&v));
-                len += oval_key(&o, sig + len, EV_STR_MAX + 8);
+            uint64_t h = 0x84222325cbf29ce4ULL;
+            for (int g = 0; g < ng; g++) {
+                eval_expr(n->select_stmt.group_exprs[g], &ec, &kv[g]);
+                h = mix64(h ^ ev_hash(&kv[g]));
             }
-            SMSlot* sl = sm_slot(&gm, sig, true);
-            if (!sl) { ok = false; break; }
-            if (sl->val < 0) sl->val = ngroups++;
-            group_of[i] = sl->val;
+            int found = -1;
+            for (size_t j = gm.cap ? h & (gm.cap - 1) : 0; gm.cap && gm.v[j] >= 0; j = (j + 1) & (gm.cap - 1))
+                if (gm.h[j] == h) {
+                    bool eq = true;
+                    for (int g = 0; g < ng && eq; g++) eq = ev_eq_key(&kv[g], &gk[(size_t)gm.v[j] * (size_t)ng + (size_t)g]);
+                    if (eq) { found = gm.v[j]; break; }
+                }
+            if (found < 0) {
+                if (ngroups >= capg) {
+                    int nc = capg ? capg * 2 : 64;
+                    SortKey* nk = realloc(gk, sizeof(SortKey) * (size_t)nc * (size_t)(ng ? ng : 1));
+                    if (!nk) { ok = false; break; }
+                    gk = nk;
+                    capg = nc;
+                }
+                for (int g = 0; g < ng; g++) key_set(&gk[(size_t)ngroups * (size_t)ng + (size_t)g], &kv[g]);
+                if (!hmap_put(&gm, h, ngroups)) { ok = false; break; }
+                found = ngroups++;
+            }
+            group_of[i] = found;
         }
-        sm_free(&gm);
-        free(sig);
+        for (size_t i = 0; gk && i < (size_t)ngroups * (size_t)ng; i++) free(gk[i].str);
+        free(gk);
+        free(kv);
+        hmap_free(&gm);
         ec.cur = NULL;
         if (ok && n->select_stmt.num_group == 0 && ngroups == 0) ngroups = 1;   // solo aggregati: un gruppo anche vuoto
         st.group_start = calloc((size_t)ngroups + 1, sizeof(int));
@@ -3338,6 +3490,32 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
         g_sort.keys = st.keys;
         g_sort.nkeys = nkeys;
         g_sort.desc = n->select_stmt.order_desc;
+        long want = apply_order && n->select_stmt.has_limit ? (long)n->select_stmt.offset + n->select_stmt.limit : -1;
+        if (want >= 0 && want < nkeep / 4) {
+            // ORDER BY ... LIMIT k: le prime k righe con un heap (O(n log k)), poi si ordinano solo quelle
+            int k = (int)want, hn = 0;
+            for (int i = 0; i < nkeep; i++) {
+                int x = order[i];
+                if (hn < k) {                                        // inserisce nel max-heap
+                    int j = hn++;
+                    while (j > 0 && unit_cmp(&order[(j - 1) / 2], &x) < 0) { order[j] = order[(j - 1) / 2]; j = (j - 1) / 2; }
+                    order[j] = x;
+                } else if (k > 0 && unit_cmp(&x, &order[0]) < 0) {   // più piccolo del massimo: lo sostituisce
+                    int j = 0;
+                    for (;;) {
+                        int l = 2 * j + 1, r = l + 1, m = j;
+                        const int* cand = &x;
+                        if (l < hn && unit_cmp(&order[l], cand) > 0) { m = l; cand = &order[l]; }
+                        if (r < hn && unit_cmp(&order[r], cand) > 0) { m = r; }
+                        if (m == j) break;
+                        order[j] = order[m];
+                        j = m;
+                    }
+                    order[j] = x;
+                }
+            }
+            nkeep = hn;
+        }
         qsort(order, (size_t)nkeep, sizeof(int), unit_cmp);
     }
     int first = 0, count = nkeep;

@@ -56,7 +56,8 @@ typedef struct SubQuery {
 typedef enum { OP_EQ, OP_NEQ, OP_LT, OP_GT, OP_LE, OP_GE,
                OP_AND, OP_OR, OP_NOT, OP_PLUS, OP_MINUS, OP_MUL, OP_DIV,
                OP_IS_NULL, OP_IS_NOT_NULL, OP_LIKE, OP_NOT_LIKE,
-               OP_NEG       // meno unario (EXPR_UNARY)
+               OP_NEG,      // meno unario (EXPR_UNARY)
+               OP_MOD       // a % b
 } OpType;
 
 typedef struct ASTExpr {

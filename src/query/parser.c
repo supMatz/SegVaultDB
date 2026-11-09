@@ -42,7 +42,7 @@ static const char* token_name(TokenType tt) {
         "FOR", "EACH", "ROW", "RENAME", "BOOLEAN",
         "an integer", "a number", "a string", "a name", "'*'", "','", "';'", "'.'",
         "'('", "')'", "'='", "'!='", "'<'", "'>'", "'<='", "'>='", "'+'", "'-'",
-        "'/'", "end of statement", "invalid token",
+        "'/'", "'%'", "end of statement", "invalid token",
     };
     _Static_assert(sizeof(NAMES) / sizeof(NAMES[0]) == TOK_ERROR + 1, "token_name non allineato a TokenType");
     return (tt >= 0 && tt <= TOK_ERROR) ? NAMES[tt] : "?";
@@ -220,6 +220,7 @@ static const char* op_text(OpType op) {
         case OP_GT: return " > ";   case OP_LE: return " <= ";  case OP_GE: return " >= ";
         case OP_AND: return " AND "; case OP_OR: return " OR ";
         case OP_PLUS: return " + "; case OP_MINUS: return " - "; case OP_MUL: return " * "; case OP_DIV: return " / ";
+        case OP_MOD: return " % ";
         case OP_LIKE: return " LIKE "; case OP_NOT_LIKE: return " NOT LIKE ";
         default: return " ? ";
     }
@@ -620,6 +621,7 @@ static ASTExpr* parse_multiplicative(ParserState* ps) {
         OpType op;
         if (match(ps, TOK_STAR))       op = OP_MUL;
         else if (match(ps, TOK_SLASH)) op = OP_DIV;
+        else if (match(ps, TOK_PERCENT)) op = OP_MOD;
         else break;
         e = depth_check(ps, new_binary(op, e, parse_unary(ps)));
     }
