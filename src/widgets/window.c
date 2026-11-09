@@ -2550,33 +2550,34 @@ static const char* const ABOUT_LINES[] = {
 
 static const char* const SQL_LINES[] = {
     "#Databases and tables",
-    "CREATE DATABASE db;  USE db;  DROP DATABASE db;  SHOW DATABASES;  SHOW TABLES;  DESCRIBE t;",
-    "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(50) NOT NULL, qty INT DEFAULT 0);",
-    "ALTER TABLE t RENAME TO t2;  DROP TABLE t;  TRUNCATE TABLE t;",
-    "CREATE INDEX i ON t (col);  DROP INDEX i ON t;  CREATE VIEW v AS SELECT ...;  DROP VIEW v;",
-    "Types: INT BIGINT FLOAT DOUBLE DECIMAL VARCHAR(n) CHAR(n) TEXT BOOLEAN DATE DATETIME BLOB",
+    "CREATE DATABASE [IF NOT EXISTS] db;  USE db;  DROP DATABASE [IF EXISTS] db;  SHOW DATABASES;  SHOW TABLES;",
+    "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(50) NOT NULL UNIQUE, qty INT DEFAULT 0 CHECK (qty >= 0),",
+    "    d INT REFERENCES dept ON DELETE CASCADE, PRIMARY KEY (a, b), FOREIGN KEY (x) REFERENCES p (y) ON UPDATE SET NULL);",
+    "ALTER TABLE t RENAME TO t2 | ADD CONSTRAINT c UNIQUE (a) | DROP CONSTRAINT c;  DROP TABLE t;  TRUNCATE TABLE t;",
+    "DESCRIBE t;  SHOW CREATE TABLE t;  SHOW CONSTRAINTS FROM t;  SHOW INDEXES FROM t;  CREATE INDEX i ON t (col);",
+    "CREATE VIEW v AS SELECT ...;  Types: INT BIGINT FLOAT DECIMAL VARCHAR(n) CHAR(n) TEXT BOOLEAN DATE DATETIME",
     "",
     "#Reading data",
-    "SELECT [DISTINCT] expressions [AS alias] FROM t [alias] [JOIN t2 [alias] ON condition] [WHERE ...]",
-    "       [GROUP BY ...] [HAVING ...] [ORDER BY expr [ASC|DESC], ...] [LIMIT n [OFFSET m]];",
-    "JOIN: INNER, LEFT, RIGHT, CROSS or comma; any ON condition; self-joins with aliases; views as tables",
-    "Operators: + - * /  = != <> < > <= >=  AND OR NOT  LIKE  BETWEEN  IN (...)  IS [NOT] NULL  TRUE FALSE",
-    "Aggregates: COUNT(*) COUNT([DISTINCT] x) SUM AVG MIN MAX (also on expressions)",
-    "Functions: UPPER LOWER LENGTH CHAR_LENGTH TRIM CONCAT CONCAT_WS SUBSTRING LEFT RIGHT REPLACE REVERSE",
-    "           ABS ROUND FLOOR CEIL MOD POWER SQRT SIGN COALESCE IFNULL NULLIF IF NOW CURDATE YEAR MONTH DAY",
-    "SELECT without FROM: SELECT 1;  SELECT NOW();      EXPLAIN SELECT ... shows the query plan",
+    "SELECT [DISTINCT] expr [AS a] FROM t [a] {, t2 | [LEFT|RIGHT|CROSS] JOIN t2 ON ...} [WHERE] [GROUP BY] [HAVING]",
+    "       [ORDER BY expr [DESC]] [LIMIT n [OFFSET m]];   UNION [ALL], INTERSECT, EXCEPT between SELECTs",
+    "Subqueries: x IN (SELECT ...), NOT IN, EXISTS, NOT EXISTS, x > ALL / ANY (SELECT ...), (SELECT MAX(..)) as a value",
+    "FROM (SELECT ...) AS d;  WITH m AS (SELECT ...) SELECT ... FROM m;  CASE WHEN c THEN a ELSE b END",
+    "Operators: + - * / = <> < > <= >= AND OR NOT LIKE BETWEEN IN IS [NOT] NULL;  COUNT SUM AVG MIN MAX",
+    "Functions: UPPER LOWER LENGTH TRIM CONCAT SUBSTRING REPLACE ABS ROUND FLOOR CEIL MOD COALESCE NULLIF IF NOW YEAR",
     "",
     "#Changing data",
-    "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y'), ...;   all rows or none",
-    "UPDATE t SET a = a + 1, b = 'z' WHERE ...;   DELETE FROM t WHERE ...;",
-    "Strings: 'It''s' or 'It\\'s'  \xc2\xb7  escapes \\n \\t \\\\",
+    "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y');  INSERT INTO t SELECT ...;   all rows or none",
+    "UPDATE t SET a = a + 1 WHERE ...;  DELETE FROM t WHERE ...;   constraints checked before writing",
     "",
-    "#Transactions",
-    "BEGIN;  COMMIT;  ROLLBACK;  SAVEPOINT s;  ROLLBACK TO s;",
+    "#Transactions and triggers",
+    "BEGIN;  COMMIT;  ROLLBACK;  SAVEPOINT s;  ROLLBACK TO s;  CHECKPOINT;",
+    "CREATE TRIGGER n {BEFORE|AFTER} {INSERT|UPDATE [OF c]|DELETE} ON t FOR EACH {ROW|STATEMENT} [WHEN (...)]",
+    "    BEGIN ...; END   with NEW.col / OLD.col, SET NEW.col = ..., SIGNAL 'message', IF ... THEN ... END IF",
     "",
-    "#Checks and limits",
-    "Values are validated (integers, numbers, VARCHAR(n) length, real dates); NOT NULL and PRIMARY KEY enforced.",
-    "Text values up to 511 bytes. Not yet: subqueries, ALTER TABLE ADD/DROP COLUMN.",
+    "#Inside the engine",
+    "EXPLAIN SELECT ...  plan with estimated rows;  EXPLAIN ANALYZE SELECT ...  also the actual rows and times",
+    "SHOW STATUS  buffer pool hits / misses / CLOCK evictions, log size;  SHOW TRIGGERS",
+    "Exercises for Databases 1 and 2: the examples/ folder (01_universita.sql ... 05_bd2_transazioni_trigger.sql)",
 };
 
 static void draw_info(AppWindow* app) {
@@ -3086,6 +3087,9 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
         "--\n"
         "-- The example below creates a small database, fills a table and queries it.\n"
         "-- Change it as you like, or start from a blank script with Ctrl+N.\n"
+        "--\n"
+        "-- Exercises for Databases 1 and 2 (in Italian) are in the examples/ folder:\n"
+        "-- open examples/01_universita.sql with Ctrl+O and run it with F5, then 02 ... 05.\n"
         "\n"
         "CREATE DATABASE demo;\n"
         "USE demo;\n"

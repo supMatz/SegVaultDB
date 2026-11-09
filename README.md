@@ -8,7 +8,10 @@
 ## 📋 Table of Contents
 
 - [Overview](#overview)
+- [Per i corsi di Basi di Dati 1 e 2](#per-i-corsi-di-basi-di-dati-1-e-2)
+- [Supported SQL](#supported-sql)
 - [Architecture](#architecture)
+- [Prestazioni](#prestazioni)
 - [GUI Layout](#gui-layout)
 - [Source Structure](#source-structure)
 - [Documentation & References](#documentation--references)
@@ -29,17 +32,44 @@
 ## Overview
 
 **SegVault** is a didactic yet fully functional relational DBMS built entirely in C — no external libraries, no frameworks, no shortcuts.
+Pensato per i corsi di **Basi di Dati 1 e 2** di ingegneria informatica: lo stesso programma fa da ambiente per gli esercizi di SQL e da laboratorio sugli interni di un DBMS (piani di esecuzione, indici, buffer pool, log, transazioni, trigger).
 
 | Feature | Details |
 |---|---|
-| **Language** | C (C11) |
-| **Version** | 0.1.0 |
+| **Language** | C (C11), zero dipendenze per il motore |
+| **Version** | 1.1.0 |
 | **GUI** | Win32 / GDI (Windows) · Xlib/X11 + Xft (Linux) |
 | **Font** | JetBrains Mono (editor e dati) · Inter / Fira Sans (interfaccia), con fallback automatico |
-| **Storage** | Custom B+Tree with page-based I/O (4 KB pages) |
-| **SQL** | Hand-written recursive descent parser + lexer |
-| **Transactions** | Write-Ahead Log (ARIES-style recovery) |
-| **Cross-compilation** | MinGW-w64 — build `.exe` from Linux (⚠ richiede fix `pread`/`pwrite`) |
+| **SQL** | Lexer e parser a discesa ricorsiva scritti a mano; subquery (anche correlate), `UNION` / `INTERSECT` / `EXCEPT`, `WITH`, `CASE`, viste, vincoli, trigger |
+| **Vincoli** | `PRIMARY KEY` (anche composta), `UNIQUE`, `NOT NULL`, `CHECK`, `FOREIGN KEY` con `ON DELETE` / `ON UPDATE` `CASCADE`, `SET NULL`, `SET DEFAULT`, `RESTRICT` |
+| **Storage** | Heap file a pagine da 4 KB con slot directory e free-space map; indici hash in memoria (anche su più colonne) |
+| **Buffer pool** | 1024 frame, tabella hash per la ricerca, sostituzione **CLOCK**; statistiche con `SHOW STATUS` |
+| **Ottimizzatore** | Pushdown delle selezioni, hash join (anche per `FROM a, b WHERE a.x = b.y`), accesso con indice, subquery decorrelate per chiave; `EXPLAIN` con stime alla System R e `EXPLAIN ANALYZE` con le righe reali |
+| **Transazioni** | Write-Ahead Log con undo/redo, `BEGIN` / `COMMIT` / `ROLLBACK`, `SAVEPOINT`, recovery dopo un crash, `CHECKPOINT` (anche automatico) |
+| **Basi di dati attive** | Trigger `BEFORE` / `AFTER`, `FOR EACH ROW` / `FOR EACH STATEMENT`, `NEW` / `OLD`, `WHEN`, `SET NEW.col`, `SIGNAL`, `IF` |
+| **Cross-compilation** | MinGW-w64 — `make windows` produce `segvault.exe` da Linux |
+
+---
+
+## Per i corsi di Basi di Dati 1 e 2
+
+La cartella [`examples/`](examples/) contiene script pronti da aprire nell'editor (`Ctrl+O`): ogni istruzione è commentata con la domanda a cui risponde. Il test `make test` li esegue tutti, quindi funzionano sempre con la versione corrente.
+
+| Script | Argomenti |
+|---|---|
+| [`01_universita.sql`](examples/01_universita.sql) | Schema relazionale con chiavi primarie (anche composte), chiavi esterne con azioni referenziali, `UNIQUE`, `CHECK`, `DEFAULT` — il database usato dagli esercizi |
+| [`02_query_bd1.sql`](examples/02_query_bd1.sql) | 28 esercizi: selezione e proiezione, join impliciti ed espliciti, outer join, self join, aggregati con `GROUP BY` / `HAVING`, `IN` / `EXISTS` / `ANY` / `ALL`, subquery correlate, **divisione relazionale** (doppio `NOT EXISTS` e conteggio), `UNION` / `INTERSECT` / `EXCEPT`, viste, `WITH`, tabelle derivate, `CASE` |
+| [`03_vincoli.sql`](examples/03_vincoli.sql) | Ogni vincolo violato apposta (le istruzioni marcate *errore atteso*), `CASCADE`, `SET NULL`, `ON UPDATE CASCADE`, `ALTER TABLE ADD/DROP CONSTRAINT`, `SHOW CREATE TABLE` |
+| [`04_bd2_ottimizzazione.sql`](examples/04_bd2_ottimizzazione.sql) | Generazione di 10.000 righe con un prodotto cartesiano, scansione sequenziale contro accesso con indice, `CREATE INDEX`, selettività e stime, pushdown e hash join, subquery correlate, `ORDER BY` + `LIMIT`, buffer pool e checkpoint |
+| [`05_bd2_transazioni_trigger.sql`](examples/05_bd2_transazioni_trigger.sql) | Atomicità con `COMMIT` / `ROLLBACK`, `SAVEPOINT`, log WAL; trigger evento-condizione-azione, trigger a cascata, rifiuto con `SIGNAL`, trigger per riga e per istruzione |
+
+**Basi di Dati 1** — modello relazionale e SQL: tutto il linguaggio di interrogazione dei corsi (compresi gli operatori insiemistici e le interrogazioni annidate con la logica a tre valori di SQL: `NOT IN` con un `NULL` non è mai vero, `ALL` su un insieme vuoto è vero), viste, vincoli di integrità di dominio, di tupla, di chiave e referenziali, con controllo prima di ogni scrittura: uno statement che viola un vincolo non modifica nulla.
+
+**Basi di Dati 2** — come funziona un DBMS:
+- `EXPLAIN` mostra il piano: scansione sequenziale o accesso con indice, filtri anticipati, hash join o nested loop, aggregazione, ordinamento, con le **stime delle righe secondo le selettività di default di System R** (1/10 per `=`, 1/3 per un intervallo). `EXPLAIN ANALYZE` esegue la query e affianca le righe reali di ogni passo, il numero di esecuzioni delle subquery correlate e i tempi.
+- `SHOW STATUS` riporta richieste al buffer pool, hit, miss, hit ratio, sostituzioni (CLOCK), pagine scritte, dimensione del log e checkpoint; `SHOW INDEXES FROM t` gli indici e se sono già stati costruiti.
+- Transazioni con WAL: ogni modifica viene scritta nel log prima delle pagine; `ROLLBACK` usa le immagini precedenti (undo), dopo un crash le transazioni completate vengono rifatte (redo) e quelle aperte annullate. `CHECKPOINT` scrive le pagine e svuota il log.
+- Trigger con la semantica dei DBMS reali: i `BEFORE` vedono e possono cambiare la riga prima dei controlli dei vincoli, gli `AFTER` possono attivare altri trigger; se un trigger fallisce lo statement viene annullato per intero.
 
 ---
 
@@ -115,59 +145,110 @@ Ogni statement eseguito viene registrato in `<data>/history.sql` (data, esito, r
 ### Data Definition Language (DDL)
 
 ```sql
--- Database
-CREATE DATABASE nome_db;
-DROP DATABASE nome_db;
-USE nome_db;
-SHOW DATABASES;
-SHOW TABLES;
-DESCRIBE nome_tabella;
+CREATE DATABASE [IF NOT EXISTS] uni;    DROP DATABASE [IF EXISTS] uni;    USE uni;
+SHOW DATABASES;   SHOW TABLES;   DESCRIBE esame;   SHOW CREATE TABLE esame;
 
--- Table
-CREATE TABLE utenti (
-    id     INT,
-    nome   VARCHAR(100),
-    eta    INT,
-    salario FLOAT,
-    attivo BOOLEAN
+CREATE TABLE [IF NOT EXISTS] esame (
+    studente INT        NOT NULL REFERENCES studente ON DELETE CASCADE,
+    corso    VARCHAR(6) NOT NULL REFERENCES corso (codice),
+    data     DATE       NOT NULL,
+    voto     INT        NOT NULL CHECK (voto BETWEEN 18 AND 30),
+    lode     BOOLEAN    DEFAULT 0,
+    PRIMARY KEY (studente, corso),                          -- chiave composta
+    CONSTRAINT lode_solo_30 CHECK (lode = 0 OR voto = 30)   -- vincolo di tupla con nome
 );
-DROP TABLE nome_tabella;
+DROP TABLE [IF EXISTS] esame;
+TRUNCATE TABLE esame;
 
--- Index
-CREATE INDEX idx_nome ON utenti (nome);
+ALTER TABLE esame RENAME TO esami;
+ALTER TABLE studente ADD CONSTRAINT nome_unico UNIQUE (nome, cognome);   -- i dati esistenti vengono controllati
+ALTER TABLE studente DROP CONSTRAINT nome_unico;
+SHOW CONSTRAINTS FROM esame;
+
+CREATE INDEX idx_esame_corso ON esame (corso);   DROP INDEX idx_esame_corso ON esame;
+SHOW INDEXES FROM esame;
+
+CREATE VIEW carriera AS SELECT studente, AVG(voto) AS media FROM esame GROUP BY studente;
+DROP VIEW [IF EXISTS] carriera;
 ```
+
+**Vincoli:** `NOT NULL`, `DEFAULT`, `AUTO_INCREMENT`, `PRIMARY KEY` (di colonna o `PRIMARY KEY (a, b)`), `UNIQUE` (più `NULL` ammessi, come in SQL), `CHECK (condizione)` di colonna o di tabella (soddisfatto se vero o sconosciuto), `FOREIGN KEY (a, b) REFERENCES t [(x, y)]` o `REFERENCES t` sulla colonna (senza colonne: la chiave primaria di `t`), con `ON DELETE` / `ON UPDATE` `NO ACTION` (predefinito), `RESTRICT`, `CASCADE`, `SET NULL`, `SET DEFAULT`; anche autoreferenziali. Le colonne riferite devono essere la chiave primaria o una chiave `UNIQUE`. Ogni statement calcola prima tutte le modifiche, comprese quelle a cascata, controlla tutti i vincoli e solo dopo scrive.
 
 ### Data Manipulation Language (DML)
 
 ```sql
--- Insert
-INSERT INTO utenti VALUES (1, 'Alice', 30, 45000.0, 1);
-INSERT INTO utenti (id, nome) VALUES (2, 'Bob');
+INSERT INTO studente VALUES (1, 'Anna', 'Milano'), (2, 'Bruno', 'Roma');
+INSERT INTO studente (matricola, nome) VALUES (3, 'Carla');
+INSERT INTO archivio SELECT * FROM esame WHERE data < '2020-01-01';
 
--- Select
-SELECT * FROM utenti;
-SELECT nome, eta FROM utenti;
-SELECT * FROM utenti WHERE id = 1;
-SELECT * FROM utenti WHERE nome = 'Alice';
-
--- Update
-UPDATE utenti SET eta = 31 WHERE id = 1;
-
--- Delete
-DELETE FROM utenti WHERE id = 2;
+UPDATE esame SET voto = voto + 1, lode = 0 WHERE corso = 'BD1' AND voto < 30;
+DELETE FROM esame WHERE studente NOT IN (SELECT matricola FROM studente);
+-- subquery correlata: gli esami sotto la media del proprio corso
+DELETE FROM esame WHERE voto < (SELECT AVG(e2.voto) FROM esame e2 WHERE e2.corso = esame.corso);
 ```
 
-### Transactions
+### Interrogazioni
+
+```sql
+SELECT [DISTINCT] espressioni [AS alias]
+FROM t1 [alias] { , t2 | [INNER | LEFT [OUTER] | RIGHT [OUTER] | CROSS] JOIN t2 [alias] [ON condizione] }
+WHERE condizione
+GROUP BY espressioni HAVING condizione
+ORDER BY espressioni [ASC | DESC]
+LIMIT n [OFFSET m];
+```
+
+| Costrutto | Esempio |
+|---|---|
+| Operatori | `+ - * /`, `= <> != < > <= >=`, `AND OR NOT` (logica a tre valori), `IS [NOT] NULL`, `[NOT] LIKE 'a%_'`, `[NOT] BETWEEN`, `[NOT] IN (lista)` |
+| Aggregati | `COUNT(*)`, `COUNT([DISTINCT] x)`, `SUM`, `AVG`, `MIN`, `MAX` (anche su espressioni) |
+| Subquery | `x IN (SELECT ...)`, `NOT IN`, `EXISTS`, `NOT EXISTS`, `x > ALL (SELECT ...)`, `x = ANY / SOME (...)`, subquery scalari `(SELECT MAX(voto) FROM esame)` in `SELECT`, `WHERE`, `HAVING`, `SET`; correlate a qualunque profondità |
+| Insiemi | `UNION [ALL]`, `INTERSECT`, `EXCEPT` (`INTERSECT` lega più degli altri), `ORDER BY` / `LIMIT` sul risultato |
+| Tabelle derivate | `FROM (SELECT ...) AS t`, `JOIN (SELECT ...) AS t ON ...` |
+| `WITH` | `WITH medie AS (SELECT ...), migliori AS (SELECT ... FROM medie) SELECT ...` |
+| `CASE` | `CASE WHEN voto >= 28 THEN 'alto' ELSE 'basso' END`, `CASE cfu WHEN 6 THEN ... END` |
+| Funzioni | `UPPER`, `LOWER`, `LENGTH`, `CHAR_LENGTH`, `TRIM`, `CONCAT`, `CONCAT_WS`, `SUBSTRING`, `LEFT`, `RIGHT`, `REPLACE`, `REVERSE`, `ABS`, `ROUND`, `FLOOR`, `CEIL`, `MOD`, `POWER`, `SQRT`, `SIGN`, `COALESCE`, `IFNULL`, `NULLIF`, `IF`, `NOW`, `CURDATE`, `YEAR`, `MONTH`, `DAY` |
+
+Un alias nasconde il nome della tabella, come in SQL standard: in `... FROM esame e2 WHERE e2.corso = esame.corso` il secondo `esame` è la query esterna.
+
+### Piani di esecuzione e statistiche
+
+```sql
+EXPLAIN SELECT ...;            -- piano con le righe stimate di ogni passo
+EXPLAIN ANALYZE SELECT ...;    -- esegue la query: righe stimate e reali, esecuzioni delle subquery, tempo
+SHOW STATUS;                   -- buffer pool (hit ratio, sostituzioni CLOCK), pagine scritte, log, checkpoint
+SHOW INDEXES FROM t;           -- chiavi e indici, costruiti o no, numero di chiavi distinte
+CHECKPOINT;                    -- pagine modificate su disco e log svuotato
+```
+
+### Transazioni
 
 ```sql
 BEGIN;
-INSERT INTO utenti VALUES (3, 'Charlie', 25, 50000.0, 1);
-COMMIT;
-
-BEGIN;
-UPDATE utenti SET eta = 26 WHERE id = 3;
-ROLLBACK;
+UPDATE conto SET saldo = saldo - 100 WHERE numero = 1;
+SAVEPOINT prima;
+UPDATE conto SET saldo = saldo + 100 WHERE numero = 2;
+ROLLBACK TO prima;      -- annulla solo la seconda UPDATE (il savepoint resta)
+COMMIT;                 -- oppure ROLLBACK
 ```
+
+### Trigger
+
+```sql
+CREATE TRIGGER nome {BEFORE | AFTER} {INSERT | UPDATE [OF colonne] | DELETE} ON tabella
+[FOR EACH ROW | FOR EACH STATEMENT]
+[WHEN (condizione su NEW / OLD)]
+BEGIN
+    istruzione; ...      -- INSERT, UPDATE, DELETE, SELECT,
+                         -- SET NEW.colonna = valore (solo BEFORE ... FOR EACH ROW),
+                         -- SIGNAL [SQLSTATE '45000'] [SET MESSAGE_TEXT =] 'messaggio',
+                         -- IF condizione THEN ... [ELSEIF ... THEN ...] [ELSE ...] END IF
+END;
+
+DROP TRIGGER [IF EXISTS] nome;   SHOW TRIGGERS [FROM tabella];
+```
+
+`NEW` e `OLD` si usano nel corpo come le colonne di una query esterna (`WHERE id = NEW.conto`). Un trigger può attivarne altri fino a 16 livelli; se fallisce, l'intero statement che lo ha attivato viene annullato. I trigger non scattano per le modifiche fatte dalle azioni `CASCADE` / `SET NULL` delle chiavi esterne.
 
 ### Tipi di dato supportati
 
@@ -180,44 +261,14 @@ ROLLBACK;
 | `CHAR(n)` | Stringa a lunghezza fissa |
 | `TEXT` | Stringa lunga (max 65535 byte) |
 | `BOOL` / `BOOLEAN` | 1 byte (0/1) |
-| `DATE` | 4 byte (giorni dal 1970) |
-| `DATETIME` | 8 byte (ms dal 1970) |
+| `DATE` | `YYYY-MM-DD`, controllata |
+| `DATETIME` | `YYYY-MM-DD HH:MM:SS`, controllata |
 | `BLOB` | Dati binari |
-| `DECIMAL` | Numero decimale a precisione fissa |
+| `DECIMAL(p, s)` | Numero decimale (conservato come testo, confrontato come numero) |
 
-### Column constraints (parsed, not enforced)
+### Non supportato
 
-`NOT NULL`, `NULL`, `PRIMARY KEY`, `AUTO_INCREMENT`, `DEFAULT valore`
-
-### Stato implementazione SQL — giugno 2026
-
-| Feature | Stato |
-|---|---|
-| `SELECT` con proiezione colonne | ✅ |
-| `WHERE` (con operatori =, !=, <, >, <=, >=) | ✅ |
-| `ORDER BY` (ASC/DESC) | ✅ |
-| `LIMIT` | ✅ |
-| `DISTINCT` | ✅ |
-| `JOIN` (INNER, LEFT, RIGHT, CROSS) | ✅ |
-| `GROUP BY` | ✅ |
-| `HAVING` | ✅ |
-| `INSERT` (con/senza colonne) | ✅ |
-| `UPDATE` | ✅ |
-| `DELETE` | ✅ |
-| `WHERE` con nomi qualificati (`tabella.colonna`) | ✅ |
-| Transazioni (BEGIN/COMMIT/ROLLBACK) | ✅ |
-| SAVEPOINT / ROLLBACK TO | ✅ |
-| CREATE / DROP INDEX | ✅ |
-| CREATE / DROP VIEW | ✅ |
-| CREATE / DROP TRIGGER (parsing, non eseguito) | ✅ |
-| ALTER TABLE (RENAME TO) | ✅ |
-| EXPLAIN | ✅ |
-| TRUNCATE | ✅ |
-| Subquery | ❌ |
-| Stored procedure | ❌ |
-| NULL / NOT NULL / PRIMARY KEY / DEFAULT (parsed) | ✅ parsing |
-| `LIKE`, `IN`, `BETWEEN` | ❌ |
-| `UNION` | ❌ |
+`FULL OUTER JOIN`, `NATURAL JOIN`, `WITH RECURSIVE`, funzioni finestra (`OVER`), `ALTER TABLE ADD/DROP COLUMN`, stored procedure, controllo della concorrenza fra più utenti (il motore è embedded: una sessione alla volta).
 
 ---
 
@@ -242,19 +293,21 @@ ROLLBACK;
                        │
 ┌──────────────────────▼──────────────────────────────────────┐
 │              Query Executor                                 │
-│        src/query/executor.c — dispatches AST → results      │
+│   piano: sorgenti → filtri anticipati → hash join → WHERE   │
+│   → GROUP BY/HAVING → DISTINCT → ORDER BY/LIMIT → colonne   │
+│   vincoli e trigger: modifiche calcolate, controllate, scritte │
 └──────────────────────┬──────────────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────────────┐
 │                  Storage Engine                             │
-│    B+Tree Index  │  Buffer Pool LRU (1024 pagine)           │
-│    Heap File     │  Page size: 4 KB                         │
+│    Indici hash   │  Buffer pool CLOCK (1024 pagine)         │
+│    Heap File + FSM │  Page size: 4 KB                       │
 │    Limiti: 64 DB · 256 tabelle · 64 colonne · 16 indici     │
 └──────────────────────┬──────────────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────────────┐
 │           Write-Ahead Log (WAL)                             │
-│         BEGIN · COMMIT · ROLLBACK                           │
+│   BEGIN · COMMIT · ROLLBACK · SAVEPOINT · CHECKPOINT · redo/undo │
 └──────────────────────┬──────────────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────────────┐
@@ -322,6 +375,25 @@ Tutti i colori vivono in una struct `Theme` (`src/widgets/theme.h` / `theme.c`):
 | `TH_TEXT*`, `TH_CELL_*` | Testo dell'interfaccia e delle celle |
 | `TH_SUCCESS` / `TH_ERROR` / `TH_WARNING` / `TH_INFO` | Stati (OK, errore, transazione aperta, info) |
 | `TH_SYN_*`, `TH_EDITOR_*`, `TH_CARET`, `TH_GUTTER_*` | Editor SQL e syntax highlighting |
+
+---
+
+## Prestazioni
+
+`make bench` crea uno schema universitario con 10.000 studenti, 50 corsi e 100.000 esami e misura le query tipiche (Linux, un core):
+
+| Operazione | Tempo |
+|---|---|
+| 110.050 `INSERT` (blocchi da 500 righe) | 0,33 s |
+| `SELECT ... WHERE voto = 30` su 100.000 righe | 10 ms |
+| `GROUP BY` + `AVG` su 100.000 righe | 19 ms |
+| `ORDER BY ... LIMIT 10` su 100.000 righe | 36 ms |
+| join di 2 tabelle (hash join) + filtro | 10 ms |
+| `NOT EXISTS` correlata, 10.000 × 100.000 righe | 10 ms |
+| divisione relazionale (doppio `NOT EXISTS`) | 24 ms |
+| ricerca per chiave primaria | 0,01 ms |
+
+Da dove viene la velocità: free-space map dell'heap (un `INSERT` non legge più tutta la tabella), buffer pool con tabella hash, scansioni senza allocare le righe scartate dai filtri, numeri formattati come testo solo per il risultato, hash join, subquery correlate risolte con una ricerca per chiave sulle righe lette una volta sola, `ORDER BY` + `LIMIT` che calcola le colonne solo delle righe tenute.
 
 ---
 
@@ -496,9 +568,11 @@ All core engine structures are implemented from scratch.
 
 | Structure | Reference |
 |---|---|
-| **B+Tree** | [Wikipedia — B+Tree](https://en.wikipedia.org/wiki/B%2B_tree) · [USC Indexing paper (PDF)](https://infolab.usc.edu/csci585/Spring2010/den_ar/indexing.pdf) |
-| **Buffer Pool / LRU Cache** | [Cache Replacement Policies — LRU](https://en.wikipedia.org/wiki/Cache_replacement_policies#LRU) |
-| **Hash Map** (catalog) | [Hash Table](https://en.wikipedia.org/wiki/Hash_table) |
+| **B+Tree** (`src/index/btree.c`, chiavi intere su pagine) | [Wikipedia — B+Tree](https://en.wikipedia.org/wiki/B%2B_tree) · [USC Indexing paper (PDF)](https://infolab.usc.edu/csci585/Spring2010/den_ar/indexing.pdf) |
+| **Buffer Pool / CLOCK** | [Cache Replacement Policies — CLOCK](https://en.wikipedia.org/wiki/Page_replacement_algorithm#Clock) |
+| **Hash Map** (indici, hash join, `GROUP BY`, `DISTINCT`) | [Hash Table](https://en.wikipedia.org/wiki/Hash_table) |
+| **Hash join** | [Hash join](https://en.wikipedia.org/wiki/Hash_join) |
+| **Selettività di System R** | [Selinger et al., Access Path Selection (1979)](https://courses.cs.duke.edu/compsci516/cps216/spring03/papers/selinger-etal-1979.pdf) |
 | **Linked List** | [Linked List](https://en.wikipedia.org/wiki/Linked_list) |
 
 ---
@@ -546,8 +620,14 @@ make
 # GUI-only build (uses db_api_test.c stub, no engine) — same binary name
 make gui
 
-# Test suite (71 test — include JOIN, GROUP BY, HAVING, DISTINCT, ORDER BY, ecc.)
+# Test: motore (128), SQL end-to-end (389, con crash e recovery), script di examples/ (142 istruzioni)
 make test
+
+# Gli stessi test con AddressSanitizer + UndefinedBehaviorSanitizer
+make test-asan
+
+# Benchmark su 100.000 righe
+make bench
 ```
 
 **Dipendenze su Linux:** `libX11`, `libXft`, `libXrender`, `fontconfig` (presenti su qualsiasi desktop X11; su Debian/Ubuntu: `sudo apt install libx11-dev libxft-dev`, su Arch: `sudo pacman -S libx11 libxft`). Per il miglior risultato installare **JetBrains Mono** e **Inter** o **Fira Sans**: se mancano, fontconfig sceglie automaticamente il miglior font monospace / sans-serif disponibile.
