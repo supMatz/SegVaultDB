@@ -1947,6 +1947,10 @@ static void plan_free(SelectPlan* p) {
 static void plan_free_void(void* p) { plan_free((SelectPlan*)p); }
 
 static bool query_exec(SelectPlan* p, EvalCtx* outer, int stop_after, ORows* res);
+static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_order, ORows* res);
+static bool rows_append(ORows* dst, ORows* src, int i);
+static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* outer, const CteScope* ctes,
+                                   char* err, size_t errn, bool arm);
 
 // tipo (nome) della colonna j del risultato: dallo schema, dalla funzione o dai valori
 static const char* out_type_name(const SelectPlan* p, int j, const ORows* rows, bool for_schema) {
@@ -1970,6 +1974,40 @@ static const char* out_type_name(const SelectPlan* p, int j, const ORows* rows, 
     if (!any) return for_schema ? "VARCHAR" : "";
     if (all_int) return (for_schema && !small) ? "BIGINT" : "INT";
     return all_num ? "FLOAT" : "VARCHAR";
+}
+
+// righe calcolate (vista, WITH, tabella derivata) -> tuple della sorgente con lo schema ts (che diventa suo)
+static bool source_fill(Source* s, TableSchema* ts, const ORows* src_rows) {
+    const ORows rows = *src_rows;
+    bool ok = true;
+    s->is_view = true;
+    s->own_ts = s->ts = ts;
+    int cap = 0;
+    for (int i = 0; ok && i < rows.nrows; i++) {
+        Tuple* t = tuple_create(ts->num_columns);
+        if (!t) { ok = false; break; }
+        for (int c = 0; c < ts->num_columns; c++) {
+            const OVal* o = &orow(&rows, i)[c];
+            Value* v = &t->values[c];
+            if (o->null) { v->is_null = true; continue; }
+            switch (ts->columns[c].type) {
+                case SV_TYPE_INT:    v->int_val = (int32_t)(o->is_int ? o->inum : (int64_t)o->num); break;
+                case SV_TYPE_BIGINT: v->bigint_val = o->is_int ? o->inum : (int64_t)o->num; break;
+                case SV_TYPE_FLOAT:  v->float_val = o->num; break;
+                case SV_TYPE_BOOL:   v->bool_val = (o->is_num ? o->num : 0) != 0; break;
+                default: {
+                    EvalVal ev;
+                    ev_from_oval(&ev, o);
+                    v->str_val = strdup(ev_s(&ev));
+                    v->owns_str = v->str_val != NULL;
+                    if (!v->str_val) ok = false;
+                    break;
+                }
+            }
+        }
+        if (!source_push(s, t, (RID){0, 0}, &cap)) { tuple_free(t); ok = false; }
+    }
+    return ok;
 }
 
 // sorgente calcolata (vista, WITH, tabella derivata): esegue la query e ne copia le righe
@@ -1998,38 +2036,183 @@ static bool source_materialize(ExecCtx* x, Source* s, ASTNode* q, int depth, con
         }
         ts->num_rows = (uint64_t)rows.nrows;
     }
-    s->is_view = true;
-    s->own_ts = s->ts = ts;
-    int cap = 0;
-    for (int i = 0; ok && i < rows.nrows; i++) {
-        Tuple* t = tuple_create(ts->num_columns);
-        if (!t) { ok = false; break; }
-        for (int c = 0; c < ts->num_columns; c++) {
-            const OVal* o = &orow(&rows, i)[c];
-            Value* v = &t->values[c];
-            if (o->null) { v->is_null = true; continue; }
-            switch (ts->columns[c].type) {
-                case SV_TYPE_INT:    v->int_val = (int32_t)(o->is_int ? o->inum : (int64_t)o->num); break;
-                case SV_TYPE_BIGINT: v->bigint_val = o->is_int ? o->inum : (int64_t)o->num; break;
-                case SV_TYPE_FLOAT:  v->float_val = o->num; break;
-                case SV_TYPE_BOOL:   v->bool_val = (o->is_num ? o->num : 0) != 0; break;
-                default: {
-                    EvalVal ev;
-                    ev_from_oval(&ev, o);
-                    v->str_val = strdup(ev_s(&ev));
-                    v->owns_str = v->str_val != NULL;
-                    if (!v->str_val) ok = false;
-                    break;
-                }
-            }
-        }
-        if (!source_push(s, t, (RID){0, 0}, &cap)) { tuple_free(t); ok = false; }
-    }
+    if (ok) ok = source_fill(s, ts, &rows); else free(ts);
     orows_free(&rows);
     plan_free(sp);
     if (!ok) { snprintf(err, errn, "Out of memory while computing '%.64s'", s->table); return false; }
     s->loaded = true;
     return true;
+}
+
+// ── WITH RECURSIVE ──
+
+#define MAX_RECURSION_STEPS 1000
+#define MAX_RECURSION_ROWS  1000000
+
+typedef struct { ORows* rows; TableSchema* ts; } WorkTable;
+
+static bool expr_refs_table(const ASTExpr* e, const char* name);
+
+// la query nomina la tabella (anche in un join, una tabella derivata o una subquery)?
+static bool ast_refs_table(const ASTNode* n, const char* name) {
+    if (!n || n->type != NODE_SELECT) return false;
+    #define q (&n->select_stmt)
+    if (q->from_sub ? ast_refs_table(q->from_sub, name) : !strcasecmp(q->table_name, name)) return true;
+    for (int j = 0; j < q->num_joins; j++) {
+        if (q->joins[j].sub ? ast_refs_table(q->joins[j].sub, name) : !strcasecmp(q->joins[j].table_name, name)) return true;
+        if (expr_refs_table(q->joins[j].condition, name)) return true;
+    }
+    for (int i = 0; i < q->num_cols; i++) if (expr_refs_table(q->columns[i], name)) return true;
+    if (expr_refs_table(q->where, name) || expr_refs_table(q->having, name)) return true;
+    bool r = ast_refs_table(q->set_next, name);
+    #undef q
+    return r;
+}
+
+// solo questo ramo di una UNION (non i successivi)
+static bool arm_refs_table(ASTNode* n, const char* name) {
+    ASTNode* next = n->select_stmt.set_next;
+    n->select_stmt.set_next = NULL;
+    bool r = ast_refs_table(n, name);
+    n->select_stmt.set_next = next;
+    return r;
+}
+
+static bool expr_refs_table(const ASTExpr* e, const char* name) {
+    if (!e) return false;
+    if (e->type == EXPR_SUBQUERY && e->subq && ast_refs_table(e->subq->node, name)) return true;
+    if (expr_refs_table(e->left, name) || expr_refs_table(e->right, name)) return true;
+    for (int i = 0; i < e->nargs; i++) if (expr_refs_table(e->args[i], name)) return true;
+    return false;
+}
+
+static bool orows_append_copy(ORows* dst, const OVal* row) {
+    OVal* r = orows_add(dst);
+    if (!r) return false;
+    for (int j = 0; j < dst->ncols; j++) {
+        r[j] = row[j];
+        if (row[j].str && !(r[j].str = strdup(row[j].str))) return false;
+    }
+    return true;
+}
+
+// esegue i rami [from, to) come SELECT indipendenti e ne accoda le righe
+static bool run_arms(ExecCtx* x, ASTNode** arms, int from, int to, int depth, const CteScope* scope, ORows* out,
+                     SelectPlan** first_plan, char* err, size_t errn) {
+    for (int k = from; k < to; k++) {
+        char perr[300] = "";
+        SelectPlan* p = plan_prepare_ex(x, arms[k], depth + 1, NULL, scope, perr, sizeof(perr), true);
+        if (!p) { snprintf(err, errn, "%.250s", perr); return false; }
+        if (out->ncols && p->nout != out->ncols) {
+            snprintf(err, errn, "Each SELECT of the recursive WITH must have %d column(s)", out->ncols);
+            plan_free(p);
+            return false;
+        }
+        ORows r = {0};
+        r.ncols = p->nout;
+        if (!arm_exec(p, NULL, 0, false, &r)) { snprintf(err, errn, "%.250s", p->err); orows_free(&r); plan_free(p); return false; }
+        if (!out->ncols) out->ncols = r.ncols;
+        bool ok = true;
+        for (int i = 0; ok && i < r.nrows; i++) ok = rows_append(out, &r, i);
+        orows_free(&r);
+        if (first_plan && !*first_plan) *first_plan = p; else plan_free(p);
+        if (!ok) { snprintf(err, errn, "Out of memory"); return false; }
+    }
+    return true;
+}
+
+// ancora UNION [ALL] passo ricorsivo: il passo viene ripetuto sulle righe dell'iterazione
+// precedente finché non ne produce di nuove (con UNION le righe già viste non contano)
+static int cte_recursive(ExecCtx* x, Source* s, ASTCte* c, const CteScope* sc, int i, int depth, char* err, size_t errn) {
+    CteScope self = { sc->ctes, i + 1, sc->parent };
+    ASTNode* arms[64];
+    int na = 0;
+    for (ASTNode* a = c->node; a && na < 64; a = a->select_stmt.set_next) arms[na++] = a;
+    int nanchor = 0;
+    while (nanchor < na && !arm_refs_table(arms[nanchor], c->name)) nanchor++;
+    if (nanchor == na) return -1;                                  // non ricorsiva: calcolo normale
+    if (nanchor == 0) { snprintf(err, errn, "WITH RECURSIVE '%.64s': the first SELECT (the anchor) must not use '%.64s'", c->name, c->name); return 0; }
+    bool distinct = false;
+    for (int k = 0; k + 1 < na; k++) {
+        if (arms[k]->select_stmt.set_op != SETOP_UNION) { snprintf(err, errn, "WITH RECURSIVE '%.64s' must combine its SELECTs with UNION or UNION ALL", c->name); return 0; }
+        if (!arms[k]->select_stmt.set_all) distinct = true;
+    }
+    ORows all = {0}, work = {0}, step = {0};
+    SelectPlan* anchor_plan = NULL;
+    StrMap seen = {0};
+    TableSchema* ts = NULL;
+    char* sig = NULL;
+    bool ok = run_arms(x, arms, 0, nanchor, depth, &self, &step, &anchor_plan, err, errn);
+    size_t sigcap = 0;
+    if (ok) {
+        ts = calloc(1, sizeof(TableSchema));
+        sigcap = (size_t)(step.ncols ? step.ncols : 1) * (EV_STR_MAX + 24) + 1;
+        sig = malloc(sigcap);
+        if (!ts || !sig) { ok = false; snprintf(err, errn, "Out of memory"); }
+    }
+    if (ok && c->ncols && c->ncols != step.ncols) {
+        snprintf(err, errn, "WITH '%.64s' names %d column(s) but its query returns %d", c->name, c->ncols, step.ncols);
+        ok = false;
+    }
+    if (ok) {
+        snprintf(ts->name, sizeof(ts->name), "%s", c->name);
+        ts->num_columns = step.ncols;
+        for (int j = 0; j < step.ncols; j++) {
+            const char* cn = c->ncols ? c->cols[j] : anchor_plan->out[j].name;
+            const char* dot = strrchr(cn, '.');
+            snprintf(ts->columns[j].name, sizeof(ts->columns[j].name), "%s", dot ? dot + 1 : cn);
+            DataType t = parse_type(out_type_name(anchor_plan, j, &step, true));
+            if (t == SV_TYPE_INT && anchor_plan->out[j].src_type < 0) t = SV_TYPE_BIGINT;   // i calcoli possono crescere
+            ts->columns[j].type = t;
+            ts->columns[j].nullable = true;
+        }
+        all.ncols = work.ncols = step.ncols;
+    }
+    plan_free(anchor_plan);
+    int iter = 0;
+    while (ok) {
+        // le righe del passo che non c'erano già diventano la nuova tabella di lavoro
+        orows_free(&work);
+        for (int r = 0; ok && r < step.nrows; r++) {
+            if (distinct) {
+                row_sig(orow(&step, r), step.ncols, sig, sigcap);
+                SMSlot* sl = sm_slot(&seen, sig, true);
+                if (!sl) { ok = false; snprintf(err, errn, "Out of memory"); break; }
+                if (sl->val >= 0) continue;
+                sl->val = 1;
+            }
+            ok = orows_append_copy(&all, orow(&step, r)) && orows_append_copy(&work, orow(&step, r));
+            if (!ok) snprintf(err, errn, "Out of memory");
+        }
+        orows_free(&step);
+        step.ncols = all.ncols;
+        if (!ok || work.nrows == 0) break;
+        if (++iter > MAX_RECURSION_STEPS || all.nrows > MAX_RECURSION_ROWS) {
+            snprintf(err, errn, "WITH RECURSIVE '%.64s' does not stop (over %d steps or %d rows): check the condition that ends it",
+                     c->name, MAX_RECURSION_STEPS, MAX_RECURSION_ROWS);
+            ok = false;
+            break;
+        }
+        if (atomic_load(&g_sv_scan_cancel)) { snprintf(err, errn, "Query cancelled"); ok = false; break; }
+        WorkTable wt = { &work, ts };
+        c->work = &wt;
+        ok = run_arms(x, arms, nanchor, na, depth, &self, &step, NULL, err, errn);
+        c->work = NULL;
+    }
+    orows_free(&work);
+    orows_free(&step);
+    sm_free(&seen);
+    free(sig);
+    if (ok) {
+        ts->num_rows = (uint64_t)all.nrows;
+        s->is_view = true;
+        ok = source_fill(s, ts, &all);
+        if (!ok) snprintf(err, errn, "Out of memory");
+    } else {
+        free(ts);
+    }
+    orows_free(&all);
+    return ok ? 1 : 0;
 }
 
 // apre una sorgente: nome definito con WITH, tabella, vista o tabella derivata
@@ -2043,8 +2226,31 @@ static bool source_open(ExecCtx* x, Database* db, Source* s, const char* table, 
     for (const CteScope* sc = scope; sc; sc = sc->parent)
         for (int i = sc->n - 1; i >= 0; i--)
             if (!strcasecmp(sc->ctes[i].name, table)) {
+                ASTCte* c = &sc->ctes[i];
+                if (c->work) {                                     // passo ricorsivo: righe dell'iterazione precedente
+                    WorkTable* w = c->work;
+                    TableSchema* ts = malloc(sizeof(TableSchema));
+                    if (!ts) { snprintf(err, errn, "Out of memory"); return false; }
+                    *ts = *w->ts;
+                    s->is_view = true;
+                    if (!source_fill(s, ts, w->rows)) { snprintf(err, errn, "Out of memory"); return false; }
+                    s->loaded = true;
+                    return true;
+                }
+                if (c->recursive) {
+                    int r = cte_recursive(x, s, c, sc, i, depth, err, errn);
+                    if (r >= 0) { if (r) s->loaded = true; return r == 1; }
+                }
                 CteScope before = { sc->ctes, i, sc->parent };   // un nome WITH vede solo quelli precedenti
-                return source_materialize(x, s, sc->ctes[i].node, depth, &before, "WITH query", err, errn);
+                if (!source_materialize(x, s, c->node, depth, &before, "WITH query", err, errn)) return false;
+                if (c->ncols) {                                    // WITH nome (colonne) AS ...
+                    if (c->ncols != s->ts->num_columns) {
+                        snprintf(err, errn, "WITH '%.64s' names %d column(s) but its query returns %d", c->name, c->ncols, s->ts->num_columns);
+                        return false;
+                    }
+                    for (int k = 0; k < c->ncols; k++) snprintf(s->ts->columns[k].name, sizeof(s->ts->columns[k].name), "%s", c->cols[k]);
+                }
+                return true;
             }
     if (!db) { snprintf(err, errn, "No database selected"); return false; }
     s->ts = catalog_get_table(x->catalog, db->name, table);

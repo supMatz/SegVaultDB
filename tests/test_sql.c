@@ -482,6 +482,24 @@ int main(void) {
     t("SELECT * FROM studente JOIN iscritto USING (pippo)", "ERR:USING");
     cols("SELECT matricola, corso FROM studente FULL JOIN iscritto USING (matricola) WHERE matricola = 9", "matricola|iscritto.corso", "INT|VARCHAR");
     cols("SELECT * FROM studente NATURAL JOIN iscritto", "matricola|studente.nome|studente.citta|iscritto.corso", "INT|VARCHAR|VARCHAR|VARCHAR");
+    // WITH RECURSIVE e nomi delle colonne di WITH
+    t("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 5) SELECT SUM(x), COUNT(*) FROM n", "15|5");
+    t("WITH RECURSIVE f(n, v) AS (SELECT 1, 1 UNION ALL SELECT n + 1, v * (n + 1) FROM f WHERE n < 20) SELECT v FROM f WHERE n = 20",
+      "2432902008176640000");
+    t("CREATE TABLE persona (id INT PRIMARY KEY, nome VARCHAR(10), capo INT REFERENCES persona)", "OK:0");
+    t("INSERT INTO persona VALUES (1, 'Ada', NULL), (2, 'Bea', 1), (3, 'Ciro', 2), (4, 'Dino', 2), (5, 'Eva', 4)", "OK:5");
+    t("WITH RECURSIVE sotto(id, livello) AS (SELECT id, 0 FROM persona WHERE id = 2 "
+      "UNION ALL SELECT p.id, s.livello + 1 FROM persona p JOIN sotto s ON p.capo = s.id) SELECT id, livello FROM sotto ORDER BY id",
+      "2|0;3|1;4|1;5|2");
+    t("WITH RECURSIVE capi AS (SELECT capo FROM persona WHERE id = 5 UNION SELECT p.capo FROM persona p, capi c WHERE p.id = c.capo) "
+      "SELECT COUNT(capo) FROM capi", "3");
+    t("CREATE TABLE arco (da INT, a INT)", "OK:0");
+    t("INSERT INTO arco VALUES (1, 2), (2, 3), (3, 1), (3, 4)", "OK:4");
+    t("WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT a FROM arco JOIN r ON da = n) SELECT n FROM r ORDER BY n", "1;2;3;4");   // ciclo: UNION si ferma
+    t("WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT a FROM arco JOIN r ON da = n) SELECT COUNT(*) FROM r", "ERR:does not stop");
+    t("WITH RECURSIVE r(n) AS (SELECT n FROM r UNION SELECT 1) SELECT * FROM r", "ERR:anchor");
+    t("WITH t(a, b) AS (SELECT 1, 2) SELECT b FROM t", "2");
+    t("WITH t(a) AS (SELECT 1, 2) SELECT * FROM t", "ERR:names 1 column");
     // ALTER TABLE ... ADD / DROP / RENAME COLUMN
     t("ALTER TABLE studente ADD COLUMN email VARCHAR(40)", "OK:0");
     t("SELECT matricola, email FROM studente WHERE matricola = 1", "1|NULL");

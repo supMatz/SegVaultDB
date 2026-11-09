@@ -122,6 +122,10 @@ typedef struct {
 typedef struct {
     char            name[64];
     struct ASTNode* node;
+    char            cols[16][64];  // WITH nome (colonne) AS ...
+    int             ncols;
+    bool            recursive;     // WITH RECURSIVE
+    void*           work;          // durante il calcolo ricorsivo: righe dell'iterazione precedente
 } ASTCte;
 
 // operatori insiemistici fra SELECT

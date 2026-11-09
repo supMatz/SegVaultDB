@@ -870,7 +870,8 @@ static ASTNode* parse_query(ParserState* ps) {
     int nctes = 0;
     if (ident_is(ps, "WITH")) {
         consume(ps);
-        if (ident_is(ps, "RECURSIVE")) { parse_fail(ps, "WITH RECURSIVE is not supported", peek(ps)); return NULL; }
+        bool recursive = false;
+        if (ident_is(ps, "RECURSIVE")) { consume(ps); recursive = true; }
         do {
             Token nm = consume(ps);
             if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a name after WITH", nm); break; }
@@ -880,6 +881,17 @@ static ASTNode* parse_query(ParserState* ps) {
             ASTCte* c = &ctes[nctes++];
             memset(c, 0, sizeof(*c));
             copy_text(ps, c->name, sizeof(c->name), nm.text);
+            c->recursive = recursive;
+            if (match(ps, TOK_LPAREN)) {                               // WITH nome (colonne) AS ...
+                do {
+                    Token col = consume(ps);
+                    if (col.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", col); break; }
+                    if (c->ncols >= 16) { parse_fail(ps, "Too many columns (max 16)", col); break; }
+                    copy_text(ps, c->cols[c->ncols++], 64, col.text);
+                } while (match(ps, TOK_COMMA));
+                if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' after the column names", peek(ps));
+                if (!ps->result->success) break;
+            }
             if (!match(ps, TOK_AS)) { parse_fail(ps, "Expected AS after the WITH name", peek(ps)); break; }
             if (!match(ps, TOK_LPAREN)) { parse_fail(ps, "Expected '(' after AS", peek(ps)); break; }
             c->node = parse_query(ps);
