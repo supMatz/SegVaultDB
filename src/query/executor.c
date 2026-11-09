@@ -674,7 +674,9 @@ static bool col_is_indexed(const TableSchema* ts, int ci) {
         if (!strcasecmp(ts->indexes[i].col_name, ts->columns[ci].name)) return true;
     for (int i = 0; i < ts->num_constraints; i++) {
         const Constraint* c = &ts->constraints[i];
-        if ((c->kind == CONS_FOREIGN || c->kind == CONS_UNIQUE) && c->ncols == 1 && c->cols[0] == ci) return true;
+        // (le chiavi esterne hanno un indice solo per i controlli di integrità, come in PostgreSQL:
+        // per cercare le righe di una colonna di chiave esterna serve CREATE INDEX)
+        if (c->kind == CONS_UNIQUE && c->ncols == 1 && c->cols[0] == ci) return true;
     }
     return false;
 }
@@ -3203,6 +3205,24 @@ static void wal_log(ExecCtx* ctx, uint8_t type, RID rid, const Tuple* newt, cons
     free(os);
 }
 
+static void wal_log_move(ExecCtx* ctx, RID old_rid, RID new_rid, const Tuple* newt, const Tuple* oldt, TableSchema* ts) {
+    if (!ctx->wal) return;
+    size_t nl = 0, ol = 0;
+    uint8_t* ns = tuple_serialize((Tuple*)newt, ts, &nl);
+    uint8_t* os = tuple_serialize((Tuple*)oldt, ts, &ol);
+    uint8_t* data = ns ? malloc(nl + 6) : NULL;
+    if (data) {
+        memcpy(data, &new_rid.page_id, 4);
+        memcpy(data + 4, &new_rid.slot_id, 2);
+        memcpy(data + 6, ns, nl);
+        wal_write(ctx->wal, LOG_UPDATE_MOVE, ctx->tx_id, old_rid.page_id, (SVRID){old_rid.page_id, old_rid.slot_id},
+                  data, (uint32_t)(nl + 6), os, (uint32_t)ol);
+    }
+    free(data);
+    free(ns);
+    free(os);
+}
+
 // ═════════════════════════════════════════════════════════════════
 //  Vincoli di integrità
 //  - chiavi (PRIMARY KEY e UNIQUE, anche composte): nessuna coppia di righe con la stessa
@@ -3625,7 +3645,9 @@ static int cs_apply(ChangeSet* cs, char* msg, size_t mn, const char** fail) {
                 free(hf);
                 break;
             }
-            wal_log(cs->x, LOG_UPDATE, ch->rid, ch->nt, ch->old, T);
+            // la riga nuova può stare in un altro slot: un solo record con le due posizioni
+            // (undo e redo lavorano per posizione; un record solo è atomico anche dopo un crash)
+            wal_log_move(cs->x, ch->rid, nrid, ch->nt, ch->old, T);
             mi_on_delete(cs->db->name, T, ch->old, ch->rid);
             mi_on_insert(cs->db->name, T, ch->nt, nrid);
             T->num_pages = hf->num_pages;
@@ -4772,7 +4794,7 @@ static QueryResult* exec_show_extra(ExecCtx* ctx, ASTNode* n) {
         if (c->kind != CONS_FOREIGN) continue;
         snprintf(ix[nix].name, sizeof(ix[nix].name), "%s", c->name);
         for (int k = 0; k < c->ncols; k++) ix[nix].cols[k] = c->cols[k];
-        ix[nix].n = c->ncols; ix[nix].kind = "FOREIGN KEY (hash)";
+        ix[nix].n = c->ncols; ix[nix].kind = "FOREIGN KEY checks (hash)";
         nix++;
     }
     for (int i = 0; i < ts->num_columns; i++)
@@ -4993,8 +5015,40 @@ static QueryResult* exec_explain(ExecCtx* ctx, ASTNode* n) {
     return run_select_ex(ctx, stmt, 0, true, n->explain.analyze);
 }
 
+// IF EXISTS / IF NOT EXISTS: l'oggetto manca (DROP) o c'è già (CREATE) -> nulla da fare
+static bool if_exists_noop(ExecCtx* ctx, ASTNode* n) {
+    Database* db = catalog_current_db(ctx->catalog);
+    const char* dbn = db ? db->name : "";
+    switch (n->type) {
+        case NODE_DROP_DB:      return !catalog_get_db(ctx->catalog, n->drop_db.db_name);
+        case NODE_CREATE_DB:    return catalog_get_db(ctx->catalog, n->create_db.db_name) != NULL;
+        case NODE_DROP_TABLE:   return db && !catalog_get_table(ctx->catalog, dbn, n->drop_table.table_name);
+        case NODE_CREATE_TABLE: return db && catalog_get_table(ctx->catalog, dbn, n->create_table.table_name);
+        case NODE_DROP_VIEW:    return db && !catalog_get_view(ctx->catalog, dbn, n->drop_view.view_name);
+        case NODE_CREATE_VIEW:  return db && catalog_get_view(ctx->catalog, dbn, n->create_view.view_name);
+        case NODE_DROP_TRIGGER: case NODE_CREATE_TRIGGER: {
+            if (!db) return false;
+            const char* nm = n->type == NODE_DROP_TRIGGER ? n->drop_trigger.name : n->create_trigger.name;
+            bool found = false;
+            for (int i = 0; i < db->num_triggers; i++) if (!strcasecmp(db->triggers[i].name, nm)) found = true;
+            return n->type == NODE_DROP_TRIGGER ? !found : found;
+        }
+        case NODE_DROP_INDEX: case NODE_CREATE_INDEX: {
+            if (!db) return false;
+            const char* tn = n->type == NODE_DROP_INDEX ? n->drop_index.table_name : n->create_index.table_name;
+            const char* in = n->type == NODE_DROP_INDEX ? n->drop_index.index_name : n->create_index.index_name;
+            TableSchema* ts = catalog_get_table(ctx->catalog, dbn, tn);
+            bool found = false;
+            for (int i = 0; ts && i < ts->num_indexes; i++) if (!strcasecmp(ts->indexes[i].name, in)) found = true;
+            return n->type == NODE_DROP_INDEX ? !found : found;
+        }
+        default: return false;
+    }
+}
+
 QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt) {
     if (!ctx || !stmt) return result_error_msg("Invalid executor context");
+    if (stmt->if_exists && if_exists_noop(ctx, stmt)) return result_ok_msg(0);
 
     switch (stmt->type) {
         case NODE_CREATE_DB:    return exec_create_db(ctx, stmt);

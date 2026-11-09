@@ -129,6 +129,7 @@ enum { SETOP_NONE, SETOP_UNION, SETOP_INTERSECT, SETOP_EXCEPT };
 
 typedef struct ASTNode {
     StmtType type;
+    bool     if_exists;        // DROP ... IF EXISTS / CREATE ... IF NOT EXISTS
     union {
         struct {
             ASTExpr*   columns[64];

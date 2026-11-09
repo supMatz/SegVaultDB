@@ -384,84 +384,14 @@ static bool db_rollback_to_impl(const char* name) {
     wal_flush(g_db.wal);
     bp_flush_all(g_db.bp);
 
-    // Undo only entries after the savepoint offset for current tx
+    // annulla le voci della transazione scritte dopo il savepoint (stesso undo del ROLLBACK)
     off_t sp_off = g_savepoints[sp_idx].offset;
-    int log_fd = sv_open(g_db.log_path, SV_O_RDONLY, 0);
-    if (log_fd >= 0) {
-        sv_lseek(log_fd, sp_off, SEEK_SET);
-        #define MAX_UNDO 4096
-        typedef struct { uint8_t type; uint32_t page_id; uint16_t slot_id;
-                         uint32_t data_len; uint32_t old_data_len;
-                         uint8_t* data; uint8_t* old_data; } UndoEntry;
-        UndoEntry undo[MAX_UNDO];
-        int n_undo = 0;
-
-        uint8_t hdr[23];
-        while (sv_read(log_fd, hdr, 23) == 23 && n_undo < MAX_UNDO) {
-            uint64_t entry_tx_id;
-            memcpy(&entry_tx_id, hdr + 1, 8);
-            uint32_t page_id; memcpy(&page_id, hdr + 9, 4);
-            uint16_t slot_id; memcpy(&slot_id, hdr + 13, 2);
-            uint32_t dlen;    memcpy(&dlen, hdr + 15, 4);
-            uint32_t oldlen;  memcpy(&oldlen, hdr + 19, 4);
-
-            if (entry_tx_id == g_db.exec_ctx.tx_id && dlen > 0 && hdr[0] != LOG_BEGIN &&
-                hdr[0] != LOG_COMMIT && hdr[0] != LOG_ABORT &&
-                hdr[0] != LOG_SAVEPOINT && hdr[0] != LOG_ROLLBACK_TO) {
-                UndoEntry* e = &undo[n_undo++];
-                e->type = hdr[0]; e->page_id = page_id; e->slot_id = slot_id;
-                e->data_len = dlen; e->old_data_len = oldlen;
-                e->data = NULL;
-                e->old_data = NULL;
-                bool ok = dlen <= (64u << 20) && oldlen <= (64u << 20);
-                if (ok && dlen > 0)   ok = (e->data = malloc(dlen)) && sv_read_full(log_fd, e->data, dlen);
-                if (ok && oldlen > 0) ok = (e->old_data = malloc(oldlen)) && sv_read_full(log_fd, e->old_data, oldlen);
-                if (!ok) {                                   // voce troncata o illeggibile: fine del log
-                    free(e->data);
-                    free(e->old_data);
-                    n_undo--;
-                    break;
-                }
-            } else {
-                if (dlen > 0) sv_lseek(log_fd, dlen, SEEK_CUR);
-                if (oldlen > 0) sv_lseek(log_fd, oldlen, SEEK_CUR);
-            }
-        }
-        sv_close(log_fd);
-
-        int db_fd = sv_open(g_db.db_path, SV_O_RDWR, 0);
-        if (db_fd >= 0) {
-            for (int i = n_undo - 1; i >= 0; i--) {
-                UndoEntry* e = &undo[i];
-                Page* p = page_read(e->page_id, db_fd);
-                if (!p) { free(e->data); free(e->old_data); continue; }
-                switch (e->type) {
-                    case LOG_INSERT:
-                        page_delete_slot(p, e->slot_id);
-                        break;
-                    case LOG_DELETE:
-                        if (e->old_data && e->old_data_len > 0)
-                            page_insert(p, e->old_data, e->old_data_len);
-                        break;
-                    case LOG_UPDATE:
-                        page_delete_slot(p, e->slot_id);
-                        if (e->old_data && e->old_data_len > 0)
-                            page_insert(p, e->old_data, e->old_data_len);
-                        break;
-                }
-                page_write(p, db_fd);
-                page_free(p);
-                free(e->data);
-                free(e->old_data);
-            }
-            sv_close(db_fd);
-        }
-    }
+    wal_undo_tx_from(g_db.log_path, g_db.db_path, g_db.exec_ctx.tx_id, (long)sp_off);
 
     if (sv_ftruncate(g_db.wal->fd, sp_off) != 0)
         fprintf(stderr, "[SegVault] cannot shorten the transaction log after ROLLBACK TO\n");
     sv_lseek(g_db.wal->fd, 0, SEEK_END);
-    g_num_savepoints = sp_idx;
+    g_num_savepoints = sp_idx + 1;      // il savepoint resta (come in SQL): ci si può tornare ancora
 
     bp_remove_all(g_db.bp);
     executor_invalidate_indexes();

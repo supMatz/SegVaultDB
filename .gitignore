@@ -23,3 +23,5 @@ test_btree_asan
 test_sql
 test_sql_asan
 bench_sql
+test_examples
+test_examples_asan

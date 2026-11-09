@@ -83,6 +83,7 @@ static void crash_recovery_test(void) {
         for (int i = 1; i <= 50; i++) {
             snprintf(sql, sizeof(sql), "INSERT INTO t VALUES (%d, 'row %d')", i, i);
             db_result_free(db_execute(sql));
+            if (i == 20) db_result_free(db_execute("UPDATE t SET v = 'changed' WHERE id <= 5"));   // righe spostate
         }
         _exit(0);                                   // niente db_shutdown: pagine non scritte, log aperto
     }
@@ -100,6 +101,7 @@ static void crash_recovery_test(void) {
     t("USE c", "OK:0");
     t("SELECT COUNT(*), MIN(id), MAX(id) FROM t", "49|1|49");   // l'ultima riga era nella voce troncata
     t("SELECT v FROM t WHERE id = 49", "row 49");
+    t("SELECT COUNT(*) FROM t WHERE v = 'changed'", "5");                // le UPDATE rifatte dal log
     t("INSERT INTO t VALUES (50, 'again')", "OK:1");
     db_shutdown();
     if (system("rm -rf /tmp/sv_crash_test") != 0) { /* nulla */ }
@@ -595,6 +597,29 @@ int main(void) {
     t("INSERT INTO esame VALUES (1, 'BD1', 30, 0)", "ERR:Foreign key");
     t("SHOW CONSTRAINTS FROM esame", "#5");
     t("USE vinc", "OK:0");
+
+    // ── UPDATE e DELETE annullati: niente righe duplicate o perse ──
+    t("CREATE DATABASE tx", "OK:0");
+    t("USE tx", "OK:0");
+    t("CREATE TABLE c (id INT PRIMARY KEY, v INT)", "OK:0");
+    t("INSERT INTO c VALUES (1, 10), (2, 20), (3, 30)", "OK:3");
+    t("BEGIN", "OK:0");
+    t("UPDATE c SET v = v + 1", "OK:3");
+    t("ROLLBACK", "OK:0");
+    t("SELECT id, v FROM c ORDER BY id", "1|10;2|20;3|30");
+    t("UPDATE c SET v = 0 WHERE id = 2", "OK:1");                      // nessun duplicato della chiave
+    t("BEGIN", "OK:0");
+    t("UPDATE c SET v = 100 WHERE id = 1", "OK:1");
+    t("SAVEPOINT s1", "OK:0");
+    t("UPDATE c SET v = 200 WHERE id = 1", "OK:1");
+    t("DELETE FROM c WHERE id = 3", "OK:1");
+    t("INSERT INTO c VALUES (4, 40)", "OK:1");
+    t("ROLLBACK TO s1", "OK:0");
+    t("SELECT id, v FROM c ORDER BY id", "1|100;2|0;3|30");               // anche la DELETE è annullata
+    t("UPDATE c SET v = 300 WHERE id = 1", "OK:1");
+    t("ROLLBACK TO s1", "OK:0");                                         // il savepoint resta
+    t("COMMIT", "OK:0");
+    t("SELECT id, v FROM c ORDER BY id", "1|100;2|0;3|30");
 
     // ── trigger (basi di dati attive) ──
     t("CREATE DATABASE att", "OK:0");

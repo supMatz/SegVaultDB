@@ -84,10 +84,17 @@ BTREE_TEST_SRCS = tests/test_btree.c src/index/btree.c src/storage/buffer_pool.c
 
 SQL_TEST_SRCS = tests/test_sql.c $(ENGINE_SRCS)
 
-test: test_engine test_btree test_sql
+EXAMPLES_TEST_SRCS = tests/test_examples.c src/widgets/sql_text.c $(ENGINE_SRCS)
+
+test: test_engine test_btree test_sql test_examples
 	./test_btree
 	./test_engine
 	./test_sql
+	./test_examples
+
+# gli script di examples/ eseguiti come nell'editor
+test_examples: $(EXAMPLES_TEST_SRCS) $(wildcard examples/*.sql)
+	$(CC) $(CFLAGS) -I. $(INCLUDES) -o test_examples $(EXAMPLES_TEST_SRCS) -lm -pthread
 
 test_sql: $(SQL_TEST_SRCS)
 	$(CC) $(CFLAGS) -I. $(INCLUDES) -o test_sql $(SQL_TEST_SRCS) -lm -pthread
@@ -105,8 +112,11 @@ test-asan: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
 	ASAN_OPTIONS=detect_leaks=1 ./test_btree_asan
 	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
 		-I. $(INCLUDES) -o test_sql_asan $(SQL_TEST_SRCS) -lm -pthread
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
+		-I. $(INCLUDES) -o test_examples_asan $(EXAMPLES_TEST_SRCS) -lm -pthread
 	ASAN_OPTIONS=detect_leaks=1 ./test_engine_asan
 	ASAN_OPTIONS=detect_leaks=1 ./test_sql_asan
+	ASAN_OPTIONS=detect_leaks=1 ./test_examples_asan
 
 test_engine: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o test_engine test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c -lm -pthread
@@ -129,7 +139,7 @@ build-win/%.o: %.c
 	$(WIN_CC) $(CFLAGS) $(DEPFLAGS) $(BASE_INCLUDES) -c $< -o $@
 
 clean:
-	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(GUI_OBJS:.o=.d) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql
+	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(GUI_OBJS:.o=.d) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql test_examples test_examples_asan
 	$(RM) -r obj build-win
 
 -include $(FULL_OBJS:.o=.d) $(GUI_OBJS:.o=.d) $(WIN_OBJS:.o=.d)

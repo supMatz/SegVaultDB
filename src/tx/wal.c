@@ -61,12 +61,60 @@ int wal_flush(WAL* wal) {
     return SV_OK;
 }
 
+// LOG_UPDATE_MOVE: posizione nuova all'inizio di data
+static bool move_target(const uint8_t* data, uint32_t data_len, uint32_t* pid, uint16_t* slot) {
+    if (!data || data_len < 6) return false;
+    memcpy(pid, data, 4);
+    memcpy(slot, data + 4, 2);
+    return *pid != 0;
+}
+
+static void replay_move(int db_fd, uint32_t page_id, uint16_t slot_id, const uint8_t* data, uint32_t data_len,
+                        const uint8_t* old_data, uint32_t old_data_len) {
+    uint32_t npid;
+    uint16_t nslot;
+    if (!move_target(data, data_len, &npid, &nslot)) return;
+    // 1. la riga vecchia sparisce (se c'è ancora)
+    Page* p = page_read(page_id, db_fd);
+    if (p) {
+        uint16_t len = 0;
+        const void* cur = page_get_slot(p, slot_id, &len);
+        if (cur && old_data && len == old_data_len && memcmp(cur, old_data, len) == 0) {
+            page_delete_slot(p, slot_id);
+            page_write(p, db_fd);
+        }
+        page_free(p);
+    }
+    // 2. la riga nuova compare nella sua posizione (se non è già stata scritta)
+    p = page_read(npid, db_fd);
+    if (p) {
+        if (nslot == p->num_slots && page_insert(p, data + 6, (uint16_t)(data_len - 6)) >= 0) page_write(p, db_fd);
+        page_free(p);
+    }
+}
+
+static void undo_move(int db_fd, uint32_t page_id, const uint8_t* data, uint32_t data_len,
+                      const uint8_t* old_data, uint32_t old_data_len) {
+    uint32_t npid;
+    uint16_t nslot;
+    if (!move_target(data, data_len, &npid, &nslot)) return;
+    Page* p = page_read(npid, db_fd);
+    if (p) { page_delete_slot(p, nslot); page_write(p, db_fd); page_free(p); }
+    p = page_read(page_id, db_fd);
+    if (p) {
+        if (old_data && old_data_len > 0) page_insert(p, old_data, (uint16_t)old_data_len);
+        page_write(p, db_fd);
+        page_free(p);
+    }
+}
+
 // Replay a single WAL entry on the database file
 static void replay_entry(int db_fd, uint8_t type, uint32_t page_id,
                           uint16_t slot_id,
                           const uint8_t* data, uint32_t data_len,
                           const uint8_t* old_data, uint32_t old_data_len) {
     if (page_id == 0) return;
+    if (type == LOG_UPDATE_MOVE) { replay_move(db_fd, page_id, slot_id, data, data_len, old_data, old_data_len); return; }
     // Read the page from db file
     Page* p = page_read(page_id, db_fd);
     if (!p && type == LOG_INSERT) {
@@ -106,6 +154,7 @@ static void undo_entry(int db_fd, uint8_t type, uint32_t page_id,
                         const uint8_t* data, uint32_t data_len,
                         const uint8_t* old_data, uint32_t old_data_len) {
     if (page_id == 0) return;
+    if (type == LOG_UPDATE_MOVE) { undo_move(db_fd, page_id, data, data_len, old_data, old_data_len); return; }
     Page* p = page_read(page_id, db_fd);
     if (!p) return;
 
@@ -240,8 +289,13 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
 }
 
 int wal_undo_tx(const char* log_path, const char* db_path, uint64_t tx_id) {
+    return wal_undo_tx_from(log_path, db_path, tx_id, 0);
+}
+
+int wal_undo_tx_from(const char* log_path, const char* db_path, uint64_t tx_id, long from) {
     int log_fd = sv_open(log_path, SV_O_RDONLY, 0);
     if (log_fd < 0) return SV_NOT_FOUND;
+    if (from > 0 && sv_lseek(log_fd, from, SEEK_SET) != from) { sv_close(log_fd); return SV_ERR; }
 
     int db_fd = sv_open(db_path, SV_O_RDWR, 0);
     if (db_fd < 0) { sv_close(log_fd); return SV_ERR; }
@@ -296,11 +350,12 @@ int wal_undo_tx(const char* log_path, const char* db_path, uint64_t tx_id) {
     }
     sv_close(log_fd);
 
-    // Undo in reverse order
+    // Undo in reverse order (le voci di controllo non toccano le pagine)
     for (int i = num_entries - 1; i >= 0; i--) {
         LogEntry* e = &entries[i];
-        undo_entry(db_fd, e->type, e->page_id, e->slot_id,
-                   e->data, e->data_len, e->old_data, e->old_data_len);
+        if (e->type == LOG_INSERT || e->type == LOG_DELETE || e->type == LOG_UPDATE || e->type == LOG_UPDATE_MOVE)
+            undo_entry(db_fd, e->type, e->page_id, e->slot_id,
+                       e->data, e->data_len, e->old_data, e->old_data_len);
         free(e->data);
         free(e->old_data);
     }

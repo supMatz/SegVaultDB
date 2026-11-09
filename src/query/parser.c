@@ -1525,6 +1525,11 @@ static ASTNode* parse_statement(ParserState* ps) {
         case TOK_CREATE: {
             consume(ps);
             Token sub = consume(ps);
+            if (ident_is(ps, "IF")) {                            // CREATE ... IF NOT EXISTS
+                consume(ps);
+                if (!match(ps, TOK_NOT) || !match(ps, TOK_EXISTS)) { parse_fail(ps, "Expected IF NOT EXISTS", peek(ps)); break; }
+                n->if_exists = true;
+            }
             if (sub.type == TOK_DATABASE) {
                 n->type = NODE_CREATE_DB;
                 Token dn = consume(ps);
@@ -1637,6 +1642,11 @@ static ASTNode* parse_statement(ParserState* ps) {
         case TOK_DROP: {
             consume(ps);
             Token sub = consume(ps);
+            if (ident_is(ps, "IF")) {                            // DROP ... IF EXISTS
+                consume(ps);
+                if (!match(ps, TOK_EXISTS)) { parse_fail(ps, "Expected IF EXISTS", peek(ps)); break; }
+                n->if_exists = true;
+            }
             if (sub.type == TOK_DATABASE) {
                 n->type = NODE_DROP_DB;
                 Token dn = consume(ps);
