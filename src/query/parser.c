@@ -153,9 +153,17 @@ static void subq_release(SubQuery* q) {
     free(q);
 }
 
+static void win_free(WindowSpec* w) {
+    if (!w) return;
+    for (int i = 0; i < w->npart; i++) ast_expr_free(w->part[i]);
+    for (int i = 0; i < w->nord; i++) ast_expr_free(w->ord[i]);
+    free(w);
+}
+
 void ast_expr_free(ASTExpr* e) {
     if (!e) return;
     subq_release(e->subq);
+    win_free(e->win);
     ast_expr_free(e->left);
     ast_expr_free(e->right);
     for (int i = 0; i < e->nargs; i++) ast_expr_free(e->args[i]);
@@ -172,6 +180,17 @@ ASTExpr* ast_expr_clone(const ASTExpr* e) {
     c->args = NULL;
     c->nargs = 0;
     if (c->subq) c->subq->refs++;
+    c->win = NULL;
+    if (e->win) {
+        c->win = calloc(1, sizeof(WindowSpec));
+        if (!c->win) { ast_expr_free(c); return NULL; }
+        c->win->slot = e->win->slot;
+        for (int i = 0; i < e->win->npart; i++) { c->win->part[i] = ast_expr_clone(e->win->part[i]); c->win->npart = i + 1; if (!c->win->part[i]) { ast_expr_free(c); return NULL; } }
+        for (int i = 0; i < e->win->nord; i++) {
+            c->win->ord[i] = ast_expr_clone(e->win->ord[i]); c->win->desc[i] = e->win->desc[i]; c->win->nord = i + 1;
+            if (!c->win->ord[i]) { ast_expr_free(c); return NULL; }
+        }
+    }
     if (e->left && !(c->left = ast_expr_clone(e->left))) { ast_expr_free(c); return NULL; }
     if (e->right && !(c->right = ast_expr_clone(e->right))) { ast_expr_free(c); return NULL; }
     if (e->nargs > 0) {
@@ -231,7 +250,7 @@ static void fmt_rec(const ASTExpr* e, char* out, size_t n, size_t* len, bool top
             if (e->table_name[0]) { fmt_put(out, n, len, e->table_name); fmt_put(out, n, len, "."); }
             fmt_put(out, n, len, e->col_name);
             break;
-        case EXPR_AGG: case EXPR_FUNC:
+        case EXPR_AGG: case EXPR_FUNC: case EXPR_WINDOW:
             fmt_put(out, n, len, e->func);
             fmt_put(out, n, len, "(");
             if (e->agg_distinct) fmt_put(out, n, len, "DISTINCT ");
@@ -241,6 +260,19 @@ static void fmt_rec(const ASTExpr* e, char* out, size_t n, size_t* len, bool top
                 fmt_rec(e->args[i], out, n, len, true);
             }
             fmt_put(out, n, len, ")");
+            if (e->type == EXPR_WINDOW && e->win) {
+                fmt_put(out, n, len, " OVER (");
+                for (int i = 0; i < e->win->npart; i++) {
+                    fmt_put(out, n, len, i ? ", " : "PARTITION BY ");
+                    fmt_rec(e->win->part[i], out, n, len, true);
+                }
+                for (int i = 0; i < e->win->nord; i++) {
+                    fmt_put(out, n, len, i ? ", " : (e->win->npart ? " ORDER BY " : "ORDER BY "));
+                    fmt_rec(e->win->ord[i], out, n, len, true);
+                    if (e->win->desc[i]) fmt_put(out, n, len, " DESC");
+                }
+                fmt_put(out, n, len, ")");
+            }
             break;
         case EXPR_SUBQUERY:
             if (e->subkind == SUBQ_EXISTS) fmt_put(out, n, len, "EXISTS ");
@@ -475,6 +507,37 @@ static ASTExpr* parse_call(ParserState* ps) {
     if (agg && e->nargs != (strcmp(e->col_name, "*") == 0 ? 0 : 1))
         parse_fail(ps, "Aggregate functions take exactly one argument", fn);
     if (!ps->result->success) { ast_expr_free(e); return NULL; }
+    if (ident_is(ps, "OVER")) {                       // funzione finestra
+        consume(ps);
+        if (!match(ps, TOK_LPAREN)) { parse_fail(ps, "Expected '(' after OVER", peek(ps)); ast_expr_free(e); return NULL; }
+        WindowSpec* w = calloc(1, sizeof(WindowSpec));
+        if (!w) { ast_expr_free(e); parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
+        e->win = w;
+        e->type = EXPR_WINDOW;
+        if (ident_is(ps, "PARTITION")) {
+            consume(ps);
+            expect(ps, TOK_BY);
+            do {
+                if (w->npart >= 8) { parse_fail(ps, "Too many PARTITION BY expressions (max 8)", peek(ps)); break; }
+                ASTExpr* x = parse_expr(ps);
+                if (!x) break;
+                w->part[w->npart++] = x;
+            } while (ps->result->success && match(ps, TOK_COMMA));
+        }
+        if (ps->result->success && match(ps, TOK_ORDER)) {
+            expect(ps, TOK_BY);
+            do {
+                if (w->nord >= 8) { parse_fail(ps, "Too many ORDER BY expressions in OVER (max 8)", peek(ps)); break; }
+                ASTExpr* x = parse_expr(ps);
+                if (!x) break;
+                w->ord[w->nord] = x;
+                if (match(ps, TOK_DESC)) w->desc[w->nord] = true; else match(ps, TOK_ASC);
+                w->nord++;
+            } while (ps->result->success && match(ps, TOK_COMMA));
+        }
+        if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' to close OVER (window frames are not supported)", peek(ps));
+        if (!ps->result->success) { ast_expr_free(e); return NULL; }
+    }
     return e;
 }
 

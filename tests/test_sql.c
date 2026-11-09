@@ -428,6 +428,26 @@ int main(void) {
     t("SELECT 2 UNION SELECT 1 UNION SELECT 2 ORDER BY 1 DESC LIMIT 1", "2");
     t("SELECT 1 UNION SELECT 1, 2", "ERR:same number of columns");
     t("SELECT nome FROM studente UNION SELECT titolo FROM corso ORDER BY voto", "ERR:must name a result column");
+    // funzioni finestra
+    t("SELECT corso, matricola, ROW_NUMBER() OVER (PARTITION BY corso ORDER BY voto DESC) AS pos FROM esame ORDER BY corso, pos",
+      "AN1|2|1;AN1|1|2;AN1|3|3;BD1|1|1;BD1|3|2;BD1|2|3;BD2|3|1;BD2|1|2;BD2|4|3");
+    t("SELECT voto, RANK() OVER (ORDER BY voto DESC), DENSE_RANK() OVER (ORDER BY voto DESC) FROM esame ORDER BY voto DESC, matricola",
+      "30|1|1;30|1|1;30|1|1;28|4|2;27|5|3;25|6|4;24|7|5;22|8|6;18|9|7");
+    t("SELECT matricola, corso, SUM(voto) OVER (PARTITION BY matricola ORDER BY corso) FROM esame WHERE matricola = 1 ORDER BY corso",
+      "1|AN1|25;1|BD1|55;1|BD2|83");
+    t("SELECT matricola, voto, AVG(voto) OVER (PARTITION BY matricola) FROM esame WHERE matricola = 2 ORDER BY voto", "2|18|24;2|30|24");
+    t("SELECT COUNT(*) OVER () FROM esame LIMIT 1", "9");
+    t("SELECT corso, voto, LAG(voto) OVER (PARTITION BY corso ORDER BY voto), LEAD(voto, 1, 0) OVER (PARTITION BY corso ORDER BY voto) "
+      "FROM esame WHERE corso = 'BD1' ORDER BY voto", "BD1|18|NULL|27;BD1|27|18|30;BD1|30|27|0");
+    t("SELECT corso, RANK() OVER (ORDER BY AVG(voto) DESC) FROM esame GROUP BY corso ORDER BY 2", "BD2|1;AN1|2;BD1|3");
+    t("SELECT corso, matricola FROM (SELECT corso, matricola, ROW_NUMBER() OVER (PARTITION BY corso ORDER BY voto DESC) AS r FROM esame) AS t "
+      "WHERE r = 1 ORDER BY corso", "AN1|2;BD1|1;BD2|3");
+    t("SELECT voto, NTILE(2) OVER (ORDER BY voto) FROM esame WHERE corso = 'BD1' ORDER BY voto", "18|1;27|1;30|2");
+    t("SELECT DISTINCT corso, FIRST_VALUE(matricola) OVER (PARTITION BY corso ORDER BY voto DESC) FROM esame ORDER BY corso", "AN1|2;BD1|1;BD2|3");
+    t("SELECT matricola, MAX(voto) OVER (PARTITION BY matricola) - voto AS distacco FROM esame WHERE corso = 'AN1' ORDER BY matricola", "1|0;2|0;3|0");
+    t("SELECT voto FROM esame WHERE ROW_NUMBER() OVER () = 1", "ERR:not allowed in WHERE");
+    t("SELECT ROW_NUMBER() FROM esame", "ERR:Unknown function");
+    t("SELECT UPPER(corso) OVER () FROM esame", "ERR:cannot be used with OVER");
     // CASE
     t("SELECT nome, CASE WHEN citta = 'Milano' THEN 'MI' WHEN citta IS NULL THEN '?' ELSE 'altro' END FROM studente ORDER BY matricola",
       "Anna|MI;Bruno|altro;Carla|MI;Dario|altro;Elena|?");

@@ -602,6 +602,9 @@ typedef struct {
     char        buf[EV_STR_MAX + 1];
 } EvalVal;
 
+// valore tipizzato conservato (risultati, chiavi di ordinamento, funzioni finestra)
+typedef struct SortKey { bool null, is_num, is_int; int64_t inum; double num; char* str; } SortKey;
+
 static void ev_null(EvalVal* v) { v->null = true; v->is_num = v->is_int = false; v->str = ""; }
 
 // i numeri vengono convertiti in testo solo quando serve (ev_s): confronti, aritmetica e
@@ -1026,6 +1029,8 @@ typedef struct EvalCtx {
     char      err[256];         // primo errore di valutazione
     ExecCtx*  x;                // per eseguire le subquery
     struct EvalCtx* outer;      // query esterna (colonne correlate)
+    struct SortKey** win;       // valori delle funzioni finestra (per funzione, per unità)
+    int       win_row;          // unità corrente (combinazione o gruppo)
 } EvalCtx;
 
 static void ctx_error(EvalCtx* c, const char* fmt, const char* a) {
@@ -1065,6 +1070,7 @@ static int plan_using_left(const SelectPlan* p, int s, int c);
 static int plan_join_type(const SelectPlan* p, int s);
 static int plan_joined_copy(const SelectPlan* p, int s, int c, int* rk, int* rc);
 static void plan_mark_correlated(SelectPlan* p);
+static bool plan_add_window(SelectPlan* p, ASTExpr* w);
 
 static void bind_error(BindCtx* b, const char* msg) {
     if (!b->err[0]) snprintf(b->err, sizeof(b->err), "%s", msg);
@@ -1238,6 +1244,28 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
             for (int i = 0; i < e->nargs; i++) bind_expr(e->args[i], b);
             bind_expr(e->right, b);
             return;
+        case EXPR_WINDOW: {
+            static const struct { const char* n; int lo, hi; } WF[] = {
+                { "ROW_NUMBER", 0, 0 }, { "RANK", 0, 0 }, { "DENSE_RANK", 0, 0 }, { "NTILE", 1, 1 },
+                { "LAG", 1, 3 }, { "LEAD", 1, 3 }, { "FIRST_VALUE", 1, 1 }, { "LAST_VALUE", 1, 1 },
+                { "COUNT", 0, 1 }, { "SUM", 1, 1 }, { "AVG", 1, 1 }, { "MIN", 1, 1 }, { "MAX", 1, 1 },
+            };
+            int k = -1;
+            for (size_t i = 0; i < sizeof(WF) / sizeof(WF[0]); i++) if (!strcmp(WF[i].n, e->func)) k = (int)i;
+            if (k < 0) { snprintf(msg, sizeof(msg), "'%.32s' cannot be used with OVER", e->func); bind_error(b, msg); return; }
+            if (e->nargs < WF[k].lo || e->nargs > WF[k].hi) { snprintf(msg, sizeof(msg), "Wrong number of arguments for %.32s", e->func); bind_error(b, msg); return; }
+            if (b->mode != BIND_AGG_OK || !b->plan || (strcmp(b->clause, "SELECT") && strcmp(b->clause, "ORDER BY"))) {
+                snprintf(msg, sizeof(msg), "Window functions (OVER) are not allowed in %s", b->clause);
+                bind_error(b, msg);
+                return;
+            }
+            if (b->in_agg) { bind_error(b, "Window functions cannot be inside an aggregate"); return; }
+            for (int i = 0; i < e->nargs; i++) bind_expr(e->args[i], b);
+            for (int i = 0; i < e->win->npart; i++) bind_expr(e->win->part[i], b);
+            for (int i = 0; i < e->win->nord; i++) bind_expr(e->win->ord[i], b);
+            if (!b->err[0] && !plan_add_window(b->plan, e)) bind_error(b, "Too many window functions (max 16)");
+            return;
+        }
         default:
             bind_expr(e->left, b);
             bind_expr(e->right, b);
@@ -1257,6 +1285,7 @@ static bool expr_has_agg(const ASTExpr* e) {
 static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out);
 static bool eval_cond(ASTExpr* e, EvalCtx* c);
 static void eval_subquery(ASTExpr* e, EvalCtx* c, EvalVal* out);
+static void ev_from_oval(EvalVal* v, const SortKey* o);
 
 static bool like_match(const char* s, const char* p);
 
@@ -1547,6 +1576,10 @@ static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             return;
         }
         case EXPR_SUBQUERY: eval_subquery(e, c, out); return;
+        case EXPR_WINDOW:
+            if (!c->win || !e->win || !c->win[e->win->slot]) { ctx_error(c, "%s", "Window function used outside of SELECT / ORDER BY"); ev_null(out); return; }
+            ev_from_oval(out, &c->win[e->win->slot][c->win_row]);
+            return;
         case EXPR_CASE: {
             EvalVal a, w;
             if (e->left) eval_expr(e->left, c, &a);
@@ -1736,7 +1769,6 @@ static bool source_load(ExecCtx* ctx, const char* db, Source* s, ASTExpr* where_
 
 // ── valori del risultato (tipizzati: i numeri restano numeri) ──
 
-typedef struct { bool null, is_num, is_int; int64_t inum; double num; char* str; } SortKey;
 typedef SortKey OVal;
 
 // copia di un valore calcolato (il testo viene duplicato; i numeri senza testo restano binari)
@@ -1899,6 +1931,9 @@ struct SelectPlan {
     long      execs;                    // esecuzioni (EXPLAIN delle subquery)
     // NATURAL / USING: copia di destra di una colonna unita -> colonna di sinistra (s*1024+c+1)
     int       using_left[MAX_SOURCES][SV_MAX_COLUMNS];
+    // funzioni finestra della query
+    ASTExpr*  wins[16];
+    int       nwins;
     // righe reali per EXPLAIN ANALYZE (sommate su tutte le esecuzioni)
     long      st_scanned[MAX_SOURCES];  // righe lette dalla tabella
     long      st_loaded[MAX_SOURCES];   // righe dopo i filtri della lettura
@@ -1926,6 +1961,13 @@ static int plan_join_type(const SelectPlan* p, int s) {
     return (s >= 1 && s < p->nsrc) ? (int)p->n->select_stmt.joins[s - 1].type : JOIN_INNER;
 }
 static void plan_mark_correlated(SelectPlan* p) { for (; p; p = p->next_arm) p->correlated = true; }
+static bool plan_add_window(SelectPlan* p, ASTExpr* w) {
+    for (int i = 0; i < p->nwins; i++) if (p->wins[i] == w) return true;
+    if (p->nwins >= 16) return false;
+    w->win->slot = p->nwins;
+    p->wins[p->nwins++] = w;
+    return true;
+}
 
 static void plan_free(SelectPlan* p) {
     while (p) {
@@ -2290,7 +2332,7 @@ static void expr_refs(const ASTExpr* e, unsigned* mask, bool* outer, bool* opaqu
             else if (e->outer > 0) *outer = true;
             else if (e->bound > 0) *mask |= 1u << ((e->bound - 1) / 1024);
             return;
-        case EXPR_SUBQUERY: case EXPR_AGG:
+        case EXPR_SUBQUERY: case EXPR_AGG: case EXPR_WINDOW:
             *opaque = true;
             return;
         default:
@@ -2893,6 +2935,8 @@ typedef struct {
     SortKey*   keys;
     int        nkeys_alloc;
     Tuple**    null_combo;
+    SortKey*   winv[16];      // valori delle funzioni finestra, per unità
+    int        nwinv;          // unità per funzione
 } ArmState;
 
 static void arm_state_free(ArmState* st, int nsrc) {
@@ -2902,6 +2946,174 @@ static void arm_state_free(ArmState* st, int nsrc) {
     for (int i = 0; i < st->nkeys_alloc; i++) free(st->keys[i].str);
     free(st->keys);
     free(st->null_combo);
+    for (int w = 0; w < 16; w++) {
+        if (!st->winv[w]) continue;
+        for (int i = 0; i < st->nwinv; i++) free(st->winv[w][i].str);
+        free(st->winv[w]);
+    }
+}
+
+static void arm_set_unit(SelectPlan* p, ArmState* st, EvalCtx* ec, int u) {
+    if (p->grouped) {
+        ec->grp  = st->group_size[u] ? &st->groups_buf[st->group_start[u]] : &st->null_combo;
+        ec->ngrp = st->group_size[u];
+        ec->cur  = st->group_size[u] ? st->groups_buf[st->group_start[u]] : st->null_combo;
+    } else {
+        ec->cur = COMBO(&st->combos, u);
+        ec->grp = NULL;
+        ec->ngrp = 0;
+    }
+    ec->win_row = u;
+}
+
+// ── funzioni finestra ──
+// Le unità vengono ordinate per (PARTITION BY, ORDER BY). Con ORDER BY il frame va dall'inizio
+// della partizione alla riga corrente compresi i suoi pari (righe con le stesse chiavi), come il
+// RANGE predefinito di SQL; senza ORDER BY è l'intera partizione.
+
+static struct { const SortKey* keys; int K, npart; const bool* desc; } g_wsort;
+
+static int wsort_cmp(const void* a, const void* b) {
+    int ia = *(const int*)a, ib = *(const int*)b;
+    const SortKey* x = &g_wsort.keys[(size_t)ia * (size_t)g_wsort.K];
+    const SortKey* y = &g_wsort.keys[(size_t)ib * (size_t)g_wsort.K];
+    for (int k = 0; k < g_wsort.K; k++) {
+        int c = key_cmp(&x[k], &y[k]);
+        if (c) return (k >= g_wsort.npart && g_wsort.desc[k - g_wsort.npart]) ? -c : c;
+    }
+    return ia < ib ? -1 : ia > ib;
+}
+
+static bool keys_equal(const SortKey* x, const SortKey* y, int from, int to) {
+    for (int k = from; k < to; k++) if (key_cmp(&x[k], &y[k])) return false;
+    return true;
+}
+
+static void oval_copy(SortKey* dst, const SortKey* src) {
+    free(dst->str);
+    *dst = *src;
+    dst->str = src->str ? strdup(src->str) : NULL;
+}
+
+typedef struct { int64_t count, isum; double dsum; bool all_int, overflow; const SortKey* best; } WinAcc;
+
+static void wacc_add(WinAcc* a, const char* f, const SortKey* v, bool star) {
+    if (star) { a->count++; return; }
+    if (v->null) return;
+    a->count++;
+    if (!strcmp(f, "SUM") || !strcmp(f, "AVG")) {
+        a->dsum += v->is_num ? v->num : 0;
+        if (v->is_int && !a->overflow) { if (__builtin_add_overflow(a->isum, v->inum, &a->isum)) a->overflow = true; }
+        else a->all_int = false;
+    } else if (!strcmp(f, "MIN") || !strcmp(f, "MAX")) {
+        int c = a->best ? key_cmp(v, a->best) : 0;
+        if (!a->best || (f[1] == 'I' ? c < 0 : c > 0)) a->best = v;
+    }
+}
+
+static void wacc_result(const WinAcc* a, const char* f, SortKey* out) {
+    free(out->str);
+    memset(out, 0, sizeof(*out));
+    if (!strcmp(f, "COUNT")) { out->is_num = out->is_int = true; out->inum = a->count; out->num = (double)a->count; return; }
+    if (a->count == 0) { out->null = true; return; }
+    if (!strcmp(f, "SUM") && a->all_int && !a->overflow) { out->is_num = out->is_int = true; out->inum = a->isum; out->num = (double)a->isum; return; }
+    if (!strcmp(f, "SUM")) { out->is_num = true; out->num = a->dsum; return; }
+    if (!strcmp(f, "AVG")) { out->is_num = true; out->num = a->dsum / (double)a->count; return; }
+    if (a->best) oval_copy(out, a->best);
+    else out->null = true;
+}
+
+static bool window_compute(SelectPlan* p, ArmState* st, EvalCtx* ec, ASTExpr* w, const int* units, int n, SortKey* vals) {
+    WindowSpec* ws = w->win;
+    const char* f = w->func;
+    int K = ws->npart + ws->nord;
+    SortKey* keys = calloc((size_t)n * (size_t)(K ? K : 1) + 1, sizeof(SortKey));
+    SortKey* argv = calloc((size_t)n * 3 + 1, sizeof(SortKey));      // argomenti 1, 2, 3 di ogni riga
+    int* idx = malloc(sizeof(int) * (size_t)(n ? n : 1));
+    bool ok = keys && argv && idx;
+    for (int i = 0; ok && i < n; i++) {
+        arm_set_unit(p, st, ec, units[i]);
+        for (int k = 0; k < K; k++) {
+            EvalVal v;
+            eval_expr(k < ws->npart ? ws->part[k] : ws->ord[k - ws->npart], ec, &v);
+            key_set(&keys[(size_t)i * (size_t)K + (size_t)k], &v);
+        }
+        for (int a = 0; a < w->nargs && a < 3; a++) {
+            EvalVal v;
+            eval_expr(w->args[a], ec, &v);
+            key_set(&argv[(size_t)i * 3 + (size_t)a], &v);
+        }
+        idx[i] = i;
+    }
+    if (ok && ec->err[0]) ok = false;
+    if (ok && K) {
+        g_wsort.keys = keys; g_wsort.K = K; g_wsort.npart = ws->npart; g_wsort.desc = ws->desc;
+        qsort(idx, (size_t)n, sizeof(int), wsort_cmp);
+    }
+    #define KEY(r) (&keys[(size_t)idx[r] * (size_t)K])
+    #define ARG(r, a) (&argv[(size_t)idx[r] * 3 + (a)])
+    #define OUT(r) (&vals[units[idx[r]]])
+    bool star = !strcmp(f, "COUNT") && w->nargs == 0;
+    bool aggregate = !strcmp(f, "COUNT") || !strcmp(f, "SUM") || !strcmp(f, "AVG") || !strcmp(f, "MIN") || !strcmp(f, "MAX");
+    for (int start = 0; ok && start < n; ) {
+        int end = start + 1;
+        while (end < n && keys_equal(KEY(start), KEY(end), 0, ws->npart)) end++;
+        int dense = 0;
+        WinAcc acc = { 0, 0, 0, true, false, NULL };
+        if (aggregate && ws->nord == 0) {                     // tutta la partizione
+            for (int r = start; r < end; r++) wacc_add(&acc, f, ARG(r, 0), star);
+            for (int r = start; r < end; r++) wacc_result(&acc, f, OUT(r));
+        }
+        for (int g = start; g < end; ) {                      // gruppi di pari
+            int ge = g + 1;
+            while (ge < end && keys_equal(KEY(g), KEY(ge), ws->npart, K)) ge++;
+            dense++;
+            if (aggregate && ws->nord) {
+                for (int r = g; r < ge; r++) wacc_add(&acc, f, ARG(r, 0), star);
+                for (int r = g; r < ge; r++) wacc_result(&acc, f, OUT(r));
+            }
+            for (int r = g; r < ge && !aggregate; r++) {
+                SortKey* o = OUT(r);
+                free(o->str);
+                memset(o, 0, sizeof(*o));
+                int64_t iv = 0;
+                bool is_int = true;
+                if (!strcmp(f, "ROW_NUMBER")) iv = r - start + 1;
+                else if (!strcmp(f, "RANK")) iv = g - start + 1;
+                else if (!strcmp(f, "DENSE_RANK")) iv = dense;
+                else if (!strcmp(f, "NTILE")) {
+                    const SortKey* b = ARG(start, 0);
+                    int64_t buckets = b->is_num ? (int64_t)b->num : 0;
+                    if (buckets < 1) { snprintf(ec->err, sizeof(ec->err), "NTILE needs a positive number of groups"); ok = false; break; }
+                    int64_t cnt = end - start, size = cnt / buckets, extra = cnt % buckets, pos = r - start;
+                    iv = pos < extra * (size + 1) ? pos / (size + 1) + 1 : extra + (size ? (pos - extra * (size + 1)) / size : 0) + 1;
+                } else {
+                    is_int = false;
+                    if (!strcmp(f, "LAG") || !strcmp(f, "LEAD")) {
+                        const SortKey* ov = ARG(r, 1);
+                        int64_t off = w->nargs > 1 ? (ov->is_num ? (int64_t)ov->num : 0) : 1;
+                        int64_t t = !strcmp(f, "LAG") ? r - off : r + off;
+                        if (t >= start && t < end) oval_copy(o, ARG(t, 0));
+                        else if (w->nargs > 2) oval_copy(o, ARG(r, 2));
+                        else o->null = true;
+                    } else if (!strcmp(f, "FIRST_VALUE")) oval_copy(o, ARG(start, 0));
+                    else oval_copy(o, ARG(ws->nord ? ge - 1 : end - 1, 0));      // LAST_VALUE
+                }
+                if (is_int) { o->is_num = o->is_int = true; o->inum = iv; o->num = (double)iv; }
+            }
+            g = ge;
+        }
+        start = end;
+    }
+    #undef KEY
+    #undef ARG
+    #undef OUT
+    for (size_t i = 0; keys && i < (size_t)n * (size_t)K; i++) free(keys[i].str);
+    for (size_t i = 0; argv && i < (size_t)n * 3; i++) free(argv[i].str);
+    free(keys);
+    free(argv);
+    free(idx);
+    return ok;
 }
 
 static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_order, ORows* res) {
@@ -2990,7 +3202,7 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
     // 3. unità di output: combinazioni o gruppi
     st.null_combo = calloc((size_t)w, sizeof(Tuple*));
     if (!st.null_combo) AFAIL("Out of memory");
-    int nunits = 0;
+    int nunits = 0, nunits_total = 0;
     if (p->grouped) {
         int ngroups = 0;
         int* group_of = malloc(sizeof(int) * (size_t)(st.combos.n ? st.combos.n : 1));
@@ -3036,21 +3248,17 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
         st.units = malloc(sizeof(int) * (size_t)(ngroups ? ngroups : 1));
         if (!st.units) AFAIL("Out of memory");
         for (int u = 0; u < ngroups; u++) st.units[nunits++] = u;
+        nunits_total = ngroups;
         p->st_groups += ngroups;
     } else {
         st.units = malloc(sizeof(int) * (size_t)(st.combos.n ? st.combos.n : 1));
         if (!st.units) AFAIL("Out of memory");
         for (int i = 0; i < st.combos.n; i++) st.units[nunits++] = i;
+        nunits_total = st.combos.n;
     }
 
-    #define SET_UNIT(u) do { \
-        if (p->grouped) { \
-            int g_ = (u); \
-            ec.grp  = st.group_size[g_] ? &st.groups_buf[st.group_start[g_]] : &st.null_combo; \
-            ec.ngrp = st.group_size[g_]; \
-            ec.cur  = st.group_size[g_] ? st.groups_buf[st.group_start[g_]] : st.null_combo; \
-        } else { ec.cur = COMBO(&st.combos, (u)); ec.grp = NULL; ec.ngrp = 0; } \
-    } while (0)
+    #define SET_UNIT(u) arm_set_unit(p, &st, &ec, (u))
+
 
     // HAVING
     if (p->grouped && n->select_stmt.having) {
@@ -3063,6 +3271,18 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
         if (ec.err[0]) AFAIL("%s", ec.err);
     }
     p->st_having += nunits;
+
+    // funzioni finestra: calcolate su tutte le unità rimaste, prima di DISTINCT / ORDER BY
+    if (p->nwins) {
+        int total = nunits_total;
+        st.nwinv = total;
+        for (int w = 0; w < p->nwins; w++) {
+            st.winv[w] = calloc((size_t)(total ? total : 1), sizeof(SortKey));
+            if (!st.winv[w]) AFAIL("Out of memory");
+            if (!window_compute(p, &st, &ec, p->wins[w], st.units, nunits, st.winv[w])) AFAIL("%s", ec.err[0] ? ec.err : "Out of memory");
+        }
+        ec.win = st.winv;
+    }
 
     // 4. DISTINCT, ORDER BY, OFFSET / LIMIT; le colonne si calcolano solo per le righe che restano
     int nkeys = apply_order ? n->select_stmt.num_order : 0;
@@ -3571,6 +3791,11 @@ static double explain_arm(PlanOut* po, SelectPlan* p, const char* indent, int de
     }
     buf[0] = '\0';
     for (int i = 0; i < p->nout; i++) snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s%s", i ? ", " : "", p->out[i].name);
+    for (int w = 0; w < p->nwins; w++) {
+        char wf[300];
+        ast_expr_format(p->wins[w], wf, sizeof(wf));
+        plan_row_a(po, indent, "Window", wf, rows, po->analyze ? (p->grouped ? p->st_having : p->st_resid) : -1);
+    }
     // le colonne si calcolano per tutte le righe solo con DISTINCT; altrimenti dopo ORDER BY / LIMIT
     long projected = n->select_stmt.distinct ? (p->grouped ? p->st_having : p->st_resid) : p->st_out;
     plan_row_a(po, indent, "Projection", buf, rows, po->analyze ? projected : -1);

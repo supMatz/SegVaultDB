@@ -23,8 +23,19 @@ typedef enum { EXPR_COLUMN, EXPR_INT, EXPR_FLOAT, EXPR_STRING, EXPR_STAR,
                EXPR_AGG,    // aggregato: func = COUNT/SUM/AVG/MIN/MAX; args[0] = argomento, col_name "*" per COUNT(*)
                EXPR_FUNC,   // funzione scalare: func = nome (UPPER, LENGTH, COALESCE, ...), args = argomenti
                EXPR_SUBQUERY, // subquery: subq; subkind = SUBQ_*; left = operando di IN / ANY / ALL
-               EXPR_CASE    // CASE [left] WHEN args[0] THEN args[1] ... [ELSE right] END
+               EXPR_CASE,   // CASE [left] WHEN args[0] THEN args[1] ... [ELSE right] END
+               EXPR_WINDOW  // funzione finestra: func(args) OVER (win)
 } ExprType;
+
+// OVER ( [PARTITION BY ...] [ORDER BY ...] )
+typedef struct WindowSpec {
+    struct ASTExpr* part[8];
+    int             npart;
+    struct ASTExpr* ord[8];
+    bool            desc[8];
+    int             nord;
+    int             slot;          // posizione fra le funzioni finestra della query (executor)
+} WindowSpec;
 
 // tipi di subquery
 //   SUBQ_SCALAR  (SELECT ...)            un valore (NULL se nessuna riga, errore se più righe)
@@ -72,6 +83,7 @@ typedef struct ASTExpr {
     int      depth;           // profondità dell'albero (limitata: valutazione e liberazione sono ricorsive)
     SubQuery* subq;           // EXPR_SUBQUERY
     int      subkind;         // EXPR_SUBQUERY: SUBQ_*
+    WindowSpec* win;          // EXPR_WINDOW
 } ASTExpr;
 
 // libera un'espressione e tutti i suoi figli
