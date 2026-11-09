@@ -744,7 +744,21 @@ int main(void) {
     t("CREATE TRIGGER bad BEFORE INSERT ON r FOR EACH ROW WHEN (NEW.y > 0) SIGNAL 'x'", "ERR:Unknown column 'y'");
     t("CREATE TRIGGER bad BEFORE INSERT ON r FOR EACH ROW DROP TABLE r", "ERR:A trigger can contain");
     t("CREATE TRIGGER storico AFTER INSERT ON r FOR EACH ROW SIGNAL 'x'", "ERR:already exists");
-    t("SHOW TRIGGERS", "#5");
+    // i trigger scattano anche per le modifiche a cascata delle chiavi esterne
+    t("CREATE TABLE pa (id INT PRIMARY KEY)", "OK:0");
+    t("CREATE TABLE fi (id INT PRIMARY KEY, pid INT REFERENCES pa ON DELETE CASCADE ON UPDATE CASCADE)", "OK:0");
+    t("CREATE TABLE registro (evento VARCHAR(30))", "OK:0");
+    t("INSERT INTO pa VALUES (1), (2)", "OK:2");
+    t("INSERT INTO fi VALUES (10, 1), (11, 1), (12, 2)", "OK:3");
+    t("CREATE TRIGGER fi_del AFTER DELETE ON fi FOR EACH ROW INSERT INTO registro VALUES (CONCAT('cancellato ', OLD.id))", "OK:0");
+    t("CREATE TRIGGER fi_upd BEFORE UPDATE OF pid ON fi FOR EACH ROW WHEN (NEW.pid = 99) SIGNAL 'pid 99 vietato'", "OK:0");
+    t("DELETE FROM pa WHERE id = 1", "OK:1");
+    t("SELECT evento FROM registro ORDER BY evento", "cancellato 10;cancellato 11");
+    t("UPDATE pa SET id = 99 WHERE id = 2", "ERR:pid 99 vietato");
+    t("SELECT id FROM pa", "2");
+    t("UPDATE pa SET id = 3 WHERE id = 2", "OK:1");
+    t("SELECT pid FROM fi", "3");
+    t("SHOW TRIGGERS", "#7");
     t("SHOW TRIGGERS FROM conto", "#2");
     {
         // lo split dell'editor tiene insieme BEGIN ... END di un trigger

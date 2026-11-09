@@ -4924,6 +4924,32 @@ static QueryResult* exec_drop_trigger(ExecCtx* ctx, ASTNode* n) {
     return result_error_msg(msg);
 }
 
+// trigger per riga delle modifiche fatte dalle azioni delle chiavi esterne (CASCADE, SET NULL, ...)
+static const char* fire_cascaded(ExecCtx* ctx, Database* db, ChangeSet* cs, bool before, char* msg, size_t mn) {
+    if (!db->num_triggers) return NULL;
+    for (int i = 0; i < cs->n; i++) {
+        Change* ch = &cs->v[i];
+        if (ch->direct) continue;
+        int changed[SV_MAX_COLUMNS], nch = 0;
+        for (int c = 0; ch->nt && c < ch->ts->num_columns; c++) {
+            char a[EV_STR_MAX + 1], b[EV_STR_MAX + 1];
+            const Value* x = &ch->old->values[c];
+            const Value* y = &ch->nt->values[c];
+            bool diff = x->is_null != y->is_null;
+            if (!diff && !x->is_null) {
+                mi_key(x, ch->ts->columns[c].type, a, sizeof(a));
+                mi_key(y, ch->ts->columns[c].type, b, sizeof(b));
+                diff = strcmp(a, b) != 0;
+            }
+            if (diff) changed[nch++] = c;
+        }
+        const char* f = fire_triggers(ctx, db, ch->ts, ch->nt ? "UPDATE" : "DELETE", before, true, ch->old, ch->nt,
+                                      ch->nt ? changed : NULL, nch, msg, mn);
+        if (f) return f;
+    }
+    return NULL;
+}
+
 static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
@@ -5237,11 +5263,13 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
             else nt[i] = NULL;                                   // ora appartiene all'insieme delle modifiche
         }
         if (!fail) fail = cs_cascade(&cs, msg, sizeof(msg));
+        if (!fail) fail = fire_cascaded(ctx, db, &cs, true, msg, sizeof(msg));
         if (!fail) fail = cs_validate(&cs, msg, sizeof(msg));
         if (!fail) affected = cs_apply(&cs, msg, sizeof(msg), &fail);
         for (int i = 0; i < cs.n && !fail; i++)
             if (cs.v[i].direct)
                 fail = fire_triggers(ctx, db, ts, "UPDATE", false, true, cs.v[i].old, cs.v[i].nt, set_ci, n->update_stmt.num_sets, msg, sizeof(msg));
+        if (!fail) fail = fire_cascaded(ctx, db, &cs, false, msg, sizeof(msg));
         if (!fail) fail = fire_triggers(ctx, db, ts, "UPDATE", false, false, NULL, NULL, set_ci, n->update_stmt.num_sets, msg, sizeof(msg));
         cs_free(&cs);
     }
@@ -5293,10 +5321,12 @@ static QueryResult* exec_delete(ExecCtx* ctx, ASTNode* n) {
     for (int i = 0; i < nm && !fail; i++)
         if (cs_add(&cs, ts, s.rids[idx[i]], s.rows[idx[i]], NULL, false, true) < 0) fail = "Out of memory";
     if (!fail) fail = cs_cascade(&cs, msg, sizeof(msg));
+    if (!fail) fail = fire_cascaded(ctx, db, &cs, true, msg, sizeof(msg));
     if (!fail) fail = cs_validate(&cs, msg, sizeof(msg));
     if (!fail) affected = cs_apply(&cs, msg, sizeof(msg), &fail);
     for (int i = 0; i < cs.n && !fail; i++)
         if (cs.v[i].direct) fail = fire_triggers(ctx, db, ts, "DELETE", false, true, cs.v[i].old, NULL, NULL, 0, msg, sizeof(msg));
+    if (!fail) fail = fire_cascaded(ctx, db, &cs, false, msg, sizeof(msg));
     if (!fail) fail = fire_triggers(ctx, db, ts, "DELETE", false, false, NULL, NULL, NULL, 0, msg, sizeof(msg));
     cs_free(&cs);
     free(idx);
