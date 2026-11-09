@@ -31,10 +31,22 @@ static int skip_quoted_or_comment(const char* s, int len, int i) {
     return i;
 }
 
+static bool word_eq(const char* s, int a, int b, const char* w) {
+    int n = (int)strlen(w);
+    if (b - a != n) return false;
+    for (int k = 0; k < n; k++) if (toupper((unsigned char)s[a + k]) != w[k]) return false;
+    return true;
+}
+
+// Divide lo script negli statement separati da ';' (fuori da stringhe e commenti).
+// Dentro CREATE TRIGGER ... BEGIN ... END i ';' del corpo non separano: si conta la
+// profondità dei blocchi (BEGIN e CASE aprono, END chiude; END IF chiude un IF).
 int sql_split(const char* s, int len, SqlRange* out, int max_out) {
     int n = 0, i = 0, start = 0, code_start = -1;
+    int words = 0, depth = 0;
+    bool trigger = false, prev_end = false;
     while (i <= len && n < max_out) {
-        if (i == len || s[i] == ';') {
+        if (i == len || (s[i] == ';' && !(trigger && depth > 0))) {
             if (i < len || start < len) {
                 SqlRange r;
                 r.start      = start;
@@ -48,6 +60,8 @@ int sql_split(const char* s, int len, SqlRange* out, int max_out) {
             i++;
             start = i;
             code_start = -1;
+            words = depth = 0;
+            trigger = prev_end = false;
             continue;
         }
         char c = s[i];
@@ -59,6 +73,23 @@ int sql_split(const char* s, int len, SqlRange* out, int max_out) {
             continue;
         }
         if (!isspace((unsigned char)c) && code_start < 0) code_start = i;
+        if (isalpha((unsigned char)c) || c == '_') {
+            int e = i;
+            while (e < len && (isalnum((unsigned char)s[e]) || s[e] == '_')) e++;
+            words++;
+            if (words <= 4 && word_eq(s, i, e, "TRIGGER") && word_eq(s, code_start, code_start + 6, "CREATE")) trigger = true;
+            if (trigger) {
+                bool closes_if = prev_end && (word_eq(s, i, e, "IF") || word_eq(s, i, e, "LOOP") || word_eq(s, i, e, "WHILE"));
+                if (closes_if) depth++;                          // "END IF": l'END non chiudeva un BEGIN
+                if (word_eq(s, i, e, "BEGIN") || word_eq(s, i, e, "CASE")) depth++;
+                else if (word_eq(s, i, e, "END")) depth--;
+                prev_end = word_eq(s, i, e, "END");
+                if (depth < 0) depth = 0;
+            }
+            i = e;
+            continue;
+        }
+        if (!isspace((unsigned char)c)) prev_end = false;
         i++;
     }
     return n;

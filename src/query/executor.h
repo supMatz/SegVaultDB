@@ -11,11 +11,18 @@
 #include "../tx/wal.h"
 #include "parser.h"
 
+struct BindCtx;
+struct EvalCtx;
+
 typedef struct {
     Catalog*    catalog;
     BufferPool* bp;
     WAL*        wal;
     uint64_t    tx_id;
+    // istruzioni del corpo di un trigger: NEW e OLD sono visibili come una query esterna
+    struct BindCtx* trig_bind;
+    struct EvalCtx* trig_eval;
+    int         trig_depth;       // trigger annidati (un trigger che ne attiva altri)
 } ExecCtx;
 
 QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt);

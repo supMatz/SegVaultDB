@@ -163,6 +163,76 @@ static void maybe_checkpoint(void) {
     if (g_db.initialized && !g_db.exec_ctx.tx_id && wal_size(g_db.wal) > SV_WAL_CHECKPOINT_BYTES) do_checkpoint();
 }
 
+static int g_num_savepoints;
+
+// Uno statement con trigger è atomico: se un trigger fallisce dopo che le righe sono state
+// scritte, tutto lo statement viene annullato (transazione implicita, o savepoint se c'è
+// già una transazione aperta). Senza trigger le modifiche sono già validate prima di scrivere.
+static QueryResult* exec_atomic(ASTNode* stmt) {
+    Database* db = catalog_current_db(g_db.catalog);
+    bool dml = stmt->type == NODE_INSERT || stmt->type == NODE_UPDATE || stmt->type == NODE_DELETE;
+    if (!dml || !db || db->num_triggers == 0) return executor_run(&g_db.exec_ctx, stmt);
+    if (!g_db.exec_ctx.tx_id) {
+        if (!db_begin()) return executor_run(&g_db.exec_ctx, stmt);
+        QueryResult* r = executor_run(&g_db.exec_ctx, stmt);
+        if (r && r->success) db_commit(); else db_rollback();
+        return r;
+    }
+    int before = g_num_savepoints;
+    bool sp = db_savepoint("__sv_statement");
+    QueryResult* r = executor_run(&g_db.exec_ctx, stmt);
+    if (sp && (!r || !r->success)) db_rollback_to("__sv_statement");
+    if (sp) g_num_savepoints = before;          // il savepoint interno non resta visibile
+    return r;
+}
+
+// esegue uno statement già analizzato (transazioni e CHECKPOINT gestiti qui)
+static QueryResult* exec_one(ASTNode* stmt) {
+    QueryResult* result = NULL;
+    if (stmt->type == NODE_BEGIN) {
+        result = db_begin() ? result_ok(0) : result_error("Failed to begin transaction");
+    } else if (stmt->type == NODE_COMMIT) {
+        result = db_commit() ? result_ok(0) : result_error("Failed to commit");
+    } else if (stmt->type == NODE_ROLLBACK && stmt->rollback_to.name[0] == 0) {
+        result = db_rollback() ? result_ok(0) : result_error("Failed to rollback");
+    } else if (stmt->type == NODE_CHECKPOINT) {
+        result = g_db.exec_ctx.tx_id ? result_error("CHECKPOINT is not allowed inside a transaction")
+               : do_checkpoint() ? result_ok(0) : result_error("Checkpoint failed");
+    } else if (stmt->type == NODE_SAVEPOINT) {
+        result = db_savepoint(stmt->savepoint.name) ? result_ok(0) : result_error("Failed to set savepoint");
+    } else if (stmt->type == NODE_ROLLBACK_TO) {
+        result = db_rollback_to(stmt->rollback_to.name) ? result_ok(0) : result_error("Failed to rollback to savepoint");
+    } else if (stmt->type == NODE_SELECT) {
+        // sola lettura: interrompibile a metà
+        atomic_store(&g_read_running, 1);
+        if (atomic_load(&g_cancel_requested)) atomic_store(&g_sv_scan_cancel, 1);
+        result = atomic_load(&g_sv_scan_cancel) ? NULL : executor_run(&g_db.exec_ctx, stmt);
+        atomic_store(&g_read_running, 0);
+        if (atomic_load(&g_sv_scan_cancel)) {   // risultato parziale: scartato
+            if (result) db_result_free(result);
+            result = result_error("Query cancelled");
+            atomic_store(&g_sv_scan_cancel, 0);
+        }
+    } else {
+        result = exec_atomic(stmt);
+    }
+
+    // le modifiche allo schema vanno subito su disco: dopo un arresto anomalo le tabelle
+    // create non devono sparire (il catalogo è piccolo, salvarlo costa poco)
+    if (result && result->success) {
+        switch (stmt->type) {
+            case NODE_CREATE_DB: case NODE_CREATE_TABLE: case NODE_CREATE_INDEX: case NODE_CREATE_VIEW:
+            case NODE_DROP_DB: case NODE_DROP_TABLE: case NODE_DROP_VIEW: case NODE_DROP_INDEX:
+            case NODE_ALTER_TABLE: case NODE_TRUNCATE: case NODE_CREATE_TRIGGER: case NODE_DROP_TRIGGER:
+                bp_flush_all(g_db.bp);
+                catalog_save(g_db.catalog, g_db.cat_path);
+                break;
+            default: break;
+        }
+    }
+    return result;
+}
+
 static QueryResult* db_execute_impl(const char* sql) {
     if (!g_db.initialized) return result_error("DB non inizializzato");
     if (!sql || !sql[0])   return result_error("Query vuota");
@@ -181,56 +251,8 @@ static QueryResult* db_execute_impl(const char* sql) {
     }
 
     // Esegui il primo statement (multi-statement gestito da db_execute_multi)
-    QueryResult* result = NULL;
-    if (parsed->count > 0) {
-        ASTNode* stmt = parsed->statements[0];
-        // Handle transaction statements directly at bridge level
-        if (stmt->type == NODE_BEGIN) {
-            result = db_begin() ? result_ok(0) : result_error("Failed to begin transaction");
-        } else if (stmt->type == NODE_COMMIT) {
-            result = db_commit() ? result_ok(0) : result_error("Failed to commit");
-        } else if (stmt->type == NODE_ROLLBACK && stmt->rollback_to.name[0] == 0) {
-            result = db_rollback() ? result_ok(0) : result_error("Failed to rollback");
-        } else if (stmt->type == NODE_CHECKPOINT) {
-            result = g_db.exec_ctx.tx_id ? result_error("CHECKPOINT is not allowed inside a transaction")
-                   : do_checkpoint() ? result_ok(0) : result_error("Checkpoint failed");
-        } else if (stmt->type == NODE_SAVEPOINT) {
-            result = db_savepoint(stmt->savepoint.name) ? result_ok(0) : result_error("Failed to set savepoint");
-        } else if (stmt->type == NODE_ROLLBACK_TO) {
-            result = db_rollback_to(stmt->rollback_to.name) ? result_ok(0) : result_error("Failed to rollback to savepoint");
-        } else if (stmt->type == NODE_SELECT) {
-            // sola lettura: interrompibile a metà
-            atomic_store(&g_read_running, 1);
-            if (atomic_load(&g_cancel_requested)) atomic_store(&g_sv_scan_cancel, 1);
-            result = atomic_load(&g_sv_scan_cancel) ? NULL : executor_run(&g_db.exec_ctx, stmt);
-            atomic_store(&g_read_running, 0);
-            if (atomic_load(&g_sv_scan_cancel)) {   // risultato parziale: scartato
-                if (result) db_result_free(result);
-                result = result_error("Query cancelled");
-                atomic_store(&g_sv_scan_cancel, 0);
-            }
-        } else {
-            result = executor_run(&g_db.exec_ctx, stmt);
-        }
-    } else {
-        result = result_ok(0);
-    }
-
+    QueryResult* result = parsed->count > 0 ? exec_one(parsed->statements[0]) : result_ok(0);
     if (result) result->exec_time_ms = get_time_ms() - t_start;
-
-    // le modifiche allo schema vanno subito su disco: dopo un arresto anomalo le tabelle
-    // create non devono sparire (il catalogo è piccolo, salvarlo costa poco)
-    if (result && result->success && parsed->count > 0) {
-        switch (parsed->statements[0]->type) {
-            case NODE_CREATE_DB: case NODE_CREATE_TABLE: case NODE_CREATE_INDEX: case NODE_CREATE_VIEW:
-            case NODE_DROP_DB: case NODE_DROP_TABLE: case NODE_DROP_VIEW: case NODE_DROP_INDEX:
-            case NODE_ALTER_TABLE: case NODE_TRUNCATE: case NODE_CREATE_TRIGGER: case NODE_DROP_TRIGGER:
-                bp_flush_all(g_db.bp);
-                catalog_save(g_db.catalog, g_db.cat_path);
-                break;
-            default: break;
-        }
-    }
 
     parse_result_free(parsed);
     lexer_free(tokens);
@@ -255,7 +277,7 @@ static QueryResult** db_execute_multi_impl(const char* sql, int* out_count) {
 
     QueryResult** results = SV_ALLOC_N(QueryResult*, parsed->count);
     for (int i = 0; i < parsed->count; i++) {
-        results[i] = executor_run(&g_db.exec_ctx, parsed->statements[i]);
+        results[i] = exec_one(parsed->statements[i]);
         if (results[i])
             results[i]->exec_time_ms = get_time_ms() - t_start;
     }
@@ -290,9 +312,11 @@ void db_result_free_multi(QueryResult** results, int count) {
 
 static bool db_begin_impl(void) {
     if (!g_db.initialized) return false;
+    if (g_db.exec_ctx.tx_id) return false;          // transazione già aperta
     Transaction* tx = txm_begin(g_db.txm);
     if (!tx) return false;
     g_db.exec_ctx.tx_id = tx->tx_id;
+    g_num_savepoints = 0;
     wal_write(g_db.wal, LOG_BEGIN, tx->tx_id, 0,
               (SVRID){0,0}, NULL, 0, NULL, 0);
     return true;
@@ -305,6 +329,7 @@ static bool db_commit_impl(void) {
     wal_flush(g_db.wal); // DEVE essere su disco prima del commit
     txm_commit(g_db.txm, g_db.exec_ctx.tx_id);
     g_db.exec_ctx.tx_id = 0;
+    g_num_savepoints = 0;
     return true;
 }
 
@@ -322,13 +347,14 @@ static bool db_rollback_impl(void) {
     bp_remove_all(g_db.bp);
     txm_abort(g_db.txm, g_db.exec_ctx.tx_id);
     g_db.exec_ctx.tx_id = 0;
+    g_num_savepoints = 0;
     executor_invalidate_indexes();   // le righe sono tornate indietro (e possono aver cambiato posizione)
     return true;
 }
 
 // Simple savepoint tracking: store name and file offset
 static struct { char name[64]; off_t offset; } g_savepoints[64];
-static int g_num_savepoints = 0;
+static int g_num_savepoints = 0;   // (dichiarato prima di exec_atomic)
 
 static bool db_savepoint_impl(const char* name) {
     if (!g_db.initialized) return false;

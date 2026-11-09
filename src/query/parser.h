@@ -256,4 +256,40 @@ ASTExpr*    parser_parse_expr(TokenList* tokens, char* err, size_t errn);
 void        ast_node_free(ASTNode* n);
 void        parse_result_free(ParseResult* r);
 
+// ── trigger ──
+// Testo salvato nel catalogo (dopo "ON tabella"):
+//   [OF colonna {, colonna}] [FOR EACH ROW | FOR EACH STATEMENT] [WHEN (condizione)] corpo
+//   corpo := BEGIN istruzione; {istruzione;} END | istruzione
+//   istruzione := INSERT | UPDATE | DELETE | SELECT
+//              | SET NEW.colonna = espressione          (solo BEFORE ... FOR EACH ROW)
+//              | SIGNAL [SQLSTATE '45000'] [SET MESSAGE_TEXT =] 'messaggio'   (annulla lo statement)
+//              | IF condizione THEN istruzioni {ELSEIF condizione THEN istruzioni} [ELSE istruzioni] END IF
+typedef enum { TS_SQL, TS_SET, TS_SIGNAL, TS_IF } TrigStmtKind;
+
+typedef struct TrigStmt {
+    TrigStmtKind      kind;
+    ASTNode*          sql;          // TS_SQL
+    char              col[64];      // TS_SET: colonna di NEW
+    ASTExpr*          expr;         // TS_SET: valore; TS_SIGNAL: messaggio
+    ASTExpr*          cond;         // TS_IF
+    struct TrigStmt** then_v;
+    int               nthen;
+    struct TrigStmt** else_v;       // ELSEIF diventa un IF dentro l'ELSE
+    int               nelse;
+} TrigStmt;
+
+typedef struct {
+    bool       success;
+    char       error[256];
+    char       of_cols[8][64];      // UPDATE OF colonne
+    int        n_of;
+    bool       for_each_row;        // false = FOR EACH STATEMENT
+    ASTExpr*   when;
+    TrigStmt** v;
+    int        n;
+} TrigProgram;
+
+TrigProgram* parser_parse_trigger(TokenList* tokens);
+void         trig_program_free(TrigProgram* p);
+
 #endif

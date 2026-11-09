@@ -1007,33 +1007,233 @@ static void parse_column_ref(ParserState* ps, ASTExpr* e) {
     }
 }
 
+// ── trigger ──
+
+static bool tokens_text(ParserState* ps, int from, int to, char* out, size_t cap);
+static void trig_stmts_free(TrigStmt** v, int n);
+
+static void trig_stmt_free(TrigStmt* t) {
+    if (!t) return;
+    free_node(t->sql);
+    ast_expr_free(t->expr);
+    ast_expr_free(t->cond);
+    trig_stmts_free(t->then_v, t->nthen);
+    trig_stmts_free(t->else_v, t->nelse);
+    free(t);
+}
+
+static void trig_stmts_free(TrigStmt** v, int n) {
+    for (int i = 0; i < n; i++) trig_stmt_free(v[i]);
+    free(v);
+}
+
+void trig_program_free(TrigProgram* p) {
+    if (!p) return;
+    ast_expr_free(p->when);
+    trig_stmts_free(p->v, p->n);
+    free(p);
+}
+
+static bool trig_push(ParserState* ps, TrigStmt*** v, int* n, TrigStmt* t) {
+    TrigStmt** nv = realloc(*v, sizeof(TrigStmt*) * (size_t)(*n + 1));
+    if (!nv) { trig_stmt_free(t); parse_fail(ps, "Out of memory", peek(ps)); return false; }
+    *v = nv;
+    (*v)[(*n)++] = t;
+    return true;
+}
+
+static ASTNode* parse_statement(ParserState* ps);
+static TrigStmt* parse_trig_stmt(ParserState* ps);
+
+// istruzioni fino a una delle parole di chiusura (END, ELSE, ELSEIF), ciascuna seguita da ';'
+static void parse_trig_list(ParserState* ps, TrigStmt*** v, int* n) {
+    while (ps->result->success) {
+        Token t = peek(ps);
+        if (t.type == TOK_EOF) { parse_fail(ps, "Expected END to close the trigger body", t); return; }
+        if (t.type == TOK_END || t.type == TOK_ELSE || ident_is(ps, "ELSEIF")) return;
+        if (t.type == TOK_SEMICOLON) { consume(ps); continue; }
+        TrigStmt* st = parse_trig_stmt(ps);
+        if (!st) return;
+        if (!trig_push(ps, v, n, st)) return;
+        if (!match(ps, TOK_SEMICOLON) && peek(ps).type != TOK_END) { parse_fail(ps, "Expected ';' after the statement in the trigger", peek(ps)); return; }
+    }
+}
+
+// IF ... THEN ... {ELSEIF ... THEN ...} [ELSE ...] END IF  (IF già consumato)
+static TrigStmt* parse_trig_if(ParserState* ps) {
+    TrigStmt* t = calloc(1, sizeof(TrigStmt));
+    if (!t) return NULL;
+    t->kind = TS_IF;
+    t->cond = parse_expr(ps);
+    if (!t->cond || !match(ps, TOK_THEN)) { if (ps->result->success) parse_fail(ps, "Expected THEN after the IF condition", peek(ps)); trig_stmt_free(t); return NULL; }
+    parse_trig_list(ps, &t->then_v, &t->nthen);
+    if (!ps->result->success) { trig_stmt_free(t); return NULL; }
+    if (ident_is(ps, "ELSEIF")) {
+        consume(ps);
+        TrigStmt* inner = parse_trig_if(ps);           // consuma anche END IF
+        if (!inner || !trig_push(ps, &t->else_v, &t->nelse, inner)) { trig_stmt_free(t); return NULL; }
+        return t;
+    }
+    if (match(ps, TOK_ELSE)) {
+        parse_trig_list(ps, &t->else_v, &t->nelse);
+        if (!ps->result->success) { trig_stmt_free(t); return NULL; }
+    }
+    if (!match(ps, TOK_END) || !(ident_is(ps, "IF") || peek(ps).type == TOK_IDENTIFIER)) {
+        parse_fail(ps, "Expected END IF", peek(ps));
+        trig_stmt_free(t);
+        return NULL;
+    }
+    if (!ident_is(ps, "IF")) { parse_fail(ps, "Expected END IF", peek(ps)); trig_stmt_free(t); return NULL; }
+    consume(ps);
+    return t;
+}
+
+static TrigStmt* parse_trig_stmt(ParserState* ps) {
+    if (ident_is(ps, "IF")) { consume(ps); return parse_trig_if(ps); }
+    TrigStmt* t = calloc(1, sizeof(TrigStmt));
+    if (!t) { parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
+    if (peek(ps).type == TOK_SET) {                     // SET NEW.colonna = espressione
+        consume(ps);
+        Token q = consume(ps);
+        if (q.type != TOK_IDENTIFIER || strcasecmp(q.text, "NEW") || !match(ps, TOK_DOT)) {
+            parse_fail(ps, "In a trigger SET can only change NEW.column", q);
+            free(t);
+            return NULL;
+        }
+        Token c = consume(ps);
+        if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name after NEW.", c); free(t); return NULL; }
+        copy_text(ps, t->col, sizeof(t->col), c.text);
+        if (!match(ps, TOK_EQ)) { parse_fail(ps, "Expected '=' in SET", peek(ps)); free(t); return NULL; }
+        t->kind = TS_SET;
+        t->expr = parse_expr(ps);
+        if (!t->expr) { free(t); return NULL; }
+        return t;
+    }
+    if (ident_is(ps, "SIGNAL") || ident_is(ps, "RAISE")) {
+        // SIGNAL [SQLSTATE ['VALUE'] '45000'] [SET MESSAGE_TEXT =] 'messaggio'   |   RAISE 'messaggio'
+        consume(ps);
+        if (ident_is(ps, "SQLSTATE")) {
+            consume(ps);
+            if (ident_is(ps, "VALUE")) consume(ps);
+            if (peek(ps).type == TOK_STRING) consume(ps);
+        }
+        if (peek(ps).type == TOK_SET) {
+            consume(ps);
+            if (!ident_is(ps, "MESSAGE_TEXT")) { parse_fail(ps, "Expected MESSAGE_TEXT", peek(ps)); free(t); return NULL; }
+            consume(ps);
+            if (!match(ps, TOK_EQ)) { parse_fail(ps, "Expected '=' after MESSAGE_TEXT", peek(ps)); free(t); return NULL; }
+        }
+        t->kind = TS_SIGNAL;
+        if (peek(ps).type == TOK_SEMICOLON || peek(ps).type == TOK_END) {
+            t->expr = new_expr(EXPR_STRING);
+            if (t->expr) snprintf(t->expr->str_val, sizeof(t->expr->str_val), "Error raised by a trigger");
+        } else {
+            t->expr = parse_expr(ps);
+        }
+        if (!t->expr) { free(t); return NULL; }
+        return t;
+    }
+    Token k = peek(ps);
+    if (k.type != TOK_INSERT && k.type != TOK_UPDATE && k.type != TOK_DELETE && !query_starts(ps, 0)) {
+        parse_fail(ps, "A trigger can contain INSERT, UPDATE, DELETE, SELECT, SET NEW.column, SIGNAL and IF", k);
+        free(t);
+        return NULL;
+    }
+    t->kind = TS_SQL;
+    t->sql = parse_statement(ps);
+    if (!t->sql || !ps->result->success) { trig_stmt_free(t); return NULL; }
+    return t;
+}
+
+// [OF colonne] [FOR EACH ROW | STATEMENT] [WHEN (condizione)] corpo
+static void parse_trigger_rest(ParserState* ps, TrigProgram* p) {
+    p->for_each_row = true;
+    if (ident_is(ps, "OF")) {
+        consume(ps);
+        do {
+            Token c = consume(ps);
+            if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name after OF", c); return; }
+            if (p->n_of >= 8) { parse_fail(ps, "Too many columns after OF (max 8)", c); return; }
+            copy_text(ps, p->of_cols[p->n_of++], 64, c.text);
+        } while (match(ps, TOK_COMMA));
+    }
+    if (match(ps, TOK_FOR)) {
+        match(ps, TOK_EACH);
+        if (match(ps, TOK_ROW)) p->for_each_row = true;
+        else if (ident_is(ps, "STATEMENT")) { consume(ps); p->for_each_row = false; }
+        else { parse_fail(ps, "Expected ROW or STATEMENT after FOR EACH", peek(ps)); return; }
+    }
+    if (match(ps, TOK_WHEN)) {
+        bool par = match(ps, TOK_LPAREN);
+        p->when = parse_expr(ps);
+        if (!p->when) return;
+        if (par && !match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')' after the WHEN condition", peek(ps)); return; }
+    }
+    if (match(ps, TOK_BEGIN)) {
+        parse_trig_list(ps, &p->v, &p->n);
+        if (ps->result->success && !match(ps, TOK_END)) parse_fail(ps, "Expected END to close the trigger body", peek(ps));
+    } else {
+        TrigStmt* st = parse_trig_stmt(ps);
+        if (st) trig_push(ps, &p->v, &p->n, st);
+    }
+}
+
+TrigProgram* parser_parse_trigger(TokenList* tokens) {
+    TrigProgram* p = calloc(1, sizeof(TrigProgram));
+    if (!p) return NULL;
+    ParseResult r;
+    memset(&r, 0, sizeof(r));
+    r.success = true;
+    ParserState ps = { tokens, 0, &r, 0 };
+    parse_trigger_rest(&ps, p);
+    match(&ps, TOK_SEMICOLON);
+    if (r.success && peek(&ps).type != TOK_EOF) parse_fail(&ps, "Unexpected text after the trigger body", peek(&ps));
+    p->success = r.success;
+    snprintf(p->error, sizeof(p->error), "%s", r.error);
+    return p;
+}
+
+// CREATE TRIGGER nome {BEFORE | AFTER} {INSERT | UPDATE [OF colonne] | DELETE} ON tabella resto
 static ASTNode* parse_create_trigger(ParserState* ps, ASTNode* n) {
     n->type = NODE_CREATE_TRIGGER;
     Token tg = consume(ps);
+    if (tg.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the trigger name", tg); return n; }
     copy_text(ps, n->create_trigger.name, sizeof(n->create_trigger.name), tg.text);
     if (match(ps, TOK_BEFORE)) n->create_trigger.before = true;
     else if (match(ps, TOK_AFTER)) n->create_trigger.before = false;
-    else { n->create_trigger.before = true; }
+    else { parse_fail(ps, "Expected BEFORE or AFTER", peek(ps)); return n; }
     Token ev = consume(ps);
-    copy_text(ps, n->create_trigger.event, sizeof(n->create_trigger.event), ev.text);
-    expect(ps, TOK_ON);
-    Token tbl = consume(ps);
-    copy_text(ps, n->create_trigger.table_name, sizeof(n->create_trigger.table_name), tbl.text);
-    match(ps, TOK_FOR);
-    match(ps, TOK_EACH);
-    match(ps, TOK_ROW);
-    char body[SV_MAX_SQL_LEN] = {0};
-    int di = 0;
-    while (peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF && di < (int)sizeof(body) - 2) {
-        Token t = consume(ps);
-        int tl = strlen(t.text);
-        if (di + tl + 1 < (int)sizeof(body)) {
-            if (di > 0) body[di++] = ' ';
-            memcpy(body + di, t.text, tl);
-            di += tl;
-        }
+    if (ev.type != TOK_INSERT && ev.type != TOK_UPDATE && ev.type != TOK_DELETE) { parse_fail(ps, "Expected INSERT, UPDATE or DELETE", ev); return n; }
+    copy_text(ps, n->create_trigger.event, sizeof(n->create_trigger.event), ev.type == TOK_INSERT ? "INSERT" : ev.type == TOK_UPDATE ? "UPDATE" : "DELETE");
+    int of_start = ps->pos;
+    if (ident_is(ps, "OF")) {                            // UPDATE OF colonne: le colonne vanno nel testo salvato
+        if (ev.type != TOK_UPDATE) { parse_fail(ps, "OF columns is only allowed with UPDATE", peek(ps)); return n; }
+        consume(ps);
+        do { consume(ps); } while (match(ps, TOK_COMMA));
     }
-    copy_text(ps, n->create_trigger.body, sizeof(n->create_trigger.body), body);
+    int of_end = ps->pos;
+    if (!expect(ps, TOK_ON)) return n;
+    Token tbl = consume(ps);
+    if (tbl.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the table name after ON", tbl); return n; }
+    copy_text(ps, n->create_trigger.table_name, sizeof(n->create_trigger.table_name), tbl.text);
+    // il resto viene controllato ora e salvato come testo (OF ... + FOR EACH ... + corpo)
+    int start = ps->pos;
+    TrigProgram* prog = calloc(1, sizeof(TrigProgram));
+    if (!prog) { parse_fail(ps, "Out of memory", peek(ps)); return n; }
+    parse_trigger_rest(ps, prog);
+    trig_program_free(prog);
+    if (!ps->result->success) return n;
+    int end = ps->pos;
+    char* text = malloc(SV_MAX_SQL_LEN);
+    if (!text) { parse_fail(ps, "Out of memory", peek(ps)); return n; }
+    size_t len = 0;
+    text[0] = '\0';
+    if (of_end > of_start && !tokens_text(ps, of_start, of_end, text, SV_MAX_SQL_LEN - 1)) { free(text); parse_fail(ps, "Trigger is too long", peek(ps)); return n; }
+    len = strlen(text);
+    if (len) text[len++] = ' ';
+    if (!tokens_text(ps, start, end, text + len, SV_MAX_SQL_LEN - len)) { free(text); parse_fail(ps, "Trigger is too long", peek(ps)); return n; }
+    copy_text(ps, n->create_trigger.body, sizeof(n->create_trigger.body), text);
+    free(text);
     return n;
 }
 
@@ -1068,7 +1268,7 @@ static bool tokens_text(ParserState* ps, int from, int to, char* out, size_t cap
             snprintf(piece, sizeof(piece), "%s", t->text);
         }
         size_t pl = strlen(piece);
-        bool tight = t->type == TOK_DOT || t->type == TOK_RPAREN || t->type == TOK_COMMA ||
+        bool tight = t->type == TOK_DOT || t->type == TOK_RPAREN || t->type == TOK_COMMA || t->type == TOK_SEMICOLON ||
                      (i > from && (ps->tokens->tokens[i - 1].type == TOK_DOT || ps->tokens->tokens[i - 1].type == TOK_LPAREN));
         if (di + pl + 2 >= cap) return false;
         if (di > 0 && !tight) out[di++] = ' ';
@@ -1481,10 +1681,16 @@ static ASTNode* parse_statement(ParserState* ps) {
             if (!strcasecmp(what.text, "DATABASES")) kind = "DATABASES";
             else if (!strcasecmp(what.text, "TABLES")) kind = "TABLES";
             else if (!strcasecmp(what.text, "STATUS")) kind = "STATUS";
+            else if (!strcasecmp(what.text, "TRIGGERS")) kind = "TRIGGERS";
             else if (what.type == TOK_CREATE) { expect(ps, TOK_TABLE); kind = "CREATE"; needs_table = true; }
             else if (!strcasecmp(what.text, "CONSTRAINTS")) { kind = "CONSTRAINTS"; needs_table = true; }
             else if (what.type == TOK_INDEX || !strcasecmp(what.text, "INDEXES") || !strcasecmp(what.text, "KEYS")) { kind = "INDEXES"; needs_table = true; }
-            if (!kind) { parse_fail(ps, "Expected DATABASES, TABLES, STATUS, CREATE TABLE, CONSTRAINTS or INDEXES after SHOW", what); break; }
+            if (!kind) { parse_fail(ps, "Expected DATABASES, TABLES, STATUS, TRIGGERS, CREATE TABLE, CONSTRAINTS or INDEXES after SHOW", what); break; }
+            if (!strcmp(kind, "TRIGGERS") && (match(ps, TOK_FROM) || match(ps, TOK_IN))) {      // SHOW TRIGGERS [FROM t]
+                Token tn = consume(ps);
+                if (tn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name", tn); break; }
+                copy_text(ps, n->select_stmt.table_alias, sizeof(n->select_stmt.table_alias), tn.text);
+            }
             snprintf(n->select_stmt.table_name, sizeof(n->select_stmt.table_name), "%s", kind);
             if (needs_table) {
                 if (strcmp(kind, "CREATE") && !match(ps, TOK_FROM) && !match(ps, TOK_IN)) { parse_fail(ps, "Expected FROM table", peek(ps)); break; }

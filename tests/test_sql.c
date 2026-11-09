@@ -595,6 +595,68 @@ int main(void) {
     t("INSERT INTO esame VALUES (1, 'BD1', 30, 0)", "ERR:Foreign key");
     t("SHOW CONSTRAINTS FROM esame", "#5");
     t("USE vinc", "OK:0");
+
+    // ── trigger (basi di dati attive) ──
+    t("CREATE DATABASE att", "OK:0");
+    t("USE att", "OK:0");
+    t("CREATE TABLE conto (id INT PRIMARY KEY, saldo INT NOT NULL)", "OK:0");
+    t("CREATE TABLE movimento (id INT AUTO_INCREMENT PRIMARY KEY, conto INT, importo INT, nota VARCHAR(40))", "OK:0");
+    t("CREATE TABLE log_saldo (conto INT, vecchio INT, nuovo INT)", "OK:0");
+    t("CREATE TRIGGER no_scoperto BEFORE UPDATE OF saldo ON conto FOR EACH ROW WHEN (NEW.saldo < 0) "
+      "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Saldo negativo'", "OK:0");
+    t("CREATE TRIGGER storico AFTER UPDATE ON conto FOR EACH ROW BEGIN INSERT INTO log_saldo VALUES (OLD.id, OLD.saldo, NEW.saldo); END", "OK:0");
+    t("CREATE TRIGGER applica AFTER INSERT ON movimento FOR EACH ROW UPDATE conto SET saldo = saldo + NEW.importo WHERE id = NEW.conto", "OK:0");
+    t("CREATE TRIGGER nota_default BEFORE INSERT ON movimento FOR EACH ROW BEGIN "
+      "IF NEW.nota IS NULL THEN SET NEW.nota = 'n/d'; ELSEIF NEW.importo < 0 THEN SET NEW.nota = CONCAT('prelievo: ', NEW.nota); END IF; END", "OK:0");
+    t("INSERT INTO conto VALUES (1, 100), (2, 0)", "OK:2");
+    t("INSERT INTO movimento (conto, importo) VALUES (1, 50)", "OK:1");
+    t("INSERT INTO movimento (conto, importo, nota) VALUES (1, -20, 'bancomat')", "OK:1");
+    t("SELECT saldo FROM conto WHERE id = 1", "130");
+    t("SELECT nota FROM movimento ORDER BY id", "n/d;prelievo: bancomat");
+    t("SELECT * FROM log_saldo", "1|100|150;1|150|130");
+    t("INSERT INTO movimento (conto, importo) VALUES (2, -10)", "ERR:Saldo negativo");     // rifiutato da no_scoperto
+    t("SELECT COUNT(*) FROM movimento", "2");                                               // annullato per intero
+    t("SELECT COUNT(*) FROM log_saldo", "2");
+    t("UPDATE conto SET saldo = saldo - 1000 WHERE id = 1", "ERR:Saldo negativo");
+    t("SELECT saldo FROM conto WHERE id = 1", "130");
+    t("UPDATE conto SET id = 3 WHERE id = 2", "OK:1");                                     // OF saldo: no_scoperto non scatta
+    t("SELECT COUNT(*) FROM log_saldo", "3");
+    t("CREATE TABLE contatore (n INT)", "OK:0");
+    t("INSERT INTO contatore VALUES (0)", "OK:1");
+    t("CREATE TRIGGER conta AFTER DELETE ON movimento FOR EACH STATEMENT UPDATE contatore SET n = n + 1", "OK:0");
+    t("DELETE FROM movimento", "OK:2");
+    t("SELECT n FROM contatore", "1");                                                      // una volta per statement
+    t("BEGIN", "OK:0");
+    t("INSERT INTO movimento (conto, importo) VALUES (1, 5)", "OK:1");
+    t("INSERT INTO movimento (conto, importo) VALUES (3, -100)", "ERR:Saldo negativo");
+    t("COMMIT", "OK:0");
+    t("SELECT saldo FROM conto ORDER BY id", "135;0");                                      // il primo INSERT resta
+    t("SELECT COUNT(*) FROM movimento", "1");
+    t("CREATE TABLE r (x INT)", "OK:0");
+    t("CREATE TRIGGER ciclo AFTER INSERT ON r FOR EACH ROW INSERT INTO r VALUES (NEW.x + 1)", "OK:0");
+    t("INSERT INTO r VALUES (1)", "ERR:nested too deeply");
+    t("SELECT COUNT(*) FROM r", "0");
+    t("DROP TRIGGER ciclo", "OK:0");
+    t("DROP TRIGGER ciclo", "ERR:not found");
+    t("CREATE TRIGGER bad AFTER INSERT ON r FOR EACH ROW SET NEW.x = 1", "ERR:only allowed in BEFORE");
+    t("CREATE TRIGGER bad BEFORE INSERT ON nope FOR EACH ROW SIGNAL 'x'", "ERR:Table 'nope' not found");
+    t("CREATE TRIGGER bad BEFORE INSERT ON r FOR EACH ROW WHEN (NEW.y > 0) SIGNAL 'x'", "ERR:Unknown column 'y'");
+    t("CREATE TRIGGER bad BEFORE INSERT ON r FOR EACH ROW DROP TABLE r", "ERR:A trigger can contain");
+    t("CREATE TRIGGER storico AFTER INSERT ON r FOR EACH ROW SIGNAL 'x'", "ERR:already exists");
+    t("SHOW TRIGGERS", "#5");
+    t("SHOW TRIGGERS FROM conto", "#2");
+    {
+        // lo split dell'editor tiene insieme BEGIN ... END di un trigger
+        tests++;
+        const char* script = "CREATE TRIGGER t1 AFTER INSERT ON r FOR EACH ROW BEGIN INSERT INTO r VALUES (1); "
+                             "UPDATE r SET x = CASE WHEN x > 0 THEN 1 ELSE 0 END; END; SELECT 1; SELECT 2";
+        int nr = 0;
+        QueryResult** rs = db_execute_multi(script, &nr);
+        if (nr != 3 || !rs[0] || !rs[0]->success) { failed++; printf("FAIL %d: trigger script split (%d)\n", tests, nr); }
+        db_result_free_multi(rs, nr);
+    }
+    t("DROP TRIGGER t1", "OK:0");
+    t("USE vinc", "OK:0");
     // i vincoli restano dopo un riavvio
     db_shutdown();
     if (!db_init("/tmp/sv_sql_test")) { printf("FAIL: reopen\n"); return 1; }

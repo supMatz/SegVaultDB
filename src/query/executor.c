@@ -3090,13 +3090,13 @@ static QueryResult* plan_explain(SelectPlan* p, bool analyze, long result_rows) 
 
 static QueryResult* run_select_ex(ExecCtx* ctx, ASTNode* n, int depth, bool explain, bool analyze) {
     char err[300] = "";
-    SelectPlan* p = plan_prepare(ctx, n, depth, NULL, NULL, err, sizeof(err));
+    SelectPlan* p = plan_prepare(ctx, n, depth, ctx->trig_bind, NULL, err, sizeof(err));
     if (!p) return result_error_msg(err);
     if (explain) {
         long nr = -1;
         if (analyze) {                          // esegue la query: righe reali di ogni passo
             ORows rows = {0};
-            if (!query_exec(p, NULL, 0, &rows)) {
+            if (!query_exec(p, ctx->trig_eval, 0, &rows)) {
                 snprintf(err, sizeof(err), "%s", p->err[0] ? p->err : "Query failed");
                 orows_free(&rows);
                 plan_free(p);
@@ -3110,7 +3110,7 @@ static QueryResult* run_select_ex(ExecCtx* ctx, ASTNode* n, int depth, bool expl
         return r ? r : result_error_msg("Out of memory");
     }
     ORows rows = {0};
-    if (!query_exec(p, NULL, 0, &rows)) {
+    if (!query_exec(p, ctx->trig_eval, 0, &rows)) {
         snprintf(err, sizeof(err), "%s", p->err[0] ? p->err : "Query failed");
         orows_free(&rows);
         plan_free(p);
@@ -3880,6 +3880,240 @@ static const Constraint* referenced_by(Database* db, const TableSchema* ts, cons
     return NULL;
 }
 
+// ═════════════════════════════════════════════════════════════════
+//  Trigger (basi di dati attive): regole evento-condizione-azione
+//  CREATE TRIGGER nome {BEFORE | AFTER} {INSERT | UPDATE [OF colonne] | DELETE} ON tabella
+//      [FOR EACH ROW | FOR EACH STATEMENT] [WHEN (condizione)] corpo
+//  - FOR EACH ROW: eseguito per ogni riga, con NEW (riga nuova) e OLD (riga precedente)
+//  - BEFORE: prima dei controlli dei vincoli; può cambiare la riga con SET NEW.col = ...
+//    o rifiutarla con SIGNAL 'messaggio'
+//  - AFTER: dopo la modifica; le sue istruzioni possono attivare altri trigger
+//  Se un trigger fallisce lo statement che lo ha attivato viene annullato per intero.
+// ═════════════════════════════════════════════════════════════════
+
+#define MAX_TRIGGER_DEPTH 16
+
+typedef struct {
+    Source  src[2];       // NEW, OLD
+    Tuple*  cur[2];
+    BindCtx b;
+    EvalCtx e;
+} TrigScope;
+
+static void trig_scope_init(TrigScope* sc, ExecCtx* ctx, TableSchema* ts, Tuple* newt, Tuple* oldt) {
+    memset(sc, 0, sizeof(*sc));
+    const char* names[2] = { "NEW", "OLD" };
+    for (int i = 0; i < 2; i++) {
+        snprintf(sc->src[i].name, sizeof(sc->src[i].name), "%s", names[i]);
+        snprintf(sc->src[i].table, sizeof(sc->src[i].table), "%s", names[i]);
+        sc->src[i].ts = ts;
+    }
+    sc->cur[0] = newt;
+    sc->cur[1] = oldt;
+    sc->b.src = sc->src; sc->b.nsrc = 2; sc->b.mode = BIND_ROW; sc->b.x = ctx; sc->b.clause = "the trigger";
+    sc->e.src = sc->src; sc->e.nsrc = 2; sc->e.cur = sc->cur; sc->e.x = ctx;
+}
+
+static bool trig_has_set(TrigStmt** v, int n) {
+    for (int i = 0; i < n; i++) {
+        if (v[i]->kind == TS_SET) return true;
+        if (v[i]->kind == TS_IF && (trig_has_set(v[i]->then_v, v[i]->nthen) || trig_has_set(v[i]->else_v, v[i]->nelse))) return true;
+    }
+    return false;
+}
+
+// controlla le espressioni del corpo (WHEN, SET, IF, SIGNAL) contro NEW / OLD
+static const char* trig_bind_all(TrigScope* sc, TableSchema* ts, TrigStmt** v, int n, char* msg, size_t mn) {
+    for (int i = 0; i < n; i++) {
+        TrigStmt* t = v[i];
+        sc->b.err[0] = '\0';
+        if (t->kind == TS_SET) {
+            if (catalog_get_col_index(ts, t->col) < 0) { snprintf(msg, mn, "Unknown column 'NEW.%.64s'", t->col); return msg; }
+            bind_expr(t->expr, &sc->b);
+        } else if (t->kind == TS_SIGNAL) {
+            bind_expr(t->expr, &sc->b);
+        } else if (t->kind == TS_IF) {
+            bind_expr(t->cond, &sc->b);
+            if (!sc->b.err[0] && trig_bind_all(sc, ts, t->then_v, t->nthen, msg, mn)) return msg;
+            if (!sc->b.err[0] && trig_bind_all(sc, ts, t->else_v, t->nelse, msg, mn)) return msg;
+        }
+        if (sc->b.err[0]) { snprintf(msg, mn, "%.250s", sc->b.err); return msg; }
+    }
+    return NULL;
+}
+
+static const char* trig_run(ExecCtx* ctx, TrigScope* sc, TableSchema* ts, TrigStmt** v, int n, Tuple* newt,
+                            char* msg, size_t mn) {
+    for (int i = 0; i < n; i++) {
+        TrigStmt* t = v[i];
+        sc->e.err[0] = '\0';
+        switch (t->kind) {
+            case TS_SQL: {
+                QueryResult* r = executor_run(ctx, t->sql);
+                if (!r || !r->success) {
+                    snprintf(msg, mn, "%.280s", r ? r->error : "statement failed");
+                    db_result_free(r);
+                    return msg;
+                }
+                db_result_free(r);
+                break;
+            }
+            case TS_SET: {
+                int ci = catalog_get_col_index(ts, t->col);
+                if (ci < 0 || !newt) { snprintf(msg, mn, "Cannot set NEW.%.64s here", t->col); return msg; }
+                EvalVal v2;
+                eval_expr(t->expr, &sc->e, &v2);
+                if (sc->e.err[0]) { snprintf(msg, mn, "%.250s", sc->e.err); return msg; }
+                char text[EV_STR_MAX + 1];
+                const char* tx = NULL;
+                if (!v2.null) { snprintf(text, sizeof(text), "%s", ev_s(&v2)); tx = text; }
+                if (tx && check_value(&ts->columns[ci], tx, msg, mn)) return msg;
+                value_set_from_text(&newt->values[ci], ts->columns[ci].type, tx);
+                break;
+            }
+            case TS_SIGNAL: {
+                EvalVal v2;
+                eval_expr(t->expr, &sc->e, &v2);
+                snprintf(msg, mn, "%.280s", v2.null ? "Error raised by a trigger" : ev_s(&v2));
+                return msg;
+            }
+            case TS_IF: {
+                bool c = eval_cond(t->cond, &sc->e);
+                if (sc->e.err[0]) { snprintf(msg, mn, "%.250s", sc->e.err); return msg; }
+                const char* f = c ? trig_run(ctx, sc, ts, t->then_v, t->nthen, newt, msg, mn)
+                                  : trig_run(ctx, sc, ts, t->else_v, t->nelse, newt, msg, mn);
+                if (f) return f;
+                break;
+            }
+        }
+    }
+    return NULL;
+}
+
+// esegue i trigger della tabella per l'evento; NULL se tutto va bene, altrimenti il messaggio
+static const char* fire_triggers(ExecCtx* ctx, Database* db, TableSchema* ts, const char* event, bool before, bool row,
+                                 Tuple* oldt, Tuple* newt, const int* set_ci, int nset, char* msg, size_t mn) {
+    if (!db || !db->num_triggers) return NULL;
+    for (int i = 0; i < db->num_triggers; i++) {
+        TriggerSchema* tg = &db->triggers[i];
+        if (tg->before != before || strcasecmp(tg->table_name, ts->name) || strcasecmp(tg->event, event)) continue;
+        TokenList* tk = lexer_tokenize(tg->body);
+        TrigProgram* prog = tk ? parser_parse_trigger(tk) : NULL;
+        if (!prog || !prog->success) {
+            snprintf(msg, mn, "Trigger '%.64s' cannot be read: %.180s", tg->name, prog ? prog->error : "out of memory");
+            trig_program_free(prog);
+            lexer_free(tk);
+            return msg;
+        }
+        bool skip = prog->for_each_row != row;
+        if (!skip && prog->n_of > 0 && set_ci) {                  // UPDATE OF colonne
+            skip = true;
+            for (int k = 0; k < prog->n_of && skip; k++)
+                for (int j = 0; j < nset; j++)
+                    if (!strcasecmp(ts->columns[set_ci[j]].name, prog->of_cols[k])) skip = false;
+        }
+        const char* fail = NULL;
+        if (!skip) {
+            if (ctx->trig_depth >= MAX_TRIGGER_DEPTH) fail = "Triggers are nested too deeply (a trigger keeps activating itself?)";
+            TrigScope* sc = fail ? NULL : malloc(sizeof(TrigScope));
+            if (!fail && !sc) fail = "Out of memory";
+            if (sc) {
+                trig_scope_init(sc, ctx, ts, row ? newt : NULL, row ? oldt : NULL);
+                bool go = true;
+                if (prog->when) {
+                    bind_expr(prog->when, &sc->b);
+                    if (sc->b.err[0]) { snprintf(msg, mn, "%.250s", sc->b.err); fail = msg; }
+                    else go = eval_cond(prog->when, &sc->e);
+                    if (!fail && sc->e.err[0]) { snprintf(msg, mn, "%.250s", sc->e.err); fail = msg; }
+                }
+                if (!fail && go) fail = trig_bind_all(sc, ts, prog->v, prog->n, msg, mn);
+                if (!fail && go) {
+                    struct BindCtx* sb = ctx->trig_bind;
+                    struct EvalCtx* se = ctx->trig_eval;
+                    ctx->trig_bind = &sc->b;
+                    ctx->trig_eval = &sc->e;
+                    ctx->trig_depth++;
+                    fail = trig_run(ctx, sc, ts, prog->v, prog->n, before ? newt : NULL, msg, mn);
+                    ctx->trig_depth--;
+                    ctx->trig_bind = sb;
+                    ctx->trig_eval = se;
+                }
+                free(sc);
+            }
+        }
+        trig_program_free(prog);
+        lexer_free(tk);
+        if (fail) {
+            if (!strncmp(fail, "Trigger '", 9)) { if (fail != msg) snprintf(msg, mn, "%s", fail); return msg; }   // dal trigger più interno
+            char inner[300];
+            snprintf(inner, sizeof(inner), "%s", fail);
+            snprintf(msg, mn, "Trigger '%.64s': %.220s", tg->name, inner);
+            return msg;
+        }
+        // la tabella può essere cambiata (indirizzo) solo con DDL, non ammessi nei trigger
+    }
+    return NULL;
+}
+
+static QueryResult* exec_create_trigger(ExecCtx* ctx, ASTNode* n) {
+    Database* db = catalog_current_db(ctx->catalog);
+    if (!db) return result_error_msg("No database selected");
+    char msg[300];
+    TableSchema* ts = catalog_get_table(ctx->catalog, db->name, n->create_trigger.table_name);
+    if (!ts) { snprintf(msg, sizeof(msg), "Table '%.64s' not found (triggers are defined on tables)", n->create_trigger.table_name); return result_error_msg(msg); }
+    for (int i = 0; i < db->num_triggers; i++)
+        if (!strcasecmp(db->triggers[i].name, n->create_trigger.name)) {
+            snprintf(msg, sizeof(msg), "Trigger '%.64s' already exists", n->create_trigger.name);
+            return result_error_msg(msg);
+        }
+    if (db->num_triggers >= 64) return result_error_msg("Too many triggers (max 64 per database)");
+    TokenList* tk = lexer_tokenize(n->create_trigger.body);
+    TrigProgram* prog = tk ? parser_parse_trigger(tk) : NULL;
+    const char* fail = NULL;
+    if (!prog || !prog->success) { snprintf(msg, sizeof(msg), "Invalid trigger: %.250s", prog ? prog->error : "out of memory"); fail = msg; }
+    if (!fail && trig_has_set(prog->v, prog->n) && (!n->create_trigger.before || !prog->for_each_row))
+        fail = "SET NEW.column is only allowed in BEFORE ... FOR EACH ROW triggers";
+    if (!fail && trig_has_set(prog->v, prog->n) && !strcasecmp(n->create_trigger.event, "DELETE"))
+        fail = "A DELETE trigger has no NEW row to change";
+    for (int k = 0; !fail && prog && k < prog->n_of; k++)
+        if (catalog_get_col_index(ts, prog->of_cols[k]) < 0) { snprintf(msg, sizeof(msg), "Unknown column '%.64s' after OF", prog->of_cols[k]); fail = msg; }
+    if (!fail) {
+        TrigScope* sc = malloc(sizeof(TrigScope));
+        if (!sc) fail = "Out of memory";
+        else {
+            trig_scope_init(sc, ctx, ts, NULL, NULL);
+            if (prog->when) { bind_expr(prog->when, &sc->b); if (sc->b.err[0]) { snprintf(msg, sizeof(msg), "%.250s", sc->b.err); fail = msg; } }
+            if (!fail) fail = trig_bind_all(sc, ts, prog->v, prog->n, msg, sizeof(msg));
+            free(sc);
+        }
+    }
+    trig_program_free(prog);
+    lexer_free(tk);
+    if (fail) { if (fail != msg) snprintf(msg, sizeof(msg), "%s", fail); return result_error_msg(msg); }
+    TriggerSchema* tg = &db->triggers[db->num_triggers++];
+    memset(tg, 0, sizeof(*tg));
+    snprintf(tg->name, sizeof(tg->name), "%s", n->create_trigger.name);
+    snprintf(tg->table_name, sizeof(tg->table_name), "%s", ts->name);
+    tg->before = n->create_trigger.before;
+    snprintf(tg->event, sizeof(tg->event), "%s", n->create_trigger.event);
+    snprintf(tg->body, sizeof(tg->body), "%s", n->create_trigger.body);
+    return result_ok_msg(0);
+}
+
+static QueryResult* exec_drop_trigger(ExecCtx* ctx, ASTNode* n) {
+    Database* db = catalog_current_db(ctx->catalog);
+    if (!db) return result_error_msg("No database selected");
+    for (int i = 0; i < db->num_triggers; i++)
+        if (!strcasecmp(db->triggers[i].name, n->drop_trigger.name)) {
+            memmove(&db->triggers[i], &db->triggers[i + 1], sizeof(TriggerSchema) * (size_t)(db->num_triggers - i - 1));
+            db->num_triggers--;
+            return result_ok_msg(0);
+        }
+    char msg[200];
+    snprintf(msg, sizeof(msg), "Trigger '%.64s' not found", n->drop_trigger.name);
+    return result_error_msg(msg);
+}
+
 static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
@@ -3911,7 +4145,7 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     bool from_select = n->insert_stmt.select != NULL;
     if (from_select) {
         char perr[300] = "";
-        SelectPlan* sp = plan_prepare(ctx, n->insert_stmt.select, 0, NULL, NULL, perr, sizeof(perr));
+        SelectPlan* sp = plan_prepare(ctx, n->insert_stmt.select, 0, ctx->trig_bind, NULL, perr, sizeof(perr));
         if (!sp) return result_error_msg(perr);
         if (sp->nout != ncols) {
             snprintf(msg, sizeof(msg), "Column count doesn't match: %d column%s, the SELECT returns %d",
@@ -3919,7 +4153,7 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
             plan_free(sp);
             return result_error_msg(msg);
         }
-        if (!query_exec(sp, NULL, 0, &srows)) {
+        if (!query_exec(sp, ctx->trig_eval, 0, &srows)) {
             snprintf(msg, sizeof(msg), "%s", sp->err);
             plan_free(sp);
             orows_free(&srows);
@@ -3939,6 +4173,7 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     b.mode = BIND_ROW;
     b.clause = "VALUES";
     b.x = ctx;
+    b.outer = ctx->trig_bind;
     for (int i = 0; !from_select && i < nrows * ncols; i++) bind_expr(n->insert_stmt.values[i], &b);
     if (b.err[0]) return result_error_msg(b.err);
 
@@ -3956,6 +4191,7 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     EvalCtx ec;
     memset(&ec, 0, sizeof(ec));
     ec.x = ctx;
+    ec.outer = ctx->trig_eval;
     const char* fail = NULL;
     static char vals[64][EV_STR_MAX + 1];   // testi della riga corrente
     char ai_buf[32];
@@ -4004,7 +4240,17 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
         tuples[r] = tuple_from_strings(text, nc, ts);
         if (!tuples[r]) { fail = "Out of memory"; break; }
     }
-    // vincoli: CHECK, PRIMARY KEY / UNIQUE (anche fra le righe dello statement), FOREIGN KEY
+    // trigger BEFORE (possono cambiare NEW o rifiutare la riga), poi i vincoli: CHECK,
+    // PRIMARY KEY / UNIQUE (anche fra le righe dello statement), FOREIGN KEY
+    if (!fail) fail = fire_triggers(ctx, db, ts, "INSERT", true, false, NULL, NULL, NULL, 0, msg, sizeof(msg));
+    for (int r = 0; r < nrows && !fail; r++)
+        fail = fire_triggers(ctx, db, ts, "INSERT", true, true, NULL, tuples[r], NULL, 0, msg, sizeof(msg));
+    for (int r = 0; r < nrows && !fail; r++)                      // un trigger può aver tolto un valore obbligatorio
+        for (int c = 0; c < nc && !fail; c++)
+            if (tuples[r]->values[c].is_null && (!ts->columns[c].nullable || ts->columns[c].primary_key)) {
+                snprintf(msg, sizeof(msg), "Column '%.64s' cannot be NULL", ts->columns[c].name);
+                fail = msg;
+            }
     if (!fail) fail = validate_inserts(ctx, db, ts, tuples, nrows, msg, sizeof(msg));
     if (fail) {
         for (int r = 0; r < nrows; r++) if (tuples[r]) tuple_free(tuples[r]);
@@ -4030,8 +4276,13 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
         ts->num_pages = hf->num_pages;
         free(hf);
     }
+    const char* tfail = NULL;
+    for (int r = 0; r < done && !tfail; r++)                      // trigger AFTER
+        tfail = fire_triggers(ctx, db, ts, "INSERT", false, true, NULL, tuples[r], NULL, 0, msg, sizeof(msg));
+    if (!tfail && done == nrows) tfail = fire_triggers(ctx, db, ts, "INSERT", false, false, NULL, NULL, NULL, 0, msg, sizeof(msg));
     for (int r = 0; r < nrows; r++) tuple_free(tuples[r]);
     free(tuples);
+    if (tfail) return result_error_msg(msg);
     if (done < nrows) {
         mi_invalidate_table(db->name, ts->name);
         snprintf(msg, sizeof(msg), "Failed to insert row %d of %d (the previous rows were inserted)", done + 1, nrows);
@@ -4040,9 +4291,42 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     return result_ok_msg(done);
 }
 
-// righe della tabella che soddisfano la WHERE (con l'indice quando possibile)
+// righe della tabella che soddisfano la WHERE (con l'indice quando possibile: anche per
+// "colonna indicizzata = espressione senza colonne della tabella", es. NEW.id in un trigger)
 static const char* select_matches(ExecCtx* ctx, Database* db, Source* s, ASTExpr* where, EvalCtx* ec,
                                   int** out_idx, int* out_n) {
+    ExprVec conj = {0};
+    collect_conj(where, &conj);
+    for (int i = 0; i < conj.n && !s->loaded; i++) {
+        ASTExpr* w = conj.v[i];
+        if (w->type != EXPR_BINARY || w->op != OP_EQ) continue;
+        for (int side = 0; side < 2 && !s->loaded; side++) {
+            ASTExpr* col = side ? w->right : w->left;
+            ASTExpr* key = side ? w->left : w->right;
+            if (col->type != EXPR_COLUMN || col->bound <= 0 || col->outer) continue;
+            int ci = (col->bound - 1) % 1024;
+            unsigned m = 0; bool o = false, op = false;
+            expr_refs(key, &m, &o, &op);
+            if (m || op || !col_is_indexed(s->ts, ci) || key->type == EXPR_INT || key->type == EXPR_STRING) continue;
+            EvalVal kv;
+            eval_expr(key, ec, &kv);
+            char kt[EV_STR_MAX + 1];
+            if (!probe_text(&kv, s->ts->columns[ci].type, kt, sizeof(kt)) && !kv.null) continue;
+            MemIndex* ix = mi_get(ctx, db->name, s->ts, ci);
+            if (!ix) continue;
+            s->loaded = true;
+            HeapFile* hf = heap_open(ctx->bp, s->ts->root_page_id, s->ts->num_pages);
+            if (!hf) { free(conj.v); return "Failed to read the table"; }
+            int cap = 0;
+            const RidList* l = kv.null ? NULL : mi_lookup(ix, kt);
+            for (int r = 0; l && r < l->n; r++) {
+                Tuple* t = heap_get(hf, l->r[r], s->ts);
+                if (t && !source_push(s, t, l->r[r], &cap)) { tuple_free(t); free(hf); free(conj.v); return "Out of memory"; }
+            }
+            free(hf);
+        }
+    }
+    free(conj.v);
     if (!source_load(ctx, db->name, s, where, NULL, 0)) return "Failed to read the table";
     int* idx = malloc(sizeof(int) * (size_t)(s->n ? s->n : 1));
     if (!idx) return "Out of memory";
@@ -4083,7 +4367,7 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
     s.ts = ts;
     BindCtx b;
     memset(&b, 0, sizeof(b));
-    b.src = &s; b.nsrc = 1; b.mode = BIND_ROW; b.x = ctx;
+    b.src = &s; b.nsrc = 1; b.mode = BIND_ROW; b.x = ctx; b.outer = ctx->trig_bind;
     b.clause = "SET";
     for (int k = 0; k < n->update_stmt.num_sets; k++) bind_expr(n->update_stmt.set_exprs[k], &b);
     b.clause = "WHERE";
@@ -4093,6 +4377,7 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
     EvalCtx ec;
     memset(&ec, 0, sizeof(ec));
     ec.x = ctx;
+    ec.outer = ctx->trig_eval;
     int* idx = NULL;
     int nm = 0;
     const char* fail = select_matches(ctx, db, &s, n->update_stmt.where, &ec, &idx, &nm);
@@ -4126,8 +4411,12 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
     }
     ec.cur = NULL;
 
-    // modifiche (con le azioni a cascata delle chiavi esterne), controllo dei vincoli, scrittura
+    // trigger BEFORE, modifiche (con le azioni a cascata delle chiavi esterne), controllo dei
+    // vincoli, scrittura, trigger AFTER
     int affected = 0;
+    if (!fail) fail = fire_triggers(ctx, db, ts, "UPDATE", true, false, NULL, NULL, set_ci, n->update_stmt.num_sets, msg, sizeof(msg));
+    for (int i = 0; i < nm && !fail; i++)
+        fail = fire_triggers(ctx, db, ts, "UPDATE", true, true, s.rows[idx[i]], nt[i], set_ci, n->update_stmt.num_sets, msg, sizeof(msg));
     if (!fail) {
         ChangeSet cs;
         memset(&cs, 0, sizeof(cs));
@@ -4140,6 +4429,10 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
         if (!fail) fail = cs_cascade(&cs, msg, sizeof(msg));
         if (!fail) fail = cs_validate(&cs, msg, sizeof(msg));
         if (!fail) affected = cs_apply(&cs, msg, sizeof(msg), &fail);
+        for (int i = 0; i < cs.n && !fail; i++)
+            if (cs.v[i].direct)
+                fail = fire_triggers(ctx, db, ts, "UPDATE", false, true, cs.v[i].old, cs.v[i].nt, set_ci, n->update_stmt.num_sets, msg, sizeof(msg));
+        if (!fail) fail = fire_triggers(ctx, db, ts, "UPDATE", false, false, NULL, NULL, set_ci, n->update_stmt.num_sets, msg, sizeof(msg));
         cs_free(&cs);
     }
     for (int i = 0; i < nm; i++) if (nt[i]) tuple_free(nt[i]);
@@ -4165,13 +4458,14 @@ static QueryResult* exec_delete(ExecCtx* ctx, ASTNode* n) {
     s.ts = ts;
     BindCtx b;
     memset(&b, 0, sizeof(b));
-    b.src = &s; b.nsrc = 1; b.mode = BIND_ROW; b.clause = "WHERE"; b.x = ctx;
+    b.src = &s; b.nsrc = 1; b.mode = BIND_ROW; b.clause = "WHERE"; b.x = ctx; b.outer = ctx->trig_bind;
     bind_expr(n->delete_stmt.where, &b);
     if (b.err[0]) return result_error_msg(b.err);
 
     EvalCtx ec;
     memset(&ec, 0, sizeof(ec));
     ec.x = ctx;
+    ec.outer = ctx->trig_eval;
     int* idx = NULL;
     int nm = 0;
     char msg[300];
@@ -4183,11 +4477,17 @@ static QueryResult* exec_delete(ExecCtx* ctx, ASTNode* n) {
     memset(&cs, 0, sizeof(cs));
     cs.x = ctx;
     cs.db = db;
+    if (!fail) fail = fire_triggers(ctx, db, ts, "DELETE", true, false, NULL, NULL, NULL, 0, msg, sizeof(msg));
+    for (int i = 0; i < nm && !fail; i++)
+        fail = fire_triggers(ctx, db, ts, "DELETE", true, true, s.rows[idx[i]], NULL, NULL, 0, msg, sizeof(msg));
     for (int i = 0; i < nm && !fail; i++)
         if (cs_add(&cs, ts, s.rids[idx[i]], s.rows[idx[i]], NULL, false, true) < 0) fail = "Out of memory";
     if (!fail) fail = cs_cascade(&cs, msg, sizeof(msg));
     if (!fail) fail = cs_validate(&cs, msg, sizeof(msg));
     if (!fail) affected = cs_apply(&cs, msg, sizeof(msg), &fail);
+    for (int i = 0; i < cs.n && !fail; i++)
+        if (cs.v[i].direct) fail = fire_triggers(ctx, db, ts, "DELETE", false, true, cs.v[i].old, NULL, NULL, 0, msg, sizeof(msg));
+    if (!fail) fail = fire_triggers(ctx, db, ts, "DELETE", false, false, NULL, NULL, NULL, 0, msg, sizeof(msg));
     cs_free(&cs);
     free(idx);
     source_free(&s);
@@ -4387,6 +4687,18 @@ static QueryResult* exec_show_extra(ExecCtx* ctx, ASTNode* n) {
         return r;
     }
     if (!db) return result_error_msg("No database selected");
+    if (!strcmp(kind, "TRIGGERS")) {
+        static const char* const NAMES[] = { "Trigger", "Timing", "Event", "Table", "Definition" };
+        QueryResult* r = text_result(5, NAMES);
+        if (!r) return result_error_msg("Out of memory");
+        for (int i = 0; i < db->num_triggers; i++) {
+            TriggerSchema* tg = &db->triggers[i];
+            if (n->select_stmt.table_alias[0] && strcasecmp(n->select_stmt.table_alias, tg->table_name)) continue;
+            const char* v[5] = { tg->name, tg->before ? "BEFORE" : "AFTER", tg->event, tg->table_name, tg->body };
+            if (!text_row(r, &cap, v)) { db_result_free(r); return result_error_msg("Out of memory"); }
+        }
+        return r;
+    }
     TableSchema* ts = catalog_get_table(ctx->catalog, db->name, n->select_stmt.table_alias);
     if (!ts) { snprintf(a, sizeof(a), "Table '%.64s' not found", n->select_stmt.table_alias); return result_error_msg(a); }
     if (!strcmp(kind, "CREATE")) {
@@ -4709,9 +5021,9 @@ QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt) {
             return result_ok_msg(0);
         case NODE_SAVEPOINT:    return result_ok_msg(0);
         case NODE_ROLLBACK_TO:  return result_ok_msg(0);
-        case NODE_CREATE_TRIGGER: return result_ok_msg(0);
+        case NODE_CREATE_TRIGGER: return exec_create_trigger(ctx, stmt);
         case NODE_CHECKPOINT:   return result_ok_msg(0);
-        case NODE_DROP_TRIGGER: return result_ok_msg(0);
+        case NODE_DROP_TRIGGER: return exec_drop_trigger(ctx, stmt);
         default:
             return result_error_msg("Unsupported statement type");
     }
