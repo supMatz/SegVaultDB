@@ -69,6 +69,13 @@ int main(int argc, char** argv) {
     run("JOIN 3 tabelle + GROUP BY", "SELECT c.nome, s.citta, AVG(e.voto) FROM esame e JOIN studente s ON e.matricola = s.matricola JOIN corso c ON c.id = e.corso GROUP BY c.nome, s.citta");
     run("DISTINCT", "SELECT DISTINCT citta, anno FROM studente");
     run("LIKE", "SELECT COUNT(*) FROM studente WHERE nome LIKE '%99%'");
+    run("IN (subquery)", "SELECT COUNT(*) FROM studente WHERE matricola IN (SELECT matricola FROM esame WHERE voto = 30)");
+    run("NOT EXISTS correlata", "SELECT COUNT(*) FROM studente s WHERE NOT EXISTS (SELECT * FROM esame e WHERE e.matricola = s.matricola AND e.voto > 28)");
+    run("subquery scalare correlata", "SELECT matricola, (SELECT MAX(voto) FROM esame e WHERE e.matricola = s.matricola) FROM studente s WHERE anno = 1");
+    run("divisione (doppio NOT EXISTS)", "SELECT COUNT(*) FROM studente s WHERE NOT EXISTS (SELECT * FROM corso c WHERE c.id < 3 AND NOT EXISTS "
+        "(SELECT * FROM esame e WHERE e.matricola = s.matricola AND e.corso = c.id))");
+    run("join implicito FROM a, b WHERE", "SELECT COUNT(*) FROM esame e, studente s WHERE e.matricola = s.matricola AND s.citta = 'Roma'");
+    run("UNION", "SELECT citta FROM studente UNION SELECT nome FROM corso");
     run("UPDATE con filtro", "UPDATE esame SET voto = voto + 0 WHERE corso = 3");
     run("DELETE con filtro", "DELETE FROM esame WHERE corso = 49");
     db_shutdown();

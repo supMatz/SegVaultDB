@@ -47,6 +47,11 @@ uint8_t* tuple_serialize(Tuple* t, TableSchema* s, size_t* out_len);
 // Deserializza un byte array in una tuple
 Tuple* tuple_deserialize(const uint8_t* data, size_t len, TableSchema* s);
 
+// Deserializza in una tupla già allocata (num_values = colonne) senza allocare memoria:
+// i testi vengono copiati in strbuf (owns_str = false). false se i dati sono incompleti
+// o se i testi non entrano in strbuf (strcap >= len basta sempre).
+bool tuple_view(Tuple* t, const uint8_t* data, size_t len, const TableSchema* s, char* strbuf, size_t strcap);
+
 // Crea una tuple da un array di stringhe (usato dall'executor)
 Tuple* tuple_from_strings(const char** values, int count, TableSchema* s);
 

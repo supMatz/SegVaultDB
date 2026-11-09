@@ -19,8 +19,26 @@ typedef enum { JOIN_INNER, JOIN_LEFT, JOIN_RIGHT, JOIN_CROSS } JoinType;
 typedef enum { EXPR_COLUMN, EXPR_INT, EXPR_FLOAT, EXPR_STRING, EXPR_STAR,
                EXPR_BINARY, EXPR_UNARY, EXPR_NULL,
                EXPR_AGG,    // aggregato: func = COUNT/SUM/AVG/MIN/MAX; args[0] = argomento, col_name "*" per COUNT(*)
-               EXPR_FUNC    // funzione scalare: func = nome (UPPER, LENGTH, COALESCE, ...), args = argomenti
+               EXPR_FUNC,   // funzione scalare: func = nome (UPPER, LENGTH, COALESCE, ...), args = argomenti
+               EXPR_SUBQUERY, // subquery: subq; subkind = SUBQ_*; left = operando di IN / ANY / ALL
+               EXPR_CASE    // CASE [left] WHEN args[0] THEN args[1] ... [ELSE right] END
 } ExprType;
+
+// tipi di subquery
+//   SUBQ_SCALAR  (SELECT ...)            un valore (NULL se nessuna riga, errore se più righe)
+//   SUBQ_EXISTS  EXISTS (SELECT ...)
+//   SUBQ_ANY     left op ANY (SELECT ...)   (x IN (SELECT ...) = x = ANY (...))
+//   SUBQ_ALL     left op ALL (SELECT ...)   (x NOT IN (SELECT ...) = x <> ALL (...))
+enum { SUBQ_SCALAR, SUBQ_EXISTS, SUBQ_ANY, SUBQ_ALL };
+
+struct ASTNode;
+// subquery condivisa: le copie di un'espressione (BETWEEN, IN) puntano alla stessa
+typedef struct SubQuery {
+    struct ASTNode* node;            // la SELECT
+    int    refs;
+    void*  plan;                     // piano preparato dall'executor (libero con plan_free)
+    void (*plan_free)(void*);
+} SubQuery;
 
 typedef enum { OP_EQ, OP_NEQ, OP_LT, OP_GT, OP_LE, OP_GE,
                OP_AND, OP_OR, OP_NOT, OP_PLUS, OP_MINUS, OP_MUL, OP_DIV,
@@ -48,7 +66,10 @@ typedef struct ASTExpr {
     // risoluzione fatta dall'executor prima di eseguire (EXPR_COLUMN):
     //   > 0  sorgente * 1024 + colonna + 1      < 0  alias della SELECT numero -(bound + 1)
     int      bound;
+    int      outer;           // EXPR_COLUMN: 0 = colonna di questa query, k = della query esterna di k livelli
     int      depth;           // profondità dell'albero (limitata: valutazione e liberazione sono ricorsive)
+    SubQuery* subq;           // EXPR_SUBQUERY
+    int      subkind;         // EXPR_SUBQUERY: SUBQ_*
 } ASTExpr;
 
 // libera un'espressione e tutti i suoi figli
@@ -73,13 +94,23 @@ typedef struct {
     JoinType   type;
     char       table_name[64];
     char       alias[64];      // "" = nessun alias
+    struct ASTNode* sub;       // JOIN (SELECT ...) alias: tabella derivata
 } ASTJoin;
+
+// WITH nome AS (SELECT ...)
+typedef struct {
+    char            name[64];
+    struct ASTNode* node;
+} ASTCte;
+
+// operatori insiemistici fra SELECT
+enum { SETOP_NONE, SETOP_UNION, SETOP_INTERSECT, SETOP_EXCEPT };
 
 #define SV_MAX_ORDER   8
 #define SV_MAX_GROUP   16
 #define SV_MAX_SETS    64
 
-typedef struct {
+typedef struct ASTNode {
     StmtType type;
     union {
         struct {
@@ -100,6 +131,14 @@ typedef struct {
             ASTExpr*   having;
             ASTJoin    joins[8];
             int        num_joins;
+            struct ASTNode* from_sub;  // FROM (SELECT ...) alias: tabella derivata
+            // SELECT ... UNION [ALL] / INTERSECT / EXCEPT SELECT ...: catena dei rami.
+            // Con set_next != NULL, ORDER BY e LIMIT di questo nodo valgono per l'intero risultato.
+            struct ASTNode* set_next;
+            int        set_op;         // operatore fra questo ramo e set_next (SETOP_*)
+            bool       set_all;        // UNION ALL
+            ASTCte*    ctes;           // WITH (solo sul primo ramo)
+            int        num_ctes;
         } select_stmt;
         struct {
             char       table_name[64];
@@ -108,6 +147,7 @@ typedef struct {
             ASTExpr**  values;         // num_rows * num_values espressioni (riga per riga)
             int        num_values;     // valori per riga
             int        num_rows;
+            struct ASTNode* select;    // INSERT INTO t [(colonne)] SELECT ...
         } insert_stmt;
         struct {
             char       table_name[64];
@@ -188,6 +228,7 @@ typedef struct {
 } ParseResult;
 
 ParseResult* parser_parse(TokenList* tokens);
+void        ast_node_free(ASTNode* n);
 void        parse_result_free(ParseResult* r);
 
 #endif

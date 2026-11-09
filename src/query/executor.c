@@ -287,15 +287,26 @@ typedef struct {
 
 static void ev_null(EvalVal* v) { v->null = true; v->is_num = v->is_int = false; v->str = ""; }
 
+// i numeri vengono convertiti in testo solo quando serve (ev_s): confronti, aritmetica e
+// filtri lavorano sui valori binari, senza snprintf per ogni riga
 static void ev_int(EvalVal* v, int64_t x) {
-    v->null = false; v->is_num = v->is_int = true; v->inum = x; v->num = (double)x;
-    snprintf(v->buf, sizeof(v->buf), "%lld", (long long)x); v->str = v->buf;
+    v->null = false; v->is_num = v->is_int = true; v->inum = x; v->num = (double)x; v->str = NULL;
 }
 
 static void ev_num(EvalVal* v, double x) {
     if (x != x || x - x != 0) { ev_null(v); return; }        // NaN / infinito: NULL
-    v->null = false; v->is_num = true; v->is_int = false; v->num = x;
-    snprintf(v->buf, sizeof(v->buf), "%.15g", x); v->str = v->buf;
+    v->null = false; v->is_num = true; v->is_int = false; v->num = x; v->str = NULL;
+}
+
+// testo del valore ("" per NULL); per i numeri viene formattato alla prima richiesta
+static const char* ev_s(const EvalVal* cv) {
+    EvalVal* v = (EvalVal*)cv;
+    if (v->null) return "";
+    if (v->str) return v->str;
+    if (v->is_int) snprintf(v->buf, sizeof(v->buf), "%lld", (long long)v->inum);
+    else           snprintf(v->buf, sizeof(v->buf), "%.15g", v->num);
+    v->str = v->buf;
+    return v->str;
 }
 
 // testo: copia nel buffer (false se più lungo di EV_STR_MAX)
@@ -331,7 +342,7 @@ static bool text_is_number(const char* s, double* out) {
 // valore numerico di qualunque cosa (testo: prefisso numerico come MySQL, altrimenti 0)
 static double ev_as_num(const EvalVal* v) {
     if (v->is_num) return v->num;
-    return strtod(v->str, NULL);
+    return strtod(ev_s(v), NULL);
 }
 
 // confronto: numeri fra loro, numero contro testo numerico, altrimenti testo
@@ -343,12 +354,12 @@ static int ev_cmp(const EvalVal* a, const EvalVal* b) {
     if (a->is_num || b->is_num) {
         double d;
         const EvalVal* txt = a->is_num ? b : a;
-        if (text_is_number(txt->str, &d)) {
+        if (text_is_number(ev_s(txt), &d)) {
             double x = a->is_num ? a->num : d, y = a->is_num ? d : b->num;
             return x < y ? -1 : x > y;
         }
     }
-    int c = strcmp(a->str, b->str);
+    int c = strcmp(ev_s(a), ev_s(b));
     return c < 0 ? -1 : c > 0;
 }
 
@@ -640,7 +651,9 @@ static bool source_push(Source* s, Tuple* t, RID rid, int* cap) {
 //  Contesto di valutazione
 // ═════════════════════════════════════════════════════════════════
 
-typedef struct {
+typedef struct SelectPlan SelectPlan;
+
+typedef struct EvalCtx {
     Source*   src;
     int       nsrc;
     Tuple**   cur;              // riga corrente di ogni sorgente (NULL = riga mancante di un outer join)
@@ -649,6 +662,8 @@ typedef struct {
     ASTExpr** sel;              // espressioni della SELECT (alias in HAVING / ORDER BY)
     int       nsel;
     char      err[256];         // primo errore di valutazione
+    ExecCtx*  x;                // per eseguire le subquery
+    struct EvalCtx* outer;      // query esterna (colonne correlate)
 } EvalCtx;
 
 static void ctx_error(EvalCtx* c, const char* fmt, const char* a) {
@@ -660,7 +675,10 @@ static void ctx_error(EvalCtx* c, const char* fmt, const char* a) {
 
 typedef enum { BIND_ROW, BIND_AGG_OK } BindMode;   // BIND_AGG_OK: SELECT, HAVING, ORDER BY
 
-typedef struct {
+// nomi definiti con WITH visibili in una query (catena verso le query che la contengono)
+typedef struct CteScope { ASTCte* ctes; int n; const struct CteScope* parent; } CteScope;
+
+typedef struct BindCtx {
     Source*   src;
     int       nsrc;             // sorgenti visibili (le condizioni ON vedono solo quelle già unite)
     ASTExpr** sel;              // alias utilizzabili (HAVING / ORDER BY / GROUP BY)
@@ -670,7 +688,18 @@ typedef struct {
     bool      saw_agg;
     const char* clause;
     char      err[256];
+    ExecCtx*  x;                // NULL: subquery non ammesse
+    struct BindCtx* outer;      // query esterna (per le subquery correlate)
+    SelectPlan* plan;           // piano della query che si sta risolvendo
+    int       depth;            // annidamento di viste e subquery
+    const CteScope* ctes;
 } BindCtx;
+
+static SelectPlan* plan_prepare(ExecCtx* x, ASTNode* n, int depth, BindCtx* outer, const CteScope* ctes,
+                                char* err, size_t errn);
+static void plan_free_void(void* p);
+static int plan_width(const SelectPlan* p);
+static void plan_mark_correlated(SelectPlan* p);
 
 static void bind_error(BindCtx* b, const char* msg) {
     if (!b->err[0]) snprintf(b->err, sizeof(b->err), "%s", msg);
@@ -701,7 +730,9 @@ static int find_column(BindCtx* b, const char* qual, const char* col, int* out_s
     int found = 0;
     for (int s = 0; s < b->nsrc; s++) {
         Source* src = &b->src[s];
-        if (qual[0] && strcasecmp(qual, src->name) && strcasecmp(qual, src->table)) continue;
+        // con un alias la tabella si chiama solo con l'alias (come in SQL standard): così in
+        // una subquery correlata "esame.corso" indica la query esterna se dentro c'è "esame e2"
+        if (qual[0] && strcasecmp(qual, src->name)) continue;
         for (int c = 0; c < src->ts->num_columns; c++) {
             if (strcasecmp(src->ts->columns[c].name, col)) continue;
             if (found) return -1;
@@ -714,8 +745,9 @@ static int find_column(BindCtx* b, const char* qual, const char* col, int* out_s
 }
 
 static bool qualifier_exists(BindCtx* b, const char* qual) {
-    for (int s = 0; s < b->nsrc; s++)
-        if (!strcasecmp(qual, b->src[s].name) || !strcasecmp(qual, b->src[s].table)) return true;
+    for (; b; b = b->outer)
+        for (int s = 0; s < b->nsrc; s++)
+            if (!strcasecmp(qual, b->src[s].name)) return true;
     return false;
 }
 
@@ -725,9 +757,24 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
     switch (e->type) {
         case EXPR_COLUMN: {
             e->bound = 0;
+            e->outer = 0;
             int s = 0, c = 0;
             int r = find_column(b, e->table_name, e->col_name, &s, &c);
             if (r == 1) { e->bound = s * 1024 + c + 1; return; }
+            if (r == 0) {
+                // colonna di una query esterna: la subquery è correlata
+                int level = 1;
+                for (BindCtx* o = b->outer; o && r == 0; o = o->outer, level++) {
+                    r = find_column(o, e->table_name, e->col_name, &s, &c);
+                    if (r == 1) {
+                        e->bound = s * 1024 + c + 1;
+                        e->outer = level;
+                        BindCtx* m = b;
+                        for (int k = 0; k < level && m; k++, m = m->outer) if (m->plan) plan_mark_correlated(m->plan);
+                        return;
+                    }
+                }
+            }
             if (r < 0) {
                 snprintf(msg, sizeof(msg), "Column '%.64s' is ambiguous: qualify it with the table name", e->col_name);
                 bind_error(b, msg);
@@ -774,6 +821,30 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
         case EXPR_STAR:
             bind_error(b, "* is only allowed in the SELECT list and in COUNT(*)");
             return;
+        case EXPR_SUBQUERY: {
+            bind_expr(e->left, b);
+            if (b->err[0]) return;
+            if (!b->x) { bind_error(b, "Subqueries are not allowed here"); return; }
+            SubQuery* q = e->subq;
+            if (!q->plan) {
+                char perr[300] = "";
+                BindCtx* save_outer = b;
+                SelectPlan* sp = plan_prepare(b->x, q->node, b->depth + 1, save_outer, b->ctes, perr, sizeof(perr));
+                if (!sp) { bind_error(b, perr); return; }
+                q->plan = sp;
+                q->plan_free = plan_free_void;
+            }
+            if (e->subkind != SUBQ_EXISTS && plan_width((SelectPlan*)q->plan) != 1) {
+                snprintf(msg, sizeof(msg), "The subquery in %s must return exactly one column", b->clause);
+                bind_error(b, msg);
+            }
+            return;
+        }
+        case EXPR_CASE:
+            bind_expr(e->left, b);
+            for (int i = 0; i < e->nargs; i++) bind_expr(e->args[i], b);
+            bind_expr(e->right, b);
+            return;
         default:
             bind_expr(e->left, b);
             bind_expr(e->right, b);
@@ -791,11 +862,13 @@ static bool expr_has_agg(const ASTExpr* e) {
 // ── valutazione ──
 
 static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out);
+static bool eval_cond(ASTExpr* e, EvalCtx* c);
+static void eval_subquery(ASTExpr* e, EvalCtx* c, EvalVal* out);
 
 static bool like_match(const char* s, const char* p);
 
 // testo di un valore (numeri formattati); per i NULL: ""
-static const char* ev_str(const EvalVal* v) { return v->null ? "" : v->str; }
+static const char* ev_str(const EvalVal* v) { return ev_s(v); }
 
 static int utf8_chars(const char* s) {
     int n = 0;
@@ -859,7 +932,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         for (int i = ws ? 1 : 0; i < e->nargs; i++) {
             eval_expr(e->args[i], c, &v);
             if (v.null) { if (ws) continue; ev_null(out); return; }   // CONCAT con un NULL = NULL
-            const char* parts[2] = { ws && !first ? sep.str : "", v.str };
+            const char* parts[2] = { ws && !first ? ev_s(&sep) : "", ev_s(&v) };
             for (int p = 0; p < 2; p++) {
                 size_t l = strlen(parts[p]);
                 if (len + l > EV_STR_MAX) { ctx_error(c, "%s", "String result longer than 511 bytes"); ev_null(out); return; }
@@ -891,15 +964,15 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     if (!strcmp(f, "UPPER") || !strcmp(f, "UCASE") || !strcmp(f, "LOWER") || !strcmp(f, "LCASE")) {
         bool up = f[0] == 'U';
         char buf[EV_STR_MAX + 1];
-        size_t l = strlen(a[0].str);
-        for (size_t i = 0; i < l; i++) buf[i] = (char)(up ? toupper((unsigned char)a[0].str[i]) : tolower((unsigned char)a[0].str[i]));
+        size_t l = strlen(ev_s(&a[0]));
+        for (size_t i = 0; i < l; i++) buf[i] = (char)(up ? toupper((unsigned char)ev_s(&a[0])[i]) : tolower((unsigned char)ev_s(&a[0])[i]));
         ev_set_text(c, out, buf, l);
         return;
     }
-    if (!strcmp(f, "LENGTH"))        { ev_int(out, (int64_t)strlen(a[0].str)); return; }
-    if (!strncmp(f, "CHAR", 4))      { ev_int(out, utf8_chars(a[0].str)); return; }
+    if (!strcmp(f, "LENGTH"))        { ev_int(out, (int64_t)strlen(ev_s(&a[0]))); return; }
+    if (!strncmp(f, "CHAR", 4))      { ev_int(out, utf8_chars(ev_s(&a[0]))); return; }
     if (!strcmp(f, "TRIM") || !strcmp(f, "LTRIM") || !strcmp(f, "RTRIM")) {
-        const char* s = a[0].str;
+        const char* s = ev_s(&a[0]);
         const char* e2 = s + strlen(s);
         if (f[0] != 'R') while (*s == ' ') s++;
         if (f[0] != 'L') while (e2 > s && e2[-1] == ' ') e2--;
@@ -907,7 +980,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         return;
     }
     if (!strcmp(f, "SUBSTRING") || !strcmp(f, "SUBSTR") || !strcmp(f, "LEFT") || !strcmp(f, "RIGHT")) {
-        const char* s = a[0].str;
+        const char* s = ev_s(&a[0]);
         int chars = utf8_chars(s);
         int64_t start, count;
         if (!strcmp(f, "LEFT"))       { start = 1; count = (int64_t)ev_as_num(&a[1]); }
@@ -925,7 +998,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         return;
     }
     if (!strcmp(f, "REPLACE")) {
-        const char* s = a[0].str, *from = a[1].str, *to = a[2].str;
+        const char* s = ev_s(&a[0]), *from = ev_s(&a[1]), *to = ev_s(&a[2]);
         size_t fl = strlen(from), tl = strlen(to), len = 0;
         char buf[EV_STR_MAX + 2];
         while (*s) {
@@ -941,7 +1014,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         return;
     }
     if (!strcmp(f, "REVERSE")) {
-        const char* s = a[0].str;
+        const char* s = ev_s(&a[0]);
         size_t l = strlen(s);
         char buf[EV_STR_MAX + 1];
         size_t k = 0;
@@ -957,7 +1030,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     }
     if (!strcmp(f, "YEAR") || !strcmp(f, "MONTH") || !strcmp(f, "DAY")) {
         int y, m, d;
-        if (sscanf(a[0].str, "%d-%d-%d", &y, &m, &d) != 3) { ev_null(out); return; }
+        if (sscanf(ev_s(&a[0]), "%d-%d-%d", &y, &m, &d) != 3) { ev_null(out); return; }
         ev_int(out, f[0] == 'Y' ? y : f[0] == 'M' ? m : d);
         return;
     }
@@ -1024,7 +1097,7 @@ static void eval_aggregate(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             if (v.is_int) snprintf(key, sizeof(key), "n%lld", (long long)v.inum);
             else if (v.is_num && v.num == floor(v.num) && fabs(v.num) < 9e18) snprintf(key, sizeof(key), "n%lld", (long long)v.num);
             else if (v.is_num) snprintf(key, sizeof(key), "n%.17g", v.num);
-            else snprintf(key, sizeof(key), "s%s", v.str);
+            else snprintf(key, sizeof(key), "s%s", ev_s(&v));
             SMSlot* sl = sm_slot(&seen, key, true);
             if (!sl) { ctx_error(c, "%s", "Out of memory"); break; }
             if (sl->val >= 0) continue;
@@ -1039,7 +1112,7 @@ static void eval_aggregate(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         }
         if ((is_min || is_max) && (!have_best || (is_min ? ev_cmp(&v, &best) < 0 : ev_cmp(&v, &best) > 0))) {
             ev_copy(&best, &v);
-            if (best.str != best.buf) {   // il testo punta alla tupla: copia (la riga corrente cambia)
+            if (best.str && best.str != best.buf) {   // il testo punta alla tupla: copia (la riga corrente cambia)
                 size_t l = strlen(best.str);
                 memcpy(best.buf, best.str, l > EV_STR_MAX ? EV_STR_MAX : l);
                 best.buf[l > EV_STR_MAX ? EV_STR_MAX : l] = '\0';
@@ -1072,10 +1145,29 @@ static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out) {
                 return;
             }
             if (e->bound == 0) { ctx_error(c, "Unresolved column '%s'", e->col_name); ev_null(out); return; }
+            const EvalCtx* cc = c;
+            for (int k = 0; k < e->outer && cc; k++) cc = cc->outer;   // colonna della query esterna
             int s = (e->bound - 1) / 1024, col = (e->bound - 1) % 1024;
-            Tuple* t = (c->cur && s < c->nsrc) ? c->cur[s] : NULL;
+            Tuple* t = (cc && cc->cur && s < cc->nsrc) ? cc->cur[s] : NULL;
             if (!t || col >= t->num_values) { ev_null(out); return; }
-            ev_from_value(out, &t->values[col], c->src[s].ts->columns[col].type);
+            ev_from_value(out, &t->values[col], cc->src[s].ts->columns[col].type);
+            return;
+        }
+        case EXPR_SUBQUERY: eval_subquery(e, c, out); return;
+        case EXPR_CASE: {
+            EvalVal a, w;
+            if (e->left) eval_expr(e->left, c, &a);
+            for (int i = 0; i + 1 < e->nargs; i += 2) {
+                bool hit;
+                if (e->left) {                                   // CASE x WHEN v THEN ...: x = v
+                    eval_expr(e->args[i], c, &w);
+                    hit = !a.null && !w.null && ev_cmp(&a, &w) == 0;
+                } else {
+                    hit = eval_cond(e->args[i], c);
+                }
+                if (hit) { eval_expr(e->args[i + 1], c, out); return; }
+            }
+            if (e->right) eval_expr(e->right, c, out); else ev_null(out);
             return;
         }
         case EXPR_AGG:  eval_aggregate(e, c, out); return;
@@ -1124,12 +1216,12 @@ static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out) {
                 case OP_GT: ev_int(out, ev_cmp(&a, &b) > 0); return;
                 case OP_LE: ev_int(out, ev_cmp(&a, &b) <= 0); return;
                 case OP_GE: ev_int(out, ev_cmp(&a, &b) >= 0); return;
-                case OP_LIKE:     ev_int(out, like_match(a.str, b.str)); return;
-                case OP_NOT_LIKE: ev_int(out, !like_match(a.str, b.str)); return;
+                case OP_LIKE:     ev_int(out, like_match(ev_s(&a), ev_s(&b))); return;
+                case OP_NOT_LIKE: ev_int(out, !like_match(ev_s(&a), ev_s(&b))); return;
                 case OP_PLUS: case OP_MINUS: case OP_MUL: {
                     double x = ev_as_num(&a), y = ev_as_num(&b);
-                    bool ints = (a.is_int || (!a.is_num && x == (double)(int64_t)x && strpbrk(a.str, ".eE") == NULL)) &&
-                                (b.is_int || (!b.is_num && y == (double)(int64_t)y && strpbrk(b.str, ".eE") == NULL));
+                    bool ints = (a.is_int || (!a.is_num && x == (double)(int64_t)x && strpbrk(ev_s(&a), ".eE") == NULL)) &&
+                                (b.is_int || (!b.is_num && y == (double)(int64_t)y && strpbrk(ev_s(&b), ".eE") == NULL));
                     if (ints) {
                         int64_t xi = a.is_int ? a.inum : (int64_t)x, yi = b.is_int ? b.inum : (int64_t)y, r;
                         bool ovf = e->op == OP_PLUS  ? __builtin_add_overflow(xi, yi, &r)
@@ -1172,74 +1264,20 @@ static bool eval_cond(ASTExpr* e, EvalCtx* c) {
 #define MAX_VIEW_DEPTH   16
 #define MAX_JOIN_ROWS    10000000
 
-static QueryResult* run_select(ExecCtx* ctx, ASTNode* n, int depth, bool explain);
-
 static bool is_text_type(DataType t) {
     return t == SV_TYPE_VARCHAR || t == SV_TYPE_CHAR || t == SV_TYPE_TEXT || t == SV_TYPE_DATE || t == SV_TYPE_DATETIME;
 }
 static bool is_int_type(DataType t) { return t == SV_TYPE_INT || t == SV_TYPE_BIGINT; }
 
-// schema costruito dal risultato di una vista
-static TableSchema* schema_from_result(const QueryResult* r, const char* name) {
-    TableSchema* ts = calloc(1, sizeof(TableSchema));
-    if (!ts) return NULL;
-    snprintf(ts->name, sizeof(ts->name), "%s", name);
-    ts->num_columns = r->num_cols < SV_MAX_COLUMNS ? r->num_cols : SV_MAX_COLUMNS;
-    for (int i = 0; i < ts->num_columns; i++) {
-        const char* cn = r->col_names[i] ? r->col_names[i] : "?";
-        const char* dot = strrchr(cn, '.');
-        snprintf(ts->columns[i].name, sizeof(ts->columns[i].name), "%s", dot ? dot + 1 : cn);
-        const char* tn = (r->col_types && r->col_types[i] && r->col_types[i][0]) ? r->col_types[i] : "VARCHAR";
-        ts->columns[i].type = parse_type(tn);
-        ts->columns[i].nullable = true;
-    }
-    return ts;
-}
+static Tuple* tuple_clone(const Tuple* t, const TableSchema* ts);
 
-// apre una sorgente: tabella (righe caricate dopo) o vista (eseguita subito)
-static bool source_open(ExecCtx* ctx, Database* db, Source* s, const char* table, const char* alias,
-                        int depth, char* err, size_t errn) {
-    memset(s, 0, sizeof(*s));
-    snprintf(s->table, sizeof(s->table), "%s", table);
-    snprintf(s->name, sizeof(s->name), "%s", alias && alias[0] ? alias : table);
-    s->ts = catalog_get_table(ctx->catalog, db->name, table);
-    if (s->ts) return true;
-
-    ViewSchema* view = catalog_get_view(ctx->catalog, db->name, table);
-    if (!view) { snprintf(err, errn, "Table or view '%.64s' not found", table); return false; }
-    if (depth >= MAX_VIEW_DEPTH) { snprintf(err, errn, "View '%.64s' is nested too deeply (or refers to itself)", table); return false; }
-    TokenList* tk = lexer_tokenize(view->definition);
-    ParseResult* pr = tk ? parser_parse(tk) : NULL;
-    if (!pr || !pr->success || pr->count != 1 || pr->statements[0]->type != NODE_SELECT) {
-        snprintf(err, errn, "View '%.64s' has an invalid definition", table);
-        parse_result_free(pr);
-        lexer_free(tk);
-        return false;
-    }
-    QueryResult* r = run_select(ctx, pr->statements[0], depth + 1, false);
-    parse_result_free(pr);
-    lexer_free(tk);
-    if (!r || !r->success) {
-        snprintf(err, errn, "View '%.64s': %.180s", table, r ? r->error : "out of memory");
-        db_result_free(r);
-        return false;
-    }
-    s->is_view = true;
-    s->own_ts = s->ts = schema_from_result(r, table);
-    bool ok = s->ts != NULL;
-    int cap = 0;
-    for (int i = 0; ok && i < r->num_rows; i++) {
-        Tuple* t = tuple_create(s->ts->num_columns);
-        if (!t) { ok = false; break; }
-        for (int c = 0; c < s->ts->num_columns; c++) {
-            const Cell* cell = c < r->rows[i].num_cells ? &r->rows[i].cells[c] : NULL;
-            value_set_from_text(&t->values[c], s->ts->columns[c].type, (!cell || cell->is_null) ? NULL : cell->value);
-        }
-        if (!source_push(s, t, (RID){0, 0}, &cap)) { tuple_free(t); ok = false; }
-    }
-    db_result_free(r);
-    if (!ok) { snprintf(err, errn, "Out of memory while reading view '%.64s'", table); return false; }
-    s->loaded = true;
+// chiave per l'hash join: interi -> numero, testo -> testo; false per NULL
+static bool join_key(const Tuple* t, int col, DataType type, char* buf, size_t n) {
+    if (!t || col >= t->num_values || t->values[col].is_null) return false;
+    const Value* v = &t->values[col];
+    if (type == SV_TYPE_INT)         snprintf(buf, n, "%d", v->int_val);
+    else if (type == SV_TYPE_BIGINT) snprintf(buf, n, "%lld", (long long)v->bigint_val);
+    else                             snprintf(buf, n, "%s", v->str_val ? v->str_val : "");
     return true;
 }
 
@@ -1302,149 +1340,75 @@ static bool source_load(ExecCtx* ctx, const char* db, Source* s, ASTExpr* where_
     return ok;
 }
 
-// ── combinazioni di righe (una tupla per sorgente) ──
 
-typedef struct { Tuple*** v; int n, cap; } Combos;
-
-static void combos_free(Combos* c) {
-    for (int i = 0; i < c->n; i++) free(c->v[i]);
-    free(c->v);
-    memset(c, 0, sizeof(*c));
-}
-
-static bool combos_push(Combos* c, Tuple** base, int nsrc, int k, Tuple* row) {
-    if (c->n >= MAX_JOIN_ROWS) return false;
-    if (c->n >= c->cap) {
-        int nc = c->cap ? c->cap * 2 : 256;
-        Tuple*** nv = realloc(c->v, sizeof(Tuple**) * (size_t)nc);
-        if (!nv) return false;
-        c->v = nv;
-        c->cap = nc;
-    }
-    Tuple** t = calloc((size_t)nsrc, sizeof(Tuple*));
-    if (!t) return false;
-    if (base) memcpy(t, base, sizeof(Tuple*) * (size_t)nsrc);
-    if (k >= 0) t[k] = row;
-    c->v[c->n++] = t;
-    return true;
-}
-
-// chiave per l'hash join: interi -> numero, testo -> testo; false per NULL
-static bool join_key(const Tuple* t, int col, DataType type, char* buf, size_t n) {
-    if (!t || col >= t->num_values || t->values[col].is_null) return false;
-    const Value* v = &t->values[col];
-    if (type == SV_TYPE_INT)         snprintf(buf, n, "%d", v->int_val);
-    else if (type == SV_TYPE_BIGINT) snprintf(buf, n, "%lld", (long long)v->bigint_val);
-    else                             snprintf(buf, n, "%s", v->str_val ? v->str_val : "");
-    return true;
-}
-
-// "colonna della sorgente k = colonna di una sorgente precedente", con tipi confrontabili per testo
-static bool find_hash_cond(ASTExpr* on, int k, Source* src, int* nk_col, int* other_src, int* other_col) {
-    if (!on || on->type != EXPR_BINARY) return false;
-    if (on->op == OP_AND) return find_hash_cond(on->left, k, src, nk_col, other_src, other_col) ||
-                                 find_hash_cond(on->right, k, src, nk_col, other_src, other_col);
-    if (on->op != OP_EQ || on->left->type != EXPR_COLUMN || on->right->type != EXPR_COLUMN) return false;
-    if (on->left->bound <= 0 || on->right->bound <= 0) return false;
-    int ls = (on->left->bound - 1) / 1024, lc = (on->left->bound - 1) % 1024;
-    int rs = (on->right->bound - 1) / 1024, rc = (on->right->bound - 1) % 1024;
-    if (rs == k && ls < k) { int ts = ls, tc = lc; ls = rs; lc = rc; rs = ts; rc = tc; }
-    if (ls != k || rs >= k) return false;
-    DataType a = src[ls].ts->columns[lc].type, b = src[rs].ts->columns[rc].type;
-    bool same_class = (is_int_type(a) && is_int_type(b)) || (is_text_type(a) && is_text_type(b));
-    if (!same_class) return false;
-    *nk_col = lc; *other_src = rs; *other_col = rc;
-    return true;
-}
-
-// unisce la sorgente k alle combinazioni correnti
-static const char* join_step(EvalCtx* ec, Combos* in, Combos* out, int k, ASTJoin* j) {
-    Source* s = &ec->src[k];
-    int nsrc = ec->nsrc;
-    bool* right_hit = (j->type == JOIN_RIGHT && s->n) ? calloc((size_t)s->n, sizeof(bool)) : NULL;
-    if (j->type == JOIN_RIGHT && s->n && !right_hit) return "Out of memory";
-
-    // hash join quando la condizione contiene un'uguaglianza fra colonne confrontabili
-    int kc, os, oc;
-    StrMap map = {0};
-    int* next = NULL;                     // catena delle righe con la stessa chiave
-    bool hashed = find_hash_cond(j->condition, k, ec->src, &kc, &os, &oc);
-    if (hashed) {
-        next = malloc(sizeof(int) * (size_t)(s->n ? s->n : 1));
-        if (!next) { free(right_hit); return "Out of memory"; }
-        DataType kt = s->ts->columns[kc].type;
-        for (int r = s->n - 1; r >= 0; r--) {          // in ordine: la catena parte dalla prima riga
-            char key[EV_STR_MAX + 1];
-            next[r] = -1;
-            if (!join_key(s->rows[r], kc, kt, key, sizeof(key))) continue;
-            SMSlot* sl = sm_slot(&map, key, true);
-            if (!sl) { sm_free(&map); free(next); free(right_hit); return "Out of memory"; }
-            next[r] = sl->val;
-            sl->val = r;
-        }
-    }
-    const char* fail = NULL;
-    for (int i = 0; i < in->n && !fail; i++) {
-        if ((i & 1023) == 0 && atomic_load(&g_sv_scan_cancel)) { fail = "Query cancelled"; break; }
-        ec->cur = in->v[i];
-        bool matched = false;
-        int r = 0;
-        if (hashed) {
-            char key[EV_STR_MAX + 1];
-            DataType ot = ec->src[os].ts->columns[oc].type;
-            SMSlot* sl = join_key(in->v[i][os], oc, ot, key, sizeof(key)) ? sm_slot(&map, key, false) : NULL;
-            r = sl ? sl->val : -1;
-        }
-        for (; hashed ? r >= 0 : r < s->n; r = hashed ? next[r] : r + 1) {
-            ec->cur[k] = s->rows[r];
-            bool ok = eval_cond(j->condition, ec);
-            ec->cur[k] = NULL;
-            if (!ok) continue;
-            matched = true;
-            if (right_hit) right_hit[r] = true;
-            if (!combos_push(out, in->v[i], nsrc, k, s->rows[r])) { fail = out->n >= MAX_JOIN_ROWS ? "The JOIN produces too many rows (over 10 million)" : "Out of memory"; break; }
-        }
-        if (!fail && !matched && j->type == JOIN_LEFT && !combos_push(out, in->v[i], nsrc, k, NULL)) fail = "Out of memory";
-    }
-    if (!fail && right_hit)
-        for (int r = 0; r < s->n && !fail; r++)
-            if (!right_hit[r] && !combos_push(out, NULL, nsrc, k, s->rows[r])) fail = "Out of memory";
-    sm_free(&map);
-    free(next);
-    free(right_hit);
-    ec->cur = NULL;
-    return fail;
-}
-
-// ── chiavi di ordinamento ──
+// ── valori del risultato (tipizzati: i numeri restano numeri) ──
 
 typedef struct { bool null, is_num, is_int; int64_t inum; double num; char* str; } SortKey;
+typedef SortKey OVal;
 
+// copia di un valore calcolato (il testo viene duplicato; i numeri senza testo restano binari)
 static void key_set(SortKey* k, const EvalVal* v) {
     k->null = v->null; k->is_num = v->is_num; k->is_int = v->is_int; k->inum = v->inum; k->num = v->num;
-    k->str = v->null ? NULL : strdup(v->str);
+    k->str = (v->null || (v->is_num && !v->str)) ? NULL : strdup(ev_s(v));
+}
+
+static void ev_from_oval(EvalVal* v, const OVal* o) {
+    if (o->null) { ev_null(v); return; }
+    v->null = false; v->is_num = o->is_num; v->is_int = o->is_int; v->inum = o->inum; v->num = o->num;
+    v->str = o->str ? o->str : (o->is_num ? NULL : "");
 }
 
 static int key_cmp(const SortKey* a, const SortKey* b) {
     if (a->null || b->null) return a->null == b->null ? 0 : a->null ? -1 : 1;   // NULL per primi
     EvalVal x, y;
-    x.null = y.null = false;
-    x.is_num = a->is_num; x.is_int = a->is_int; x.inum = a->inum; x.num = a->num; x.str = a->str ? a->str : "";
-    y.is_num = b->is_num; y.is_int = b->is_int; y.inum = b->inum; y.num = b->num; y.str = b->str ? b->str : "";
+    ev_from_oval(&x, a);
+    ev_from_oval(&y, b);
     return ev_cmp(&x, &y);
 }
 
-typedef struct { Cell* cells; SortKey* keys; } OutRow;
+// chiave canonica (DISTINCT, UNION, INTERSECT, EXCEPT): numeri uguali hanno la stessa chiave
+static size_t oval_key(const OVal* o, char* buf, size_t cap) {
+    int n;
+    if (o->null)        n = snprintf(buf, cap, "\x01\x1f");
+    else if (o->is_int) n = snprintf(buf, cap, "n%lld\x1f", (long long)o->inum);
+    else if (o->is_num && o->num == floor(o->num) && fabs(o->num) < 9e18) n = snprintf(buf, cap, "n%lld\x1f", (long long)o->num);
+    else if (o->is_num) n = snprintf(buf, cap, "n%.17g\x1f", o->num);
+    else                n = snprintf(buf, cap, "s%.511s\x1f", o->str ? o->str : "");
+    return n < 0 ? 0 : (size_t)n >= cap ? cap - 1 : (size_t)n;
+}
 
-static struct { OutRow* rows; int nkeys; const bool* desc; } g_sort;
+typedef struct { OVal* v; int nrows, ncols, cap; } ORows;
 
-static int out_row_cmp(const void* pa, const void* pb) {
-    int ia = *(const int*)pa, ib = *(const int*)pb;
-    for (int k = 0; k < g_sort.nkeys; k++) {
-        int c = key_cmp(&g_sort.rows[ia].keys[k], &g_sort.rows[ib].keys[k]);
-        if (c) return g_sort.desc[k] ? -c : c;
+static void orows_free(ORows* r) {
+    for (long i = 0; i < (long)r->nrows * r->ncols; i++) free(r->v[i].str);
+    free(r->v);
+    int nc = r->ncols;
+    memset(r, 0, sizeof(*r));
+    r->ncols = nc;
+}
+
+static OVal* orows_add(ORows* r) {
+    int w = r->ncols > 0 ? r->ncols : 1;
+    if (r->nrows >= r->cap) {
+        int nc = r->cap ? r->cap * 2 : 64;
+        OVal* nv = realloc(r->v, sizeof(OVal) * (size_t)nc * (size_t)w);
+        if (!nv) return NULL;
+        r->v = nv;
+        r->cap = nc;
     }
-    return ia < ib ? -1 : ia > ib;   // stabile
+    OVal* row = r->v + (size_t)r->nrows * (size_t)w;
+    memset(row, 0, sizeof(OVal) * (size_t)w);
+    r->nrows++;
+    return row;
+}
+
+static OVal* orow(const ORows* r, int i) { return r->v + (size_t)i * (size_t)(r->ncols > 0 ? r->ncols : 1); }
+
+static size_t row_sig(const OVal* row, int ncols, char* buf, size_t cap) {
+    size_t len = 0;
+    buf[0] = '\0';
+    for (int j = 0; j < ncols && len + 1 < cap; j++) len += oval_key(&row[j], buf + len, cap - len);
+    return len;
 }
 
 // ── colonne di output ──
@@ -1459,285 +1423,877 @@ typedef struct {
 static void fill_cell(Cell* cell, const EvalVal* v, int src_type) {
     if (v->null) { cell->is_null = true; cell->type = CELL_TYPE_NULL; snprintf(cell->value, sizeof(cell->value), "NULL"); return; }
     cell->is_null = false;
-    snprintf(cell->value, sizeof(cell->value), "%s", v->str);
+    snprintf(cell->value, sizeof(cell->value), "%s", ev_s(v));
     if (src_type >= 0)  cell->type = cell_type_of((DataType)src_type);
     else if (v->is_int) cell->type = CELL_TYPE_INT;
     else if (v->is_num) cell->type = CELL_TYPE_FLOAT;
     else                cell->type = CELL_TYPE_STRING;
 }
 
-// tipo di una colonna calcolata, dedotto dai valori (INT, FLOAT o VARCHAR; "" se tutti NULL)
-static const char* infer_type(const QueryResult* r, int j) {
-    bool any = false, all_int = true, all_num = true;
-    for (int i = 0; i < r->num_rows; i++) {
-        const Cell* c = &r->rows[i].cells[j];
-        if (c->is_null) continue;
-        any = true;
-        if (c->type != CELL_TYPE_INT) all_int = false;
-        if (c->type != CELL_TYPE_INT && c->type != CELL_TYPE_FLOAT) all_num = false;
+// ── vettori di espressioni ──
+
+typedef struct { ASTExpr** v; int n, cap; } ExprVec;
+
+static bool xv_push(ExprVec* xv, ASTExpr* e) {
+    if (xv->n >= xv->cap) {
+        int nc = xv->cap ? xv->cap * 2 : 4;
+        ASTExpr** nv = realloc(xv->v, sizeof(ASTExpr*) * (size_t)nc);
+        if (!nv) return false;
+        xv->v = nv;
+        xv->cap = nc;
     }
-    return !any ? "" : all_int ? "INT" : all_num ? "FLOAT" : "VARCHAR";
+    xv->v[xv->n++] = e;
+    return true;
 }
 
-static QueryResult* run_select(ExecCtx* ctx, ASTNode* n, int depth, bool explain) {
-    Database* db = catalog_current_db(ctx->catalog);
-    if (!db && n->select_stmt.table_name[0]) return result_error_msg("No database selected");
-    char err[300] = "";
-    Source src[MAX_SOURCES];
-    int nsrc = 0;
-    OutCol out[SV_MAX_COLUMNS];
-    int nout = 0;
-    Combos combos = {0};
-    OutRow* rows = NULL;
-    int nrows = 0, caprows = 0;
-    Tuple*** groups_buf = NULL;
-    Tuple** null_combo = NULL;
-    QueryResult* r = NULL;
-    EvalCtx ec;
-    memset(&ec, 0, sizeof(ec));
-    memset(src, 0, sizeof(src));
-    char plan_lookup[600] = "";
+static bool xv_all_true(const ExprVec* xv, EvalCtx* c) {
+    for (int i = 0; i < xv->n; i++) if (!eval_cond(xv->v[i], c)) return false;
+    return true;
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  Piano di una SELECT
+//  plan_prepare apre le sorgenti, risolve i nomi e decide dove applicare ogni condizione;
+//  query_exec lo esegue (una volta, o una volta per riga esterna se è una subquery correlata).
+//
+//  Ottimizzazioni (le stesse dei DBMS reali, visibili con EXPLAIN):
+//  - selection pushdown: le condizioni della WHERE su una sola tabella vengono applicate
+//    durante la lettura della tabella, prima dei join
+//  - le condizioni fra due tabelle (anche di FROM a, b WHERE a.x = b.y) diventano condizioni
+//    di join: con un'uguaglianza il join è un hash join invece di un prodotto cartesiano
+//  - accesso con indice per "colonna indicizzata = costante"
+//  - subquery non correlate eseguite una sola volta (IN con una tabella hash);
+//    subquery correlate con le righe lette una volta sola e una ricerca per chiave
+//  - ORDER BY + LIMIT: si ordina e si taglia prima di calcolare le colonne di output
+// ═════════════════════════════════════════════════════════════════
+
+struct SelectPlan {
+    ExecCtx*  x;
+    ASTNode*  n;
+    int       depth;
+    CteScope  scope;
+    Source    src[MAX_SOURCES];
+    int       nsrc;
+    OutCol    out[SV_MAX_COLUMNS];
+    int       nout;
+    ASTExpr*  sel[SV_MAX_COLUMNS];
+    bool      grouped;
+    bool      correlated;        // usa colonne di una query esterna: rieseguita per ogni riga esterna
+    bool      compound;          // primo ramo di UNION / INTERSECT / EXCEPT
+    struct SelectPlan* next_arm; // ramo successivo
+    int       corder[SV_MAX_ORDER];   // ORDER BY dell'operazione insiemistica: colonna di output
+    // dove si applica ogni condizione
+    ExprVec   pre_static[MAX_SOURCES];  // filtri della sorgente valutati durante la lettura
+    ExprVec   pre_dyn[MAX_SOURCES];     // filtri della sorgente che usano la query esterna
+    ExprVec   jcond[MAX_SOURCES];       // condizioni del join con la sorgente k
+    ExprVec   resid;                    // resto della WHERE (dopo i join)
+    // ricerca per chiave nella sorgente: colonna = espressione senza colonne della sorgente
+    int       probe_col[MAX_SOURCES];
+    ASTExpr*  probe_key[MAX_SOURCES];
+    bool      probe_dyn[MAX_SOURCES];
+    bool      used_index[MAX_SOURCES];
+    StrMap    pmap[MAX_SOURCES];
+    int*      pnext[MAX_SOURCES];
+    bool      loaded;
+    // risultato di una subquery non correlata
+    ORows     cache;
+    bool      cache_ok;
+    int       cache_stop;
+    StrMap    inset;                    // IN (SELECT ...): valori del risultato
+    int       inset_class;              // 1 numeri, 2 testi, 3 misto
+    bool      inset_null;
+    bool      inset_built;
+    long      execs;                    // esecuzioni (EXPLAIN delle subquery)
+    char      err[300];
+};
+
+static int plan_width(const SelectPlan* p) { return p->nout; }
+static void plan_mark_correlated(SelectPlan* p) { for (; p; p = p->next_arm) p->correlated = true; }
+
+static void plan_free(SelectPlan* p) {
+    while (p) {
+        SelectPlan* nx = p->next_arm;
+        for (int s = 0; s < MAX_SOURCES; s++) {
+            free(p->pre_static[s].v); free(p->pre_dyn[s].v); free(p->jcond[s].v);
+            sm_free(&p->pmap[s]); free(p->pnext[s]);
+        }
+        free(p->resid.v);
+        for (int i = 0; i < p->nout; i++) if (p->out[i].owned) ast_expr_free(p->out[i].e);
+        for (int s = 0; s < p->nsrc; s++) source_free(&p->src[s]);
+        orows_free(&p->cache);
+        sm_free(&p->inset);
+        free(p);
+        p = nx;
+    }
+}
+
+static void plan_free_void(void* p) { plan_free((SelectPlan*)p); }
+
+static bool query_exec(SelectPlan* p, EvalCtx* outer, int stop_after, ORows* res);
+
+// tipo (nome) della colonna j del risultato: dallo schema, dalla funzione o dai valori
+static const char* out_type_name(const SelectPlan* p, int j, const ORows* rows, bool for_schema) {
+    const OutCol* oc = &p->out[j];
+    const ASTExpr* e = oc->e;
+    if (oc->src_type >= 0) return datatype_name((DataType)oc->src_type);
+    if (e->type == EXPR_AGG && !strcmp(e->func, "COUNT")) return "INT";
+    if (e->type == EXPR_AGG && !strcmp(e->func, "AVG")) return "FLOAT";
+    if (e->type == EXPR_AGG && strcmp(e->func, "SUM") && e->nargs == 1 && e->args[0]->type == EXPR_COLUMN &&
+        e->args[0]->bound > 0 && e->args[0]->outer == 0)        // MIN/MAX di una colonna
+        return datatype_name(p->src[(e->args[0]->bound - 1) / 1024].ts->columns[(e->args[0]->bound - 1) % 1024].type);
+    bool any = false, all_int = true, all_num = true, small = true;
+    for (int i = 0; rows && i < rows->nrows; i++) {
+        const OVal* o = &orow(rows, i)[j];
+        if (o->null) continue;
+        any = true;
+        if (!o->is_int) all_int = false;
+        else if (o->inum < INT32_MIN || o->inum > INT32_MAX) small = false;
+        if (!o->is_num) all_num = false;
+    }
+    if (!any) return for_schema ? "VARCHAR" : "";
+    if (all_int) return (for_schema && !small) ? "BIGINT" : "INT";
+    return all_num ? "FLOAT" : "VARCHAR";
+}
+
+// sorgente calcolata (vista, WITH, tabella derivata): esegue la query e ne copia le righe
+static bool source_materialize(ExecCtx* x, Source* s, ASTNode* q, int depth, const CteScope* scope,
+                               const char* what, char* err, size_t errn) {
+    char perr[300] = "";
+    SelectPlan* sp = plan_prepare(x, q, depth + 1, NULL, scope, perr, sizeof(perr));
+    ORows rows = {0};
+    if (!sp || !query_exec(sp, NULL, 0, &rows)) {
+        snprintf(err, errn, "%s '%.64s': %.200s", what, s->table, sp ? sp->err : perr);
+        orows_free(&rows);
+        plan_free(sp);
+        return false;
+    }
+    TableSchema* ts = calloc(1, sizeof(TableSchema));
+    bool ok = ts != NULL;
+    if (ok) {
+        snprintf(ts->name, sizeof(ts->name), "%s", s->table);
+        ts->num_columns = sp->nout;
+        for (int i = 0; i < sp->nout; i++) {
+            const char* cn = sp->out[i].name;
+            const char* dot = strrchr(cn, '.');
+            snprintf(ts->columns[i].name, sizeof(ts->columns[i].name), "%s", dot ? dot + 1 : cn);
+            ts->columns[i].type = parse_type(out_type_name(sp, i, &rows, true));
+            ts->columns[i].nullable = true;
+        }
+        ts->num_rows = (uint64_t)rows.nrows;
+    }
+    s->is_view = true;
+    s->own_ts = s->ts = ts;
+    int cap = 0;
+    for (int i = 0; ok && i < rows.nrows; i++) {
+        Tuple* t = tuple_create(ts->num_columns);
+        if (!t) { ok = false; break; }
+        for (int c = 0; c < ts->num_columns; c++) {
+            const OVal* o = &orow(&rows, i)[c];
+            Value* v = &t->values[c];
+            if (o->null) { v->is_null = true; continue; }
+            switch (ts->columns[c].type) {
+                case SV_TYPE_INT:    v->int_val = (int32_t)(o->is_int ? o->inum : (int64_t)o->num); break;
+                case SV_TYPE_BIGINT: v->bigint_val = o->is_int ? o->inum : (int64_t)o->num; break;
+                case SV_TYPE_FLOAT:  v->float_val = o->num; break;
+                case SV_TYPE_BOOL:   v->bool_val = (o->is_num ? o->num : 0) != 0; break;
+                default: {
+                    EvalVal ev;
+                    ev_from_oval(&ev, o);
+                    v->str_val = strdup(ev_s(&ev));
+                    v->owns_str = v->str_val != NULL;
+                    if (!v->str_val) ok = false;
+                    break;
+                }
+            }
+        }
+        if (!source_push(s, t, (RID){0, 0}, &cap)) { tuple_free(t); ok = false; }
+    }
+    orows_free(&rows);
+    plan_free(sp);
+    if (!ok) { snprintf(err, errn, "Out of memory while computing '%.64s'", s->table); return false; }
+    s->loaded = true;
+    return true;
+}
+
+// apre una sorgente: nome definito con WITH, tabella, vista o tabella derivata
+static bool source_open(ExecCtx* x, Database* db, Source* s, const char* table, const char* alias, ASTNode* derived,
+                        int depth, const CteScope* scope, char* err, size_t errn) {
+    memset(s, 0, sizeof(*s));
+    snprintf(s->table, sizeof(s->table), "%s", table);
+    snprintf(s->name, sizeof(s->name), "%s", alias && alias[0] ? alias : table);
+    if (depth >= MAX_VIEW_DEPTH) { snprintf(err, errn, "'%.64s' is nested too deeply (or refers to itself)", table); return false; }
+    if (derived) return source_materialize(x, s, derived, depth, scope, "Subquery", err, errn);
+    for (const CteScope* sc = scope; sc; sc = sc->parent)
+        for (int i = sc->n - 1; i >= 0; i--)
+            if (!strcasecmp(sc->ctes[i].name, table)) {
+                CteScope before = { sc->ctes, i, sc->parent };   // un nome WITH vede solo quelli precedenti
+                return source_materialize(x, s, sc->ctes[i].node, depth, &before, "WITH query", err, errn);
+            }
+    if (!db) { snprintf(err, errn, "No database selected"); return false; }
+    s->ts = catalog_get_table(x->catalog, db->name, table);
+    if (s->ts) return true;
+
+    ViewSchema* view = catalog_get_view(x->catalog, db->name, table);
+    if (!view) { snprintf(err, errn, "Table or view '%.64s' not found", table); return false; }
+    TokenList* tk = lexer_tokenize(view->definition);
+    ParseResult* pr = tk ? parser_parse(tk) : NULL;
+    if (!pr || !pr->success || pr->count != 1 || pr->statements[0]->type != NODE_SELECT) {
+        snprintf(err, errn, "View '%.64s' has an invalid definition", table);
+        parse_result_free(pr);
+        lexer_free(tk);
+        return false;
+    }
+    bool ok = source_materialize(x, s, pr->statements[0], depth, NULL, "View", err, errn);
+    parse_result_free(pr);
+    lexer_free(tk);
+    return ok;
+}
+
+// ── analisi delle condizioni ──
+
+static void collect_conj(ASTExpr* e, ExprVec* out) {
+    if (!e) return;
+    if (e->type == EXPR_BINARY && e->op == OP_AND) { collect_conj(e->left, out); collect_conj(e->right, out); return; }
+    xv_push(out, e);
+}
+
+// sorgenti della query usate dall'espressione; outer: usa colonne esterne; opaque: subquery,
+// alias o aggregati (la condizione resta dov'è)
+static void expr_refs(const ASTExpr* e, unsigned* mask, bool* outer, bool* opaque) {
+    if (!e) return;
+    switch (e->type) {
+        case EXPR_COLUMN:
+            if (e->bound < 0) *opaque = true;
+            else if (e->outer > 0) *outer = true;
+            else if (e->bound > 0) *mask |= 1u << ((e->bound - 1) / 1024);
+            return;
+        case EXPR_SUBQUERY: case EXPR_AGG:
+            *opaque = true;
+            return;
+        default:
+            break;
+    }
+    expr_refs(e->left, mask, outer, opaque);
+    expr_refs(e->right, mask, outer, opaque);
+    for (int i = 0; i < e->nargs; i++) expr_refs(e->args[i], mask, outer, opaque);
+}
+
+// la sorgente s può ricevere righe NULL da un outer join?
+static bool src_nullable(const SelectPlan* p, int s) {
+    const ASTNode* n = p->n;
+    if (s >= 1 && n->select_stmt.joins[s - 1].type == JOIN_LEFT) return true;
+    for (int j = s + 1; j < p->nsrc; j++) if (n->select_stmt.joins[j - 1].type == JOIN_RIGHT) return true;
+    return false;
+}
+
+static int popcount_u(unsigned m) { int c = 0; while (m) { c += (int)(m & 1u); m >>= 1; } return c; }
+static int highest_bit(unsigned m) { int h = -1; for (int i = 0; m; i++, m >>= 1) if (m & 1u) h = i; return h; }
+
+// "colonna di s = espressione senza colonne di questa query" -> ricerca per chiave
+static void find_probe(SelectPlan* p, int s, ExprVec* conds, bool dyn) {
+    if (p->probe_col[s] >= 0) return;
+    for (int i = 0; i < conds->n; i++) {
+        ASTExpr* w = conds->v[i];
+        if (w->type != EXPR_BINARY || w->op != OP_EQ) continue;
+        for (int side = 0; side < 2; side++) {
+            ASTExpr* col = side ? w->right : w->left;
+            ASTExpr* key = side ? w->left : w->right;
+            if (col->type != EXPR_COLUMN || col->bound <= 0 || col->outer || (col->bound - 1) / 1024 != s) continue;
+            unsigned m = 0; bool o = false, op = false;
+            expr_refs(key, &m, &o, &op);
+            if (m || op || o != dyn) continue;
+            int ci = (col->bound - 1) % 1024;
+            DataType t = p->src[s].ts->columns[ci].type;
+            if (!is_int_type(t) && !is_text_type(t)) continue;
+            p->probe_col[s] = ci;
+            p->probe_key[s] = key;
+            p->probe_dyn[s] = dyn;
+            return;
+        }
+    }
+}
+
+// chiave di ricerca dal valore calcolato; false se il tipo non è confrontabile esattamente
+static bool probe_text(const EvalVal* v, DataType col, char* buf, size_t n) {
+    if (v->null) return false;
+    if (is_int_type(col) && v->is_int) {
+        if (col == SV_TYPE_INT && (v->inum < INT32_MIN || v->inum > INT32_MAX)) return false;
+        snprintf(buf, n, "%lld", (long long)v->inum);
+        return true;
+    }
+    if (is_text_type(col) && !v->is_num) { snprintf(buf, n, "%s", ev_s(v)); return true; }
+    return false;
+}
+
+static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* outer, const CteScope* ctes,
+                                   char* err, size_t errn, bool arm);
+
+static SelectPlan* plan_prepare(ExecCtx* x, ASTNode* n, int depth, BindCtx* outer, const CteScope* ctes,
+                                char* err, size_t errn) {
+    return plan_prepare_ex(x, n, depth, outer, ctes, err, errn, false);
+}
+
+// arm = true: solo questo ramo di UNION / INTERSECT / EXCEPT (i successivi li prepara il primo)
+static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* outer, const CteScope* ctes,
+                                   char* err, size_t errn, bool arm) {
+    if (!n || n->type != NODE_SELECT) { snprintf(err, errn, "Expected a SELECT"); return NULL; }
+    if (depth > MAX_VIEW_DEPTH * 4) { snprintf(err, errn, "Query is nested too deeply"); return NULL; }
+    SelectPlan* p = calloc(1, sizeof(SelectPlan));
+    if (!p) { snprintf(err, errn, "Out of memory"); return NULL; }
+    p->x = x;
+    p->n = n;
+    p->depth = depth;
+    p->scope.ctes = n->select_stmt.ctes;
+    p->scope.n = n->select_stmt.num_ctes;
+    p->scope.parent = ctes;
+    for (int s = 0; s < MAX_SOURCES; s++) p->probe_col[s] = -1;
+    Database* db = catalog_current_db(x->catalog);
+    const CteScope* scope = p->scope.n ? &p->scope : ctes;
+    p->compound = !arm && n->select_stmt.set_next != NULL;
+    #define FAIL(...) do { snprintf(err, errn, __VA_ARGS__); plan_free(p); return NULL; } while (0)
 
     // 1. sorgenti (SELECT senza FROM: nessuna, il risultato ha una riga)
-    if (n->select_stmt.table_name[0] &&
-        !source_open(ctx, db, &src[nsrc++], n->select_stmt.table_name, n->select_stmt.table_alias, depth, err, sizeof(err)))
-        goto done;
+    if (n->select_stmt.table_name[0]) {
+        if (!source_open(x, db, &p->src[p->nsrc++], n->select_stmt.table_name, n->select_stmt.table_alias,
+                         n->select_stmt.from_sub, depth, scope, err, errn)) { plan_free(p); return NULL; }
+    }
     for (int j = 0; j < n->select_stmt.num_joins; j++) {
         ASTJoin* jn = &n->select_stmt.joins[j];
-        if (!source_open(ctx, db, &src[nsrc++], jn->table_name, jn->alias, depth, err, sizeof(err))) goto done;
+        if (!source_open(x, db, &p->src[p->nsrc++], jn->table_name, jn->alias, jn->sub, depth, scope, err, errn)) {
+            plan_free(p); return NULL;
+        }
     }
-    for (int a = 0; a < nsrc; a++)
+    for (int a = 0; a < p->nsrc; a++)
         for (int b = 0; b < a; b++)
-            if (!strcasecmp(src[a].name, src[b].name)) {
-                snprintf(err, sizeof(err), "Table '%.64s' is used twice: give each one an alias", src[a].name);
-                goto done;
-            }
+            if (!strcasecmp(p->src[a].name, p->src[b].name))
+                FAIL("Table '%.64s' is used twice: give each one an alias", p->src[a].name);
 
     // 2. colonne di output (* espanso)
     for (int i = 0; i < n->select_stmt.num_cols; i++) {
         ASTExpr* e = n->select_stmt.columns[i];
         if (e->type == EXPR_STAR) {
             bool any = false;
-            for (int s = 0; s < nsrc; s++) {
-                if (e->table_name[0] && strcasecmp(e->table_name, src[s].name) && strcasecmp(e->table_name, src[s].table)) continue;
+            for (int s = 0; s < p->nsrc; s++) {
+                Source* sr = &p->src[s];
+                if (e->table_name[0] && strcasecmp(e->table_name, sr->name) && strcasecmp(e->table_name, sr->table)) continue;
                 any = true;
-                for (int c = 0; c < src[s].ts->num_columns; c++) {
-                    if (nout >= SV_MAX_COLUMNS) { snprintf(err, sizeof(err), "Too many columns in the result (max %d)", SV_MAX_COLUMNS); goto done; }
+                for (int c = 0; c < sr->ts->num_columns; c++) {
+                    if (p->nout >= SV_MAX_COLUMNS) FAIL("Too many columns in the result (max %d)", SV_MAX_COLUMNS);
                     ASTExpr* col = calloc(1, sizeof(ASTExpr));
-                    if (!col) { snprintf(err, sizeof(err), "Out of memory"); goto done; }
+                    if (!col) FAIL("Out of memory");
                     col->type = EXPR_COLUMN;
-                    snprintf(col->col_name, sizeof(col->col_name), "%s", src[s].ts->columns[c].name);
+                    snprintf(col->col_name, sizeof(col->col_name), "%s", sr->ts->columns[c].name);
                     col->bound = s * 1024 + c + 1;
-                    OutCol* oc = &out[nout++];
+                    OutCol* oc = &p->out[p->nout++];
                     oc->e = col;
                     oc->owned = true;
-                    oc->src_type = (int)src[s].ts->columns[c].type;
-                    if (nsrc > 1) snprintf(oc->name, sizeof(oc->name), "%.64s.%.64s", src[s].name, col->col_name);
-                    else          snprintf(oc->name, sizeof(oc->name), "%s", col->col_name);
+                    oc->src_type = (int)sr->ts->columns[c].type;
+                    if (p->nsrc > 1) snprintf(oc->name, sizeof(oc->name), "%.64s.%.64s", sr->name, col->col_name);
+                    else             snprintf(oc->name, sizeof(oc->name), "%s", col->col_name);
                 }
             }
-            if (!any && !nsrc) { snprintf(err, sizeof(err), "SELECT * needs a FROM clause"); goto done; }
-            if (!any) { snprintf(err, sizeof(err), "Unknown table '%.64s' in SELECT", e->table_name); goto done; }
+            if (!any && !p->nsrc) FAIL("SELECT * needs a FROM clause");
+            if (!any) FAIL("Unknown table '%.64s' in SELECT", e->table_name);
             continue;
         }
-        if (nout >= SV_MAX_COLUMNS) { snprintf(err, sizeof(err), "Too many columns in the result (max %d)", SV_MAX_COLUMNS); goto done; }
-        out[nout].e = e;
-        out[nout].owned = false;
-        out[nout].src_type = -1;
-        nout++;
+        if (p->nout >= SV_MAX_COLUMNS) FAIL("Too many columns in the result (max %d)", SV_MAX_COLUMNS);
+        p->out[p->nout].e = e;
+        p->out[p->nout].owned = false;
+        p->out[p->nout].src_type = -1;
+        p->nout++;
     }
 
-    // 3. binding
-    ASTExpr* sel[SV_MAX_COLUMNS];
-    for (int i = 0; i < nout; i++) sel[i] = out[i].e;
+    // 3. risoluzione dei nomi
+    for (int i = 0; i < p->nout; i++) p->sel[i] = p->out[i].e;
     bool has_agg = false;
     {
         BindCtx b;
         memset(&b, 0, sizeof(b));
-        b.src = src;
+        b.src = p->src;
+        b.x = x;
+        b.outer = outer;
+        b.plan = p;
+        b.depth = depth;
+        b.ctes = scope;
         for (int j = 0; j < n->select_stmt.num_joins; j++) {          // ON vede solo le tabelle già unite
             b.nsrc = j + 2; b.mode = BIND_ROW; b.clause = "ON";
             bind_expr(n->select_stmt.joins[j].condition, &b);
         }
-        b.nsrc = nsrc;
+        b.nsrc = p->nsrc;
         b.mode = BIND_AGG_OK; b.clause = "SELECT";
-        for (int i = 0; i < nout; i++) if (!out[i].owned) bind_expr(out[i].e, &b);
+        for (int i = 0; i < p->nout; i++) if (!p->out[i].owned) bind_expr(p->out[i].e, &b);
         has_agg = b.saw_agg;
         b.mode = BIND_ROW; b.clause = "WHERE";
         bind_expr(n->select_stmt.where, &b);
-        b.sel = sel; b.nsel = nout;
+        b.sel = p->sel; b.nsel = p->nout;
         b.clause = "GROUP BY";
         for (int i = 0; i < n->select_stmt.num_group; i++) {
             ASTExpr* g = n->select_stmt.group_exprs[i];
             bind_expr(g, &b);
-            if (!b.err[0] && g->type == EXPR_COLUMN && g->bound < 0 && expr_has_agg(sel[-g->bound - 1]))
+            if (!b.err[0] && g->type == EXPR_COLUMN && g->bound < 0 && expr_has_agg(p->sel[-g->bound - 1]))
                 bind_error(&b, "Cannot GROUP BY an aggregate");
         }
         b.mode = BIND_AGG_OK; b.saw_agg = false; b.clause = "HAVING";
         bind_expr(n->select_stmt.having, &b);
         b.clause = "ORDER BY";
-        for (int i = 0; i < n->select_stmt.num_order; i++) {
+        for (int i = 0; !p->compound && i < n->select_stmt.num_order; i++) {
             ASTExpr* o = n->select_stmt.order_exprs[i];
             if (o->type == EXPR_INT) {                                  // ORDER BY 2 = seconda colonna
-                if (o->int_val < 1 || o->int_val > nout) { bind_error(&b, "ORDER BY position is out of range"); break; }
+                if (o->int_val < 1 || o->int_val > p->nout) { bind_error(&b, "ORDER BY position is out of range"); break; }
                 continue;
             }
             // un nome che è alias di una colonna di output vale l'alias (come MySQL)
             if (o->type == EXPR_COLUMN && !o->table_name[0]) {
                 int k;
-                for (k = 0; k < nout; k++) if (sel[k]->alias[0] && !strcasecmp(sel[k]->alias, o->col_name)) break;
-                if (k < nout) { o->bound = -(k + 1); continue; }
+                for (k = 0; k < p->nout; k++) if (p->sel[k]->alias[0] && !strcasecmp(p->sel[k]->alias, o->col_name)) break;
+                if (k < p->nout) { o->bound = -(k + 1); continue; }
             }
             bind_expr(o, &b);
         }
         if (b.saw_agg) has_agg = true;
-        if (b.err[0]) { snprintf(err, sizeof(err), "%s", b.err); goto done; }
+        if (b.err[0]) FAIL("%s", b.err);
     }
-    for (int i = 0; i < nout; i++) {
-        OutCol* oc = &out[i];
+    for (int i = 0; i < p->nout; i++) {
+        OutCol* oc = &p->out[i];
         if (oc->owned) continue;
         ASTExpr* e = oc->e;
-        if (e->type == EXPR_COLUMN && e->bound > 0) {
+        if (e->type == EXPR_COLUMN && e->bound > 0 && e->outer == 0) {
             int s = (e->bound - 1) / 1024, c = (e->bound - 1) % 1024;
-            oc->src_type = (int)src[s].ts->columns[c].type;
+            oc->src_type = (int)p->src[s].ts->columns[c].type;
         }
-        if (e->alias[0])                                snprintf(oc->name, sizeof(oc->name), "%s", e->alias);
-        else if (e->type == EXPR_COLUMN && nsrc > 1)    snprintf(oc->name, sizeof(oc->name), "%.64s.%.64s",
-                                                                 src[(e->bound - 1) / 1024].name, e->col_name);
-        else if (e->type == EXPR_COLUMN)                snprintf(oc->name, sizeof(oc->name), "%s", e->col_name);
-        else                                            ast_expr_format(e, oc->name, sizeof(oc->name));
+        if (e->alias[0])                                                   snprintf(oc->name, sizeof(oc->name), "%s", e->alias);
+        else if (e->type == EXPR_COLUMN && p->nsrc > 1 && e->outer == 0 && e->bound > 0)
+            snprintf(oc->name, sizeof(oc->name), "%.64s.%.64s", p->src[(e->bound - 1) / 1024].name, e->col_name);
+        else if (e->type == EXPR_COLUMN)                                   snprintf(oc->name, sizeof(oc->name), "%s", e->col_name);
+        else                                                               ast_expr_format(e, oc->name, sizeof(oc->name));
     }
-    bool grouped = has_agg || n->select_stmt.num_group > 0 || n->select_stmt.having;
+    p->grouped = has_agg || n->select_stmt.num_group > 0 || n->select_stmt.having;
 
-    // 4. EXPLAIN: descrive il piano senza eseguire
-    if (explain) {
-        char fake[400] = "";
-        int fci;
-        bool lookup = nsrc == 1 && !src[0].is_view && find_index_eq(n->select_stmt.where, src[0].ts, &fci, fake, sizeof(fake));
-        r = calloc(1, sizeof(QueryResult));
-        if (!r) goto done;
-        r->success = true;
-        r->num_cols = 3;
-        r->col_names = calloc(3, sizeof(char*));
-        r->col_types = calloc(3, sizeof(char*));
-        r->col_names[0] = strdup("Step"); r->col_names[1] = strdup("Operation"); r->col_names[2] = strdup("Details");
-        for (int i = 0; i < 3; i++) r->col_types[i] = strdup(i ? "VARCHAR" : "INT");
-        r->rows = calloc(64, sizeof(Row));
-        char detail[440], buf[400];
-        #define PLAN(op, ...) do { if (r->num_rows < 64) { Row* pr = &r->rows[r->num_rows++]; pr->num_cells = 3; \
-            pr->cells = calloc(3, sizeof(Cell)); snprintf(pr->cells[0].value, sizeof(pr->cells[0].value), "%d", r->num_rows); \
-            pr->cells[0].type = CELL_TYPE_INT; snprintf(pr->cells[1].value, sizeof(pr->cells[1].value), "%s", op); \
-            snprintf(pr->cells[2].value, sizeof(pr->cells[2].value), __VA_ARGS__); \
-            pr->cells[1].type = pr->cells[2].type = CELL_TYPE_STRING; } } while (0)
-        for (int s = 0; s < nsrc; s++) {
-            if (src[s].is_view)  PLAN("View", "%.64s (%d rows, computed)", src[s].name, src[s].n);
-            else if (s == 0 && lookup) {
-                ast_expr_format(n->select_stmt.where, buf, sizeof(buf));
-                PLAN("Index lookup", "%.64s using %.64s.%.64s (in-memory index)", src[s].name, src[s].table, src[s].ts->columns[fci].name);
-            } else PLAN("Table scan", "%.64s (about %llu rows)", src[s].name, (unsigned long long)src[s].ts->num_rows);
-            if (s > 0) {
-                ASTJoin* j = &n->select_stmt.joins[s - 1];
-                int a1, a2, a3;
-                const char* kind = j->type == JOIN_LEFT ? "LEFT" : j->type == JOIN_RIGHT ? "RIGHT" : j->type == JOIN_CROSS ? "CROSS" : "INNER";
-                if (j->condition) ast_expr_format(j->condition, buf, sizeof(buf)); else snprintf(buf, sizeof(buf), "every combination");
-                snprintf(detail, sizeof(detail), "%s JOIN ON %s", kind, buf);
-                PLAN(find_hash_cond(j->condition, s, src, &a1, &a2, &a3) ? "Hash join" : "Nested loop join", "%s", detail);
-            }
+    // 4. dove applicare le condizioni
+    ExprVec conj = {0};
+    collect_conj(n->select_stmt.where, &conj);
+    for (int i = 0; i < conj.n; i++) {
+        ASTExpr* c = conj.v[i];
+        unsigned m = 0; bool o = false, op = false;
+        expr_refs(c, &m, &o, &op);
+        bool safe = !op && m != 0;
+        for (int s = 0; safe && s < p->nsrc; s++) if ((m >> s & 1u) && src_nullable(p, s)) safe = false;
+        if (safe && popcount_u(m) == 1) {
+            int s = highest_bit(m);
+            xv_push(o ? &p->pre_dyn[s] : &p->pre_static[s], c);
+            continue;
         }
-        if (n->select_stmt.where) { ast_expr_format(n->select_stmt.where, buf, sizeof(buf)); PLAN("Filter", "WHERE %s", buf); }
-        if (grouped) {
-            buf[0] = '\0';
-            for (int i = 0; i < n->select_stmt.num_group; i++) {
-                char g[200];
-                ast_expr_format(n->select_stmt.group_exprs[i], g, sizeof(g));
-                snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s%s", i ? ", " : "", g);
-            }
-            PLAN("Aggregate", "%s", n->select_stmt.num_group ? buf : "all rows as one group");
+        int k = highest_bit(m);
+        if (safe && k >= 1 && (n->select_stmt.joins[k - 1].type == JOIN_INNER || n->select_stmt.joins[k - 1].type == JOIN_CROSS)) {
+            xv_push(&p->jcond[k], c);
+            continue;
         }
-        if (n->select_stmt.having) { ast_expr_format(n->select_stmt.having, buf, sizeof(buf)); PLAN("Filter groups", "HAVING %s", buf); }
-        buf[0] = '\0';
-        for (int i = 0; i < nout; i++) snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s%s", i ? ", " : "", out[i].name);
-        PLAN("Projection", "%s", buf);
-        if (n->select_stmt.distinct) PLAN("Distinct", "remove duplicate rows");
-        if (n->select_stmt.num_order) {
-            buf[0] = '\0';
-            for (int i = 0; i < n->select_stmt.num_order; i++) {
-                char o[200];
-                ast_expr_format(n->select_stmt.order_exprs[i], o, sizeof(o));
-                snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s%s%s", i ? ", " : "", o, n->select_stmt.order_desc[i] ? " DESC" : "");
-            }
-            PLAN("Sort", "%s", buf);
+        xv_push(&p->resid, c);
+    }
+    free(conj.v);
+    for (int k = 1; k < p->nsrc; k++) {
+        ASTJoin* j = &n->select_stmt.joins[k - 1];
+        if (j->type == JOIN_RIGHT) { if (j->condition) xv_push(&p->jcond[k], j->condition); continue; }
+        ExprVec on = {0};
+        collect_conj(j->condition, &on);
+        for (int i = 0; i < on.n; i++) {
+            ASTExpr* c = on.v[i];
+            unsigned m = 0; bool o = false, op = false;
+            expr_refs(c, &m, &o, &op);
+            // condizione dell'ON solo sulla tabella unita: filtra le sue righe prima del join
+            bool pre = !op && m == (1u << k) && (j->type == JOIN_LEFT || !src_nullable(p, k));
+            xv_push(pre ? (o ? &p->pre_dyn[k] : &p->pre_static[k]) : &p->jcond[k], c);
         }
-        if (n->select_stmt.has_limit) PLAN("Limit", "%d rows, skipping %d", n->select_stmt.limit, n->select_stmt.offset);
-        #undef PLAN
-        goto done;
+        free(on.v);
+    }
+    for (int s = 0; s < p->nsrc; s++) {
+        if (p->src[s].is_view) continue;
+        find_probe(p, s, &p->pre_dyn[s], true);
+        find_probe(p, s, &p->pre_static[s], false);
     }
 
-    // 5. righe delle tabelle (con l'indice se la WHERE lo permette e c'è una sola tabella)
-    for (int s = 0; s < nsrc; s++) {
-        if (!source_load(ctx, db->name, &src[s], nsrc == 1 ? n->select_stmt.where : NULL, plan_lookup, sizeof(plan_lookup))) {
-            snprintf(err, sizeof(err), "Failed to read table '%.64s'", src[s].table);
-            goto done;
+    // 5. rami di UNION / INTERSECT / EXCEPT
+    if (p->compound) {
+        SelectPlan* tail = p;
+        for (ASTNode* an = n->select_stmt.set_next; an; an = an->select_stmt.set_next) {
+            SelectPlan* ap = plan_prepare_ex(x, an, depth, outer, scope, err, errn, true);
+            if (!ap) { plan_free(p); return NULL; }
+            tail->next_arm = ap;
+            tail = ap;
+            if (ap->nout != p->nout)
+                FAIL("Each SELECT of %s must have the same number of columns (%d and %d)",
+                     n->select_stmt.set_op == SETOP_UNION ? "a UNION" : n->select_stmt.set_op == SETOP_INTERSECT ? "an INTERSECT" : "an EXCEPT",
+                     p->nout, ap->nout);
+            if (ap->correlated) p->correlated = true;
+        }
+        for (SelectPlan* a = p->next_arm; a; a = a->next_arm) if (a->correlated) plan_mark_correlated(p);
+        // ORDER BY del risultato: posizione o nome di una colonna del risultato
+        for (int i = 0; i < n->select_stmt.num_order; i++) {
+            ASTExpr* o = n->select_stmt.order_exprs[i];
+            int k = -1;
+            if (o->type == EXPR_INT && o->int_val >= 1 && o->int_val <= p->nout) k = (int)o->int_val - 1;
+            else if (o->type == EXPR_COLUMN)
+                for (int j = 0; j < p->nout && k < 0; j++) {
+                    const char* nm = p->out[j].name;
+                    const char* dot = strrchr(nm, '.');
+                    if (!strcasecmp(nm, o->col_name) || (dot && !strcasecmp(dot + 1, o->col_name))) k = j;
+                }
+            if (k < 0) FAIL("ORDER BY of a UNION / INTERSECT / EXCEPT must name a result column or give its position");
+            p->corder[i] = k;
         }
     }
-    if (atomic_load(&g_sv_scan_cancel)) { snprintf(err, sizeof(err), "Query cancelled"); goto done; }
+    #undef FAIL
+    return p;
+}
 
-    // 6. combinazioni (JOIN) e WHERE
-    ec.src = src;
-    ec.nsrc = nsrc;
-    ec.sel = sel;
-    ec.nsel = nout;
-    if (nsrc == 0) {                                     // SELECT senza FROM: una riga senza colonne di tabella
-        if (!combos_push(&combos, NULL, 1, -1, NULL)) { snprintf(err, sizeof(err), "Out of memory"); goto done; }
-    }
-    for (int i = 0; nsrc > 0 && i < src[0].n; i++)
-        if (!combos_push(&combos, NULL, nsrc, 0, src[0].rows[i])) { snprintf(err, sizeof(err), "Out of memory"); goto done; }
-    for (int j = 0; j < n->select_stmt.num_joins; j++) {
-        Combos next = {0};
-        const char* f = join_step(&ec, &combos, &next, j + 1, &n->select_stmt.joins[j]);
-        combos_free(&combos);
-        combos = next;
-        if (f) { snprintf(err, sizeof(err), "%s", f); goto done; }
-        if (ec.err[0]) { snprintf(err, sizeof(err), "%s", ec.err); goto done; }
-    }
-    if (n->select_stmt.where) {
-        int w = 0;
-        for (int i = 0; i < combos.n; i++) {
-            ec.cur = combos.v[i];
-            if (eval_cond(n->select_stmt.where, &ec)) combos.v[w++] = combos.v[i];
-            else free(combos.v[i]);
+// ── lettura delle sorgenti ──
+
+static bool plan_load(SelectPlan* p) {
+    if (p->loaded) return true;
+    p->loaded = true;
+    Database* db = catalog_current_db(p->x->catalog);
+    Tuple* cur[MAX_SOURCES] = {0};
+    EvalCtx ec;
+    memset(&ec, 0, sizeof(ec));
+    ec.src = p->src; ec.nsrc = p->nsrc; ec.cur = cur; ec.x = p->x;
+    for (int s = 0; s < p->nsrc; s++) {
+        Source* S = &p->src[s];
+        ExprVec* f = &p->pre_static[s];
+        if (S->loaded) {                                       // vista / WITH / derivata: filtro sulle righe
+            if (f->n) {
+                int w = 0;
+                for (int i = 0; i < S->n; i++) {
+                    cur[s] = S->rows[i];
+                    if (xv_all_true(f, &ec)) { S->rows[w] = S->rows[i]; S->rids[w] = S->rids[i]; w++; }
+                    else tuple_free(S->rows[i]);
+                }
+                S->n = w;
+                cur[s] = NULL;
+            }
+        } else {
+            S->loaded = true;
+            HeapFile* hf = heap_open(p->x->bp, S->ts->root_page_id, S->ts->num_pages);
+            if (!hf) { snprintf(p->err, sizeof(p->err), "Failed to read table '%.64s'", S->table); return false; }
+            int cap = 0;
+            bool done = false;
+            // accesso con indice: colonna indicizzata = costante
+            if (p->probe_col[s] >= 0 && !p->probe_dyn[s] && db && col_is_indexed(S->ts, p->probe_col[s])) {
+                EvalVal kv;
+                eval_expr(p->probe_key[s], &ec, &kv);
+                char key[EV_STR_MAX + 1];
+                MemIndex* ix = mi_get(p->x, db->name, S->ts, p->probe_col[s]);
+                if (ix) {
+                    done = true;
+                    p->used_index[s] = true;
+                    const RidList* l = probe_text(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key)) ? mi_lookup(ix, key) : NULL;
+                    for (int i = 0; l && i < l->n; i++) {
+                        Tuple* t = heap_get(hf, l->r[i], S->ts);
+                        if (!t) continue;
+                        cur[s] = t;
+                        if (!xv_all_true(f, &ec)) { tuple_free(t); continue; }
+                        if (!source_push(S, t, l->r[i], &cap)) { tuple_free(t); free(hf); snprintf(p->err, sizeof(p->err), "Out of memory"); return false; }
+                    }
+                }
+            }
+            if (!done) {
+                // scansione: le righe vengono lette senza allocare e copiate solo se passano i filtri
+                HeapScan* scan = heap_scan_open(hf, S->ts);
+                Tuple* view = tuple_create(S->ts->num_columns);
+                char* sbuf = malloc(SV_PAGE_SIZE + 64);
+                bool ok = scan && view && sbuf;
+                RID rid;
+                uint16_t len;
+                const uint8_t* data;
+                while (ok && (data = heap_scan_next_raw(scan, &rid, &len)) != NULL) {
+                    if (!tuple_view(view, data, len, S->ts, sbuf, SV_PAGE_SIZE + 64)) continue;
+                    if (f->n) {
+                        cur[s] = view;
+                        bool keep = xv_all_true(f, &ec);
+                        cur[s] = NULL;
+                        if (!keep) continue;
+                    }
+                    Tuple* t = tuple_clone(view, S->ts);
+                    if (!t) { ok = false; break; }
+                    t->rid = rid;
+                    if (!source_push(S, t, rid, &cap)) { tuple_free(t); ok = false; }
+                }
+                if (view) { for (int c = 0; c < view->num_values; c++) view->values[c].owns_str = false; tuple_free(view); }
+                free(sbuf);
+                heap_scan_close(scan);
+                if (!ok) { free(hf); snprintf(p->err, sizeof(p->err), "Out of memory while reading '%.64s'", S->table); return false; }
+            }
+            free(hf);
+            cur[s] = NULL;
         }
-        combos.n = w;
+        if (ec.err[0]) { snprintf(p->err, sizeof(p->err), "%s", ec.err); return false; }
+        // subquery correlata: tabella hash sulla colonna di ricerca, costruita una volta
+        if (p->probe_col[s] >= 0 && p->probe_dyn[s]) {
+            int col = p->probe_col[s];
+            DataType kt = S->ts->columns[col].type;
+            p->pnext[s] = malloc(sizeof(int) * (size_t)(S->n ? S->n : 1));
+            if (!p->pnext[s]) { snprintf(p->err, sizeof(p->err), "Out of memory"); return false; }
+            for (int r = S->n - 1; r >= 0; r--) {
+                char key[EV_STR_MAX + 1];
+                p->pnext[s][r] = -1;
+                if (!join_key(S->rows[r], col, kt, key, sizeof(key))) continue;
+                SMSlot* sl = sm_slot(&p->pmap[s], key, true);
+                if (!sl) { snprintf(p->err, sizeof(p->err), "Out of memory"); return false; }
+                p->pnext[s][r] = sl->val;
+                sl->val = r;
+            }
+        }
+    }
+    if (atomic_load(&g_sv_scan_cancel)) { snprintf(p->err, sizeof(p->err), "Query cancelled"); return false; }
+    return true;
+}
+
+// ── combinazioni di righe (una tupla per sorgente), in un unico array ──
+
+typedef struct { Tuple** v; int n, cap, w; } Combos;
+
+#define COMBO(c, i) ((c)->v + (size_t)(i) * (size_t)(c)->w)
+
+static void combos_free(Combos* c) { free(c->v); c->v = NULL; c->n = c->cap = 0; }
+
+static bool combos_push(Combos* c, Tuple** base, int k, Tuple* row) {
+    if (c->n >= MAX_JOIN_ROWS) return false;
+    if (c->n >= c->cap) {
+        int nc = c->cap ? c->cap * 2 : 256;
+        Tuple** nv = realloc(c->v, sizeof(Tuple*) * (size_t)nc * (size_t)c->w);
+        if (!nv) return false;
+        c->v = nv;
+        c->cap = nc;
+    }
+    Tuple** t = COMBO(c, c->n);
+    if (base) memcpy(t, base, sizeof(Tuple*) * (size_t)c->w);
+    else memset(t, 0, sizeof(Tuple*) * (size_t)c->w);
+    if (k >= 0) t[k] = row;
+    c->n++;
+    return true;
+}
+
+// "colonna della sorgente k = colonna di una sorgente precedente", con tipi confrontabili per testo
+static bool find_hash_cond(ExprVec* conds, int k, Source* src, int* nk_col, int* other_src, int* other_col) {
+    for (int i = 0; i < conds->n; i++) {
+        ASTExpr* on = conds->v[i];
+        if (on->type != EXPR_BINARY || on->op != OP_EQ || on->left->type != EXPR_COLUMN || on->right->type != EXPR_COLUMN) continue;
+        if (on->left->bound <= 0 || on->right->bound <= 0 || on->left->outer || on->right->outer) continue;
+        int ls = (on->left->bound - 1) / 1024, lc = (on->left->bound - 1) % 1024;
+        int rs = (on->right->bound - 1) / 1024, rc = (on->right->bound - 1) % 1024;
+        if (rs == k && ls < k) { int ts = ls, tc = lc; ls = rs; lc = rc; rs = ts; rc = tc; }
+        if (ls != k || rs >= k) continue;
+        DataType a = src[ls].ts->columns[lc].type, b = src[rs].ts->columns[rc].type;
+        bool same_class = (is_int_type(a) && is_int_type(b)) || (is_text_type(a) && is_text_type(b));
+        if (!same_class) continue;
+        *nk_col = lc; *other_src = rs; *other_col = rc;
+        return true;
+    }
+    return false;
+}
+
+// unisce le righe rows (della sorgente k) alle combinazioni correnti
+static const char* join_step(EvalCtx* ec, Combos* in, Combos* out, int k, JoinType jt, ExprVec* conds,
+                             Tuple** rows, int nrows) {
+    bool* right_hit = (jt == JOIN_RIGHT && nrows) ? calloc((size_t)nrows, sizeof(bool)) : NULL;
+    if (jt == JOIN_RIGHT && nrows && !right_hit) return "Out of memory";
+
+    // hash join quando le condizioni contengono un'uguaglianza fra colonne confrontabili
+    int kc, os, oc;
+    StrMap map = {0};
+    int* next = NULL;                     // catena delle righe con la stessa chiave
+    bool hashed = find_hash_cond(conds, k, ec->src, &kc, &os, &oc);
+    if (hashed) {
+        next = malloc(sizeof(int) * (size_t)(nrows ? nrows : 1));
+        if (!next) { free(right_hit); return "Out of memory"; }
+        DataType kt = ec->src[k].ts->columns[kc].type;
+        for (int r = nrows - 1; r >= 0; r--) {          // in ordine: la catena parte dalla prima riga
+            char key[EV_STR_MAX + 1];
+            next[r] = -1;
+            if (!join_key(rows[r], kc, kt, key, sizeof(key))) continue;
+            SMSlot* sl = sm_slot(&map, key, true);
+            if (!sl) { sm_free(&map); free(next); free(right_hit); return "Out of memory"; }
+            next[r] = sl->val;
+            sl->val = r;
+        }
+    }
+    const char* fail = NULL;
+    DataType ot = hashed ? ec->src[os].ts->columns[oc].type : SV_TYPE_INT;
+    for (int i = 0; i < in->n && !fail; i++) {
+        if ((i & 1023) == 0 && atomic_load(&g_sv_scan_cancel)) { fail = "Query cancelled"; break; }
+        Tuple** base = COMBO(in, i);
+        ec->cur = base;
+        bool matched = false;
+        int r = 0;
+        if (hashed) {
+            char key[EV_STR_MAX + 1];
+            SMSlot* sl = join_key(base[os], oc, ot, key, sizeof(key)) ? sm_slot(&map, key, false) : NULL;
+            r = sl ? sl->val : -1;
+        }
+        for (; hashed ? r >= 0 : r < nrows; r = hashed ? next[r] : r + 1) {
+            base[k] = rows[r];
+            bool ok = xv_all_true(conds, ec);
+            base[k] = NULL;
+            if (!ok) continue;
+            matched = true;
+            if (right_hit) right_hit[r] = true;
+            if (!combos_push(out, base, k, rows[r])) { fail = out->n >= MAX_JOIN_ROWS ? "The JOIN produces too many rows (over 10 million)" : "Out of memory"; break; }
+            base = COMBO(in, i);
+        }
+        if (!fail && !matched && jt == JOIN_LEFT && !combos_push(out, base, k, NULL)) fail = "Out of memory";
+    }
+    if (!fail && right_hit)
+        for (int r = 0; r < nrows && !fail; r++)
+            if (!right_hit[r] && !combos_push(out, NULL, k, rows[r])) fail = "Out of memory";
+    sm_free(&map);
+    free(next);
+    free(right_hit);
+    ec->cur = NULL;
+    return fail;
+}
+
+// ── ordinamento ──
+
+typedef struct { SortKey* keys; int nkeys; const bool* desc; } SortSpec;
+static SortSpec g_sort;
+
+static int unit_cmp(const void* pa, const void* pb) {
+    int ia = *(const int*)pa, ib = *(const int*)pb;
+    const SortKey* a = &g_sort.keys[(size_t)ia * (size_t)g_sort.nkeys];
+    const SortKey* b = &g_sort.keys[(size_t)ib * (size_t)g_sort.nkeys];
+    for (int k = 0; k < g_sort.nkeys; k++) {
+        int c = key_cmp(&a[k], &b[k]);
+        if (c) return g_sort.desc[k] ? -c : c;
+    }
+    return ia < ib ? -1 : ia > ib;   // stabile
+}
+
+// ── esecuzione di un ramo ──
+
+typedef struct {
+    Combos     combos;
+    Tuple**    frows[MAX_SOURCES];
+    bool       fown[MAX_SOURCES];
+    int        fn[MAX_SOURCES];
+    Tuple***   groups_buf;
+    int*       group_start;
+    int*       group_size;
+    int*       units;
+    SortKey*   keys;
+    int        nkeys_alloc;
+    Tuple**    null_combo;
+} ArmState;
+
+static void arm_state_free(ArmState* st, int nsrc) {
+    combos_free(&st->combos);
+    for (int s = 0; s < nsrc; s++) if (st->fown[s]) free(st->frows[s]);
+    free(st->groups_buf); free(st->group_start); free(st->group_size); free(st->units);
+    for (int i = 0; i < st->nkeys_alloc; i++) free(st->keys[i].str);
+    free(st->keys);
+    free(st->null_combo);
+}
+
+static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_order, ORows* res) {
+    ASTNode* n = p->n;
+    ArmState st;
+    memset(&st, 0, sizeof(st));
+    p->err[0] = '\0';
+    p->execs++;
+    res->ncols = p->nout;
+    if (!plan_load(p)) return false;
+
+    EvalCtx ec;
+    memset(&ec, 0, sizeof(ec));
+    ec.src = p->src; ec.nsrc = p->nsrc; ec.sel = p->sel; ec.nsel = p->nout;
+    ec.x = p->x; ec.outer = outer;
+    int w = p->nsrc ? p->nsrc : 1;
+    st.combos.w = w;
+    Tuple* cur[MAX_SOURCES] = {0};
+    #define AFAIL(...) do { snprintf(p->err, sizeof(p->err), __VA_ARGS__); arm_state_free(&st, p->nsrc); return false; } while (0)
+
+    // 1. righe di ogni sorgente che passano i filtri dipendenti dalla query esterna
+    for (int s = 0; s < p->nsrc; s++) {
+        Source* S = &p->src[s];
+        bool dyn = p->pre_dyn[s].n > 0;
+        if (!dyn) { st.frows[s] = S->rows; st.fn[s] = S->n; continue; }
+        st.frows[s] = malloc(sizeof(Tuple*) * (size_t)(S->n ? S->n : 1));
+        if (!st.frows[s]) AFAIL("Out of memory");
+        st.fown[s] = true;
+        ec.cur = cur;
+        if (p->probe_col[s] >= 0 && p->probe_dyn[s]) {
+            EvalVal kv;
+            eval_expr(p->probe_key[s], &ec, &kv);
+            char key[EV_STR_MAX + 1];
+            SMSlot* sl = probe_text(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key)) ? sm_slot(&p->pmap[s], key, false) : NULL;
+            if (!probe_text(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key)) && !kv.null) {
+                // tipo non confrontabile per chiave: si provano tutte le righe
+                for (int r = 0; r < S->n; r++) { cur[s] = S->rows[r]; if (xv_all_true(&p->pre_dyn[s], &ec)) st.frows[s][st.fn[s]++] = S->rows[r]; }
+            } else {
+                for (int r = sl ? sl->val : -1; r >= 0; r = p->pnext[s][r]) {
+                    cur[s] = S->rows[r];
+                    if (xv_all_true(&p->pre_dyn[s], &ec)) st.frows[s][st.fn[s]++] = S->rows[r];
+                }
+            }
+        } else {
+            for (int r = 0; r < S->n; r++) { cur[s] = S->rows[r]; if (xv_all_true(&p->pre_dyn[s], &ec)) st.frows[s][st.fn[s]++] = S->rows[r]; }
+        }
+        cur[s] = NULL;
         ec.cur = NULL;
-        if (ec.err[0]) { snprintf(err, sizeof(err), "%s", ec.err); goto done; }
+        if (ec.err[0]) AFAIL("%s", ec.err);
     }
 
-    // 7. righe di output (una per combinazione, o una per gruppo)
-    int nkeys = n->select_stmt.num_order;
-    null_combo = calloc((size_t)(nsrc ? nsrc : 1), sizeof(Tuple*));
-    if (!null_combo) { snprintf(err, sizeof(err), "Out of memory"); goto done; }
+    // 2. combinazioni (JOIN) e resto della WHERE
+    if (p->nsrc == 0) {
+        if (!combos_push(&st.combos, NULL, -1, NULL)) AFAIL("Out of memory");
+    }
+    for (int i = 0; p->nsrc > 0 && i < st.fn[0]; i++)
+        if (!combos_push(&st.combos, NULL, 0, st.frows[0][i])) AFAIL("%s", st.combos.n >= MAX_JOIN_ROWS ? "Too many rows" : "Out of memory");
+    for (int j = 0; j < n->select_stmt.num_joins; j++) {
+        Combos next = { NULL, 0, 0, w };
+        const char* f = join_step(&ec, &st.combos, &next, j + 1, n->select_stmt.joins[j].type, &p->jcond[j + 1],
+                                  st.frows[j + 1], st.fn[j + 1]);
+        combos_free(&st.combos);
+        st.combos = next;
+        if (f) AFAIL("%s", f);
+        if (ec.err[0]) AFAIL("%s", ec.err);
+    }
+    bool quick = stop_after > 0 && !p->grouped && !n->select_stmt.distinct && (!apply_order || !n->select_stmt.num_order) &&
+                 (!apply_order || !n->select_stmt.has_limit);
+    if (p->resid.n || quick) {
+        int kept = 0;
+        for (int i = 0; i < st.combos.n; i++) {
+            ec.cur = COMBO(&st.combos, i);
+            if (p->resid.n && !xv_all_true(&p->resid, &ec)) continue;
+            if (kept != i) memcpy(COMBO(&st.combos, kept), COMBO(&st.combos, i), sizeof(Tuple*) * (size_t)w);
+            kept++;
+            if (quick && kept >= stop_after) break;                 // EXISTS: basta una riga
+        }
+        st.combos.n = kept;
+        ec.cur = NULL;
+        if (ec.err[0]) AFAIL("%s", ec.err);
+    }
 
-    int ngroups = 0;
-    int* group_of = NULL;      // gruppo di ogni combinazione
-    int* group_start = NULL;   // prima combinazione (in groups_buf) di ogni gruppo
-    int* group_size = NULL;
-    if (grouped) {
-        group_of = malloc(sizeof(int) * (size_t)(combos.n ? combos.n : 1));
+    // 3. unità di output: combinazioni o gruppi
+    st.null_combo = calloc((size_t)w, sizeof(Tuple*));
+    if (!st.null_combo) AFAIL("Out of memory");
+    int nunits = 0;
+    if (p->grouped) {
+        int ngroups = 0;
+        int* group_of = malloc(sizeof(int) * (size_t)(st.combos.n ? st.combos.n : 1));
         StrMap gm = {0};
         bool ok = group_of != NULL;
         char* sig = malloc(SV_MAX_GROUP * (EV_STR_MAX + 8) + 1);
         if (!sig) ok = false;
-        for (int i = 0; ok && i < combos.n; i++) {
-            ec.cur = combos.v[i];
+        for (int i = 0; ok && i < st.combos.n; i++) {
+            ec.cur = COMBO(&st.combos, i);
             size_t len = 0;
             sig[0] = '\0';
             for (int g = 0; g < n->select_stmt.num_group; g++) {
                 EvalVal v;
+                OVal o;
                 eval_expr(n->select_stmt.group_exprs[g], &ec, &v);
-                if (v.null) len += (size_t)sprintf(sig + len, "\x01\x1f");
-                else if (v.is_int) len += (size_t)sprintf(sig + len, "n%lld\x1f", (long long)v.inum);
-                else if (v.is_num) len += (size_t)sprintf(sig + len, "n%.17g\x1f", v.num);
-                else len += (size_t)snprintf(sig + len, EV_STR_MAX + 4, "s%s\x1f", v.str);
+                o.null = v.null; o.is_num = v.is_num; o.is_int = v.is_int; o.inum = v.inum; o.num = v.num;
+                o.str = (char*)(v.null || v.is_num ? NULL : ev_s(&v));
+                len += oval_key(&o, sig + len, EV_STR_MAX + 8);
             }
             SMSlot* sl = sm_slot(&gm, sig, true);
             if (!sl) { ok = false; break; }
@@ -1748,153 +2304,646 @@ static QueryResult* run_select(ExecCtx* ctx, ASTNode* n, int depth, bool explain
         free(sig);
         ec.cur = NULL;
         if (ok && n->select_stmt.num_group == 0 && ngroups == 0) ngroups = 1;   // solo aggregati: un gruppo anche vuoto
-        group_start = calloc((size_t)ngroups + 1, sizeof(int));
-        group_size  = calloc((size_t)ngroups + 1, sizeof(int));
-        groups_buf  = malloc(sizeof(Tuple**) * (size_t)(combos.n ? combos.n : 1));
-        if (!ok || !group_start || !group_size || !groups_buf) {
-            free(group_of); free(group_start); free(group_size);
-            snprintf(err, sizeof(err), "Out of memory");
-            goto done;
-        }
-        for (int i = 0; i < combos.n; i++) group_size[group_of[i]]++;
-        for (int g = 1; g < ngroups; g++) group_start[g] = group_start[g - 1] + group_size[g - 1];
+        st.group_start = calloc((size_t)ngroups + 1, sizeof(int));
+        st.group_size  = calloc((size_t)ngroups + 1, sizeof(int));
+        st.groups_buf  = malloc(sizeof(Tuple**) * (size_t)(st.combos.n ? st.combos.n : 1));
         int* fill = calloc((size_t)ngroups + 1, sizeof(int));
-        if (!fill) { free(group_of); free(group_start); free(group_size); snprintf(err, sizeof(err), "Out of memory"); goto done; }
-        for (int i = 0; i < combos.n; i++) {
+        if (!ok || !st.group_start || !st.group_size || !st.groups_buf || !fill) { free(group_of); free(fill); AFAIL("Out of memory"); }
+        if (ec.err[0]) { free(group_of); free(fill); AFAIL("%s", ec.err); }
+        for (int i = 0; i < st.combos.n; i++) st.group_size[group_of[i]]++;
+        for (int g = 1; g < ngroups; g++) st.group_start[g] = st.group_start[g - 1] + st.group_size[g - 1];
+        for (int i = 0; i < st.combos.n; i++) {
             int g = group_of[i];
-            groups_buf[group_start[g] + fill[g]++] = combos.v[i];
+            st.groups_buf[st.group_start[g] + fill[g]++] = COMBO(&st.combos, i);
         }
         free(fill);
         free(group_of);
+        st.units = malloc(sizeof(int) * (size_t)(ngroups ? ngroups : 1));
+        if (!st.units) AFAIL("Out of memory");
+        for (int u = 0; u < ngroups; u++) st.units[nunits++] = u;
+    } else {
+        st.units = malloc(sizeof(int) * (size_t)(st.combos.n ? st.combos.n : 1));
+        if (!st.units) AFAIL("Out of memory");
+        for (int i = 0; i < st.combos.n; i++) st.units[nunits++] = i;
     }
 
-    int units = grouped ? ngroups : combos.n;
-    for (int u = 0; u < units; u++) {
-        if ((u & 1023) == 0 && atomic_load(&g_sv_scan_cancel)) { snprintf(err, sizeof(err), "Query cancelled"); break; }
-        if (grouped) {
-            ec.grp  = group_size[u] ? &groups_buf[group_start[u]] : NULL;
-            ec.ngrp = group_size[u];
-            ec.cur  = group_size[u] ? groups_buf[group_start[u]] : null_combo;
-            if (!ec.grp) { ec.grp = &null_combo; ec.ngrp = 0; }
-            if (n->select_stmt.having && !eval_cond(n->select_stmt.having, &ec)) continue;
-        } else {
-            ec.cur = combos.v[u];
-        }
-        if (nrows >= caprows) {
-            int nc = caprows ? caprows * 2 : 64;
-            OutRow* nr = realloc(rows, sizeof(OutRow) * (size_t)nc);
-            if (!nr) { snprintf(err, sizeof(err), "Out of memory"); break; }
-            rows = nr;
-            caprows = nc;
-        }
-        OutRow* orow = &rows[nrows];
-        orow->cells = calloc((size_t)(nout ? nout : 1), sizeof(Cell));
-        orow->keys = nkeys ? calloc((size_t)nkeys, sizeof(SortKey)) : NULL;
-        if (!orow->cells || (nkeys && !orow->keys)) { free(orow->cells); free(orow->keys); snprintf(err, sizeof(err), "Out of memory"); break; }
-        nrows++;
-        for (int j = 0; j < nout; j++) {
-            EvalVal v;
-            eval_expr(out[j].e, &ec, &v);
-            fill_cell(&orow->cells[j], &v, v.null ? -1 : out[j].src_type);
-        }
-        for (int k = 0; k < nkeys; k++) {
-            EvalVal v;
-            ASTExpr* o = n->select_stmt.order_exprs[k];
-            eval_expr(o->type == EXPR_INT ? out[o->int_val - 1].e : o, &ec, &v);
-            key_set(&orow->keys[k], &v);
-        }
-    }
-    free(group_start);
-    free(group_size);
-    ec.cur = NULL;
-    ec.grp = NULL;
-    if (!err[0] && ec.err[0]) snprintf(err, sizeof(err), "%s", ec.err);
-    if (err[0]) goto done;
+    #define SET_UNIT(u) do { \
+        if (p->grouped) { \
+            int g_ = (u); \
+            ec.grp  = st.group_size[g_] ? &st.groups_buf[st.group_start[g_]] : &st.null_combo; \
+            ec.ngrp = st.group_size[g_]; \
+            ec.cur  = st.group_size[g_] ? st.groups_buf[st.group_start[g_]] : st.null_combo; \
+        } else { ec.cur = COMBO(&st.combos, (u)); ec.grp = NULL; ec.ngrp = 0; } \
+    } while (0)
 
-    // 8. DISTINCT, ORDER BY, OFFSET / LIMIT
-    int* order = malloc(sizeof(int) * (size_t)(nrows ? nrows : 1));
-    if (!order) { snprintf(err, sizeof(err), "Out of memory"); goto done; }
+    // HAVING
+    if (p->grouped && n->select_stmt.having) {
+        int kept = 0;
+        for (int i = 0; i < nunits; i++) {
+            SET_UNIT(st.units[i]);
+            if (eval_cond(n->select_stmt.having, &ec)) st.units[kept++] = st.units[i];
+        }
+        nunits = kept;
+        if (ec.err[0]) AFAIL("%s", ec.err);
+    }
+
+    // 4. DISTINCT, ORDER BY, OFFSET / LIMIT; le colonne si calcolano solo per le righe che restano
+    int nkeys = apply_order ? n->select_stmt.num_order : 0;
+    bool distinct = n->select_stmt.distinct;
+    ORows all = {0};
+    all.ncols = p->nout;
+    int* order = malloc(sizeof(int) * (size_t)(nunits ? nunits : 1));   // indici in units (o in all con DISTINCT)
+    if (!order) AFAIL("Out of memory");
     int nkeep = 0;
-    if (n->select_stmt.distinct) {
+    if (distinct) {
         StrMap seen = {0};
-        char* sig = malloc((size_t)nout * (sizeof(((Cell*)0)->value) + 2) + 1);
+        char* sig = malloc((size_t)(p->nout ? p->nout : 1) * (EV_STR_MAX + 24) + 1);
         bool ok = sig != NULL;
-        for (int i = 0; ok && i < nrows; i++) {
-            size_t len = 0;
-            for (int j = 0; j < nout; j++) {
-                const Cell* c = &rows[i].cells[j];
-                len += (size_t)sprintf(sig + len, "%s\x1f", c->is_null ? "\x01" : c->value);
-            }
+        int* unit_of = malloc(sizeof(int) * (size_t)(nunits ? nunits : 1));
+        if (!unit_of) ok = false;
+        for (int i = 0; ok && i < nunits; i++) {
+            if ((i & 1023) == 0 && atomic_load(&g_sv_scan_cancel)) { ok = false; break; }
+            SET_UNIT(st.units[i]);
+            OVal* row = orows_add(&all);
+            if (!row) { ok = false; break; }
+            for (int j = 0; j < p->nout; j++) { EvalVal v; eval_expr(p->out[j].e, &ec, &v); key_set(&row[j], &v); }
+            row_sig(row, p->nout, sig, (size_t)(p->nout ? p->nout : 1) * (EV_STR_MAX + 24) + 1);
             SMSlot* sl = sm_slot(&seen, sig, true);
             if (!sl) { ok = false; break; }
-            if (sl->val >= 0) continue;
-            sl->val = i;
-            order[nkeep++] = i;
+            if (sl->val >= 0) { for (int j = 0; j < p->nout; j++) free(row[j].str); all.nrows--; continue; }
+            sl->val = all.nrows - 1;
+            unit_of[all.nrows - 1] = st.units[i];
+            order[nkeep++] = all.nrows - 1;
         }
         free(sig);
         sm_free(&seen);
-        if (!ok) { free(order); snprintf(err, sizeof(err), "Out of memory"); goto done; }
+        if (ok) { for (int i = 0; i < nkeep; i++) st.units[i] = unit_of[i]; }
+        free(unit_of);
+        if (!ok) { free(order); orows_free(&all); AFAIL("%s", atomic_load(&g_sv_scan_cancel) ? "Query cancelled" : "Out of memory"); }
+        nunits = nkeep;
     } else {
-        for (int i = 0; i < nrows; i++) order[nkeep++] = i;
+        for (int i = 0; i < nunits; i++) order[nkeep++] = i;
     }
+    if (ec.err[0]) { free(order); orows_free(&all); AFAIL("%s", ec.err); }
     if (nkeys) {
-        g_sort.rows = rows;
+        st.keys = calloc((size_t)nunits * (size_t)nkeys + 1, sizeof(SortKey));
+        if (!st.keys) { free(order); orows_free(&all); AFAIL("Out of memory"); }
+        st.nkeys_alloc = nunits * nkeys;
+        for (int i = 0; i < nunits; i++) {
+            SET_UNIT(st.units[i]);
+            for (int k = 0; k < nkeys; k++) {
+                EvalVal v;
+                ASTExpr* o = n->select_stmt.order_exprs[k];
+                eval_expr(o->type == EXPR_INT ? p->out[o->int_val - 1].e : o, &ec, &v);
+                key_set(&st.keys[(size_t)i * (size_t)nkeys + (size_t)k], &v);
+            }
+        }
+        g_sort.keys = st.keys;
         g_sort.nkeys = nkeys;
         g_sort.desc = n->select_stmt.order_desc;
-        qsort(order, (size_t)nkeep, sizeof(int), out_row_cmp);
+        qsort(order, (size_t)nkeep, sizeof(int), unit_cmp);
     }
-    int first = n->select_stmt.offset < nkeep ? n->select_stmt.offset : nkeep;
-    int count = nkeep - first;
-    if (n->select_stmt.has_limit && n->select_stmt.limit < count) count = n->select_stmt.limit;
+    int first = 0, count = nkeep;
+    if (apply_order) {
+        first = n->select_stmt.offset < nkeep ? n->select_stmt.offset : nkeep;
+        count = nkeep - first;
+        if (n->select_stmt.has_limit && n->select_stmt.limit < count) count = n->select_stmt.limit;
+    }
+    if (stop_after > 0 && count > stop_after) count = stop_after;
 
-    // 9. risultato
-    r = calloc(1, sizeof(QueryResult));
-    if (!r) { free(order); snprintf(err, sizeof(err), "Out of memory"); goto done; }
-    r->success = true;
-    r->num_cols = nout;
-    r->col_names = calloc((size_t)nout + 1, sizeof(char*));
-    r->col_types = calloc((size_t)nout + 1, sizeof(char*));
-    r->rows = calloc((size_t)(count ? count : 1), sizeof(Row));
-    if (!r->col_names || !r->col_types || !r->rows) { free(order); snprintf(err, sizeof(err), "Out of memory"); goto done; }
-    for (int i = 0; i < count; i++) {
-        OutRow* orow = &rows[order[first + i]];
-        r->rows[i].cells = orow->cells;
-        r->rows[i].num_cells = nout;
-        orow->cells = NULL;                 // passata al risultato
-    }
-    r->num_rows = count;
-    for (int j = 0; j < nout; j++) {
-        r->col_names[j] = strdup(out[j].name);
-        const ASTExpr* e = out[j].e;
-        const char* tn;
-        if (out[j].src_type >= 0) tn = datatype_name((DataType)out[j].src_type);
-        else if (e->type == EXPR_AGG && !strcmp(e->func, "COUNT")) tn = "INT";
-        else if (e->type == EXPR_AGG && !strcmp(e->func, "AVG")) tn = "FLOAT";
-        else if (e->type == EXPR_AGG && strcmp(e->func, "SUM") && e->nargs == 1 &&
-                 e->args[0]->type == EXPR_COLUMN && e->args[0]->bound > 0)        // MIN/MAX di una colonna
-            tn = datatype_name(src[(e->args[0]->bound - 1) / 1024].ts->columns[(e->args[0]->bound - 1) % 1024].type);
-        else tn = infer_type(r, j);
-        r->col_types[j] = strdup(tn);
+    // 5. risultato
+    for (int i = 0; i < count && !ec.err[0]; i++) {
+        int k = order[first + i];
+        OVal* row = orows_add(res);
+        if (!row) { free(order); orows_free(&all); AFAIL("Out of memory"); }
+        if (distinct) {
+            memcpy(row, orow(&all, k), sizeof(OVal) * (size_t)p->nout);
+            memset(orow(&all, k), 0, sizeof(OVal) * (size_t)p->nout);   // passati al risultato
+        } else {
+            SET_UNIT(st.units[k]);
+            for (int j = 0; j < p->nout; j++) { EvalVal v; eval_expr(p->out[j].e, &ec, &v); key_set(&row[j], &v); }
+        }
     }
     free(order);
+    orows_free(&all);
+    ec.cur = NULL;
+    ec.grp = NULL;
+    if (ec.err[0]) AFAIL("%s", ec.err);
+    if (atomic_load(&g_sv_scan_cancel)) AFAIL("Query cancelled");
+    #undef SET_UNIT
+    #undef AFAIL
+    arm_state_free(&st, p->nsrc);
+    return true;
+}
 
-done:
-    for (int i = 0; i < nrows; i++) {
-        free(rows[i].cells);
-        for (int k = 0; rows[i].keys && k < n->select_stmt.num_order; k++) free(rows[i].keys[k].str);
-        free(rows[i].keys);
+// ── UNION / INTERSECT / EXCEPT ──
+
+static bool rows_append(ORows* dst, ORows* src, int i) {
+    OVal* row = orows_add(dst);
+    if (!row) return false;
+    memcpy(row, orow(src, i), sizeof(OVal) * (size_t)dst->ncols);
+    memset(orow(src, i), 0, sizeof(OVal) * (size_t)dst->ncols);
+    return true;
+}
+
+// a op b -> out (a e b vengono consumati)
+static bool set_combine(ORows* a, ORows* b, int op, bool all, ORows* out) {
+    int nc = a->ncols;
+    size_t cap = (size_t)(nc ? nc : 1) * (EV_STR_MAX + 24) + 1;
+    char* sig = malloc(cap);
+    StrMap inb = {0}, seen = {0};
+    bool ok = sig != NULL;
+    out->ncols = nc;
+    if (ok && op != SETOP_UNION)
+        for (int i = 0; ok && i < b->nrows; i++) {
+            row_sig(orow(b, i), nc, sig, cap);
+            if (!sm_slot(&inb, sig, true)) ok = false;
+        }
+    for (int pass = 0; ok && pass < (op == SETOP_UNION ? 2 : 1); pass++) {
+        ORows* r = pass ? b : a;
+        for (int i = 0; ok && i < r->nrows; i++) {
+            if (op == SETOP_UNION && all) { ok = rows_append(out, r, i); continue; }
+            row_sig(orow(r, i), nc, sig, cap);
+            if (op == SETOP_INTERSECT && !sm_slot(&inb, sig, false)) continue;
+            if (op == SETOP_EXCEPT && sm_slot(&inb, sig, false)) continue;
+            SMSlot* sl = sm_slot(&seen, sig, true);
+            if (!sl) { ok = false; break; }
+            if (sl->val >= 0) continue;                          // duplicato
+            sl->val = 1;
+            ok = rows_append(out, r, i);
+        }
     }
-    free(rows);
-    free(groups_buf);
-    free(null_combo);
-    combos_free(&combos);
-    for (int i = 0; i < nout; i++) if (out[i].owned) ast_expr_free(out[i].e);
-    for (int s = 0; s < nsrc; s++) source_free(&src[s]);
-    if (err[0]) {
-        if (r) db_result_free(r);
+    free(sig);
+    sm_free(&inb);
+    sm_free(&seen);
+    orows_free(a);
+    orows_free(b);
+    return ok;
+}
+
+static const OVal* g_cmp_rows_base;
+static int g_cmp_ncols, g_cmp_nkeys;
+static const int* g_cmp_cols;
+static const bool* g_cmp_desc;
+
+static int compound_cmp(const void* pa, const void* pb) {
+    int ia = *(const int*)pa, ib = *(const int*)pb;
+    for (int k = 0; k < g_cmp_nkeys; k++) {
+        int c = key_cmp(&g_cmp_rows_base[(size_t)ia * (size_t)g_cmp_ncols + (size_t)g_cmp_cols[k]],
+                        &g_cmp_rows_base[(size_t)ib * (size_t)g_cmp_ncols + (size_t)g_cmp_cols[k]]);
+        if (c) return g_cmp_desc[k] ? -c : c;
+    }
+    return ia < ib ? -1 : ia > ib;
+}
+
+static bool query_exec(SelectPlan* p, EvalCtx* outer, int stop_after, ORows* res) {
+    if (!p->compound) return arm_exec(p, outer, stop_after, true, res);
+    ASTNode* n = p->n;
+    // INTERSECT lega più di UNION ed EXCEPT: prima i tratti di INTERSECT, poi da sinistra a destra
+    ORows acc = {0}, seg = {0};
+    acc.ncols = seg.ncols = p->nout;
+    int pending = SETOP_NONE;
+    bool pending_all = false;
+    bool ok = arm_exec(p, outer, 0, false, &seg);
+    const SelectPlan* errp = p;
+    SelectPlan* a = p;
+    while (ok && a->next_arm) {
+        int op = a->n->select_stmt.set_op;
+        bool all = a->n->select_stmt.set_all;
+        SelectPlan* b = a->next_arm;
+        ORows r = {0};
+        r.ncols = p->nout;
+        if (!arm_exec(b, outer, 0, false, &r)) { ok = false; errp = b; orows_free(&r); break; }
+        if (op == SETOP_INTERSECT) {
+            ORows t = {0};
+            ok = set_combine(&seg, &r, SETOP_INTERSECT, false, &t);
+            seg = t;
+        } else {
+            if (pending == SETOP_NONE) { acc = seg; }
+            else { ORows t = {0}; ok = set_combine(&acc, &seg, pending, pending_all, &t); acc = t; }
+            pending = op;
+            pending_all = all;
+            seg = r;
+        }
+        a = b;
+    }
+    if (ok) {
+        if (pending == SETOP_NONE) acc = seg;
+        else { ORows t = {0}; ok = set_combine(&acc, &seg, pending, pending_all, &t); acc = t; }
+        seg.v = NULL;
+    }
+    if (!ok) {
+        orows_free(&acc);
+        orows_free(&seg);
+        if (errp != p && errp->err[0]) snprintf(p->err, sizeof(p->err), "%s", errp->err);
+        else if (!p->err[0]) snprintf(p->err, sizeof(p->err), "Out of memory");
+        return false;
+    }
+    // ORDER BY / OFFSET / LIMIT del risultato
+    int nr = acc.nrows;
+    int* order = malloc(sizeof(int) * (size_t)(nr ? nr : 1));
+    if (!order) { orows_free(&acc); snprintf(p->err, sizeof(p->err), "Out of memory"); return false; }
+    for (int i = 0; i < nr; i++) order[i] = i;
+    if (n->select_stmt.num_order) {
+        g_cmp_rows_base = acc.v; g_cmp_ncols = acc.ncols; g_cmp_nkeys = n->select_stmt.num_order;
+        g_cmp_cols = p->corder; g_cmp_desc = n->select_stmt.order_desc;
+        qsort(order, (size_t)nr, sizeof(int), compound_cmp);
+    }
+    int first = n->select_stmt.offset < nr ? n->select_stmt.offset : nr;
+    int count = nr - first;
+    if (n->select_stmt.has_limit && n->select_stmt.limit < count) count = n->select_stmt.limit;
+    if (stop_after > 0 && count > stop_after) count = stop_after;
+    res->ncols = acc.ncols;
+    for (int i = 0; ok && i < count; i++) ok = rows_append(res, &acc, order[first + i]);
+    free(order);
+    orows_free(&acc);
+    if (!ok) { snprintf(p->err, sizeof(p->err), "Out of memory"); return false; }
+    return true;
+}
+
+// ── subquery nelle espressioni ──
+
+// confronto a op b con la logica a tre valori: 1 vero, 0 falso, -1 sconosciuto
+static int cmp_truth(OpType op, const EvalVal* a, const EvalVal* b) {
+    if (a->null || b->null) return -1;
+    int c = ev_cmp(a, b);
+    switch (op) {
+        case OP_EQ: return c == 0;  case OP_NEQ: return c != 0;
+        case OP_LT: return c < 0;   case OP_GT: return c > 0;
+        case OP_LE: return c <= 0;  case OP_GE: return c >= 0;
+        default: return -1;
+    }
+}
+
+// classe di un valore per la tabella hash di IN: 1 numero, 2 testo
+static int val_class(const EvalVal* v) { return v->is_num ? 1 : 2; }
+
+static void eval_subquery(ASTExpr* e, EvalCtx* c, EvalVal* out) {
+    SelectPlan* p = e->subq ? (SelectPlan*)e->subq->plan : NULL;
+    if (!p) { ctx_error(c, "%s", "Subquery was not prepared"); ev_null(out); return; }
+    int stop = e->subkind == SUBQ_EXISTS ? 1 : e->subkind == SUBQ_SCALAR ? 2 : 0;
+    ORows tmp = {0};
+    ORows* rows;
+    bool cached = !p->correlated;
+    if (cached && p->cache_ok && (p->cache_stop == 0 || (stop && stop <= p->cache_stop))) {
+        rows = &p->cache;
+    } else {
+        ORows* dst = cached ? &p->cache : &tmp;
+        if (cached) { orows_free(dst); p->inset_built = false; sm_free(&p->inset); }
+        if (!query_exec(p, c, stop, dst)) {
+            ctx_error(c, "%.250s", p->err[0] ? p->err : "Subquery failed");
+            orows_free(&tmp);
+            ev_null(out);
+            return;
+        }
+        if (cached) { p->cache_ok = true; p->cache_stop = stop; }
+        rows = dst;
+    }
+
+    switch (e->subkind) {
+        case SUBQ_EXISTS:
+            ev_int(out, rows->nrows > 0);
+            break;
+        case SUBQ_SCALAR:
+            if (rows->nrows == 0) { ev_null(out); break; }
+            if (rows->nrows > 1) { ctx_error(c, "%s", "Subquery used as a value returned more than one row"); ev_null(out); break; }
+            ev_from_oval(out, orow(rows, 0));
+            if (!cached && out->str) {                       // le righe vengono liberate: il testo va copiato
+                size_t l = strlen(out->str);
+                if (l > EV_STR_MAX) l = EV_STR_MAX;
+                memcpy(out->buf, out->str, l);
+                out->buf[l] = '\0';
+                out->str = out->buf;
+            }
+            break;
+        default: {                                            // ANY / ALL (IN, NOT IN)
+            EvalVal a;
+            eval_expr(e->left, c, &a);
+            bool any = e->subkind == SUBQ_ANY;
+            if (rows->nrows == 0) { ev_int(out, any ? 0 : 1); break; }
+            if (a.null) { ev_null(out); break; }
+            bool eq_set = (any && e->op == OP_EQ) || (!any && e->op == OP_NEQ);
+            if (cached && eq_set) {
+                // IN / NOT IN con subquery non correlata: tabella hash dei valori, costruita una volta
+                if (!p->inset_built) {
+                    p->inset_built = true;
+                    p->inset_class = 0;
+                    p->inset_null = false;
+                    for (int i = 0; i < rows->nrows; i++) {
+                        const OVal* o = orow(rows, i);
+                        if (o->null) { p->inset_null = true; continue; }
+                        int cl = o->is_num ? 1 : 2;
+                        p->inset_class = p->inset_class == 0 ? cl : p->inset_class == cl ? cl : 3;
+                        char key[EV_STR_MAX + 32];
+                        oval_key(o, key, sizeof(key));
+                        if (!sm_slot(&p->inset, key, true)) { p->inset_class = 3; break; }
+                    }
+                }
+                if (p->inset_class == val_class(&a) || p->inset_class == 0) {
+                    OVal o;
+                    o.null = false; o.is_num = a.is_num; o.is_int = a.is_int; o.inum = a.inum; o.num = a.num;
+                    o.str = (char*)(a.is_num ? NULL : ev_s(&a));
+                    char key[EV_STR_MAX + 32];
+                    oval_key(&o, key, sizeof(key));
+                    bool found = p->inset_class != 0 && sm_slot(&p->inset, key, false) != NULL;
+                    if (found) ev_int(out, any ? 1 : 0);
+                    else if (p->inset_null) ev_null(out);
+                    else ev_int(out, any ? 0 : 1);
+                    break;
+                }
+            }
+            bool saw_null = false, decided = false;
+            for (int i = 0; i < rows->nrows && !decided; i++) {
+                EvalVal b;
+                ev_from_oval(&b, orow(rows, i));
+                int t = cmp_truth(e->op, &a, &b);
+                if (t < 0) saw_null = true;
+                else if (any && t == 1) { ev_int(out, 1); decided = true; }
+                else if (!any && t == 0) { ev_int(out, 0); decided = true; }
+            }
+            if (!decided) { if (saw_null) ev_null(out); else ev_int(out, any ? 0 : 1); }
+            break;
+        }
+    }
+    orows_free(&tmp);
+}
+
+// ── EXPLAIN ──
+// Piano con le stime delle righe secondo le selettività di default di System R:
+//   colonna = costante 1/10, confronto di intervallo 1/3, LIKE 1/10, altro 1/2;
+//   equi-join R ⋈ S: |R|·|S| / max(|R|, |S|)  (come un join su chiave esterna)
+
+static double cond_selectivity(const ASTExpr* c) {
+    if (!c) return 1;
+    if (c->type == EXPR_BINARY) {
+        switch (c->op) {
+            case OP_AND: return cond_selectivity(c->left) * cond_selectivity(c->right);
+            case OP_OR: { double a = cond_selectivity(c->left), b = cond_selectivity(c->right); return a + b - a * b; }
+            case OP_EQ: return 0.1;
+            case OP_NEQ: return 0.9;
+            case OP_LT: case OP_GT: case OP_LE: case OP_GE: return 1.0 / 3;
+            case OP_LIKE: return 0.1;
+            case OP_NOT_LIKE: return 0.9;
+            default: return 0.5;
+        }
+    }
+    if (c->type == EXPR_UNARY && c->op == OP_NOT) return 1 - cond_selectivity(c->left);
+    if (c->type == EXPR_UNARY && c->op == OP_IS_NULL) return 0.1;
+    if (c->type == EXPR_SUBQUERY) return c->subkind == SUBQ_ALL ? 0.5 : 0.5;
+    return 0.5;
+}
+
+static double xv_selectivity(const ExprVec* xv) {
+    double s = 1;
+    for (int i = 0; i < xv->n; i++) s *= cond_selectivity(xv->v[i]);
+    return s;
+}
+
+static void xv_format(const ExprVec* xv, char* buf, size_t n) {
+    size_t len = 0;
+    buf[0] = '\0';
+    for (int i = 0; i < xv->n && len + 8 < n; i++) {
+        char t[400];
+        ast_expr_format(xv->v[i], t, sizeof(t));
+        len += (size_t)snprintf(buf + len, n - len, "%s%s", i ? " AND " : "", t);
+    }
+}
+
+typedef struct { QueryResult* r; } PlanOut;
+
+static void plan_row(PlanOut* po, const char* indent, const char* op, const char* detail, double est) {
+    QueryResult* r = po->r;
+    if (r->num_rows >= 256) return;
+    Row* pr = &r->rows[r->num_rows++];
+    pr->num_cells = 4;
+    pr->cells = calloc(4, sizeof(Cell));
+    if (!pr->cells) { r->num_rows--; return; }
+    snprintf(pr->cells[0].value, sizeof(pr->cells[0].value), "%d", r->num_rows);
+    pr->cells[0].type = CELL_TYPE_INT;
+    snprintf(pr->cells[1].value, sizeof(pr->cells[1].value), "%s%s", indent, op);
+    snprintf(pr->cells[2].value, sizeof(pr->cells[2].value), "%s", detail);
+    pr->cells[1].type = pr->cells[2].type = CELL_TYPE_STRING;
+    if (est < 0) { pr->cells[3].is_null = true; pr->cells[3].type = CELL_TYPE_NULL; snprintf(pr->cells[3].value, sizeof(pr->cells[3].value), "NULL"); }
+    else { snprintf(pr->cells[3].value, sizeof(pr->cells[3].value), "%.0f", est < 1 && est > 0 ? 1 : est); pr->cells[3].type = CELL_TYPE_INT; }
+}
+
+static void explain_subqueries(PlanOut* po, const ASTExpr* e, const char* indent, int depth);
+static double explain_arm(PlanOut* po, SelectPlan* p, const char* indent, int depth);
+
+static void explain_subqueries(PlanOut* po, const ASTExpr* e, const char* indent, int depth) {
+    if (!e || depth > 8) return;
+    if (e->type == EXPR_SUBQUERY && e->subq && e->subq->plan) {
+        SelectPlan* sp = e->subq->plan;
+        char d[300], f[200];
+        ast_expr_format(e, f, sizeof(f));
+        const char* how = sp->correlated ? "correlated: executed again for every row of the outer query"
+                                         : (e->subkind == SUBQ_ANY && e->op == OP_EQ) || (e->subkind == SUBQ_ALL && e->op == OP_NEQ)
+                                           ? "computed once, values kept in a hash table"
+                                           : "computed once";
+        snprintf(d, sizeof(d), "%s (%s)", f, how);
+        plan_row(po, indent, "Subquery", d, -1);
+        char ind[64];
+        snprintf(ind, sizeof(ind), "%s    ", indent);
+        explain_arm(po, sp, ind, depth + 1);
+        return;
+    }
+    explain_subqueries(po, e->left, indent, depth);
+    explain_subqueries(po, e->right, indent, depth);
+    for (int i = 0; i < e->nargs; i++) explain_subqueries(po, e->args[i], indent, depth);
+}
+
+static double explain_arm(PlanOut* po, SelectPlan* p, const char* indent, int depth) {
+    ASTNode* n = p->n;
+    char buf[400], det[700];
+    double rows = 1;
+    for (int s = 0; s < p->nsrc; s++) {
+        Source* S = &p->src[s];
+        double est;
+        if (S->is_view) {
+            est = (double)S->n;
+            snprintf(det, sizeof(det), "%.64s (%d rows, computed)", S->name, S->n);
+            plan_row(po, indent, "View", det, est);
+        } else if (p->probe_col[s] >= 0 && !p->probe_dyn[s] && col_is_indexed(S->ts, p->probe_col[s])) {
+            bool unique = S->ts->columns[p->probe_col[s]].primary_key;
+            est = unique ? 1 : (double)S->ts->num_rows * 0.1;
+            snprintf(det, sizeof(det), "%.64s using %.64s.%.64s (in-memory index)", S->name, S->table, S->ts->columns[p->probe_col[s]].name);
+            plan_row(po, indent, "Index lookup", det, est);
+        } else {
+            est = (double)S->ts->num_rows;
+            snprintf(det, sizeof(det), "%.64s (about %llu rows)", S->name, (unsigned long long)S->ts->num_rows);
+            plan_row(po, indent, "Table scan", det, est);
+        }
+        ExprVec* pf[2] = { &p->pre_static[s], &p->pre_dyn[s] };
+        for (int q = 0; q < 2; q++) {
+            if (!pf[q]->n) continue;
+            est *= xv_selectivity(pf[q]);
+            xv_format(pf[q], buf, sizeof(buf));
+            if (q == 1 && p->probe_col[s] >= 0 && p->probe_dyn[s])
+                snprintf(det, sizeof(det), "WHERE %s (on %.64s: lookup by %.64s in a hash table built once)", buf, S->name,
+                         S->ts->columns[p->probe_col[s]].name);
+            else
+                snprintf(det, sizeof(det), "WHERE %s (on %.64s, before the joins)", buf, S->name);
+            plan_row(po, indent, "Filter", det, est);
+        }
+        if (s == 0) { rows = est; continue; }
+        ASTJoin* j = &n->select_stmt.joins[s - 1];
+        int a1, a2, a3;
+        const char* kind = j->type == JOIN_LEFT ? "LEFT" : j->type == JOIN_RIGHT ? "RIGHT" : j->type == JOIN_CROSS ? "CROSS" : "INNER";
+        bool hashed = find_hash_cond(&p->jcond[s], s, p->src, &a1, &a2, &a3);
+        if (p->jcond[s].n) xv_format(&p->jcond[s], buf, sizeof(buf)); else snprintf(buf, sizeof(buf), "every combination");
+        if (j->type == JOIN_CROSS && p->jcond[s].n) kind = "INNER";
+        snprintf(det, sizeof(det), "%s JOIN %.64s ON %s", kind, S->name, buf);
+        double jr = hashed ? rows * est / (rows > est ? (rows > 0 ? rows : 1) : (est > 0 ? est : 1))
+                           : rows * est * xv_selectivity(&p->jcond[s]);
+        if (j->type == JOIN_LEFT && jr < rows) jr = rows;
+        if (j->type == JOIN_RIGHT && jr < est) jr = est;
+        rows = jr;
+        plan_row(po, indent, hashed ? "Hash join" : "Nested loop join", det, rows);
+    }
+    if (p->resid.n) {
+        rows *= xv_selectivity(&p->resid);
+        xv_format(&p->resid, buf, sizeof(buf));
+        snprintf(det, sizeof(det), "WHERE %s", buf);
+        plan_row(po, indent, "Filter", det, rows);
+    }
+    if (p->grouped) {
+        buf[0] = '\0';
+        for (int i = 0; i < n->select_stmt.num_group; i++) {
+            char g[200];
+            ast_expr_format(n->select_stmt.group_exprs[i], g, sizeof(g));
+            snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s%s", i ? ", " : "", g);
+        }
+        rows = n->select_stmt.num_group ? (rows > 10 ? rows / 10 : rows) : 1;
+        plan_row(po, indent, "Aggregate", n->select_stmt.num_group ? buf : "all rows as one group", rows);
+    }
+    if (n->select_stmt.having) {
+        ast_expr_format(n->select_stmt.having, buf, sizeof(buf));
+        rows *= cond_selectivity(n->select_stmt.having);
+        snprintf(det, sizeof(det), "HAVING %s", buf);
+        plan_row(po, indent, "Filter groups", det, rows);
+    }
+    buf[0] = '\0';
+    for (int i = 0; i < p->nout; i++) snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s%s", i ? ", " : "", p->out[i].name);
+    plan_row(po, indent, "Projection", buf, rows);
+    if (n->select_stmt.distinct) plan_row(po, indent, "Distinct", "remove duplicate rows", rows);
+    // subquery usate nella query
+    for (int i = 0; i < p->nout; i++) if (!p->out[i].owned) explain_subqueries(po, p->out[i].e, indent, depth);
+    explain_subqueries(po, n->select_stmt.where, indent, depth);
+    explain_subqueries(po, n->select_stmt.having, indent, depth);
+    for (int j = 0; j < n->select_stmt.num_joins; j++) explain_subqueries(po, n->select_stmt.joins[j].condition, indent, depth);
+    if (!p->compound) {
+        if (n->select_stmt.num_order) {
+            buf[0] = '\0';
+            for (int i = 0; i < n->select_stmt.num_order; i++) {
+                char o[200];
+                ast_expr_format(n->select_stmt.order_exprs[i], o, sizeof(o));
+                snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s%s%s", i ? ", " : "", o, n->select_stmt.order_desc[i] ? " DESC" : "");
+            }
+            plan_row(po, indent, "Sort", buf, rows);
+        }
+        if (n->select_stmt.has_limit) {
+            snprintf(det, sizeof(det), "%d rows, skipping %d", n->select_stmt.limit, n->select_stmt.offset);
+            if (n->select_stmt.limit < rows) rows = n->select_stmt.limit;
+            plan_row(po, indent, "Limit", det, rows);
+        }
+    }
+    return rows;
+}
+
+static QueryResult* plan_explain(SelectPlan* p) {
+    QueryResult* r = calloc(1, sizeof(QueryResult));
+    if (!r) return NULL;
+    r->success = true;
+    r->num_cols = 4;
+    r->col_names = calloc(4, sizeof(char*));
+    r->col_types = calloc(4, sizeof(char*));
+    r->rows = calloc(256, sizeof(Row));
+    if (!r->col_names || !r->col_types || !r->rows) { db_result_free(r); return NULL; }
+    const char* names[4] = { "Step", "Operation", "Details", "Est. rows" };
+    const char* types[4] = { "INT", "VARCHAR", "VARCHAR", "INT" };
+    for (int i = 0; i < 4; i++) { r->col_names[i] = strdup(names[i]); r->col_types[i] = strdup(types[i]); }
+    PlanOut po = { r };
+    if (!p->compound) { explain_arm(&po, p, "", 0); return r; }
+    double total = 0;
+    int k = 0;
+    for (SelectPlan* a = p; a; a = a->next_arm, k++) {
+        char d[64];
+        snprintf(d, sizeof(d), "SELECT #%d", k + 1);
+        plan_row(&po, "", "Branch", d, -1);
+        total += explain_arm(&po, a, "    ", 0);
+        if (a->next_arm) {
+            int op = a->n->select_stmt.set_op;
+            plan_row(&po, "", op == SETOP_UNION ? (a->n->select_stmt.set_all ? "Union all" : "Union") :
+                              op == SETOP_INTERSECT ? "Intersect" : "Except",
+                     op == SETOP_UNION && a->n->select_stmt.set_all ? "append the rows" : "hash of the rows, duplicates removed", -1);
+        }
+    }
+    ASTNode* n = p->n;
+    char buf[400];
+    if (n->select_stmt.num_order) {
+        buf[0] = '\0';
+        for (int i = 0; i < n->select_stmt.num_order; i++)
+            snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s%s%s", i ? ", " : "", p->out[p->corder[i]].name,
+                     n->select_stmt.order_desc[i] ? " DESC" : "");
+        plan_row(&po, "", "Sort", buf, total);
+    }
+    if (n->select_stmt.has_limit) {
+        snprintf(buf, sizeof(buf), "%d rows, skipping %d", n->select_stmt.limit, n->select_stmt.offset);
+        plan_row(&po, "", "Limit", buf, n->select_stmt.limit < total ? n->select_stmt.limit : total);
+    }
+    return r;
+}
+
+// ── SELECT di primo livello: risultato per la GUI ──
+
+static QueryResult* run_select(ExecCtx* ctx, ASTNode* n, int depth, bool explain) {
+    char err[300] = "";
+    SelectPlan* p = plan_prepare(ctx, n, depth, NULL, NULL, err, sizeof(err));
+    if (!p) return result_error_msg(err);
+    if (explain) {
+        QueryResult* r = plan_explain(p);
+        plan_free(p);
+        return r ? r : result_error_msg("Out of memory");
+    }
+    ORows rows = {0};
+    if (!query_exec(p, NULL, 0, &rows)) {
+        snprintf(err, sizeof(err), "%s", p->err[0] ? p->err : "Query failed");
+        orows_free(&rows);
+        plan_free(p);
         return result_error_msg(err);
     }
-    return r ? r : result_error_msg("Out of memory");
+    int nout = p->nout;
+    QueryResult* r = calloc(1, sizeof(QueryResult));
+    bool ok = r != NULL;
+    if (ok) {
+        r->success = true;
+        r->num_cols = nout;
+        r->col_names = calloc((size_t)nout + 1, sizeof(char*));
+        r->col_types = calloc((size_t)nout + 1, sizeof(char*));
+        r->rows = calloc((size_t)(rows.nrows ? rows.nrows : 1), sizeof(Row));
+        ok = r->col_names && r->col_types && r->rows;
+    }
+    for (int j = 0; ok && j < nout; j++) {
+        r->col_names[j] = strdup(p->out[j].name);
+        r->col_types[j] = strdup(out_type_name(p, j, &rows, false));
+    }
+    for (int i = 0; ok && i < rows.nrows; i++) {
+        Row* row = &r->rows[i];
+        row->cells = calloc((size_t)(nout ? nout : 1), sizeof(Cell));
+        if (!row->cells) { ok = false; break; }
+        row->num_cells = nout;
+        r->num_rows = i + 1;
+        for (int j = 0; j < nout; j++) {
+            EvalVal v;
+            const OVal* o = &orow(&rows, i)[j];
+            ev_from_oval(&v, o);
+            fill_cell(&row->cells[j], &v, o->null ? -1 : p->out[j].src_type);
+        }
+    }
+    orows_free(&rows);
+    plan_free(p);
+    if (!ok) { db_result_free(r); return result_error_msg("Out of memory"); }
+    return r;
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -1926,7 +2975,7 @@ static Tuple* tuple_clone(const Tuple* t, const TableSchema* ts) {
 }
 
 // testo di un valore calcolato da salvare (NULL per i NULL)
-static const char* ev_store_text(const EvalVal* v) { return v->null ? NULL : v->str; }
+static const char* ev_store_text(const EvalVal* v) { return v->null ? NULL : ev_s(v); }
 
 static int pk_column(const TableSchema* ts) {
     for (int i = 0; i < ts->num_columns; i++) if (ts->columns[i].primary_key) return i;
@@ -1972,19 +3021,40 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
             }
         map[i] = ci;
     }
-    if (n->insert_stmt.num_values != ncols) {
+    // INSERT ... SELECT: prima si calcola tutta la SELECT (che può leggere la stessa tabella)
+    ORows srows = {0};
+    bool from_select = n->insert_stmt.select != NULL;
+    if (from_select) {
+        char perr[300] = "";
+        SelectPlan* sp = plan_prepare(ctx, n->insert_stmt.select, 0, NULL, NULL, perr, sizeof(perr));
+        if (!sp) return result_error_msg(perr);
+        if (sp->nout != ncols) {
+            snprintf(msg, sizeof(msg), "Column count doesn't match: %d column%s, the SELECT returns %d",
+                     ncols, ncols == 1 ? "" : "s", sp->nout);
+            plan_free(sp);
+            return result_error_msg(msg);
+        }
+        if (!query_exec(sp, NULL, 0, &srows)) {
+            snprintf(msg, sizeof(msg), "%s", sp->err);
+            plan_free(sp);
+            orows_free(&srows);
+            return result_error_msg(msg);
+        }
+        plan_free(sp);
+    } else if (n->insert_stmt.num_values != ncols) {
         snprintf(msg, sizeof(msg), "Column count doesn't match value count: %d column%s, %d value%s",
                  ncols, ncols == 1 ? "" : "s", n->insert_stmt.num_values, n->insert_stmt.num_values == 1 ? "" : "s");
         return result_error_msg(msg);
     }
-    int nrows = n->insert_stmt.num_rows;
+    int nrows = from_select ? srows.nrows : n->insert_stmt.num_rows;
 
-    // i valori sono espressioni senza colonne (numeri, testi, funzioni come NOW())
+    // i valori sono espressioni senza colonne (numeri, testi, funzioni come NOW(), subquery)
     BindCtx b;
     memset(&b, 0, sizeof(b));
     b.mode = BIND_ROW;
     b.clause = "VALUES";
-    for (int i = 0; i < nrows * ncols; i++) bind_expr(n->insert_stmt.values[i], &b);
+    b.x = ctx;
+    for (int i = 0; !from_select && i < nrows * ncols; i++) bind_expr(n->insert_stmt.values[i], &b);
     if (b.err[0]) return result_error_msg(b.err);
 
     int pk = pk_column(ts);
@@ -1995,15 +3065,16 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     int64_t auto_next = 0;
     if (ai >= 0) {
         MemIndex* ix = mi_get(ctx, db->name, ts, ai);
-        if (!ix) return result_error_msg("Out of memory (AUTO_INCREMENT index)");
+        if (!ix) { orows_free(&srows); return result_error_msg("Out of memory (AUTO_INCREMENT index)"); }
         auto_next = ix->has_max ? ix->max_int : 0;
     }
 
     Tuple** tuples = calloc((size_t)(nrows ? nrows : 1), sizeof(Tuple*));
     StrMap batch = {0};
-    if (!tuples) return result_error_msg("Out of memory");
+    if (!tuples) { orows_free(&srows); return result_error_msg("Out of memory"); }
     EvalCtx ec;
     memset(&ec, 0, sizeof(ec));
+    ec.x = ctx;
     const char* fail = NULL;
     static char vals[64][EV_STR_MAX + 1];   // testi della riga corrente
     char ai_buf[32];
@@ -2014,12 +3085,13 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
         for (int i = 0; i < nc; i++) text[i] = NULL;
         for (int k = 0; k < ncols; k++) {
             EvalVal v;
-            eval_expr(n->insert_stmt.values[r * ncols + k], &ec, &v);
+            if (from_select) ev_from_oval(&v, &orow(&srows, r)[k]);
+            else eval_expr(n->insert_stmt.values[r * ncols + k], &ec, &v);
             if (ec.err[0]) { fail = ec.err; break; }
             int ci = map[k];
             given[ci] = true;
             if (v.null) { text[ci] = NULL; continue; }
-            snprintf(vals[ci], sizeof(vals[ci]), "%s", v.str);
+            snprintf(vals[ci], sizeof(vals[ci]), "%s", ev_s(&v));
             text[ci] = vals[ci];
         }
         if (fail) break;
@@ -2068,8 +3140,11 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     if (fail) {
         for (int r = 0; r < nrows; r++) if (tuples[r]) tuple_free(tuples[r]);
         free(tuples);
-        return result_error_msg(fail);
+        QueryResult* er = result_error_msg(fail);
+        orows_free(&srows);
+        return er;
     }
+    orows_free(&srows);
 
     // scrittura
     HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
@@ -2099,8 +3174,7 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
 // righe della tabella che soddisfano la WHERE (con l'indice quando possibile)
 static const char* select_matches(ExecCtx* ctx, Database* db, Source* s, ASTExpr* where, EvalCtx* ec,
                                   int** out_idx, int* out_n) {
-    char plan[8];
-    if (!source_load(ctx, db->name, s, where, plan, sizeof(plan))) return "Failed to read the table";
+    if (!source_load(ctx, db->name, s, where, NULL, 0)) return "Failed to read the table";
     int* idx = malloc(sizeof(int) * (size_t)(s->n ? s->n : 1));
     if (!idx) return "Out of memory";
     int n = 0;
@@ -2140,7 +3214,7 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
     s.ts = ts;
     BindCtx b;
     memset(&b, 0, sizeof(b));
-    b.src = &s; b.nsrc = 1; b.mode = BIND_ROW;
+    b.src = &s; b.nsrc = 1; b.mode = BIND_ROW; b.x = ctx;
     b.clause = "SET";
     for (int k = 0; k < n->update_stmt.num_sets; k++) bind_expr(n->update_stmt.set_exprs[k], &b);
     b.clause = "WHERE";
@@ -2149,6 +3223,7 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
 
     EvalCtx ec;
     memset(&ec, 0, sizeof(ec));
+    ec.x = ctx;
     int* idx = NULL;
     int nm = 0;
     const char* fail = select_matches(ctx, db, &s, n->update_stmt.where, &ec, &idx, &nm);
@@ -2260,12 +3335,13 @@ static QueryResult* exec_delete(ExecCtx* ctx, ASTNode* n) {
     s.ts = ts;
     BindCtx b;
     memset(&b, 0, sizeof(b));
-    b.src = &s; b.nsrc = 1; b.mode = BIND_ROW; b.clause = "WHERE";
+    b.src = &s; b.nsrc = 1; b.mode = BIND_ROW; b.clause = "WHERE"; b.x = ctx;
     bind_expr(n->delete_stmt.where, &b);
     if (b.err[0]) return result_error_msg(b.err);
 
     EvalCtx ec;
     memset(&ec, 0, sizeof(ec));
+    ec.x = ctx;
     int* idx = NULL;
     int nm = 0;
     char msg[300];

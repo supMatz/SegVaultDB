@@ -284,7 +284,7 @@ int main(void) {
 
     // ── EXPLAIN ──
     t("EXPLAIN SELECT * FROM u WHERE id = 4",
-      "1|Index lookup|u using u.id (in-memory index);2|Filter|WHERE id = 4;3|Projection|id, x, y, label");
+      "1|Index lookup|u using u.id (in-memory index)|1;2|Filter|WHERE id = 4 (on u, before the joins)|1;3|Projection|id, x, y, label|1");
     t("EXPLAIN DELETE FROM u", "ERR:EXPLAIN works with SELECT");
     {
         tests++;
@@ -369,6 +369,101 @@ int main(void) {
     if (t1 - t0 > 20000 || t2 - t1 > 5000) { failed++; printf("FAIL: too slow\n"); }
     t("SELECT COUNT(*) FROM perf", "20000");
     t("INSERT INTO perf VALUES (777, 'dup')", "ERR:Duplicate entry '777'");
+
+    // ── Basi di Dati 1: subquery, operatori insiemistici, CASE, WITH (schema universitario) ──
+    t("CREATE DATABASE uni", "OK:0");
+    t("USE uni", "OK:0");
+    t("CREATE TABLE studente (matricola INT PRIMARY KEY, nome VARCHAR(20), citta VARCHAR(20))", "OK:0");
+    t("CREATE TABLE corso (codice VARCHAR(5) PRIMARY KEY, titolo VARCHAR(30), cfu INT)", "OK:0");
+    t("CREATE TABLE esame (matricola INT, corso VARCHAR(5), voto INT)", "OK:0");
+    t("INSERT INTO studente VALUES (1, 'Anna', 'Milano'), (2, 'Bruno', 'Roma'), (3, 'Carla', 'Milano'), (4, 'Dario', 'Torino'), (5, 'Elena', NULL)", "OK:5");
+    t("INSERT INTO corso VALUES ('BD1', 'Basi di dati 1', 9), ('BD2', 'Basi di dati 2', 6), ('AN1', 'Analisi 1', 12)", "OK:3");
+    t("INSERT INTO esame VALUES (1, 'BD1', 30), (1, 'BD2', 28), (1, 'AN1', 25), (2, 'BD1', 18), (2, 'AN1', 30), "
+      "(3, 'BD1', 27), (3, 'BD2', 30), (3, 'AN1', 24), (4, 'BD2', 22)", "OK:9");
+    // IN / NOT IN
+    t("SELECT nome FROM studente WHERE matricola IN (SELECT matricola FROM esame WHERE voto = 30) ORDER BY nome", "Anna;Bruno;Carla");
+    t("SELECT nome FROM studente WHERE matricola NOT IN (SELECT matricola FROM esame)", "Elena");
+    t("SELECT nome FROM studente WHERE citta NOT IN (SELECT citta FROM studente WHERE matricola > 3)", "");   // la subquery contiene NULL
+    t("SELECT nome FROM studente WHERE citta IN (SELECT citta FROM studente WHERE matricola > 3)", "Dario");
+    t("SELECT nome FROM studente WHERE matricola IN (SELECT matricola FROM esame WHERE corso IN "
+      "(SELECT codice FROM corso WHERE cfu = 6)) ORDER BY nome", "Anna;Carla;Dario");
+    // EXISTS / NOT EXISTS correlate
+    t("SELECT nome FROM studente s WHERE EXISTS (SELECT * FROM esame e WHERE e.matricola = s.matricola AND e.voto >= 28) ORDER BY nome",
+      "Anna;Bruno;Carla");
+    t("SELECT nome FROM studente s WHERE NOT EXISTS (SELECT * FROM esame e WHERE e.matricola = s.matricola)", "Elena");
+    // divisione relazionale: studenti che hanno superato TUTTI i corsi
+    t("SELECT nome FROM studente s WHERE NOT EXISTS (SELECT * FROM corso c WHERE NOT EXISTS "
+      "(SELECT * FROM esame e WHERE e.matricola = s.matricola AND e.corso = c.codice)) ORDER BY nome", "Anna;Carla");
+    t("SELECT s.nome FROM studente s JOIN esame e ON e.matricola = s.matricola GROUP BY s.nome "
+      "HAVING COUNT(*) = (SELECT COUNT(*) FROM corso) ORDER BY s.nome", "Anna;Carla");
+    // subquery scalari
+    t("SELECT DISTINCT s.nome FROM studente s JOIN esame e ON e.matricola = s.matricola WHERE e.voto = (SELECT MAX(voto) FROM esame) ORDER BY s.nome",
+      "Anna;Bruno;Carla");
+    t("SELECT nome, (SELECT COUNT(*) FROM esame e WHERE e.matricola = s.matricola) FROM studente s ORDER BY matricola",
+      "Anna|3;Bruno|2;Carla|3;Dario|1;Elena|0");
+    t("SELECT nome, (SELECT AVG(voto) FROM esame e WHERE e.matricola = s.matricola) AS media FROM studente s WHERE matricola = 2", "Bruno|24");
+    t("SELECT matricola FROM esame GROUP BY matricola HAVING AVG(voto) > (SELECT AVG(voto) FROM esame) ORDER BY matricola", "1;3");
+    t("SELECT (SELECT voto FROM esame)", "ERR:more than one row");
+    t("SELECT (SELECT voto FROM esame WHERE voto > 100)", "NULL");
+    t("SELECT nome FROM studente WHERE matricola IN (SELECT matricola, voto FROM esame)", "ERR:exactly one column");
+    t("SELECT nome FROM studente WHERE matricola IN (SELECT pippo FROM esame)", "ERR:Unknown column 'pippo'");
+    // ANY / ALL
+    t("SELECT matricola, voto FROM esame WHERE voto >= ALL (SELECT voto FROM esame) ORDER BY matricola", "1|30;2|30;3|30");
+    t("SELECT DISTINCT matricola FROM esame WHERE voto < ANY (SELECT voto FROM esame WHERE matricola = 4)", "2");
+    t("SELECT COUNT(*) FROM esame WHERE voto > ALL (SELECT voto FROM esame WHERE matricola = 99)", "9");   // ALL su insieme vuoto: vero
+    // tabelle derivate e WITH
+    t("SELECT AVG(n) FROM (SELECT matricola, COUNT(*) AS n FROM esame GROUP BY matricola) AS t", "2.25");
+    t("SELECT MAX(n) FROM (SELECT COUNT(*) AS n FROM esame GROUP BY corso)", "3");
+    t("WITH medie AS (SELECT matricola, AVG(voto) AS media FROM esame GROUP BY matricola) "
+      "SELECT s.nome FROM studente s JOIN medie m ON m.matricola = s.matricola WHERE m.media >= 27 ORDER BY s.nome", "Anna;Carla");
+    t("WITH a AS (SELECT matricola FROM esame WHERE voto = 30), b AS (SELECT * FROM a WHERE matricola > 1) SELECT COUNT(*) FROM b", "2");
+    // UNION / INTERSECT / EXCEPT
+    t("SELECT citta FROM studente WHERE citta IS NOT NULL UNION SELECT 'Roma' ORDER BY citta", "Milano;Roma;Torino");
+    t("SELECT COUNT(*) FROM (SELECT matricola FROM esame UNION ALL SELECT matricola FROM studente) AS u", "14");
+    t("SELECT matricola FROM esame WHERE corso = 'BD1' INTERSECT SELECT matricola FROM esame WHERE corso = 'BD2' ORDER BY 1", "1;3");
+    t("SELECT matricola FROM studente EXCEPT SELECT matricola FROM esame", "5");
+    t("SELECT 1 UNION SELECT 2 INTERSECT SELECT 3", "1");                 // INTERSECT lega più di UNION
+    t("SELECT 2 UNION SELECT 1 UNION SELECT 2 ORDER BY 1 DESC LIMIT 1", "2");
+    t("SELECT 1 UNION SELECT 1, 2", "ERR:same number of columns");
+    t("SELECT nome FROM studente UNION SELECT titolo FROM corso ORDER BY voto", "ERR:must name a result column");
+    // CASE
+    t("SELECT nome, CASE WHEN citta = 'Milano' THEN 'MI' WHEN citta IS NULL THEN '?' ELSE 'altro' END FROM studente ORDER BY matricola",
+      "Anna|MI;Bruno|altro;Carla|MI;Dario|altro;Elena|?");
+    t("SELECT CASE cfu WHEN 9 THEN 'nove' WHEN 6 THEN 'sei' END FROM corso ORDER BY codice", "NULL;nove;sei");
+    t("SELECT SUM(CASE WHEN voto >= 28 THEN 1 ELSE 0 END) FROM esame", "4");
+    t("SELECT CASE WHEN 1 THEN 'x' END", "x");
+    t("SELECT CASE WHEN 1 'x' END", "ERR:Expected THEN");
+    // join impliciti (FROM a, b WHERE ...) e outer join
+    t("SELECT s.nome, c.titolo FROM studente s, esame e, corso c WHERE s.matricola = e.matricola AND e.corso = c.codice AND e.voto = 18",
+      "Bruno|Basi di dati 1");
+    {
+        tests++;
+        QueryResult* r = db_execute("EXPLAIN SELECT s.nome FROM studente s, esame e WHERE s.matricola = e.matricola AND e.voto = 18");
+        char got[4096];
+        if (r && r->success) render(r, got, sizeof(got)); else snprintf(got, sizeof(got), "ERR");
+        if (!strstr(got, "Hash join") || !strstr(got, "WHERE e.voto = 18 (on e, before the joins)")) {
+            failed++;
+            printf("FAIL %d: implicit join plan\n   got: %s\n", tests, got);
+        }
+        db_result_free(r);
+    }
+    t("SELECT s.nome FROM studente s LEFT JOIN esame e ON e.matricola = s.matricola WHERE e.matricola IS NULL", "Elena");
+    t("SELECT s.nome, COUNT(e.voto) FROM studente s LEFT JOIN esame e ON e.matricola = s.matricola AND e.voto = 30 "
+      "GROUP BY s.nome ORDER BY s.nome", "Anna|1;Bruno|1;Carla|1;Dario|0;Elena|0");
+    t("SELECT c.codice, s.nome FROM esame e RIGHT JOIN corso c ON c.codice = e.corso AND e.voto = 18 LEFT JOIN studente s ON s.matricola = e.matricola ORDER BY c.codice",
+      "AN1|NULL;BD1|Bruno;BD2|NULL");
+    // INSERT ... SELECT, UPDATE e DELETE con subquery
+    t("CREATE TABLE lodati (matricola INT, voto INT)", "OK:0");
+    t("INSERT INTO lodati SELECT matricola, voto FROM esame WHERE voto = 30", "OK:3");
+    t("INSERT INTO lodati (matricola) SELECT matricola FROM studente WHERE citta = 'Torino'", "OK:1");
+    t("SELECT COUNT(*), COUNT(voto) FROM lodati", "4|3");
+    t("INSERT INTO lodati SELECT matricola FROM esame", "ERR:Column count doesn't match");
+    t("DELETE FROM lodati WHERE matricola IN (SELECT matricola FROM studente WHERE citta = 'Roma')", "OK:1");
+    t("UPDATE studente SET citta = 'Napoli' WHERE matricola NOT IN (SELECT matricola FROM esame)", "OK:1");
+    t("SELECT citta FROM studente WHERE matricola = 5", "Napoli");
+    // correlata nella DELETE: esami sotto la media del proprio corso
+    t("DELETE FROM esame WHERE voto < (SELECT AVG(voto) FROM esame e2 WHERE e2.corso = esame.corso)", "OK:4");
+    t("SELECT COUNT(*) FROM esame", "5");
 
     db_shutdown();
     crash_recovery_test();

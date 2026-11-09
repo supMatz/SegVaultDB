@@ -119,7 +119,8 @@ static const char* KEYWORDS[] = {
     "COMMIT","ROLLBACK","SAVEPOINT","TO","TRANSACTION","ALTER","RENAME","ADD","COLUMN","PRIMARY",
     "KEY","FOREIGN","REFERENCES","UNIQUE","DEFAULT","AUTO_INCREMENT","CONSTRAINT","CHECK",
     "EXPLAIN","TRUNCATE","IF","BEFORE","AFTER","FOR","EACH","ROW","REPLACE","WITH","RETURNS",
-    "CASCADE","COLUMNS","INDEXES","TEMPORARY","OF",
+    "CASCADE","COLUMNS","INDEXES","TEMPORARY","OF","INTERSECT","EXCEPT","SOME","CHECKPOINT",
+    "RESTRICT","ACTION","NO","STATUS",
 };
 static const char* TYPES[] = {
     "INT","INTEGER","BIGINT","SMALLINT","TINYINT","FLOAT","DOUBLE","REAL","DECIMAL","NUMERIC",
@@ -230,7 +231,7 @@ enum { TK_NONE, TK_WORD, TK_KEYWORD, TK_OPEN, TK_CLOSE, TK_COMMA, TK_OP, TK_DOT,
 
 char* sql_format(const char* s, int len) {
     static const char* const CLAUSES[] = { "FROM", "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "VALUES",
-                                           "SET", "UNION", "SELECT", NULL };
+                                           "SET", "UNION", "INTERSECT", "EXCEPT", "SELECT", NULL };
     static const char* const JOIN_MODS[] = { "LEFT", "RIGHT", "INNER", "OUTER", "CROSS", "FULL", "NATURAL", NULL };
 
     SBuf sb = { malloc(len + 64), 0, len + 64, true };

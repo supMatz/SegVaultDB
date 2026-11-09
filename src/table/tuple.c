@@ -138,6 +138,38 @@ Tuple* tuple_deserialize(const uint8_t* data, size_t len,
     return t;
 }
 
+bool tuple_view(Tuple* t, const uint8_t* data, size_t len, const TableSchema* s, char* strbuf, size_t strcap) {
+    if (t->num_values != s->num_columns) return false;
+    int nb = (s->num_columns + 7) / 8;
+    if ((size_t)nb > len) return false;
+    size_t pos = (size_t)nb, sp = 0;
+    for (int i = 0; i < s->num_columns; i++) {
+        Value* v = &t->values[i];
+        v->owns_str = false;
+        if (data[i / 8] & (1 << (i % 8))) { v->is_null = true; v->str_val = NULL; continue; }
+        v->is_null = false;
+        switch (s->columns[i].type) {
+            case SV_TYPE_INT:    if (pos + 4 > len) return false; memcpy(&v->int_val, data + pos, 4); pos += 4; break;
+            case SV_TYPE_BIGINT: if (pos + 8 > len) return false; memcpy(&v->bigint_val, data + pos, 8); pos += 8; break;
+            case SV_TYPE_FLOAT:  if (pos + 8 > len) return false; memcpy(&v->float_val, data + pos, 8); pos += 8; break;
+            case SV_TYPE_BOOL:   if (pos + 1 > len) return false; v->bool_val = data[pos++]; break;
+            default: {
+                uint16_t sl;
+                if (pos + 2 > len) return false;
+                memcpy(&sl, data + pos, 2); pos += 2;
+                if (pos + sl > len || sp + sl + 1 > strcap) return false;
+                memcpy(strbuf + sp, data + pos, sl);
+                strbuf[sp + sl] = '\0';
+                v->str_val = strbuf + sp;
+                sp += (size_t)sl + 1;
+                pos += sl;
+                break;
+            }
+        }
+    }
+    return true;
+}
+
 void value_set_from_text(Value* v, DataType type, const char* text) {
     if (v->owns_str) free(v->str_val);
     memset(v, 0, sizeof(*v));
