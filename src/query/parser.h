@@ -201,6 +201,10 @@ typedef struct ASTNode {
             ConstraintDef add;                // ADD [CONSTRAINT nome] vincolo
             bool       has_add;
             char       drop_constraint[64];   // DROP CONSTRAINT nome
+            struct ASTNode* add_column;       // ADD [COLUMN] definizione (nodo CREATE TABLE con una colonna)
+            char       drop_column[64];       // DROP [COLUMN] nome
+            char       rename_from[64];       // RENAME COLUMN vecchio TO nuovo
+            char       rename_to[64];
         } alter_table;
         struct {
             char       table_name[64];

@@ -482,6 +482,30 @@ int main(void) {
     t("SELECT * FROM studente JOIN iscritto USING (pippo)", "ERR:USING");
     cols("SELECT matricola, corso FROM studente FULL JOIN iscritto USING (matricola) WHERE matricola = 9", "matricola|iscritto.corso", "INT|VARCHAR");
     cols("SELECT * FROM studente NATURAL JOIN iscritto", "matricola|studente.nome|studente.citta|iscritto.corso", "INT|VARCHAR|VARCHAR|VARCHAR");
+    // ALTER TABLE ... ADD / DROP / RENAME COLUMN
+    t("ALTER TABLE studente ADD COLUMN email VARCHAR(40)", "OK:0");
+    t("SELECT matricola, email FROM studente WHERE matricola = 1", "1|NULL");
+    t("ALTER TABLE studente ADD anno INT NOT NULL", "ERR:give it a DEFAULT");
+    t("ALTER TABLE studente ADD anno INT NOT NULL DEFAULT 2024 CHECK (anno >= 2000)", "OK:0");
+    t("SELECT COUNT(*) FROM studente WHERE anno = 2024", "5");
+    t("INSERT INTO studente VALUES (9, 'Zeno', 'Pisa', 'z@x.it', 1990)", "ERR:CHECK constraint");
+    t("INSERT INTO studente (matricola, nome) VALUES (9, 'Zeno')", "OK:1");
+    t("SELECT anno, email FROM studente WHERE matricola = 9", "2024|NULL");
+    t("ALTER TABLE studente ADD nome INT", "ERR:already exists");
+    t("ALTER TABLE studente DROP COLUMN anno", "ERR:used by constraint");
+    t("ALTER TABLE studente DROP COLUMN matricola", "ERR:used by constraint");
+    t("ALTER TABLE studente RENAME COLUMN anno TO anno_iscrizione", "OK:0");
+    t("SHOW CONSTRAINTS FROM studente", "#2");
+    t("INSERT INTO studente (matricola, nome, anno_iscrizione) VALUES (10, 'Ugo', 1500)", "ERR:anno_iscrizione >= 2000");
+    t("ALTER TABLE studente DROP COLUMN email", "OK:0");
+    t("SELECT * FROM studente WHERE matricola = 1", "1|Anna|Milano|2024");
+    t("BEGIN", "OK:0");
+    t("ALTER TABLE studente ADD x INT", "ERR:inside a transaction");
+    t("ROLLBACK", "OK:0");
+    t("ALTER TABLE corso RENAME COLUMN codice TO sigla", "OK:0");
+    t("SELECT COUNT(*) FROM esame e JOIN corso c ON c.sigla = e.corso", "9");
+    t("DELETE FROM studente WHERE matricola = 9", "OK:1");
+    t("SHOW CONSTRAINTS FROM esame", "#0");
     // INSERT ... SELECT, UPDATE e DELETE con subquery
     t("CREATE TABLE lodati (matricola INT, voto INT)", "OK:0");
     t("INSERT INTO lodati SELECT matricola, voto FROM esame WHERE voto = 30", "OK:3");
@@ -703,6 +727,9 @@ int main(void) {
     t("INSERT INTO esame VALUES (2, 'BD1', 30, 0)", "ERR:Duplicate entry '2-BD1'");
     t("INSERT INTO esame VALUES (9, 'BD1', 30, 0)", "ERR:Foreign key");
     t("INSERT INTO studente VALUES (-1, 'X')", "ERR:CHECK constraint");
+    t("USE uni", "OK:0");
+    t("SELECT nome, anno_iscrizione FROM studente WHERE matricola = 1", "Anna|2024");    // colonna aggiunta, dopo il riavvio
+    t("USE vinc", "OK:0");
     t("DELETE FROM studente WHERE matricola = 2", "OK:1");
     t("SELECT COUNT(*) FROM esame", "0");
 

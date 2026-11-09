@@ -213,11 +213,233 @@ static QueryResult* exec_drop_table(ExecCtx* ctx, ASTNode* n) {
     return result_ok_msg(0);
 }
 
+// ── ALTER TABLE ... COLUMN ──
+
+static void value_copy(Value* dst, const Value* src, DataType t);
+
+// testo SQL con gli identificatori 'from' sostituiti da 'to' (CHECK, corpi dei trigger)
+static bool rename_ident_in_text(const char* text, const char* from, const char* to, char* out, size_t cap) {
+    TokenList* tk = lexer_tokenize(text);
+    if (!tk) return false;
+    size_t len = 0;
+    out[0] = '\0';
+    bool ok = true;
+    for (int i = 0; i < tk->count && ok; i++) {
+        const Token* t = &tk->tokens[i];
+        if (t->type == TOK_EOF) break;
+        char piece[1100];
+        if (t->type == TOK_STRING) {
+            size_t k = 0;
+            piece[k++] = '\'';
+            for (const char* q = t->text; *q && k < sizeof(piece) - 3; q++) { if (*q == '\'' || *q == '\\') piece[k++] = *q; piece[k++] = *q; }
+            piece[k++] = '\'';
+            piece[k] = '\0';
+        } else if (t->type == TOK_IDENTIFIER && !strcasecmp(t->text, from)) {
+            snprintf(piece, sizeof(piece), "%s", to);
+        } else {
+            snprintf(piece, sizeof(piece), "%s", t->text);
+        }
+        bool tight = t->type == TOK_DOT || t->type == TOK_RPAREN || t->type == TOK_COMMA || t->type == TOK_SEMICOLON ||
+                     (i > 0 && (tk->tokens[i - 1].type == TOK_DOT || tk->tokens[i - 1].type == TOK_LPAREN));
+        size_t pl = strlen(piece);
+        if (len + pl + 2 >= cap) { ok = false; break; }
+        if (len && !tight) out[len++] = ' ';
+        memcpy(out + len, piece, pl + 1);
+        len += pl;
+    }
+    lexer_free(tk);
+    return ok;
+}
+
+static bool ident_in_text(const char* text, const char* name) {
+    TokenList* tk = lexer_tokenize(text);
+    bool found = false;
+    for (int i = 0; tk && i < tk->count && !found; i++)
+        if (tk->tokens[i].type == TOK_IDENTIFIER && !strcasecmp(tk->tokens[i].text, name)) found = true;
+    lexer_free(tk);
+    return found;
+}
+
+// copia le righe in una nuova catena di pagine con lo schema ns (map[i] = colonna vecchia, -1 = nuova
+// con il valore def). La tabella vecchia non viene toccata: se qualcosa va storto (anche un
+// arresto anomalo) il catalogo punta ancora alle pagine di prima.
+static const char* rewrite_rows(ExecCtx* ctx, TableSchema* ts, TableSchema* ns, const int* map, const char* def,
+                                uint32_t* out_root, uint32_t* out_pages) {
+    uint32_t root;
+    if (bp_new_page(ctx->bp, &root) != SV_OK) return "Cannot allocate a page";
+    bp_unpin(ctx->bp, root, false);
+    HeapFile* nh = heap_open(ctx->bp, root, 1);
+    HeapFile* oh = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
+    HeapScan* scan = oh ? heap_scan_open(oh, ts) : NULL;
+    const char* fail = (!nh || !scan) ? "Cannot read the table" : NULL;
+    Tuple* t;
+    RID rid;
+    while (!fail && (t = heap_scan_next(scan, &rid)) != NULL) {
+        Tuple* nt = tuple_create(ns->num_columns);
+        if (!nt) { tuple_free(t); fail = "Out of memory"; break; }
+        for (int i = 0; i < ns->num_columns; i++) {
+            if (map[i] >= 0) value_copy(&nt->values[i], &t->values[map[i]], ns->columns[i].type);
+            else value_set_from_text(&nt->values[i], ns->columns[i].type, def);
+        }
+        RID nr;
+        if (heap_insert(nh, nt, ns, &nr) != SV_OK) fail = "Cannot write the new rows (disk full?)";
+        tuple_free(nt);
+        tuple_free(t);
+    }
+    if (scan) heap_scan_close(scan);
+    if (nh) { *out_root = nh->root_page_id; *out_pages = nh->num_pages; }
+    free(nh);
+    free(oh);
+    if (fail) heap_cache_forget(ctx->bp, root);
+    return fail;
+}
+
+static QueryResult* alter_column(ExecCtx* ctx, Database* db, TableSchema* ts, ASTNode* n) {
+    char msg[300];
+    if (ctx->tx_id && (n->alter_table.add_column || n->alter_table.drop_column[0]))
+        return result_error_msg("ALTER TABLE ... ADD / DROP COLUMN is not allowed inside a transaction: COMMIT first");
+
+    // RENAME COLUMN: solo il catalogo (e i testi che usano il nome)
+    if (n->alter_table.rename_from[0]) {
+        const char* from = n->alter_table.rename_from, *to = n->alter_table.rename_to;
+        int ci = catalog_get_col_index(ts, from);
+        if (ci < 0) { snprintf(msg, sizeof(msg), "Unknown column '%.64s'", from); return result_error_msg(msg); }
+        if (strcasecmp(from, to) && catalog_get_col_index(ts, to) >= 0) { snprintf(msg, sizeof(msg), "Column '%.64s' already exists", to); return result_error_msg(msg); }
+        char* buf = malloc(SV_MAX_SQL_LEN);
+        if (!buf) return result_error_msg("Out of memory");
+        for (int k = 0; k < ts->num_constraints; k++)
+            if (ts->constraints[k].kind == CONS_CHECK && rename_ident_in_text(ts->constraints[k].check, from, to, buf, SV_CHECK_LEN))
+                snprintf(ts->constraints[k].check, sizeof(ts->constraints[k].check), "%s", buf);
+        for (int i = 0; i < db->num_tables; i++)
+            for (int k = 0; k < db->tables[i].num_constraints; k++) {
+                Constraint* c = &db->tables[i].constraints[k];
+                if (c->kind != CONS_FOREIGN || strcasecmp(c->ref_table, ts->name)) continue;
+                for (int q = 0; q < c->ncols; q++) if (!strcasecmp(c->ref_cols[q], from)) snprintf(c->ref_cols[q], sizeof(c->ref_cols[q]), "%s", to);
+            }
+        for (int i = 0; i < db->num_triggers; i++)
+            if (!strcasecmp(db->triggers[i].table_name, ts->name) && rename_ident_in_text(db->triggers[i].body, from, to, buf, SV_MAX_SQL_LEN))
+                snprintf(db->triggers[i].body, sizeof(db->triggers[i].body), "%s", buf);
+        free(buf);
+        for (int i = 0; i < ts->num_indexes; i++)
+            if (!strcasecmp(ts->indexes[i].col_name, from)) snprintf(ts->indexes[i].col_name, sizeof(ts->indexes[i].col_name), "%s", to);
+        snprintf(ts->columns[ci].name, sizeof(ts->columns[ci].name), "%s", to);
+        mi_invalidate_table(db->name, ts->name);
+        return result_ok_msg(0);
+    }
+
+    TableSchema* ns = malloc(sizeof(TableSchema));
+    TableSchema* backup = malloc(sizeof(TableSchema));
+    int* map = malloc(sizeof(int) * SV_MAX_COLUMNS);
+    if (!ns || !backup || !map) { free(ns); free(backup); free(map); return result_error_msg("Out of memory"); }
+    *ns = *ts;
+    *backup = *ts;
+    const char* def = NULL;
+    const char* fail = NULL;
+    ASTNode* add = n->alter_table.add_column;
+    int dropped = -1;
+    if (add) {
+        ColumnDef* cd = &add->create_table.columns[0];
+        if (add->create_table.num_columns != 1) fail = "Expected one column definition";
+        else if (!known_type(cd->type)) { snprintf(msg, sizeof(msg), "Unknown type '%.32s'", cd->type); fail = msg; }
+        else if (catalog_get_col_index(ts, cd->name) >= 0) { snprintf(msg, sizeof(msg), "Column '%.64s' already exists", cd->name); fail = msg; }
+        else if (ts->num_columns >= SV_MAX_COLUMNS) fail = "Too many columns (max 64)";
+        else if (cd->primary_key || cd->auto_increment) fail = "Add the column first, then ALTER TABLE ... ADD CONSTRAINT ... PRIMARY KEY";
+        if (!fail) {
+            Column* col = &ns->columns[ns->num_columns];
+            memset(col, 0, sizeof(*col));
+            snprintf(col->name, sizeof(col->name), "%s", cd->name);
+            col->type = parse_type(cd->type);
+            col->size = cd->size;
+            col->nullable = cd->nullable;
+            snprintf(col->default_val, sizeof(col->default_val), "%s", cd->default_val);
+            if (cd->default_val[0] && strcasecmp(cd->default_val, "NULL")) {
+                def = col->default_val;
+                if (check_value(col, def, msg, sizeof(msg))) fail = msg;
+            }
+            if (!fail && !col->nullable && !def && ts->num_rows > 0) {
+                snprintf(msg, sizeof(msg), "Column '%.64s' is NOT NULL: give it a DEFAULT for the existing rows", cd->name);
+                fail = msg;
+            }
+            for (int i = 0; i < ts->num_columns; i++) map[i] = i;
+            map[ns->num_columns] = -1;
+            ns->num_columns++;
+        }
+    } else {
+        const char* name = n->alter_table.drop_column;
+        dropped = catalog_get_col_index(ts, name);
+        if (dropped < 0) { snprintf(msg, sizeof(msg), "Unknown column '%.64s'", name); fail = msg; }
+        else if (ts->num_columns == 1) fail = "A table needs at least one column: use DROP TABLE";
+        for (int k = 0; !fail && k < ts->num_constraints; k++) {
+            const Constraint* c = &ts->constraints[k];
+            bool uses = c->kind == CONS_CHECK ? ident_in_text(c->check, name) : false;
+            for (int q = 0; q < c->ncols; q++) if (c->cols[q] == dropped) uses = true;
+            if (uses) { snprintf(msg, sizeof(msg), "Column '%.64s' is used by constraint '%.64s': drop the constraint first", name, c->name); fail = msg; }
+        }
+        for (int i = 0; !fail && i < db->num_tables; i++)
+            for (int k = 0; !fail && k < db->tables[i].num_constraints; k++) {
+                const Constraint* c = &db->tables[i].constraints[k];
+                if (c->kind != CONS_FOREIGN || strcasecmp(c->ref_table, ts->name)) continue;
+                for (int q = 0; q < c->ncols; q++)
+                    if (!strcasecmp(c->ref_cols[q], name)) {
+                        snprintf(msg, sizeof(msg), "Column '%.64s' is referenced by foreign key '%.64s' of table '%.64s'", name, c->name, db->tables[i].name);
+                        fail = msg;
+                    }
+            }
+        for (int i = 0; !fail && i < db->num_triggers; i++)
+            if (!strcasecmp(db->triggers[i].table_name, ts->name) && ident_in_text(db->triggers[i].body, name)) {
+                snprintf(msg, sizeof(msg), "Column '%.64s' is used by trigger '%.64s': drop the trigger first", name, db->triggers[i].name);
+                fail = msg;
+            }
+        if (!fail) {
+            for (int i = 0, k = 0; i < ts->num_columns; i++) {
+                if (i == dropped) continue;
+                ns->columns[k] = ts->columns[i];
+                map[k++] = i;
+            }
+            ns->num_columns--;
+            for (int k = 0; k < ns->num_constraints; k++)
+                for (int q = 0; q < ns->constraints[k].ncols; q++)
+                    if (ns->constraints[k].cols[q] > dropped) ns->constraints[k].cols[q]--;
+            int w = 0;                                              // gli indici sulla colonna spariscono con lei
+            for (int i = 0; i < ns->num_indexes; i++)
+                if (strcasecmp(ns->indexes[i].col_name, name)) ns->indexes[w++] = ns->indexes[i];
+            ns->num_indexes = w;
+        }
+    }
+    uint32_t root = 0, pages = 0;
+    if (!fail) fail = rewrite_rows(ctx, ts, ns, map, def, &root, &pages);
+    if (!fail) {
+        uint32_t old_root = ts->root_page_id;
+        ns->root_page_id = root;
+        ns->num_pages = pages;
+        *ts = *ns;
+        mi_invalidate_table(db->name, ts->name);
+        // vincoli scritti con la nuova colonna (controllano le righe esistenti)
+        for (int i = 0; add && !fail && i < add->create_table.num_cons; i++)
+            fail = add_constraint(ctx, db, ts, &add->create_table.cons[i], msg, sizeof(msg));
+        if (fail) {
+            heap_cache_forget(ctx->bp, root);
+            *ts = *backup;                                         // le pagine di prima sono intatte
+            mi_invalidate_table(db->name, ts->name);
+        } else {
+            heap_cache_forget(ctx->bp, old_root);
+            bp_flush_all(ctx->bp);                                 // le righe nuove su disco prima del catalogo
+        }
+    }
+    free(ns);
+    free(backup);
+    free(map);
+    if (fail) { if (fail != msg) snprintf(msg, sizeof(msg), "%s", fail); return result_error_msg(msg); }
+    return result_ok_msg(0);
+}
+
 static QueryResult* exec_alter_table(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
     TableSchema* ts = catalog_get_table(ctx->catalog, db->name, n->alter_table.table_name);
     if (!ts) return result_error_msg("Table not found");
+    if (n->alter_table.add_column || n->alter_table.drop_column[0] || n->alter_table.rename_from[0])
+        return alter_column(ctx, db, ts, n);
     // RENAME TO
     if (n->alter_table.new_name[0]) {
         const char* nn = n->alter_table.new_name;

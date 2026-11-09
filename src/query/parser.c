@@ -1060,6 +1060,7 @@ static bool trig_push(ParserState* ps, TrigStmt*** v, int* n, TrigStmt* t) {
 
 static ASTNode* parse_statement(ParserState* ps);
 static TrigStmt* parse_trig_stmt(ParserState* ps);
+static void parse_column_def(ParserState* ps, ASTNode* n);
 
 // istruzioni fino a una delle parole di chiusura (END, ELSE, ELSEIF), ciascuna seguita da ';'
 static void parse_trig_list(ParserState* ps, TrigStmt*** v, int* n) {
@@ -1387,6 +1388,104 @@ static bool parse_table_constraint(ParserState* ps, ConstraintDef* c) {
     return true;
 }
 
+// definizione di colonna: nome tipo [(n [, m])] modificatori (vincoli di colonna in n->create_table.cons)
+static void parse_column_def(ParserState* ps, ASTNode* n) {
+    if (n->create_table.num_columns >= 64) { parse_fail(ps, "Too many columns (max 64)", peek(ps)); return; }
+    ColumnDef* cd = &n->create_table.columns[n->create_table.num_columns];
+    memset(cd, 0, sizeof(ColumnDef));
+    cd->nullable = true;                       // come in SQL standard: NULL ammesso se non dichiarato
+    Token cn = consume(ps);
+    if (cn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", cn); return; }
+    copy_text(ps, cd->name, sizeof(cd->name), cn.text);
+    Token ct = consume(ps);
+    if (ct.type != TOK_IDENTIFIER && ct.type != TOK_BOOLEAN) { parse_fail(ps, "Expected a column type", ct); return; }
+    copy_text(ps, cd->type, sizeof(cd->type), ct.text);
+    if (match(ps, TOK_LPAREN)) {
+        Token sz = consume(ps);
+        if (sz.type != TOK_INTEGER) { parse_fail(ps, "Expected a size", sz); return; }
+        cd->size = atoi(sz.text);
+        if (match(ps, TOK_COMMA)) {                    // DECIMAL(p, s)
+            Token sc = consume(ps);
+            if (sc.type != TOK_INTEGER) { parse_fail(ps, "Expected the number of decimal digits", sc); return; }
+        }
+        if (!expect(ps, TOK_RPAREN)) return;
+    }
+    n->create_table.num_columns++;
+    for (;;) {
+        if (!ps->result->success) return;
+        char ccn[64] = "";
+        if (ident_is(ps, "CONSTRAINT")) {
+            consume(ps);
+            Token nm = consume(ps);
+            if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a name after CONSTRAINT", nm); return; }
+            copy_text(ps, ccn, sizeof(ccn), nm.text);
+            if (!ident_is(ps, "CHECK") && !ident_is(ps, "REFERENCES") && !ident_is(ps, "UNIQUE") && !ident_is(ps, "PRIMARY")) {
+                parse_fail(ps, "Expected CHECK, REFERENCES, UNIQUE or PRIMARY KEY after the constraint name", peek(ps));
+                return;
+            }
+        }
+        if (match(ps, TOK_NOT)) {
+            if (!match(ps, TOK_NULL)) { parse_fail(ps, "Expected NULL after NOT", peek(ps)); return; }
+            cd->nullable = false;
+        } else if (match(ps, TOK_NULL)) {
+            cd->nullable = true;
+        } else if (ident_is(ps, "PRIMARY")) {
+            consume(ps);
+            expect(ps, TOK_KEY);
+            cd->primary_key = true;
+            cd->nullable = false;
+            if (ccn[0]) {
+                ConstraintDef* c = new_cons(ps, n);
+                if (!c) return;
+                memcpy(c->name, ccn, sizeof(c->name));
+                c->kind = CONS_PRIMARY; c->ncols = 1;
+                memcpy(c->cols[0], cd->name, 64);
+            }
+        } else if (ident_is(ps, "UNIQUE")) {
+            consume(ps);
+            ConstraintDef* c = new_cons(ps, n);
+            if (!c) return;
+            memcpy(c->name, ccn, sizeof(c->name));
+            c->kind = CONS_UNIQUE; c->ncols = 1;
+            memcpy(c->cols[0], cd->name, 64);
+        } else if (ident_is(ps, "AUTO_INCREMENT") || ident_is(ps, "AUTOINCREMENT")) {
+            consume(ps);
+            cd->auto_increment = true;
+        } else if (ident_is(ps, "DEFAULT")) {
+            consume(ps);
+            Token dv = consume(ps);
+            if (dv.type == TOK_MINUS || dv.type == TOK_PLUS) {          // DEFAULT -1
+                Token num = consume(ps);
+                if (num.type != TOK_INTEGER && num.type != TOK_FLOAT) { parse_fail(ps, "Expected a number after the sign", num); return; }
+                snprintf(cd->default_val, sizeof(cd->default_val), "%s%.100s", dv.type == TOK_MINUS ? "-" : "", num.text);
+            } else if (dv.type == TOK_INTEGER || dv.type == TOK_FLOAT || dv.type == TOK_STRING || dv.type == TOK_NULL ||
+                       dv.type == TOK_IDENTIFIER) {
+                copy_text(ps, cd->default_val, sizeof(cd->default_val), dv.text);
+            } else {
+                parse_fail(ps, "Expected a value after DEFAULT", dv);
+                return;
+            }
+        } else if (ident_is(ps, "CHECK")) {
+            consume(ps);
+            ConstraintDef* c = new_cons(ps, n);
+            if (!c) return;
+            memcpy(c->name, ccn, sizeof(c->name));
+            c->kind = CONS_CHECK;
+            parse_check(ps, c);
+        } else if (ident_is(ps, "REFERENCES")) {
+            consume(ps);
+            ConstraintDef* c = new_cons(ps, n);
+            if (!c) return;
+            memcpy(c->name, ccn, sizeof(c->name));
+            c->kind = CONS_FOREIGN; c->ncols = 1;
+            memcpy(c->cols[0], cd->name, 64);
+            parse_references(ps, c);
+        } else {
+            break;
+        }
+    }
+}
+
 static void parse_create_table(ParserState* ps, ASTNode* n) {
     n->type = NODE_CREATE_TABLE;
     Token tn = consume(ps);
@@ -1412,101 +1511,8 @@ static void parse_create_table(ParserState* ps, ASTNode* n) {
             if (!parse_table_constraint(ps, c)) { parse_fail(ps, "Expected PRIMARY KEY, UNIQUE, FOREIGN KEY or CHECK", peek(ps)); return; }
             continue;
         }
-        // colonna
-        if (n->create_table.num_columns >= 64) { parse_fail(ps, "Too many columns (max 64)", peek(ps)); return; }
-        ColumnDef* cd = &n->create_table.columns[n->create_table.num_columns];
-        memset(cd, 0, sizeof(ColumnDef));
-        cd->nullable = true;                       // come in SQL standard: NULL ammesso se non dichiarato
-        Token cn = consume(ps);
-        if (cn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", cn); return; }
-        copy_text(ps, cd->name, sizeof(cd->name), cn.text);
-        Token ct = consume(ps);
-        if (ct.type != TOK_IDENTIFIER && ct.type != TOK_BOOLEAN) { parse_fail(ps, "Expected a column type", ct); return; }
-        copy_text(ps, cd->type, sizeof(cd->type), ct.text);
-        if (match(ps, TOK_LPAREN)) {
-            Token sz = consume(ps);
-            if (sz.type != TOK_INTEGER) { parse_fail(ps, "Expected a size", sz); return; }
-            cd->size = atoi(sz.text);
-            if (match(ps, TOK_COMMA)) {                    // DECIMAL(p, s)
-                Token sc = consume(ps);
-                if (sc.type != TOK_INTEGER) { parse_fail(ps, "Expected the number of decimal digits", sc); return; }
-            }
-            if (!expect(ps, TOK_RPAREN)) return;
-        }
-        n->create_table.num_columns++;
-        for (;;) {
-            if (!ps->result->success) return;
-            char ccn[64] = "";
-            if (ident_is(ps, "CONSTRAINT")) {
-                consume(ps);
-                Token nm = consume(ps);
-                if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a name after CONSTRAINT", nm); return; }
-                copy_text(ps, ccn, sizeof(ccn), nm.text);
-                if (!ident_is(ps, "CHECK") && !ident_is(ps, "REFERENCES") && !ident_is(ps, "UNIQUE") && !ident_is(ps, "PRIMARY")) {
-                    parse_fail(ps, "Expected CHECK, REFERENCES, UNIQUE or PRIMARY KEY after the constraint name", peek(ps));
-                    return;
-                }
-            }
-            if (match(ps, TOK_NOT)) {
-                if (!match(ps, TOK_NULL)) { parse_fail(ps, "Expected NULL after NOT", peek(ps)); return; }
-                cd->nullable = false;
-            } else if (match(ps, TOK_NULL)) {
-                cd->nullable = true;
-            } else if (ident_is(ps, "PRIMARY")) {
-                consume(ps);
-                expect(ps, TOK_KEY);
-                cd->primary_key = true;
-                cd->nullable = false;
-                if (ccn[0]) {
-                    ConstraintDef* c = new_cons(ps, n);
-                    if (!c) return;
-                    memcpy(c->name, ccn, sizeof(c->name));
-                    c->kind = CONS_PRIMARY; c->ncols = 1;
-                    memcpy(c->cols[0], cd->name, 64);
-                }
-            } else if (ident_is(ps, "UNIQUE")) {
-                consume(ps);
-                ConstraintDef* c = new_cons(ps, n);
-                if (!c) return;
-                memcpy(c->name, ccn, sizeof(c->name));
-                c->kind = CONS_UNIQUE; c->ncols = 1;
-                memcpy(c->cols[0], cd->name, 64);
-            } else if (ident_is(ps, "AUTO_INCREMENT") || ident_is(ps, "AUTOINCREMENT")) {
-                consume(ps);
-                cd->auto_increment = true;
-            } else if (ident_is(ps, "DEFAULT")) {
-                consume(ps);
-                Token dv = consume(ps);
-                if (dv.type == TOK_MINUS || dv.type == TOK_PLUS) {          // DEFAULT -1
-                    Token num = consume(ps);
-                    if (num.type != TOK_INTEGER && num.type != TOK_FLOAT) { parse_fail(ps, "Expected a number after the sign", num); return; }
-                    snprintf(cd->default_val, sizeof(cd->default_val), "%s%.100s", dv.type == TOK_MINUS ? "-" : "", num.text);
-                } else if (dv.type == TOK_INTEGER || dv.type == TOK_FLOAT || dv.type == TOK_STRING || dv.type == TOK_NULL ||
-                           dv.type == TOK_IDENTIFIER) {
-                    copy_text(ps, cd->default_val, sizeof(cd->default_val), dv.text);
-                } else {
-                    parse_fail(ps, "Expected a value after DEFAULT", dv);
-                    return;
-                }
-            } else if (ident_is(ps, "CHECK")) {
-                consume(ps);
-                ConstraintDef* c = new_cons(ps, n);
-                if (!c) return;
-                memcpy(c->name, ccn, sizeof(c->name));
-                c->kind = CONS_CHECK;
-                parse_check(ps, c);
-            } else if (ident_is(ps, "REFERENCES")) {
-                consume(ps);
-                ConstraintDef* c = new_cons(ps, n);
-                if (!c) return;
-                memcpy(c->name, ccn, sizeof(c->name));
-                c->kind = CONS_FOREIGN; c->ncols = 1;
-                memcpy(c->cols[0], cd->name, 64);
-                parse_references(ps, c);
-            } else {
-                break;
-            }
-        }
+        parse_column_def(ps, n);
+        if (!ps->result->success) return;
     } while (match(ps, TOK_COMMA));
     expect(ps, TOK_RPAREN);
 }
@@ -1620,7 +1626,16 @@ static ASTNode* parse_statement(ParserState* ps) {
             n->type = NODE_ALTER_TABLE;
             Token tn = consume(ps);
             copy_text(ps, n->alter_table.table_name, sizeof(n->alter_table.table_name), tn.text);
-            if (match(ps, TOK_RENAME)) {
+            if (match(ps, TOK_RENAME) && ident_is(ps, "COLUMN")) {         // RENAME COLUMN a TO b
+                consume(ps);
+                Token a = consume(ps);
+                if (a.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the column name after RENAME COLUMN", a); break; }
+                if (!expect(ps, TOK_TO)) break;
+                Token b = consume(ps);
+                if (b.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the new column name after TO", b); break; }
+                copy_text(ps, n->alter_table.rename_from, sizeof(n->alter_table.rename_from), a.text);
+                copy_text(ps, n->alter_table.rename_to, sizeof(n->alter_table.rename_to), b.text);
+            } else if (ps->tokens->tokens[ps->pos - 1].type == TOK_RENAME) {
                 expect(ps, TOK_TO);
                 Token nn = consume(ps);
                 if (nn.type != TOK_IDENTIFIER) parse_fail(ps, "Expected the new table name after RENAME TO", nn);
@@ -1630,7 +1645,12 @@ static ASTNode* parse_statement(ParserState* ps) {
                 consume(ps);
                 if (ident_is(ps, "COLUMN") || (peek(ps).type == TOK_IDENTIFIER && !ident_is(ps, "CONSTRAINT") &&
                     !ident_is(ps, "PRIMARY") && !ident_is(ps, "UNIQUE") && !ident_is(ps, "FOREIGN") && !ident_is(ps, "CHECK"))) {
-                    parse_fail(ps, "ALTER TABLE ... ADD COLUMN is not supported (only RENAME TO, ADD CONSTRAINT and DROP CONSTRAINT)", peek(ps));
+                    if (ident_is(ps, "COLUMN")) consume(ps);           // ADD [COLUMN] nome tipo modificatori
+                    ASTNode* def = calloc(1, sizeof(ASTNode));
+                    if (!def) { parse_fail(ps, "Out of memory", peek(ps)); break; }
+                    def->type = NODE_CREATE_TABLE;
+                    n->alter_table.add_column = def;
+                    parse_column_def(ps, def);
                     break;
                 }
                 ConstraintDef* c = &n->alter_table.add;
@@ -1645,13 +1665,19 @@ static ASTNode* parse_statement(ParserState* ps) {
                     parse_fail(ps, "Expected PRIMARY KEY, UNIQUE, FOREIGN KEY or CHECK after ADD", peek(ps));
                 n->alter_table.has_add = true;
             } else if (match(ps, TOK_DROP)) {
-                if (!ident_is(ps, "CONSTRAINT")) { parse_fail(ps, "Expected CONSTRAINT after DROP", peek(ps)); break; }
+                if (!ident_is(ps, "CONSTRAINT")) {                          // DROP [COLUMN] nome
+                    if (ident_is(ps, "COLUMN")) consume(ps);
+                    Token c = consume(ps);
+                    if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the column name after DROP", c); break; }
+                    copy_text(ps, n->alter_table.drop_column, sizeof(n->alter_table.drop_column), c.text);
+                    break;
+                }
                 consume(ps);
                 Token nm = consume(ps);
                 if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the constraint name", nm); break; }
                 copy_text(ps, n->alter_table.drop_constraint, sizeof(n->alter_table.drop_constraint), nm.text);
             } else {
-                parse_fail(ps, "Expected RENAME TO, ADD CONSTRAINT or DROP CONSTRAINT after ALTER TABLE name", peek(ps));
+                parse_fail(ps, "Expected RENAME, ADD or DROP after ALTER TABLE name", peek(ps));
             }
             break;
         }
@@ -1875,6 +1901,9 @@ static void free_node(ASTNode* n) {
             break;
         case NODE_EXPLAIN:
             free_node((ASTNode*)n->explain.stmt);
+            break;
+        case NODE_ALTER_TABLE:
+            free_node(n->alter_table.add_column);
             break;
         default:
             break;
