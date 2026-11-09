@@ -1,4 +1,5 @@
 #include "executor.h"
+#include "platform_compat.h"
 #include <string.h>
 #include <ctype.h>
 #include <stdlib.h>
@@ -88,58 +89,100 @@ static QueryResult* exec_drop_db(ExecCtx* ctx, ASTNode* n) {
     return result_ok_msg(0);
 }
 
+static const char* add_constraint(ExecCtx* ctx, Database* db, TableSchema* ts, ConstraintDef* d, char* msg, size_t mn);
+static const char* check_value(const Column* c, const char* v, char* msg, size_t n);
+static const Constraint* referenced_by(Database* db, const TableSchema* ts, const TableSchema** child);
+
 static QueryResult* exec_create_table(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
 
-    char msg[200];
+    char msg[300];
     if (n->create_table.num_columns == 0) return result_error_msg("A table needs at least one column");
     if (n->create_table.num_columns > SV_MAX_COLUMNS) return result_error_msg("Too many columns (max 64)");
-    int pks = 0;
+    int pks = 0, pk_col = -1;
     for (int i = 0; i < n->create_table.num_columns; i++) {
         ColumnDef* cd = &n->create_table.columns[i];
         if (!known_type(cd->type)) {
             snprintf(msg, sizeof(msg), "Unknown type '%.32s' for column '%.64s'", cd->type, cd->name);
             return result_error_msg(msg);
         }
-        if (cd->primary_key) pks++;
+        if (cd->primary_key) { pks++; pk_col = i; }
         for (int k = 0; k < i; k++)
             if (!strcasecmp(n->create_table.columns[k].name, cd->name)) {
                 snprintf(msg, sizeof(msg), "Column '%.64s' is defined twice", cd->name);
                 return result_error_msg(msg);
             }
     }
-    if (pks > 1) return result_error_msg("A table can have only one PRIMARY KEY column");
+    // una sola chiave primaria: di colonna o di tabella (CONSTRAINT nome PRIMARY KEY sulla colonna
+    // arriva in entrambe le forme, ed è la stessa)
+    int table_pks = 0;
+    bool same_as_inline = false;
+    for (int i = 0; i < n->create_table.num_cons; i++) {
+        ConstraintDef* d = &n->create_table.cons[i];
+        if (d->kind != CONS_PRIMARY) continue;
+        table_pks++;
+        if (pk_col >= 0 && d->ncols == 1 && !strcasecmp(d->cols[0], n->create_table.columns[pk_col].name)) same_as_inline = true;
+    }
+    bool table_pk = table_pks > 0;
+    if (pks > 1 || table_pks > 1 || (pks == 1 && table_pk && !same_as_inline))
+        return result_error_msg("A table can have only one PRIMARY KEY");
     if (catalog_get_table(ctx->catalog, db->name, n->create_table.table_name) ||
         catalog_get_view(ctx->catalog, db->name, n->create_table.table_name)) {
         snprintf(msg, sizeof(msg), "Table or view '%.64s' already exists", n->create_table.table_name);
         return result_error_msg(msg);
     }
 
-    TableSchema ts;
-    memset(&ts, 0, sizeof(ts));
-    snprintf(ts.name, sizeof(ts.name), "%s", n->create_table.table_name);
-    ts.num_rows = 0;
-    ts.num_pages = 0;
+    TableSchema* ts = calloc(1, sizeof(TableSchema));
+    if (!ts) return result_error_msg("Out of memory");
+    snprintf(ts->name, sizeof(ts->name), "%s", n->create_table.table_name);
 
     for (int i = 0; i < n->create_table.num_columns && i < SV_MAX_COLUMNS; i++) {
         ColumnDef* cd = &n->create_table.columns[i];
-        Column* col = &ts.columns[ts.num_columns++];
+        Column* col = &ts->columns[ts->num_columns++];
         memset(col, 0, sizeof(Column));
         snprintf(col->name, sizeof(col->name), "%s", cd->name);
         col->type = parse_type(cd->type);
         col->size = cd->size;
         col->nullable = cd->nullable;
-        col->primary_key = cd->primary_key;
         col->auto_increment = cd->auto_increment;
         if (cd->default_val[0])
             snprintf(col->default_val, sizeof(col->default_val), "%s", cd->default_val);
+        if (cd->default_val[0] && strcasecmp(cd->default_val, "NULL") && check_value(col, cd->default_val, msg, sizeof(msg))) {
+            free(ts);
+            return result_error_msg(msg);
+        }
     }
 
-    if (catalog_add_table(ctx->catalog, db->name, &ts) != SV_OK)
-        return result_error_msg("Failed to create table");
+    // vincoli: prima la chiave primaria (le chiavi esterne verso la tabella stessa la usano)
+    const char* fail = NULL;
+    if (pks == 1 && !table_pk) {
+        ConstraintDef d;
+        memset(&d, 0, sizeof(d));
+        d.kind = CONS_PRIMARY;
+        d.ncols = 1;
+        snprintf(d.cols[0], sizeof(d.cols[0]), "%s", n->create_table.columns[pk_col].name);
+        snprintf(d.name, sizeof(d.name), "pk_%.58s", ts->name);
+        fail = add_constraint(ctx, db, ts, &d, msg, sizeof(msg));
+    }
+    for (int pass = 0; pass < 2 && !fail; pass++)
+        for (int i = 0; i < n->create_table.num_cons && !fail; i++) {
+            ConstraintDef* d = &n->create_table.cons[i];
+            if ((d->kind == CONS_PRIMARY) != (pass == 0)) continue;
+            if (d->kind == CONS_PRIMARY && !d->name[0]) snprintf(d->name, sizeof(d->name), "pk_%.58s", ts->name);
+            fail = add_constraint(ctx, db, ts, d, msg, sizeof(msg));
+        }
+    if (fail) {
+        if (fail != msg) snprintf(msg, sizeof(msg), "%s", fail);
+        free(ts);
+        return result_error_msg(msg);
+    }
 
-    TableSchema* saved = catalog_get_table(ctx->catalog, db->name, ts.name);
+    int rc = catalog_add_table(ctx->catalog, db->name, ts);
+    free(ts);
+    if (rc != SV_OK) return result_error_msg("Failed to create table");
+
+    TableSchema* saved = catalog_get_table(ctx->catalog, db->name, n->create_table.table_name);
     if (saved) {
         uint32_t pid;
         if (bp_new_page(ctx->bp, &pid) == SV_OK) {
@@ -154,8 +197,16 @@ static QueryResult* exec_create_table(ExecCtx* ctx, ASTNode* n) {
 static QueryResult* exec_drop_table(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
-    mi_invalidate_table(db->name, n->drop_table.table_name);
     TableSchema* dts = catalog_get_table(ctx->catalog, db->name, n->drop_table.table_name);
+    const TableSchema* child = NULL;
+    const Constraint* ref = dts ? referenced_by(db, dts, &child) : NULL;
+    if (ref) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "Cannot drop table '%.64s': it is referenced by the foreign key '%.64s' of table '%.64s'",
+                 dts->name, ref->name, child->name);
+        return result_error_msg(msg);
+    }
+    mi_invalidate_table(db->name, n->drop_table.table_name);
     if (dts) heap_cache_forget(ctx->bp, dts->root_page_id);
     if (catalog_drop_table(ctx->catalog, db->name, n->drop_table.table_name) != SV_OK)
         return result_error_msg("Table not found");
@@ -174,7 +225,51 @@ static QueryResult* exec_alter_table(ExecCtx* ctx, ASTNode* n) {
             (catalog_get_table(ctx->catalog, db->name, nn) || catalog_get_view(ctx->catalog, db->name, nn)))
             return result_error_msg("A table or view with the new name already exists");
         mi_invalidate_table(db->name, ts->name);
+        for (int i = 0; i < db->num_tables; i++)                 // le chiavi esterne seguono il nuovo nome
+            for (int k = 0; k < db->tables[i].num_constraints; k++)
+                if (db->tables[i].constraints[k].kind == CONS_FOREIGN && !strcasecmp(db->tables[i].constraints[k].ref_table, ts->name))
+                    snprintf(db->tables[i].constraints[k].ref_table, sizeof(db->tables[i].constraints[k].ref_table), "%s", nn);
         snprintf(ts->name, sizeof(ts->name), "%s", nn);
+    }
+    char msg[300];
+    if (n->alter_table.has_add) {
+        const char* fail = add_constraint(ctx, db, ts, &n->alter_table.add, msg, sizeof(msg));
+        if (fail) { if (fail != msg) snprintf(msg, sizeof(msg), "%s", fail); return result_error_msg(msg); }
+    }
+    if (n->alter_table.drop_constraint[0]) {
+        int k;
+        for (k = 0; k < ts->num_constraints; k++) if (!strcasecmp(ts->constraints[k].name, n->alter_table.drop_constraint)) break;
+        if (k == ts->num_constraints) {
+            snprintf(msg, sizeof(msg), "Constraint '%.64s' not found in table '%.64s'", n->alter_table.drop_constraint, ts->name);
+            return result_error_msg(msg);
+        }
+        Constraint* c = &ts->constraints[k];
+        if (c->kind == CONS_PRIMARY || c->kind == CONS_UNIQUE) {
+            // una chiave usata da una chiave esterna non si può togliere
+            for (int i = 0; i < db->num_tables; i++)
+                for (int f = 0; f < db->tables[i].num_constraints; f++) {
+                    const Constraint* fk = &db->tables[i].constraints[f];
+                    if (fk->kind != CONS_FOREIGN || strcasecmp(fk->ref_table, ts->name) || fk->ncols != c->ncols) continue;
+                    bool same = true;
+                    for (int a = 0; a < fk->ncols && same; a++) {
+                        bool in = false;
+                        for (int b = 0; b < c->ncols; b++) if (!strcasecmp(fk->ref_cols[a], ts->columns[c->cols[b]].name)) in = true;
+                        same = in;
+                    }
+                    if (same && &db->tables[i] != ts) {
+                        snprintf(msg, sizeof(msg), "Cannot drop '%.64s': the foreign key '%.64s' of table '%.64s' uses it",
+                                 c->name, fk->name, db->tables[i].name);
+                        return result_error_msg(msg);
+                    }
+                }
+            for (int b = 0; b < c->ncols; b++) {
+                if (c->kind == CONS_PRIMARY) ts->columns[c->cols[b]].primary_key = false;
+                else if (c->ncols == 1) ts->columns[c->cols[b]].unique = false;
+            }
+        }
+        memmove(c, c + 1, sizeof(Constraint) * (size_t)(ts->num_constraints - k - 1));
+        ts->num_constraints--;
+        mi_invalidate_table(db->name, ts->name);
     }
     return result_ok_msg(0);
 }
@@ -456,7 +551,10 @@ static SMSlot* sm_slot(StrMap* m, const char* key, bool create) {
 typedef struct { RID* r; int n, cap; } RidList;
 
 typedef struct MemIndex {
-    char      db[SV_MAX_NAME_LEN], table[SV_MAX_NAME_LEN], col[SV_MAX_NAME_LEN];
+    char      db[SV_MAX_NAME_LEN], table[SV_MAX_NAME_LEN];
+    char      col[SV_MAX_NAME_LEN * 2];   // nome della colonna, o "a,b" per una chiave composta
+    int       cols[SV_MAX_KEY_COLS];      // posizioni delle colonne della chiave
+    int       ncols;
     StrMap    map;          // chiave -> posizione in lists
     RidList*  lists;
     int       nlists, caplists;
@@ -497,10 +595,22 @@ static void mi_key(const Value* v, DataType t, char* buf, size_t n) {
     value_to_string((Value*)v, t, buf, n);
 }
 
-static bool mi_add(MemIndex* ix, const Value* v, DataType t, RID rid) {
-    if (v->is_null) return true;
-    char key[EV_STR_MAX + 1];
-    mi_key(v, t, key, sizeof(key));
+// chiave della tupla sulle colonne indicate; false se una colonna è NULL (non indicizzata:
+// in SQL una chiave con NULL non è mai uguale a un'altra)
+static bool tuple_key(const TableSchema* ts, const Tuple* t, const int* cols, int ncols, char* buf, size_t n) {
+    size_t len = 0;
+    buf[0] = '\0';
+    for (int k = 0; k < ncols; k++) {
+        int ci = cols[k];
+        if (ci < 0 || ci >= t->num_values || t->values[ci].is_null) return false;
+        if (k) { if (len + 2 >= n) return false; buf[len++] = '\x1f'; buf[len] = '\0'; }
+        mi_key(&t->values[ci], ts->columns[ci].type, buf + len, n - len);
+        len += strlen(buf + len);
+    }
+    return true;
+}
+
+static bool mi_add_key(MemIndex* ix, const char* key, RID rid) {
     SMSlot* s = sm_slot(&ix->map, key, true);
     if (!s) return false;
     if (s->val < 0) {
@@ -523,18 +633,28 @@ static bool mi_add(MemIndex* ix, const Value* v, DataType t, RID rid) {
         l->cap = nc;
     }
     l->r[l->n++] = rid;
-    if (t == SV_TYPE_INT || t == SV_TYPE_BIGINT) {
-        int64_t x = t == SV_TYPE_INT ? v->int_val : v->bigint_val;
-        if (!ix->has_max || x > ix->max_int) ix->max_int = x;
-        ix->has_max = true;
+    return true;
+}
+
+static bool mi_add_tuple(MemIndex* ix, const TableSchema* ts, const Tuple* t, RID rid) {
+    char key[EV_STR_MAX + 1];
+    if (!tuple_key(ts, t, ix->cols, ix->ncols, key, sizeof(key))) return true;
+    if (!mi_add_key(ix, key, rid)) return false;
+    if (ix->ncols == 1) {
+        int ci = ix->cols[0];
+        DataType ty = ts->columns[ci].type;
+        if (ty == SV_TYPE_INT || ty == SV_TYPE_BIGINT) {
+            int64_t x = ty == SV_TYPE_INT ? t->values[ci].int_val : t->values[ci].bigint_val;
+            if (!ix->has_max || x > ix->max_int) ix->max_int = x;
+            ix->has_max = true;
+        }
     }
     return true;
 }
 
-static void mi_remove(MemIndex* ix, const Value* v, DataType t, RID rid) {
-    if (v->is_null) return;
+static void mi_remove_tuple(MemIndex* ix, const TableSchema* ts, const Tuple* t, RID rid) {
     char key[EV_STR_MAX + 1];
-    mi_key(v, t, key, sizeof(key));
+    if (!tuple_key(ts, t, ix->cols, ix->ncols, key, sizeof(key))) return;
     SMSlot* s = sm_slot(&ix->map, key, false);
     if (!s || s->val < 0) return;
     RidList* l = &ix->lists[s->val];
@@ -547,33 +667,47 @@ static const RidList* mi_lookup(MemIndex* ix, const char* key) {
     return (s && s->val >= 0) ? &ix->lists[s->val] : NULL;
 }
 
-// la colonna ha un indice (chiave primaria, AUTO_INCREMENT o CREATE INDEX)?
+// la colonna ha un indice (chiave primaria, AUTO_INCREMENT, UNIQUE o CREATE INDEX)?
 static bool col_is_indexed(const TableSchema* ts, int ci) {
-    if (ts->columns[ci].primary_key || ts->columns[ci].auto_increment) return true;
+    if (ts->columns[ci].primary_key || ts->columns[ci].auto_increment || ts->columns[ci].unique) return true;
     for (int i = 0; i < ts->num_indexes; i++)
         if (!strcasecmp(ts->indexes[i].col_name, ts->columns[ci].name)) return true;
+    for (int i = 0; i < ts->num_constraints; i++) {
+        const Constraint* c = &ts->constraints[i];
+        if ((c->kind == CONS_FOREIGN || c->kind == CONS_UNIQUE) && c->ncols == 1 && c->cols[0] == ci) return true;
+    }
     return false;
 }
 
-// indice della colonna, costruito se manca. NULL se la colonna non è indicizzata o la
-// costruzione è fallita (memoria, scansione annullata).
-static MemIndex* mi_get(ExecCtx* ctx, const char* db, TableSchema* ts, int ci) {
-    if (ci < 0 || ci >= ts->num_columns || !col_is_indexed(ts, ci)) return NULL;
+// indice sulle colonne indicate (costruito leggendo la tabella se manca). NULL se manca
+// memoria o la lettura è stata annullata.
+static MemIndex* mi_get_cols(ExecCtx* ctx, const char* db, TableSchema* ts, const int* cols, int ncols) {
+    if (ncols < 1 || ncols > SV_MAX_KEY_COLS) return NULL;
+    char name[SV_MAX_NAME_LEN * 2];
+    size_t len = 0;
+    name[0] = '\0';
+    for (int k = 0; k < ncols; k++) {
+        if (cols[k] < 0 || cols[k] >= ts->num_columns) return NULL;
+        int w = snprintf(name + len, sizeof(name) - len, "%s%s", k ? "," : "", ts->columns[cols[k]].name);
+        if (w < 0 || (size_t)w >= sizeof(name) - len) return NULL;
+        len += (size_t)w;
+    }
     for (MemIndex* ix = g_mem_indexes; ix; ix = ix->next)
-        if (!strcasecmp(ix->db, db) && !strcasecmp(ix->table, ts->name) && !strcasecmp(ix->col, ts->columns[ci].name))
-            return ix;
+        if (!strcasecmp(ix->db, db) && !strcasecmp(ix->table, ts->name) && !strcasecmp(ix->col, name)) return ix;
     MemIndex* ix = calloc(1, sizeof(MemIndex));
     if (!ix) return NULL;
     snprintf(ix->db, sizeof(ix->db), "%s", db);
     snprintf(ix->table, sizeof(ix->table), "%s", ts->name);
-    snprintf(ix->col, sizeof(ix->col), "%s", ts->columns[ci].name);
+    snprintf(ix->col, sizeof(ix->col), "%s", name);
+    memcpy(ix->cols, cols, sizeof(int) * (size_t)ncols);
+    ix->ncols = ncols;
     HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
     HeapScan* scan = hf ? heap_scan_open(hf, ts) : NULL;
     bool ok = scan != NULL;
     Tuple* t;
     RID rid;
     while (ok && (t = heap_scan_next(scan, &rid)) != NULL) {
-        if (ci < t->num_values) ok = mi_add(ix, &t->values[ci], ts->columns[ci].type, rid);
+        ok = mi_add_tuple(ix, ts, t, rid);
         tuple_free(t);
     }
     if (scan) heap_scan_close(scan);
@@ -584,12 +718,17 @@ static MemIndex* mi_get(ExecCtx* ctx, const char* db, TableSchema* ts, int ci) {
     return ix;
 }
 
+// indice di una colonna (solo se la colonna è indicizzata)
+static MemIndex* mi_get(ExecCtx* ctx, const char* db, TableSchema* ts, int ci) {
+    if (ci < 0 || ci >= ts->num_columns || !col_is_indexed(ts, ci)) return NULL;
+    return mi_get_cols(ctx, db, ts, &ci, 1);
+}
+
 // aggiornamento degli indici già costruiti della tabella
 static void mi_on_insert(const char* db, TableSchema* ts, const Tuple* t, RID rid) {
     for (MemIndex* ix = g_mem_indexes; ix; ix = ix->next) {
         if (strcasecmp(ix->db, db) || strcasecmp(ix->table, ts->name)) continue;
-        int ci = catalog_get_col_index(ts, ix->col);
-        if (ci >= 0 && ci < t->num_values && !mi_add(ix, &t->values[ci], ts->columns[ci].type, rid)) {
+        if (!mi_add_tuple(ix, ts, t, rid)) {
             mi_invalidate_table(db, ts->name);   // memoria esaurita: meglio ricostruire che usarlo incompleto
             return;
         }
@@ -599,8 +738,7 @@ static void mi_on_insert(const char* db, TableSchema* ts, const Tuple* t, RID ri
 static void mi_on_delete(const char* db, TableSchema* ts, const Tuple* t, RID rid) {
     for (MemIndex* ix = g_mem_indexes; ix; ix = ix->next) {
         if (strcasecmp(ix->db, db) || strcasecmp(ix->table, ts->name)) continue;
-        int ci = catalog_get_col_index(ts, ix->col);
-        if (ci >= 0 && ci < t->num_values) mi_remove(ix, &t->values[ci], ts->columns[ci].type, rid);
+        mi_remove_tuple(ix, ts, t, rid);
     }
 }
 
@@ -2995,6 +3133,683 @@ static void wal_log(ExecCtx* ctx, uint8_t type, RID rid, const Tuple* newt, cons
     free(os);
 }
 
+// ═════════════════════════════════════════════════════════════════
+//  Vincoli di integrità
+//  - chiavi (PRIMARY KEY e UNIQUE, anche composte): nessuna coppia di righe con la stessa
+//    chiave; le chiavi con un NULL non si confrontano (UNIQUE ammette più NULL)
+//  - CHECK: la condizione non deve essere FALSA (vera o sconosciuta va bene, come in SQL)
+//  - FOREIGN KEY: ogni chiave esterna senza NULL deve esistere nella tabella riferita;
+//    cancellare o modificare una riga riferita applica l'azione del vincolo:
+//    NO ACTION / RESTRICT (errore), CASCADE, SET NULL, SET DEFAULT
+//  Le modifiche di uno statement (comprese quelle a cascata) vengono prima calcolate tutte
+//  e controllate, poi scritte: uno statement che viola un vincolo non lascia modifiche.
+// ═════════════════════════════════════════════════════════════════
+
+typedef struct { int cols[SV_MAX_KEY_COLS]; int n; bool primary; const char* name; } KeyDef;
+
+// chiavi della tabella: la chiave primaria (vincolo o colonna del formato precedente) e le UNIQUE
+static int table_keys(const TableSchema* ts, KeyDef* out, int max) {
+    int k = 0;
+    bool have_pk = false;
+    for (int i = 0; i < ts->num_constraints && k < max; i++) {
+        const Constraint* c = &ts->constraints[i];
+        if (c->kind != CONS_PRIMARY && c->kind != CONS_UNIQUE) continue;
+        KeyDef* d = &out[k++];
+        d->n = c->ncols;
+        for (int j = 0; j < c->ncols; j++) d->cols[j] = c->cols[j];
+        d->primary = c->kind == CONS_PRIMARY;
+        d->name = c->name;
+        if (d->primary) have_pk = true;
+    }
+    if (!have_pk && k < max)
+        for (int i = 0; i < ts->num_columns; i++)
+            if (ts->columns[i].primary_key) {
+                KeyDef* d = &out[k++];
+                d->n = 1; d->cols[0] = i; d->primary = true; d->name = ts->columns[i].name;
+                break;
+            }
+    return k;
+}
+
+static void key_cols_text(const TableSchema* ts, const int* cols, int n, char* buf, size_t cap) {
+    size_t len = 0;
+    buf[0] = '\0';
+    for (int k = 0; k < n && len + 4 < cap; k++)
+        len += (size_t)snprintf(buf + len, cap - len, "%s%s", k ? ", " : "", ts->columns[cols[k]].name);
+}
+
+// "Duplicate entry '5' for primary key 'id'" / "... for unique key (a, b)"
+static void dup_message(const TableSchema* ts, const KeyDef* k, const char* key, char* msg, size_t n) {
+    char shown[200], cols[200];
+    snprintf(shown, sizeof(shown), "%.190s", key);
+    for (char* p = shown; *p; p++) if (*p == '\x1f') *p = '-';
+    key_cols_text(ts, k->cols, k->n, cols, sizeof(cols));
+    if (k->n == 1) snprintf(msg, n, "Duplicate entry '%.100s' for %s '%.64s'", shown, k->primary ? "primary key" : "unique key", cols);
+    else           snprintf(msg, n, "Duplicate entry '%.100s' for %s (%.120s)", shown, k->primary ? "primary key" : "unique key", cols);
+}
+
+// posizioni nella tabella riferita delle colonne di una chiave esterna; false se non esistono
+static bool fk_ref_cols(const Constraint* f, const TableSchema* parent, int* out) {
+    for (int k = 0; k < f->ncols; k++) {
+        out[k] = catalog_get_col_index((TableSchema*)parent, f->ref_cols[k]);
+        if (out[k] < 0) return false;
+    }
+    return true;
+}
+
+// ── CHECK ──
+
+typedef struct {
+    ASTExpr*          e[SV_MAX_CONSTRAINTS];
+    const Constraint* c[SV_MAX_CONSTRAINTS];
+    int               n;
+    Source            src;
+    const TableSchema* ts;
+} Checks;
+
+static void checks_free(Checks* ck) {
+    for (int i = 0; i < ck->n; i++) ast_expr_free(ck->e[i]);
+    ck->n = 0;
+}
+
+static ASTExpr* compile_check(const char* text, Source* src, char* msg, size_t n) {
+    TokenList* tk = lexer_tokenize(text);
+    if (!tk) { snprintf(msg, n, "Out of memory"); return NULL; }
+    char perr[256] = "";
+    ASTExpr* e = parser_parse_expr(tk, perr, sizeof(perr));
+    lexer_free(tk);
+    if (!e) { snprintf(msg, n, "Invalid CHECK condition: %.200s", perr); return NULL; }
+    BindCtx b;
+    memset(&b, 0, sizeof(b));
+    b.src = src; b.nsrc = 1; b.mode = BIND_ROW; b.clause = "CHECK";
+    bind_expr(e, &b);
+    if (b.err[0]) { snprintf(msg, n, "%.250s", b.err); ast_expr_free(e); return NULL; }
+    return e;
+}
+
+static const char* checks_prepare(Checks* ck, TableSchema* ts, char* msg, size_t n) {
+    memset(ck, 0, sizeof(*ck));
+    ck->ts = ts;
+    snprintf(ck->src.name, sizeof(ck->src.name), "%s", ts->name);
+    snprintf(ck->src.table, sizeof(ck->src.table), "%s", ts->name);
+    ck->src.ts = ts;
+    for (int i = 0; i < ts->num_constraints; i++) {
+        const Constraint* c = &ts->constraints[i];
+        if (c->kind != CONS_CHECK) continue;
+        ASTExpr* e = compile_check(c->check, &ck->src, msg, n);
+        if (!e) { checks_free(ck); return msg; }
+        ck->e[ck->n] = e;
+        ck->c[ck->n++] = c;
+    }
+    return NULL;
+}
+
+static const char* checks_eval(Checks* ck, Tuple* t, char* msg, size_t n) {
+    if (!ck->n) return NULL;
+    Tuple* cur[1] = { t };
+    EvalCtx ec;
+    memset(&ec, 0, sizeof(ec));
+    ec.src = &ck->src; ec.nsrc = 1; ec.cur = cur;
+    for (int i = 0; i < ck->n; i++) {
+        EvalVal v;
+        eval_expr(ck->e[i], &ec, &v);
+        if (ec.err[0]) { snprintf(msg, n, "%.250s", ec.err); return msg; }
+        if (ev_truth(&v) == 0) {
+            snprintf(msg, n, "CHECK constraint '%.64s' is violated: %.180s", ck->c[i]->name, ck->c[i]->check);
+            return msg;
+        }
+    }
+    return NULL;
+}
+
+// ── insieme delle modifiche di uno statement ──
+
+typedef struct {
+    TableSchema* ts;
+    RID          rid;
+    Tuple*       old;      // riga attuale (immagine per il WAL e gli indici)
+    Tuple*       nt;       // nuova riga; NULL = cancellazione
+    bool         owns_old;
+    bool         direct;   // chiesta dallo statement (non a cascata)
+} Change;
+
+typedef struct {
+    Change*   v;
+    int       n, cap;
+    StrMap    idx;         // "tabella:pagina:slot" -> posizione
+    ExecCtx*  x;
+    Database* db;
+} ChangeSet;
+
+static void row_ref(const TableSchema* ts, RID r, char* buf, size_t n) {
+    snprintf(buf, n, "%p:%u:%u", (const void*)ts, r.page_id, (unsigned)r.slot_id);
+}
+
+static int cs_find(ChangeSet* cs, const TableSchema* ts, RID r) {
+    char k[64];
+    row_ref(ts, r, k, sizeof(k));
+    SMSlot* sl = sm_slot(&cs->idx, k, false);
+    return sl ? sl->val : -1;
+}
+
+static int cs_add(ChangeSet* cs, TableSchema* ts, RID r, Tuple* old, Tuple* nt, bool owns_old, bool direct) {
+    if (cs->n >= cs->cap) {
+        int nc = cs->cap ? cs->cap * 2 : 64;
+        Change* nv = realloc(cs->v, sizeof(Change) * (size_t)nc);
+        if (!nv) return -1;
+        cs->v = nv;
+        cs->cap = nc;
+    }
+    char k[64];
+    row_ref(ts, r, k, sizeof(k));
+    SMSlot* sl = sm_slot(&cs->idx, k, true);
+    if (!sl) return -1;
+    sl->val = cs->n;
+    cs->v[cs->n] = (Change){ ts, r, old, nt, owns_old, direct };
+    return cs->n++;
+}
+
+static void cs_free(ChangeSet* cs) {
+    for (int i = 0; i < cs->n; i++) {
+        if (cs->v[i].nt) tuple_free(cs->v[i].nt);
+        if (cs->v[i].owns_old) tuple_free(cs->v[i].old);
+    }
+    free(cs->v);
+    sm_free(&cs->idx);
+    memset(cs, 0, sizeof(*cs));
+}
+
+static void value_copy(Value* dst, const Value* src, DataType t) {
+    if (dst->owns_str) free(dst->str_val);
+    *dst = *src;
+    dst->owns_str = false;
+    if (src->is_null) { dst->str_val = NULL; return; }
+    if (t != SV_TYPE_INT && t != SV_TYPE_BIGINT && t != SV_TYPE_FLOAT && t != SV_TYPE_BOOL) {
+        dst->str_val = strdup(src->str_val ? src->str_val : "");
+        dst->owns_str = dst->str_val != NULL;
+    }
+}
+
+// propaga le cancellazioni e le modifiche delle chiavi riferite (azioni delle FOREIGN KEY)
+static const char* cs_cascade(ChangeSet* cs, char* msg, size_t mn) {
+    Database* db = cs->db;
+    typedef struct { TableSchema* child; RID rid; const Constraint* f; const TableSchema* parent; } Restrict;
+    Restrict* rs = NULL;
+    int nrs = 0, caprs = 0;
+    const char* fail = NULL;
+    bool again = true;
+    for (int pass = 0; again && !fail; pass++) {
+        if (pass >= 32) { fail = "Cascading foreign key actions do not converge"; break; }
+        again = false;
+        nrs = 0;
+        for (int i = 0; i < cs->n && !fail; i++) {
+            TableSchema* T = cs->v[i].ts;
+            for (int ti = 0; ti < db->num_tables && !fail; ti++) {
+                TableSchema* C = &db->tables[ti];
+                for (int fi = 0; fi < C->num_constraints && !fail; fi++) {
+                    const Constraint* f = &C->constraints[fi];
+                    if (f->kind != CONS_FOREIGN || strcasecmp(f->ref_table, T->name)) continue;
+                    int pcols[SV_MAX_KEY_COLS];
+                    if (!fk_ref_cols(f, T, pcols)) continue;
+                    char okey[EV_STR_MAX + 1], nkey[EV_STR_MAX + 1];
+                    if (!tuple_key(T, cs->v[i].old, pcols, f->ncols, okey, sizeof(okey))) continue;
+                    bool is_del = cs->v[i].nt == NULL;
+                    if (!is_del && tuple_key(T, cs->v[i].nt, pcols, f->ncols, nkey, sizeof(nkey)) && !strcmp(okey, nkey)) continue;
+                    int fcols[SV_MAX_KEY_COLS];
+                    for (int k = 0; k < f->ncols; k++) fcols[k] = f->cols[k];
+                    MemIndex* cix = mi_get_cols(cs->x, db->name, C, fcols, f->ncols);
+                    if (!cix) { fail = "Out of memory (foreign key index)"; break; }
+                    const RidList* l = mi_lookup(cix, okey);
+                    int nl = l ? l->n : 0;
+                    RID* rids = nl ? malloc(sizeof(RID) * (size_t)nl) : NULL;
+                    if (nl && !rids) { fail = "Out of memory"; break; }
+                    if (nl) memcpy(rids, l->r, sizeof(RID) * (size_t)nl);
+                    int action = is_del ? f->on_delete : f->on_update;
+                    for (int q = 0; q < nl && !fail; q++) {
+                        int ex = cs_find(cs, C, rids[q]);
+                        if (ex >= 0 && cs->v[ex].nt == NULL) continue;          // riga già cancellata
+                        if (action == FK_NO_ACTION || action == FK_RESTRICT) {
+                            if (nrs >= caprs) {
+                                int nc = caprs ? caprs * 2 : 16;
+                                Restrict* nr = realloc(rs, sizeof(Restrict) * (size_t)nc);
+                                if (!nr) { fail = "Out of memory"; break; }
+                                rs = nr;
+                                caprs = nc;
+                            }
+                            rs[nrs++] = (Restrict){ C, rids[q], f, T };
+                            continue;
+                        }
+                        if (action == FK_CASCADE && is_del) {                 // ON DELETE CASCADE
+                            if (ex >= 0) { tuple_free(cs->v[ex].nt); cs->v[ex].nt = NULL; if (ex <= i) again = true; continue; }
+                            HeapFile* hf = heap_open(cs->x->bp, C->root_page_id, C->num_pages);
+                            Tuple* child = hf ? heap_get(hf, rids[q], C) : NULL;
+                            free(hf);
+                            if (!child) continue;
+                            if (cs_add(cs, C, rids[q], child, NULL, true, false) < 0) { tuple_free(child); fail = "Out of memory"; }
+                            continue;
+                        }
+                        // CASCADE (modifica), SET NULL, SET DEFAULT: nuova versione della riga figlia
+                        Tuple* target;
+                        if (ex >= 0) {
+                            target = cs->v[ex].nt;
+                            if (ex <= i) again = true;
+                        } else {
+                            HeapFile* hf = heap_open(cs->x->bp, C->root_page_id, C->num_pages);
+                            Tuple* child = hf ? heap_get(hf, rids[q], C) : NULL;
+                            free(hf);
+                            if (!child) continue;
+                            target = tuple_clone(child, C);
+                            if (!target || cs_add(cs, C, rids[q], child, target, true, false) < 0) {
+                                tuple_free(child); tuple_free(target); fail = "Out of memory"; break;
+                            }
+                        }
+                        for (int k = 0; k < f->ncols; k++) {
+                            int cc = f->cols[k];
+                            DataType ty = C->columns[cc].type;
+                            if (action == FK_CASCADE) value_copy(&target->values[cc], &cs->v[i].nt->values[pcols[k]], ty);
+                            else if (action == FK_SET_NULL) value_set_from_text(&target->values[cc], ty, NULL);
+                            else {
+                                const char* dv = C->columns[cc].default_val;
+                                value_set_from_text(&target->values[cc], ty, (dv[0] && strcasecmp(dv, "NULL")) ? dv : NULL);
+                            }
+                        }
+                    }
+                    free(rids);
+                }
+            }
+        }
+    }
+    // NO ACTION / RESTRICT: la riga che riferisce deve sparire nello stesso statement
+    for (int i = 0; !fail && i < nrs; i++) {
+        int ex = cs_find(cs, rs[i].child, rs[i].rid);
+        if (ex >= 0 && cs->v[ex].nt == NULL) continue;
+        snprintf(msg, mn, "Cannot delete or change the row of '%.64s': it is referenced by table '%.64s' "
+                 "(foreign key '%.64s')", rs[i].parent->name, rs[i].child->name, rs[i].f->name);
+        fail = msg;
+    }
+    free(rs);
+    return fail;
+}
+
+// esiste (alla fine dello statement) una riga di P con quella chiave sulle colonne pcols?
+static int key_exists_final(ChangeSet* cs, TableSchema* P, const int* pcols, int n, const char* key) {
+    MemIndex* ix = mi_get_cols(cs->x, cs->db->name, P, pcols, n);
+    if (!ix) return -1;
+    const RidList* l = mi_lookup(ix, key);
+    for (int i = 0; l && i < l->n; i++) {
+        int ex = cs_find(cs, P, l->r[i]);
+        if (ex < 0) return 1;                                   // riga non toccata
+        if (cs->v[ex].nt) {                                     // modificata: conta la nuova chiave
+            char k2[EV_STR_MAX + 1];
+            if (tuple_key(P, cs->v[ex].nt, pcols, n, k2, sizeof(k2)) && !strcmp(k2, key)) return 1;
+        }
+    }
+    for (int i = 0; i < cs->n; i++) {                           // righe modificate che assumono la chiave
+        if (cs->v[i].ts != P || !cs->v[i].nt) continue;
+        char k2[EV_STR_MAX + 1];
+        if (tuple_key(P, cs->v[i].nt, pcols, n, k2, sizeof(k2)) && !strcmp(k2, key)) return 1;
+    }
+    return 0;
+}
+
+static void fk_message(const TableSchema* C, const Constraint* f, const char* key, char* msg, size_t n) {
+    char shown[200], cols[200];
+    snprintf(shown, sizeof(shown), "%.190s", key);
+    for (char* p = shown; *p; p++) if (*p == '\x1f') *p = ',';
+    int fc[SV_MAX_KEY_COLS];
+    for (int k = 0; k < f->ncols; k++) fc[k] = f->cols[k];
+    key_cols_text(C, fc, f->ncols, cols, sizeof(cols));
+    snprintf(msg, n, "Foreign key '%.40s' is violated: no row of '%.40s' has (%.60s) = (%.60s)", f->name, f->ref_table, cols, shown);
+}
+
+// controlla le righe modificate (NOT NULL, CHECK, chiavi, chiavi esterne)
+static const char* cs_validate(ChangeSet* cs, char* msg, size_t mn) {
+    Database* db = cs->db;
+    const TableSchema* seen[SV_MAX_TABLES];
+    int nseen = 0;
+    for (int i = 0; i < cs->n; i++) {
+        TableSchema* T = cs->v[i].ts;
+        bool done = false;
+        for (int k = 0; k < nseen; k++) if (seen[k] == T) done = true;
+        if (done) continue;
+        if (nseen < SV_MAX_TABLES) seen[nseen++] = T;
+        Checks ck;
+        if (checks_prepare(&ck, T, msg, mn)) return msg;
+        KeyDef keys[SV_MAX_CONSTRAINTS + 1];
+        int nk = table_keys(T, keys, SV_MAX_CONSTRAINTS + 1);
+        StrMap finals[SV_MAX_CONSTRAINTS + 1];
+        memset(finals, 0, sizeof(finals));
+        const char* fail = NULL;
+        for (int j = i; j < cs->n && !fail; j++) {
+            Change* ch = &cs->v[j];
+            if (ch->ts != T || !ch->nt) continue;
+            for (int c = 0; c < T->num_columns && !fail; c++)
+                if (ch->nt->values[c].is_null && (!T->columns[c].nullable || T->columns[c].primary_key)) {
+                    snprintf(msg, mn, "Column '%.64s' cannot be NULL", T->columns[c].name);
+                    fail = msg;
+                }
+            if (!fail) fail = checks_eval(&ck, ch->nt, msg, mn);
+            // chiavi: due righe finali con la stessa chiave
+            for (int k = 0; k < nk && !fail; k++) {
+                char nkey[EV_STR_MAX + 1], okey[EV_STR_MAX + 1];
+                if (!tuple_key(T, ch->nt, keys[k].cols, keys[k].n, nkey, sizeof(nkey))) {
+                    if (keys[k].primary) { snprintf(msg, mn, "Primary key column cannot be NULL"); fail = msg; }
+                    continue;
+                }
+                SMSlot* sl = sm_slot(&finals[k], nkey, true);
+                if (!sl) { fail = "Out of memory"; break; }
+                if (sl->val >= 0) { dup_message(T, &keys[k], nkey, msg, mn); fail = msg; break; }
+                sl->val = j;
+                bool same = tuple_key(T, ch->old, keys[k].cols, keys[k].n, okey, sizeof(okey)) && !strcmp(okey, nkey);
+                if (same) continue;
+                MemIndex* ix = mi_get_cols(cs->x, db->name, T, keys[k].cols, keys[k].n);
+                if (!ix) { fail = "Out of memory (key index)"; break; }
+                const RidList* l = mi_lookup(ix, nkey);
+                for (int q = 0; l && q < l->n; q++)
+                    if (cs_find(cs, T, l->r[q]) < 0) { dup_message(T, &keys[k], nkey, msg, mn); fail = msg; break; }
+            }
+            // chiavi esterne della riga modificata
+            for (int fi = 0; fi < T->num_constraints && !fail; fi++) {
+                const Constraint* f = &T->constraints[fi];
+                if (f->kind != CONS_FOREIGN) continue;
+                int fc[SV_MAX_KEY_COLS];
+                for (int k = 0; k < f->ncols; k++) fc[k] = f->cols[k];
+                char nkey[EV_STR_MAX + 1], okey[EV_STR_MAX + 1];
+                if (!tuple_key(T, ch->nt, fc, f->ncols, nkey, sizeof(nkey))) continue;     // con un NULL: non controllata
+                if (tuple_key(T, ch->old, fc, f->ncols, okey, sizeof(okey)) && !strcmp(okey, nkey)) continue;
+                TableSchema* P = catalog_get_table(cs->x->catalog, db->name, f->ref_table);
+                int pcols[SV_MAX_KEY_COLS];
+                if (!P || !fk_ref_cols(f, P, pcols)) { snprintf(msg, mn, "Table '%.64s' of foreign key '%.64s' not found", f->ref_table, f->name); fail = msg; break; }
+                int ok = key_exists_final(cs, P, pcols, f->ncols, nkey);
+                if (ok < 0) { fail = "Out of memory"; break; }
+                if (!ok) { fk_message(T, f, nkey, msg, mn); fail = msg; }
+            }
+        }
+        for (int k = 0; k < nk; k++) sm_free(&finals[k]);
+        checks_free(&ck);
+        if (fail) return fail;
+    }
+    return NULL;
+}
+
+// scrive le modifiche (WAL, pagine, indici)
+static int cs_apply(ChangeSet* cs, char* msg, size_t mn, const char** fail) {
+    int direct = 0;
+    *fail = NULL;
+    for (int i = 0; i < cs->n; i++) {
+        Change* ch = &cs->v[i];
+        TableSchema* T = ch->ts;
+        HeapFile* hf = heap_open(cs->x->bp, T->root_page_id, T->num_pages);
+        if (!hf) { *fail = "Failed to open the table"; break; }
+        if (!ch->nt) {
+            wal_log(cs->x, LOG_DELETE, ch->rid, NULL, ch->old, T);
+            if (heap_delete(hf, ch->rid) != SV_OK) { mi_invalidate_table(cs->db->name, T->name); free(hf); continue; }
+            mi_on_delete(cs->db->name, T, ch->old, ch->rid);
+            if (T->num_rows > 0) T->num_rows--;
+        } else {
+            RID nrid = ch->rid;
+            if (heap_update(hf, ch->rid, ch->nt, T, &nrid) != SV_OK) {
+                mi_invalidate_table(cs->db->name, T->name);
+                snprintf(msg, mn, "Failed to update row %d of %d (the previous rows were updated)", i + 1, cs->n);
+                *fail = msg;
+                free(hf);
+                break;
+            }
+            wal_log(cs->x, LOG_UPDATE, ch->rid, ch->nt, ch->old, T);
+            mi_on_delete(cs->db->name, T, ch->old, ch->rid);
+            mi_on_insert(cs->db->name, T, ch->nt, nrid);
+            T->num_pages = hf->num_pages;
+        }
+        free(hf);
+        if (ch->direct) direct++;
+    }
+    return direct;
+}
+
+// righe nuove di un INSERT: CHECK, chiavi, chiavi esterne
+static const char* validate_inserts(ExecCtx* ctx, Database* db, TableSchema* ts, Tuple** rows, int nrows, char* msg, size_t mn) {
+    Checks ck;
+    if (checks_prepare(&ck, ts, msg, mn)) return msg;
+    const char* fail = NULL;
+    for (int r = 0; r < nrows && !fail; r++) fail = checks_eval(&ck, rows[r], msg, mn);
+    checks_free(&ck);
+    if (fail) return fail;
+
+    KeyDef keys[SV_MAX_CONSTRAINTS + 1];
+    int nk = table_keys(ts, keys, SV_MAX_CONSTRAINTS + 1);
+    for (int k = 0; k < nk && !fail; k++) {
+        MemIndex* ix = mi_get_cols(ctx, db->name, ts, keys[k].cols, keys[k].n);
+        if (!ix) return "Out of memory (key index)";
+        StrMap batch = {0};
+        for (int r = 0; r < nrows && !fail; r++) {
+            char key[EV_STR_MAX + 1];
+            if (!tuple_key(ts, rows[r], keys[k].cols, keys[k].n, key, sizeof(key))) {
+                if (keys[k].primary) { snprintf(msg, mn, "Primary key column cannot be NULL"); fail = msg; }
+                continue;
+            }
+            const RidList* l = mi_lookup(ix, key);
+            SMSlot* sl = sm_slot(&batch, key, true);
+            if (!sl) { fail = "Out of memory"; break; }
+            if ((l && l->n > 0) || sl->val >= 0) { dup_message(ts, &keys[k], key, msg, mn); fail = msg; break; }
+            sl->val = r;
+        }
+        sm_free(&batch);
+    }
+    for (int fi = 0; fi < ts->num_constraints && !fail; fi++) {
+        const Constraint* f = &ts->constraints[fi];
+        if (f->kind != CONS_FOREIGN) continue;
+        TableSchema* P = catalog_get_table(ctx->catalog, db->name, f->ref_table);
+        int pcols[SV_MAX_KEY_COLS], fc[SV_MAX_KEY_COLS];
+        if (!P || !fk_ref_cols(f, P, pcols)) { snprintf(msg, mn, "Table '%.64s' of foreign key '%.64s' not found", f->ref_table, f->name); return msg; }
+        for (int k = 0; k < f->ncols; k++) fc[k] = f->cols[k];
+        MemIndex* pix = mi_get_cols(ctx, db->name, P, pcols, f->ncols);
+        if (!pix) return "Out of memory (foreign key index)";
+        StrMap own = {0};                    // tabella che riferisce sé stessa: chiavi delle righe nuove
+        if (P == ts)
+            for (int r = 0; r < nrows; r++) {
+                char key[EV_STR_MAX + 1];
+                if (tuple_key(ts, rows[r], pcols, f->ncols, key, sizeof(key)) && !sm_slot(&own, key, true)) { fail = "Out of memory"; break; }
+            }
+        for (int r = 0; r < nrows && !fail; r++) {
+            char key[EV_STR_MAX + 1];
+            if (!tuple_key(ts, rows[r], fc, f->ncols, key, sizeof(key))) continue;     // con un NULL: non controllata
+            const RidList* l = mi_lookup(pix, key);
+            if ((l && l->n > 0) || (P == ts && sm_slot(&own, key, false))) continue;
+            fk_message(ts, f, key, msg, mn);
+            fail = msg;
+        }
+        sm_free(&own);
+    }
+    return fail;
+}
+
+// ── definizione dei vincoli (CREATE TABLE, ALTER TABLE ADD CONSTRAINT) ──
+
+static bool types_compatible(DataType a, DataType b) {
+    if (a == b) return true;
+    if (is_int_type(a) && is_int_type(b)) return true;
+    bool ta = a == SV_TYPE_VARCHAR || a == SV_TYPE_CHAR || a == SV_TYPE_TEXT;
+    bool tb = b == SV_TYPE_VARCHAR || b == SV_TYPE_CHAR || b == SV_TYPE_TEXT;
+    return ta && tb;
+}
+
+static bool cons_name_used(const TableSchema* ts, const char* name) {
+    for (int i = 0; i < ts->num_constraints; i++) if (!strcasecmp(ts->constraints[i].name, name)) return true;
+    return false;
+}
+
+// colonne -> posizioni (con controllo di esistenza e duplicati)
+static const char* resolve_cols(const TableSchema* ts, char names[][64], int n, uint8_t* out, char* msg, size_t mn) {
+    if (n < 1) return "A key needs at least one column";
+    for (int k = 0; k < n; k++) {
+        int ci = catalog_get_col_index((TableSchema*)ts, names[k]);
+        if (ci < 0) { snprintf(msg, mn, "Unknown column '%.64s' in the constraint", names[k]); return msg; }
+        for (int j = 0; j < k; j++) if (out[j] == ci) { snprintf(msg, mn, "Column '%.64s' is listed twice in the constraint", names[k]); return msg; }
+        out[k] = (uint8_t)ci;
+    }
+    return NULL;
+}
+
+// aggiunge a ts il vincolo d (parent: la tabella riferita, o ts stessa se si riferisce a sé)
+static const char* add_constraint(ExecCtx* ctx, Database* db, TableSchema* ts, ConstraintDef* d, char* msg, size_t mn) {
+    if (ts->num_constraints >= SV_MAX_CONSTRAINTS) return "Too many constraints on the table (max 16)";
+    Constraint c;
+    memset(&c, 0, sizeof(c));
+    c.kind = (uint8_t)d->kind;
+    const char* prefix = d->kind == CONS_PRIMARY ? "pk" : d->kind == CONS_UNIQUE ? "uq" : d->kind == CONS_FOREIGN ? "fk" : "chk";
+    if (d->name[0]) snprintf(c.name, sizeof(c.name), "%s", d->name);
+    else for (int k = 1; ; k++) {
+        snprintf(c.name, sizeof(c.name), "%s_%.40s_%d", prefix, ts->name, k);
+        if (!cons_name_used(ts, c.name)) break;
+    }
+    if (cons_name_used(ts, c.name)) { snprintf(msg, mn, "A constraint named '%.64s' already exists", c.name); return msg; }
+
+    if (d->kind == CONS_CHECK) {
+        Source src;
+        memset(&src, 0, sizeof(src));
+        snprintf(src.name, sizeof(src.name), "%s", ts->name);
+        snprintf(src.table, sizeof(src.table), "%s", ts->name);
+        src.ts = ts;
+        ASTExpr* e = compile_check(d->check, &src, msg, mn);
+        if (!e) return msg;
+        bool agg = expr_has_agg(e);
+        ast_expr_free(e);
+        if (agg) return "Aggregate functions are not allowed in CHECK";
+        snprintf(c.check, sizeof(c.check), "%s", d->check);
+    } else {
+        if (resolve_cols(ts, d->cols, d->ncols, c.cols, msg, mn)) return msg;
+        c.ncols = (uint8_t)d->ncols;
+    }
+    if (d->kind == CONS_PRIMARY) {
+        KeyDef keys[SV_MAX_CONSTRAINTS + 1];
+        int nk = table_keys(ts, keys, SV_MAX_CONSTRAINTS + 1);
+        for (int k = 0; k < nk; k++) if (keys[k].primary) return "A table can have only one PRIMARY KEY";
+    }
+    if (d->kind == CONS_FOREIGN) {
+        bool self = !strcasecmp(d->ref_table, ts->name);
+        TableSchema* P = self ? ts : catalog_get_table(ctx->catalog, db->name, d->ref_table);
+        if (!P) { snprintf(msg, mn, "Referenced table '%.64s' not found", d->ref_table); return msg; }
+        snprintf(c.ref_table, sizeof(c.ref_table), "%s", P->name);
+        int pc[SV_MAX_KEY_COLS];
+        int np = d->nref;
+        if (np == 0) {                                          // REFERENCES t: la chiave primaria di t
+            KeyDef keys[SV_MAX_CONSTRAINTS + 1];
+            int nk = table_keys(P, keys, SV_MAX_CONSTRAINTS + 1);
+            for (int k = 0; k < nk && !np; k++) if (keys[k].primary) { np = keys[k].n; memcpy(pc, keys[k].cols, sizeof(int) * (size_t)np); }
+            if (!np) { snprintf(msg, mn, "Table '%.64s' has no primary key: list the referenced columns", P->name); return msg; }
+        } else {
+            for (int k = 0; k < np; k++) {
+                pc[k] = catalog_get_col_index(P, d->ref_cols[k]);
+                if (pc[k] < 0) { snprintf(msg, mn, "Unknown column '%.64s' in table '%.64s'", d->ref_cols[k], P->name); return msg; }
+            }
+        }
+        if (np != d->ncols) { snprintf(msg, mn, "Foreign key '%.64s' has %d column(s) but references %d", c.name, d->ncols, np); return msg; }
+        // le colonne riferite devono formare una chiave (PRIMARY KEY o UNIQUE) della tabella riferita
+        KeyDef keys[SV_MAX_CONSTRAINTS + 1];
+        int nk = table_keys(P, keys, SV_MAX_CONSTRAINTS + 1);
+        bool is_key = false;
+        for (int k = 0; k < nk && !is_key; k++) {
+            if (keys[k].n != np) continue;
+            bool all = true;
+            for (int a = 0; a < np && all; a++) {
+                bool in = false;
+                for (int b = 0; b < np; b++) if (keys[k].cols[b] == pc[a]) in = true;
+                all = in;
+            }
+            is_key = all;
+        }
+        if (!is_key) { snprintf(msg, mn, "The columns referenced by '%.64s' must be the PRIMARY KEY or a UNIQUE key of '%.64s'", c.name, P->name); return msg; }
+        for (int k = 0; k < np; k++) {
+            snprintf(c.ref_cols[k], sizeof(c.ref_cols[k]), "%s", P->columns[pc[k]].name);
+            if (!types_compatible(ts->columns[c.cols[k]].type, P->columns[pc[k]].type)) {
+                snprintf(msg, mn, "Column '%.64s' (%s) cannot reference '%.64s.%.64s' (%s): different types", ts->columns[c.cols[k]].name,
+                         datatype_name(ts->columns[c.cols[k]].type), P->name, P->columns[pc[k]].name, datatype_name(P->columns[pc[k]].type));
+                return msg;
+            }
+        }
+        c.on_delete = (uint8_t)d->on_delete;
+        c.on_update = (uint8_t)d->on_update;
+        for (int k = 0; k < c.ncols; k++)
+            if ((c.on_delete == FK_SET_NULL || c.on_update == FK_SET_NULL) && !ts->columns[c.cols[k]].nullable) {
+                snprintf(msg, mn, "SET NULL is impossible: column '%.64s' is NOT NULL", ts->columns[c.cols[k]].name);
+                return msg;
+            }
+    }
+
+    // i dati esistenti devono già rispettare il vincolo (ALTER TABLE ADD CONSTRAINT)
+    if (ts->num_rows > 0 || ts->root_page_id) {
+        HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
+        HeapScan* scan = hf ? heap_scan_open(hf, ts) : NULL;
+        StrMap seen = {0};
+        Checks ck;
+        memset(&ck, 0, sizeof(ck));
+        const char* fail = NULL;
+        TableSchema* P = d->kind == CONS_FOREIGN ? catalog_get_table(ctx->catalog, db->name, c.ref_table) : NULL;
+        int pcols[SV_MAX_KEY_COLS], cc[SV_MAX_KEY_COLS];
+        for (int k = 0; k < c.ncols; k++) cc[k] = c.cols[k];
+        MemIndex* pix = NULL;
+        if (P && fk_ref_cols(&c, P, pcols)) pix = mi_get_cols(ctx, db->name, P, pcols, c.ncols);
+        if (d->kind == CONS_CHECK) {
+            ck.ts = ts;
+            snprintf(ck.src.name, sizeof(ck.src.name), "%s", ts->name);
+            snprintf(ck.src.table, sizeof(ck.src.table), "%s", ts->name);
+            ck.src.ts = ts;
+            ck.e[0] = compile_check(c.check, &ck.src, msg, mn);
+            ck.c[0] = &c;
+            ck.n = ck.e[0] ? 1 : 0;
+            if (!ck.n) fail = msg;
+        }
+        Tuple* t;
+        RID rid;
+        while (!fail && scan && (t = heap_scan_next(scan, &rid)) != NULL) {
+            char key[EV_STR_MAX + 1];
+            if (d->kind == CONS_CHECK) fail = checks_eval(&ck, t, msg, mn);
+            else if (d->kind == CONS_FOREIGN) {
+                if (tuple_key(ts, t, cc, c.ncols, key, sizeof(key)) && (!pix || !mi_lookup(pix, key) || !mi_lookup(pix, key)->n)) {
+                    snprintf(msg, mn, "Existing rows violate the foreign key '%.64s' (for example %.100s)", c.name, key);
+                    fail = msg;
+                }
+            } else {
+                if (!tuple_key(ts, t, cc, c.ncols, key, sizeof(key))) {
+                    if (d->kind == CONS_PRIMARY) fail = "Existing rows have NULL in the primary key columns";
+                } else {
+                    SMSlot* sl = sm_slot(&seen, key, true);
+                    if (!sl) fail = "Out of memory";
+                    else if (sl->val >= 0) { snprintf(msg, mn, "Existing rows have duplicate values for the new key (%.100s)", key); fail = msg; }
+                    else sl->val = 1;
+                }
+            }
+            tuple_free(t);
+        }
+        if (scan) heap_scan_close(scan);
+        free(hf);
+        sm_free(&seen);
+        checks_free(&ck);
+        if (fail) return fail;
+    }
+
+    ts->constraints[ts->num_constraints++] = c;
+    if (d->kind == CONS_PRIMARY)
+        for (int k = 0; k < c.ncols; k++) { ts->columns[c.cols[k]].primary_key = true; ts->columns[c.cols[k]].nullable = false; }
+    if (d->kind == CONS_UNIQUE && c.ncols == 1) ts->columns[c.cols[0]].unique = true;
+    mi_invalidate_table(db->name, ts->name);
+    return NULL;
+}
+
+// la tabella ts è riferita da una chiave esterna di un'altra tabella? (nome del vincolo)
+static const Constraint* referenced_by(Database* db, const TableSchema* ts, const TableSchema** child) {
+    for (int i = 0; i < db->num_tables; i++) {
+        const TableSchema* C = &db->tables[i];
+        if (C == ts) continue;
+        for (int k = 0; k < C->num_constraints; k++)
+            if (C->constraints[k].kind == CONS_FOREIGN && !strcasecmp(C->constraints[k].ref_table, ts->name)) {
+                if (child) *child = C;
+                return &C->constraints[k];
+            }
+    }
+    return NULL;
+}
+
 static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
@@ -3057,9 +3872,6 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     for (int i = 0; !from_select && i < nrows * ncols; i++) bind_expr(n->insert_stmt.values[i], &b);
     if (b.err[0]) return result_error_msg(b.err);
 
-    int pk = pk_column(ts);
-    MemIndex* pk_ix = pk >= 0 ? mi_get(ctx, db->name, ts, pk) : NULL;
-    if (pk >= 0 && !pk_ix) return result_error_msg("Out of memory (primary key index)");
     int ai = -1;
     for (int i = 0; i < nc; i++) if (ts->columns[i].auto_increment) { ai = i; break; }
     int64_t auto_next = 0;
@@ -3070,7 +3882,6 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     }
 
     Tuple** tuples = calloc((size_t)(nrows ? nrows : 1), sizeof(Tuple*));
-    StrMap batch = {0};
     if (!tuples) { orows_free(&srows); return result_error_msg("Out of memory"); }
     EvalCtx ec;
     memset(&ec, 0, sizeof(ec));
@@ -3122,21 +3933,9 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
         if (fail) break;
         tuples[r] = tuple_from_strings(text, nc, ts);
         if (!tuples[r]) { fail = "Out of memory"; break; }
-        if (pk >= 0) {                                            // chiave primaria univoca
-            char key[EV_STR_MAX + 1];
-            mi_key(&tuples[r]->values[pk], ts->columns[pk].type, key, sizeof(key));
-            const RidList* l = mi_lookup(pk_ix, key);
-            SMSlot* sl = sm_slot(&batch, key, true);
-            if (!sl) { fail = "Out of memory"; break; }
-            if ((l && l->n > 0) || sl->val >= 0) {
-                snprintf(msg, sizeof(msg), "Duplicate entry '%.60s' for primary key '%.64s'", key, ts->columns[pk].name);
-                fail = msg;
-                break;
-            }
-            sl->val = r;
-        }
     }
-    sm_free(&batch);
+    // vincoli: CHECK, PRIMARY KEY / UNIQUE (anche fra le righe dello statement), FOREIGN KEY
+    if (!fail) fail = validate_inserts(ctx, db, ts, tuples, nrows, msg, sizeof(msg));
     if (fail) {
         for (int r = 0; r < nrows; r++) if (tuples[r]) tuple_free(tuples[r]);
         free(tuples);
@@ -3257,60 +4056,21 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
     }
     ec.cur = NULL;
 
-    // chiave primaria: univoca fra le righe modificate e rispetto a tutte le altre
-    int pk = pk_column(ts);
-    bool pk_changed = false;
-    for (int k = 0; k < n->update_stmt.num_sets; k++) if (set_ci[k] == pk) pk_changed = true;
-    if (!fail && pk >= 0 && pk_changed && nm > 0) {
-        MemIndex* ix = mi_get(ctx, db->name, ts, pk);
-        StrMap mine = {0}, newkeys = {0};
-        if (!ix) fail = "Out of memory (primary key index)";
-        for (int i = 0; !fail && i < nm; i++) {
-            char rk[32];
-            rid_key(s.rids[idx[i]], rk, sizeof(rk));
-            if (!sm_slot(&mine, rk, true)) fail = "Out of memory";
-        }
-        for (int i = 0; !fail && i < nm; i++) {
-            char key[EV_STR_MAX + 1];
-            mi_key(&nt[i]->values[pk], ts->columns[pk].type, key, sizeof(key));
-            SMSlot* sl = sm_slot(&newkeys, key, true);
-            if (!sl) { fail = "Out of memory"; break; }
-            bool dup = sl->val >= 0;
-            sl->val = i;
-            const RidList* l = mi_lookup(ix, key);
-            for (int q = 0; !dup && l && q < l->n; q++) {
-                char rk[32];
-                rid_key(l->r[q], rk, sizeof(rk));
-                if (!sm_slot(&mine, rk, false)) dup = true;       // la chiave appartiene a una riga non modificata
-            }
-            if (dup) {
-                snprintf(msg, sizeof(msg), "Duplicate entry '%.60s' for primary key '%.64s'", key, ts->columns[pk].name);
-                fail = msg;
-            }
-        }
-        sm_free(&mine);
-        sm_free(&newkeys);
-    }
-
+    // modifiche (con le azioni a cascata delle chiavi esterne), controllo dei vincoli, scrittura
     int affected = 0;
     if (!fail) {
-        HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
-        if (!hf) fail = "Failed to open the table";
-        for (int i = 0; hf && i < nm; i++) {
-            RID rid = s.rids[idx[i]], nrid = rid;
-            Tuple* old = s.rows[idx[i]];
-            if (heap_update(hf, rid, nt[i], ts, &nrid) != SV_OK) {
-                mi_invalidate_table(db->name, ts->name);
-                snprintf(msg, sizeof(msg), "Failed to update row %d of %d (the previous rows were updated)", i + 1, nm);
-                fail = msg;
-                break;
-            }
-            wal_log(ctx, LOG_UPDATE, rid, nt[i], old, ts);
-            mi_on_delete(db->name, ts, old, rid);
-            mi_on_insert(db->name, ts, nt[i], nrid);
-            affected++;
+        ChangeSet cs;
+        memset(&cs, 0, sizeof(cs));
+        cs.x = ctx;
+        cs.db = db;
+        for (int i = 0; i < nm && !fail; i++) {
+            if (cs_add(&cs, ts, s.rids[idx[i]], s.rows[idx[i]], nt[i], false, true) < 0) fail = "Out of memory";
+            else nt[i] = NULL;                                   // ora appartiene all'insieme delle modifiche
         }
-        if (hf) { ts->num_pages = hf->num_pages; free(hf); }
+        if (!fail) fail = cs_cascade(&cs, msg, sizeof(msg));
+        if (!fail) fail = cs_validate(&cs, msg, sizeof(msg));
+        if (!fail) affected = cs_apply(&cs, msg, sizeof(msg), &fail);
+        cs_free(&cs);
     }
     for (int i = 0; i < nm; i++) if (nt[i]) tuple_free(nt[i]);
     free(nt);
@@ -3348,20 +4108,20 @@ static QueryResult* exec_delete(ExecCtx* ctx, ASTNode* n) {
     const char* fail = select_matches(ctx, db, &s, n->delete_stmt.where, &ec, &idx, &nm);
     if (fail) { snprintf(msg, sizeof(msg), "%s", fail); source_free(&s); return result_error_msg(msg); }
 
-    HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
     int affected = 0;
-    for (int i = 0; hf && i < nm; i++) {
-        RID rid = s.rids[idx[i]];
-        Tuple* old = s.rows[idx[i]];
-        wal_log(ctx, LOG_DELETE, rid, NULL, old, ts);
-        if (heap_delete(hf, rid) != SV_OK) { mi_invalidate_table(db->name, ts->name); continue; }
-        mi_on_delete(db->name, ts, old, rid);
-        if (ts->num_rows > 0) ts->num_rows--;
-        affected++;
-    }
-    free(hf);
+    ChangeSet cs;
+    memset(&cs, 0, sizeof(cs));
+    cs.x = ctx;
+    cs.db = db;
+    for (int i = 0; i < nm && !fail; i++)
+        if (cs_add(&cs, ts, s.rids[idx[i]], s.rows[idx[i]], NULL, false, true) < 0) fail = "Out of memory";
+    if (!fail) fail = cs_cascade(&cs, msg, sizeof(msg));
+    if (!fail) fail = cs_validate(&cs, msg, sizeof(msg));
+    if (!fail) affected = cs_apply(&cs, msg, sizeof(msg), &fail);
+    cs_free(&cs);
     free(idx);
     source_free(&s);
+    if (fail) { if (fail != msg) snprintf(msg, sizeof(msg), "%s", fail); return result_error_msg(msg); }
     return result_ok_msg(affected);
 }
 
@@ -3371,7 +4131,299 @@ static QueryResult* exec_use(ExecCtx* ctx, ASTNode* n) {
     return result_ok_msg(0);
 }
 
+// ═════════════════════════════════════════════════════════════════
+//  Script DDL di una tabella e SHOW
+// ═════════════════════════════════════════════════════════════════
+
+static const char* fk_action_name(int a) {
+    switch (a) {
+        case FK_CASCADE: return "CASCADE";  case FK_SET_NULL: return "SET NULL";
+        case FK_SET_DEFAULT: return "SET DEFAULT"; case FK_RESTRICT: return "RESTRICT";
+        default: return "NO ACTION";
+    }
+}
+
+typedef struct { char* p; size_t n, cap; bool ok; } TBuf;
+
+static void tb_add(TBuf* b, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+#include <stdarg.h>
+static void tb_add(TBuf* b, const char* fmt, ...) {
+    if (!b->ok) return;
+    for (;;) {
+        va_list ap;
+        va_start(ap, fmt);
+        int w = vsnprintf(b->p ? b->p + b->n : NULL, b->p ? b->cap - b->n : 0, fmt, ap);
+        va_end(ap);
+        if (w < 0) { b->ok = false; return; }
+        if (b->p && b->n + (size_t)w < b->cap) { b->n += (size_t)w; return; }
+        size_t nc = (b->cap ? b->cap : 256) * 2 + (size_t)w;
+        char* np = realloc(b->p, nc);
+        if (!np) { b->ok = false; return; }
+        b->p = np;
+        b->cap = nc;
+    }
+}
+
+static void tb_cols(TBuf* b, const TableSchema* ts, const uint8_t* cols, int n) {
+    for (int k = 0; k < n; k++) tb_add(b, "%s%s", k ? ", " : "", ts->columns[cols[k]].name);
+}
+
+static void tb_fk(TBuf* b, const TableSchema* ts, const Constraint* c) {
+    tb_add(b, "CONSTRAINT %s FOREIGN KEY (", c->name);
+    tb_cols(b, ts, c->cols, c->ncols);
+    tb_add(b, ") REFERENCES %s (", c->ref_table);
+    for (int k = 0; k < c->ncols; k++) tb_add(b, "%s%s", k ? ", " : "", c->ref_cols[k]);
+    tb_add(b, ")");
+    if (c->on_delete != FK_NO_ACTION) tb_add(b, " ON DELETE %s", fk_action_name(c->on_delete));
+    if (c->on_update != FK_NO_ACTION) tb_add(b, " ON UPDATE %s", fk_action_name(c->on_update));
+}
+
+// CREATE TABLE con colonne e vincoli; with_fk = false: senza le chiavi esterne (un dump le
+// aggiunge alla fine con executor_fk_statements, quando tutte le tabelle hanno i dati)
+char* executor_create_statement(Catalog* cat, const char* db, const char* table, bool with_fk) {
+    TableSchema* t = catalog_get_table(cat, db, table);
+    if (!t) return NULL;
+    TBuf b = { NULL, 0, 0, true };
+    char pkname[SV_MAX_NAME_LEN + 8];
+    snprintf(pkname, sizeof(pkname), "pk_%.58s", t->name);
+    const Constraint* inline_pk = NULL;
+    for (int i = 0; i < t->num_constraints; i++)
+        if (t->constraints[i].kind == CONS_PRIMARY && t->constraints[i].ncols == 1 && !strcasecmp(t->constraints[i].name, pkname))
+            inline_pk = &t->constraints[i];
+    bool has_pk_cons = false;
+    for (int i = 0; i < t->num_constraints; i++) if (t->constraints[i].kind == CONS_PRIMARY) has_pk_cons = true;
+    tb_add(&b, "CREATE TABLE %s (", t->name);
+    for (int i = 0; i < t->num_columns; i++) {
+        const Column* c = &t->columns[i];
+        char type[48];
+        if ((c->type == SV_TYPE_VARCHAR || c->type == SV_TYPE_CHAR) && c->size > 0)
+            snprintf(type, sizeof(type), "%s(%d)", datatype_name(c->type), c->size);
+        else
+            snprintf(type, sizeof(type), "%s", datatype_name(c->type));
+        bool pk_here = (inline_pk && inline_pk->cols[0] == i) || (!has_pk_cons && c->primary_key);
+        tb_add(&b, "%s\n    %s %s%s%s%s", i ? "," : "", c->name, type, pk_here ? " PRIMARY KEY" : "",
+               c->auto_increment ? " AUTO_INCREMENT" : "", (!c->nullable && !c->primary_key) ? " NOT NULL" : "");
+        if (c->default_val[0]) {
+            bool num = c->type == SV_TYPE_INT || c->type == SV_TYPE_BIGINT || c->type == SV_TYPE_FLOAT ||
+                       c->type == SV_TYPE_DECIMAL || c->type == SV_TYPE_BOOL || !strcasecmp(c->default_val, "NULL");
+            tb_add(&b, num ? " DEFAULT %s" : " DEFAULT '%s'", c->default_val);
+        }
+    }
+    for (int i = 0; i < t->num_constraints; i++) {
+        const Constraint* c = &t->constraints[i];
+        if (c == inline_pk || (c->kind == CONS_FOREIGN && !with_fk)) continue;
+        tb_add(&b, ",\n    ");
+        switch (c->kind) {
+            case CONS_PRIMARY: tb_add(&b, "CONSTRAINT %s PRIMARY KEY (", c->name); tb_cols(&b, t, c->cols, c->ncols); tb_add(&b, ")"); break;
+            case CONS_UNIQUE:  tb_add(&b, "CONSTRAINT %s UNIQUE (", c->name); tb_cols(&b, t, c->cols, c->ncols); tb_add(&b, ")"); break;
+            case CONS_CHECK:   tb_add(&b, "CONSTRAINT %s CHECK (%s)", c->name, c->check); break;
+            case CONS_FOREIGN: tb_fk(&b, t, c); break;
+        }
+    }
+    tb_add(&b, "\n);");
+    if (!b.ok) { free(b.p); return NULL; }
+    return b.p;
+}
+
+// ALTER TABLE ... ADD CONSTRAINT per le chiavi esterne della tabella ("" se non ne ha)
+char* executor_fk_statements(Catalog* cat, const char* db, const char* table) {
+    TableSchema* t = catalog_get_table(cat, db, table);
+    if (!t) return NULL;
+    TBuf b = { NULL, 0, 0, true };
+    tb_add(&b, "%s", "");
+    for (int i = 0; i < t->num_constraints; i++) {
+        if (t->constraints[i].kind != CONS_FOREIGN) continue;
+        tb_add(&b, "ALTER TABLE %s ADD ", t->name);
+        tb_fk(&b, t, &t->constraints[i]);
+        tb_add(&b, ";\n");
+    }
+    if (!b.ok) { free(b.p); return NULL; }
+    return b.p;
+}
+
+// risultato con colonne di testo
+static QueryResult* text_result(int ncols, const char* const* names) {
+    QueryResult* r = calloc(1, sizeof(QueryResult));
+    if (!r) return NULL;
+    r->success = true;
+    r->num_cols = ncols;
+    r->col_names = calloc((size_t)ncols, sizeof(char*));
+    r->col_types = calloc((size_t)ncols, sizeof(char*));
+    if (!r->col_names || !r->col_types) { db_result_free(r); return NULL; }
+    for (int i = 0; i < ncols; i++) { r->col_names[i] = strdup(names[i]); r->col_types[i] = strdup("VARCHAR"); }
+    return r;
+}
+
+static bool text_row(QueryResult* r, int* cap, const char* const* vals) {
+    if (r->num_rows >= *cap) {
+        int nc = *cap ? *cap * 2 : 16;
+        Row* nr = realloc(r->rows, sizeof(Row) * (size_t)nc);
+        if (!nr) return false;
+        r->rows = nr;
+        *cap = nc;
+    }
+    Row* row = &r->rows[r->num_rows];
+    row->cells = calloc((size_t)r->num_cols, sizeof(Cell));
+    if (!row->cells) return false;
+    row->num_cells = r->num_cols;
+    for (int i = 0; i < r->num_cols; i++) {
+        Cell* c = &row->cells[i];
+        if (!vals[i]) { c->is_null = true; c->type = CELL_TYPE_NULL; snprintf(c->value, sizeof(c->value), "NULL"); continue; }
+        snprintf(c->value, sizeof(c->value), "%s", vals[i]);
+        c->type = CELL_TYPE_STRING;
+    }
+    r->num_rows++;
+    return true;
+}
+
+static QueryResult* exec_show_extra(ExecCtx* ctx, ASTNode* n) {
+    const char* kind = n->select_stmt.table_name;
+    Database* db = catalog_current_db(ctx->catalog);
+    int cap = 0;
+    char a[600], b2[600], c3[600];
+    if (!strcmp(kind, "STATUS")) {
+        static const char* const NAMES[] = { "Variable", "Value" };
+        QueryResult* r = text_result(2, NAMES);
+        if (!r) return result_error_msg("Out of memory");
+        BufferStats* st = &ctx->bp->stats;
+        int mi = 0;
+        for (MemIndex* ix = g_mem_indexes; ix; ix = ix->next) mi++;
+        long pages = sv_lseek(ctx->bp->db_fd, 0, SEEK_END) / SV_PAGE_SIZE;
+        struct { const char* k; char v[64]; } rows[16];
+        int nr = 0;
+        #define STAT(name, ...) do { rows[nr].k = name; snprintf(rows[nr].v, sizeof(rows[nr].v), __VA_ARGS__); nr++; } while (0)
+        STAT("page_size", "%d bytes", SV_PAGE_SIZE);
+        STAT("database_pages", "%ld", pages);
+        STAT("buffer_pool_frames", "%d (%d in use)", ctx->bp->capacity, ctx->bp->num_used);
+        STAT("buffer_pool_policy", "CLOCK (second chance)");
+        STAT("buffer_requests", "%llu", (unsigned long long)st->requests);
+        STAT("buffer_hits", "%llu", (unsigned long long)st->hits);
+        STAT("buffer_misses", "%llu (pages read from disk)", (unsigned long long)st->misses);
+        STAT("buffer_hit_ratio", "%.2f%%", st->requests ? 100.0 * (double)st->hits / (double)st->requests : 100.0);
+        STAT("buffer_evictions", "%llu", (unsigned long long)st->evictions);
+        STAT("pages_written", "%llu", (unsigned long long)st->dirty_writes);
+        STAT("pages_allocated", "%llu", (unsigned long long)st->new_pages);
+        STAT("wal_size", "%ld bytes", ctx->wal ? wal_size(ctx->wal) : 0L);
+        STAT("wal_records", "%llu", ctx->wal ? (unsigned long long)ctx->wal->sequence : 0ULL);
+        STAT("checkpoints", "%llu", ctx->wal ? (unsigned long long)ctx->wal->checkpoints : 0ULL);
+        STAT("in_memory_indexes", "%d", mi);
+        if (ctx->tx_id) STAT("transaction", "%llu (open)", (unsigned long long)ctx->tx_id);
+        else            STAT("transaction", "none (autocommit)");
+        #undef STAT
+        for (int i = 0; i < nr; i++) {
+            const char* v[2] = { rows[i].k, rows[i].v };
+            if (!text_row(r, &cap, v)) { db_result_free(r); return result_error_msg("Out of memory"); }
+        }
+        return r;
+    }
+    if (!db) return result_error_msg("No database selected");
+    TableSchema* ts = catalog_get_table(ctx->catalog, db->name, n->select_stmt.table_alias);
+    if (!ts) { snprintf(a, sizeof(a), "Table '%.64s' not found", n->select_stmt.table_alias); return result_error_msg(a); }
+    if (!strcmp(kind, "CREATE")) {
+        static const char* const NAMES[] = { "Table", "Create Table" };
+        QueryResult* r = text_result(2, NAMES);
+        char* ddl = executor_create_statement(ctx->catalog, db->name, ts->name, true);
+        const char* v[2] = { ts->name, ddl ? ddl : "" };
+        if (!r || !text_row(r, &cap, v)) { free(ddl); db_result_free(r); return result_error_msg("Out of memory"); }
+        free(ddl);
+        return r;
+    }
+    if (!strcmp(kind, "CONSTRAINTS")) {
+        static const char* const NAMES[] = { "Name", "Type", "Columns", "References", "On delete", "On update", "Check" };
+        QueryResult* r = text_result(7, NAMES);
+        if (!r) return result_error_msg("Out of memory");
+        bool pk_cons = false;
+        for (int i = 0; i < ts->num_constraints; i++) if (ts->constraints[i].kind == CONS_PRIMARY) pk_cons = true;
+        for (int i = 0; !pk_cons && i < ts->num_columns; i++)
+            if (ts->columns[i].primary_key) {                    // formato precedente: colonna PRIMARY KEY
+                const char* v[7] = { "PRIMARY", "PRIMARY KEY", ts->columns[i].name, NULL, NULL, NULL, NULL };
+                text_row(r, &cap, v);
+                break;
+            }
+        for (int i = 0; i < ts->num_constraints; i++) {
+            const Constraint* c = &ts->constraints[i];
+            TBuf cb = { NULL, 0, 0, true };
+            tb_cols(&cb, ts, c->cols, c->ncols);
+            snprintf(a, sizeof(a), "%s", cb.p ? cb.p : "");
+            free(cb.p);
+            b2[0] = '\0';
+            if (c->kind == CONS_FOREIGN) {
+                size_t len = (size_t)snprintf(b2, sizeof(b2), "%.64s (", c->ref_table);
+                for (int k = 0; k < c->ncols && len < sizeof(b2); k++) len += (size_t)snprintf(b2 + len, sizeof(b2) - len, "%s%.64s", k ? ", " : "", c->ref_cols[k]);
+                if (len < sizeof(b2)) snprintf(b2 + len, sizeof(b2) - len, ")");
+            }
+            snprintf(c3, sizeof(c3), "%s", c->check);
+            const char* type = c->kind == CONS_PRIMARY ? "PRIMARY KEY" : c->kind == CONS_UNIQUE ? "UNIQUE" :
+                               c->kind == CONS_FOREIGN ? "FOREIGN KEY" : "CHECK";
+            bool fk = c->kind == CONS_FOREIGN;
+            const char* v[7] = { c->name, type, c->kind == CONS_CHECK ? NULL : a, fk ? b2 : NULL,
+                                 fk ? fk_action_name(c->on_delete) : NULL, fk ? fk_action_name(c->on_update) : NULL,
+                                 c->kind == CONS_CHECK ? c3 : NULL };
+            if (!text_row(r, &cap, v)) { db_result_free(r); return result_error_msg("Out of memory"); }
+        }
+        return r;
+    }
+    // INDEXES: chiavi, indici dichiarati e chiavi esterne, con lo stato dell'indice in memoria
+    static const char* const NAMES[] = { "Name", "Columns", "Kind", "Built", "Distinct keys" };
+    QueryResult* r = text_result(5, NAMES);
+    if (!r) return result_error_msg("Out of memory");
+    struct { char name[SV_MAX_NAME_LEN]; int cols[SV_MAX_KEY_COLS]; int n; const char* kind; } ix[SV_MAX_CONSTRAINTS * 2 + SV_MAX_INDEXES + 1];
+    int nix = 0;
+    KeyDef keys[SV_MAX_CONSTRAINTS + 1];
+    int nk = table_keys(ts, keys, SV_MAX_CONSTRAINTS + 1);
+    for (int k = 0; k < nk; k++) {
+        snprintf(ix[nix].name, sizeof(ix[nix].name), "%s", keys[k].name);
+        memcpy(ix[nix].cols, keys[k].cols, sizeof(int) * (size_t)keys[k].n);
+        ix[nix].n = keys[k].n;
+        ix[nix].kind = keys[k].primary ? "PRIMARY KEY (hash)" : "UNIQUE (hash)";
+        nix++;
+    }
+    for (int i = 0; i < ts->num_indexes; i++) {
+        int ci = catalog_get_col_index(ts, ts->indexes[i].col_name);
+        if (ci < 0) continue;
+        snprintf(ix[nix].name, sizeof(ix[nix].name), "%s", ts->indexes[i].name);
+        ix[nix].cols[0] = ci; ix[nix].n = 1; ix[nix].kind = "INDEX (hash)";
+        nix++;
+    }
+    for (int i = 0; i < ts->num_constraints; i++) {
+        const Constraint* c = &ts->constraints[i];
+        if (c->kind != CONS_FOREIGN) continue;
+        snprintf(ix[nix].name, sizeof(ix[nix].name), "%s", c->name);
+        for (int k = 0; k < c->ncols; k++) ix[nix].cols[k] = c->cols[k];
+        ix[nix].n = c->ncols; ix[nix].kind = "FOREIGN KEY (hash)";
+        nix++;
+    }
+    for (int i = 0; i < ts->num_columns; i++)
+        if (ts->columns[i].auto_increment) {
+            snprintf(ix[nix].name, sizeof(ix[nix].name), "auto_increment");
+            ix[nix].cols[0] = i; ix[nix].n = 1; ix[nix].kind = "AUTO_INCREMENT (hash)";
+            nix++;
+            break;
+        }
+    for (int i = 0; i < nix; i++) {
+        size_t len = 0;
+        a[0] = '\0';
+        for (int k = 0; k < ix[i].n && len < sizeof(a); k++)
+            len += (size_t)snprintf(a + len, sizeof(a) - len, "%s%s", k ? ", " : "", ts->columns[ix[i].cols[k]].name);
+        // indice costruito? (nome come in mi_get_cols)
+        char nm[SV_MAX_NAME_LEN * 2];
+        size_t nl = 0;
+        nm[0] = '\0';
+        for (int k = 0; k < ix[i].n && nl < sizeof(nm); k++)
+            nl += (size_t)snprintf(nm + nl, sizeof(nm) - nl, "%s%s", k ? "," : "", ts->columns[ix[i].cols[k]].name);
+        MemIndex* mi = NULL;
+        for (MemIndex* m = g_mem_indexes; m; m = m->next)
+            if (!strcasecmp(m->db, db->name) && !strcasecmp(m->table, ts->name) && !strcasecmp(m->col, nm)) mi = m;
+        snprintf(b2, sizeof(b2), "%d", mi ? (int)mi->map.n : 0);
+        const char* v[5] = { ix[i].name, a, ix[i].kind, mi ? "yes" : "no (built on first use)", mi ? b2 : NULL };
+        if (!text_row(r, &cap, v)) { db_result_free(r); return result_error_msg("Out of memory"); }
+    }
+    return r;
+}
+
 static QueryResult* exec_show(ExecCtx* ctx, ASTNode* n) {
+    if (strcmp(n->select_stmt.table_name, "TABLES") && strcmp(n->select_stmt.table_name, "DATABASES"))
+        return exec_show_extra(ctx, n);
     bool tables = strcmp(n->select_stmt.table_name, "TABLES") == 0;
     Database* db = catalog_current_db(ctx->catalog);
     if (tables && !db) return result_error_msg("No database selected");
@@ -3433,7 +4485,18 @@ static QueryResult* exec_describe(ExecCtx* ctx, ASTNode* n) {
         snprintf(r->rows[i].cells[0].value, sizeof(r->rows[i].cells[0].value), "%s", cols[i].name);
         snprintf(r->rows[i].cells[1].value, sizeof(r->rows[i].cells[1].value), "%s", cols[i].type);
         snprintf(r->rows[i].cells[2].value, sizeof(r->rows[i].cells[2].value), "%s", cols[i].nullable ? "YES" : "NO");
-        snprintf(r->rows[i].cells[3].value, sizeof(r->rows[i].cells[3].value), "%s", cols[i].primary_key ? "PRI" : "");
+        const char* key = cols[i].primary_key ? "PRI" : "";
+        TableSchema* dts = catalog_get_table(ctx->catalog, db->name, tname);
+        int ci = dts ? catalog_get_col_index(dts, cols[i].name) : -1;
+        for (int k = 0; !key[0] && dts && ci >= 0 && k < dts->num_constraints; k++) {
+            const Constraint* c = &dts->constraints[k];
+            if (c->kind == CONS_UNIQUE && c->ncols == 1 && c->cols[0] == ci) key = "UNI";
+        }
+        for (int k = 0; !key[0] && dts && ci >= 0 && k < dts->num_constraints; k++) {
+            const Constraint* c = &dts->constraints[k];
+            for (int j = 0; (c->kind == CONS_FOREIGN || c->kind == CONS_UNIQUE) && j < c->ncols; j++) if (c->cols[j] == ci) key = "MUL";
+        }
+        snprintf(r->rows[i].cells[3].value, sizeof(r->rows[i].cells[3].value), "%s", key);
     }
     db_columns_free(cols, num_cols);
     return r;
@@ -3514,6 +4577,14 @@ static QueryResult* exec_truncate(ExecCtx* ctx, ASTNode* n) {
     if (!db) return result_error_msg("No database selected");
     TableSchema* ts = catalog_get_table(ctx->catalog, db->name, n->delete_stmt.table_name);
     if (!ts) return result_error_msg("Table not found");
+    const TableSchema* child = NULL;
+    const Constraint* ref = referenced_by(db, ts, &child);
+    if (ref) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "Cannot truncate '%.64s': it is referenced by the foreign key '%.64s' of table '%.64s' (use DELETE)",
+                 ts->name, ref->name, child->name);
+        return result_error_msg(msg);
+    }
     // Delete all rows
     HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
     if (!hf) return result_error_msg("Failed to open heap");
@@ -3569,6 +4640,7 @@ QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt) {
         case NODE_SAVEPOINT:    return result_ok_msg(0);
         case NODE_ROLLBACK_TO:  return result_ok_msg(0);
         case NODE_CREATE_TRIGGER: return result_ok_msg(0);
+        case NODE_CHECKPOINT:   return result_ok_msg(0);
         case NODE_DROP_TRIGGER: return result_ok_msg(0);
         default:
             return result_error_msg("Unsupported statement type");

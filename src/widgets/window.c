@@ -2703,7 +2703,7 @@ static bool dump_database(AppWindow* app, const char* path) {
     int tables = 0, rows = 0;
     for (int i = 0; nl && i < nl->count; i++) {
         const char* t = nl->names[i];
-        char* create = db_get_create_statement(dbname, t);
+        char* create = db_get_create_statement_nofk(dbname, t);   // le FOREIGN KEY alla fine
         if (create) {
             sb_add(&b, create);
             size_t cl = strlen(create);
@@ -2729,6 +2729,12 @@ static bool dump_database(AppWindow* app, const char* path) {
         db_result_free(r);
         sb_add(&b, "\n");
         tables++;
+    }
+    // chiavi esterne dopo i dati di tutte le tabelle: lo script si ricarica in qualunque ordine
+    for (int i = 0; nl && i < nl->count; i++) {
+        char* fk = db_get_foreign_keys(dbname, nl->names[i]);
+        if (fk && fk[0]) sb_add(&b, fk);
+        db_free_string(fk);
     }
     db_namelist_free(nl);
     bool ok = b.p && write_text_file(path, b.p);

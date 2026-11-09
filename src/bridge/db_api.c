@@ -191,6 +191,9 @@ static QueryResult* db_execute_impl(const char* sql) {
             result = db_commit() ? result_ok(0) : result_error("Failed to commit");
         } else if (stmt->type == NODE_ROLLBACK && stmt->rollback_to.name[0] == 0) {
             result = db_rollback() ? result_ok(0) : result_error("Failed to rollback");
+        } else if (stmt->type == NODE_CHECKPOINT) {
+            result = g_db.exec_ctx.tx_id ? result_error("CHECKPOINT is not allowed inside a transaction")
+                   : do_checkpoint() ? result_ok(0) : result_error("Checkpoint failed");
         } else if (stmt->type == NODE_SAVEPOINT) {
             result = db_savepoint(stmt->savepoint.name) ? result_ok(0) : result_error("Failed to set savepoint");
         } else if (stmt->type == NODE_ROLLBACK_TO) {
@@ -531,8 +534,10 @@ static ColumnInfo* db_list_columns_impl(const char* db_name, const char* table,
     ColumnInfo* cols = SV_ALLOC_N(ColumnInfo, t->num_columns);
     for (int i = 0; i < t->num_columns; i++) {
         strncpy(cols[i].name, t->columns[i].name, 63);
-        snprintf(cols[i].type, sizeof(cols[i].type), "%s",
-                 datatype_name(t->columns[i].type));
+        if ((t->columns[i].type == SV_TYPE_VARCHAR || t->columns[i].type == SV_TYPE_CHAR) && t->columns[i].size > 0)
+            snprintf(cols[i].type, sizeof(cols[i].type), "%s(%d)", datatype_name(t->columns[i].type), t->columns[i].size);
+        else
+            snprintf(cols[i].type, sizeof(cols[i].type), "%s", datatype_name(t->columns[i].type));
         cols[i].nullable       = t->columns[i].nullable;
         cols[i].primary_key    = t->columns[i].primary_key;
         cols[i].auto_increment = t->columns[i].auto_increment;
@@ -584,31 +589,15 @@ void db_session_free(SessionInfo* s) { free(s); }
 
 // CREATE TABLE che ricrea la struttura della tabella (dump, "Copy as SQL")
 static char* db_get_create_statement_impl(const char* db_name, const char* table) {
-    TableSchema* t = catalog_get_table(g_db.catalog, db_name, table);
-    if (!t) return NULL;
-    size_t cap = 256 + (size_t)t->num_columns * 400;
-    char* out = malloc(cap);
-    if (!out) return NULL;
-    size_t n = (size_t)snprintf(out, cap, "CREATE TABLE %s (", t->name);
-    for (int i = 0; i < t->num_columns && n < cap; i++) {
-        const Column* c = &t->columns[i];
-        char type[48];
-        if ((c->type == SV_TYPE_VARCHAR || c->type == SV_TYPE_CHAR) && c->size > 0)
-            snprintf(type, sizeof(type), "%s(%d)", datatype_name(c->type), c->size);
-        else
-            snprintf(type, sizeof(type), "%s", datatype_name(c->type));
-        n += (size_t)snprintf(out + n, cap - n, "%s\n    %s %s%s%s%s", i ? "," : "", c->name, type,
-                              c->primary_key ? " PRIMARY KEY" : "",
-                              c->auto_increment ? " AUTO_INCREMENT" : "",
-                              (!c->nullable && !c->primary_key) ? " NOT NULL" : "");
-        if (c->default_val[0] && n < cap) {
-            bool num = c->type == SV_TYPE_INT || c->type == SV_TYPE_BIGINT || c->type == SV_TYPE_FLOAT ||
-                       c->type == SV_TYPE_DECIMAL;
-            n += (size_t)snprintf(out + n, cap - n, num ? " DEFAULT %s" : " DEFAULT '%s'", c->default_val);
-        }
-    }
-    if (n < cap) snprintf(out + n, cap - n, "\n);");
-    return out;
+    return executor_create_statement(g_db.catalog, db_name, table, true);
+}
+
+static char* db_get_create_statement_nofk_impl(const char* db_name, const char* table) {
+    return executor_create_statement(g_db.catalog, db_name, table, false);
+}
+
+static char* db_get_foreign_keys_impl(const char* db_name, const char* table) {
+    return executor_fk_statements(g_db.catalog, db_name, table);
 }
 
 void db_free_string(char* s) { free(s); }
@@ -773,6 +762,20 @@ SessionInfo* db_session_info(void) {
 char* db_get_create_statement(const char* db_name, const char* table) {
     db_lock();
     char* r = db_get_create_statement_impl(db_name, table);
+    db_unlock();
+    return r;
+}
+
+char* db_get_create_statement_nofk(const char* db_name, const char* table) {
+    db_lock();
+    char* r = db_get_create_statement_nofk_impl(db_name, table);
+    db_unlock();
+    return r;
+}
+
+char* db_get_foreign_keys(const char* db_name, const char* table) {
+    db_lock();
+    char* r = db_get_foreign_keys_impl(db_name, table);
     db_unlock();
     return r;
 }

@@ -1,5 +1,6 @@
 #include "schema.h"
 #include <string.h>
+#include <stddef.h>
 #include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,7 +53,31 @@ Catalog* catalog_create(void) {
 // letto e alla prima chiusura riscritto nel formato v2.
 
 #define CAT_MAGIC   "SVCAT2\0\0"
-#define CAT_VERSION 3u   // v3: il flag "nullable" delle colonne è significativo (NOT NULL applicato)
+#define CAT_VERSION 4u   // v3: il flag "nullable" delle colonne è significativo (NOT NULL applicato)
+                         // v4: vincoli (PRIMARY KEY composta, UNIQUE, FOREIGN KEY, CHECK) in coda a TableSchema
+
+// TableSchema fino alla v3: gli stessi campi senza i vincoli in coda
+#define TABLE_V3_SIZE offsetof(TableSchema, num_constraints)
+
+// formato più vecchio (v1): la struct Catalog intera, con le TableSchema senza vincoli
+typedef struct { uint8_t raw[TABLE_V3_SIZE]; } TableSchemaV3;
+typedef struct {
+    char           name[SV_MAX_NAME_LEN];
+    TableSchemaV3  tables[SV_MAX_TABLES];
+    int            num_tables;
+    ViewSchema     views[64];
+    int            num_views;
+    RoutineSchema  routines[64];
+    int            num_routines;
+    TriggerSchema  triggers[64];
+    int            num_triggers;
+} DatabaseV1;
+typedef struct {
+    DatabaseV1  databases[SV_MAX_DATABASES];
+    int         num_databases;
+    int         current_db;
+    uint32_t    next_page_id;
+} CatalogV1;
 
 // lettura/scrittura complete (read/write possono trasferire meno byte del richiesto)
 static bool read_all(int fd, void* buf, size_t n) {
@@ -94,7 +119,7 @@ Catalog* catalog_load(const char* path) {
     if (ok && memcmp(magic, CAT_MAGIC, 8) == 0) {
         uint32_t version = 0, next_page = 1;
         int32_t ndb = 0, cur = -1;
-        ok = read_all(fd, &version, 4) && (version == 2u || version == CAT_VERSION) &&
+        ok = read_all(fd, &version, 4) && version >= 2u && version <= CAT_VERSION &&
              read_i32(fd, &ndb) && read_i32(fd, &cur) && read_all(fd, &next_page, 4) &&
              ndb >= 0 && ndb <= SV_MAX_DATABASES;
         if (ok) {
@@ -112,15 +137,39 @@ Catalog* catalog_load(const char* path) {
                  nr >= 0 && nr <= 64 && ntr >= 0 && ntr <= 64;
             if (!ok) break;
             db->num_tables = nt; db->num_views = nv; db->num_routines = nr; db->num_triggers = ntr;
-            ok = read_all(fd, db->tables,   sizeof(TableSchema)   * (size_t)nt) &&
+            if (version >= 4u) ok = read_all(fd, db->tables, sizeof(TableSchema) * (size_t)nt);
+            else for (int t = 0; ok && t < nt; t++) ok = read_all(fd, &db->tables[t], TABLE_V3_SIZE);   // senza vincoli
+            ok = ok &&
                  read_all(fd, db->views,    sizeof(ViewSchema)    * (size_t)nv) &&
                  read_all(fd, db->routines, sizeof(RoutineSchema) * (size_t)nr) &&
                  read_all(fd, db->triggers, sizeof(TriggerSchema) * (size_t)ntr);
         }
     } else if (ok) {
-        // formato precedente: la struct Catalog intera
-        memcpy(c, magic, sizeof(magic));
-        ok = read_all(fd, (uint8_t*)c + sizeof(magic), sizeof(Catalog) - sizeof(magic));
+        // formato precedente: la struct Catalog intera (TableSchema senza vincoli)
+        CatalogV1* old = calloc(1, sizeof(CatalogV1));
+        ok = old != NULL;
+        if (ok) {
+            memcpy(old, magic, sizeof(magic));
+            ok = read_all(fd, (uint8_t*)old + sizeof(magic), sizeof(CatalogV1) - sizeof(magic)) &&
+                 old->num_databases >= 0 && old->num_databases <= SV_MAX_DATABASES;
+        }
+        for (int d = 0; ok && d < old->num_databases; d++) {
+            DatabaseV1* od = &old->databases[d];
+            Database* nd = &c->databases[d];
+            if (od->num_tables < 0 || od->num_tables > SV_MAX_TABLES) { ok = false; break; }
+            memcpy(nd->name, od->name, sizeof(nd->name));
+            nd->num_tables = od->num_tables;
+            for (int t = 0; t < od->num_tables; t++) memcpy(&nd->tables[t], od->tables[t].raw, TABLE_V3_SIZE);
+            memcpy(nd->views, od->views, sizeof(nd->views));       nd->num_views = od->num_views;
+            memcpy(nd->routines, od->routines, sizeof(nd->routines)); nd->num_routines = od->num_routines;
+            memcpy(nd->triggers, od->triggers, sizeof(nd->triggers)); nd->num_triggers = od->num_triggers;
+        }
+        if (ok) {
+            c->num_databases = old->num_databases;
+            c->current_db = old->current_db;
+            c->next_page_id = old->next_page_id;
+        }
+        free(old);
         migrate_nullable = true;
     }
     sv_close(fd);

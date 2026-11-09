@@ -465,6 +465,132 @@ int main(void) {
     t("DELETE FROM esame WHERE voto < (SELECT AVG(voto) FROM esame e2 WHERE e2.corso = esame.corso)", "OK:4");
     t("SELECT COUNT(*) FROM esame", "5");
 
+    // ── vincoli di integrità: PRIMARY KEY composta, UNIQUE, CHECK, FOREIGN KEY con azioni ──
+    t("CREATE DATABASE vinc", "OK:0");
+    t("USE vinc", "OK:0");
+    t("CREATE TABLE dipartimento (codice CHAR(3) PRIMARY KEY, nome VARCHAR(30) NOT NULL UNIQUE)", "OK:0");
+    t("CREATE TABLE impiegato (matricola INT PRIMARY KEY, nome VARCHAR(30) NOT NULL, stipendio INT CHECK (stipendio > 0), "
+      "dip CHAR(3) REFERENCES dipartimento ON DELETE SET NULL ON UPDATE CASCADE, capo INT, "
+      "CONSTRAINT fk_capo FOREIGN KEY (capo) REFERENCES impiegato (matricola) ON DELETE CASCADE, "
+      "CONSTRAINT stip_max CHECK (stipendio <= 10000))", "OK:0");
+    t("INSERT INTO dipartimento VALUES ('AMM', 'Amministrazione'), ('PRO', 'Produzione')", "OK:2");
+    t("INSERT INTO dipartimento VALUES ('XXX', 'Produzione')", "ERR:Duplicate entry 'Produzione' for unique key 'nome'");
+    t("INSERT INTO impiegato VALUES (1, 'Rossi', 5000, 'AMM', NULL)", "OK:1");
+    t("INSERT INTO impiegato VALUES (2, 'Bianchi', 3000, 'PRO', 1), (3, 'Verdi', 2000, 'PRO', 2)", "OK:2");   // 3 riferisce 2 dello stesso INSERT
+    t("INSERT INTO impiegato VALUES (4, 'Neri', 1000, 'ZZZ', NULL)", "ERR:Foreign key");
+    t("INSERT INTO impiegato VALUES (4, 'Neri', 1000, NULL, 99)", "ERR:Foreign key 'fk_capo' is violated");
+    t("INSERT INTO impiegato VALUES (4, 'Neri', -5, NULL, NULL)", "ERR:CHECK constraint");
+    t("INSERT INTO impiegato VALUES (4, 'Neri', 20000, NULL, NULL)", "ERR:'stip_max' is violated");
+    t("INSERT INTO impiegato VALUES (4, 'Neri', NULL, NULL, NULL)", "OK:1");                 // CHECK sconosciuto: ammesso
+    t("UPDATE impiegato SET stipendio = stipendio * 3 WHERE matricola = 1", "ERR:stip_max");
+    t("SELECT stipendio FROM impiegato WHERE matricola = 1", "5000");
+    t("UPDATE impiegato SET capo = 77 WHERE matricola = 4", "ERR:fk_capo");
+    t("UPDATE dipartimento SET codice = 'ADM' WHERE codice = 'AMM'", "OK:1");               // ON UPDATE CASCADE
+    t("SELECT dip FROM impiegato WHERE matricola = 1", "ADM");
+    t("DELETE FROM dipartimento WHERE codice = 'PRO'", "OK:1");                            // ON DELETE SET NULL
+    t("SELECT matricola FROM impiegato WHERE dip IS NULL ORDER BY 1", "2;3;4");
+    t("DELETE FROM impiegato WHERE matricola = 1", "OK:1");                                // a cascata: 2 e poi 3
+    t("SELECT matricola FROM impiegato", "4");
+    t("UPDATE impiegato SET capo = 4 WHERE matricola = 4", "OK:1");                        // riferisce sé stesso
+    t("DELETE FROM impiegato", "OK:1");
+    // chiave primaria composta e chiavi esterne verso più tabelle
+    t("CREATE TABLE corso (codice VARCHAR(5) PRIMARY KEY, cfu INT NOT NULL CHECK (cfu BETWEEN 1 AND 15))", "OK:0");
+    t("CREATE TABLE studente (matricola INT PRIMARY KEY, nome VARCHAR(20))", "OK:0");
+    t("CREATE TABLE esame (matricola INT REFERENCES studente ON DELETE CASCADE, corso VARCHAR(5) REFERENCES corso, "
+      "voto INT NOT NULL CHECK (voto BETWEEN 18 AND 30), lode BOOL DEFAULT 0, PRIMARY KEY (matricola, corso), "
+      "CHECK (lode = 0 OR voto = 30))", "OK:0");
+    t("INSERT INTO corso VALUES ('BD1', 9), ('BD2', 6)", "OK:2");
+    t("INSERT INTO corso VALUES ('XX', 20)", "ERR:CHECK constraint");
+    t("INSERT INTO studente VALUES (1, 'Anna'), (2, 'Bruno')", "OK:2");
+    t("INSERT INTO esame VALUES (1, 'BD1', 30, 1)", "OK:1");
+    t("INSERT INTO esame VALUES (1, 'BD1', 28, 0)", "ERR:Duplicate entry '1-BD1' for primary key (matricola, corso)");
+    t("INSERT INTO esame VALUES (1, 'BD2', 28, 1)", "ERR:CHECK constraint");
+    t("INSERT INTO esame VALUES (2, 'BD2', 17, 0)", "ERR:CHECK constraint");
+    t("INSERT INTO esame VALUES (3, 'BD2', 25, 0)", "ERR:Foreign key");
+    t("INSERT INTO esame VALUES (NULL, 'BD2', 25, 0)", "ERR:cannot be NULL");
+    t("INSERT INTO esame (matricola, corso, voto) VALUES (2, 'BD2', 25), (2, 'BD1', 27)", "OK:2");
+    t("SELECT lode FROM esame WHERE matricola = 2 AND corso = 'BD2'", "0");
+    t("UPDATE esame SET corso = 'BD1' WHERE matricola = 2 AND corso = 'BD2'", "ERR:Duplicate entry '2-BD1'");
+    t("UPDATE esame SET voto = voto + 1 WHERE matricola = 2", "OK:2");
+    t("DELETE FROM corso WHERE codice = 'BD1'", "ERR:referenced by table 'esame'");        // NO ACTION
+    t("UPDATE studente SET matricola = 20 WHERE matricola = 2", "ERR:referenced by table 'esame'");
+    t("DELETE FROM studente WHERE matricola = 1", "OK:1");                                 // CASCADE sugli esami
+    t("SELECT COUNT(*) FROM esame", "2");
+    t("DROP TABLE studente", "ERR:referenced by the foreign key");
+    t("TRUNCATE TABLE corso", "ERR:Cannot truncate");
+    t("ALTER TABLE esame DROP CONSTRAINT nope", "ERR:not found");
+    t("ALTER TABLE studente ADD CONSTRAINT nome_unico UNIQUE (nome)", "OK:0");
+    t("INSERT INTO studente VALUES (5, 'Bruno')", "ERR:Duplicate entry 'Bruno' for unique key 'nome'");
+    t("ALTER TABLE studente DROP CONSTRAINT nome_unico", "OK:0");
+    t("INSERT INTO studente VALUES (5, 'Bruno')", "OK:1");
+    t("ALTER TABLE studente ADD CONSTRAINT nome_unico UNIQUE (nome)", "ERR:duplicate values");
+    t("ALTER TABLE studente ADD CHECK (matricola > 0)", "OK:0");
+    t("ALTER TABLE studente ADD CHECK (matricola > 3)", "ERR:CHECK constraint");
+    t("ALTER TABLE studente DROP CONSTRAINT pk_studente", "ERR:uses it");
+    t("CREATE TABLE bad1 (a INT REFERENCES nonexist)", "ERR:Referenced table 'nonexist' not found");
+    t("CREATE TABLE bad2 (a INT REFERENCES corso (cfu))", "ERR:must be the PRIMARY KEY or a UNIQUE key");
+    t("CREATE TABLE bad3 (a INT REFERENCES corso)", "ERR:different types");
+    t("CREATE TABLE bad4 (a INT CHECK (b > 0))", "ERR:Unknown column 'b'");
+    t("CREATE TABLE bad5 (a INT, PRIMARY KEY (a, a))", "ERR:listed twice");
+    t("CREATE TABLE bad6 (a INT NOT NULL REFERENCES studente ON DELETE SET NULL)", "ERR:SET NULL is impossible");
+    t("CREATE TABLE bad7 (a INT CHECK (COUNT(*) > 0))", "ERR:Aggregate functions are not allowed");
+    t("CREATE TABLE bad8 (a INT CHECK (a IN (SELECT 1)))", "ERR:Subqueries are not allowed");
+    t("CREATE TABLE bad9 (a INT PRIMARY KEY, b INT, PRIMARY KEY (b))", "ERR:only one PRIMARY KEY");
+    t("SELECT COUNT(*) FROM bad1", "ERR:not found");                                      // nessuna tabella a metà
+    // DDL rigenerato, SHOW, statistiche, CHECKPOINT
+    t("SHOW CONSTRAINTS FROM esame",
+      "pk_esame|PRIMARY KEY|matricola, corso|NULL|NULL|NULL|NULL;fk_esame_1|FOREIGN KEY|matricola|studente (matricola)|CASCADE|NO ACTION|NULL;"
+      "fk_esame_2|FOREIGN KEY|corso|corso (codice)|NO ACTION|NO ACTION|NULL;chk_esame_1|CHECK|NULL|NULL|NULL|NULL|voto BETWEEN 18 AND 30;"
+      "chk_esame_2|CHECK|NULL|NULL|NULL|NULL|lode = 0 OR voto = 30");
+    t("DESCRIBE esame", "matricola|INT|NO|PRI;corso|VARCHAR(5)|NO|PRI;voto|INT|NO|;lode|BOOL|YES|");
+    t("DESCRIBE dipartimento", "codice|CHAR(3)|NO|PRI;nome|VARCHAR(30)|NO|UNI");
+    t("SHOW CREATE TABLE studente", "studente|CREATE TABLE studente (\n    matricola INT PRIMARY KEY,\n    nome VARCHAR(20),\n"
+      "    CONSTRAINT chk_studente_1 CHECK (matricola > 0)\n);");
+    t("SHOW INDEXES FROM esame", "#3");
+    t("SHOW STATUS", "#16");
+    t("CHECKPOINT", "OK:0");
+    t("SHOW CREATE TABLE nope", "ERR:not found");
+    {
+        // lo script generato ricrea gli stessi vincoli in un altro database
+        tests++;
+        const char* tabs[] = { "corso", "studente", "esame" };
+        char* ddl[3] = {0};
+        char* fks[3] = {0};
+        for (int i = 0; i < 3; i++) { ddl[i] = db_get_create_statement_nofk("vinc", tabs[i]); fks[i] = db_get_foreign_keys("vinc", tabs[i]); }
+        db_result_free(db_execute("CREATE DATABASE copia"));
+        db_result_free(db_execute("USE copia"));
+        bool ok = true;
+        for (int i = 2; i >= 0 && ok; i--) {          // in ordine inverso: senza FK non importa
+            QueryResult* r = ddl[i] ? db_execute(ddl[i]) : NULL;
+            ok = r && r->success;
+            if (!ok) printf("FAIL %d: DDL %s: %s\n", tests, ddl[i] ? ddl[i] : "NULL", r ? r->error : "");
+            db_result_free(r);
+        }
+        for (int i = 0; i < 3 && ok; i++) {
+            if (!fks[i] || !fks[i][0]) continue;
+            QueryResult** rs = NULL;
+            int nr = 0;
+            rs = db_execute_multi(fks[i], &nr);
+            for (int k = 0; k < nr; k++) if (!rs[k] || !rs[k]->success) { ok = false; printf("FAIL %d: %s: %s\n", tests, fks[i], rs[k] ? rs[k]->error : ""); }
+            db_result_free_multi(rs, nr);
+        }
+        for (int i = 0; i < 3; i++) { db_free_string(ddl[i]); db_free_string(fks[i]); }
+        if (!ok) failed++;
+    }
+    t("SELECT COUNT(*) FROM (SELECT 1 FROM esame) AS x", "0");
+    t("INSERT INTO esame VALUES (1, 'BD1', 30, 0)", "ERR:Foreign key");
+    t("SHOW CONSTRAINTS FROM esame", "#5");
+    t("USE vinc", "OK:0");
+    // i vincoli restano dopo un riavvio
+    db_shutdown();
+    if (!db_init("/tmp/sv_sql_test")) { printf("FAIL: reopen\n"); return 1; }
+    t("USE vinc", "OK:0");
+    t("INSERT INTO esame VALUES (2, 'BD1', 30, 0)", "ERR:Duplicate entry '2-BD1'");
+    t("INSERT INTO esame VALUES (9, 'BD1', 30, 0)", "ERR:Foreign key");
+    t("INSERT INTO studente VALUES (-1, 'X')", "ERR:CHECK constraint");
+    t("DELETE FROM studente WHERE matricola = 2", "OK:1");
+    t("SELECT COUNT(*) FROM esame", "0");
+
     db_shutdown();
     crash_recovery_test();
     if (system("rm -rf /tmp/sv_sql_test") != 0) { /* nulla */ }

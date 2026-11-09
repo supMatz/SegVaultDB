@@ -3,6 +3,7 @@
 
 #include "../../include/common.h"
 #include "lexer.h"
+#include "../catalog/schema.h"
 
 typedef enum {
     NODE_SELECT, NODE_INSERT, NODE_UPDATE, NODE_DELETE,
@@ -12,6 +13,7 @@ typedef enum {
     NODE_EXPLAIN, NODE_BEGIN, NODE_COMMIT, NODE_ROLLBACK,
     NODE_TRUNCATE, NODE_SAVEPOINT, NODE_ROLLBACK_TO,
     NODE_CREATE_TRIGGER, NODE_DROP_TRIGGER,
+    NODE_CHECKPOINT,
 } StmtType;
 
 typedef enum { JOIN_INNER, JOIN_LEFT, JOIN_RIGHT, JOIN_CROSS } JoinType;
@@ -88,6 +90,21 @@ typedef struct {
     bool     auto_increment;
     char     default_val[128];
 } ColumnDef;
+
+// vincolo di CREATE TABLE / ALTER TABLE ADD CONSTRAINT (di colonna o di tabella)
+typedef struct {
+    char     name[64];               // CONSTRAINT nome ("" = generato)
+    int      kind;                   // CONS_PRIMARY, CONS_UNIQUE, CONS_FOREIGN, CONS_CHECK (schema.h)
+    int      ncols;
+    char     cols[8][64];
+    char     ref_table[64];
+    int      nref;
+    char     ref_cols[8][64];        // vuoto: la chiave primaria della tabella riferita
+    int      on_delete, on_update;   // FkAction
+    char     check[512];             // testo della condizione
+} ConstraintDef;
+
+#define SV_MAX_CONS_DEFS 16
 
 typedef struct {
     ASTExpr*   condition;      // ON (NULL = prodotto cartesiano)
@@ -170,10 +187,15 @@ typedef struct ASTNode {
             char       table_name[64];
             ColumnDef  columns[64];
             int        num_columns;
+            ConstraintDef cons[SV_MAX_CONS_DEFS];
+            int        num_cons;
         } create_table;
         struct {
             char       table_name[64];
-            char       new_name[64];
+            char       new_name[64];          // RENAME TO
+            ConstraintDef add;                // ADD [CONSTRAINT nome] vincolo
+            bool       has_add;
+            char       drop_constraint[64];   // DROP CONSTRAINT nome
         } alter_table;
         struct {
             char       table_name[64];
@@ -228,6 +250,8 @@ typedef struct {
 } ParseResult;
 
 ParseResult* parser_parse(TokenList* tokens);
+// una sola espressione (vincoli CHECK salvati nel catalogo); NULL con il messaggio in err
+ASTExpr*    parser_parse_expr(TokenList* tokens, char* err, size_t errn);
 void        ast_node_free(ASTNode* n);
 void        parse_result_free(ParseResult* r);
 

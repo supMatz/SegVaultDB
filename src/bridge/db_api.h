@@ -186,6 +186,8 @@ const char* db_current_database(void);
 // ── utilities ──
 
 char* db_get_create_statement(const char* db_name, const char* table); // genera lo script CREATE TABLE di una tabella (per "Copy as SQL")
+char* db_get_create_statement_nofk(const char* db_name, const char* table); // CREATE TABLE senza le FOREIGN KEY (dump)
+char* db_get_foreign_keys(const char* db_name, const char* table);         // ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY (dump)
 
 void db_free_string(char* s); // libera una stringa allocata dal DB engine 
 

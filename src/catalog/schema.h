@@ -53,6 +53,26 @@ typedef struct {
     uint32_t root_page_id;     // Prima pagina del B+Tree di questo indice
 } Index;
 
+// -- vincoli di integrità --
+#define SV_MAX_CONSTRAINTS 16
+#define SV_MAX_KEY_COLS    8
+#define SV_CHECK_LEN       512
+
+typedef enum { CONS_PRIMARY = 1, CONS_UNIQUE, CONS_FOREIGN, CONS_CHECK } ConstraintKind;
+// azione referenziale (ON DELETE / ON UPDATE)
+typedef enum { FK_NO_ACTION = 0, FK_RESTRICT, FK_CASCADE, FK_SET_NULL, FK_SET_DEFAULT } FkAction;
+
+typedef struct {
+    char     name[SV_MAX_NAME_LEN];
+    uint8_t  kind;                       // ConstraintKind
+    uint8_t  ncols;
+    uint8_t  on_delete, on_update;       // FkAction (FOREIGN KEY)
+    uint8_t  cols[SV_MAX_KEY_COLS];      // colonne della tabella (posizioni)
+    char     ref_table[SV_MAX_NAME_LEN]; // FOREIGN KEY: tabella riferita
+    char     ref_cols[SV_MAX_KEY_COLS][SV_MAX_NAME_LEN];
+    char     check[SV_CHECK_LEN];        // CHECK: testo SQL della condizione
+} Constraint;
+
 // -- definizione tabella --
 typedef struct {
     char      name[SV_MAX_NAME_LEN];
@@ -64,6 +84,9 @@ typedef struct {
     uint32_t  num_pages;       // numero di pagine allocate
     uint64_t  num_rows;        // numero di righe (approssimativo)
     char      comment[256];
+    // ── dal formato v4 del catalogo (i campi precedenti hanno la disposizione di prima) ──
+    int       num_constraints;
+    Constraint constraints[SV_MAX_CONSTRAINTS];
 } TableSchema;
 
 // -- definizione vista --
