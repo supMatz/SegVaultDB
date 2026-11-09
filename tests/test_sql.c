@@ -604,6 +604,36 @@ int main(void) {
     t("SELECT COUNT(*) FROM esame e JOIN corso c ON c.sigla = e.corso", "9");
     t("DELETE FROM studente WHERE matricola = 9", "OK:1");
     t("SHOW CONSTRAINTS FROM esame", "#0");
+    // ALTER TABLE ... ALTER COLUMN: tipo, DEFAULT, NOT NULL
+    t("CREATE TABLE misura (id INT PRIMARY KEY, valore VARCHAR(10), nota VARCHAR(20), quando VARCHAR(20))", "OK:0");
+    t("INSERT INTO misura VALUES (1, '12', 'breve', '2025-03-01'), (2, '7.0', 'una nota lunga', NULL), (3, NULL, NULL, '2025-04-02')", "OK:3");
+    t("ALTER TABLE misura ALTER COLUMN valore TYPE INT", "OK:0");
+    t("SELECT id, valore + 1 FROM misura ORDER BY valore", "3|NULL;2|8;1|13");
+    t("ALTER TABLE misura ALTER COLUMN nota SET DATA TYPE VARCHAR(10)", "ERR:Value too long for column 'nota' (14 characters, maximum 10)");
+    t("SELECT nota FROM misura WHERE id = 2", "una nota lunga");
+    t("ALTER TABLE misura MODIFY nota VARCHAR(5)", "ERR:Cannot change the type of 'nota'");
+    t("ALTER TABLE misura MODIFY COLUMN quando DATE", "OK:0");
+    t("INSERT INTO misura VALUES (4, 1, 'x', '2025-02-30')", "ERR:valid date");
+    t("ALTER TABLE misura ALTER valore TYPE FLOAT", "OK:0");
+    t("INSERT INTO misura (id, valore) VALUES (4, 2.5)", "OK:1");
+    t("ALTER TABLE misura ALTER COLUMN valore TYPE INT", "ERR:expects an integer, got '2.5'");
+    t("ALTER TABLE misura ALTER COLUMN valore TYPE COLORE", "ERR:Unknown type");
+    t("ALTER TABLE misura ALTER COLUMN nota SET DEFAULT 'nessuna'", "OK:0");
+    t("INSERT INTO misura (id) VALUES (5)", "OK:1");
+    t("SELECT nota FROM misura WHERE id = 5", "nessuna");
+    t("ALTER TABLE misura ALTER COLUMN nota DROP DEFAULT", "OK:0");
+    t("ALTER TABLE misura ALTER COLUMN valore SET DEFAULT 'tanto'", "ERR:expects a number");
+    t("ALTER TABLE misura ALTER COLUMN nota SET NOT NULL", "ERR:contains NULL in 2 rows");
+    t("UPDATE misura SET nota = '-' WHERE nota IS NULL", "OK:2");
+    t("ALTER TABLE misura ALTER COLUMN nota SET NOT NULL", "OK:0");
+    t("INSERT INTO misura (id) VALUES (6)", "ERR:cannot be NULL");
+    t("ALTER TABLE misura ALTER COLUMN nota DROP NOT NULL", "OK:0");
+    t("INSERT INTO misura (id) VALUES (6)", "OK:1");
+    t("ALTER TABLE misura ALTER COLUMN id DROP NOT NULL", "ERR:primary key");
+    t("ALTER TABLE misura ALTER COLUMN id TYPE BIGINT", "OK:0");
+    t("SELECT id FROM misura WHERE id = 4", "4");
+    t("ALTER TABLE misura ALTER COLUMN nota", "ERR:Expected TYPE, SET or DROP");
+    t("DROP TABLE misura", "OK:0");
     // INSERT ... SELECT, UPDATE e DELETE con subquery
     t("CREATE TABLE lodati (matricola INT, voto INT)", "OK:0");
     t("INSERT INTO lodati SELECT matricola, voto FROM esame WHERE voto = 30", "OK:3");
@@ -625,6 +655,8 @@ int main(void) {
       "dip CHAR(3) REFERENCES dipartimento ON DELETE SET NULL ON UPDATE CASCADE, capo INT, "
       "CONSTRAINT fk_capo FOREIGN KEY (capo) REFERENCES impiegato (matricola) ON DELETE CASCADE, "
       "CONSTRAINT stip_max CHECK (stipendio <= 10000))", "OK:0");
+    t("ALTER TABLE impiegato ALTER COLUMN dip TYPE VARCHAR(5)", "ERR:part of foreign key");
+    t("ALTER TABLE dipartimento ALTER COLUMN codice TYPE VARCHAR(5)", "ERR:referenced by foreign key");
     t("INSERT INTO dipartimento VALUES ('AMM', 'Amministrazione'), ('PRO', 'Produzione')", "OK:2");
     t("INSERT INTO dipartimento VALUES ('XXX', 'Produzione')", "ERR:Duplicate entry 'Produzione' for unique key 'nome'");
     t("INSERT INTO impiegato VALUES (1, 'Rossi', 5000, 'AMM', NULL)", "OK:1");

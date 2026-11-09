@@ -77,6 +77,15 @@ ALTER TABLE studente ADD COLUMN telefono VARCHAR(20) NOT NULL;
 ALTER TABLE studente RENAME COLUMN email TO posta;
 ALTER TABLE studente DROP COLUMN posta;
 
+-- cambiare il tipo: ogni valore esistente viene convertito e controllato
+-- errore atteso: "Esposito" non entra in 5 caratteri
+ALTER TABLE studente ALTER COLUMN cognome TYPE VARCHAR(5);
+ALTER TABLE studente ALTER COLUMN cognome TYPE VARCHAR(40);
+
+-- errore atteso: ci sono studenti senza città
+ALTER TABLE studente ALTER COLUMN citta SET NOT NULL;
+ALTER TABLE studente ALTER COLUMN citta SET DEFAULT 'Milano';
+
 -- errore atteso: la colonna fa parte della chiave primaria
 ALTER TABLE esame DROP COLUMN corso;
 

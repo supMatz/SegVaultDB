@@ -103,6 +103,8 @@ void ast_expr_format(const ASTExpr* e, char* out, size_t n);
 // testo del frame di una funzione finestra ("ROWS BETWEEN 2 PRECEDING AND CURRENT ROW")
 void frame_text(const WindowSpec* w, char* buf, size_t n);
 
+enum { ALT_NONE, ALT_TYPE, ALT_SET_DEFAULT, ALT_DROP_DEFAULT, ALT_SET_NOT_NULL, ALT_DROP_NOT_NULL };
+
 typedef struct {
     char     name[64];
     char     type[32];
@@ -231,6 +233,11 @@ typedef struct ASTNode {
             char       drop_column[64];       // DROP [COLUMN] nome
             char       rename_from[64];       // RENAME COLUMN vecchio TO nuovo
             char       rename_to[64];
+            // ALTER [COLUMN] nome TYPE t | SET DEFAULT v | DROP DEFAULT | SET NOT NULL | DROP NOT NULL
+            // (MODIFY [COLUMN] nome tipo: come TYPE)
+            char       alter_col[64];
+            int        alter_kind;            // ALT_*
+            ColumnDef  alter_def;             // tipo e dimensione (TYPE) o valore (SET DEFAULT)
         } alter_table;
         struct {
             char       table_name[64];

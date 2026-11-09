@@ -263,8 +263,10 @@ static bool ident_in_text(const char* text, const char* name) {
 // copia le righe in una nuova catena di pagine con lo schema ns (map[i] = colonna vecchia, -1 = nuova
 // con il valore def). La tabella vecchia non viene toccata: se qualcosa va storto (anche un
 // arresto anomalo) il catalogo punta ancora alle pagine di prima.
+// conv >= 0: la colonna conv cambia tipo e ogni valore passa dal testo (con i controlli del nuovo tipo);
+// cmsg riceve l'errore di conversione
 static const char* rewrite_rows(ExecCtx* ctx, TableSchema* ts, TableSchema* ns, const int* map, const char* def,
-                                uint32_t* out_root, uint32_t* out_pages) {
+                                int conv, char* cmsg, size_t cmsgn, uint32_t* out_root, uint32_t* out_pages) {
     uint32_t root;
     if (bp_new_page(ctx->bp, &root) != SV_OK) return "Cannot allocate a page";
     bp_unpin(ctx->bp, root, false);
@@ -277,10 +279,19 @@ static const char* rewrite_rows(ExecCtx* ctx, TableSchema* ts, TableSchema* ns, 
     while (!fail && (t = heap_scan_next(scan, &rid)) != NULL) {
         Tuple* nt = tuple_create(ns->num_columns);
         if (!nt) { tuple_free(t); fail = "Out of memory"; break; }
-        for (int i = 0; i < ns->num_columns; i++) {
-            if (map[i] >= 0) value_copy(&nt->values[i], &t->values[map[i]], ns->columns[i].type);
+        for (int i = 0; i < ns->num_columns && !fail; i++) {
+            if (i == conv && !t->values[map[i]].is_null) {
+                char txt[4096], why[200];
+                value_to_string(&t->values[map[i]], ts->columns[map[i]].type, txt, sizeof(txt));
+                if (check_value(&ns->columns[i], txt, why, sizeof(why))) {
+                    snprintf(cmsg, cmsgn, "Cannot change the type of '%.64s': %s", ns->columns[i].name, why);
+                    fail = cmsg;
+                } else value_set_from_text(&nt->values[i], ns->columns[i].type, txt);
+            }
+            else if (map[i] >= 0) value_copy(&nt->values[i], &t->values[map[i]], ns->columns[i].type);
             else value_set_from_text(&nt->values[i], ns->columns[i].type, def);
         }
+        if (fail) { tuple_free(nt); tuple_free(t); break; }
         RID nr;
         if (heap_insert(nh, nt, ns, &nr) != SV_OK) fail = "Cannot write the new rows (disk full?)";
         tuple_free(nt);
@@ -292,6 +303,120 @@ static const char* rewrite_rows(ExecCtx* ctx, TableSchema* ts, TableSchema* ns, 
     free(oh);
     if (fail) heap_cache_forget(ctx->bp, root);
     return fail;
+}
+
+// la colonna ci fa parte di una chiave esterna (della tabella o di un'altra che la riferisce)?
+static const char* col_in_fk(Database* db, const TableSchema* ts, int ci, char* msg, size_t n) {
+    for (int k = 0; k < ts->num_constraints; k++) {
+        const Constraint* c = &ts->constraints[k];
+        if (c->kind != CONS_FOREIGN) continue;
+        for (int q = 0; q < c->ncols; q++)
+            if (c->cols[q] == ci) { snprintf(msg, n, "Column '%.64s' is part of foreign key '%.64s': drop it first", ts->columns[ci].name, c->name); return msg; }
+    }
+    for (int i = 0; i < db->num_tables; i++)
+        for (int k = 0; k < db->tables[i].num_constraints; k++) {
+            const Constraint* c = &db->tables[i].constraints[k];
+            if (c->kind != CONS_FOREIGN || strcasecmp(c->ref_table, ts->name)) continue;
+            for (int q = 0; q < c->ncols; q++)
+                if (!strcasecmp(c->ref_cols[q], ts->columns[ci].name)) {
+                    snprintf(msg, n, "Column '%.64s' is referenced by foreign key '%.64s' of table '%.64s': drop it first",
+                             ts->columns[ci].name, c->name, db->tables[i].name);
+                    return msg;
+                }
+        }
+    return NULL;
+}
+
+// ALTER TABLE t ALTER COLUMN c TYPE ... | SET / DROP DEFAULT | SET / DROP NOT NULL
+static QueryResult* alter_column_attr(ExecCtx* ctx, Database* db, TableSchema* ts, ASTNode* n) {
+    char msg[300];
+    const char* name = n->alter_table.alter_col;
+    int ci = catalog_get_col_index(ts, name);
+    if (ci < 0) { snprintf(msg, sizeof(msg), "Unknown column '%.64s'", name); return result_error_msg(msg); }
+    Column* col = &ts->columns[ci];
+    const ColumnDef* d = &n->alter_table.alter_def;
+    bool in_pk = col->primary_key;
+    for (int k = 0; k < ts->num_constraints; k++)
+        if (ts->constraints[k].kind == CONS_PRIMARY)
+            for (int q = 0; q < ts->constraints[k].ncols; q++) if (ts->constraints[k].cols[q] == ci) in_pk = true;
+    switch (n->alter_table.alter_kind) {
+        case ALT_SET_DEFAULT: {
+            const char* v = d->default_val;
+            if (v[0] && strcasecmp(v, "NULL")) {
+                if (check_value(col, v, msg, sizeof(msg))) return result_error_msg(msg);
+            } else if (!col->nullable) {
+                snprintf(msg, sizeof(msg), "Column '%.64s' is NOT NULL: its DEFAULT cannot be NULL", name);
+                return result_error_msg(msg);
+            }
+            snprintf(col->default_val, sizeof(col->default_val), "%s", strcasecmp(v, "NULL") ? v : "");
+            return result_ok_msg(0);
+        }
+        case ALT_DROP_DEFAULT:
+            col->default_val[0] = '\0';
+            return result_ok_msg(0);
+        case ALT_DROP_NOT_NULL:
+            if (in_pk) { snprintf(msg, sizeof(msg), "Column '%.64s' is part of the primary key: it cannot be NULL", name); return result_error_msg(msg); }
+            col->nullable = true;
+            return result_ok_msg(0);
+        case ALT_SET_NOT_NULL: {
+            // le righe esistenti devono già rispettare il vincolo
+            HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
+            HeapScan* scan = hf ? heap_scan_open(hf, ts) : NULL;
+            if (!scan) { free(hf); return result_error_msg("Cannot read the table"); }
+            long nulls = 0;
+            Tuple* t;
+            RID rid;
+            while ((t = heap_scan_next(scan, &rid)) != NULL) {
+                if (ci < t->num_values && t->values[ci].is_null) nulls++;
+                tuple_free(t);
+            }
+            heap_scan_close(scan);
+            free(hf);
+            if (nulls) {
+                snprintf(msg, sizeof(msg), "Column '%.64s' contains NULL in %ld row%s: update them before SET NOT NULL", name, nulls, nulls == 1 ? "" : "s");
+                return result_error_msg(msg);
+            }
+            col->nullable = false;
+            return result_ok_msg(0);
+        }
+        default: break;
+    }
+    // TYPE: le righe vengono riscritte con il valore convertito
+    if (ctx->tx_id) return result_error_msg("ALTER TABLE ... ALTER COLUMN ... TYPE is not allowed inside a transaction: COMMIT first");
+    if (!known_type(d->type)) { snprintf(msg, sizeof(msg), "Unknown type '%.32s'", d->type); return result_error_msg(msg); }
+    if (col_in_fk(db, ts, ci, msg, sizeof(msg))) return result_error_msg(msg);
+    Column nc = *col;
+    nc.type = parse_type(d->type);
+    nc.size = d->size;
+    if (col->auto_increment && nc.type != SV_TYPE_INT && nc.type != SV_TYPE_BIGINT) {
+        snprintf(msg, sizeof(msg), "Column '%.64s' is AUTO_INCREMENT: it must stay an integer", name);
+        return result_error_msg(msg);
+    }
+    if (nc.default_val[0] && strcasecmp(nc.default_val, "NULL") && check_value(&nc, nc.default_val, msg, sizeof(msg))) {
+        char m2[400];
+        snprintf(m2, sizeof(m2), "DEFAULT does not fit the new type (%s): change it first", msg);
+        return result_error_msg(m2);
+    }
+    TableSchema* ns = malloc(sizeof(TableSchema));
+    int* map = malloc(sizeof(int) * SV_MAX_COLUMNS);
+    if (!ns || !map) { free(ns); free(map); return result_error_msg("Out of memory"); }
+    *ns = *ts;
+    ns->columns[ci] = nc;
+    for (int i = 0; i < ts->num_columns; i++) map[i] = i;
+    uint32_t root = 0, pages = 0, old_root = ts->root_page_id;
+    const char* fail = rewrite_rows(ctx, ts, ns, map, NULL, ci, msg, sizeof(msg), &root, &pages);
+    if (!fail) {
+        ns->root_page_id = root;
+        ns->num_pages = pages;
+        *ts = *ns;
+        mi_invalidate_table(db->name, ts->name);
+        heap_cache_forget(ctx->bp, old_root);
+        bp_flush_all(ctx->bp);                                     // le righe nuove su disco prima del catalogo
+    }
+    free(ns);
+    free(map);
+    if (fail) { if (fail != msg) snprintf(msg, sizeof(msg), "%s", fail); return result_error_msg(msg); }
+    return result_ok_msg(0);
 }
 
 static QueryResult* alter_column(ExecCtx* ctx, Database* db, TableSchema* ts, ASTNode* n) {
@@ -407,7 +532,7 @@ static QueryResult* alter_column(ExecCtx* ctx, Database* db, TableSchema* ts, AS
         }
     }
     uint32_t root = 0, pages = 0;
-    if (!fail) fail = rewrite_rows(ctx, ts, ns, map, def, &root, &pages);
+    if (!fail) fail = rewrite_rows(ctx, ts, ns, map, def, -1, msg, sizeof(msg), &root, &pages);
     if (!fail) {
         uint32_t old_root = ts->root_page_id;
         ns->root_page_id = root;
@@ -440,6 +565,7 @@ static QueryResult* exec_alter_table(ExecCtx* ctx, ASTNode* n) {
     if (!ts) return result_error_msg("Table not found");
     if (n->alter_table.add_column || n->alter_table.drop_column[0] || n->alter_table.rename_from[0])
         return alter_column(ctx, db, ts, n);
+    if (n->alter_table.alter_kind) return alter_column_attr(ctx, db, ts, n);
     // RENAME TO
     if (n->alter_table.new_name[0]) {
         const char* nn = n->alter_table.new_name;

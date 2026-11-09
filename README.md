@@ -164,6 +164,10 @@ ALTER TABLE esame RENAME TO esami;
 ALTER TABLE studente ADD [COLUMN] email VARCHAR(60) DEFAULT 'n/d';      -- le righe esistenti ricevono il DEFAULT
 ALTER TABLE studente RENAME COLUMN email TO posta;                       -- aggiorna anche CHECK, FK e trigger
 ALTER TABLE studente DROP [COLUMN] posta;
+ALTER TABLE studente ALTER [COLUMN] citta TYPE VARCHAR(40);              -- ogni valore viene convertito e controllato
+ALTER TABLE studente MODIFY citta VARCHAR(40);                           -- la stessa cosa, sintassi MySQL
+ALTER TABLE studente ALTER COLUMN citta SET DEFAULT 'Milano';            -- DROP DEFAULT
+ALTER TABLE studente ALTER COLUMN cognome SET NOT NULL;                  -- rifiutato se ci sono già dei NULL; DROP NOT NULL
 ALTER TABLE studente ADD CONSTRAINT nome_unico UNIQUE (nome, cognome);   -- i dati esistenti vengono controllati
 ALTER TABLE studente DROP CONSTRAINT nome_unico;
 SHOW CONSTRAINTS FROM esame;
@@ -274,7 +278,7 @@ DROP TRIGGER [IF EXISTS] nome;   SHOW TRIGGERS [FROM tabella];
 
 ### Non supportato
 
-Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), `ALTER COLUMN` per cambiare il tipo di una colonna, stored procedure, controllo della concorrenza fra più utenti (il motore è embedded: una sessione alla volta).
+Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), stored procedure, controllo della concorrenza fra più utenti (il motore è embedded: una sessione alla volta).
 
 ---
 

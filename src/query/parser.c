@@ -1562,6 +1562,41 @@ static bool parse_table_constraint(ParserState* ps, ConstraintDef* c) {
 }
 
 // definizione di colonna: nome tipo [(n [, m])] modificatori (vincoli di colonna in n->create_table.cons)
+// tipo di una colonna: nome [(dimensione [, decimali])]
+static bool parse_type_spec(ParserState* ps, ColumnDef* cd) {
+    Token ct = consume(ps);
+    if (ct.type != TOK_IDENTIFIER && ct.type != TOK_BOOLEAN) { parse_fail(ps, "Expected a column type", ct); return false; }
+    copy_text(ps, cd->type, sizeof(cd->type), ct.text);
+    if (match(ps, TOK_LPAREN)) {
+        Token sz = consume(ps);
+        if (sz.type != TOK_INTEGER) { parse_fail(ps, "Expected a size", sz); return false; }
+        cd->size = atoi(sz.text);
+        if (match(ps, TOK_COMMA)) {                    // DECIMAL(p, s)
+            Token sc = consume(ps);
+            if (sc.type != TOK_INTEGER) { parse_fail(ps, "Expected the number of decimal digits", sc); return false; }
+        }
+        if (!expect(ps, TOK_RPAREN)) return false;
+    }
+    return true;
+}
+
+// valore dopo DEFAULT: numero (anche con segno), stringa, NULL o parola
+static bool parse_default_value(ParserState* ps, char* out, size_t n) {
+    Token dv = consume(ps);
+    if (dv.type == TOK_MINUS || dv.type == TOK_PLUS) {          // DEFAULT -1
+        Token num = consume(ps);
+        if (num.type != TOK_INTEGER && num.type != TOK_FLOAT) { parse_fail(ps, "Expected a number after the sign", num); return false; }
+        snprintf(out, n, "%s%.100s", dv.type == TOK_MINUS ? "-" : "", num.text);
+        return true;
+    }
+    if (dv.type == TOK_INTEGER || dv.type == TOK_FLOAT || dv.type == TOK_STRING || dv.type == TOK_NULL || dv.type == TOK_IDENTIFIER) {
+        copy_text(ps, out, n, dv.text);
+        return true;
+    }
+    parse_fail(ps, "Expected a value after DEFAULT", dv);
+    return false;
+}
+
 static void parse_column_def(ParserState* ps, ASTNode* n) {
     if (n->create_table.num_columns >= 64) { parse_fail(ps, "Too many columns (max 64)", peek(ps)); return; }
     ColumnDef* cd = &n->create_table.columns[n->create_table.num_columns];
@@ -1570,19 +1605,7 @@ static void parse_column_def(ParserState* ps, ASTNode* n) {
     Token cn = consume(ps);
     if (cn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", cn); return; }
     copy_text(ps, cd->name, sizeof(cd->name), cn.text);
-    Token ct = consume(ps);
-    if (ct.type != TOK_IDENTIFIER && ct.type != TOK_BOOLEAN) { parse_fail(ps, "Expected a column type", ct); return; }
-    copy_text(ps, cd->type, sizeof(cd->type), ct.text);
-    if (match(ps, TOK_LPAREN)) {
-        Token sz = consume(ps);
-        if (sz.type != TOK_INTEGER) { parse_fail(ps, "Expected a size", sz); return; }
-        cd->size = atoi(sz.text);
-        if (match(ps, TOK_COMMA)) {                    // DECIMAL(p, s)
-            Token sc = consume(ps);
-            if (sc.type != TOK_INTEGER) { parse_fail(ps, "Expected the number of decimal digits", sc); return; }
-        }
-        if (!expect(ps, TOK_RPAREN)) return;
-    }
+    if (!parse_type_spec(ps, cd)) return;
     n->create_table.num_columns++;
     for (;;) {
         if (!ps->result->success) return;
@@ -1626,18 +1649,7 @@ static void parse_column_def(ParserState* ps, ASTNode* n) {
             cd->auto_increment = true;
         } else if (ident_is(ps, "DEFAULT")) {
             consume(ps);
-            Token dv = consume(ps);
-            if (dv.type == TOK_MINUS || dv.type == TOK_PLUS) {          // DEFAULT -1
-                Token num = consume(ps);
-                if (num.type != TOK_INTEGER && num.type != TOK_FLOAT) { parse_fail(ps, "Expected a number after the sign", num); return; }
-                snprintf(cd->default_val, sizeof(cd->default_val), "%s%.100s", dv.type == TOK_MINUS ? "-" : "", num.text);
-            } else if (dv.type == TOK_INTEGER || dv.type == TOK_FLOAT || dv.type == TOK_STRING || dv.type == TOK_NULL ||
-                       dv.type == TOK_IDENTIFIER) {
-                copy_text(ps, cd->default_val, sizeof(cd->default_val), dv.text);
-            } else {
-                parse_fail(ps, "Expected a value after DEFAULT", dv);
-                return;
-            }
+            if (!parse_default_value(ps, cd->default_val, sizeof(cd->default_val))) return;
         } else if (ident_is(ps, "CHECK")) {
             consume(ps);
             ConstraintDef* c = new_cons(ps, n);
@@ -1849,8 +1861,38 @@ static ASTNode* parse_statement(ParserState* ps) {
                 Token nm = consume(ps);
                 if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the constraint name", nm); break; }
                 copy_text(ps, n->alter_table.drop_constraint, sizeof(n->alter_table.drop_constraint), nm.text);
+            } else if (match(ps, TOK_ALTER) || ident_is(ps, "MODIFY")) {
+                // ALTER [COLUMN] c TYPE t | SET DATA TYPE t | SET DEFAULT v | DROP DEFAULT | SET / DROP NOT NULL
+                bool modify = ps->tokens->tokens[ps->pos - 1].type != TOK_ALTER;
+                if (modify) consume(ps);
+                if (ident_is(ps, "COLUMN")) consume(ps);
+                Token c = consume(ps);
+                if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the column name", c); break; }
+                copy_text(ps, n->alter_table.alter_col, sizeof(n->alter_table.alter_col), c.text);
+                ColumnDef* d = &n->alter_table.alter_def;
+                memset(d, 0, sizeof(*d));
+                if (modify) { n->alter_table.alter_kind = ALT_TYPE; parse_type_spec(ps, d); break; }
+                if (ident_is(ps, "TYPE")) { consume(ps); n->alter_table.alter_kind = ALT_TYPE; parse_type_spec(ps, d); break; }
+                bool set = match(ps, TOK_SET);
+                if (!set && !match(ps, TOK_DROP)) { parse_fail(ps, "Expected TYPE, SET or DROP after the column name", peek(ps)); break; }
+                if (set && ident_is(ps, "DATA")) {
+                    consume(ps);
+                    if (!ident_is(ps, "TYPE")) { parse_fail(ps, "Expected TYPE after SET DATA", peek(ps)); break; }
+                    consume(ps);
+                    n->alter_table.alter_kind = ALT_TYPE;
+                    parse_type_spec(ps, d);
+                } else if (ident_is(ps, "DEFAULT")) {
+                    consume(ps);
+                    n->alter_table.alter_kind = set ? ALT_SET_DEFAULT : ALT_DROP_DEFAULT;
+                    if (set) parse_default_value(ps, d->default_val, sizeof(d->default_val));
+                } else if (match(ps, TOK_NOT)) {
+                    if (!match(ps, TOK_NULL)) { parse_fail(ps, "Expected NULL after NOT", peek(ps)); break; }
+                    n->alter_table.alter_kind = set ? ALT_SET_NOT_NULL : ALT_DROP_NOT_NULL;
+                } else {
+                    parse_fail(ps, set ? "Expected DATA TYPE, DEFAULT or NOT NULL after SET" : "Expected DEFAULT or NOT NULL after DROP", peek(ps));
+                }
             } else {
-                parse_fail(ps, "Expected RENAME, ADD or DROP after ALTER TABLE name", peek(ps));
+                parse_fail(ps, "Expected RENAME, ADD, DROP or ALTER after ALTER TABLE name", peek(ps));
             }
             break;
         }
