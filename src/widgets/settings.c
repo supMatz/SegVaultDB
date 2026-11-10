@@ -27,6 +27,7 @@ static const char* const ONERR[]     = { "Stop at the first error", "Continue wi
 static const char* const HISTORY[]   = { "50 queries", "100 queries", "250 queries", "500 queries" };
 static const char* const DELIMS[]    = { "Comma  ,", "Semicolon  ;", "Tab" };
 static const char* const CSVNULLS[]  = { "Empty field", "NULL" };
+static const char* const STARTUP[]   = { "Ask every time", "SQL editor", "API server" };
 
 #define N(a) ((int)(sizeof(a) / sizeof(a[0])))
 #define S(f) (&g_settings.f)
@@ -90,6 +91,19 @@ static SettingDef DEFS[] = {
       SET_CHOICE, S(csv_null), CSVNULL_EMPTY, 0, 0, CSVNULLS, N(CSVNULLS) },
     { "Export", "json_pretty", "Readable JSON", "Indent JSON exports (off = one compact line)",
       SET_BOOL, S(json_pretty), 1, 0, 1, ON_OFF, 2 },
+
+    { "Server", "startup_mode", "At startup open", "The SQL editor, the API server for web and desktop apps, or ask",
+      SET_CHOICE, S(startup_mode), START_ASK, 0, 0, STARTUP, N(STARTUP) },
+    { "Server", "server_port", "Server port", "TCP port of the API server (http://127.0.0.1:PORT/api/v1)",
+      SET_INT, S(server_port), 8484, 1024, 65535, NULL, 0 },
+    { "Server", "server_lan", "Reachable from the local network", "Other computers can connect; a token is always required",
+      SET_BOOL, S(server_lan), 0, 0, 1, ON_OFF, 2 },
+    { "Server", "server_token", "Require a token", "Apps send \"Authorization: Bearer <token>\" (always on with network or CORS)",
+      SET_BOOL, S(server_token), 0, 0, 1, ON_OFF, 2 },
+    { "Server", "server_cors", "Allow web apps from any origin", "CORS for pages served elsewhere (e.g. a dev server); requires the token",
+      SET_BOOL, S(server_cors), 0, 0, 1, ON_OFF, 2 },
+    { "Server", "server_timeout", "Request time limit (s)", "A request running longer is stopped (0 = no limit)",
+      SET_INT, S(server_timeout), 30, 0, 600, NULL, 0 },
 };
 
 int settings_count(void) { return N(DEFS); }

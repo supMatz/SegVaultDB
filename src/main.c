@@ -11,6 +11,8 @@ SCOPO: Entry point di SegVault.
 #include "platform/platform.h"
 #include "widgets/window.h"
 #include "bridge/db_api.h"
+#include "widgets/settings.h"
+#include <string.h>
 #include <stdio.h>
 #include <signal.h>
 
@@ -35,8 +37,22 @@ static void on_quit_signal(int sig) { (void)sig; g_quit_requested = 1; }
 
 int main(int argc, char** argv) {
 
-    // -- directory dei dati --
-    const char* data_dir = (argc > 1) ? argv[1] : "./data";
+    // -- argomenti: [--server | --editor] [cartella-dati] --
+    const char* data_dir = "./data";
+    int start_mode = -1;                       // -1 = come in Settings > Server > At startup open
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--server"))      start_mode = START_SERVER;
+        else if (!strcmp(argv[i], "--editor")) start_mode = START_EDITOR;
+        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            printf("Usage: %s [--editor | --server] [data-directory]\n"
+                   "  --editor   open the SQL editor\n"
+                   "  --server   start the API server for web and desktop apps (see docs/API.md)\n"
+                   "Without options SegVault asks (Settings > Server > At startup open).\n"
+                   "For a server without a window use segvault-server.\n", argv[0]);
+            return 0;
+        }
+        else data_dir = argv[i];
+    }
 
     // crea la directory se non esiste
     // (mkdir -p equivalente per portabilità)
@@ -89,6 +105,7 @@ int main(int argc, char** argv) {
     }
     app_window_resize(app, INITIAL_W, INITIAL_H);
     app_window_set_data_dir(app, data_dir);   // ripristina l'ultima sessione e la cronologia
+    app_window_startup(app, start_mode);      // editor, server API o la scelta iniziale
 
     printf("[SegVault] Started correctly. Window opened.\n");
 

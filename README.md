@@ -291,10 +291,20 @@ con un client HTTP (browser, Node.js, Python, C#, Java, Go, ...) può salvare, c
 dati in SegVault. Come il resto del progetto è scritto in C senza dipendenze, per Linux e Windows.
 Riferimento completo del protocollo: [`docs/API.md`](docs/API.md). Client pronti: [`clients/`](clients/).
 
+**Dall'app desktop:** all'avvio SegVault chiede se aprire l'**editor SQL** o il **server API**
+(oppure `segvault --server` / `segvault --editor`; per non sceglierlo ogni volta: Settings › Server ›
+*At startup open*). Il pannello del server mostra l'indirizzo da copiare (anche quello in rete
+locale), statistiche e registro delle richieste in tempo reale, e le opzioni: porta, accesso dalla
+rete locale, token, CORS, limite di tempo. *Open SQL editor* ferma il server e torna all'editor con
+i dati scritti dalle app; *File › Start API server…* riapre il server.
+
+**Senza finestra** (server, container, servizio):
+
 ```bash
 make server                       # ./segvault-server   (make windows produce anche segvault-server.exe)
 ./segvault-server                 # http://127.0.0.1:8484/api/v1, dati in ./data
 ./segvault-server --static examples/web     # + la web app d'esempio su http://127.0.0.1:8484/
+./segvault-server -b 0.0.0.0 --token auto   # in rete locale, con un token casuale
 ```
 
 Tutto passa da una sola chiamata, `POST /api/v1/query`:
@@ -318,6 +328,10 @@ Regole da ricordare, valide per tutti i linguaggi:
 - Ogni richiesta è un'unità chiusa: una transazione non può restare aperta fra due richieste.
 - Le richieste vengono eseguite una alla volta (il motore ha una sola sessione): è pensato per
   app, siti piccoli e medi, laboratori, non per migliaia di scritture concorrenti al secondo.
+  Una richiesta che supera il limite di tempo (default 30 s) viene fermata.
+- Una pagina web di un'altra origine può chiamare il server solo se è ammessa (`--cors`, o
+  *Web apps: Any origin* nel pannello); le altre ricevono 403 (protezione dai siti malevoli
+  aperti nel browser).
 - Tipi in JSON: `INT`/`FLOAT` → numero, `BOOL` → booleano, `NULL` → `null`, il resto (anche
   `DATE`, `AAAA-MM-GG`) → stringa.
 - Con colonne qualificate (`p.nome`) la chiave JSON è `"p.nome"`: usa un alias (`p.nome AS nome`).
@@ -778,7 +792,9 @@ SegVaultDB/
 │   │   ├── panel.h
 │   │   ├── panel.c            # Contenitore con bordo/padding
 │   │   ├── splitter.h
-│   │   └── splitter.c         # Divisore ridimensionabile
+│   │   ├── splitter.c         # Divisore ridimensionabile
+│   │   ├── server_view.h
+│   │   └── server_view.c      # Scelta iniziale (editor / server) e pannello del server API
 │   │
 │   ├── storage/               # Layer fisico: pagine su disco
 │   │   ├── page.h / page.c

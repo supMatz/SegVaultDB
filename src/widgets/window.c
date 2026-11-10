@@ -1622,7 +1622,7 @@ typedef enum {
     // editor
     CTX_CUT, CTX_COPY, CTX_PASTE, CTX_SELECT_ALL, CTX_RUN, CTX_RUN_STMT, CTX_FORMAT, CTX_COMMENT,
     // File
-    CTX_NEW, CTX_OPEN, CTX_SAVE, CTX_SAVE_AS, CTX_QUIT,
+    CTX_NEW, CTX_OPEN, CTX_SAVE, CTX_SAVE_AS, CTX_SERVER, CTX_QUIT,
     // Edit
     CTX_UNDO, CTX_REDO, CTX_FIND, CTX_REPLACE, CTX_GOTO, CTX_DUP_LINE, CTX_DEL_LINE, CTX_UPPER, CTX_LOWER,
     // View
@@ -1671,6 +1671,7 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
     [CTX_OPEN]          = { "Open SQL file\xe2\x80\xa6", "Ctrl+O" },
     [CTX_SAVE]          = { "Save",                      "Ctrl+S" },
     [CTX_SAVE_AS]       = { "Save as\xe2\x80\xa6",       "Ctrl+Shift+S" },
+    [CTX_SERVER]        = { "Start API server\xe2\x80\xa6", NULL },
     [CTX_QUIT]          = { "Exit",                      NULL },
     [CTX_UNDO]          = { "Undo",                      "Ctrl+Z" },
     [CTX_REDO]          = { "Redo",                      "Ctrl+Y" },
@@ -1731,7 +1732,7 @@ enum { CTXK_NONE = 0, CTXK_GRID, CTXK_EDITOR, CTXK_MENU };
 
 // ── barra dei menu ───────────────────────────────────────────────
 
-static const int M_FILE[] = { CTX_NEW, CTX_OPEN, CTX_SAVE, CTX_SAVE_AS, CTX_SEP, CTX_RUN_FILE, CTX_SEP, CTX_QUIT };
+static const int M_FILE[] = { CTX_NEW, CTX_OPEN, CTX_SAVE, CTX_SAVE_AS, CTX_SEP, CTX_RUN_FILE, CTX_SEP, CTX_SERVER, CTX_SEP, CTX_QUIT };
 static const int M_EDIT[] = { CTX_UNDO, CTX_REDO, CTX_SEP, CTX_CUT, CTX_COPY, CTX_PASTE, CTX_SELECT_ALL, CTX_SEP,
                               CTX_FIND, CTX_REPLACE, CTX_GOTO, CTX_SEP, CTX_DUP_LINE, CTX_DEL_LINE, CTX_COMMENT,
                               CTX_UPPER, CTX_LOWER, CTX_SEP, CTX_FORMAT };
@@ -1783,6 +1784,7 @@ static bool ctx_enabled(AppWindow* app, int a) {
         case CTX_REDO: return app->editor->redo_count > 0;
         case CTX_RUN: case CTX_RUN_STMT: case CTX_EXPLAIN: case CTX_RUN_FILE: case CTX_IMPORT_CSV: return idle;
         case CTX_STOP: return !idle;
+        case CTX_SERVER: return idle && !app->in_transaction;
         case CTX_BEGIN: return idle && !app->in_transaction;
         case CTX_COMMIT: case CTX_ROLLBACK: return idle;
         case CTX_DUMP_DB: {   // il motore si interroga solo se libero (il thread di lavoro lo tiene occupato)
@@ -2126,6 +2128,7 @@ static void ctx_run(AppWindow* app, int a) {
         case CTX_SAVE:    if (app->file_path[0]) save_to(app, app->file_path); else bar_open(app, BAR_SAVE_AS, false); break;
         case CTX_SAVE_AS: bar_open(app, BAR_SAVE_AS, false); break;
         case CTX_QUIT:    app->quit_requested = true; break;
+        case CTX_SERVER:  app_window_set_mode(app, APP_MODE_SERVER); break;
         case CTX_RUN_FILE:   bar_open(app, BAR_RUN_FILE, false); break;
         case CTX_IMPORT_CSV: bar_open(app, BAR_IMPORT_CSV, false); break;
         case CTX_DUMP_DB:    bar_open(app, BAR_DUMP, false); break;
@@ -2285,8 +2288,8 @@ static bool ctx_try_open(AppWindow* app, sEvent* evt) {
 
 // ── Settings ─────────────────────────────────────────────────────
 
-static const char* const SETTINGS_SECTIONS[] = { "Appearance", "Editor", "Results", "Execution", "Export" };
-#define SETTINGS_NSECT 5
+static const char* const SETTINGS_SECTIONS[] = { "Appearance", "Editor", "Results", "Execution", "Export", "Server" };
+#define SETTINGS_NSECT 6
 #define SET_ROW_H 54
 
 // indici (in settings_get) delle voci della sezione
@@ -3022,6 +3025,8 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
     if (!app) return NULL;
 
     app->win    = win;
+    app->server = server_panel_create(win);
+    app->start.hover = -1;
     app->win_w  = width;
     app->win_h  = height;
     app->splitter_y    = TOP_H + (int)((height - TOP_H - FOOTER_H) * 0.52f);
@@ -3213,6 +3218,25 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         return;
     }
     if (evt->type == EVT_PAINT) return;
+
+    // scelta iniziale e pannello del server: tutta la finestra è loro
+    if (app->mode == APP_MODE_START) {
+        if (evt->type == EVT_MOUSE_MOVE) platform_set_cursor(app->win, CURSOR_ARROW);
+        ViewAction a = start_screen_event(&app->start, evt);
+        if (a == VIEW_OPEN_EDITOR || a == VIEW_OPEN_SERVER) {
+            if (app->start.remember) {
+                g_settings.startup_mode = a == VIEW_OPEN_SERVER ? START_SERVER : START_EDITOR;
+                settings_store(app);
+            }
+            app_window_set_mode(app, a == VIEW_OPEN_SERVER ? APP_MODE_SERVER : APP_MODE_EDITOR);
+        }
+        return;
+    }
+    if (app->mode == APP_MODE_SERVER) {
+        if (evt->type == EVT_MOUSE_MOVE) platform_set_cursor(app->win, CURSOR_ARROW);
+        if (server_panel_event(app->server, evt) == VIEW_OPEN_EDITOR) app_window_set_mode(app, APP_MODE_EDITOR);
+        return;
+    }
 
     sync_scrollbars(app);
 
@@ -3430,6 +3454,8 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
 
 bool app_window_tick(AppWindow* app, uint64_t now_ms) {
     if (!app) return false;
+    if (app->mode == APP_MODE_SERVER) return server_panel_tick(app->server, now_ms);
+    if (app->mode == APP_MODE_START) return false;
     bool a = textbox_tick(app->editor, now_ms);
     bool b = line_edit_tick(app->bar_input, now_ms);
     bool c = line_edit_tick(app->bar_replace_input, now_ms);
@@ -3705,6 +3731,16 @@ static void draw_footer(AppWindow* app) {
 void app_window_draw(AppWindow* app) {
     if (!app) return;
     PlatformWindow* win = app->win;
+    if (app->mode == APP_MODE_START) {
+        start_screen_draw(&app->start, win, app->win_w, app->win_h, app->data_dir);
+        platform_present(win);
+        return;
+    }
+    if (app->mode == APP_MODE_SERVER) {
+        server_panel_draw(app->server, app->win_w, app->win_h);
+        platform_present(win);
+        return;
+    }
 
     sync_scrollbars(app);
     layout_toolbar(app);   // nome del DB, transazione e tema cambiano lo spazio disponibile
@@ -4095,6 +4131,8 @@ static void finish_run(AppWindow* app) {
 
 void app_window_destroy(AppWindow* app) {
     if (!app) return;
+    server_panel_destroy(app->server);      // prima del motore: le richieste in corso finiscono qui
+    app->server = NULL;
     if (app->job) {   // chiusura durante un'esecuzione: annulla e attende il thread prima di chiudere il motore
         atomic_store(&app->job->cancel, 1);
         db_request_cancel();
@@ -4137,6 +4175,7 @@ void app_window_set_data_dir(AppWindow* app, const char* dir) {
     join_path(app->settings_path, sizeof(app->settings_path), dir, "settings.ini");
     bool have_settings = settings_load(app->settings_path);
     apply_settings(app);
+    server_panel_set_paths(app->server, dir, app->settings_path);
     history_load(app);
     if (!g_settings.restore_session) {
         if (!have_settings) settings_store(app);
@@ -4186,6 +4225,49 @@ void app_window_set_data_dir(AppWindow* app, const char* dir) {
     app->modified = modified != 0;
     if (!have_settings) settings_store(app);   // prima esecuzione con Settings: crea il file
     set_status(app, STATUS_IDLE, "Previous session restored", "");
+}
+
+// ── modalità: editor SQL / server API ────────────────────────────
+
+void app_window_set_mode(AppWindow* app, AppMode mode) {
+    if (!app || mode == app->mode) return;
+    if (mode == APP_MODE_SERVER) {
+        // il server usa lo stesso motore: niente query in corso né transazioni lasciate aperte
+        if (app->job) {
+            app->mode = APP_MODE_EDITOR;
+            set_status(app, STATUS_ERROR, "Wait for the running query (or stop it) before starting the API server", "");
+            return;
+        }
+        update_session(app);
+        if (app->in_transaction) {
+            app->mode = APP_MODE_EDITOR;
+            set_status(app, STATUS_ERROR, "Commit or roll back the open transaction before starting the API server", "");
+            return;
+        }
+        app->menu_open = -1;
+        app->ctx_kind = 0;
+        app->settings_open = false;
+        app->theme_menu_open = false;
+        app->mode = APP_MODE_SERVER;
+        server_panel_start(app->server);      // un errore (es. porta occupata) resta visibile nel pannello
+    } else if (mode == APP_MODE_EDITOR) {
+        bool was_server = app->mode == APP_MODE_SERVER;
+        server_panel_stop(app->server);
+        app->mode = APP_MODE_EDITOR;
+        update_session(app);                  // le app possono aver cambiato schema e dati
+        refresh_tree(app);
+        if (was_server) set_status(app, STATUS_INFO, "API server stopped", "");
+    } else {
+        app->mode = mode;
+    }
+    platform_set_cursor(app->win, CURSOR_ARROW);
+}
+
+void app_window_startup(AppWindow* app, int forced) {
+    if (!app) return;
+    int m = forced >= 0 ? forced : g_settings.startup_mode;
+    if (m == START_SERVER) app_window_set_mode(app, APP_MODE_SERVER);
+    else if (m == START_ASK) { app->start.hover = -1; app->mode = APP_MODE_START; }
 }
 
 void app_window_save_session(AppWindow* app) {

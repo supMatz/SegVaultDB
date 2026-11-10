@@ -1,6 +1,6 @@
 ifeq ($(OS), Windows_NT)
     PLATFORM_SRC = src/platform/win32.c
-    LIBS         = -lgdi32 -luser32 -lkernel32
+    LIBS         = -lgdi32 -luser32 -lkernel32 -lws2_32
     OUT          = segvault.exe
     MKDIR        = mkdir
     RM           = del /Q /F
@@ -39,7 +39,11 @@ WIDGET_SRCS = \
 	src/widgets/scrollbar.c \
 	src/widgets/panel.c \
 	src/widgets/splitter.c \
+	src/widgets/server_view.c \
 	src/widgets/window.c
+
+# ── server HTTP/JSON (usato anche dalla GUI, modalità "API server") ──
+NET_SRCS = src/server/server.c src/server/json.c
 
 # ── DB engine source files ──
 ENGINE_SRCS = \
@@ -64,7 +68,7 @@ ENGINE_SRCS = \
 GUI_SRCS  = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) src/bridge/db_api_test.c
 GUI_OBJS  = $(GUI_SRCS:.c=.o)
 
-FULL_SRCS = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) $(ENGINE_SRCS)
+FULL_SRCS = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) $(NET_SRCS) $(ENGINE_SRCS)
 FULL_OBJS = $(FULL_SRCS:.c=.o)
 
 .PHONY: all gui full clean test test-asan windows bench server lib
@@ -72,7 +76,7 @@ FULL_OBJS = $(FULL_SRCS:.c=.o)
 all: full server
 
 # ── server HTTP/JSON (nessuna GUI, nessuna libreria X11): segvault-server ──
-SERVER_SRCS = src/server/main.c src/server/server.c src/server/json.c src/widgets/sql_text.c $(ENGINE_SRCS)
+SERVER_SRCS = src/server/main.c $(NET_SRCS) src/widgets/sql_text.c $(ENGINE_SRCS)
 SERVER_OBJS = $(patsubst %.c,build-server/%.o,$(SERVER_SRCS))
 
 server: segvault-server
@@ -160,13 +164,13 @@ test_engine: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
 # ── Cross-compilazione Windows da Linux (MinGW-w64) ──
 #   make windows  ->  segvault.exe (statico: basta copiarlo con la cartella assets/)
 WIN_CC   ?= x86_64-w64-mingw32-gcc
-WIN_SRCS  = src/main.c src/platform/win32.c $(WIDGET_SRCS) $(ENGINE_SRCS)
+WIN_SRCS  = src/main.c src/platform/win32.c $(WIDGET_SRCS) $(NET_SRCS) $(ENGINE_SRCS)
 WIN_OBJS  = $(patsubst %.c,build-win/%.o,$(WIN_SRCS))
 
 WIN_SERVER_OBJS = $(patsubst %.c,build-win/%.o,$(SERVER_SRCS))
 
 windows: $(WIN_OBJS) $(WIN_SERVER_OBJS)
-	$(WIN_CC) $(CFLAGS) -o segvault.exe $(WIN_OBJS) -static -mwindows -lgdi32 -luser32 -lkernel32
+	$(WIN_CC) $(CFLAGS) -o segvault.exe $(WIN_OBJS) -static -mwindows -lgdi32 -luser32 -lkernel32 -lws2_32
 	$(WIN_CC) $(CFLAGS) -o segvault-server.exe $(WIN_SERVER_OBJS) -static -lws2_32
 	@echo "=== Windows build: segvault.exe, segvault-server.exe ==="
 

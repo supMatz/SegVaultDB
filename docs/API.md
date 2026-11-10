@@ -9,6 +9,17 @@ I client pronti sono in [`clients/`](../clients/).
 
 ## Avvio
 
+**Dall'app desktop.** All'avvio `segvault` chiede se aprire l'editor SQL o il server API
+(Settings › Server › *At startup open* per non chiederlo più; `segvault --server` / `--editor` da
+riga di comando). Il pannello del server mostra gli indirizzi da copiare, le statistiche, le
+opzioni (porta, rete locale, token, CORS, limite di tempo: una modifica riavvia il server) e il
+registro delle richieste in tempo reale. *Open SQL editor* ferma il server e torna all'editor;
+*File › Start API server…* fa il contrario (non con una query in corso o una transazione aperta,
+perché server ed editor usano lo stesso motore). Il token è salvato in `server.token` nella
+cartella dati.
+
+**Senza finestra** (un server, un container, un servizio di sistema):
+
 ```bash
 make server                          # produce ./segvault-server   (make windows: anche segvault-server.exe)
 ./segvault-server                    # dati in ./data, http://127.0.0.1:8484
@@ -16,6 +27,7 @@ make server                          # produce ./segvault-server   (make windows
 ./segvault-server --static examples/web          # serve anche una web app: http://127.0.0.1:8484/
 ./segvault-server --cors http://localhost:5173   # una web app su un'altra origine (es. Vite in sviluppo)
 SEGVAULT_TOKEN=segreto ./segvault-server -b 0.0.0.0   # raggiungibile in rete: il token è obbligatorio
+./segvault-server -b 0.0.0.0 --token auto              # genera un token casuale e lo stampa
 ```
 
 | Opzione | Significato |
@@ -27,6 +39,7 @@ SEGVAULT_TOKEN=segreto ./segvault-server -b 0.0.0.0   # raggiungibile in rete: i
 | `--cors ORIGIN` | permette le chiamate dal browser da `ORIGIN` (`*` = da tutte) |
 | `--static DIR` | serve i file di `DIR` fuori da `/api` (pagina e API sulla stessa origine: niente CORS) |
 | `--max-body MB` | corpo massimo di una richiesta (default 16) |
+| `--timeout S` | ferma una richiesta che dura più di S secondi (default 30, `0` = mai) |
 | `--no-auth` | consente un indirizzo non locale senza token (sconsigliato) |
 | `-q, --quiet` | niente log delle richieste |
 
@@ -44,6 +57,7 @@ Tutti sotto `/api/v1`. Le risposte sono JSON con `"ok": true|false`.
 | Metodo | Percorso | Risposta |
 |---|---|---|
 | `GET` | `/health` | `{"ok":true,"server":"SegVault","version":"1.2.0"}` (senza token) |
+| `GET` | `/status` | uptime, richieste, errori, righe inviate, connessioni aperte, `busy`, `timeout_ms` |
 | `POST` | `/query` | esegue SQL (sotto) |
 | `GET` | `/databases` | `{"ok":true,"databases":["shop", ...]}` |
 | `GET` | `/databases/{db}/tables` | `{"ok":true,"database":"shop","tables":[...],"views":[...]}` |
@@ -102,6 +116,7 @@ tutto il resto (`VARCHAR`, `TEXT`, `DATE`, ...) → stringa. Le date sono string
 |---|---|
 | 400 | JSON non valido, SQL errato, vincolo violato, numero di `params` diverso dai `?` |
 | 401 | token mancante o sbagliato |
+| 403 | richiesta da una pagina web di un'altra origine non ammessa, o `Host` non locale senza token (vedi Sicurezza) |
 | 404 | endpoint, database o tabella inesistente |
 | 405 | metodo sbagliato (es. `GET /query`) |
 | 411 | manca `Content-Length` (i corpi *chunked* non sono supportati) |
@@ -132,6 +147,14 @@ blocca gli altri). Ogni richiesta è un'unità chiusa:
 Uno statement che fallisce non lascia mai modifiche a metà (come nella GUI); senza
 `"transaction": true` gli statement **precedenti** della stessa richiesta restano invece applicati.
 
+Il database corrente viene ripristinato alla fine di ogni richiesta: un `USE` dentro una richiesta
+non cambia quello delle successive (passa sempre `database`, o avvia il server con `--database`).
+
+**Limite di tempo.** Una richiesta che lavora più di `--timeout` secondi (default 30) viene fermata
+con HTTP 400 `"the request took longer than ... and was stopped"`: le `SELECT` (anche con subquery
+correlate) si interrompono subito, le modifiche alla fine dello statement in corso, gli statement
+successivi non vengono eseguiti. Così una query sbagliata non blocca tutte le altre app.
+
 ## Incorporare il motore in un'app C/C++ (senza server)
 
 Per un'app desktop in C o C++ si può linkare direttamente il motore, come si fa con SQLite:
@@ -160,3 +183,9 @@ db_shutdown();
 - Il token dà accesso completo (anche `DROP`): non metterlo nel codice di una pagina pubblica.
   Per un sito pubblico il browser parla con il tuo backend, che parla con SegVault.
 - `--static` non serve file nascosti (`/.qualcosa`) né percorsi con `..`.
+- **Siti aperti nel browser.** Una pagina qualsiasi può inviare un `POST` a `localhost` (con
+  `text/plain` il browser non chiede il permesso CORS prima). Per questo una richiesta con un header
+  `Origin` viene eseguita solo se l'origine è la pagina servita dal server stesso o quella ammessa
+  con `--cors`; le altre ricevono 403 senza eseguire nulla. Senza token, inoltre, il server in
+  ascolto su `127.0.0.1` risponde solo se `Host` è `localhost` / `127.x.x.x` (difesa dal *DNS rebinding*).
+  Client che non sono browser (curl, Python, C#, Java, Node) non inviano `Origin` e non ne sono toccati.

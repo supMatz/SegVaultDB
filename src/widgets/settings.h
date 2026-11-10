@@ -22,6 +22,7 @@ enum { NULL_TEXT = 0, NULL_PAREN, NULL_SYMBOL, NULL_EMPTY };
 enum { ONERR_STOP = 0, ONERR_CONTINUE };
 enum { DELIM_COMMA = 0, DELIM_SEMICOLON, DELIM_TAB };
 enum { CSVNULL_EMPTY = 0, CSVNULL_TEXT };
+enum { START_ASK = 0, START_EDITOR, START_SERVER };
 
 typedef struct {
     // aspetto
@@ -56,6 +57,13 @@ typedef struct {
     int csv_header;
     int csv_null;
     int json_pretty;
+    // server API
+    int startup_mode;       // START_ASK / START_EDITOR / START_SERVER
+    int server_port;
+    int server_lan;         // raggiungibile dalla rete locale (richiede il token)
+    int server_token;       // richiede il token anche in locale
+    int server_cors;        // le web app di qualsiasi origine possono chiamarlo (richiede il token)
+    int server_timeout;     // secondi (0 = nessun limite)
 } Settings;
 
 typedef struct {

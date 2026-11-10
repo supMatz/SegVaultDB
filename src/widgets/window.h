@@ -28,6 +28,7 @@ SCOPO: Layout principale dell'applicazione SegVault.
 #include "panel.h"
 #include "splitter.h"
 #include "../bridge/db_api.h"
+#include "server_view.h"
 
 #define MENUBAR_H         30   // barra dei menu (File, Edit, ...) sopra la toolbar
 #define TOOLBAR_H         52   // Altezza toolbar in pixel
@@ -44,6 +45,9 @@ SCOPO: Layout principale dell'applicazione SegVault.
 #define MAX_RESULT_TABS   20
 
 typedef enum { RUN_SCRIPT, RUN_CURRENT } RunMode;
+
+// cosa mostra la finestra: l'editor SQL, la scelta iniziale o il pannello del server API
+typedef enum { APP_MODE_EDITOR = 0, APP_MODE_START, APP_MODE_SERVER } AppMode;
 
 typedef enum { STATUS_IDLE, STATUS_OK, STATUS_ERROR, STATUS_INFO } StatusKind;
 
@@ -71,6 +75,11 @@ struct RunJob;   // esecuzione in corso nel thread di lavoro (window.c)
 
 typedef struct {
     PlatformWindow* win;        // Finestra OS sottostante
+
+    // -- modalità: editor, scelta iniziale, server API --
+    AppMode         mode;
+    StartScreen     start;
+    ServerPanel*    server;
 
     // -- toolbar --
     Button* btn_run;            // esegui script / selezione (F5)
@@ -219,6 +228,13 @@ void app_window_set_data_dir(AppWindow* app, const char* dir);
 
 // true dopo File > Exit: il main loop chiude l'applicazione
 bool app_window_quit_requested(AppWindow* app);
+
+// all'avvio: apre l'editor, il server o la scelta iniziale secondo Settings > Server
+// (forced = START_EDITOR / START_SERVER dalla riga di comando, -1 = usa l'impostazione)
+void app_window_startup(AppWindow* app, int forced);
+
+// passa all'editor o al server (il server parte solo se il motore è libero e senza transazioni aperte)
+void app_window_set_mode(AppWindow* app, AppMode mode);
 
 // salva il contenuto dell'editor per la prossima sessione (da chiamare prima di chiudere)
 void app_window_save_session(AppWindow* app);
