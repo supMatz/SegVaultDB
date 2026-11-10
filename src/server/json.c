@@ -17,7 +17,7 @@ typedef struct {
 } JP;
 
 static void jp_fail(JP* p, const char* msg) {
-    if (!p->failed) snprintf(p->err, p->errsz, "%s at byte %zu", msg, p->i);
+    if (!p->failed) snprintf(p->err, p->errsz, "%s at byte %llu", msg, (unsigned long long)p->i);
     p->failed = true;
 }
 

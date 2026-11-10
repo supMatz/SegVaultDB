@@ -164,12 +164,12 @@ static bool send_response(SvServer* s, sock_t fd, const Request* rq, Response* r
         "HTTP/1.1 %d %s\r\n"
         "Server: SegVault/" SV_VERSION_STR "\r\n"
         "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
+        "Content-Length: %llu\r\n"
         "Connection: %s\r\n"
         "X-Content-Type-Options: nosniff\r\n",
         rs->status, status_text(rs->status),
         rs->content_type ? rs->content_type : "application/json; charset=utf-8",
-        blen, rs->close ? "close" : "keep-alive");
+        (unsigned long long)blen, rs->close ? "close" : "keep-alive");
     if (s->cors && n > 0 && (size_t)n < sizeof(head)) {
         // origine ammessa: "*" oppure quella configurata, ripetuta solo se coincide con la richiesta
         const char* allow = !strcmp(s->cors, "*") ? "*" : (rq && !strcmp(rq->origin, s->cors) ? s->cors : NULL);
@@ -516,7 +516,7 @@ static void handle_query(SvServer* s, Request* rq, Response* rs) {
 
     if (dbname[0]) {
         char use[96];
-        snprintf(use, sizeof(use), "USE %s", dbname);
+        snprintf(use, sizeof(use), "USE %.63s", dbname);       // valid_ident: al massimo 63 caratteri
         QueryResult* r = db_execute(use);
         if (!r || !r->success) {
             failed = true;
@@ -916,7 +916,7 @@ static void log_request(SvServer* s, const char* client, const Request* rq, cons
     memset(e, 0, sizeof(*e));
     e->seq = s->n_requests;
     strftime(e->when, sizeof(e->when), "%H:%M:%S", &tmv);
-    snprintf(e->method, sizeof(e->method), "%s", rq->method);
+    snprintf(e->method, sizeof(e->method), "%.7s", rq->method);
     one_line(e->path, sizeof(e->path), rq->path);
     snprintf(e->client, sizeof(e->client), "%s", client);
     one_line(e->detail, sizeof(e->detail), rs->detail);
@@ -971,8 +971,8 @@ static void serve_connection(Conn* c) {
         bool sent = send_response(s, c->fd, &rq, &rs);
         double ms = now_ms() - t0;
         if (!s->cfg.quiet)
-            fprintf(stderr, "[segvault-server] %s %s %s -> %d (%zu bytes, %.1f ms)\n",
-                    c->client, rq.method, rq.path, rs.status, rs.body.len, ms);
+            fprintf(stderr, "[segvault-server] %s %s %s -> %d (%llu bytes, %.1f ms)\n",
+                    c->client, rq.method, rq.path, rs.status, (unsigned long long)rs.body.len, ms);
         if (strcmp(rq.method, "OPTIONS")) log_request(s, c->client, &rq, &rs, ms);
         free(rs.body.data);
         if (!sent || rs.close) goto done;

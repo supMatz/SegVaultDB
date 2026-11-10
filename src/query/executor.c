@@ -948,8 +948,8 @@ static bool key_text(char* buf, size_t cap, const char* s) {
     size_t pre = n < 64 ? n : 64;
     if (pre + 60 > cap) pre = cap > 60 ? cap - 60 : 0;
     for (size_t k = 0; k < pre; k++) buf[k] = (s[k] == '\x1e' || s[k] == '\x1f') ? '?' : s[k];
-    snprintf(buf + pre, cap - pre, "\x1e%016llx%016llx:%zu", (unsigned long long)key_hash(s, n, g_key_seed[0]),
-             (unsigned long long)key_hash(s, n, g_key_seed[1]), n);
+    snprintf(buf + pre, cap - pre, "\x1e%016llx%016llx:%llu", (unsigned long long)key_hash(s, n, g_key_seed[0]),
+             (unsigned long long)key_hash(s, n, g_key_seed[1]), (unsigned long long)n);
     return true;
 }
 
@@ -2537,7 +2537,7 @@ static bool source_materialize(ExecCtx* x, Source* s, ASTNode* q, int depth, con
         for (int i = 0; i < sp->nout; i++) {
             const char* cn = sp->out[i].name;
             const char* dot = strrchr(cn, '.');
-            snprintf(ts->columns[i].name, sizeof(ts->columns[i].name), "%s", dot ? dot + 1 : cn);
+            snprintf(ts->columns[i].name, sizeof(ts->columns[i].name), "%.63s", dot ? dot + 1 : cn);
             ts->columns[i].type = parse_type(out_type_name(sp, i, &rows, true));
             ts->columns[i].nullable = true;
         }
@@ -5134,7 +5134,7 @@ static const char* row_fits(const TableSchema* ts, const Tuple* t, char* msg, si
     size_t sz = tuple_serialized_size(t, ts, &too_long);
     if (too_long) { snprintf(msg, mn, "A text value in table '%.64s' is longer than 65535 bytes", ts->name); return msg; }
     if (sz > SV_MAX_ROW_BYTES) {
-        snprintf(msg, mn, "Row too large for table '%.64s' (%zu bytes, at most %d per row)", ts->name, sz, (int)SV_MAX_ROW_BYTES);
+        snprintf(msg, mn, "Row too large for table '%.64s' (%llu bytes, at most %d per row)", ts->name, (unsigned long long)sz, (int)SV_MAX_ROW_BYTES);
         return msg;
     }
     return NULL;
