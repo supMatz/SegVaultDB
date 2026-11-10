@@ -10,6 +10,7 @@
 - [Overview](#overview)
 - [Per i corsi di Basi di Dati 1 e 2](#per-i-corsi-di-basi-di-dati-1-e-2)
 - [Supported SQL](#supported-sql)
+- [API: usare SegVault da siti web e app desktop](#api-usare-segvault-da-siti-web-e-app-desktop)
 - [Architecture](#architecture)
 - [Prestazioni](#prestazioni)
 - [GUI Layout](#gui-layout)
@@ -47,6 +48,7 @@ Pensato per i corsi di **Basi di Dati 1 e 2** di ingegneria informatica: lo stes
 | **Ottimizzatore** | Pushdown delle selezioni, hash join (anche per `FROM a, b WHERE a.x = b.y`), accesso con indice per uguaglianza o per intervallo (`<`, `BETWEEN`, scelto solo se conviene), subquery decorrelate per chiave; `EXPLAIN` con stime alla System R e `EXPLAIN ANALYZE` con le righe reali |
 | **Transazioni** | Write-Ahead Log con undo/redo, `BEGIN` / `COMMIT` / `ROLLBACK`, `SAVEPOINT`, recovery dopo un crash, `CHECKPOINT` (anche automatico) |
 | **Basi di dati attive** | Trigger `BEFORE` / `AFTER`, `FOR EACH ROW` / `FOR EACH STATEMENT`, `NEW` / `OLD`, `WHEN`, `SET NEW.col`, `SIGNAL`, `IF` |
+| **API** | `segvault-server`: HTTP/JSON con parametri `?`, transazioni per richiesta, token, CORS; client per TypeScript/JavaScript e Python, esempi C# e Java; `libsegvault.a` per incorporare il motore in C/C++ |
 | **Cross-compilation** | MinGW-w64 — `make windows` produce `segvault.exe` da Linux |
 
 ---
@@ -282,6 +284,338 @@ Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), stored procedur
 
 ---
 
+## API: usare SegVault da siti web e app desktop
+
+`segvault-server` è il motore senza GUI, esposto come servizio **HTTP/JSON**: qualsiasi linguaggio
+con un client HTTP (browser, Node.js, Python, C#, Java, Go, ...) può salvare, caricare ed elaborare
+dati in SegVault. Come il resto del progetto è scritto in C senza dipendenze, per Linux e Windows.
+Riferimento completo del protocollo: [`docs/API.md`](docs/API.md). Client pronti: [`clients/`](clients/).
+
+```bash
+make server                       # ./segvault-server   (make windows produce anche segvault-server.exe)
+./segvault-server                 # http://127.0.0.1:8484/api/v1, dati in ./data
+./segvault-server --static examples/web     # + la web app d'esempio su http://127.0.0.1:8484/
+```
+
+Tutto passa da una sola chiamata, `POST /api/v1/query`:
+
+```bash
+curl -s http://127.0.0.1:8484/api/v1/query -H 'Content-Type: application/json' -d '{
+  "database": "shop",
+  "sql": "SELECT nome, prezzo FROM prodotto WHERE prezzo < ?",
+  "params": [10],
+  "rows": "objects"
+}'
+# {"ok":true,"results":[{"columns":[...],"rows":[{"nome":"pane","prezzo":1.5}],"row_count":1,"time_ms":0.02}],"time_ms":0.05}
+```
+
+Regole da ricordare, valide per tutti i linguaggi:
+
+- **I dati dell'utente vanno sempre in `params`**, con un `?` nell'SQL: il server li trasforma in
+  letterali sicuri (niente SQL injection). Mai concatenare stringhe nell'SQL.
+- Più statement separati da `;` in una richiesta danno un risultato ciascuno; con
+  `"transaction": true` vengono applicati **tutti o nessuno**.
+- Ogni richiesta è un'unità chiusa: una transazione non può restare aperta fra due richieste.
+- Le richieste vengono eseguite una alla volta (il motore ha una sola sessione): è pensato per
+  app, siti piccoli e medi, laboratori, non per migliaia di scritture concorrenti al secondo.
+- Tipi in JSON: `INT`/`FLOAT` → numero, `BOOL` → booleano, `NULL` → `null`, il resto (anche
+  `DATE`, `AAAA-MM-GG`) → stringa.
+- Con colonne qualificate (`p.nome`) la chiave JSON è `"p.nome"`: usa un alias (`p.nome AS nome`).
+- Limite attuale: un letterale stringa (quindi anche un parametro stringa) è al massimo 511 byte.
+
+Gli esempi usano lo stesso schema:
+
+```sql
+CREATE DATABASE shop;
+USE shop;
+CREATE TABLE prodotto (id INT PRIMARY KEY AUTO_INCREMENT, nome VARCHAR(60) NOT NULL UNIQUE,
+                       prezzo FLOAT NOT NULL CHECK (prezzo >= 0), categoria VARCHAR(20));
+CREATE TABLE ordine (id INT PRIMARY KEY AUTO_INCREMENT, prodotto INT NOT NULL REFERENCES prodotto(id),
+                     quantita INT NOT NULL CHECK (quantita > 0), giorno DATE NOT NULL);
+```
+
+### TypeScript / JavaScript (browser, Node.js 18+, Deno, Bun)
+
+Client: [`clients/segvault.ts`](clients/segvault.ts) (TypeScript) o [`clients/segvault.js`](clients/segvault.js)
+(JavaScript): usano solo `fetch`, nessun pacchetto da installare.
+
+```ts
+import { SegVault, SegVaultError } from "./segvault";
+
+interface Prodotto { id: number; nome: string; prezzo: number; categoria: string | null }
+
+const db = new SegVault("http://127.0.0.1:8484", { database: "shop" });
+
+// salvare: un INSERT con parametri
+await db.run("INSERT INTO prodotto (nome, prezzo, categoria) VALUES (?, ?, ?)", ["pane", 1.5, "cibo"]);
+
+// salvare molti record arrivati dall'app (form, file, API esterna) in un colpo solo, atomico
+const nuovi = [{ nome: "latte", prezzo: 1.2, categoria: "cibo" }, { nome: "vino", prezzo: 9.9, categoria: "bevande" }];
+await db.transaction(
+  "INSERT INTO prodotto (nome, prezzo, categoria) VALUES " + nuovi.map(() => "(?, ?, ?)").join(", "),
+  nuovi.flatMap((p) => [p.nome, p.prezzo, p.categoria]),
+);
+
+// caricare: righe come oggetti tipizzati
+const economici = await db.all<Prodotto>("SELECT * FROM prodotto WHERE prezzo < ? ORDER BY prezzo", [5]);
+const uno = await db.get<Prodotto>("SELECT * FROM prodotto WHERE nome = ?", ["pane"]);
+
+// elaborare: le aggregazioni conviene farle fare al database...
+const perCategoria = await db.all<{ categoria: string; n: number; medio: number }>(
+  "SELECT categoria, COUNT(*) AS n, AVG(prezzo) AS medio FROM prodotto GROUP BY categoria");
+// ...e il resto in JavaScript sui dati caricati
+const listino = economici.map((p) => `${p.nome}: ${p.prezzo.toFixed(2)} €`);
+
+// aggiornare / cancellare
+const cambiati = await db.run("UPDATE prodotto SET prezzo = prezzo * 1.1 WHERE categoria = ?", ["bevande"]);
+
+// errori: vincoli violati, SQL errato, ...
+try {
+  await db.run("INSERT INTO prodotto (nome, prezzo) VALUES (?, ?)", ["pane", 2]);   // UNIQUE
+} catch (e) {
+  if (e instanceof SegVaultError) console.error(e.message, "statement", e.statement);
+}
+```
+
+**Da una pagina web** ci sono due strade:
+1. la pagina è servita dal server stesso (`--static cartella`) e chiama `/api/v1/...` sulla stessa
+   origine: è il caso di [`examples/web/index.html`](examples/web/index.html), un registro spese completo;
+2. la web app gira altrove (Vite, React, ...): avvia il server con `--cors http://localhost:5173`.
+
+Per un **sito pubblico** il browser non deve parlare direttamente con il database (chiunque
+vedrebbe e userebbe il token): il browser chiama il tuo backend (Node, Python, C#, Java, ...),
+che usa SegVault con il client del suo linguaggio. Lo stesso vale per un'app **Electron/Tauri**:
+le chiamate partono dal processo principale.
+
+### Python
+
+Client: [`clients/segvault.py`](clients/segvault.py), solo libreria standard.
+
+```python
+from segvault import SegVault, SegVaultError
+
+db = SegVault("http://127.0.0.1:8484", database="shop")
+
+# salvare
+db.run("INSERT INTO prodotto (nome, prezzo, categoria) VALUES (?, ?, ?)", ["pane", 1.5, "cibo"])
+
+# importare record (es. da un CSV) in un'unica transazione
+import csv
+with open("prodotti.csv", newline="", encoding="utf-8") as f:
+    righe = [(r["nome"], float(r["prezzo"]), r["categoria"]) for r in csv.DictReader(f)]
+for i in range(0, len(righe), 500):                     # blocchi da 500 righe
+    blocco = righe[i:i + 500]
+    db.transaction("INSERT INTO prodotto (nome, prezzo, categoria) VALUES "
+                   + ", ".join(["(?, ?, ?)"] * len(blocco)),
+                   [v for riga in blocco for v in riga])
+
+# caricare: lista di dict
+for p in db.all("SELECT nome, prezzo FROM prodotto WHERE prezzo < ? ORDER BY prezzo", [5]):
+    print(p["nome"], p["prezzo"])
+
+# elaborare in SQL (join + aggregazione)...
+fatturato = db.all("""SELECT p.categoria AS categoria, SUM(p.prezzo * o.quantita) AS totale
+                      FROM ordine o JOIN prodotto p ON p.id = o.prodotto
+                      WHERE o.giorno >= ? GROUP BY p.categoria ORDER BY totale DESC""", ["2026-01-01"])
+
+# ...o in Python, ad esempio con pandas
+import pandas as pd
+df = pd.DataFrame(db.all("SELECT * FROM prodotto"))
+print(df.groupby("categoria")["prezzo"].describe())
+
+try:
+    db.run("INSERT INTO ordine (prodotto, quantita, giorno) VALUES (?, ?, ?)", [999, 1, "2026-11-10"])
+except SegVaultError as e:                              # chiave esterna violata
+    print("rifiutato:", e)
+```
+
+### C# (.NET 6+)
+
+Nessun pacchetto: `HttpClient` e `System.Text.Json` sono nella libreria standard.
+
+```csharp
+using System.Net.Http.Json;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+public record Prodotto(int Id, string Nome, double Prezzo, string? Categoria);
+
+public class SegVaultException(string message, int? statement) : Exception(message)
+{
+    public int? Statement { get; } = statement;
+}
+
+public class SegVault(string url, string database, string? token = null)
+{
+    static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
+    readonly HttpClient http = new() { BaseAddress = new Uri(url) };
+
+    record Request(string Sql, object?[] Params, string Database, bool Transaction, string Rows);
+    record Error(string Message, int? Statement);
+    record Result(JsonElement[]? Rows, int? RowsAffected);
+    record Response(bool Ok, Result[] Results, Error? Error);
+
+    async Task<Result[]> Send(string sql, object?[] args, bool transaction)
+    {
+        using var req = new HttpRequestMessage(HttpMethod.Post, "/api/v1/query")
+        {
+            Content = JsonContent.Create(new Request(sql, args, database, transaction, "objects"),
+                options: new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase })
+        };
+        if (token != null) req.Headers.Authorization = new("Bearer", token);
+        using var res = await http.SendAsync(req);
+        var body = await res.Content.ReadFromJsonAsync<Response>(
+            new JsonSerializerOptions(Json) { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower });
+        if (body is null || !body.Ok)
+            throw new SegVaultException(body?.Error?.Message ?? $"HTTP {(int)res.StatusCode}", body?.Error?.Statement);
+        return body.Results;
+    }
+
+    // righe dell'ultimo statement convertite nel tipo T (le colonne diventano proprietà)
+    public async Task<List<T>> All<T>(string sql, params object?[] args)
+    {
+        var results = await Send(sql, args, false);
+        return results.Length == 0 || results[^1].Rows is null ? new()
+             : results[^1].Rows!.Select(r => r.Deserialize<T>(Json)!).ToList();
+    }
+
+    public async Task<int> Run(string sql, params object?[] args) =>
+        (await Send(sql, args, false)) is { Length: > 0 } r ? r[^1].RowsAffected ?? 0 : 0;
+
+    public Task<Result[]> Transaction(string sql, params object?[] args) => Send(sql, args, true);
+}
+```
+
+```csharp
+var db = new SegVault("http://127.0.0.1:8484", "shop");
+
+// salvare
+await db.Run("INSERT INTO prodotto (nome, prezzo, categoria) VALUES (?, ?, ?)", "pane", 1.5, "cibo");
+
+// salvare una lista di oggetti dell'app, atomicamente
+var nuovi = new[] { new Prodotto(0, "latte", 1.2, "cibo"), new Prodotto(0, "vino", 9.9, "bevande") };
+await db.Transaction(
+    "INSERT INTO prodotto (nome, prezzo, categoria) VALUES " + string.Join(", ", nuovi.Select(_ => "(?, ?, ?)")),
+    nuovi.SelectMany(p => new object?[] { p.Nome, p.Prezzo, p.Categoria }).ToArray());
+
+// caricare in oggetti tipizzati
+List<Prodotto> economici = await db.All<Prodotto>("SELECT * FROM prodotto WHERE prezzo < ?", 5);
+
+// elaborare: in SQL o con LINQ
+var medie = await db.All<JsonElement>("SELECT categoria, AVG(prezzo) AS medio FROM prodotto GROUP BY categoria");
+var piuCaro = economici.MaxBy(p => p.Prezzo);
+
+try { await db.Run("DELETE FROM prodotto WHERE id = ?", 1); }
+catch (SegVaultException e) { Console.WriteLine($"errore: {e.Message}"); }   // es. RESTRICT su una FK
+```
+
+In un'app desktop (WPF, WinForms, Avalonia, MAUI) si può anche avviare il server insieme all'app con
+`Process.Start("segvault-server.exe", "-p 8484 dati")` e chiuderlo all'uscita.
+
+### Java (11+)
+
+`java.net.http.HttpClient` è nella libreria standard; per il JSON serve una libreria, qui
+**Jackson** (`com.fasterxml.jackson.core:jackson-databind`).
+
+```java
+import com.fasterxml.jackson.databind.*;
+import java.net.URI;
+import java.net.http.*;
+import java.util.*;
+
+public class SegVault {
+    private static final ObjectMapper JSON = new ObjectMapper()
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+    private final HttpClient http = HttpClient.newHttpClient();
+    private final String url, database, token;
+
+    public SegVault(String url, String database, String token) {
+        this.url = url; this.database = database; this.token = token;
+    }
+
+    public static class SegVaultException extends RuntimeException {
+        public final Integer statement;
+        SegVaultException(String msg, Integer statement) { super(msg); this.statement = statement; }
+    }
+
+    private JsonNode send(String sql, List<?> params, boolean transaction) throws Exception {
+        Map<String, Object> body = new HashMap<>();
+        body.put("sql", sql);
+        body.put("params", params);
+        body.put("database", database);
+        body.put("transaction", transaction);
+        body.put("rows", "objects");
+        HttpRequest.Builder rb = HttpRequest.newBuilder(URI.create(url + "/api/v1/query"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(body)));
+        if (token != null) rb.header("Authorization", "Bearer " + token);
+        HttpResponse<String> res = http.send(rb.build(), HttpResponse.BodyHandlers.ofString());
+        JsonNode root = JSON.readTree(res.body());
+        if (!root.path("ok").asBoolean()) {
+            JsonNode e = root.path("error");
+            throw new SegVaultException(e.path("message").asText("HTTP " + res.statusCode()),
+                                        e.has("statement") ? e.get("statement").asInt() : null);
+        }
+        JsonNode results = root.get("results");
+        return results.size() > 0 ? results.get(results.size() - 1) : JSON.createObjectNode();
+    }
+
+    /** righe dell'ultimo statement come oggetti della classe indicata */
+    public <T> List<T> all(Class<T> type, String sql, Object... params) throws Exception {
+        List<T> out = new ArrayList<>();
+        for (JsonNode row : send(sql, Arrays.asList(params), false).path("rows")) out.add(JSON.treeToValue(row, type));
+        return out;
+    }
+
+    public int run(String sql, Object... params) throws Exception {
+        return send(sql, Arrays.asList(params), false).path("rows_affected").asInt();
+    }
+
+    public void transaction(String sql, List<?> params) throws Exception { send(sql, params, true); }
+}
+```
+
+```java
+public record Prodotto(int id, String nome, double prezzo, String categoria) {}
+
+SegVault db = new SegVault("http://127.0.0.1:8484", "shop", null);
+
+// salvare
+db.run("INSERT INTO prodotto (nome, prezzo, categoria) VALUES (?, ?, ?)", "pane", 1.5, "cibo");
+
+// salvare molti record in una transazione
+List<Prodotto> nuovi = List.of(new Prodotto(0, "latte", 1.2, "cibo"), new Prodotto(0, "vino", 9.9, "bevande"));
+String values = String.join(", ", Collections.nCopies(nuovi.size(), "(?, ?, ?)"));
+List<Object> args = new ArrayList<>();
+for (Prodotto p : nuovi) { args.add(p.nome()); args.add(p.prezzo()); args.add(p.categoria()); }
+db.transaction("INSERT INTO prodotto (nome, prezzo, categoria) VALUES " + values, args);
+
+// caricare in record Java
+List<Prodotto> economici = db.all(Prodotto.class, "SELECT * FROM prodotto WHERE prezzo < ?", 5);
+
+// elaborare: SQL per le aggregazioni, stream per il resto
+double totale = economici.stream().mapToDouble(Prodotto::prezzo).sum();
+```
+
+### C / C++ (motore incorporato, senza server)
+
+Un'app desktop in C o C++ può linkare direttamente il motore, come si fa con SQLite:
+`make lib` produce `libsegvault.a`, l'header è [`src/bridge/db_api.h`](src/bridge/db_api.h).
+Esempio in [`docs/API.md`](docs/API.md#incorporare-il-motore-in-unapp-cc-senza-server).
+
+### Quale modalità scegliere
+
+| Scenario | Come |
+|---|---|
+| Sito / web app che gira sulla stessa macchina | `segvault-server --static app/` (stessa origine) |
+| Frontend su un'altra origine (sviluppo) | `segvault-server --cors http://localhost:5173` |
+| Sito pubblico | browser → tuo backend → `segvault-server` su `127.0.0.1` |
+| App desktop in C#, Java, Python, Electron | il server avviato insieme all'app (porta locale) |
+| App desktop in C/C++ | `libsegvault.a`, nessun processo in più |
+| Server in rete locale | `segvault-server -b 0.0.0.0 --token ...`, meglio dietro HTTPS |
+
+---
+
 ## Architecture
 
 ```
@@ -396,6 +730,7 @@ Tutti i colori vivono in una struct `Theme` (`src/widgets/theme.h` / `theme.c`):
 |---|---|
 | 110.050 `INSERT` (blocchi da 500 righe) | 0,11 s |
 | `COUNT(*)` su 100.000 righe | 9 ms |
+| `SELECT *` di 100.000 righe (risultato completo) | 36 ms |
 | `SELECT ... WHERE voto = 30` su 100.000 righe | 10 ms |
 | `GROUP BY` + `AVG` su 100.000 righe | 10 ms |
 | `ORDER BY ... LIMIT 10` su 100.000 righe | 11 ms |
@@ -471,10 +806,19 @@ SegVaultDB/
 │   ├── bridge/                # IL PONTE TRA GUI E DB
 │   │   └── db_api.h / db_api.c
 │   │
+│   ├── server/                # segvault-server: HTTP/JSON sopra db_api.h
+│   │   ├── server.h / server.c   # socket, HTTP/1.1, endpoint, parametri ?
+│   │   ├── json.h / json.c       # lettura e scrittura JSON
+│   │   └── main.c                # opzioni da riga di comando
+│   │
 │   └── main.c                 # Entry point
 │
 ├── include/
 │   └── common.h               # Tipi globali, macro
+│
+├── clients/                   # client per l'API: segvault.ts, segvault.js, segvault.py
+├── docs/API.md                # riferimento dell'API HTTP/JSON
+├── examples/web/              # web app d'esempio (registro spese)
 │
 └── Makefile.
 ```
@@ -634,7 +978,7 @@ make
 # GUI-only build (uses db_api_test.c stub, no engine) — same binary name
 make gui
 
-# Test: motore (128), SQL end-to-end (469, con crash e recovery), script di examples/ (159 istruzioni)
+# Test: motore (128), SQL end-to-end (533, con crash e recovery), script di examples/ (166 istruzioni), server HTTP (50 controlli)
 make test
 
 # Gli stessi test con AddressSanitizer + UndefinedBehaviorSanitizer
@@ -642,6 +986,10 @@ make test-asan
 
 # Benchmark su 100.000 righe
 make bench
+
+# Server HTTP/JSON (./segvault-server) e libreria del motore (libsegvault.a)
+make server
+make lib
 ```
 
 **Dipendenze su Linux:** `libX11`, `libXft`, `libXrender`, `fontconfig` (presenti su qualsiasi desktop X11; su Debian/Ubuntu: `sudo apt install libx11-dev libxft-dev`, su Arch: `sudo pacman -S libx11 libxft`). Per il miglior risultato installare **JetBrains Mono** e **Inter** o **Fira Sans**: se mancano, fontconfig sceglie automaticamente il miglior font monospace / sans-serif disponibile.

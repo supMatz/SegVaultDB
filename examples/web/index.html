@@ -1,0 +1,130 @@
+<!doctype html>
+<!--
+  Web app d'esempio: registro spese salvato in SegVault.
+  Avvio:   ./segvault-server --static examples/web
+  Poi apri http://127.0.0.1:8484/  (pagina e API sulla stessa origine: niente CORS)
+-->
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spese · SegVault</title>
+<style>
+  :root { --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #677085; --accent: #2f6fde; --bad: #c43d3d; --line: #e3e6ec; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #14171d; --card: #1c2028; --text: #e6e9ef; --muted: #98a1b3; --accent: #6d9dff; --bad: #ff7a7a; --line: #2c323d; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-top: 16px; }
+  form { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr auto; gap: 8px; }
+  @media (max-width: 640px) { form { grid-template-columns: 1fr 1fr; } }
+  input, select, button { font: inherit; padding: 7px 9px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); min-width: 0; }
+  button { background: var(--accent); color: #fff; border: 0; cursor: pointer; }
+  button.link { background: none; color: var(--bad); padding: 0 4px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+  .bar { height: 8px; background: var(--accent); border-radius: 4px; }
+  #err { color: var(--bad); min-height: 1.5em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Registro spese</h1>
+  <div class="muted">Dati salvati in SegVault tramite <code>POST /api/v1/query</code> con parametri <code>?</code>.</div>
+  <div id="err"></div>
+
+  <section>
+    <form id="add">
+      <input name="descrizione" placeholder="Descrizione" required maxlength="80">
+      <input name="importo" type="number" step="0.01" min="0.01" placeholder="Importo €" required>
+      <select name="categoria">
+        <option>Casa</option><option>Cibo</option><option>Trasporti</option><option>Svago</option><option>Altro</option>
+      </select>
+      <input name="giorno" type="date" required>
+      <button>Aggiungi</button>
+    </form>
+  </section>
+
+  <section>
+    <strong>Per categoria</strong> <span class="muted">(GROUP BY lato database)</span>
+    <table id="cat"><thead><tr><th>Categoria</th><th class="n">Spese</th><th class="n">Totale</th><th style="width:40%"></th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section>
+    <strong>Ultime spese</strong>
+    <table id="list"><thead><tr><th>Giorno</th><th>Descrizione</th><th>Categoria</th><th class="n">Importo</th><th></th></tr></thead><tbody></tbody></table>
+  </section>
+</main>
+
+<script type="module">
+// client minimo (lo stesso di clients/segvault.js, ridotto)
+async function sql(sql, params = [], opts = {}) {
+  const res = await fetch("/api/v1/query", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sql, params, database: "spese", rows: "objects", ...opts }),
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error.message);
+  return data.results.at(-1)?.rows ?? [];
+}
+
+const euro = new Intl.NumberFormat("it-IT", { style: "currency", currency: "EUR" });
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const showError = (e) => { $("#err").textContent = e ? e.message : ""; };
+
+async function setup() {
+  // schema creato al primo avvio (database: null = nessun USE prima dello script)
+  const dbs = await (await fetch("/api/v1/databases")).json();
+  if (!dbs.databases.includes("spese")) {
+    await sql(`CREATE DATABASE spese; USE spese;
+               CREATE TABLE spesa (
+                 id INT PRIMARY KEY AUTO_INCREMENT,
+                 descrizione VARCHAR(80) NOT NULL,
+                 importo FLOAT NOT NULL CHECK (importo > 0),
+                 categoria VARCHAR(20) NOT NULL,
+                 giorno DATE NOT NULL)`, [], { database: null, transaction: true });
+  }
+}
+
+async function refresh() {
+  const cats = await sql(`SELECT categoria, COUNT(*) AS n, SUM(importo) AS totale
+                          FROM spesa GROUP BY categoria ORDER BY totale DESC`);
+  const max = Math.max(1, ...cats.map((c) => c.totale));
+  $("#cat tbody").innerHTML = cats.map((c) => `<tr><td>${esc(c.categoria)}</td><td class="n">${c.n}</td>
+      <td class="n">${euro.format(c.totale)}</td><td><div class="bar" style="width:${(100 * c.totale / max).toFixed(1)}%"></div></td></tr>`).join("");
+
+  const rows = await sql("SELECT * FROM spesa ORDER BY giorno DESC, id DESC LIMIT ?", [50]);
+  $("#list tbody").innerHTML = rows.map((r) => `<tr><td>${esc(r.giorno)}</td><td>${esc(r.descrizione)}</td>
+      <td>${esc(r.categoria)}</td><td class="n">${euro.format(r.importo)}</td>
+      <td><button class="link" data-id="${r.id}" title="Elimina">✕</button></td></tr>`).join("");
+}
+
+$("#add").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  try {
+    await sql("INSERT INTO spesa (descrizione, importo, categoria, giorno) VALUES (?, ?, ?, ?)",
+              [f.get("descrizione"), Number(f.get("importo")), f.get("categoria"), f.get("giorno")]);
+    ev.target.reset();
+    ev.target.giorno.valueAsDate = new Date();
+    showError(null);
+    await refresh();
+  } catch (e) { showError(e); }
+});
+
+$("#list").addEventListener("click", async (ev) => {
+  const id = ev.target.dataset?.id;
+  if (!id) return;
+  try { await sql("DELETE FROM spesa WHERE id = ?", [Number(id)]); await refresh(); } catch (e) { showError(e); }
+});
+
+$("#add").giorno.valueAsDate = new Date();
+setup().then(refresh).catch(showError);
+</script>
+</body>
+</html>

@@ -67,9 +67,32 @@ GUI_OBJS  = $(GUI_SRCS:.c=.o)
 FULL_SRCS = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) $(ENGINE_SRCS)
 FULL_OBJS = $(FULL_SRCS:.c=.o)
 
-.PHONY: all gui full clean test test-asan windows bench
+.PHONY: all gui full clean test test-asan windows bench server lib
 
-all: full
+all: full server
+
+# ── server HTTP/JSON (nessuna GUI, nessuna libreria X11): segvault-server ──
+SERVER_SRCS = src/server/main.c src/server/server.c src/server/json.c src/widgets/sql_text.c $(ENGINE_SRCS)
+SERVER_OBJS = $(patsubst %.c,build-server/%.o,$(SERVER_SRCS))
+
+server: segvault-server
+
+segvault-server: $(SERVER_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(SERVER_OBJS) -lm -pthread
+	@echo "=== Server build: segvault-server ==="
+
+build-server/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(DEPFLAGS) $(BASE_INCLUDES) -c $< -o $@
+
+# ── libreria statica del motore, per incorporarlo in un'app C/C++ (come SQLite): libsegvault.a ──
+LIB_OBJS = $(patsubst %.c,build-server/%.o,$(ENGINE_SRCS))
+
+lib: libsegvault.a
+
+libsegvault.a: $(LIB_OBJS)
+	ar rcs $@ $(LIB_OBJS)
+	@echo "=== Library: libsegvault.a (header: src/bridge/db_api.h) ==="
 
 gui: $(GUI_OBJS)
 	$(CC) $(CFLAGS) -o $(OUT) $(GUI_OBJS) $(LIBS)
@@ -86,11 +109,18 @@ SQL_TEST_SRCS = tests/test_sql.c $(ENGINE_SRCS)
 
 EXAMPLES_TEST_SRCS = tests/test_examples.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
-test: test_engine test_btree test_sql test_examples
+test: test_engine test_btree test_sql test_examples test_server
 	./test_btree
 	./test_engine
 	./test_sql
 	./test_examples
+	./test_server
+
+TEST_SERVER_SRCS = tests/test_server.c src/server/server.c src/server/json.c src/widgets/sql_text.c $(ENGINE_SRCS)
+
+# il server HTTP: richieste reali su un socket locale
+test_server: $(TEST_SERVER_SRCS) src/server/server.h src/server/json.h
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_server $(TEST_SERVER_SRCS) -lm -pthread
 
 # gli script di examples/ eseguiti come nell'editor
 test_examples: $(EXAMPLES_TEST_SRCS) $(wildcard examples/*.sql)
@@ -117,6 +147,9 @@ test-asan: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
 	ASAN_OPTIONS=detect_leaks=1 ./test_engine_asan
 	ASAN_OPTIONS=detect_leaks=1 ./test_sql_asan
 	ASAN_OPTIONS=detect_leaks=1 ./test_examples_asan
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
+		-I. $(BASE_INCLUDES) -o test_server_asan $(TEST_SERVER_SRCS) -lm -pthread
+	ASAN_OPTIONS=detect_leaks=1 ./test_server_asan
 
 test_engine: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o test_engine test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c -lm -pthread
@@ -130,9 +163,12 @@ WIN_CC   ?= x86_64-w64-mingw32-gcc
 WIN_SRCS  = src/main.c src/platform/win32.c $(WIDGET_SRCS) $(ENGINE_SRCS)
 WIN_OBJS  = $(patsubst %.c,build-win/%.o,$(WIN_SRCS))
 
-windows: $(WIN_OBJS)
+WIN_SERVER_OBJS = $(patsubst %.c,build-win/%.o,$(SERVER_SRCS))
+
+windows: $(WIN_OBJS) $(WIN_SERVER_OBJS)
 	$(WIN_CC) $(CFLAGS) -o segvault.exe $(WIN_OBJS) -static -mwindows -lgdi32 -luser32 -lkernel32
-	@echo "=== Windows build: segvault.exe ==="
+	$(WIN_CC) $(CFLAGS) -o segvault-server.exe $(WIN_SERVER_OBJS) -static -lws2_32
+	@echo "=== Windows build: segvault.exe, segvault-server.exe ==="
 
 build-win/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -140,9 +176,10 @@ build-win/%.o: %.c
 
 clean:
 	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(GUI_OBJS:.o=.d) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql test_examples test_examples_asan
-	$(RM) -r obj build-win
+	$(RM) segvault-server segvault-server.exe libsegvault.a test_server test_server_asan
+	$(RM) -r obj build-win build-server
 
--include $(FULL_OBJS:.o=.d) $(GUI_OBJS:.o=.d) $(WIN_OBJS:.o=.d)
+-include $(FULL_OBJS:.o=.d) $(GUI_OBJS:.o=.d) $(WIN_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(WIN_SERVER_OBJS:.o=.d)
 
 # ── benchmark del motore (schema universitario, righe configurabili: ./bench_sql 100000) ──
 bench_sql: bench/bench.c $(ENGINE_SRCS)

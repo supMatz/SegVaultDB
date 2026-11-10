@@ -45,4 +45,5 @@ jobs:
           name: segvault-windows
           path: |
             segvault.exe
+            segvault-server.exe
             assets/

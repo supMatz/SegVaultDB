@@ -25,3 +25,10 @@ test_sql_asan
 bench_sql
 test_examples
 test_examples_asan
+segvault-server
+segvault-server.exe
+libsegvault.a
+build-server/
+test_server
+test_server_asan
+__pycache__/
