@@ -1,6 +1,6 @@
 ifeq ($(OS), Windows_NT)
     PLATFORM_SRC = src/platform/win32.c
-    LIBS         = -lgdi32 -luser32 -lkernel32 -lws2_32
+    LIBS         = -lgdi32 -luser32 -lkernel32 -lws2_32 -lshell32
     OUT          = segvault.exe
     MKDIR        = mkdir
     RM           = del /Q /F
@@ -170,7 +170,7 @@ WIN_OBJS  = $(patsubst %.c,build-win/%.o,$(WIN_SRCS))
 WIN_SERVER_OBJS = $(patsubst %.c,build-win/%.o,$(SERVER_SRCS))
 
 windows: $(WIN_OBJS) $(WIN_SERVER_OBJS)
-	$(WIN_CC) $(CFLAGS) -o segvault.exe $(WIN_OBJS) -static -mwindows -lgdi32 -luser32 -lkernel32 -lws2_32
+	$(WIN_CC) $(CFLAGS) -o segvault.exe $(WIN_OBJS) -static -mwindows -lgdi32 -luser32 -lkernel32 -lws2_32 -lshell32
 	$(WIN_CC) $(CFLAGS) -o segvault-server.exe $(WIN_SERVER_OBJS) -static -lws2_32
 	@echo "=== Windows build: segvault.exe, segvault-server.exe ==="
 

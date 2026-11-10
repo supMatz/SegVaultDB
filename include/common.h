@@ -19,6 +19,7 @@ SCOPO: Header incluso da TUTTI i moduli del progetto.
 #define SV_VERSION_MINOR 2
 #define SV_VERSION_PATCH 0
 #define SV_VERSION_STR  "1.2.0"
+#define SV_DOCS_URL     "https://github.com/supMatz/SegVaultDB/blob/main/README.md"   // Help > Online documentation
 #define SV_NAME         "SegVault"
 
 // codici di ritorno

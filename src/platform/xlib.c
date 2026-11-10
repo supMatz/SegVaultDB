@@ -18,6 +18,7 @@ SCOPO: Stessa interfaccia di win32.c ma usa Xlib (Linux/X11).
 #include <X11/extensions/Xrender.h>
 #include <sys/select.h>
 #include <unistd.h>      // readlink
+#include <sys/wait.h>    // waitpid (platform_open_url)
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -660,6 +661,24 @@ void platform_set_cursor(PlatformWindow* win, CursorKind kind) {
 }
 
 // -- appunti --
+
+bool platform_open_url(const char* url) {
+    if (!url || strncmp(url, "https://", 8)) return false;     // solo pagine web, mai comandi o file
+    // doppio fork: il browser non resta figlio dell'app (niente processi zombie, nessuna attesa)
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        setsid();
+        if (fork() == 0) {
+            execlp("xdg-open", "xdg-open", url, (char*)NULL);
+            _exit(127);
+        }
+        _exit(0);
+    }
+    int st;
+    waitpid(pid, &st, 0);
+    return true;
+}
 
 void platform_set_clipboard(PlatformWindow* win, const char* text) {
     if (!text) return;

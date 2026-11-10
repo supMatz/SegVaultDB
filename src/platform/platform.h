@@ -170,6 +170,9 @@ void platform_set_cursor(PlatformWindow* win, CursorKind kind);
 void  platform_set_clipboard(PlatformWindow* win, const char* text);
 char* platform_get_clipboard(PlatformWindow* win);   // stringa malloc'd (free() del chiamante) o NULL
 
+// apre un indirizzo (https://...) nel browser predefinito; false se non è possibile
+bool  platform_open_url(const char* url);
+
 // thread di lavoro (usato per eseguire le query senza bloccare l'interfaccia)
 typedef struct PlatformThread PlatformThread;
 PlatformThread* platform_thread_start(void (*fn)(void* arg), void* arg);  // NULL se non riesce

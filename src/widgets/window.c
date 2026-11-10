@@ -1636,7 +1636,7 @@ typedef enum {
     CTX_EXPORT_CSV, CTX_EXPORT_TSV, CTX_EXPORT_JSON, CTX_EXPORT_MD, CTX_EXPORT_HTML, CTX_EXPORT_SQL,
     CTX_COPY_JSON, CTX_COPY_MD, CTX_COPY_SQL, CTX_DUMP_DB,
     // Settings / Help
-    CTX_SETTINGS, CTX_SETTINGS_RESET, CTX_SHORTCUTS, CTX_SQL_REFERENCE, CTX_ABOUT,
+    CTX_SETTINGS, CTX_SETTINGS_RESET, CTX_SHORTCUTS, CTX_SQL_REFERENCE, CTX_DOCS, CTX_ABOUT,
     CTX_ACTION_COUNT
 } CtxAction;
 
@@ -1720,6 +1720,7 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
     [CTX_SETTINGS_RESET] = { "Reset all settings",       NULL },
     [CTX_SHORTCUTS]     = { "Keyboard shortcuts",        "F1" },
     [CTX_SQL_REFERENCE] = { "Supported SQL",             NULL },
+    [CTX_DOCS]          = { "Online documentation",      NULL },
     [CTX_ABOUT]         = { "About SegVault",            NULL },
 };
 
@@ -1748,7 +1749,7 @@ static const int M_EXPORT[] = { CTX_EXPORT_CSV, CTX_EXPORT_TSV, CTX_EXPORT_JSON,
                                 CTX_DUMP_DB };
 static const int M_SETTINGS[] = { CTX_SETTINGS, CTX_SEP, CTX_NEXT_THEME, CTX_TOGGLE_SIDEBAR, CTX_TOGGLE_FOOTER,
                                   CTX_TOGGLE_LINENUMS, CTX_TOGGLE_ROWNUMS, CTX_SEP, CTX_SETTINGS_RESET };
-static const int M_HELP[] = { CTX_SHORTCUTS, CTX_SQL_REFERENCE, CTX_SEP, CTX_ABOUT };
+static const int M_HELP[] = { CTX_SHORTCUTS, CTX_SQL_REFERENCE, CTX_DOCS, CTX_SEP, CTX_ABOUT };
 
 typedef struct { const char* title; const int* items; int n; char key; } MenuDef;
 #define MENU(t, a, k) { t, a, (int)(sizeof(a) / sizeof(a[0])), k }
@@ -2167,6 +2168,13 @@ static void ctx_run(AppWindow* app, int a) {
         case CTX_SHORTCUTS:     app->help_open = true; break;
         case CTX_SQL_REFERENCE: app->info_page = 2; app->info_scroll = 0; break;
         case CTX_ABOUT:         app->info_page = 1; app->info_scroll = 0; break;
+        case CTX_DOCS:
+            if (platform_open_url(SV_DOCS_URL)) set_status(app, STATUS_INFO, "Documentation opened in the browser", SV_DOCS_URL);
+            else {
+                platform_set_clipboard(app->win, SV_DOCS_URL);
+                set_status(app, STATUS_ERROR, "Cannot open the browser: the address is in the clipboard", SV_DOCS_URL);
+            }
+            break;
         default: break;
     }
 }

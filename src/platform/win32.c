@@ -9,6 +9,7 @@ SCOPO: Implementa platform.h usando le API native Windows.
 #endif
 #include <windows.h>   // API Win32 completa
 #include <windowsx.h>  // GET_X_LPARAM, GET_Y_LPARAM
+#include <shellapi.h>  // ShellExecuteA (platform_open_url)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -602,6 +603,11 @@ void platform_set_cursor(PlatformWindow* win, CursorKind kind) {
 }
 
 // -- appunti (UTF-8 <-> UTF-16, \n <-> \r\n) --
+
+bool platform_open_url(const char* url) {
+    if (!url || strncmp(url, "https://", 8)) return false;     // solo pagine web
+    return (INT_PTR)ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL) > 32;
+}
 
 void platform_set_clipboard(PlatformWindow* win, const char* text) {
     if (!text || !OpenClipboard(win->hwnd)) return;
