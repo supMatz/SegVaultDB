@@ -60,6 +60,8 @@ int main(int argc, char** argv) {
     printf("%-44s %9.2f ms  (%d righe)\n", "INSERT (a blocchi di 500)", now_ms() - t0, n + ns + 50);
 
     run("COUNT(*)", "SELECT COUNT(*) FROM esame");
+    run("SELECT * intera tabella", "SELECT * FROM esame");
+    run("SELECT * + ORDER BY", "SELECT * FROM esame ORDER BY data, matricola");
     run("scan + filtro", "SELECT * FROM esame WHERE voto = 30");
     run("scan + filtro composto", "SELECT matricola, voto FROM esame WHERE voto >= 28 AND corso < 10");
     run("lookup chiave primaria", "SELECT * FROM studente WHERE matricola = 4242");

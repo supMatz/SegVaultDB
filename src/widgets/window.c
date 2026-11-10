@@ -387,12 +387,7 @@ static QueryResult* make_grid(const char* const* cols, const char* const* types,
         r->col_names[c] = strdup(cols[c]);
         r->col_types[c] = strdup(types[c]);
     }
-    for (int i = 0; i < nrows; i++) {
-        r->rows[i].cells = calloc(ncols, sizeof(Cell));
-        if (!r->rows[i].cells) { db_result_free(r); return NULL; }
-        r->rows[i].num_cells = ncols;
-        r->num_rows++;
-    }
+    (void)nrows;   // le righe le riempie il chiamante con db_row_set, aumentando num_rows
     return r;
 }
 
@@ -404,22 +399,21 @@ static void history_show(AppWindow* app) {
     if (!r) return;
     for (int i = 0; i < n; i++) {
         const HistoryEntry* e = &app->history[n - 1 - i];   // più recente in alto
-        Cell* c = r->rows[i].cells;
-        snprintf(c[0].value, sizeof(c[0].value), "%s", e->when);
-        snprintf(c[1].value, sizeof(c[1].value), "%s", e->ok ? "ok" : "error");
-        snprintf(c[2].value, sizeof(c[2].value), "%d", e->rows);
-        snprintf(c[3].value, sizeof(c[3].value), "%.1f", e->ms);
-        c[0].type = c[1].type = c[4].type = CELL_TYPE_STRING;
-        c[2].type = CELL_TYPE_INT;
-        c[3].type = CELL_TYPE_FLOAT;
+        char rows_s[16], ms_s[32], stmt[512];
+        snprintf(rows_s, sizeof(rows_s), "%d", e->rows);
+        snprintf(ms_s, sizeof(ms_s), "%.1f", e->ms);
         // statement su una riga sola
         int k = 0;
         bool sp = false;
-        for (const char* s = e->sql; *s && k < (int)sizeof(c[4].value) - 4; s++) {
-            if (isspace((unsigned char)*s)) { if (!sp && k) c[4].value[k++] = ' '; sp = true; }
-            else { c[4].value[k++] = *s; sp = false; }
+        for (const char* s = e->sql; *s && k < (int)sizeof(stmt) - 4; s++) {
+            if (isspace((unsigned char)*s)) { if (!sp && k) stmt[k++] = ' '; sp = true; }
+            else { stmt[k++] = *s; sp = false; }
         }
-        c[4].value[k] = '\0';
+        stmt[k] = '\0';
+        const char* vals[5] = { e->when, e->ok ? "ok" : "error", rows_s, ms_s, stmt };
+        static const CellType ct[5] = { CELL_TYPE_STRING, CELL_TYPE_STRING, CELL_TYPE_INT, CELL_TYPE_FLOAT, CELL_TYPE_STRING };
+        if (!db_row_set(&r->rows[i], 5, vals, ct)) break;
+        r->num_rows++;
     }
     show_result(app, r);
     app->showing_history = true;

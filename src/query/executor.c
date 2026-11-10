@@ -2187,16 +2187,6 @@ typedef struct {
     int      src_type;       // tipo della colonna se è un riferimento diretto, altrimenti -1
 } OutCol;
 
-static void fill_cell(Cell* cell, const EvalVal* v, int src_type) {
-    if (v->null) { cell->is_null = true; cell->type = CELL_TYPE_NULL; snprintf(cell->value, sizeof(cell->value), "NULL"); return; }
-    cell->is_null = false;
-    snprintf(cell->value, sizeof(cell->value), "%s", ev_s(v));
-    if (src_type >= 0)  cell->type = cell_type_of((DataType)src_type);
-    else if (v->is_int) cell->type = CELL_TYPE_INT;
-    else if (v->is_num) cell->type = CELL_TYPE_FLOAT;
-    else                cell->type = CELL_TYPE_STRING;
-}
-
 // ── vettori di espressioni ──
 
 typedef struct { ASTExpr** v; int n, cap; } ExprVec;
@@ -4266,20 +4256,15 @@ static void plan_row_a(PlanOut* po, const char* indent, const char* op, const ch
     QueryResult* r = po->r;
     if (r->num_rows >= 256) return;
     Row* pr = &r->rows[r->num_rows++];
-    pr->num_cells = r->num_cols;
-    pr->cells = calloc((size_t)r->num_cols, sizeof(Cell));
-    if (!pr->cells) { r->num_rows--; return; }
-    snprintf(pr->cells[0].value, sizeof(pr->cells[0].value), "%d", r->num_rows);
-    pr->cells[0].type = CELL_TYPE_INT;
-    snprintf(pr->cells[1].value, sizeof(pr->cells[1].value), "%s%s", indent, op);
-    snprintf(pr->cells[2].value, sizeof(pr->cells[2].value), "%s", detail);
-    pr->cells[1].type = pr->cells[2].type = CELL_TYPE_STRING;
-    if (est < 0) { pr->cells[3].is_null = true; pr->cells[3].type = CELL_TYPE_NULL; snprintf(pr->cells[3].value, sizeof(pr->cells[3].value), "NULL"); }
-    else { snprintf(pr->cells[3].value, sizeof(pr->cells[3].value), "%.0f", est < 1 && est > 0 ? 1 : est); pr->cells[3].type = CELL_TYPE_INT; }
-    if (r->num_cols > 4) {
-        if (actual < 0) { pr->cells[4].is_null = true; pr->cells[4].type = CELL_TYPE_NULL; snprintf(pr->cells[4].value, sizeof(pr->cells[4].value), "NULL"); }
-        else { snprintf(pr->cells[4].value, sizeof(pr->cells[4].value), "%ld", actual); pr->cells[4].type = CELL_TYPE_INT; }
-    }
+    char c0[16], c1[512], c2[512], c3[32], c4[32];
+    snprintf(c0, sizeof(c0), "%d", r->num_rows);
+    snprintf(c1, sizeof(c1), "%s%s", indent, op);
+    snprintf(c2, sizeof(c2), "%s", detail);
+    snprintf(c3, sizeof(c3), "%.0f", est < 1 && est > 0 ? 1 : est);
+    snprintf(c4, sizeof(c4), "%ld", actual);
+    const char* vals[5] = { c0, c1, c2, est < 0 ? NULL : c3, actual < 0 ? NULL : c4 };
+    static const CellType types[5] = { CELL_TYPE_INT, CELL_TYPE_STRING, CELL_TYPE_STRING, CELL_TYPE_INT, CELL_TYPE_INT };
+    if (!db_row_set(pr, r->num_cols < 5 ? r->num_cols : 5, vals, types)) { r->num_rows--; return; }
 }
 
 static void explain_subqueries(PlanOut* po, const ASTExpr* e, const char* indent, int depth);
@@ -4547,19 +4532,48 @@ static QueryResult* run_select_ex(ExecCtx* ctx, ASTNode* n, int depth, bool expl
         r->col_names[j] = strdup(p->out[j].name);
         r->col_types[j] = strdup(out_type_name(p, j, &rows, false));
     }
+    // ogni riga è un solo blocco: le celle seguite dai testi, scritti prima in un buffer di appoggio
+    size_t tcap = 4096, *toff = malloc(sizeof(size_t) * (size_t)(nout ? nout : 1));
+    char* tbuf = malloc(tcap);
+    CellType* ttype = malloc(sizeof(CellType) * (size_t)(nout ? nout : 1));
+    if (!toff || !tbuf || !ttype) ok = false;
     for (int i = 0; ok && i < rows.nrows; i++) {
-        Row* row = &r->rows[i];
-        row->cells = calloc((size_t)(nout ? nout : 1), sizeof(Cell));
-        if (!row->cells) { ok = false; break; }
-        row->num_cells = nout;
-        r->num_rows = i + 1;
-        for (int j = 0; j < nout; j++) {
+        size_t tlen = 0;
+        for (int j = 0; ok && j < nout; j++) {
             EvalVal v;
             const OVal* o = &orow(&rows, i)[j];
             ev_from_oval(&v, o);
-            fill_cell(&row->cells[j], &v, o->null ? -1 : p->out[j].src_type);
+            const char* s = v.null ? "NULL" : ev_s(&v);
+            size_t l = strlen(s);
+            if (tlen + l + 1 > tcap) {
+                while (tlen + l + 1 > tcap) tcap *= 2;
+                char* nb = realloc(tbuf, tcap);
+                if (!nb) { ok = false; break; }
+                tbuf = nb;
+            }
+            memcpy(tbuf + tlen, s, l + 1);
+            toff[j] = tlen;
+            tlen += l + 1;
+            int st = o->null ? -1 : p->out[j].src_type;
+            ttype[j] = v.null ? CELL_TYPE_NULL : st >= 0 ? cell_type_of((DataType)st)
+                     : v.is_int ? CELL_TYPE_INT : v.is_num ? CELL_TYPE_FLOAT : CELL_TYPE_STRING;
+        }
+        if (!ok) break;
+        Row* row = &r->rows[i];
+        size_t head = sizeof(Cell) * (size_t)(nout ? nout : 1);
+        char* block = malloc(head + tlen);
+        if (!block) { ok = false; break; }
+        memcpy(block + head, tbuf, tlen);
+        row->cells = (Cell*)block;
+        row->num_cells = nout;
+        r->num_rows = i + 1;
+        for (int j = 0; j < nout; j++) {
+            row->cells[j].value = block + head + toff[j];
+            row->cells[j].type = ttype[j];
+            row->cells[j].is_null = ttype[j] == CELL_TYPE_NULL;
         }
     }
+    free(toff); free(tbuf); free(ttype);
     orows_free(&rows);
     plan_free(p);
     if (!ok) { db_result_free(r); return result_error_msg("Out of memory"); }
@@ -6123,16 +6137,7 @@ static bool text_row(QueryResult* r, int* cap, const char* const* vals) {
         r->rows = nr;
         *cap = nc;
     }
-    Row* row = &r->rows[r->num_rows];
-    row->cells = calloc((size_t)r->num_cols, sizeof(Cell));
-    if (!row->cells) return false;
-    row->num_cells = r->num_cols;
-    for (int i = 0; i < r->num_cols; i++) {
-        Cell* c = &row->cells[i];
-        if (!vals[i]) { c->is_null = true; c->type = CELL_TYPE_NULL; snprintf(c->value, sizeof(c->value), "NULL"); continue; }
-        snprintf(c->value, sizeof(c->value), "%s", vals[i]);
-        c->type = CELL_TYPE_STRING;
-    }
+    if (!db_row_set(&r->rows[r->num_rows], r->num_cols, vals, NULL)) return false;
     r->num_rows++;
     return true;
 }
@@ -6310,10 +6315,8 @@ static QueryResult* exec_show(ExecCtx* ctx, ASTNode* n) {
         r->num_rows = ctx->catalog->num_databases;
         r->rows = calloc(r->num_rows, sizeof(Row));
         for (int i = 0; i < r->num_rows; i++) {
-            r->rows[i].num_cells = 1;
-            r->rows[i].cells = calloc(1, sizeof(Cell));
-            snprintf(r->rows[i].cells[0].value, sizeof(r->rows[i].cells[0].value),
-                     "%s", ctx->catalog->databases[i].name);
+            const char* v = ctx->catalog->databases[i].name;
+            db_row_set(&r->rows[i], 1, &v, NULL);
         }
     } else {
         r->num_cols = 1;
@@ -6322,10 +6325,8 @@ static QueryResult* exec_show(ExecCtx* ctx, ASTNode* n) {
         r->num_rows = db->num_tables;
         r->rows = calloc(r->num_rows, sizeof(Row));
         for (int i = 0; i < r->num_rows; i++) {
-            r->rows[i].num_cells = 1;
-            r->rows[i].cells = calloc(1, sizeof(Cell));
-            snprintf(r->rows[i].cells[0].value, sizeof(r->rows[i].cells[0].value),
-                     "%s", db->tables[i].name);
+            const char* v = db->tables[i].name;
+            db_row_set(&r->rows[i], 1, &v, NULL);
         }
     }
     return r;
@@ -6353,11 +6354,6 @@ static QueryResult* exec_describe(ExecCtx* ctx, ASTNode* n) {
     r->num_rows = num_cols;
     r->rows = calloc(num_cols, sizeof(Row));
     for (int i = 0; i < num_cols; i++) {
-        r->rows[i].num_cells = 4;
-        r->rows[i].cells = calloc(4, sizeof(Cell));
-        snprintf(r->rows[i].cells[0].value, sizeof(r->rows[i].cells[0].value), "%s", cols[i].name);
-        snprintf(r->rows[i].cells[1].value, sizeof(r->rows[i].cells[1].value), "%s", cols[i].type);
-        snprintf(r->rows[i].cells[2].value, sizeof(r->rows[i].cells[2].value), "%s", cols[i].nullable ? "YES" : "NO");
         const char* key = cols[i].primary_key ? "PRI" : "";
         TableSchema* dts = catalog_get_table(ctx->catalog, db->name, tname);
         int ci = dts ? catalog_get_col_index(dts, cols[i].name) : -1;
@@ -6369,7 +6365,8 @@ static QueryResult* exec_describe(ExecCtx* ctx, ASTNode* n) {
             const Constraint* c = &dts->constraints[k];
             for (int j = 0; (c->kind == CONS_FOREIGN || c->kind == CONS_UNIQUE) && j < c->ncols; j++) if (c->cols[j] == ci) key = "MUL";
         }
-        snprintf(r->rows[i].cells[3].value, sizeof(r->rows[i].cells[3].value), "%s", key);
+        const char* vals[4] = { cols[i].name, cols[i].type, cols[i].nullable ? "YES" : "NO", key };
+        db_row_set(&r->rows[i], 4, vals, NULL);
     }
     db_columns_free(cols, num_cols);
     return r;

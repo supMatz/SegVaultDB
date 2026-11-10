@@ -11,6 +11,8 @@ SCOPO: L'unico punto di contatto tra GUI e DB engine.
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 // -- strutture risultato --
 
@@ -27,16 +29,38 @@ typedef enum {
 
 // singola cella
 typedef struct {
-    char value[512]; // valore come stringa -> la gui non conosce tipi
+    char* value;     // valore come stringa (mai NULL: "NULL" se is_null) -> la gui non conosce tipi.
+                     // Il testo sta nello stesso blocco di memoria delle celle della riga (vedi db_row_set)
     CellType type;   // tipo della cella
     bool is_null;    // true se valore cella = NULL
 } Cell;
 
 // una riga del risultato
 typedef struct {
-    Cell* cells;   // puntatore alla prima Cell seguita dalle altre
+    Cell* cells;   // un solo blocco: le celle seguite dai loro testi -> free(cells) libera tutto
     int num_cells; // numero di celle totali della riga
 } Row;
+
+// Riempie una riga: alloca in un solo blocco le ncols celle e i loro testi.
+// vals[i] == NULL -> cella NULL; types == NULL -> tutte CELL_TYPE_STRING.
+static inline bool db_row_set(Row* row, int ncols, const char* const* vals, const CellType* types) {
+    size_t lens[ncols > 0 ? ncols : 1], total = 0;
+    for (int i = 0; i < ncols; i++) { lens[i] = strlen(vals[i] ? vals[i] : "NULL"); total += lens[i] + 1; }
+    char* block = (char*)malloc(sizeof(Cell) * (size_t)(ncols > 0 ? ncols : 1) + total);
+    row->cells = (Cell*)block;
+    row->num_cells = block ? ncols : 0;
+    if (!block) return false;
+    char* p = block + sizeof(Cell) * (size_t)(ncols > 0 ? ncols : 1);
+    for (int i = 0; i < ncols; i++) {
+        Cell* c = &row->cells[i];
+        memcpy(p, vals[i] ? vals[i] : "NULL", lens[i] + 1);
+        c->value = p;
+        p += lens[i] + 1;
+        c->is_null = vals[i] == NULL;
+        c->type = c->is_null ? CELL_TYPE_NULL : types ? types[i] : CELL_TYPE_STRING;
+    }
+    return true;
+}
 
 // risultato di una query qualsiasi
 typedef struct {
