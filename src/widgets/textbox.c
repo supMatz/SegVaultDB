@@ -928,33 +928,36 @@ static void insert_pair(TextBox* tb, const char* pair) {
     move_cursor(tb, tb->cursor_pos - 1, false, false);
 }
 
-static void handle_char(TextBox* tb, uint32_t cp) {
+// chiusure automatiche di parentesi e apici; true se il carattere è stato gestito qui
+static bool handle_auto_close(TextBox* tb, uint32_t cp) {
     char next = char_at(tb, tb->cursor_pos);
     char prev = char_at(tb, tb->cursor_pos - 1);
     bool sel  = has_sel(tb);
 
-    if (!tb->opt_auto_close) goto plain;
-
     // sovrascrittura della chiusura già inserita automaticamente
     if (!sel && (cp == ')' || cp == ']') && next == (char)cp) {
         move_cursor(tb, tb->cursor_pos + 1, false, false);
-        return;
+        return true;
     }
     if (cp == '\'' || cp == '"' || cp == '`') {
         char q[3] = {(char)cp, (char)cp, 0};
-        if (!sel && next == (char)cp) { move_cursor(tb, tb->cursor_pos + 1, false, false); return; }
-        if (sel) { wrap_selection(tb, q + 1, q + 1); return; }
-        if (!is_word_char(prev) && !is_word_char(next)) { insert_pair(tb, q); return; }
+        if (!sel && next == (char)cp) { move_cursor(tb, tb->cursor_pos + 1, false, false); return true; }
+        if (sel) { wrap_selection(tb, q + 1, q + 1); return true; }
+        if (!is_word_char(prev) && !is_word_char(next)) { insert_pair(tb, q); return true; }
     }
     if (cp == '(') {
-        if (sel) { wrap_selection(tb, "(", ")"); return; }
+        if (sel) { wrap_selection(tb, "(", ")"); return true; }
         if (next == '\0' || next == ' ' || next == '\n' || next == ')' || next == ',' || next == ';') {
             insert_pair(tb, "()");
-            return;
+            return true;
         }
     }
+    return false;
+}
 
-plain:;
+static void handle_char(TextBox* tb, uint32_t cp) {
+    if (tb->opt_auto_close && handle_auto_close(tb, cp)) return;
+
     char buf[5] = {0};
     utf8_encode(cp, buf);
     insert_text(tb, buf, EDIT_TYPE);

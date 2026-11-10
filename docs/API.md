@@ -127,6 +127,40 @@ tutto il resto (`VARCHAR`, `TEXT`, `DATE`, ...) → stringa. Le date sono string
 | 415 | `Content-Type` diverso da `application/json` / `text/plain` |
 | 503 | troppe connessioni contemporanee (64) |
 
+## Endpoint salvati (un'API senza scrivere backend)
+
+Una query con un nome, salvata nel database, diventa un URL: un sito o un'app la chiamano senza
+conoscere l'SQL e senza un backend in mezzo (come in PocketBase o Supabase). Gli endpoint sono le
+righe della tabella `api_endpoints` del database (si gestiscono con l'SQL o dalla griglia dell'app):
+
+```sql
+CREATE TABLE api_endpoints (
+    name        VARCHAR(60) PRIMARY KEY,
+    sql         TEXT NOT NULL,                        -- uno o più statement con parametri :nome
+    access      VARCHAR(10) NOT NULL DEFAULT 'token', -- 'public' o 'token'
+    description VARCHAR(200)
+);
+INSERT INTO api_endpoints VALUES
+  ('prodotti_economici', 'SELECT id, nome, prezzo FROM prodotto WHERE prezzo < :max ORDER BY prezzo', 'public', 'Listino'),
+  ('nuovo_ordine', 'INSERT INTO ordine (prodotto, quantita, giorno) VALUES (:prodotto, :quantita, CURDATE())', 'token', NULL);
+```
+
+```bash
+curl 'http://127.0.0.1:8484/api/v1/endpoints/prodotti_economici?database=shop&max=10'
+curl -X POST http://127.0.0.1:8484/api/v1/endpoints/nuovo_ordine?database=shop \
+     -H 'Authorization: Bearer TOKEN' -H 'Content-Type: application/json' -d '{"prodotto": 3, "quantita": 2}'
+curl 'http://127.0.0.1:8484/api/v1/endpoints?database=shop'        # elenco (richiede il token, se c'è)
+```
+
+- I parametri `:nome` arrivano dalla query string (`GET`, i numeri restano numeri) o da un oggetto
+  JSON nel corpo (`POST`) e vengono legati come i `?`: niente SQL injection. Un parametro mancante
+  dà 400 `missing parameter :nome`.
+- Lo script di un endpoint è sempre **atomico** (tutto o niente); le righe tornano come oggetti
+  (`?rows=arrays` per gli array). Il database si indica con `?database=` (o `--database`).
+- `access = 'public'`: chiamabile **senza token e da qualsiasi sito** (la risposta ha
+  `Access-Control-Allow-Origin: *`): è il modo di dare dati a una pagina pubblica esponendo solo
+  quelle query, non tutto il database. `'token'`: come il resto dell'API.
+
 ## Parametri `?` (niente SQL injection)
 
 Non costruire mai l'SQL concatenando i dati dell'utente: usa `?` e `params`. Il server sostituisce

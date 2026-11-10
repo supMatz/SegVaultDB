@@ -92,6 +92,14 @@ export class SegVault {
     return this.query(sql, params, { ...opts, transaction: true });
   }
 
+  /** Endpoint salvato (tabella api_endpoints): righe dell'ultimo statement come oggetti tipizzati. */
+  async endpoint<T = Record<string, SqlValue>>(name: string, params: Record<string, SqlValue> = {},
+                                               database = this.options.database): Promise<T[]> {
+    const q = database ? `?database=${encodeURIComponent(database)}` : "";
+    const data = await this.call<{ results: StatementResult[] }>("POST", `/endpoints/${encodeURIComponent(name)}${q}`, params);
+    return (data.results.at(-1)?.rows ?? []) as T[];
+  }
+
   health() { return this.call<{ ok: true; version: string }>("GET", "/health"); }
 
   async databases(): Promise<string[]> {

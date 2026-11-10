@@ -73,6 +73,13 @@ export class SegVault {
     return this.query(sql, params, { ...options, transaction: true });
   }
 
+  /** Endpoint salvato (tabella api_endpoints): righe dell'ultimo statement come oggetti. */
+  async endpoint(name, params = {}, { database = this.database } = {}) {
+    const q = database ? `?database=${encodeURIComponent(database)}` : "";
+    const data = await this.#call("POST", `/endpoints/${encodeURIComponent(name)}${q}`, params);
+    return data.results.length ? (data.results[data.results.length - 1].rows || []) : [];
+  }
+
   health()                 { return this.#call("GET", "/health"); }
   async databases()        { return (await this.#call("GET", "/databases")).databases; }
   async tables(db = this.database)        { return this.#call("GET", `/databases/${encodeURIComponent(db)}/tables`); }

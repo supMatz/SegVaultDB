@@ -170,7 +170,8 @@ static bool send_response(SvServer* s, sock_t fd, const Request* rq, Response* r
         rs->status, status_text(rs->status),
         rs->content_type ? rs->content_type : "application/json; charset=utf-8",
         (unsigned long long)blen, rs->close ? "close" : "keep-alive");
-    if (s->cors && n > 0 && (size_t)n < sizeof(head)) {
+    bool own_acao = rs->extra_headers && strstr(rs->extra_headers, "Access-Control-Allow-Origin");
+    if (s->cors && !own_acao && n > 0 && (size_t)n < sizeof(head)) {
         // origine ammessa: "*" oppure quella configurata, ripetuta solo se coincide con la richiesta
         const char* allow = !strcmp(s->cors, "*") ? "*" : (rq && !strcmp(rq->origin, s->cors) ? s->cors : NULL);
         if (allow)
@@ -291,9 +292,11 @@ static bool append_literal(JsonBuf* o, const JsonVal* v, char* err, size_t errsz
     }
 }
 
+// params: array -> segnaposto '?' nell'ordine; oggetto -> segnaposto con nome ':nome'
 static char* bind_params(const char* sql, const JsonVal* params, char* err, size_t errsz) {
     JsonBuf o = {0};
-    int used = 0, nparams = params ? params->count : 0;
+    bool named = params && params->type == JSON_OBJECT;
+    int used = 0, nparams = params && !named ? params->count : 0;
     size_t n = strlen(sql), i = 0;
     while (i < n) {
         char c = sql[i];
@@ -313,7 +316,21 @@ static char* bind_params(const char* sql, const JsonVal* params, char* err, size
             const char* e = strstr(sql + i + 2, "*/");
             i = e ? (size_t)(e - sql) + 2 : n;
             jb_raw(&o, sql + st, i - st);
+        } else if (c == ':' && named && i + 1 < n && (isalpha((unsigned char)sql[i + 1]) || sql[i + 1] == '_') &&
+                   (i == 0 || (!isalnum((unsigned char)sql[i - 1]) && sql[i - 1] != '_' && sql[i - 1] != ':'))) {
+            size_t a = i + 1, b = a;
+            while (b < n && (isalnum((unsigned char)sql[b]) || sql[b] == '_')) b++;
+            char name[64];
+            if (b - a >= sizeof(name)) { snprintf(err, errsz, "parameter name too long"); free(o.data); return NULL; }
+            memcpy(name, sql + a, b - a);
+            name[b - a] = '\0';
+            const JsonVal* v = json_get(params, name);
+            if (!v) { snprintf(err, errsz, "missing parameter :%s", name); free(o.data); return NULL; }
+            if (!append_literal(&o, v, err, errsz, used)) { free(o.data); return NULL; }
+            used++;
+            i = b;
         } else if (c == '?') {
+            if (named) { snprintf(err, errsz, "use :name placeholders with named parameters"); free(o.data); return NULL; }
             if (used >= nparams) {
                 snprintf(err, errsz, "the SQL has more '?' placeholders than params (%d)", nparams);
                 free(o.data);
@@ -323,12 +340,12 @@ static char* bind_params(const char* sql, const JsonVal* params, char* err, size
             used++;
             i++;
         } else {
-            while (i < n && sql[i] != '\'' && sql[i] != '"' && sql[i] != '`' && sql[i] != '-' && sql[i] != '/' && sql[i] != '?') i++;
+            while (i < n && sql[i] != '\'' && sql[i] != '"' && sql[i] != '`' && sql[i] != '-' && sql[i] != '/' && sql[i] != '?' && sql[i] != ':') i++;
             if (i == st) i++;
             jb_raw(&o, sql + st, i - st);
         }
     }
-    if (used != nparams) {
+    if (!named && used != nparams) {
         snprintf(err, errsz, "%d params given but the SQL has %d '?' placeholders", nparams, used);
         free(o.data);
         return NULL;
@@ -444,65 +461,23 @@ static void exec_end(SvServer* s) {
 
 // ── POST /api/v1/query ──────────────────────────────────────────
 
-static void handle_query(SvServer* s, Request* rq, Response* rs) {
-    char err[512];
-    JsonVal* root = NULL;
-    const char* sql = NULL;
-    char dbname[128] = "";
-    const JsonVal* params = NULL;
-    bool want_tx = false, objects = false;
-
-    char ct[128];
-    snprintf(ct, sizeof(ct), "%s", rq->content_type);
-    for (char* p = ct; *p; p++) *p = (char)tolower((unsigned char)*p);
-    if (!strncmp(ct, "text/plain", 10) || !strncmp(ct, "application/sql", 15)) {
-        // corpo = SQL; database e formato nella query string
-        sql = rq->body;
-        query_param(rq->query, "database", dbname, sizeof(dbname));
-        char f[32];
-        if (query_param(rq->query, "rows", f, sizeof(f))) objects = !strcmp(f, "objects");
-    } else if (!ct[0] || !strncmp(ct, "application/json", 16)) {
-        root = json_parse(rq->body, rq->body_len, err, sizeof(err));
-        if (!root) { json_error(rs, 400, "invalid JSON: %s", err); return; }
-        if (root->type != JSON_OBJECT) { json_error(rs, 400, "the body must be a JSON object"); goto out; }
-        const JsonVal* v = json_get(root, "sql");
-        if (!v || v->type != JSON_STRING) { json_error(rs, 400, "missing \"sql\" (string)"); goto out; }
-        if (memchr(v->str, '\0', v->len)) { json_error(rs, 400, "\"sql\" cannot contain NUL characters"); goto out; }
-        sql = v->str;
-        v = json_get(root, "database");
-        if (v && v->type == JSON_STRING) snprintf(dbname, sizeof(dbname), "%s", v->str);
-        else if (v && v->type != JSON_NULL) { json_error(rs, 400, "\"database\" must be a string"); goto out; }
-        params = json_get(root, "params");
-        if (params && params->type == JSON_NULL) params = NULL;
-        if (params && params->type != JSON_ARRAY) { json_error(rs, 400, "\"params\" must be an array"); goto out; }
-        if (params && params->count > MAX_PARAMS) { json_error(rs, 400, "too many params (max %d)", MAX_PARAMS); goto out; }
-        v = json_get(root, "transaction");
-        want_tx = v && v->type == JSON_BOOL && v->boolean;
-        v = json_get(root, "rows");
-        if (v && v->type == JSON_STRING) objects = !strcmp(v->str, "objects");
-    } else {
-        json_error(rs, 415, "use Content-Type application/json or text/plain");
-        return;
-    }
-    if (!dbname[0] && s->default_db) snprintf(dbname, sizeof(dbname), "%s", s->default_db);
-    if (dbname[0] && !valid_ident(dbname)) { json_error(rs, 400, "invalid database name"); goto out; }
-
-    char* script = bind_params(sql, params, err, sizeof(err));
-    if (!script) { json_error(rs, 400, "%s", err); goto out; }
-
+// esegue lo script (già con i parametri) nel database indicato e scrive la risposta;
+// sql_for_log: il testo originale, con i segnaposto, per il registro. Libera script.
+static void run_script(SvServer* s, Response* rs, char* script, const char* sql_for_log, const char* dbname,
+                       bool want_tx, bool objects) {
     int len = (int)strlen(script), cap = 64, nst;
     SqlRange* ranges = NULL;
     for (;;) {                                  // quanti statement: si raddoppia finché bastano
         free(ranges);
         ranges = malloc(sizeof(SqlRange) * (size_t)cap);
-        if (!ranges) { free(script); json_error(rs, 500, "out of memory"); goto out; }
+        if (!ranges) { free(script); json_error(rs, 500, "out of memory"); return; }
         nst = sql_split(script, len, ranges, cap);
         if (nst < cap) break;
         cap *= 2;
     }
 
     double t0 = now_ms();
-    one_line(rs->detail, sizeof(rs->detail), sql);   // con i '?': i valori dei parametri non finiscono nel registro
+    one_line(rs->detail, sizeof(rs->detail), sql_for_log);   // con i '?': i valori dei parametri non finiscono nel registro
     exec_begin(s);
     // il database corrente si ripristina alla fine: una richiesta non cambia quello delle successive
     char prev_db[128] = "";
@@ -591,8 +566,201 @@ static void handle_query(SvServer* s, Request* rq, Response* rs) {
     if (b->oom) json_error(rs, 500, "result too large for memory");
     free(ranges);
     free(script);
-out:
+}
+
+// legge una richiesta /query (JSON o SQL puro); false = errore già scritto in rs.
+// *root riceve l'albero JSON (lo libera chi chiama, anche in caso di errore)
+static bool read_query_request(SvServer* s, Request* rq, Response* rs, JsonVal** root, const char** sql,
+                               char* dbname, size_t dbn, const JsonVal** params, bool* want_tx, bool* objects) {
+    char err[512];
+    char ct[128];
+    snprintf(ct, sizeof(ct), "%s", rq->content_type);
+    for (char* p = ct; *p; p++) *p = (char)tolower((unsigned char)*p);
+    if (!strncmp(ct, "text/plain", 10) || !strncmp(ct, "application/sql", 15)) {
+        // corpo = SQL; database e formato nella query string
+        *sql = rq->body;
+        query_param(rq->query, "database", dbname, dbn);
+        char f[32];
+        if (query_param(rq->query, "rows", f, sizeof(f))) *objects = !strcmp(f, "objects");
+    } else if (!ct[0] || !strncmp(ct, "application/json", 16)) {
+        *root = json_parse(rq->body, rq->body_len, err, sizeof(err));
+        if (!*root) { json_error(rs, 400, "invalid JSON: %s", err); return false; }
+        if ((*root)->type != JSON_OBJECT) { json_error(rs, 400, "the body must be a JSON object"); return false; }
+        const JsonVal* v = json_get(*root, "sql");
+        if (!v || v->type != JSON_STRING) { json_error(rs, 400, "missing \"sql\" (string)"); return false; }
+        if (memchr(v->str, '\0', v->len)) { json_error(rs, 400, "\"sql\" cannot contain NUL characters"); return false; }
+        *sql = v->str;
+        v = json_get(*root, "database");
+        if (v && v->type == JSON_STRING) snprintf(dbname, dbn, "%s", v->str);
+        else if (v && v->type != JSON_NULL) { json_error(rs, 400, "\"database\" must be a string"); return false; }
+        *params = json_get(*root, "params");
+        if (*params && (*params)->type == JSON_NULL) *params = NULL;
+        if (*params && (*params)->type != JSON_ARRAY) { json_error(rs, 400, "\"params\" must be an array"); return false; }
+        if (*params && (*params)->count > MAX_PARAMS) { json_error(rs, 400, "too many params (max %d)", MAX_PARAMS); return false; }
+        v = json_get(*root, "transaction");
+        *want_tx = v && v->type == JSON_BOOL && v->boolean;
+        v = json_get(*root, "rows");
+        if (v && v->type == JSON_STRING) *objects = !strcmp(v->str, "objects");
+    } else {
+        json_error(rs, 415, "use Content-Type application/json or text/plain");
+        return false;
+    }
+    if (!dbname[0] && s->default_db) snprintf(dbname, dbn, "%s", s->default_db);
+    if (dbname[0] && !valid_ident(dbname)) { json_error(rs, 400, "invalid database name"); return false; }
+    return true;
+}
+
+static void handle_query(SvServer* s, Request* rq, Response* rs) {
+    JsonVal* root = NULL;
+    const char* sql = NULL;
+    const JsonVal* params = NULL;
+    char dbname[128] = "";
+    bool want_tx = false, objects = false;
+    if (read_query_request(s, rq, rs, &root, &sql, dbname, sizeof(dbname), &params, &want_tx, &objects)) {
+        char err[512];
+        char* script = bind_params(sql, params, err, sizeof(err));
+        if (!script) json_error(rs, 400, "%s", err);
+        else run_script(s, rs, script, sql, dbname, want_tx, objects);   // libera script
+    }
     json_free(root);
+}
+
+// ── endpoint salvati: /api/v1/endpoints[/nome] ──────────────────
+// Una query con un nome, salvata nella tabella api_endpoints del database:
+//   CREATE TABLE api_endpoints (name VARCHAR(60) PRIMARY KEY, sql TEXT NOT NULL,
+//                               access VARCHAR(10) NOT NULL DEFAULT 'token', description VARCHAR(200));
+// GET / POST /api/v1/endpoints/nome?database=db&param=valore esegue lo SQL legando i :param
+// (dalla query string o da un oggetto JSON nel corpo). access = 'public': chiamabile senza token e
+// da qualsiasi sito (per una pagina pubblica); 'token': come il resto dell'API.
+
+#define ENDPOINTS_TABLE "api_endpoints"
+
+// 1 = trovato, 0 = non esiste (o manca la tabella), -1 = errore (database inesistente, ...)
+static int endpoint_lookup(SvServer* s, const char* db, const char* name, char** sql_out, bool* is_public,
+                           char* err, size_t errn) {
+    *sql_out = NULL;
+    *is_public = false;
+    mx_lock(&s->exec_mx);
+    char prev[128] = "";
+    const char* cur = db_current_database();
+    if (cur) snprintf(prev, sizeof(prev), "%s", cur);
+    char q[300];
+    snprintf(q, sizeof(q), "USE %.63s", db);
+    QueryResult* r = db_execute(q);
+    int found = -1;
+    if (!r || !r->success) snprintf(err, errn, "database '%.63s' not found", db);
+    else {
+        db_result_free(r);
+        snprintf(q, sizeof(q), "SELECT `sql`, `access` FROM " ENDPOINTS_TABLE " WHERE `name` = '%.63s'", name);
+        r = db_execute(q);
+        if (!r || !r->success) found = 0;                       // nessuna tabella api_endpoints
+        else if (r->num_rows == 0) found = 0;
+        else {
+            found = 1;
+            *sql_out = strdup(r->rows[0].cells[0].is_null ? "" : r->rows[0].cells[0].value);
+            *is_public = !r->rows[0].cells[1].is_null && !strcasecmp(r->rows[0].cells[1].value, "public");
+        }
+    }
+    db_result_free(r);
+    cur = db_current_database();
+    if (prev[0] && (!cur || strcmp(cur, prev))) { snprintf(q, sizeof(q), "USE %.63s", prev); db_result_free(db_execute(q)); }
+    mx_unlock(&s->exec_mx);
+    return found;
+}
+
+// la chiave è già nell'oggetto JSON in costruzione? (vale la prima occorrenza)
+static bool seen_key(const JsonBuf* j, const char* key) {
+    JsonBuf k = {0};
+    jb_str(&k, key);
+    jb_lit(&k, ":");
+    bool seen = j->data && k.data && strstr(j->data, k.data) != NULL;
+    free(k.data);
+    return seen;
+}
+
+// parametri dalla query string ("max=10&nome=pane", tranne database e rows): numeri come numeri
+static JsonVal* query_params_json(const char* q) {
+    JsonBuf j = {0};
+    jb_lit(&j, "{");
+    int n = 0;
+    while (*q) {
+        const char* amp = strchr(q, '&');
+        size_t seg = amp ? (size_t)(amp - q) : strlen(q);
+        const char* eq = memchr(q, '=', seg);
+        char key[128], val[2048];
+        if (eq && url_decode(q, (size_t)(eq - q), key, sizeof(key), true) > 0 &&
+            url_decode(eq + 1, seg - (size_t)(eq - q) - 1, val, sizeof(val), true) >= 0 &&
+            strcmp(key, "database") && strcmp(key, "rows") && !seen_key(&j, key)) {
+            if (n++) jb_lit(&j, ",");
+            jb_str(&j, key);
+            jb_lit(&j, ":");
+            if (is_json_number(val)) jb_raw(&j, val, strlen(val));
+            else jb_str(&j, val);
+        }
+        q += seg + (amp ? 1 : 0);
+    }
+    jb_lit(&j, "}");
+    char err[64];
+    JsonVal* v = j.oom ? NULL : json_parse(j.data, j.len, err, sizeof(err));
+    free(j.data);
+    return v;
+}
+
+static void handle_endpoint(SvServer* s, Request* rq, Response* rs, const char* name, const char* db, const char* sql) {
+    char err[512];
+    JsonVal* params = NULL;
+    bool objects = true;
+    char f[32];
+    if (query_param(rq->query, "rows", f, sizeof(f))) objects = strcmp(f, "arrays") != 0;
+    if (!strcmp(rq->method, "POST") && rq->body_len > 0) {
+        params = json_parse(rq->body, rq->body_len, err, sizeof(err));
+        if (!params) { json_error(rs, 400, "invalid JSON: %s", err); return; }
+        if (params->type != JSON_OBJECT) { json_free(params); json_error(rs, 400, "the body must be a JSON object of parameters"); return; }
+    } else {
+        params = query_params_json(rq->query);
+        if (!params) { json_error(rs, 400, "invalid parameters"); return; }
+    }
+    char* script = bind_params(sql, params, err, sizeof(err));
+    json_free(params);
+    if (!script) { json_error(rs, 400, "endpoint '%s': %s", name, err); return; }
+    char label[200];
+    snprintf(label, sizeof(label), "endpoint %.60s: %.120s", name, sql);
+    run_script(s, rs, script, label, db, true, objects);    // sempre atomico: tutto o niente
+}
+
+static void handle_endpoint_list(SvServer* s, Request* rq, Response* rs, const char* db) {
+    mx_lock(&s->exec_mx);
+    char prev[128] = "";
+    const char* cur = db_current_database();
+    if (cur) snprintf(prev, sizeof(prev), "%s", cur);
+    char q[200];
+    snprintf(q, sizeof(q), "USE %.63s", db);
+    QueryResult* r = db_execute(q);
+    if (!r || !r->success) { db_result_free(r); r = NULL; json_error(rs, 404, "database '%s' not found", db); }
+    else {
+        db_result_free(r);
+        r = db_execute("SELECT `name`, `access`, `sql`, `description` FROM " ENDPOINTS_TABLE " ORDER BY `name`");
+        JsonBuf* b = &rs->body;
+        rs->status = 200;
+        jb_lit(b, "{\"ok\":true,\"database\":");
+        jb_str(b, db);
+        jb_lit(b, ",\"endpoints\":[");
+        for (int i = 0; r && r->success && i < r->num_rows; i++) {
+            const Cell* c = r->rows[i].cells;
+            if (i) jb_lit(b, ",");
+            jb_lit(b, "{\"name\":"); jb_str(b, c[0].value);
+            jb_lit(b, ",\"access\":"); jb_str(b, c[1].is_null ? "token" : c[1].value);
+            jb_lit(b, ",\"sql\":"); jb_str(b, c[2].is_null ? "" : c[2].value);
+            jb_lit(b, ",\"description\":"); if (c[3].is_null) jb_lit(b, "null"); else jb_str(b, c[3].value);
+            jb_lit(b, "}");
+        }
+        jb_lit(b, "]}");
+    }
+    db_result_free(r);
+    cur = db_current_database();
+    if (prev[0] && (!cur || strcmp(cur, prev))) { snprintf(q, sizeof(q), "USE %.63s", prev); db_result_free(db_execute(q)); }
+    mx_unlock(&s->exec_mx);
+    (void)rq;
 }
 
 // ── catalogo: /api/v1/databases[/db/tables[/t]] ─────────────────
@@ -744,12 +912,37 @@ static void route(SvServer* s, Request* rq, Response* rs) {
                (rq->path[sizeof(API_PREFIX) - 1] == '\0' || rq->path[sizeof(API_PREFIX) - 1] == '/');
     const char* sub = api ? rq->path + sizeof(API_PREFIX) - 1 : NULL;
 
-    const char* bad_origin = api ? origin_problem(s, rq) : NULL;
-    if (bad_origin) { json_error(rs, 403, "%s", bad_origin); return; }
+    // endpoint salvato: va cercato prima dei controlli (uno pubblico non chiede token né origine)
+    bool ep = api && !strncmp(sub, "/endpoints/", 11) && sub[11];
+    bool ep_public = false;
+    char* ep_sql = NULL;
+    char ep_db[128] = "";
+    if (api && !strncmp(sub, "/endpoints", 10) && (sub[10] == '\0' || sub[10] == '/')) {
+        query_param(rq->query, "database", ep_db, sizeof(ep_db));
+        if (!ep_db[0] && s->default_db) snprintf(ep_db, sizeof(ep_db), "%s", s->default_db);
+        if (!ep_db[0] || !valid_ident(ep_db)) { json_error(rs, 400, "add ?database=name (or start the server with --database)"); return; }
+    }
+    if (ep) {
+        const char* name = sub + 11;
+        if (!valid_ident(name)) { json_error(rs, 404, "endpoint not found"); return; }
+        char err[200];
+        int f = endpoint_lookup(s, ep_db, name, &ep_sql, &ep_public, err, sizeof(err));
+        if (f < 0) { json_error(rs, 404, "%s", err); return; }
+        if (f == 0) { json_error(rs, 404, "endpoint '%s' not found in database '%s'", name, ep_db); return; }
+    }
+
+    const char* bad_origin = api && !ep_public ? origin_problem(s, rq) : NULL;
+    if (bad_origin) { free(ep_sql); json_error(rs, 403, "%s", bad_origin); return; }
 
     if (!strcmp(rq->method, "OPTIONS")) {        // preflight CORS
         rs->status = 204;
-        rs->extra_headers = "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        free(ep_sql);
+        rs->extra_headers = ep_public ?
+                            "Access-Control-Allow-Origin: *\r\n"
+                            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                            "Access-Control-Allow-Headers: Content-Type\r\n"
+                            "Access-Control-Max-Age: 600\r\n" :
+                            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
                             "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
                             "Access-Control-Max-Age: 600\r\n";
         return;
@@ -759,12 +952,13 @@ static void route(SvServer* s, Request* rq, Response* rs) {
         jb_lit(&rs->body, "{\"ok\":true,\"server\":\"SegVault\",\"version\":\"" SV_VERSION_STR "\"}");
         return;
     }
-    if (api && s->token && strcmp(rq->method, "OPTIONS")) {
+    if (api && s->token && !ep_public) {
         const char* a = rq->auth;
         bool ok = !strncasecmp(a, "Bearer ", 7) && secret_equal(a + 7, s->token);
         if (!ok) {
             rs->extra_headers = "WWW-Authenticate: Bearer\r\n";
             json_error(rs, 401, "missing or wrong token (send \"Authorization: Bearer <token>\")");
+            free(ep_sql);
             return;
         }
     }
@@ -778,6 +972,18 @@ static void route(SvServer* s, Request* rq, Response* rs) {
                       "\"errors\":%lld,\"rows_sent\":%lld,\"connections\":%d,\"busy\":%s,\"timeout_ms\":%d}",
                       st.uptime_s, st.requests, st.errors, st.rows_sent, st.connections, st.busy ? "true" : "false",
                       s->cfg.timeout_ms);
+            return;
+        }
+        if (ep) {
+            if (strcmp(rq->method, "GET") && strcmp(rq->method, "POST")) { free(ep_sql); json_error(rs, 405, "use GET or POST"); return; }
+            if (ep_public) rs->extra_headers = "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n";
+            handle_endpoint(s, rq, rs, sub + 11, ep_db, ep_sql);
+            free(ep_sql);
+            return;
+        }
+        if (!strcmp(sub, "/endpoints")) {
+            if (strcmp(rq->method, "GET")) { json_error(rs, 405, "use GET"); return; }
+            handle_endpoint_list(s, rq, rs, ep_db);
             return;
         }
         if (!strcmp(sub, "/query")) {
@@ -926,64 +1132,66 @@ static void log_request(SvServer* s, const char* client, const Request* rq, cons
     mx_unlock(&s->conn_mx);
 }
 
+// risponde a una richiesta della connessione; false = connessione da chiudere
+static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
+    // intestazione: fino a \r\n\r\n
+    char* hend = NULL;
+    while (!(hend = in->data ? strstr(in->data, "\r\n\r\n") : NULL)) {
+        if (in->len >= MAX_HEADER) {
+            Response rs = { .close = true };
+            json_error(&rs, 431, "request headers too large");
+            send_response(s, c->fd, NULL, &rs);
+            free(rs.body.data);
+            return false;
+        }
+        if (!fill(c->fd, in, in->len + 1, &s->stop)) return false;
+    }
+    size_t head_len = (size_t)(hend - in->data) + 4;
+    double t0 = now_ms();
+    Request rq;
+    memset(&rq, 0, sizeof(rq));
+    char saved = in->data[head_len - 2];
+    in->data[head_len - 2] = '\0';              // la testata termina con l'ultimo \r\n
+    int perr = parse_head(s, in->data, &rq);
+    in->data[head_len - 2] = saved;
+    Response rs = {0};
+    if (perr) {
+        rs.close = true;
+        json_error(&rs, perr, "%s", perr == 413 ? "request body too large" :
+                                    perr == 411 ? "a Content-Length header is required (no chunked bodies)" : "malformed request");
+        send_response(s, c->fd, &rq, &rs);
+        free(rs.body.data);
+        return false;
+    }
+    if (!fill(c->fd, in, head_len + rq.content_length, &s->stop)) return false;
+    char after = in->data[head_len + rq.content_length];
+    in->data[head_len + rq.content_length] = '\0';
+    rq.body = in->data + head_len;
+    rq.body_len = rq.content_length;
+
+    route(s, &rq, &rs);
+    rs.close = !rq.keep_alive || s->stop;
+    in->data[head_len + rq.content_length] = after;
+    bool sent = send_response(s, c->fd, &rq, &rs);
+    double ms = now_ms() - t0;
+    if (!s->cfg.quiet)
+        fprintf(stderr, "[segvault-server] %s %s %s -> %d (%llu bytes, %.1f ms)\n",
+                c->client, rq.method, rq.path, rs.status, (unsigned long long)rs.body.len, ms);
+    if (strcmp(rq.method, "OPTIONS")) log_request(s, c->client, &rq, &rs, ms);
+    free(rs.body.data);
+    if (!sent || rs.close) return false;
+    // richieste in coda (pipelining): si sposta il resto all'inizio
+    size_t used = head_len + rq.content_length;
+    memmove(in->data, in->data + used, in->len - used);
+    in->len -= used;
+    in->data[in->len] = '\0';
+    return true;
+}
+
 static void serve_connection(Conn* c) {
-    SvServer* s = c->s;
     InBuf in = {0};
     set_timeout(c->fd, IDLE_TIMEOUT_MS);
-    for (;;) {
-        // intestazione: fino a \r\n\r\n
-        char* hend = NULL;
-        while (!(hend = in.data ? strstr(in.data, "\r\n\r\n") : NULL)) {
-            if (in.len >= MAX_HEADER) {
-                Response rs = { .close = true };
-                json_error(&rs, 431, "request headers too large");
-                send_response(s, c->fd, NULL, &rs);
-                free(rs.body.data);
-                goto done;
-            }
-            if (!fill(c->fd, &in, in.len + 1, &s->stop)) goto done;
-        }
-        size_t head_len = (size_t)(hend - in.data) + 4;
-        double t0 = now_ms();
-        Request rq;
-        memset(&rq, 0, sizeof(rq));
-        char saved = in.data[head_len - 2];
-        in.data[head_len - 2] = '\0';              // la testata termina con l'ultimo \r\n
-        int perr = parse_head(s, in.data, &rq);
-        in.data[head_len - 2] = saved;
-        Response rs = {0};
-        if (perr) {
-            rs.close = true;
-            json_error(&rs, perr, "%s", perr == 413 ? "request body too large" :
-                                        perr == 411 ? "a Content-Length header is required (no chunked bodies)" : "malformed request");
-            send_response(s, c->fd, &rq, &rs);
-            free(rs.body.data);
-            goto done;
-        }
-        if (!fill(c->fd, &in, head_len + rq.content_length, &s->stop)) goto done;
-        char after = in.data[head_len + rq.content_length];
-        in.data[head_len + rq.content_length] = '\0';
-        rq.body = in.data + head_len;
-        rq.body_len = rq.content_length;
-
-        route(s, &rq, &rs);
-        rs.close = !rq.keep_alive || s->stop;
-        in.data[head_len + rq.content_length] = after;
-        bool sent = send_response(s, c->fd, &rq, &rs);
-        double ms = now_ms() - t0;
-        if (!s->cfg.quiet)
-            fprintf(stderr, "[segvault-server] %s %s %s -> %d (%llu bytes, %.1f ms)\n",
-                    c->client, rq.method, rq.path, rs.status, (unsigned long long)rs.body.len, ms);
-        if (strcmp(rq.method, "OPTIONS")) log_request(s, c->client, &rq, &rs, ms);
-        free(rs.body.data);
-        if (!sent || rs.close) goto done;
-        // richieste in coda (pipelining): si sposta il resto all'inizio
-        size_t used = head_len + rq.content_length;
-        memmove(in.data, in.data + used, in.len - used);
-        in.len -= used;
-        in.data[in.len] = '\0';
-    }
-done:
+    while (serve_one(c->s, c, &in)) {}          // keep-alive: una richiesta dopo l'altra
     free(in.data);
 }
 

@@ -88,22 +88,21 @@ static char* jp_string(JP* p, size_t* out_len) {
             case 't': o[k++] = '\t'; break;
             case 'u': {
                 unsigned cp;
-                if (!jp_hex4(p, &cp)) { jp_fail(p, "bad \\u escape"); goto fail; }
+                if (!jp_hex4(p, &cp)) { jp_fail(p, "bad \\u escape"); free(o); return NULL; }
                 if (cp >= 0xD800 && cp <= 0xDBFF) {           // coppia surrogata
                     unsigned lo;
-                    if (p->n - p->i < 6 || p->s[p->i] != '\\' || p->s[p->i + 1] != 'u') { jp_fail(p, "lone surrogate"); goto fail; }
+                    if (p->n - p->i < 6 || p->s[p->i] != '\\' || p->s[p->i + 1] != 'u') { jp_fail(p, "lone surrogate"); free(o); return NULL; }
                     p->i += 2;
-                    if (!jp_hex4(p, &lo) || lo < 0xDC00 || lo > 0xDFFF) { jp_fail(p, "bad surrogate pair"); goto fail; }
+                    if (!jp_hex4(p, &lo) || lo < 0xDC00 || lo > 0xDFFF) { jp_fail(p, "bad surrogate pair"); free(o); return NULL; }
                     cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                } else if (cp >= 0xDC00 && cp <= 0xDFFF) { jp_fail(p, "lone surrogate"); goto fail; }
+                } else if (cp >= 0xDC00 && cp <= 0xDFFF) { jp_fail(p, "lone surrogate"); free(o); return NULL; }
                 k += utf8_put(o + k, cp);
                 break;
             }
-            default: jp_fail(p, "bad escape"); goto fail;
+            default: jp_fail(p, "bad escape"); free(o); return NULL;
         }
     }
     jp_fail(p, "unterminated string");
-fail:
     free(o);
     return NULL;
 }

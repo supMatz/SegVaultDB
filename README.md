@@ -501,7 +501,8 @@ make server                                   # ./segvault-server (make windows:
 | `--max-body MB` | corpo massimo di una richiesta (default 16) |
 
 Endpoint: `GET /api/v1/health`, `GET /api/v1/status`, `POST /api/v1/query`,
-`GET /api/v1/databases`, `GET /api/v1/databases/{db}/tables`, `GET /api/v1/databases/{db}/tables/{t}`.
+`GET /api/v1/databases`, `GET /api/v1/databases/{db}/tables`, `GET /api/v1/databases/{db}/tables/{t}`,
+`GET|POST /api/v1/endpoints/{nome}` e `GET /api/v1/endpoints` (endpoint salvati, sotto).
 Tutto il lavoro passa da `POST /api/v1/query`:
 
 ```bash
@@ -513,6 +514,27 @@ curl -s http://127.0.0.1:8484/api/v1/query -H 'Content-Type: application/json' -
 }'
 # {"ok":true,"results":[{"columns":[...],"rows":[{"nome":"pane","prezzo":1.5}],"row_count":1,"time_ms":0.02}],"time_ms":0.05}
 ```
+
+**Endpoint salvati — un'API senza scrivere backend.** Una query con un nome, salvata nella tabella
+`api_endpoints` del database, diventa un URL (come in PocketBase o Supabase):
+
+```sql
+CREATE TABLE api_endpoints (name VARCHAR(60) PRIMARY KEY, sql TEXT NOT NULL,
+                            access VARCHAR(10) NOT NULL DEFAULT 'token', description VARCHAR(200));
+INSERT INTO api_endpoints VALUES
+  ('prodotti_economici', 'SELECT id, nome, prezzo FROM prodotto WHERE prezzo < :max ORDER BY prezzo', 'public', NULL);
+```
+
+```js
+// da una pagina pubblica, senza token e senza backend:
+const r = await fetch("http://127.0.0.1:8484/api/v1/endpoints/prodotti_economici?database=shop&max=10");
+const { results } = await r.json();          // results[0].rows = [{ id, nome, prezzo }, ...]
+```
+
+I parametri `:nome` vengono dalla query string o da un JSON nel corpo (`POST`) e sono legati in modo
+sicuro; lo script è atomico; `public` = chiamabile senza token da qualsiasi sito, `token` = come il
+resto dell'API. Dettagli in [`docs/API.md`](docs/API.md#endpoint-salvati-unapi-senza-scrivere-backend).
+Gli endpoint si creano e modificano con l'SQL o direttamente nella griglia dell'app.
 
 Regole da ricordare, valide per tutti i linguaggi:
 
@@ -825,6 +847,7 @@ Esempio in [`docs/API.md`](docs/API.md#incorporare-il-motore-in-unapp-cc-senza-s
 | Scenario | Come |
 |---|---|
 | Provare o sviluppare sul proprio computer | `segvault` → *API server* (pannello con il registro delle richieste) |
+| Sito pubblico che legge dati, senza backend | endpoint salvati `public` |
 | Sito statico + database, come con XAMPP | `segvault` → *API server* → *Web folder* (o `segvault-server --static cartella/`) |
 | Sito / web app che gira sulla stessa macchina | `segvault-server --static app/` (stessa origine) |
 | Frontend su un'altra origine (sviluppo) | `segvault-server --cors http://localhost:5173` |
@@ -902,7 +925,7 @@ make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitize
 | `test_sql` (994) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, transazioni, crash e recovery, testi lunghi, 100 transazioni di fila |
 | `test_examples` (166) | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
 | `test_grid_edit` (22) | Modifica dei dati nella griglia: analisi dei risultati, `UPDATE` / `INSERT` / `DELETE` generati ed eseguiti, chiavi composte, join, apici e backslash, letterali di export e dump |
-| `test_server` (65) | Il server su socket reali: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici |
+| `test_server` (78) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici |
 
 La CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) compila su Ubuntu con `-D_FORTIFY_SOURCE=2` e fallisce a qualunque warning, esegue `make test` e `make test-asan`, e compila per Windows con MinGW-w64. Durante lo sviluppo il motore è stato anche verificato con un fuzzer di SQL mutato e uno di richieste HTTP malformate (sotto ASan), con un confronto dei risultati contro SQLite su centinaia di migliaia di query e modifiche casuali, e con arresti forzati (`kill -9`) durante scritture concorrenti senza perdere nessuna scrittura confermata.
 

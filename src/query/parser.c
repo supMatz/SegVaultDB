@@ -870,51 +870,8 @@ static ASTNode* parse_derived(ParserState* ps, char* name, size_t cap) {
 }
 
 // SELECT [DISTINCT] colonne [FROM ...] [WHERE] [GROUP BY] [HAVING]  (senza ORDER BY / LIMIT)
-static ASTNode* parse_select_core(ParserState* ps) {
-    ASTNode* n = calloc(1, sizeof(ASTNode));
-    if (!n) return NULL;
-    n->type = NODE_SELECT;
-    if (!match(ps, TOK_SELECT)) { parse_fail(ps, "Expected SELECT", peek(ps)); return n; }
-
-    if (match(ps, TOK_DISTINCT)) n->select_stmt.distinct = true;
-    else match(ps, TOK_ALL);
-
-    // elenco: *  |  tabella.*  |  espressione [[AS] alias]
-    n->select_stmt.num_cols = 0;
-    do {
-        if (n->select_stmt.num_cols >= 64) { parse_fail(ps, "Too many columns in SELECT (max 64)", peek(ps)); break; }
-        ASTExpr* e = NULL;
-        if (peek(ps).type == TOK_STAR) {
-            consume(ps);
-            e = new_expr(EXPR_STAR);
-        } else if (peek(ps).type == TOK_IDENTIFIER && next_is(ps, 1, TOK_DOT) && next_is(ps, 2, TOK_STAR)) {
-            Token t = consume(ps);
-            consume(ps); consume(ps);
-            e = new_expr(EXPR_STAR);
-            if (e) copy_text(ps, e->table_name, sizeof(e->table_name), t.text);
-        } else {
-            e = parse_expr(ps);
-            if (e && (match(ps, TOK_AS) || (peek(ps).type == TOK_IDENTIFIER && !alias_forbidden(ps)))) {
-                Token al = consume(ps);
-                if (al.type != TOK_IDENTIFIER && al.type != TOK_STRING) parse_fail(ps, "Expected an alias after AS", al);
-                copy_text(ps, e->alias, sizeof(e->alias), al.text);
-            }
-        }
-        if (!e) { if (ps->result->success) parse_fail(ps, "Out of memory", peek(ps)); break; }
-        n->select_stmt.columns[n->select_stmt.num_cols++] = e;
-    } while (ps->result->success && match(ps, TOK_COMMA));
-
-    if (!ps->result->success) return n;
-    // senza FROM (SELECT 1, SELECT NOW()): nessuna tabella
-    if (!match(ps, TOK_FROM)) {
-        Token nx = peek(ps);
-        if (nx.type != TOK_EOF && nx.type != TOK_SEMICOLON && nx.type != TOK_WHERE && nx.type != TOK_ORDER &&
-            nx.type != TOK_LIMIT && nx.type != TOK_RPAREN && nx.type != TOK_UNION && nx.type != TOK_GROUP &&
-            nx.type != TOK_HAVING && !ident_is(ps, "INTERSECT") && !ident_is(ps, "EXCEPT") && !ident_is(ps, "MINUS"))
-            parse_fail(ps, "Expected FROM", nx);
-        goto clauses;
-    }
-
+// FROM con le sue sorgenti e i JOIN (dopo la parola FROM)
+static void parse_from_clause(ParserState* ps, ASTNode* n) {
     // FROM fonte [[AS] alias] { , fonte [[AS] alias]
     //   | [INNER | CROSS | LEFT [OUTER] | RIGHT [OUTER]] JOIN fonte [[AS] alias] [ON condizione] }
     // fonte := tabella | vista | '(' SELECT ... ')'
@@ -972,8 +929,54 @@ static ASTNode* parse_select_core(ParserState* ps) {
         }
         else if (jt == JOIN_LEFT || jt == JOIN_RIGHT || jt == JOIN_FULL) parse_fail(ps, "LEFT, RIGHT and FULL JOIN need ON, USING or NATURAL", peek(ps));
     }
+}
 
-clauses:
+static ASTNode* parse_select_core(ParserState* ps) {
+    ASTNode* n = calloc(1, sizeof(ASTNode));
+    if (!n) return NULL;
+    n->type = NODE_SELECT;
+    if (!match(ps, TOK_SELECT)) { parse_fail(ps, "Expected SELECT", peek(ps)); return n; }
+
+    if (match(ps, TOK_DISTINCT)) n->select_stmt.distinct = true;
+    else match(ps, TOK_ALL);
+
+    // elenco: *  |  tabella.*  |  espressione [[AS] alias]
+    n->select_stmt.num_cols = 0;
+    do {
+        if (n->select_stmt.num_cols >= 64) { parse_fail(ps, "Too many columns in SELECT (max 64)", peek(ps)); break; }
+        ASTExpr* e = NULL;
+        if (peek(ps).type == TOK_STAR) {
+            consume(ps);
+            e = new_expr(EXPR_STAR);
+        } else if (peek(ps).type == TOK_IDENTIFIER && next_is(ps, 1, TOK_DOT) && next_is(ps, 2, TOK_STAR)) {
+            Token t = consume(ps);
+            consume(ps); consume(ps);
+            e = new_expr(EXPR_STAR);
+            if (e) copy_text(ps, e->table_name, sizeof(e->table_name), t.text);
+        } else {
+            e = parse_expr(ps);
+            if (e && (match(ps, TOK_AS) || (peek(ps).type == TOK_IDENTIFIER && !alias_forbidden(ps)))) {
+                Token al = consume(ps);
+                if (al.type != TOK_IDENTIFIER && al.type != TOK_STRING) parse_fail(ps, "Expected an alias after AS", al);
+                copy_text(ps, e->alias, sizeof(e->alias), al.text);
+            }
+        }
+        if (!e) { if (ps->result->success) parse_fail(ps, "Out of memory", peek(ps)); break; }
+        n->select_stmt.columns[n->select_stmt.num_cols++] = e;
+    } while (ps->result->success && match(ps, TOK_COMMA));
+
+    if (!ps->result->success) return n;
+    // senza FROM (SELECT 1, SELECT NOW()): nessuna tabella
+    if (!match(ps, TOK_FROM)) {
+        Token nx = peek(ps);
+        if (nx.type != TOK_EOF && nx.type != TOK_SEMICOLON && nx.type != TOK_WHERE && nx.type != TOK_ORDER &&
+            nx.type != TOK_LIMIT && nx.type != TOK_RPAREN && nx.type != TOK_UNION && nx.type != TOK_GROUP &&
+            nx.type != TOK_HAVING && !ident_is(ps, "INTERSECT") && !ident_is(ps, "EXCEPT") && !ident_is(ps, "MINUS"))
+            parse_fail(ps, "Expected FROM", nx);
+    } else {
+        parse_from_clause(ps, n);
+    }
+
     if (ps->result->success && match(ps, TOK_WHERE)) n->select_stmt.where = parse_expr(ps);
 
     if (ps->result->success && match(ps, TOK_GROUP)) {

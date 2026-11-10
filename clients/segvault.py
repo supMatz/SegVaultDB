@@ -75,6 +75,13 @@ class SegVault:
     def transaction(self, sql, params=(), **kw):
         return self.query(sql, params, transaction=True, **kw)
 
+    def endpoint(self, name, params=None, database=None):
+        """Endpoint salvato (tabella api_endpoints): righe dell'ultimo statement come dizionari."""
+        db = database or self.database
+        q = "?database=" + urllib.parse.quote(db) if db else ""
+        results = self._call("POST", "/endpoints/" + urllib.parse.quote(name) + q, params or {})["results"]
+        return results[-1].get("rows", []) if results else []
+
     def health(self):
         return self._call("GET", "/health")
 

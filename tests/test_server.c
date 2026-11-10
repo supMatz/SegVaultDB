@@ -288,6 +288,63 @@ int main(void) {
     CHECK(r.body && strstr(r.body, "\"default\":\"7\""), "column default: %s", r.body);
     resp_free(&r);
 
+    // ── endpoint salvati ──
+    r = query(port, "{\"database\":\"t\",\"sql\":\"CREATE TABLE api_endpoints (name VARCHAR(60) PRIMARY KEY, sql TEXT NOT NULL, "
+                    "access VARCHAR(10) NOT NULL DEFAULT 'token', description VARCHAR(200)); "
+                    "INSERT INTO api_endpoints VALUES ('economici', 'SELECT id, nome FROM p WHERE prezzo < :max ORDER BY id', 'public', 'Cheap products'), "
+                    "('per_nome', 'SELECT id FROM p WHERE nome = :nome', 'public', NULL), "
+                    "('aggiungi', 'INSERT INTO p (id, nome, prezzo, ok) VALUES (:id, :nome, :prezzo, TRUE); SELECT COUNT(*) AS n FROM p', 'token', NULL), "
+                    "('rotto', 'INSERT INTO p (id, nome, prezzo, ok) VALUES (90, ''a'', 1, TRUE); INSERT INTO p (id, nome, prezzo, ok) VALUES (90, ''b'', 1, TRUE)', 'public', NULL)\"}");
+    CHECK(resp_ok(&r), "create endpoints: %s", r.body);
+    resp_free(&r);
+    r = request(port, "GET", "/api/v1/endpoints/economici?database=t&max=0", NULL, NULL);
+    CHECK(resp_ok(&r) && strstr(r.body, "\"rows\":[{\"id\":2,\"nome\":null}]"), "public endpoint, GET param: %s", r.body);
+    resp_free(&r);
+    r = request(port, "GET", "/api/v1/endpoints/economici?database=t", NULL, NULL);
+    CHECK(r.status == 400 && strstr(err_msg(&r), "missing parameter :max"), "missing param: %s", r.body);
+    resp_free(&r);
+    r = request(port, "GET", "/api/v1/endpoints/per_nome?database=t&nome=x%27%20OR%20%271%27%3D%271", NULL, NULL);
+    CHECK(resp_ok(&r) && strstr(r.body, "\"rows\":[]"), "injection through an endpoint parameter: %s", r.body);
+    resp_free(&r);
+    r = request(port, "GET", "/api/v1/endpoints/nope?database=t", NULL, NULL);
+    CHECK(r.status == 404, "unknown endpoint: %d", r.status);
+    resp_free(&r);
+    r = request(port, "GET", "/api/v1/endpoints/rotto?database=t", NULL, NULL);
+    CHECK(r.status == 400, "failing endpoint: %s", r.body);
+    resp_free(&r);
+    r = query(port, "{\"database\":\"t\",\"sql\":\"SELECT COUNT(*) FROM p WHERE id = 90\"}");
+    c = cell_at(&r, 0, 0, 0);
+    CHECK(c && c->number == 0, "endpoint is atomic: %s", r.body);
+    resp_free(&r);
+    r = request(port, "GET", "/api/v1/endpoints?database=t", NULL, NULL);
+    CHECK(resp_ok(&r) && strstr(r.body, "\"name\":\"aggiungi\"") && strstr(r.body, "\"access\":\"public\""), "endpoint list: %s", r.body);
+    resp_free(&r);
+    // con il token (secondo server): i pubblici senza token e da qualsiasi origine, gli altri no
+    r = request(port2, "GET", "/api/v1/endpoints/economici?max=2", "Origin: http://altro.sito\r\n", NULL);
+    CHECK(r.status == 200, "public endpoint without token, foreign origin: %d %s", r.status, r.body);
+    resp_free(&r);
+    {
+        int fd = connect_to(port2);
+        const char* q = "GET /api/v1/endpoints/economici?max=2 HTTP/1.1\r\nHost: localhost\r\nOrigin: http://altro.sito\r\nConnection: close\r\n\r\n";
+        send_str(fd, q, strlen(q));
+        char b[2048]; size_t got = 0; ssize_t g;
+        while (got < sizeof(b) - 1 && (g = recv(fd, b + got, sizeof(b) - 1 - got, 0)) > 0) got += (size_t)g;
+        b[got] = '\0';
+        CHECK(strstr(b, "Access-Control-Allow-Origin: *"), "public endpoint CORS header: %s", b);
+        close(fd);
+    }
+    r = request(port2, "POST", "/api/v1/endpoints/aggiungi", "Content-Type: application/json\r\n", "{\"id\":70,\"nome\":\"x\",\"prezzo\":1}");
+    CHECK(r.status == 401, "token endpoint without token: %d", r.status);
+    resp_free(&r);
+    r = request(port2, "POST", "/api/v1/endpoints/aggiungi", "Content-Type: application/json\r\nAuthorization: Bearer s3cret\r\n",
+                "{\"id\":70,\"nome\":\"l'olio\",\"prezzo\":4.5}");
+    CHECK(resp_ok(&r) && strstr(r.body, "\"n\":"), "token endpoint, JSON params: %s", r.body);
+    resp_free(&r);
+    r = query(port, "{\"database\":\"t\",\"sql\":\"SELECT nome FROM p WHERE id = 70; DELETE FROM p WHERE id = 70\"}");
+    c = cell_at(&r, 0, 0, 0);
+    CHECK(c && c->type == JSON_STRING && !strcmp(c->str, "l'olio"), "value bound by the endpoint: %s", r.body);
+    resp_free(&r);
+
     // ── corpo text/plain ──
     r = request(port, "POST", "/api/v1/query?database=t", "Content-Type: text/plain\r\n", "SELECT prezzo FROM p WHERE id = 3");
     c = cell_at(&r, 0, 0, 0);
