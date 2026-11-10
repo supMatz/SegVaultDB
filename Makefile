@@ -61,17 +61,13 @@ ENGINE_SRCS = \
 	src/bridge/db_api.c
 
 # ── Targets ──
-#   gui    — GUI test (no real DB engine, uses db_api_test.c stub)
-#   full   — Full SegVault DBMS with real engine
-#   all    — full (default)
-
-GUI_SRCS  = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) src/bridge/db_api_test.c
-GUI_OBJS  = $(GUI_SRCS:.c=.o)
+#   full   — app desktop (editor SQL e server API) con il motore
+#   all    — full + segvault-server (default)
 
 FULL_SRCS = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) $(NET_SRCS) $(ENGINE_SRCS)
 FULL_OBJS = $(FULL_SRCS:.c=.o)
 
-.PHONY: all gui full clean test test-asan windows bench server lib
+.PHONY: all full clean test test-asan windows bench server lib
 
 all: full server
 
@@ -97,10 +93,6 @@ lib: libsegvault.a
 libsegvault.a: $(LIB_OBJS)
 	ar rcs $@ $(LIB_OBJS)
 	@echo "=== Library: libsegvault.a (header: src/bridge/db_api.h) ==="
-
-gui: $(GUI_OBJS)
-	$(CC) $(CFLAGS) -o $(OUT) $(GUI_OBJS) $(LIBS)
-	@echo "=== GUI test build: $(OUT) ==="
 
 full: $(FULL_OBJS)
 	$(CC) $(CFLAGS) -o $(OUT) $(FULL_OBJS) $(LIBS)
@@ -179,11 +171,11 @@ build-win/%.o: %.c
 	$(WIN_CC) $(CFLAGS) $(DEPFLAGS) $(BASE_INCLUDES) -c $< -o $@
 
 clean:
-	$(RM) $(GUI_OBJS) $(FULL_OBJS) $(GUI_OBJS:.o=.d) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql test_examples test_examples_asan
+	$(RM) $(FULL_OBJS) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql test_examples test_examples_asan
 	$(RM) segvault-server segvault-server.exe libsegvault.a test_server test_server_asan
 	$(RM) -r obj build-win build-server
 
--include $(FULL_OBJS:.o=.d) $(GUI_OBJS:.o=.d) $(WIN_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(WIN_SERVER_OBJS:.o=.d)
+-include $(FULL_OBJS:.o=.d) $(WIN_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(WIN_SERVER_OBJS:.o=.d)
 
 # ── benchmark del motore (schema universitario, righe configurabili: ./bench_sql 100000) ──
 bench_sql: bench/bench.c $(ENGINE_SRCS)
