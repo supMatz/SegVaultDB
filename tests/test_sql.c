@@ -107,6 +107,24 @@ static void crash_recovery_test(void) {
     if (system("rm -rf /tmp/sv_crash_test") != 0) { /* nulla */ }
 }
 
+// testo lungo: n caratteri 'a'..'z' ripetuti, poi il suffisso (stringhe che differiscono solo alla fine)
+static char* longtext(int n, const char* suffix) {
+    size_t sl = strlen(suffix);
+    char* b = malloc((size_t)n + sl + 1);
+    for (int i = 0; i < n; i++) b[i] = (char)('a' + i % 26);
+    memcpy(b + n, suffix, sl + 1);
+    return b;
+}
+
+// SQL con %s sostituiti dai testi lunghi
+static void tl(const char* fmt, const char* a, const char* b, const char* expect) {
+    size_t n = strlen(fmt) + (a ? strlen(a) : 0) + (b ? strlen(b) : 0) + 1;
+    char* q = malloc(n);
+    snprintf(q, n, fmt, a ? a : "", b ? b : "");
+    t(q, expect);
+    free(q);
+}
+
 int main(void) {
     if (system("rm -rf /tmp/sv_sql_test && mkdir -p /tmp/sv_sql_test") != 0) return 1;
     if (!db_init("/tmp/sv_sql_test")) { printf("FAIL: db_init\n"); return 1; }
@@ -810,6 +828,58 @@ int main(void) {
     t("ROLLBACK TO ciclo", "OK:0");
     t("SELECT v FROM c WHERE id = 2", "50");
     t("COMMIT", "OK:0");
+
+    // ── testi lunghi (oltre i vecchi 511 byte): niente troncamenti, chiavi senza collisioni ──
+    {
+        char* A = longtext(1500, "-A");          // stessi 1500 caratteri iniziali, fine diversa
+        char* B = longtext(1500, "-B");
+        char* L = longtext(3000, "");
+        t("CREATE DATABASE lunghi", "OK:0");
+        t("USE lunghi", "OK:0");
+        t("CREATE TABLE doc (id INT PRIMARY KEY, titolo VARCHAR(2000) UNIQUE, corpo TEXT)", "OK:0");
+        t("CREATE INDEX i_corpo ON doc (corpo)", "OK:0");
+        tl("INSERT INTO doc VALUES (1, '%s', 'x'), (2, '%s', 'y')", A, B, "OK:2");      // UNIQUE: non sono uguali
+        tl("INSERT INTO doc VALUES (3, '%s', 'z')", A, NULL, "ERR:Duplicate");          // questo sì
+        tl("INSERT INTO doc VALUES (4, 't', '%s')", L, NULL, "OK:1");
+        t("SELECT id, LENGTH(titolo), LENGTH(corpo) FROM doc ORDER BY id", "1|1502|1;2|1502|1;4|1|3000");
+        tl("SELECT id FROM doc WHERE titolo = '%s'", B, NULL, "2");                     // ricerca con l'indice UNIQUE
+        tl("SELECT id FROM doc WHERE corpo = '%s'", L, NULL, "4");                      // e con CREATE INDEX
+        t("SELECT COUNT(DISTINCT titolo), COUNT(*) FROM doc", "3|3");
+        t("SELECT RIGHT(titolo, 2), COUNT(*) FROM doc GROUP BY titolo ORDER BY 1", "-A|1;-B|1;t|1");
+        t("SELECT DISTINCT RIGHT(titolo, 1) FROM doc ORDER BY 1", "A;B;t");
+        t("SELECT LENGTH(CONCAT(titolo, corpo, titolo)) FROM doc WHERE id = 4", "3002");
+        t("SELECT LENGTH(UPPER(corpo)), RIGHT(UPPER(corpo), 3), LEFT(REVERSE(corpo), 3) FROM doc WHERE id = 4", "3000|HIJ|jih");
+        t("SELECT LENGTH(REPLACE(corpo, 'a', 'AA')) FROM doc WHERE id = 4", "3116");
+        t("SELECT RIGHT(MAX(titolo), 2), RIGHT(MIN(titolo), 2) FROM doc WHERE id < 3", "-B|-A");
+        t("SELECT LENGTH((SELECT corpo FROM doc WHERE id = 4))", "3000");
+        t("SELECT a.id, b.id FROM doc a JOIN doc b ON a.titolo = b.titolo ORDER BY a.id", "1|1;2|2;4|4");    // hash join
+        t("SELECT COUNT(*) FROM doc WHERE titolo > 'abc'", "3");                          // intervallo: testi lunghi nell'indice
+        t("SELECT COUNT(*) FROM doc WHERE titolo < 'abd'", "2");
+        t("UPDATE doc SET titolo = CONCAT(titolo, '!') WHERE id = 1", "OK:1");
+        t("SELECT RIGHT(titolo, 3) FROM doc WHERE id = 1", "-A!");
+        tl("UPDATE doc SET titolo = '%s' WHERE id = 1", B, NULL, "ERR:Duplicate");
+        // chiave composta e chiave esterna su testi lunghi
+        t("CREATE TABLE coppia (a VARCHAR(2000), b VARCHAR(2000), PRIMARY KEY (a, b))", "OK:0");
+        tl("INSERT INTO coppia VALUES ('%s', '%s')", A, B, "OK:1");
+        tl("INSERT INTO coppia VALUES ('%s', '%s')", B, A, "OK:1");
+        tl("INSERT INTO coppia VALUES ('%s', '%s')", A, B, "ERR:Duplicate");
+        t("CREATE TABLE rif (t VARCHAR(2000) REFERENCES doc(titolo))", "OK:0");
+        tl("INSERT INTO rif VALUES ('%s')", B, NULL, "OK:1");
+        char* C = longtext(1500, "-C");
+        tl("INSERT INTO rif VALUES ('%s')", C, NULL, "ERR:Foreign key");                // stesso inizio di A e B
+        free(C);
+        // trigger che costruisce un testo lungo
+        t("CREATE TABLE nota (id INT, s TEXT)", "OK:0");
+        t("CREATE TRIGGER lunga BEFORE INSERT ON nota FOR EACH ROW SET NEW.s = CONCAT(NEW.s, NEW.s, NEW.s)", "OK:0");
+        char* M = longtext(1000, "-M");
+        tl("INSERT INTO nota VALUES (1, '%s')", M, NULL, "OK:1");
+        t("SELECT LENGTH(s), RIGHT(s, 2) FROM nota", "3006|-M");
+        free(M);
+        // riga più grande di una pagina: errore chiaro, nessuna modifica
+        tl("INSERT INTO nota VALUES (2, CONCAT('%s', '%s'))", L, L, "ERR:Row too large");
+        t("SELECT COUNT(*) FROM nota", "1");
+        free(A); free(B); free(L);
+    }
 
     // ── trigger (basi di dati attive) ──
     t("CREATE DATABASE att", "OK:0");

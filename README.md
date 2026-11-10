@@ -271,7 +271,7 @@ DROP TRIGGER [IF EXISTS] nome;   SHOW TRIGGERS [FROM tabella];
 | `FLOAT` / `DOUBLE` | 8 byte floating point |
 | `VARCHAR(n)` | Stringa a lunghezza variabile |
 | `CHAR(n)` | Stringa a lunghezza fissa |
-| `TEXT` | Stringa lunga (max 65535 byte) |
+| `TEXT` | Stringa lunga (max 65535 byte; l'intera riga deve stare in una pagina, circa 4 KB) |
 | `BOOL` / `BOOLEAN` | 1 byte (0/1) |
 | `DATE` | `YYYY-MM-DD`, controllata |
 | `DATETIME` | `YYYY-MM-DD HH:MM:SS`, controllata |
@@ -335,7 +335,9 @@ Regole da ricordare, valide per tutti i linguaggi:
 - Tipi in JSON: `INT`/`FLOAT` → numero, `BOOL` → booleano, `NULL` → `null`, il resto (anche
   `DATE`, `AAAA-MM-GG`) → stringa.
 - Con colonne qualificate (`p.nome`) la chiave JSON è `"p.nome"`: usa un alias (`p.nome AS nome`).
-- Limite attuale: un letterale stringa (quindi anche un parametro stringa) è al massimo 511 byte.
+- Un testo (letterale, parametro o risultato di `CONCAT` / `REPLACE` / ...) può essere lungo
+  quanto serve; una riga salvata deve però stare in una pagina da 4 KB (al massimo 4080 byte in
+  tutto): oltre, l'`INSERT` / `UPDATE` viene rifiutato con un messaggio chiaro e non scrive nulla.
 
 Gli esempi usano lo stesso schema:
 

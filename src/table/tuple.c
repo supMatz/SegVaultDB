@@ -27,6 +27,20 @@ void tuple_free_with_schema(Tuple* t, TableSchema* s) {
 // Formato di serializzazione:
 //   [null_bitmap: ceil(num_cols/8) byte]
 //   [col0_data][col1_data]...
+size_t tuple_serialized_size(const Tuple* t, const TableSchema* s, bool* too_long) {
+    size_t total = (size_t)(t->num_values + 7) / 8;
+    if (too_long) *too_long = false;
+    for (int i = 0; i < t->num_values; i++) {
+        if (t->values[i].is_null) continue;
+        int sz = datatype_size(s->columns[i].type);
+        if (sz > 0) { total += (size_t)sz; continue; }
+        size_t slen = strlen(t->values[i].str_val ? t->values[i].str_val : "");
+        if (slen > 65535 && too_long) *too_long = true;
+        total += 2 + slen;
+    }
+    return total;
+}
+
 //   Per VARCHAR/TEXT: [uint16_t len][bytes...]
 uint8_t* tuple_serialize(Tuple* t, TableSchema* s, size_t* out_len) {
     // Prima passata: calcola la dimensione totale

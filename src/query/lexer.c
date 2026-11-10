@@ -19,11 +19,18 @@ typedef struct {
     char      text[512];
     int       line;
     int       col;
+    const char* ext;      // testo lungo fuori dal buffer (letterali stringa oltre 511 byte), o NULL
+    size_t      ext_len;
 } LexTok;
+
+// letterale stringa più lungo accettato (un TEXT ne conserva al massimo 65535 byte: il limite
+// della colonna lo controlla l'executor con un messaggio preciso)
+#define LEX_MAX_STRING (1u << 20)
 
 // riempie t (senza azzerare tutto il buffer: un token è lungo pochi byte)
 static void make_token_into(LexTok* t, Lexer* lx, TokenType type) {
     t->type = type; t->line = lx->line; t->col = lx->col;
+    t->ext = NULL;
     t->text[0] = '\0';
     int len = (int)(lx->pos - lx->start);
     if (len > 0 && len < 512) {
@@ -42,7 +49,8 @@ static int add_token(TokenList* list, const LexTok* t) {
         list->tokens = nt;
         list->capacity = nc;
     }
-    size_t l = strlen(t->text) + 1;
+    const char* src = t->ext ? t->ext : t->text;
+    size_t l = (t->ext ? t->ext_len : strlen(t->text)) + 1;
     if (list->plen + l > list->pcap) {
         size_t nc = list->pcap ? list->pcap * 2 : 4096;
         while (nc < list->plen + l) nc *= 2;
@@ -51,7 +59,7 @@ static int add_token(TokenList* list, const LexTok* t) {
         list->pool = np;
         list->pcap = nc;
     }
-    memcpy(list->pool + list->plen, t->text, l);
+    memcpy(list->pool + list->plen, src, l);
     Token* d = &list->tokens[list->count++];
     d->type = t->type;
     d->line = t->line;
@@ -128,6 +136,9 @@ TokenList* lexer_tokenize(const char* sql) {
 
     Lexer lx;
     LexTok tok;                       // token in costruzione (riusato)
+    tok.ext = NULL;
+    char*  sbuf = NULL;               // testo dei letterali stringa (cresce a richiesta)
+    size_t scap = 0;
     lx.start = lx.pos = sql;
     lx.line = 1; lx.col = 1;
 
@@ -170,13 +181,24 @@ TokenList* lexer_tokenize(const char* sql) {
             continue;
         }
 
-        // String literals: '' (o "") dentro la stringa vale un apice; \\ \' \" \n \t \r sono escape
+        // String literals: '' (o "") dentro la stringa vale un apice; \\ \' \" \n \t \r sono escape.
+        // Il testo va in sbuf (nessun limite fisso, fino a LEX_MAX_STRING byte)
         if (*lx.pos == '\'' || *lx.pos == '"') {
             char quote = *lx.pos;
-            tok.type = TOK_STRING; tok.line = lx.line; tok.col = lx.col; tok.text[0] = '\0';
-            int n = 0;
-            bool overflow = false;
+            tok.type = TOK_STRING; tok.line = lx.line; tok.col = lx.col; tok.text[0] = '\0'; tok.ext = NULL;
+            size_t n = 0;
+            bool overflow = false, oom = false;
             lx.pos++;
+            #define SPUT(chr) do { \
+                if (n + 2 > scap) { \
+                    if (n + 2 > LEX_MAX_STRING) { overflow = true; break; } \
+                    size_t nc = scap ? scap * 2 : 1024; \
+                    char* nb = realloc(sbuf, nc); \
+                    if (!nb) { oom = true; break; } \
+                    sbuf = nb; scap = nc; \
+                } \
+                sbuf[n++] = (chr); \
+            } while (0)
             while (*lx.pos) {
                 char ch = *lx.pos;
                 if (ch == quote) {
@@ -191,7 +213,7 @@ TokenList* lexer_tokenize(const char* sql) {
                         case 'r': ch = '\r'; break;
                         case '\\': case '\'': case '"': ch = e; break;
                         default:                              // escape sconosciuto: resta com'è
-                            if (n < (int)sizeof(tok.text) - 1) tok.text[n++] = '\\'; else overflow = true;
+                            if (!overflow && !oom) SPUT('\\');
                             ch = e;
                             break;
                     }
@@ -199,18 +221,29 @@ TokenList* lexer_tokenize(const char* sql) {
                     if (ch == '\n') lx.line++;
                     lx.pos++;
                 }
-                if (n < (int)sizeof(tok.text) - 1) tok.text[n++] = ch;
-                else overflow = true;
+                if (!overflow && !oom) SPUT(ch);
             }
-            tok.text[n] = '\0';
-            if (*lx.pos) lx.pos++;                            // apice di chiusura
-            else snprintf(tok.text, sizeof(tok.text), "Unterminated string literal"), tok.type = TOK_ERROR;
-            if (overflow) {
+            #undef SPUT
+            bool closed = *lx.pos != '\0';
+            if (closed) lx.pos++;                             // apice di chiusura
+            if (!closed) {
+                snprintf(tok.text, sizeof(tok.text), "Unterminated string literal");
                 tok.type = TOK_ERROR;
-                snprintf(tok.text, sizeof(tok.text), "String literal is longer than %d bytes", (int)sizeof(tok.text) - 1);
+            } else if (overflow || oom) {
+                snprintf(tok.text, sizeof(tok.text), oom ? "Out of memory reading a string literal"
+                                                         : "String literal is longer than %u bytes", LEX_MAX_STRING);
+                tok.type = TOK_ERROR;
+            } else if (n < sizeof(tok.text)) {
+                if (n) memcpy(tok.text, sbuf, n);
+                tok.text[n] = '\0';
+            } else {
+                sbuf[n] = '\0';
+                tok.ext = sbuf;
+                tok.ext_len = n;
             }
             lx.start = lx.pos;
             add_token(list, &tok);
+            tok.ext = NULL;
             continue;
         }
 
@@ -291,6 +324,7 @@ TokenList* lexer_tokenize(const char* sql) {
     add_token(list, &tok);
     for (int i = 0; i < list->count; i++)
         list->tokens[i].text = list->pool + (uintptr_t)list->tokens[i].text;
+    free(sbuf);
     return list;
 }
 

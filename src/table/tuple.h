@@ -43,6 +43,8 @@ void     tuple_free_with_schema(Tuple* t, TableSchema* s);
 
 // Serializza la tuple in un byte array (da inserire in una pagina)
 uint8_t* tuple_serialize(Tuple* t, TableSchema* s, size_t* out_len);
+// byte occupati dalla tupla serializzata; *too_long = un testo supera 65535 byte (verrebbe troncato)
+size_t   tuple_serialized_size(const Tuple* t, const TableSchema* s, bool* too_long);
 
 // Deserializza un byte array in una tuple
 Tuple* tuple_deserialize(const uint8_t* data, size_t len, TableSchema* s);

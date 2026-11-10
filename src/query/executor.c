@@ -901,6 +901,58 @@ static SMSlot* sm_slot(StrMap* m, const char* key, bool create) {
 
 typedef struct { RID* r; int n, cap; } RidList;
 
+// ── chiavi di testo ─────────────────────────────────────────────
+// Un testo corto (fino a KEY_INLINE_MAX byte, senza i separatori \x1e e \x1f) è la chiave di
+// se stesso. Uno più lungo diventa "prefisso\x1e<hash a 128 bit>:<lunghezza>": la chiave resta
+// corta (gli indici e i controlli di unicità non troncano più), le due forme non coincidono mai
+// (solo la seconda contiene \x1e) e testi diversi non collidono. Il seme è casuale a ogni avvio:
+// le chiavi vivono solo in memoria, e nessuno può costruire apposta due testi con la stessa chiave.
+#define KEY_INLINE_MAX 200
+#define KEY_BUF        2048     // chiave di 8 colonne (SV_MAX_KEY_COLS) in forma corta o lunga
+
+static uint64_t g_key_seed[2];
+
+static uint64_t kmix64(uint64_t x) {
+    x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ULL;
+    x ^= x >> 27; x *= 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+static void key_seed_init(void) {
+    if (g_key_seed[0]) return;
+    uint64_t s = (uint64_t)time(NULL) ^ ((uint64_t)(uintptr_t)&g_key_seed << 13) ^ ((uint64_t)clock() << 32);
+    FILE* f = fopen("/dev/urandom", "rb");
+    if (f) { if (fread(g_key_seed, 1, sizeof(g_key_seed), f) != sizeof(g_key_seed)) g_key_seed[0] = 0; fclose(f); }
+    g_key_seed[0] = kmix64(g_key_seed[0] ^ s) | 1;
+    g_key_seed[1] = kmix64(g_key_seed[1] ^ s ^ 0x9E3779B97F4A7C15ULL) | 1;
+}
+
+static uint64_t key_hash(const char* s, size_t n, uint64_t seed) {
+    uint64_t h = seed ^ kmix64(n);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, s + i, 8); h = kmix64(h ^ w) + 0x9E3779B97F4A7C15ULL; }
+    uint64_t t = 0;
+    memcpy(&t, s + i, n - i);
+    return kmix64(h ^ t ^ ((uint64_t)(n - i) << 56));
+}
+
+static bool key_is_long(const char* s, size_t n) {
+    return n > KEY_INLINE_MAX || memchr(s, '\x1e', n) || memchr(s, '\x1f', n);
+}
+
+// scrive la chiave del testo s in buf (cap >= KEY_INLINE_MAX + 1); true se in forma lunga
+static bool key_text(char* buf, size_t cap, const char* s) {
+    size_t n = strlen(s);
+    if (!key_is_long(s, n) && n < cap) { memcpy(buf, s, n + 1); return false; }
+    key_seed_init();
+    size_t pre = n < 64 ? n : 64;
+    if (pre + 60 > cap) pre = cap > 60 ? cap - 60 : 0;
+    for (size_t k = 0; k < pre; k++) buf[k] = (s[k] == '\x1e' || s[k] == '\x1f') ? '?' : s[k];
+    snprintf(buf + pre, cap - pre, "\x1e%016llx%016llx:%zu", (unsigned long long)key_hash(s, n, g_key_seed[0]),
+             (unsigned long long)key_hash(s, n, g_key_seed[1]), n);
+    return true;
+}
+
 typedef struct MemIndex {
     char      db[SV_MAX_NAME_LEN], table[SV_MAX_NAME_LEN];
     char      col[SV_MAX_NAME_LEN * 2];   // nome della colonna, o "a,b" per una chiave composta
@@ -918,6 +970,7 @@ typedef struct MemIndex {
     int64_t*  okey;         // chiave numerica di ogni lista (colonne intere)
     int       nord;
     bool      ord_ok;
+    bool      has_long;     // qualche chiave è in forma lunga: niente scansioni per intervallo (l'ordine non vale)
     struct MemIndex* next;
 } MemIndex;
 
@@ -953,7 +1006,9 @@ static void mi_invalidate_table(const char* db, const char* table) {
 
 // chiave canonica di un valore (NULL non viene indicizzato)
 static void mi_key(const Value* v, DataType t, char* buf, size_t n) {
-    value_to_string((Value*)v, t, buf, n);
+    if (t != SV_TYPE_INT && t != SV_TYPE_BIGINT && t != SV_TYPE_FLOAT && t != SV_TYPE_BOOL)   // testo
+        key_text(buf, n, v->str_val ? v->str_val : "");
+    else value_to_string((Value*)v, t, buf, n);
 }
 
 // chiave della tupla sulle colonne indicate; false se una colonna è NULL (non indicizzata:
@@ -964,7 +1019,7 @@ static bool tuple_key(const TableSchema* ts, const Tuple* t, const int* cols, in
     for (int k = 0; k < ncols; k++) {
         int ci = cols[k];
         if (ci < 0 || ci >= t->num_values || t->values[ci].is_null) return false;
-        if (k) { if (len + 2 >= n) return false; buf[len++] = '\x1f'; buf[len] = '\0'; }
+        if (k) { if (len + KEY_INLINE_MAX + 2 >= n) return false; buf[len++] = '\x1f'; buf[len] = '\0'; }
         mi_key(&t->values[ci], ts->columns[ci].type, buf + len, n - len);
         len += strlen(buf + len);
     }
@@ -972,6 +1027,7 @@ static bool tuple_key(const TableSchema* ts, const Tuple* t, const int* cols, in
 }
 
 static bool mi_add_key(MemIndex* ix, const char* key, RID rid) {
+    if (strchr(key, '\x1e')) ix->has_long = true;
     SMSlot* s = sm_slot(&ix->map, key, true);
     if (!s) return false;
     if (s->val < 0) {
@@ -1005,7 +1061,7 @@ static bool mi_add_key(MemIndex* ix, const char* key, RID rid) {
 }
 
 static bool mi_add_tuple(MemIndex* ix, const TableSchema* ts, const Tuple* t, RID rid) {
-    char key[EV_STR_MAX + 1];
+    char key[KEY_BUF];
     if (!tuple_key(ts, t, ix->cols, ix->ncols, key, sizeof(key))) return true;
     if (!mi_add_key(ix, key, rid)) return false;
     if (ix->ncols == 1) {
@@ -1021,7 +1077,7 @@ static bool mi_add_tuple(MemIndex* ix, const TableSchema* ts, const Tuple* t, RI
 }
 
 static void mi_remove_tuple(MemIndex* ix, const TableSchema* ts, const Tuple* t, RID rid) {
-    char key[EV_STR_MAX + 1];
+    char key[KEY_BUF];
     if (!tuple_key(ts, t, ix->cols, ix->ncols, key, sizeof(key))) return;
     SMSlot* s = sm_slot(&ix->map, key, false);
     if (!s || s->val < 0) return;
@@ -1093,6 +1149,7 @@ static int rid_cmp(const void* a, const void* b) {
 static bool mi_range(MemIndex* ix, bool numeric, const EvalVal* lo, const EvalVal* hi, RID** out, int* nout) {
     *out = NULL;
     *nout = 0;
+    if (!numeric && ix->has_long) return false;                 // testi lunghi: l'ordine delle chiavi non vale
     if (!mi_ordered(ix, numeric)) return false;
     int a = 0, b = ix->nord;
     if (lo) {                                   // prima chiave >= lo
@@ -1557,8 +1614,52 @@ static const char* utf8_at(const char* s, int ci) {
     return s;
 }
 
+// Testi calcolati più lunghi del buffer di EvalVal (CONCAT, REPLACE, ...): copiati in un'arena
+// che vive quanto lo statement (liberata quando executor_run torna al livello più esterno).
+#define EV_TEXT_MAX (1u << 20)
+static Arena g_text_arena;
+static int   g_run_depth;
+
+// copia s nell'arena (o nel buffer se ci sta); false se troppo lungo o senza memoria
+static bool ev_text_long(EvalVal* out, const char* s, size_t n) {
+    if (n <= EV_STR_MAX) return ev_text(out, s, n);
+    if (n > EV_TEXT_MAX) return false;
+    char* p = arena_alloc(&g_text_arena, n + 1);
+    if (!p) return false;
+    memcpy(p, s, n);
+    p[n] = '\0';
+    out->null = false; out->is_num = out->is_int = false;
+    out->str = p;
+    return true;
+}
+
 static void ev_set_text(EvalCtx* c, EvalVal* out, const char* s, size_t n) {
-    if (!ev_text(out, s, n)) { ctx_error(c, "%s", "String result longer than 511 bytes"); ev_null(out); }
+    if (!ev_text_long(out, s, n)) {
+        ctx_error(c, "%s", n > EV_TEXT_MAX ? "String result longer than 1 MB" : "Out of memory");
+        ev_null(out);
+    }
+}
+
+// buffer di testo che cresce (risultati delle funzioni di testo)
+typedef struct { char* d; size_t n, cap; bool err; } TextBuf;
+static void tb_put(TextBuf* t, const char* s, size_t n) {
+    if (t->err) return;
+    if (t->n + n + 1 > t->cap) {
+        if (t->n + n + 1 > EV_TEXT_MAX + 1) { t->err = true; return; }
+        size_t nc = t->cap ? t->cap * 2 : 256;
+        while (nc < t->n + n + 1) nc *= 2;
+        char* nd = realloc(t->d, nc);
+        if (!nd) { t->err = true; return; }
+        t->d = nd; t->cap = nc;
+    }
+    memcpy(t->d + t->n, s, n);
+    t->n += n;
+    t->d[t->n] = '\0';
+}
+static void tb_result(EvalCtx* c, EvalVal* out, TextBuf* t) {
+    if (t->err) { ctx_error(c, "%s", "String result longer than 1 MB"); ev_null(out); }
+    else ev_set_text(c, out, t->d ? t->d : "", t->n);
+    free(t->d);
 }
 
 static void now_text(char* buf, size_t n, bool date_only) {
@@ -1599,24 +1700,18 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     }
     if (!strcmp(f, "CONCAT") || !strcmp(f, "CONCAT_WS")) {
         bool ws = f[6] == '_';
-        char buf[EV_STR_MAX + 2];
-        size_t len = 0;
+        TextBuf tb = {0};
         EvalVal sep, v;
         if (ws) { eval_expr(e->args[0], c, &sep); if (sep.null) { ev_null(out); return; } }
         bool first = true;
         for (int i = ws ? 1 : 0; i < e->nargs; i++) {
             eval_expr(e->args[i], c, &v);
-            if (v.null) { if (ws) continue; ev_null(out); return; }   // CONCAT con un NULL = NULL
+            if (v.null) { if (ws) continue; free(tb.d); ev_null(out); return; }   // CONCAT con un NULL = NULL
             const char* parts[2] = { ws && !first ? ev_s(&sep) : "", ev_s(&v) };
-            for (int p = 0; p < 2; p++) {
-                size_t l = strlen(parts[p]);
-                if (len + l > EV_STR_MAX) { ctx_error(c, "%s", "String result longer than 511 bytes"); ev_null(out); return; }
-                memcpy(buf + len, parts[p], l);
-                len += l;
-            }
+            for (int p = 0; p < 2; p++) tb_put(&tb, parts[p], strlen(parts[p]));
             first = false;
         }
-        ev_set_text(c, out, buf, len);
+        tb_result(c, out, &tb);
         return;
     }
     if (!strcmp(f, "NOW") || !strcmp(f, "CURRENT_TIMESTAMP") || !strcmp(f, "CURDATE") || !strcmp(f, "CURRENT_DATE")) {
@@ -1638,10 +1733,13 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     }
     if (!strcmp(f, "UPPER") || !strcmp(f, "UCASE") || !strcmp(f, "LOWER") || !strcmp(f, "LCASE")) {
         bool up = f[0] == 'U';
-        char buf[EV_STR_MAX + 1];
-        size_t l = strlen(ev_s(&a[0]));
-        for (size_t i = 0; i < l; i++) buf[i] = (char)(up ? toupper((unsigned char)ev_s(&a[0])[i]) : tolower((unsigned char)ev_s(&a[0])[i]));
+        const char* src = ev_s(&a[0]);
+        size_t l = strlen(src);
+        char* buf = malloc(l + 1);
+        if (!buf) { ctx_error(c, "%s", "Out of memory"); ev_null(out); return; }
+        for (size_t i = 0; i < l; i++) buf[i] = (char)(up ? toupper((unsigned char)src[i]) : tolower((unsigned char)src[i]));
         ev_set_text(c, out, buf, l);
+        free(buf);
         return;
     }
     if (!strcmp(f, "LENGTH"))        { ev_int(out, (int64_t)strlen(ev_s(&a[0]))); return; }
@@ -1674,24 +1772,25 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     }
     if (!strcmp(f, "REPLACE")) {
         const char* s = ev_s(&a[0]), *from = ev_s(&a[1]), *to = ev_s(&a[2]);
-        size_t fl = strlen(from), tl = strlen(to), len = 0;
-        char buf[EV_STR_MAX + 2];
-        while (*s) {
-            if (fl && !strncmp(s, from, fl)) {
-                if (len + tl > EV_STR_MAX) { ctx_error(c, "%s", "String result longer than 511 bytes"); ev_null(out); return; }
-                memcpy(buf + len, to, tl); len += tl; s += fl;
-            } else {
-                if (len + 1 > EV_STR_MAX) { ctx_error(c, "%s", "String result longer than 511 bytes"); ev_null(out); return; }
-                buf[len++] = *s++;
+        size_t fl = strlen(from), tl = strlen(to);
+        TextBuf tb = {0};
+        while (*s && !tb.err) {
+            if (fl && !strncmp(s, from, fl)) { tb_put(&tb, to, tl); s += fl; }
+            else {
+                const char* nx = fl ? strstr(s, from) : NULL;         // copia in blocco fino alla prossima occorrenza
+                size_t run = nx ? (size_t)(nx - s) : strlen(s);
+                tb_put(&tb, s, run);
+                s += run;
             }
         }
-        ev_set_text(c, out, buf, len);
+        tb_result(c, out, &tb);
         return;
     }
     if (!strcmp(f, "REVERSE")) {
         const char* s = ev_s(&a[0]);
         size_t l = strlen(s);
-        char buf[EV_STR_MAX + 1];
+        char* buf = malloc(l + 1);
+        if (!buf) { ctx_error(c, "%s", "Out of memory"); ev_null(out); return; }
         size_t k = 0;
         for (size_t i = l; i > 0; ) {                       // carattere UTF-8 intero
             size_t j = i - 1;
@@ -1701,6 +1800,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             i = j;
         }
         ev_set_text(c, out, buf, k);
+        free(buf);
         return;
     }
     if (!strcmp(f, "YEAR") || !strcmp(f, "MONTH") || !strcmp(f, "DAY")) {
@@ -1768,11 +1868,11 @@ static void eval_aggregate(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         if (v.null) continue;
         if (e->agg_distinct) {                                   // COUNT/SUM/AVG(DISTINCT x)
             // i numeri uguali hanno la stessa chiave (5 e 5.0), i testi restano distinti dai numeri
-            char key[EV_STR_MAX + 4];
+            char key[KEY_BUF];
             if (v.is_int) snprintf(key, sizeof(key), "n%lld", (long long)v.inum);
             else if (v.is_num && v.num == floor(v.num) && fabs(v.num) < 9e18) snprintf(key, sizeof(key), "n%lld", (long long)v.num);
             else if (v.is_num) snprintf(key, sizeof(key), "n%.17g", v.num);
-            else snprintf(key, sizeof(key), "s%s", ev_s(&v));
+            else { key[0] = 's'; key_text(key + 1, sizeof(key) - 1, ev_s(&v)); }
             SMSlot* sl = sm_slot(&seen, key, true);
             if (!sl) { ctx_error(c, "%s", "Out of memory"); break; }
             if (sl->val >= 0) continue;
@@ -1787,11 +1887,8 @@ static void eval_aggregate(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         }
         if ((is_min || is_max) && (!have_best || (is_min ? ev_cmp(&v, &best) < 0 : ev_cmp(&v, &best) > 0))) {
             ev_copy(&best, &v);
-            if (best.str && best.str != best.buf) {   // il testo punta alla tupla: copia (la riga corrente cambia)
-                size_t l = strlen(best.str);
-                memcpy(best.buf, best.str, l > EV_STR_MAX ? EV_STR_MAX : l);
-                best.buf[l > EV_STR_MAX ? EV_STR_MAX : l] = '\0';
-                best.str = best.buf;
+            if (best.str && best.str != best.buf && !best.is_num) {   // il testo punta alla tupla: copia (la riga corrente cambia)
+                if (!ev_text_long(&best, best.str, strlen(best.str))) { ctx_error(c, "%s", "Out of memory"); break; }
             }
             have_best = true;
         }
@@ -1969,7 +2066,7 @@ static bool join_key(const Tuple* t, int col, DataType type, char* buf, size_t n
     const Value* v = &t->values[col];
     if (type == SV_TYPE_INT)         snprintf(buf, n, "%d", v->int_val);
     else if (type == SV_TYPE_BIGINT) snprintf(buf, n, "%lld", (long long)v->bigint_val);
-    else                             snprintf(buf, n, "%s", v->str_val ? v->str_val : "");
+    else                             key_text(buf, n, v->str_val ? v->str_val : "");
     return true;
 }
 
@@ -1989,7 +2086,7 @@ static bool find_index_eq(ASTExpr* w, TableSchema* ts, int* out_ci, char* key, s
             if (t == SV_TYPE_INT && (val->int_val < INT32_MIN || val->int_val > INT32_MAX)) continue;
             snprintf(key, keyn, "%lld", (long long)val->int_val);
         } else if (is_text_type(t) && val->type == EXPR_STRING) {
-            snprintf(key, keyn, "%s", val->str_val);
+            key_text(key, keyn, val->str_val ? val->str_val : "");
         } else {
             continue;
         }
@@ -2006,7 +2103,7 @@ static bool source_load(ExecCtx* ctx, const char* db, Source* s, ASTExpr* where_
     HeapFile* hf = heap_open(ctx->bp, s->ts->root_page_id, s->ts->num_pages);
     if (!hf) return false;
     int cap = 0, ci = -1;
-    char key[EV_STR_MAX + 1];
+    char key[KEY_BUF];
     if (where_for_index && find_index_eq(where_for_index, s->ts, &ci, key, sizeof(key))) {
         MemIndex* ix = mi_get(ctx, db, s->ts, ci);
         if (ix) {
@@ -2140,7 +2237,14 @@ static size_t oval_key(const OVal* o, char* buf, size_t cap) {
     else if (o->is_int) n = snprintf(buf, cap, "n%lld\x1f", (long long)o->inum);
     else if (o->is_num && o->num == floor(o->num) && fabs(o->num) < 9e18) n = snprintf(buf, cap, "n%lld\x1f", (long long)o->num);
     else if (o->is_num) n = snprintf(buf, cap, "n%.17g\x1f", o->num);
-    else                n = snprintf(buf, cap, "s%.511s\x1f", o->str ? o->str : "");
+    else {
+        if (cap < KEY_INLINE_MAX + 3) { buf[0] = '\0'; return 0; }
+        buf[0] = 's';
+        key_text(buf + 1, cap - 2, o->str ? o->str : "");
+        n = (int)strlen(buf);
+        buf[n++] = '\x1f';
+        buf[n] = '\0';
+    }
     return n < 0 ? 0 : (size_t)n >= cap ? cap - 1 : (size_t)n;
 }
 
@@ -2786,7 +2890,9 @@ static bool range_rids(SelectPlan* p, int s, EvalCtx* ec, RID** rids, int* n) {
         if (bv[k]->null) { *rids = NULL; *n = 0; return true; }       // confronto con NULL: nessuna riga
         if (numeric ? !bv[k]->is_num : bv[k]->is_num) return false;
         if (!bv[k]->is_num) {                                          // il testo deve sopravvivere alla prossima eval
-            snprintf(keep[k], sizeof(keep[k]), "%s", ev_s(bv[k]));
+            const char* bt = ev_s(bv[k]);
+            if (key_is_long(bt, strlen(bt))) return false;               // chiave in forma lunga: niente intervallo
+            snprintf(keep[k], sizeof(keep[k]), "%s", bt);
             bv[k]->str = keep[k];
         }
     }
@@ -2808,7 +2914,7 @@ static bool probe_text(const EvalVal* v, DataType col, char* buf, size_t n) {
         snprintf(buf, n, "%lld", (long long)v->inum);
         return true;
     }
-    if (is_text_type(col) && !v->is_num) { snprintf(buf, n, "%s", ev_s(v)); return true; }
+    if (is_text_type(col) && !v->is_num) { key_text(buf, n, ev_s(v)); return true; }
     return false;
 }
 
@@ -3165,7 +3271,7 @@ static bool plan_load(SelectPlan* p) {
             if (p->probe_col[s] >= 0 && !p->probe_dyn[s] && db && col_is_indexed(S->ts, p->probe_col[s])) {
                 EvalVal kv;
                 eval_expr(p->probe_key[s], &ec, &kv);
-                char key[EV_STR_MAX + 1];
+                char key[KEY_BUF];
                 MemIndex* ix = mi_get(p->x, db->name, S->ts, p->probe_col[s]);
                 if (ix) {
                     done = true;
@@ -3265,7 +3371,7 @@ static bool plan_load(SelectPlan* p) {
             p->pnext[s] = malloc(sizeof(int) * (size_t)(S->n ? S->n : 1));
             if (!p->pnext[s]) { snprintf(p->err, sizeof(p->err), "Out of memory"); return false; }
             for (int r = S->n - 1; r >= 0; r--) {
-                char key[EV_STR_MAX + 1];
+                char key[KEY_BUF];
                 p->pnext[s][r] = -1;
                 if (!join_key(S->rows[r], col, kt, key, sizeof(key))) continue;
                 SMSlot* sl = sm_slot(&p->pmap[s], key, true);
@@ -3731,7 +3837,7 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
         if (p->probe_col[s] >= 0 && p->probe_dyn[s]) {
             EvalVal kv;
             eval_expr(p->probe_key[s], &ec, &kv);
-            char key[EV_STR_MAX + 1];
+            char key[KEY_BUF];
             SMSlot* sl = probe_text(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key)) ? sm_slot(&p->pmap[s], key, false) : NULL;
             if (!probe_text(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key)) && !kv.null) {
                 // tipo non confrontabile per chiave: si provano tutte le righe
@@ -4185,11 +4291,9 @@ static void eval_subquery(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             if (rows->nrows > 1) { ctx_error(c, "%s", "Subquery used as a value returned more than one row"); ev_null(out); break; }
             ev_from_oval(out, orow(rows, 0));
             if (!cached && out->str) {                       // le righe vengono liberate: il testo va copiato
-                size_t l = strlen(out->str);
-                if (l > EV_STR_MAX) l = EV_STR_MAX;
-                memcpy(out->buf, out->str, l);
-                out->buf[l] = '\0';
-                out->str = out->buf;
+                bool num = out->is_num, isint = out->is_int;
+                if (!ev_text_long(out, out->str, strlen(out->str))) { ctx_error(c, "%s", "Out of memory"); ev_null(out); }
+                else { out->is_num = num; out->is_int = isint; }
             }
             break;
         default: {                                            // ANY / ALL (IN, NOT IN)
@@ -4210,7 +4314,7 @@ static void eval_subquery(ASTExpr* e, EvalCtx* c, EvalVal* out) {
                         if (o->null) { p->inset_null = true; continue; }
                         int cl = o->is_num ? 1 : 2;
                         p->inset_class = p->inset_class == 0 ? cl : p->inset_class == cl ? cl : 3;
-                        char key[EV_STR_MAX + 32];
+                        char key[KEY_BUF];
                         oval_key(o, key, sizeof(key));
                         if (!sm_slot(&p->inset, key, true)) { p->inset_class = 3; break; }
                     }
@@ -4219,7 +4323,7 @@ static void eval_subquery(ASTExpr* e, EvalCtx* c, EvalVal* out) {
                     OVal o;
                     o.null = false; o.is_num = a.is_num; o.is_int = a.is_int; o.inum = a.inum; o.num = a.num;
                     o.str = (char*)(a.is_num ? NULL : ev_s(&a));
-                    char key[EV_STR_MAX + 32];
+                    char key[KEY_BUF];
                     oval_key(&o, key, sizeof(key));
                     bool found = p->inset_class != 0 && sm_slot(&p->inset, key, false) != NULL;
                     if (found) ev_int(out, any ? 1 : 0);
@@ -4910,7 +5014,7 @@ static const char* cs_cascade(ChangeSet* cs, char* msg, size_t mn) {
                     if (f->kind != CONS_FOREIGN || strcasecmp(f->ref_table, T->name)) continue;
                     int pcols[SV_MAX_KEY_COLS];
                     if (!fk_ref_cols(f, T, pcols)) continue;
-                    char okey[EV_STR_MAX + 1], nkey[EV_STR_MAX + 1];
+                    char okey[KEY_BUF], nkey[KEY_BUF];
                     if (!tuple_key(T, cs->v[i].old, pcols, f->ncols, okey, sizeof(okey))) continue;
                     bool is_del = cs->v[i].nt == NULL;
                     if (!is_del && tuple_key(T, cs->v[i].nt, pcols, f->ncols, nkey, sizeof(nkey)) && !strcmp(okey, nkey)) continue;
@@ -4999,13 +5103,13 @@ static int key_exists_final(ChangeSet* cs, TableSchema* P, const int* pcols, int
         int ex = cs_find(cs, P, l->r[i]);
         if (ex < 0) return 1;                                   // riga non toccata
         if (cs->v[ex].nt) {                                     // modificata: conta la nuova chiave
-            char k2[EV_STR_MAX + 1];
+            char k2[KEY_BUF];
             if (tuple_key(P, cs->v[ex].nt, pcols, n, k2, sizeof(k2)) && !strcmp(k2, key)) return 1;
         }
     }
     for (int i = 0; i < cs->n; i++) {                           // righe modificate che assumono la chiave
         if (cs->v[i].ts != P || !cs->v[i].nt) continue;
-        char k2[EV_STR_MAX + 1];
+        char k2[KEY_BUF];
         if (tuple_key(P, cs->v[i].nt, pcols, n, k2, sizeof(k2)) && !strcmp(k2, key)) return 1;
     }
     return 0;
@@ -5022,6 +5126,20 @@ static void fk_message(const TableSchema* C, const Constraint* f, const char* ke
 }
 
 // controlla le righe modificate (NOT NULL, CHECK, chiavi, chiavi esterne)
+// la riga deve stare in una pagina (non ci sono pagine di overflow): controllo prima di scrivere,
+// così lo statement fallisce senza lasciare modifiche a metà
+#define SV_MAX_ROW_BYTES (SV_PAGE_SIZE - SV_PAGE_HEADER_SIZE - SV_SLOT_ENTRY_SIZE)
+static const char* row_fits(const TableSchema* ts, const Tuple* t, char* msg, size_t mn) {
+    bool too_long = false;
+    size_t sz = tuple_serialized_size(t, ts, &too_long);
+    if (too_long) { snprintf(msg, mn, "A text value in table '%.64s' is longer than 65535 bytes", ts->name); return msg; }
+    if (sz > SV_MAX_ROW_BYTES) {
+        snprintf(msg, mn, "Row too large for table '%.64s' (%zu bytes, at most %d per row)", ts->name, sz, (int)SV_MAX_ROW_BYTES);
+        return msg;
+    }
+    return NULL;
+}
+
 static const char* cs_validate(ChangeSet* cs, char* msg, size_t mn) {
     Database* db = cs->db;
     const TableSchema* seen[SV_MAX_TABLES];
@@ -5042,6 +5160,7 @@ static const char* cs_validate(ChangeSet* cs, char* msg, size_t mn) {
         for (int j = i; j < cs->n && !fail; j++) {
             Change* ch = &cs->v[j];
             if (ch->ts != T || !ch->nt) continue;
+            fail = row_fits(T, ch->nt, msg, mn);
             for (int c = 0; c < T->num_columns && !fail; c++)
                 if (ch->nt->values[c].is_null && (!T->columns[c].nullable || T->columns[c].primary_key)) {
                     snprintf(msg, mn, "Column '%.64s' cannot be NULL", T->columns[c].name);
@@ -5050,7 +5169,7 @@ static const char* cs_validate(ChangeSet* cs, char* msg, size_t mn) {
             if (!fail) fail = checks_eval(&ck, ch->nt, msg, mn);
             // chiavi: due righe finali con la stessa chiave
             for (int k = 0; k < nk && !fail; k++) {
-                char nkey[EV_STR_MAX + 1], okey[EV_STR_MAX + 1];
+                char nkey[KEY_BUF], okey[KEY_BUF];
                 if (!tuple_key(T, ch->nt, keys[k].cols, keys[k].n, nkey, sizeof(nkey))) {
                     if (keys[k].primary) { snprintf(msg, mn, "Primary key column cannot be NULL"); fail = msg; }
                     continue;
@@ -5073,7 +5192,7 @@ static const char* cs_validate(ChangeSet* cs, char* msg, size_t mn) {
                 if (f->kind != CONS_FOREIGN) continue;
                 int fc[SV_MAX_KEY_COLS];
                 for (int k = 0; k < f->ncols; k++) fc[k] = f->cols[k];
-                char nkey[EV_STR_MAX + 1], okey[EV_STR_MAX + 1];
+                char nkey[KEY_BUF], okey[KEY_BUF];
                 if (!tuple_key(T, ch->nt, fc, f->ncols, nkey, sizeof(nkey))) continue;     // con un NULL: non controllata
                 if (tuple_key(T, ch->old, fc, f->ncols, okey, sizeof(okey)) && !strcmp(okey, nkey)) continue;
                 TableSchema* P = catalog_get_table(cs->x->catalog, db->name, f->ref_table);
@@ -5132,6 +5251,7 @@ static const char* validate_inserts(ExecCtx* ctx, Database* db, TableSchema* ts,
     Checks ck;
     if (checks_prepare(&ck, ts, msg, mn)) return msg;
     const char* fail = NULL;
+    for (int r = 0; r < nrows && !fail; r++) fail = row_fits(ts, rows[r], msg, mn);
     for (int r = 0; r < nrows && !fail; r++) fail = checks_eval(&ck, rows[r], msg, mn);
     checks_free(&ck);
     if (fail) return fail;
@@ -5143,7 +5263,7 @@ static const char* validate_inserts(ExecCtx* ctx, Database* db, TableSchema* ts,
         if (!ix) return "Out of memory (key index)";
         StrMap batch = {0};
         for (int r = 0; r < nrows && !fail; r++) {
-            char key[EV_STR_MAX + 1];
+            char key[KEY_BUF];
             if (!tuple_key(ts, rows[r], keys[k].cols, keys[k].n, key, sizeof(key))) {
                 if (keys[k].primary) { snprintf(msg, mn, "Primary key column cannot be NULL"); fail = msg; }
                 continue;
@@ -5168,11 +5288,11 @@ static const char* validate_inserts(ExecCtx* ctx, Database* db, TableSchema* ts,
         StrMap own = {0};                    // tabella che riferisce sé stessa: chiavi delle righe nuove
         if (P == ts)
             for (int r = 0; r < nrows; r++) {
-                char key[EV_STR_MAX + 1];
+                char key[KEY_BUF];
                 if (tuple_key(ts, rows[r], pcols, f->ncols, key, sizeof(key)) && !sm_slot(&own, key, true)) { fail = "Out of memory"; break; }
             }
         for (int r = 0; r < nrows && !fail; r++) {
-            char key[EV_STR_MAX + 1];
+            char key[KEY_BUF];
             if (!tuple_key(ts, rows[r], fc, f->ncols, key, sizeof(key))) continue;     // con un NULL: non controllata
             const RidList* l = mi_lookup(pix, key);
             if ((l && l->n > 0) || (P == ts && sm_slot(&own, key, false))) continue;
@@ -5323,7 +5443,7 @@ static const char* add_constraint(ExecCtx* ctx, Database* db, TableSchema* ts, C
         Tuple* t;
         RID rid;
         while (!fail && scan && (t = heap_scan_next(scan, &rid)) != NULL) {
-            char key[EV_STR_MAX + 1];
+            char key[KEY_BUF];
             if (d->kind == CONS_CHECK) fail = checks_eval(&ck, t, msg, mn);
             else if (d->kind == CONS_FOREIGN) {
                 if (tuple_key(ts, t, cc, c.ncols, key, sizeof(key)) && (!pix || !mi_lookup(pix, key) || !mi_lookup(pix, key)->n)) {
@@ -5455,9 +5575,7 @@ static const char* trig_run(ExecCtx* ctx, TrigScope* sc, TableSchema* ts, TrigSt
                 EvalVal v2;
                 eval_expr(t->expr, &sc->e, &v2);
                 if (sc->e.err[0]) { snprintf(msg, mn, "%.250s", sc->e.err); return msg; }
-                char text[EV_STR_MAX + 1];
-                const char* tx = NULL;
-                if (!v2.null) { snprintf(text, sizeof(text), "%s", ev_s(&v2)); tx = text; }
+                const char* tx = v2.null ? NULL : ev_s(&v2);     // v2 vive fino a value_set_from_text (che copia)
                 if (tx && check_value(&ts->columns[ci], tx, msg, mn)) return msg;
                 value_set_from_text(&newt->values[ci], ts->columns[ci].type, tx);
                 break;
@@ -5613,7 +5731,7 @@ static const char* fire_cascaded(ExecCtx* ctx, Database* db, ChangeSet* cs, bool
         if (ch->direct) continue;
         int changed[SV_MAX_COLUMNS], nch = 0;
         for (int c = 0; ch->nt && c < ch->ts->num_columns; c++) {
-            char a[EV_STR_MAX + 1], b[EV_STR_MAX + 1];
+            char a[KEY_BUF], b[KEY_BUF];
             const Value* x = &ch->old->values[c];
             const Value* y = &ch->nt->values[c];
             bool diff = x->is_null != y->is_null;
@@ -5742,8 +5860,11 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
                 text[ci] = "";
                 continue;
             }
-            snprintf(vals[ci], sizeof(vals[ci]), "%s", ev_s(&v));
-            text[ci] = vals[ci];
+            // il testo del buffer di v va copiato (v cambia alla prossima colonna); quello lungo sta già
+            // nella memoria del letterale, della riga letta o dell'arena e resta valido per lo statement
+            const char* sv = ev_s(&v);
+            if (sv == v.buf) { memcpy(vals[ci], sv, strlen(sv) + 1); text[ci] = vals[ci]; }
+            else text[ci] = sv;
         }
         if (fail) break;
         for (int i = 0; i < nc; i++) {
@@ -5852,7 +5973,7 @@ static const char* select_matches(ExecCtx* ctx, Database* db, Source* s, ASTExpr
             if (m || op || !col_is_indexed(s->ts, ci) || key->type == EXPR_INT || key->type == EXPR_STRING) continue;
             EvalVal kv;
             eval_expr(key, ec, &kv);
-            char kt[EV_STR_MAX + 1];
+            char kt[KEY_BUF];
             if (!probe_text(&kv, s->ts->columns[ci].type, kt, sizeof(kt)) && !kv.null) continue;
             MemIndex* ix = mi_get(ctx, db->name, s->ts, ci);
             if (!ix) continue;
@@ -6553,7 +6674,18 @@ static bool if_exists_noop(ExecCtx* ctx, ASTNode* n) {
     }
 }
 
+static QueryResult* executor_run_impl(ExecCtx* ctx, ASTNode* stmt);
+
+// i testi calcolati restano validi per tutto lo statement (anche dentro i trigger, che
+// rientrano qui): l'arena si libera solo all'uscita dal livello più esterno
 QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt) {
+    g_run_depth++;
+    QueryResult* r = executor_run_impl(ctx, stmt);
+    if (--g_run_depth == 0) arena_free(&g_text_arena);
+    return r;
+}
+
+static QueryResult* executor_run_impl(ExecCtx* ctx, ASTNode* stmt) {
     if (!ctx || !stmt) return result_error_msg("Invalid executor context");
     if (stmt->if_exists && if_exists_noop(ctx, stmt)) return result_ok_msg(0);
 

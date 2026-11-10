@@ -254,6 +254,21 @@ int main(void) {
         CHECK(ok_n == 100, "100 transactions in a row: %d ok", ok_n);
     }
 
+    // testo lungo come parametro (oltre i vecchi 511 byte), con apici e backslash
+    {
+        char* big = malloc(5000);
+        int k = sprintf(big, "{\"database\":\"t\",\"sql\":\"CREATE TABLE lungo (s TEXT); INSERT INTO lungo VALUES (?); "
+                             "SELECT LENGTH(s), RIGHT(s, 3) FROM lungo\",\"params\":[\"");
+        for (int i = 0; i < 2000; i++) big[k++] = "ab'\\"[i % 3 == 2 ? (i % 2 ? 2 : 3) : i % 2] == '\\' ? 'x' : "ab'"[i % 3];
+        k += sprintf(big + k, "end\"]}");
+        r = query(port, big);
+        c = cell_at(&r, 2, 0, 0);
+        const JsonVal* c2 = cell_at(&r, 2, 0, 1);
+        CHECK(resp_ok(&r) && c && c->number == 2003 && c2 && !strcmp(c2->str, "end"), "long text param: %.300s", r.body);
+        resp_free(&r);
+        free(big);
+    }
+
     // ── corpo text/plain ──
     r = request(port, "POST", "/api/v1/query?database=t", "Content-Type: text/plain\r\n", "SELECT prezzo FROM p WHERE id = 3");
     c = cell_at(&r, 0, 0, 0);
