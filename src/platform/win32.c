@@ -605,7 +605,10 @@ void platform_set_cursor(PlatformWindow* win, CursorKind kind) {
 // -- appunti (UTF-8 <-> UTF-16, \n <-> \r\n) --
 
 bool platform_open_url(const char* url) {
-    if (!url || strncmp(url, "https://", 8)) return false;     // solo pagine web
+    // solo pagine web (o il server locale di SegVault), mai comandi o file
+    if (!url || (strncmp(url, "https://", 8) && strncmp(url, "http://127.0.0.1:", 17) && strncmp(url, "http://localhost:", 17)))
+        return false;
+    for (const char* c = url; *c; c++) if ((unsigned char)*c <= ' ' || *c == '"' || *c == '\'') return false;
     return (INT_PTR)ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL) > 32;
 }
 

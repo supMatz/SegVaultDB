@@ -79,6 +79,7 @@ Su Windows: `segvault.exe` e `segvault-server.exe`, da tenere accanto alla carte
 | `session.sql`, `session.ini` | Script aperto nell'editor, cursore, file, zoom, tema |
 | `history.sql` | Cronologia degli statement eseguiti |
 | `server.token` | Token del server API (creato quando serve) |
+| `server.ini` | Cartella del sito servito dal pannello del server |
 
 Una cartella dati è usata da un solo processo alla volta: una seconda istanza sulla stessa cartella
 viene rifiutata, perché la corromperebbe.
@@ -272,6 +273,7 @@ delle richieste al posto dei risultati.
 │ TOKEN          │                                                     │
 │ WEB APPS (CORS)│                                                     │
 │ TIME LIMIT     │                                                     │
+│ WEB FOLDER     │                                                     │
 │ TRY IT  curl … │                                                     │
 ├────────────────┴─────────────────────────────────────────────────────┤
 │ ● SegVault engine 1.2.0  API server running  this computer only    F5 Start / Stop│
@@ -281,6 +283,7 @@ delle richieste al posto dei risultati.
 - **Indirizzi** da copiare: locale e, con *Local network*, quello raggiungibile dagli altri computer.
 - **Opzioni:** porta, *This computer* / *Local network*, token (obbligatorio in rete o con CORS; *Copy* e *New*, salvato in `<data>/server.token`), *Same origin* / *Any origin* per le web app, limite di tempo. Una modifica riavvia il server.
 - **Registro** in tempo reale delle ultime 200 richieste, con l'SQL così come è stato inviato (con i `?`: i valori dei parametri, come password o dati personali, non compaiono a schermo).
+- **Web folder:** una cartella con il sito (come la `htdocs` di XAMPP) viene servita su `/` insieme all'API su `/api/v1`, sulla stessa porta e quindi senza CORS; *Open site* lo apre nel browser. Il percorso è salvato in `<data>/server.ini`.
 - **Try it:** il comando `curl` pronto da copiare (a schermo il token è mostrato solo in parte).
 
 ### Temi
@@ -822,6 +825,7 @@ Esempio in [`docs/API.md`](docs/API.md#incorporare-il-motore-in-unapp-cc-senza-s
 | Scenario | Come |
 |---|---|
 | Provare o sviluppare sul proprio computer | `segvault` → *API server* (pannello con il registro delle richieste) |
+| Sito statico + database, come con XAMPP | `segvault` → *API server* → *Web folder* (o `segvault-server --static cartella/`) |
 | Sito / web app che gira sulla stessa macchina | `segvault-server --static app/` (stessa origine) |
 | Frontend su un'altra origine (sviluppo) | `segvault-server --cors http://localhost:5173` |
 | Sito pubblico | browser → tuo backend → `segvault-server` su `127.0.0.1` |

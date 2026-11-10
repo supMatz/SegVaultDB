@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static bool in_rect(Rect r, int x, int y) { return r.w > 0 && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h; }
 
@@ -152,7 +153,7 @@ ViewAction start_screen_event(StartScreen* s, const sEvent* evt) {
 enum {
     HIT_COPY_URL, HIT_COPY_LAN, HIT_PORT_MINUS, HIT_PORT_PLUS, HIT_ACCESS_LOCAL, HIT_ACCESS_LAN,
     HIT_TOKEN_OFF, HIT_TOKEN_ON, HIT_COPY_TOKEN, HIT_NEW_TOKEN, HIT_CORS_OFF, HIT_CORS_ON, HIT_TIME_MINUS,
-    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_COUNT
+    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_COUNT
 };
 
 enum { ACT_NONE, ACT_TOGGLE, ACT_EDITOR, ACT_COPY };
@@ -183,6 +184,9 @@ struct ServerPanel {
     Rect            hit[HIT_COUNT];
     int             mx, my;
     char            flash[64];       // "Copied" al posto del testo del controllo
+    LineEdit*       web_edit;        // cartella del sito servito insieme all'API (come la htdocs di XAMPP)
+    char            web_dir[1024];
+    char            site_url[96];
     int             flash_hit;
     uint64_t        flash_until;
 };
@@ -193,6 +197,8 @@ static void on_copy(void* ud)   { ((ServerPanel*)ud)->pending = ACT_COPY; }
 
 static bool token_required(void);
 static bool token_load(ServerPanel* p, bool regenerate);
+static void web_load(ServerPanel* p);
+static void web_commit(ServerPanel* p);
 
 ServerPanel* server_panel_create(PlatformWindow* win) {
     ServerPanel* p = calloc(1, sizeof(ServerPanel));
@@ -200,6 +206,8 @@ ServerPanel* server_panel_create(PlatformWindow* win) {
     p->win = win;
     p->port_edit = line_edit_create("8484");
     if (p->port_edit) p->port_edit->win = win;
+    p->web_edit = line_edit_create("Folder with index.html (optional)");
+    if (p->web_edit) p->web_edit->win = win;
     p->btn_toggle = button_create(0, 0, 0, 0, "Start server", on_toggle, p);
     p->btn_copy   = button_create(0, 0, 0, 0, "Copy address", on_copy, p);
     p->btn_editor = button_create(0, 0, 0, 0, "Open SQL editor", on_editor, p);
@@ -213,6 +221,8 @@ void server_panel_set_paths(ServerPanel* p, const char* data_dir, const char* se
     snprintf(p->data_dir, sizeof(p->data_dir), "%s", data_dir ? data_dir : "");
     snprintf(p->settings_path, sizeof(p->settings_path), "%s", settings_path ? settings_path : "");
     if (token_required()) token_load(p, false);
+    web_load(p);
+    if (p->web_edit) line_edit_set_text(p->web_edit, p->web_dir);
 }
 
 bool server_panel_running(const ServerPanel* p) { return p && p->srv; }
@@ -243,6 +253,33 @@ static bool token_load(ServerPanel* p, bool regenerate) {
     return true;
 }
 
+// cartella web in <data>/server.ini ("web_folder=...")
+static void web_path(ServerPanel* p, char* out, size_t n) {
+    snprintf(out, n, "%s%s%s", p->data_dir, p->data_dir[0] ? "/" : "", "server.ini");
+}
+
+static void web_load(ServerPanel* p) {
+    char path[600], line[1200];
+    p->web_dir[0] = '\0';
+    web_path(p, path, sizeof(path));
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!strncmp(line, "web_folder=", 11)) snprintf(p->web_dir, sizeof(p->web_dir), "%.1000s", line + 11);
+    }
+    fclose(f);
+}
+
+static void web_save(ServerPanel* p) {
+    char path[600];
+    web_path(p, path, sizeof(path));
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "web_folder=%s\n", p->web_dir);
+    fclose(f);
+}
+
 static void save_settings(ServerPanel* p) {
     if (p->settings_path[0]) settings_save(p->settings_path);
 }
@@ -257,7 +294,21 @@ bool server_panel_start(ServerPanel* p) {
         snprintf(p->error, sizeof(p->error), "Cannot generate a token");
         return false;
     }
+    // cartella del sito: "~" = home; deve esistere
+    char web[1100] = "";
+    if (p->web_dir[0]) {
+        const char* home = getenv("HOME");
+        if (!home) home = getenv("USERPROFILE");
+        if (p->web_dir[0] == '~' && home) snprintf(web, sizeof(web), "%s%s", home, p->web_dir + 1);
+        else snprintf(web, sizeof(web), "%s", p->web_dir);
+        struct stat st;
+        if (stat(web, &st) != 0 || (st.st_mode & S_IFMT) != S_IFDIR) {
+            snprintf(p->error, sizeof(p->error), "Web folder not found: %.200s", web);
+            return false;
+        }
+    }
     SvServerConfig cfg = {
+        .static_dir  = web[0] ? web : NULL,
         .bind_addr   = g_settings.server_lan ? "0.0.0.0" : "127.0.0.1",
         .port        = g_settings.server_port,
         .token       = token_required() ? p->token : NULL,
@@ -276,6 +327,7 @@ bool server_panel_start(ServerPanel* p) {
         return false;
     }
     snprintf(p->url, sizeof(p->url), "http://127.0.0.1:%d/api/v1", sv_server_port(p->srv));
+    snprintf(p->site_url, sizeof(p->site_url), "http://127.0.0.1:%d/", sv_server_port(p->srv));
     char ip[64];
     p->lan_url[0] = '\0';
     if (g_settings.server_lan && sv_local_ip(ip, sizeof(ip)))
@@ -305,6 +357,7 @@ void server_panel_destroy(ServerPanel* p) {
     if (p->btn_toggle) widget_destroy((Widget*)p->btn_toggle);
     if (p->btn_copy) widget_destroy((Widget*)p->btn_copy);
     if (p->btn_editor) widget_destroy((Widget*)p->btn_editor);
+    if (p->web_edit) widget_destroy((Widget*)p->web_edit);
     free(p);
 }
 
@@ -319,6 +372,7 @@ bool server_panel_tick(ServerPanel* p, uint64_t now_ms) {
     if (!p) return false;
     bool redraw = false;
     if (p->port_edit && line_edit_tick(p->port_edit, now_ms)) redraw = true;
+    if (p->web_edit && line_edit_tick(p->web_edit, now_ms)) redraw = true;
     if (p->flash_hit >= 0 && now_ms >= p->flash_until) { p->flash_hit = -1; redraw = true; }
     if (!p->srv || now_ms - p->last_poll < 250) return redraw;
     p->last_poll = now_ms;
@@ -536,6 +590,28 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
     stepper(p, HIT_TIME_MINUS, HIT_TIME_PLUS, (Rect){x, y, SV_MIN(w, 170), 28}, buf, NULL);
     y += 28 + 16;
 
+    // sito servito insieme all'API (stessa origine: niente CORS), come la htdocs di XAMPP
+    y = section_label(win, "WEB FOLDER", x, y);
+    if (p->web_edit) {
+        p->web_edit->base.bounds = (Rect){x, y, w, 28};
+        p->web_edit->base.visible = true;
+        widget_draw((Widget*)p->web_edit, win);
+    }
+    y += 28 + 4;
+    if (p->web_dir[0]) {
+        int ow = link_w(p, "Open site"), cw2 = link_w(p, "Clear");
+        if (running) {
+            link_btn(p, HIT_OPEN_SITE, (Rect){x - 8, y, ow, 24}, "Open site", true);
+            ui_text_clipped(win, p->site_url, x + ow, y + 5, w - ow - cw2 - 8, TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_MONO);
+        } else platform_draw_text_ex(win, "Served at / when running", -1, (Point){x, y + 5}, TH_TEXT_FAINT, TH_FONT_SMALL, FONT_UI);
+        link_btn(p, HIT_CLEAR_WEB, (Rect){x + w - cw2, y, cw2, 24}, "Clear", true);
+        y += 26;
+    } else {
+        platform_draw_text_ex(win, "Enter a folder to serve a website", -1, (Point){x, y + 3}, TH_TEXT_FAINT, TH_FONT_SMALL, FONT_UI);
+        y += 22;
+    }
+    y += 12;
+
     // prova rapida
     y = section_label(win, "TRY IT", x, y);
     char ex[400];
@@ -693,6 +769,22 @@ static void commit_port(ServerPanel* p) {
     }
 }
 
+static void web_commit(ServerPanel* p) {
+    LineEdit* we = p->web_edit;
+    if (!we) return;
+    line_edit_focus(we, false);
+    char v[1024];
+    snprintf(v, sizeof(v), "%s", we->text);
+    size_t n = strlen(v);
+    while (n > 1 && (v[n - 1] == '/' || v[n - 1] == '\\' || v[n - 1] == ' ')) v[--n] = '\0';
+    if (!strcmp(v, p->web_dir)) return;
+    snprintf(p->web_dir, sizeof(p->web_dir), "%s", v);
+    line_edit_set_text(we, v);
+    web_save(p);
+    if (p->srv) { server_panel_stop(p); server_panel_start(p); }
+    else p->error[0] = '\0';
+}
+
 static void toggle(ServerPanel* p) {
     if (p->srv) server_panel_stop(p);
     else server_panel_start(p);
@@ -716,10 +808,19 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
     if (evt->type == EVT_MOUSE_MOVE) {
         p->mx = evt->mouse_x; p->my = evt->mouse_y;
         if (pe) widget_handle_event((Widget*)pe, evt);
+        if (p->web_edit) widget_handle_event((Widget*)p->web_edit, evt);
         return VIEW_REDRAW;
     }
     if (evt->type == EVT_MOUSE_WHEEL) {
         if (in_rect(p->log_rect, evt->mouse_x, evt->mouse_y)) { p->log_scroll -= evt->wheel_delta * 3; if (p->log_scroll < 0) p->log_scroll = 0; }
+        return VIEW_REDRAW;
+    }
+    // cartella web: Invio conferma (e riavvia il server), Esc annulla
+    LineEdit* we = p->web_edit;
+    if (we && line_edit_focused(we) && (evt->type == EVT_KEY_DOWN || evt->type == EVT_CHAR)) {
+        if (evt->type == EVT_KEY_DOWN && evt->key == KEY_ENTER) { web_commit(p); return VIEW_REDRAW; }
+        if (evt->type == EVT_KEY_DOWN && evt->key == KEY_ESCAPE) { line_edit_set_text(we, p->web_dir); line_edit_focus(we, false); return VIEW_REDRAW; }
+        widget_handle_event((Widget*)we, evt);
         return VIEW_REDRAW;
     }
     // campo della porta: tastiera mentre ha il focus, Invio conferma, Esc annulla
@@ -732,6 +833,7 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
     }
     if (evt->type == EVT_MOUSE_UP) {
         if (pe) widget_handle_event((Widget*)pe, evt);
+        if (p->web_edit) widget_handle_event((Widget*)p->web_edit, evt);
         return VIEW_REDRAW;
     }
     if (evt->type == EVT_KEY_DOWN) {
@@ -746,6 +848,15 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
     if (evt->type != EVT_MOUSE_DOWN || evt->mouse_button != SV_MOUSE_LEFT) return VIEW_NONE;
 
     int x = evt->mouse_x, y = evt->mouse_y;
+    if (we) {
+        if (in_rect(we->base.bounds, x, y)) {
+            if (pe && line_edit_focused(pe)) commit_port(p);
+            if (!line_edit_focused(we)) line_edit_focus(we, true);
+            widget_handle_event((Widget*)we, evt);
+            return VIEW_REDRAW;
+        }
+        if (line_edit_focused(we)) web_commit(p);
+    }
     if (pe) {
         if (in_rect(pe->base.bounds, x, y)) {
             if (!line_edit_focused(pe)) { line_edit_focus(pe, true); line_edit_select_all(pe); }
@@ -792,6 +903,13 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
         }
         case HIT_COPY_EXAMPLE: example_text(p, ex, sizeof(ex), false); copy_text(p, hit, ex); break;
         case HIT_CLEAR_LOG: p->log_cleared = p->nlog ? p->log[0].seq : 0; p->log_scroll = 0; break;
+        case HIT_OPEN_SITE:
+            if (!platform_open_url(p->site_url)) copy_text(p, hit, p->site_url);
+            break;
+        case HIT_CLEAR_WEB:
+            if (we) line_edit_set_text(we, "");
+            web_commit(p);
+            break;
         default: return VIEW_NONE;
     }
     return VIEW_REDRAW;
