@@ -1,4 +1,5 @@
 #include "result_export.h"
+#include "grid_edit.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,19 +60,7 @@ static const char* short_name(const char* n) {
 }
 
 char* export_sql_literal(const Cell* c) {
-    Buf b = { NULL, 0, 0, true };
-    if (c->is_null) puts_(&b, "NULL");
-    else if (is_num_cell(c)) puts_(&b, c->value);
-    else {
-        putc_(&b, '\'');
-        for (const char* s = c->value; *s; s++) {
-            if (*s == '\'') putc_(&b, '\'');
-            putc_(&b, *s);
-        }
-        putc_(&b, '\'');
-    }
-    if (!b.ok) { free(b.p); return NULL; }
-    return b.p;
+    return grid_edit_cell_literal(c);    // stesso quoting della griglia: '' e \\ (il lexer tratta \ come escape)
 }
 
 static void csv_field(Buf* b, const char* v, char delim) {

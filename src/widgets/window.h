@@ -29,6 +29,7 @@ SCOPO: Layout principale dell'applicazione SegVault.
 #include "splitter.h"
 #include "../bridge/db_api.h"
 #include "server_view.h"
+#include "grid_edit.h"
 
 #define MENUBAR_H         30   // barra dei menu (File, Edit, ...) sopra la toolbar
 #define TOOLBAR_H         52   // Altezza toolbar in pixel
@@ -188,6 +189,18 @@ typedef struct {
     bool         theme_menu_open;
     Rect         theme_menu;        // menu a tendina
     int          theme_hover;       // voce sotto il mouse / evidenziata da tastiera
+
+    // -- modifica dei dati nella griglia (come phpMyAdmin) --
+    GridEdit     gedit;              // cosa si può modificare nel risultato mostrato
+    bool         gedit_cols[64];     // colonne modificabili (letto dalla griglia)
+    LineEdit*    cell_edit;          // editor della cella
+    int          edit_src, edit_col; // riga del risultato e colonna in modifica (-1 = nessuna)
+    int          draft_src;          // riga nuova non ancora salvata (indice nel risultato, -1 = nessuna)
+    bool         draft_set[64], draft_null[64];
+    char*        draft_vals[64];
+    int          del_src;            // riga in attesa di conferma della cancellazione
+    uint64_t     del_until;
+    Rect         eb_add, eb_save, eb_discard;   // pulsanti nell'intestazione dei risultati
 
     // -- stato --
     QueryResult* last_result;     // risultato mostrato (= tabs[cur_tab])

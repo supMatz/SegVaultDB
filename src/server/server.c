@@ -399,6 +399,7 @@ static void result_json(JsonBuf* b, const QueryResult* r, bool objects) {
         jb_printf(b, "],\"row_count\":%d", r->num_rows);
     } else {
         jb_printf(b, "\"rows_affected\":%d", r->rows_affected);
+        if (r->last_insert_id > 0) jb_printf(b, ",\"last_insert_id\":%d", r->last_insert_id);
     }
     jb_printf(b, ",\"time_ms\":%.3f}", r->exec_time_ms);
 }

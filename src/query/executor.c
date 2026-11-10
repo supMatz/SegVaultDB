@@ -4673,6 +4673,22 @@ static QueryResult* run_select_ex(ExecCtx* ctx, ASTNode* n, int depth, bool expl
         r->rows = calloc((size_t)(rows.nrows ? rows.nrows : 1), sizeof(Row));
         ok = r->col_names && r->col_types && r->rows;
     }
+    // origine delle colonne: solo se ogni riga del risultato è una riga di una tabella
+    if (ok && depth == 0 && !p->grouped && !p->compound && !n->select_stmt.distinct && nout > 0) {
+        Database* cdb = catalog_current_db(ctx->catalog);
+        r->col_tables = calloc((size_t)nout, sizeof(char*));
+        r->col_columns = calloc((size_t)nout, sizeof(char*));
+        if (!r->col_tables || !r->col_columns) ok = false;
+        if (cdb) snprintf(r->source_db, sizeof(r->source_db), "%s", cdb->name);
+        for (int j = 0; ok && j < nout; j++) {
+            const ASTExpr* e = p->out[j].e;
+            if (!e || e->type != EXPR_COLUMN || e->bound <= 0 || e->outer) continue;
+            int s = (e->bound - 1) / 1024, c = (e->bound - 1) % 1024;
+            if (s < 0 || s >= p->nsrc || p->src[s].is_view || !p->src[s].ts || c >= p->src[s].ts->num_columns) continue;
+            r->col_tables[j] = strdup(p->src[s].table);
+            r->col_columns[j] = strdup(p->src[s].ts->columns[c].name);
+        }
+    }
     for (int j = 0; ok && j < nout; j++) {
         r->col_names[j] = strdup(p->out[j].name);
         r->col_types[j] = strdup(out_type_name(p, j, &rows, false));
@@ -5815,6 +5831,7 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     int ai = -1;
     for (int i = 0; i < nc; i++) if (ts->columns[i].auto_increment) { ai = i; break; }
     int64_t auto_next = 0;
+    int64_t last_generated = 0;     // ultimo valore AUTO_INCREMENT generato (last_insert_id)
     if (ai >= 0) {
         MemIndex* ix = mi_get(ctx, db->name, ts, ai);
         if (!ix) { orows_free(&srows); return result_error_msg("Out of memory (AUTO_INCREMENT index)"); }
@@ -5878,6 +5895,7 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
                 if (!text[i]) {                                   // valore generato (anche per un NULL esplicito)
                     if (auto_next == INT64_MAX) { fail = "AUTO_INCREMENT value out of range"; break; }
                     snprintf(ai_buf, sizeof(ai_buf), "%lld", (long long)++auto_next);
+                    last_generated = auto_next;
                     text[i] = ai_buf;
                 } else {
                     char* end = NULL;
@@ -5951,7 +5969,9 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
         snprintf(msg, sizeof(msg), "Failed to insert row %d of %d (the previous rows were inserted)", done + 1, nrows);
         return result_error_msg(msg);
     }
-    return result_ok_msg(done);
+    QueryResult* ok = result_ok_msg(done);
+    if (ok && last_generated > 0 && last_generated <= INT32_MAX) ok->last_insert_id = (int)last_generated;
+    return ok;
 }
 
 // righe della tabella che soddisfano la WHERE (con l'indice quando possibile: anche per

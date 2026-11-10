@@ -21,6 +21,10 @@ static bool busy_guard(AppWindow* app);
 static void finish_run(AppWindow* app);
 static void style_run_button(AppWindow* app);
 static void cell_view_open(AppWindow* app);
+static void edit_begin(AppWindow* app, const char* initial);
+static void gedit_refresh(AppWindow* app);
+static bool gedit_editing(const AppWindow* app);
+static void edit_end(AppWindow* app);
 static void run_text(AppWindow* app, char* text, int base, bool from_editor, const char* label);
 static ExportOptions export_options(const char* table);
 static bool import_csv(AppWindow* app, const char* path);
@@ -152,6 +156,7 @@ static void set_result_tabs(AppWindow* app, QueryResult** rs, int n, int select)
         for (int k = 0; k < n && !kept; k++) kept = app->tabs[k] == old[i];
         if (!kept && old[i]) db_result_free(old[i]);
     }
+    gedit_refresh(app);    // cosa si può modificare nel risultato nuovo
     layout_widgets(app);   // la barra delle schede compare solo con più risultati
 }
 
@@ -164,6 +169,7 @@ static void select_result_tab(AppWindow* app, int i) {
     app->cur_tab = i;
     app->last_result = app->tabs[i];
     table_view_set_result(app->results, app->last_result);
+    gedit_refresh(app);
     QueryResult* r = app->last_result;
     if (r) snprintf(app->status_meta, sizeof(app->status_meta), "%d rows  \xc2\xb7  %d cols  \xc2\xb7  %.1f ms",
                     r->num_rows, r->num_cols, r->exec_time_ms);
@@ -438,7 +444,12 @@ static void on_history_click(void* ud) { history_toggle((AppWindow*)ud); }
 // sugli altri risultati apre il visualizzatore della cella
 static void on_results_activate(int row, void* ud) {
     AppWindow* app = (AppWindow*)ud;
-    if (!app->showing_history) { cell_view_open(app); return; }
+    if (!app->showing_history) {
+        // cella modificabile: editor; altrimenti il visualizzatore (con il motivo nello stato)
+        if (grid_edit_cell_ok(&app->gedit, app->results->selected_col)) edit_begin(app, NULL);
+        else cell_view_open(app);
+        return;
+    }
     row = table_view_source_row(app->results, row);              // griglia filtrata / ordinata
     if (row < 0 || row >= app->history_count) return;
     const HistoryEntry* e = &app->history[app->history_count - 1 - row];
@@ -1306,17 +1317,7 @@ static void sb_add(SBuf* b, const char* s) {
 
 // valore della cella come letterale SQL ('testo' con apici raddoppiati, numeri così come sono)
 static char* sql_literal(const Cell* c) {
-    if (c->is_null) return strdup("NULL");
-    if (c->type == CELL_TYPE_INT || c->type == CELL_TYPE_FLOAT) return strdup(c->value);
-    SBuf b = {0};
-    sb_add(&b, "'");
-    char one[2] = {0, 0};
-    for (const char* s = c->value; *s; s++) {
-        one[0] = *s;
-        sb_add(&b, *s == '\'' ? "''" : one);
-    }
-    sb_add(&b, "'");
-    return b.p;
+    return grid_edit_cell_literal(c);   // anche il backslash viene raddoppiato (il lexer lo tratta come escape)
 }
 
 static void copy_and_report(AppWindow* app, const char* text, const char* what) {
@@ -1325,6 +1326,454 @@ static void copy_and_report(AppWindow* app, const char* text, const char* what) 
     char msg[128];
     snprintf(msg, sizeof(msg), "Copied %s to the clipboard", what);
     set_status(app, STATUS_OK, msg, "");
+}
+
+// ── modifica dei dati nella griglia ──────────────────────────────
+// Doppio click (o F2, o un carattere) su una cella modificabile apre l'editor; Invio salva con
+// un UPDATE identificato dalla chiave primaria, Esc annulla, Tab passa alla colonna successiva.
+// "+ Row" aggiunge una riga nuova (INSERT al salvataggio); Canc elimina la riga (con conferma).
+// L'SQL generato finisce nella cronologia; dopo ogni modifica la riga viene riletta dal database.
+
+static bool gedit_editing(const AppWindow* app) { return app->edit_src >= 0; }
+
+static void draft_free_vals(AppWindow* app) {
+    for (int c = 0; c < 64; c++) { free(app->draft_vals[c]); app->draft_vals[c] = NULL; }
+    memset(app->draft_set, 0, sizeof(app->draft_set));
+    memset(app->draft_null, 0, sizeof(app->draft_null));
+}
+
+// risultato mostrato cambiato: si rifà l'analisi (legge lo schema: solo con il motore libero)
+static void gedit_refresh(AppWindow* app) {
+    TableView* tv = app->results;
+    app->edit_src = app->edit_col = -1;
+    if (app->cell_edit) line_edit_focus(app->cell_edit, false);
+    app->draft_src = -1;
+    app->del_src = -1;
+    draft_free_vals(app);
+    memset(app->gedit_cols, 0, sizeof(app->gedit_cols));
+    memset(&app->gedit, 0, sizeof(app->gedit));
+    app->gedit.row_table = -1;
+    tv->draft_row = -1;
+    tv->draft_set = app->draft_set;
+    tv->col_editable = NULL;
+    if (app->job || app->showing_history || !tv->result || tv->result->num_cols == 0) return;
+    grid_edit_analyze(&app->gedit, tv->result);
+    for (int c = 0; c < tv->result->num_cols && c < 64; c++) app->gedit_cols[c] = grid_edit_cell_ok(&app->gedit, c);
+    tv->col_editable = app->gedit_cols;
+}
+
+// esegue l'SQL generato nel database del risultato (USE temporaneo se l'utente ne ha scelto un
+// altro) e lo registra nella cronologia
+static QueryResult* gedit_exec(AppWindow* app, const char* sql) {
+    char prev[64] = "";
+    const char* cur = db_current_database();
+    if (cur) snprintf(prev, sizeof(prev), "%s", cur);
+    bool switched = app->gedit.db[0] && strcmp(prev, app->gedit.db) != 0;
+    char use[96];
+    if (switched) { snprintf(use, sizeof(use), "USE `%.60s`", app->gedit.db); db_result_free(db_execute(use)); }
+    uint64_t t0 = platform_time_ms();
+    QueryResult* r = db_execute(sql);
+    double ms = (double)(platform_time_ms() - t0);
+    if (switched && prev[0]) { snprintf(use, sizeof(use), "USE `%.60s`", prev); db_result_free(db_execute(use)); }
+    history_add(app, sql, r && r->success, r ? r->rows_affected : 0, ms);
+    return r;
+}
+
+// sostituisce i valori della riga src (vals[c] = NULL per NULL); i tipi restano quelli della riga
+static void result_set_row(QueryResult* r, int src, const char* const* vals) {
+    Row* row = &r->rows[src];
+    CellType types[64];
+    for (int c = 0; c < r->num_cols && c < 64; c++)
+        types[c] = c < row->num_cells && row->cells[c].type != CELL_TYPE_NULL ? row->cells[c].type : CELL_TYPE_STRING;
+    Row nr = {0};
+    if (!db_row_set(&nr, r->num_cols, vals, types)) return;
+    free(row->cells);
+    *row = nr;
+}
+
+static void result_remove_row(AppWindow* app, QueryResult* r, int src) {
+    free(r->rows[src].cells);
+    memmove(&r->rows[src], &r->rows[src + 1], sizeof(Row) * (size_t)(r->num_rows - src - 1));
+    r->num_rows--;
+    if (app->draft_src > src) app->draft_src--;
+    app->results->draft_row = app->draft_src;
+}
+
+// rilegge dal database la riga src (colonne della tabella t) con la chiave data
+static bool gedit_refetch(AppWindow* app, int src, int t, const char* const* key_vals) {
+    QueryResult* r = app->results->result;
+    char* sql = grid_edit_fetch_sql(&app->gedit, t, key_vals);
+    if (!sql) return false;
+    char prev[64] = "";
+    const char* cur = db_current_database();
+    if (cur) snprintf(prev, sizeof(prev), "%s", cur);
+    bool switched = app->gedit.db[0] && strcmp(prev, app->gedit.db) != 0;
+    char use[96];
+    if (switched) { snprintf(use, sizeof(use), "USE `%.60s`", app->gedit.db); db_result_free(db_execute(use)); }
+    QueryResult* fr = db_execute(sql);
+    if (switched && prev[0]) { snprintf(use, sizeof(use), "USE `%.60s`", prev); db_result_free(db_execute(use)); }
+    free(sql);
+    bool ok = fr && fr->success && fr->num_rows == 1;
+    if (ok) {
+        const char* vals[64];
+        const Row* old = &r->rows[src];
+        int k = 0;
+        for (int c = 0; c < r->num_cols && c < 64; c++) {
+            if (app->gedit.col_table[c] == t) {
+                const Cell* fc = &fr->rows[0].cells[k++];
+                vals[c] = fc->is_null ? NULL : fc->value;
+            } else vals[c] = c < old->num_cells && !old->cells[c].is_null ? old->cells[c].value : NULL;
+        }
+        // i testi puntano a fr e alla riga vecchia: result_set_row li copia prima di liberarla
+        result_set_row(r, src, vals);
+    }
+    db_result_free(fr);
+    return ok;
+}
+
+// valori di chiave (letterali) della riga src per la tabella t; false se ne manca uno
+static bool gedit_key_vals(AppWindow* app, int src, int t, char** out) {
+    const Row* row = &app->results->result->rows[src];
+    const GeTable* T = &app->gedit.t[t];
+    for (int k = 0; k < T->nkey; k++) {
+        int c = T->key[k];
+        out[k] = c < row->num_cells && !row->cells[c].is_null ? grid_edit_cell_literal(&row->cells[c]) : NULL;
+        if (!out[k]) { for (int i = 0; i < k; i++) free(out[i]); return false; }
+    }
+    return true;
+}
+
+static void gedit_place_editor(AppWindow* app) {
+    LineEdit* le = app->cell_edit;
+    if (!le || !gedit_editing(app)) { if (le) le->base.visible = false; return; }
+    int vr = table_view_view_row(app->results, app->edit_src);
+    Rect rc;
+    if (vr < 0 || !table_view_cell_rect(app->results, vr, app->edit_col, &rc)) { le->base.visible = false; return; }
+    le->base.bounds = (Rect){ rc.x + 1, rc.y + 1, rc.w - 2, rc.h - 2 };
+    le->base.visible = true;
+}
+
+// apre l'editor sulla cella selezionata; initial = testo con cui cominciare (NULL = valore attuale)
+static void edit_begin(AppWindow* app, const char* initial) {
+    TableView* tv = app->results;
+    if (app->job || !grid_has_row(app) || !grid_has_col(app)) return;
+    int c = tv->selected_col;
+    if (!grid_edit_cell_ok(&app->gedit, c)) {
+        set_status(app, STATUS_INFO, app->gedit.why[0] ? app->gedit.why : "This column is computed: it cannot be edited", "");
+        return;
+    }
+    int src = table_view_source_row(tv, tv->selected_row);
+    const Row* row = &tv->result->rows[src];
+    const char* cur;
+    if (src == app->draft_src) cur = app->draft_set[c] && !app->draft_null[c] && app->draft_vals[c] ? app->draft_vals[c] : "";
+    else cur = c < row->num_cells && !row->cells[c].is_null ? row->cells[c].value : "";
+    if (!initial && strlen(cur) >= LINE_EDIT_MAX - 1) {
+        set_status(app, STATUS_INFO, "This value is too long to edit in the grid: change it with an UPDATE in the editor", "");
+        return;
+    }
+    table_view_ensure_visible(tv);
+    app->edit_src = src;
+    app->edit_col = c;
+    LineEdit* le = app->cell_edit;
+    line_edit_set_text(le, initial ? initial : cur);
+    if (!initial) line_edit_select_all(le);
+    line_edit_focus(le, true);
+    textbox_focus(app->editor, false);
+    gedit_place_editor(app);
+    set_status(app, STATUS_INFO, "Editing \xc2\xb7 Enter saves, Tab next column, Esc cancels",
+               app->gedit.t[app->gedit.col_table[c]].name);
+}
+
+static void edit_end(AppWindow* app) {
+    app->edit_src = app->edit_col = -1;
+    if (app->cell_edit) { line_edit_focus(app->cell_edit, false); app->cell_edit->base.visible = false; }
+    app->results->base.state = WIDGET_STATE_FOCUSED;
+}
+
+static bool draft_save(AppWindow* app);
+
+// colonna modificabile successiva (dir = +1 / -1) nella riga in modifica, -1 se non c'è
+static int edit_next_col(AppWindow* app, int c, int dir) {
+    int n = app->results->result->num_cols;
+    for (int k = c + dir; k >= 0 && k < n && k < 64; k += dir) if (app->gedit_cols[k]) return k;
+    return -1;
+}
+
+// valore della riga nuova (non scrive nulla nel database fino a "Save row")
+static void draft_store(AppWindow* app, int c, const char* text, bool is_null) {
+    QueryResult* r = app->results->result;
+    free(app->draft_vals[c]);
+    app->draft_vals[c] = is_null ? NULL : strdup(text);
+    app->draft_set[c] = true;
+    app->draft_null[c] = is_null;
+    const char* vals[64];
+    for (int k = 0; k < r->num_cols && k < 64; k++) vals[k] = app->draft_set[k] && !app->draft_null[k] ? app->draft_vals[k] : NULL;
+    result_set_row(r, app->draft_src, vals);
+}
+
+// salva il valore scritto; move = +1 / -1 passa alla colonna accanto (Tab), 0 resta.
+// false se il database l'ha rifiutato (l'editor resta aperto per correggerlo)
+static bool edit_commit(AppWindow* app, int move) {
+    if (!gedit_editing(app)) return true;
+    if (app->job) { edit_end(app); return true; }
+    TableView* tv = app->results;
+    QueryResult* r = tv->result;
+    int src = app->edit_src, c = app->edit_col;
+    const char* text = app->cell_edit->text;
+    if (src == app->draft_src) {
+        draft_store(app, c, text, false);
+    } else {
+        const Cell* cell = &r->rows[src].cells[c];
+        bool same = !cell->is_null && strcmp(cell->value, text) == 0;
+        if (!same) {
+            char err[200];
+            char* sql = grid_edit_update_sql(&app->gedit, &r->rows[src], c, text, false, err, sizeof(err));
+            if (!sql) { set_status(app, STATUS_ERROR, err, ""); return false; }
+            // chiave dopo la modifica (se si cambia proprio la chiave si rilegge con il valore nuovo)
+            int t = app->gedit.col_table[c];
+            char* keys[GE_MAX_KEY] = {0};
+            bool have_keys = gedit_key_vals(app, src, t, keys);
+            for (int k = 0; have_keys && k < app->gedit.t[t].nkey; k++)
+                if (app->gedit.t[t].key[k] == c) { free(keys[k]); keys[k] = grid_edit_literal(&app->gedit, c, text); }
+            QueryResult* res = gedit_exec(app, sql);
+            bool ok = res && res->success;
+            char msg[400];
+            if (!ok) snprintf(msg, sizeof(msg), "%.390s", res ? res->error : "No response from the engine");
+            else if (res->rows_affected == 0) snprintf(msg, sizeof(msg), "No row changed: the row is no longer in the table (refresh with F5)");
+            else snprintf(msg, sizeof(msg), "Row updated");
+            if (ok && res->rows_affected > 0 && have_keys) gedit_refetch(app, src, t, (const char* const*)keys);
+            for (int k = 0; have_keys && k < app->gedit.t[t].nkey; k++) free(keys[k]);
+            set_status(app, ok && res->rows_affected > 0 ? STATUS_OK : STATUS_ERROR, msg, sql);
+            db_result_free(res);
+            free(sql);
+            if (!ok) return false;
+        }
+    }
+    int next = move ? edit_next_col(app, c, move) : -1;
+    edit_end(app);
+    if (next >= 0) {
+        tv->selected_col = next;
+        edit_begin(app, NULL);
+    } else if (move > 0 && src == app->draft_src) {
+        draft_save(app);                            // Tab dopo l'ultima colonna della riga nuova: salva
+    }
+    return true;
+}
+
+// imposta NULL nella cella selezionata (o in quella in modifica)
+static void edit_set_null(AppWindow* app) {
+    TableView* tv = app->results;
+    if (gedit_editing(app)) { tv->selected_col = app->edit_col; edit_end(app); }
+    if (app->job || !grid_has_row(app) || !grid_has_col(app)) return;
+    int c = tv->selected_col, src = table_view_source_row(tv, tv->selected_row);
+    if (!grid_edit_cell_ok(&app->gedit, c)) { set_status(app, STATUS_INFO, app->gedit.why, ""); return; }
+    if (src == app->draft_src) { draft_store(app, c, "", true); return; }
+    QueryResult* r = tv->result;
+    if (r->rows[src].cells[c].is_null) return;
+    char err[200];
+    char* sql = grid_edit_update_sql(&app->gedit, &r->rows[src], c, NULL, true, err, sizeof(err));
+    if (!sql) { set_status(app, STATUS_ERROR, err, ""); return; }
+    int t = app->gedit.col_table[c];
+    char* keys[GE_MAX_KEY] = {0};
+    bool have_keys = gedit_key_vals(app, src, t, keys);
+    QueryResult* res = gedit_exec(app, sql);
+    if (res && res->success && res->rows_affected > 0) {
+        if (have_keys) gedit_refetch(app, src, t, (const char* const*)keys);
+        set_status(app, STATUS_OK, "Row updated", sql);
+    } else set_status(app, STATUS_ERROR, res && !res->success ? res->error : "No row changed (refresh with F5)", sql);
+    for (int k = 0; have_keys && k < app->gedit.t[t].nkey; k++) free(keys[k]);
+    db_result_free(res);
+    free(sql);
+}
+
+// "+ Row": riga nuova in fondo, da compilare; viene scritta con "Save row"
+static void draft_add(AppWindow* app) {
+    TableView* tv = app->results;
+    QueryResult* r = tv->result;
+    if (app->job || !r || !grid_edit_rows_ok(&app->gedit)) {
+        set_status(app, STATUS_INFO, app->gedit.why[0] ? app->gedit.why : "Rows can be added only to the result of a single table", "");
+        return;
+    }
+    if (app->draft_src >= 0) { set_status(app, STATUS_INFO, "Save or discard the new row first", ""); return; }
+    if (gedit_editing(app) && !edit_commit(app, 0)) return;
+    Row* nr = realloc(r->rows, sizeof(Row) * (size_t)(r->num_rows + 1));
+    if (!nr) return;
+    r->rows = nr;
+    const char* vals[64] = {0};
+    if (!db_row_set(&r->rows[r->num_rows], r->num_cols, vals, NULL)) return;
+    app->draft_src = r->num_rows++;
+    draft_free_vals(app);
+    tv->draft_row = app->draft_src;
+    table_view_refresh(tv);
+    int vr = table_view_view_row(tv, app->draft_src);
+    if (vr < 0) {                                   // nascosta dal filtro: lo si toglie
+        table_view_set_filter(tv, "", -1, false);
+        if (app->filter_input->text[0]) line_edit_set_text(app->filter_input, "");
+        vr = table_view_view_row(tv, app->draft_src);
+    }
+    tv->selected_row = vr;
+    int first = -1;
+    for (int c = 0; c < r->num_cols && c < 64 && first < 0; c++)
+        if (app->gedit_cols[c] && c != app->gedit.t[app->gedit.row_table].auto_col) first = c;
+    tv->selected_col = first >= 0 ? first : 0;
+    tv->base.state = WIDGET_STATE_FOCUSED;
+    edit_begin(app, NULL);
+}
+
+static void draft_discard(AppWindow* app) {
+    if (app->draft_src < 0) return;
+    if (gedit_editing(app) && app->edit_src == app->draft_src) edit_end(app);
+    result_remove_row(app, app->results->result, app->draft_src);
+    app->draft_src = -1;
+    app->results->draft_row = -1;
+    draft_free_vals(app);
+    table_view_refresh(app->results);
+    set_status(app, STATUS_INFO, "New row discarded", "");
+}
+
+static bool draft_save(AppWindow* app) {
+    if (app->draft_src < 0 || app->job) return false;
+    if (gedit_editing(app) && !edit_commit(app, 0)) return false;
+    int src = app->draft_src, t = app->gedit.row_table;
+    char err[200];
+    char* sql = grid_edit_insert_sql(&app->gedit, (const char* const*)app->draft_vals, app->draft_null, app->draft_set, err, sizeof(err));
+    if (!sql) { set_status(app, STATUS_ERROR, err, ""); return false; }
+    QueryResult* res = gedit_exec(app, sql);
+    bool ok = res && res->success;
+    if (!ok) {
+        set_status(app, STATUS_ERROR, res ? res->error : "No response from the engine", sql);
+        db_result_free(res);
+        free(sql);
+        return false;
+    }
+    // chiave della riga nuova: valori scritti o id generato da AUTO_INCREMENT; poi la si rilegge
+    const GeTable* T = &app->gedit.t[t];
+    char* keys[GE_MAX_KEY] = {0};
+    bool have = true;
+    for (int k = 0; k < T->nkey; k++) {
+        int c = T->key[k];
+        if (app->draft_set[c] && !app->draft_null[c]) keys[k] = grid_edit_literal(&app->gedit, c, app->draft_vals[c]);
+        else if (c == T->auto_col && res->last_insert_id > 0) {
+            char num[24];
+            snprintf(num, sizeof(num), "%d", res->last_insert_id);
+            keys[k] = strdup(num);
+        }
+        if (!keys[k]) have = false;
+    }
+    app->draft_src = -1;
+    app->results->draft_row = -1;
+    if (have) gedit_refetch(app, src, t, (const char* const*)keys);
+    for (int k = 0; k < T->nkey; k++) free(keys[k]);
+    draft_free_vals(app);
+    table_view_refresh(app->results);
+    set_status(app, STATUS_OK, have ? "Row inserted" : "Row inserted (refresh with F5 to see the generated values)", sql);
+    db_result_free(res);
+    free(sql);
+    return true;
+}
+
+// Canc: elimina la riga selezionata (secondo Canc entro 3 secondi per confermare)
+static void row_delete(AppWindow* app) {
+    TableView* tv = app->results;
+    if (app->job || !grid_has_row(app)) return;
+    int src = table_view_source_row(tv, tv->selected_row);
+    if (src == app->draft_src) { draft_discard(app); return; }
+    if (!grid_edit_rows_ok(&app->gedit)) {
+        set_status(app, STATUS_INFO, app->gedit.why[0] ? app->gedit.why : "Rows can be deleted only from the result of a single table", "");
+        return;
+    }
+    uint64_t now = platform_time_ms();
+    if (app->del_src != src || now > app->del_until) {
+        app->del_src = src;
+        app->del_until = now + 3000;
+        char msg[160];
+        snprintf(msg, sizeof(msg), "Press Delete again to delete this row from '%.60s'", app->gedit.t[app->gedit.row_table].name);
+        set_status(app, STATUS_INFO, msg, "");
+        return;
+    }
+    app->del_src = -1;
+    char err[200];
+    QueryResult* r = tv->result;
+    char* sql = grid_edit_delete_sql(&app->gedit, &r->rows[src], err, sizeof(err));
+    if (!sql) { set_status(app, STATUS_ERROR, err, ""); return; }
+    QueryResult* res = gedit_exec(app, sql);
+    if (res && res->success && res->rows_affected > 0) {
+        result_remove_row(app, r, src);
+        table_view_refresh(tv);
+        if (tv->selected_row >= table_view_row_count(tv)) tv->selected_row = table_view_row_count(tv) - 1;
+        set_status(app, STATUS_OK, "Row deleted", sql);
+    } else {
+        set_status(app, STATUS_ERROR, res && !res->success ? res->error : "No row deleted: it is no longer in the table (refresh with F5)", sql);
+    }
+    db_result_free(res);
+    free(sql);
+}
+
+// eventi dell'editor di cella e dei tasti di modifica sulla griglia; true = consumato
+static bool gedit_handle_event(AppWindow* app, sEvent* evt) {
+    TableView* tv = app->results;
+    LineEdit* le = app->cell_edit;
+    if (!le) return false;
+    // pulsanti nell'intestazione dei risultati
+    if (evt->type == EVT_MOUSE_DOWN && evt->mouse_button == SV_MOUSE_LEFT) {
+        int x = evt->mouse_x, y = evt->mouse_y;
+        if (rect_has(app->eb_add, x, y))     { draft_add(app); return true; }
+        if (rect_has(app->eb_save, x, y))    { draft_save(app); return true; }
+        if (rect_has(app->eb_discard, x, y)) { draft_discard(app); return true; }
+    }
+    if (gedit_editing(app)) {
+        gedit_place_editor(app);
+        switch (evt->type) {
+            case EVT_KEY_DOWN:
+                if (evt->key == KEY_ESCAPE) { edit_end(app); set_status(app, STATUS_IDLE, "Edit cancelled", ""); return true; }
+                if (evt->key == KEY_ENTER) {
+                    if (evt->modifiers & SV_MOD_CTRL) { if (edit_commit(app, 0) && app->draft_src >= 0) draft_save(app); return true; }
+                    edit_commit(app, app->edit_src == app->draft_src ? 1 : 0);
+                    return true;
+                }
+                if (evt->key == KEY_TAB) { edit_commit(app, (evt->modifiers & SV_MOD_SHIFT) ? -1 : 1); return true; }
+                widget_handle_event((Widget*)le, evt);
+                return true;
+            case EVT_CHAR:
+                widget_handle_event((Widget*)le, evt);
+                return true;
+            case EVT_MOUSE_DOWN:
+                if (le->base.visible && widget_contains_point((Widget*)le, evt->mouse_x, evt->mouse_y)) {
+                    widget_handle_event((Widget*)le, evt);
+                    return true;
+                }
+                if (!edit_commit(app, 0)) return true;          // valore rifiutato: si resta nell'editor
+                return false;
+            case EVT_MOUSE_MOVE: case EVT_MOUSE_UP:
+                widget_handle_event((Widget*)le, evt);
+                return false;
+            case EVT_MOUSE_WHEEL:
+                if (!edit_commit(app, 0)) return true;
+                return false;
+            default:
+                return false;
+        }
+    }
+    // griglia con il focus: F2 / un carattere modificano, Canc elimina, Ctrl+Invio salva la riga nuova
+    if (tv->base.state != WIDGET_STATE_FOCUSED || !grid_ready(app) || app->showing_history) return false;
+    if (evt->type == EVT_KEY_DOWN) {
+        if (evt->key == KEY_F2) { edit_begin(app, NULL); return true; }
+        if (evt->key == KEY_DELETE && !(evt->modifiers & (SV_MOD_CTRL | SV_MOD_ALT))) { row_delete(app); return true; }
+        if (evt->key == KEY_ENTER && (evt->modifiers & SV_MOD_CTRL) && app->draft_src >= 0) { draft_save(app); return true; }
+        if (evt->key == KEY_ESCAPE && app->draft_src >= 0 && !app->job) { draft_discard(app); return true; }
+    }
+    if (evt->type == EVT_CHAR && evt->character >= 32 && evt->character != 127 && !(evt->modifiers & (SV_MOD_CTRL | SV_MOD_ALT)) &&
+        grid_has_col(app) && grid_edit_cell_ok(&app->gedit, tv->selected_col)) {
+        char first[8] = {0};
+        uint32_t cp = evt->character;                      // inizia a scrivere: sostituisce il valore
+        if (cp < 0x80) first[0] = (char)cp;
+        else if (cp < 0x800) { first[0] = (char)(0xC0 | cp >> 6); first[1] = (char)(0x80 | (cp & 0x3F)); }
+        else if (cp < 0x10000) { first[0] = (char)(0xE0 | cp >> 12); first[1] = (char)(0x80 | (cp >> 6 & 0x3F)); first[2] = (char)(0x80 | (cp & 0x3F)); }
+        else { first[0] = (char)(0xF0 | cp >> 18); first[1] = (char)(0x80 | (cp >> 12 & 0x3F)); first[2] = (char)(0x80 | (cp >> 6 & 0x3F)); first[3] = (char)(0x80 | (cp & 0x3F)); }
+        edit_begin(app, first);
+        return true;
+    }
+    return false;
 }
 
 // ── visualizzatore di cella ──────────────────────────────────────
@@ -1619,6 +2068,7 @@ typedef enum {
     CTX_VIEW, CTX_COPY_VALUE, CTX_COPY_LITERAL, CTX_INSERT_VALUE, CTX_COPY_ROW, CTX_COPY_COLUMN, CTX_COPY_COL_NAME,
     CTX_SORT_ASC, CTX_SORT_DESC, CTX_SORT_CLEAR, CTX_FIT_COL, CTX_COPY_ALL, CTX_EXPORT,
     CTX_FILTER_VALUE, CTX_FILTER_ROWS, CTX_FILTER_CLEAR,
+    CTX_EDIT_CELL, CTX_SET_NULL, CTX_ADD_ROW, CTX_SAVE_ROW, CTX_DISCARD_ROW, CTX_DELETE_ROW,
     // editor
     CTX_CUT, CTX_COPY, CTX_PASTE, CTX_SELECT_ALL, CTX_RUN, CTX_RUN_STMT, CTX_FORMAT, CTX_COMMENT,
     // File
@@ -1715,6 +2165,12 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
     [CTX_COPY_JSON]     = { "Copy results as JSON",      NULL },
     [CTX_COPY_MD]       = { "Copy results as Markdown",  NULL },
     [CTX_COPY_SQL]      = { "Copy results as SQL INSERTs", NULL },
+    [CTX_EDIT_CELL]     = { "Edit cell",                 "F2" },
+    [CTX_SET_NULL]      = { "Set to NULL",               NULL },
+    [CTX_ADD_ROW]       = { "Add row",                   NULL },
+    [CTX_SAVE_ROW]      = { "Save new row",              "Ctrl+Enter" },
+    [CTX_DISCARD_ROW]   = { "Discard new row",           "Esc" },
+    [CTX_DELETE_ROW]    = { "Delete row",                "Del" },
     [CTX_DUMP_DB]       = { "Database dump (.sql)\xe2\x80\xa6", NULL },
     [CTX_SETTINGS]      = { "Settings\xe2\x80\xa6",      "Ctrl+," },
     [CTX_SETTINGS_RESET] = { "Reset all settings",       NULL },
@@ -1785,6 +2241,11 @@ static bool ctx_enabled(AppWindow* app, int a) {
         case CTX_REDO: return app->editor->redo_count > 0;
         case CTX_RUN: case CTX_RUN_STMT: case CTX_EXPLAIN: case CTX_RUN_FILE: case CTX_IMPORT_CSV: return idle;
         case CTX_STOP: return !idle;
+        case CTX_EDIT_CELL: case CTX_SET_NULL:
+            return idle && !app->showing_history && grid_cell(app) != NULL && grid_edit_cell_ok(&app->gedit, tv->selected_col);
+        case CTX_ADD_ROW: return idle && !app->showing_history && grid_ready(app) && app->draft_src < 0 && grid_edit_rows_ok(&app->gedit);
+        case CTX_SAVE_ROW: case CTX_DISCARD_ROW: return idle && app->draft_src >= 0;
+        case CTX_DELETE_ROW: return idle && !app->showing_history && grid_has_row(app) && grid_edit_rows_ok(&app->gedit);
         case CTX_SERVER: return idle && !app->in_transaction;
         case CTX_BEGIN: return idle && !app->in_transaction;
         case CTX_COMMIT: case CTX_ROLLBACK: return idle;
@@ -1833,7 +2294,9 @@ static void ctx_open_items(AppWindow* app, int kind, const int* items, int n, in
 
 static void ctx_open(AppWindow* app, int kind, int x, int y) {
     static const int GRID[] = {
-        CTX_VIEW, CTX_COPY_VALUE, CTX_COPY_LITERAL, CTX_INSERT_VALUE, CTX_SEP,
+        CTX_VIEW, CTX_EDIT_CELL, CTX_SET_NULL, CTX_SEP,
+        CTX_ADD_ROW, CTX_SAVE_ROW, CTX_DISCARD_ROW, CTX_DELETE_ROW, CTX_SEP,
+        CTX_COPY_VALUE, CTX_COPY_LITERAL, CTX_INSERT_VALUE, CTX_SEP,
         CTX_COPY_ROW, CTX_COPY_COLUMN, CTX_COPY_COL_NAME, CTX_SEP,
         CTX_FILTER_VALUE, CTX_FILTER_ROWS, CTX_FILTER_CLEAR, CTX_SEP,
         CTX_SORT_ASC, CTX_SORT_DESC, CTX_SORT_CLEAR, CTX_FIT_COL, CTX_SEP,
@@ -2130,6 +2593,16 @@ static void ctx_run(AppWindow* app, int a) {
         case CTX_SAVE_AS: bar_open(app, BAR_SAVE_AS, false); break;
         case CTX_QUIT:    app->quit_requested = true; break;
         case CTX_SERVER:  app_window_set_mode(app, APP_MODE_SERVER); break;
+        case CTX_EDIT_CELL:    edit_begin(app, NULL); break;
+        case CTX_SET_NULL:     edit_set_null(app); break;
+        case CTX_ADD_ROW:      draft_add(app); break;
+        case CTX_SAVE_ROW:     draft_save(app); break;
+        case CTX_DISCARD_ROW:  draft_discard(app); break;
+        case CTX_DELETE_ROW:
+            app->del_until = platform_time_ms() + 3000;      // dal menu: la scelta è già la conferma
+            app->del_src = table_view_source_row(app->results, app->results->selected_row);
+            row_delete(app);
+            break;
         case CTX_RUN_FILE:   bar_open(app, BAR_RUN_FILE, false); break;
         case CTX_IMPORT_CSV: bar_open(app, BAR_IMPORT_CSV, false); break;
         case CTX_DUMP_DB:    bar_open(app, BAR_DUMP, false); break;
@@ -3175,6 +3648,9 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
     app->filter_input->base.user_data = app;
     app->filter_input->on_change = on_filter_change;
     app->filter_input->win = win;
+    app->cell_edit = line_edit_create("");
+    if (app->cell_edit) { app->cell_edit->win = win; app->cell_edit->base.visible = false; }
+    app->edit_src = app->edit_col = app->draft_src = app->del_src = -1;
     app->filter_input->base.visible = false;
     app->menu_open = app->menu_hover = -1;
     apply_settings(app);
@@ -3374,6 +3850,7 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         }
         return;
     }
+    if (gedit_handle_event(app, evt)) return;
     if (filter_handle_event(app, evt)) {
         if (evt->type == EVT_MOUSE_MOVE || evt->type == EVT_MOUSE_DOWN)
             platform_set_cursor(app->win, widget_contains_point((Widget*)app->filter_input, evt->mouse_x, evt->mouse_y)
@@ -3468,6 +3945,7 @@ bool app_window_tick(AppWindow* app, uint64_t now_ms) {
     bool b = line_edit_tick(app->bar_input, now_ms);
     bool c = line_edit_tick(app->bar_replace_input, now_ms);
     c = line_edit_tick(app->filter_input, now_ms) || c;
+    if (app->cell_edit && gedit_editing(app)) c = line_edit_tick(app->cell_edit, now_ms) || c;
     // esecuzione in background: completamento e stato con il tempo trascorso
     if (app->job) {
         if (atomic_load(&app->job->done)) {
@@ -3617,6 +4095,38 @@ static void draw_splitter_and_status(AppWindow* app) {
         widget_draw((Widget*)fe, win);
         right = fe->base.bounds.x - 14;
     }
+    // modifica dei dati: + Row / Save row · Discard, e "Editable" se la griglia si può modificare
+    app->eb_add = app->eb_save = app->eb_discard = (Rect){0, 0, 0, 0};
+    if (!app->showing_history && grid_ready(app) && grid_edit_any(&app->gedit)) {
+        int fs = TH_FONT_SMALL + 1, bh = 24, by = st.y + (st.h - bh) / 2;
+        const char* labels[2];
+        Rect* rects[2];
+        int nb = 0;
+        if (app->draft_src >= 0) { labels[nb] = "Save row"; rects[nb++] = &app->eb_save; labels[nb] = "Discard"; rects[nb++] = &app->eb_discard; }
+        else if (grid_edit_rows_ok(&app->gedit)) { labels[nb] = "+ Row"; rects[nb++] = &app->eb_add; }
+        for (int i = nb - 1; i >= 0; i--) {
+            bool primary = rects[i] == &app->eb_save;
+            int bw = platform_measure_text_ex(win, labels[i], -1, fs, primary ? FONT_UI_BOLD : FONT_UI) + 20;
+            if (right - bw < lb->x + 120) break;
+            Rect b = { right - bw, by, bw, bh };
+            *rects[i] = b;
+            bool hov = rect_has(b, app->mouse_x, app->mouse_y);
+            if (primary) platform_fill_rect_rounded(win, b, hov ? TH_ACCENT_HOVER : TH_ACCENT, 6);
+            else ui_round_box(win, b, hov ? TH_ELEVATED_HOVER : TH_ELEVATED, TH_BORDER, 6);
+            int tw = platform_measure_text_ex(win, labels[i], -1, fs, primary ? FONT_UI_BOLD : FONT_UI);
+            platform_draw_text_ex(win, labels[i], -1, (Point){b.x + (bw - tw) / 2, ui_text_y(win, b, fs, primary ? FONT_UI_BOLD : FONT_UI)},
+                                  primary ? TH_ON_ACCENT : TH_TEXT, fs, primary ? FONT_UI_BOLD : FONT_UI);
+            right = b.x - 8;
+        }
+        const char* hint = app->draft_src >= 0 ? "New row" : "Editable";
+        int hw = platform_measure_text_ex(win, hint, -1, fs, FONT_UI);
+        if (right - hw - 8 > lb->x + 200) {
+            platform_draw_text_ex(win, hint, -1, (Point){right - hw, ui_text_y(win, st, fs, FONT_UI)},
+                                  app->draft_src >= 0 ? TH_ACCENT_TEXT : TH_TEXT_FAINT, fs, FONT_UI);
+            right -= hw + 16;
+        }
+    }
+
     char meta_buf[160];
     const char* meta = app->status_meta;
     bool filtered = table_view_filtered(app->results) && grid_ready(app);
@@ -3759,6 +4269,10 @@ void app_window_draw(AppWindow* app) {
     widget_draw((Widget*)app->editor,           win);
     widget_draw((Widget*)app->editor_scroll,    win);
     widget_draw((Widget*)app->results,          win);
+    if (gedit_editing(app)) {                   // editor della cella sopra la griglia
+        gedit_place_editor(app);
+        if (app->cell_edit->base.visible) widget_draw((Widget*)app->cell_edit, win);
+    }
     widget_draw((Widget*)app->results_scroll_v, win);
     widget_draw((Widget*)app->results_scroll_h, win);
     draw_bar(app);
@@ -3841,6 +4355,11 @@ static void run_worker(void* arg) {
                 db_result_free(j->grids[0]);
                 memmove(j->grids, j->grids + 1, sizeof(j->grids[0]) * (MAX_RESULT_TABS - 1));
                 j->ngrids--;
+            }
+            if (!res->sql) {                       // statement d'origine (per rileggere / modificare il risultato)
+                size_t sl = (size_t)(r->end - r->code_start);
+                res->sql = malloc(sl + 1);
+                if (res->sql) { memcpy(res->sql, j->text + r->code_start, sl); res->sql[sl] = '\0'; }
             }
             j->grids[j->ngrids++] = res;
         } else {
@@ -3944,6 +4463,8 @@ static const char* guard_statement(const char* s, int n) {
 // from_editor: il testo inizia all'offset base dell'editor (gli errori evidenziano la riga);
 // altrimenti (import, file eseguito) gli errori indicano solo il numero dello statement.
 static void run_text(AppWindow* app, char* text, int base, bool from_editor, const char* label) {
+    // una cella in modifica viene chiusa senza salvare: il motore passa all'esecuzione
+    if (gedit_editing(app)) edit_end(app);
     TextBox* tb = app->editor;
 
     // divisione in statement (i ';' dentro stringhe e commenti sono ignorati)
@@ -4169,6 +4690,8 @@ void app_window_destroy(AppWindow* app) {
     widget_destroy((Widget*)app->bar_input);
     widget_destroy((Widget*)app->bar_replace_input);
     widget_destroy((Widget*)app->filter_input);
+    if (app->cell_edit) widget_destroy((Widget*)app->cell_edit);
+    for (int c = 0; c < 64; c++) free(app->draft_vals[c]);
     free(app);
 }
 

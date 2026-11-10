@@ -158,6 +158,7 @@ Gli statement separati da `;` vengono eseguiti in sequenza (i `;` dentro stringh
 | Scorciatoia | Azione |
 |---|---|
 | `F5` / `Ctrl+Enter` | Esegui script o selezione / statement sotto il cursore |
+| `F2`, `Canc`, `Ctrl+Enter` (sulla griglia) | Modifica la cella / elimina la riga / salva la riga nuova |
 | `Esc` | Interrompi la query in esecuzione |
 | `Ctrl+Shift+E` | `EXPLAIN` dello statement sotto il cursore |
 | `Ctrl+Shift+F` | Formatta l'SQL (selezione o intero script) |
@@ -198,6 +199,26 @@ L'editor chiude automaticamente parentesi e apici, mantiene l'indentazione andan
 **File, sessione e cronologia:** i percorsi si scrivono nella barra in alto dell'editor (`~` viene espanso); aprire un file o creare uno script nuovo resta annullabile con `Ctrl+Z`, e il footer mostra il nome del file con un pallino se ci sono modifiche non salvate. Alla chiusura (anche con `Ctrl+C` / `SIGTERM` dal terminale) script, cursore, file aperto, zoom e tema vengono salvati e ripristinati all'avvio successivo. Ogni statement eseguito finisce nella cronologia (data, esito, righe, durata): si apre nella griglia dei risultati, e doppio click o `Enter` aggiungono lo statement in fondo allo script.
 
 ### Explorer, risultati, import ed export
+
+**Modificare i dati nella griglia** (come in phpMyAdmin): quando un risultato viene da una tabella
+con la chiave primaria tra le colonne (l'anteprima dell'explorer, `SELECT * FROM t ...`, anche con
+`WHERE`, `ORDER BY` o un join) l'intestazione mostra *Editable*.
+
+| Azione | Come |
+|---|---|
+| Modificare una cella | doppio click, `F2` o si comincia a scrivere; `Invio` salva, `Tab` / `Shift+Tab` passa alla colonna accanto, `Esc` annulla |
+| Impostare `NULL` | tasto destro › *Set to NULL* |
+| Aggiungere una riga | *+ Row* (o tasto destro › *Add row*): si compilano le celle (le altre prendono il `DEFAULT`), poi *Save row*, `Ctrl+Invio` o `Invio` sull'ultima colonna; *Discard* / `Esc` la scarta |
+| Eliminare una riga | `Canc` due volte (la seconda conferma) o tasto destro › *Delete row* |
+
+Ogni modifica diventa un `UPDATE` / `INSERT` / `DELETE` che identifica la riga con la chiave
+primaria, con i valori scritti come letterali sicuri; dopo la scrittura la riga viene riletta dal
+database (valori di default, `AUTO_INCREMENT`, trigger). Se il database rifiuta il valore (tipo,
+vincolo, trigger) il messaggio compare nella barra di stato e la cella resta in modifica. Lo
+statement eseguito è nella barra dei risultati e nella cronologia; con una transazione aperta le
+modifiche ne fanno parte (`COMMIT` / `ROLLBACK`). Restano in sola lettura (con il motivo nella barra
+di stato) le colonne calcolate e i risultati di `GROUP BY`, `DISTINCT`, `UNION`, viste, e le tabelle
+senza chiave primaria.
 
 **Explorer:** click per espandere database e tabelle; doppio click su un database = `USE`, su una tabella = anteprima dei dati (`SELECT * … LIMIT 200`), su una colonna = inserisce il nome nell'editor.
 
@@ -874,9 +895,10 @@ make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitize
 |---|---|
 | `test_btree` | B+Tree sotto stress contro un modello di riferimento: inserimenti, aggiornamenti, cancellazioni e scansioni ordinate, con un buffer pool piccolo che costringe a riscrivere e rileggere le pagine |
 | `test_engine` (128) | Motore: pagine, heap, catalogo, WAL e recovery, import CSV |
-| `test_sql` (983) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, transazioni, crash e recovery, testi lunghi, 100 transazioni di fila |
+| `test_sql` (994) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, transazioni, crash e recovery, testi lunghi, 100 transazioni di fila |
 | `test_examples` (166) | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
-| `test_server` (63) | Il server su socket reali: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici |
+| `test_grid_edit` (22) | Modifica dei dati nella griglia: analisi dei risultati, `UPDATE` / `INSERT` / `DELETE` generati ed eseguiti, chiavi composte, join, apici e backslash, letterali di export e dump |
+| `test_server` (65) | Il server su socket reali: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici |
 
 La CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) compila su Ubuntu con `-D_FORTIFY_SOURCE=2` e fallisce a qualunque warning, esegue `make test` e `make test-asan`, e compila per Windows con MinGW-w64. Durante lo sviluppo il motore è stato anche verificato con un fuzzer di SQL mutato e uno di richieste HTTP malformate (sotto ASan), con un confronto dei risultati contro SQLite su centinaia di migliaia di query e modifiche casuali, e con arresti forzati (`kill -9`) durante scritture concorrenti senza perdere nessuna scrittura confermata.
 

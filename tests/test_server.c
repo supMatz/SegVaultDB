@@ -274,6 +274,20 @@ int main(void) {
         free(big);
     }
 
+    // id generato da AUTO_INCREMENT e valori di default nel catalogo
+    r = query(port, "{\"database\":\"t\",\"sql\":\"CREATE TABLE gen (id INT PRIMARY KEY AUTO_INCREMENT, v INT DEFAULT 7); "
+                    "INSERT INTO gen (v) VALUES (1), (2); INSERT INTO gen (v) VALUES (3)\"}");
+    {
+        const JsonVal* rs1 = json_get(r.json, "results");
+        const JsonVal* li1 = rs1 && rs1->count == 3 ? json_get(&rs1->items[1], "last_insert_id") : NULL;
+        const JsonVal* li2 = rs1 && rs1->count == 3 ? json_get(&rs1->items[2], "last_insert_id") : NULL;
+        CHECK(li1 && li1->number == 2 && li2 && li2->number == 3, "last_insert_id: %s", r.body);
+    }
+    resp_free(&r);
+    r = request(port, "GET", "/api/v1/databases/t/tables/gen", NULL, NULL);
+    CHECK(r.body && strstr(r.body, "\"default\":\"7\""), "column default: %s", r.body);
+    resp_free(&r);
+
     // ── corpo text/plain ──
     r = request(port, "POST", "/api/v1/query?database=t", "Content-Type: text/plain\r\n", "SELECT prezzo FROM p WHERE id = 3");
     c = cell_at(&r, 0, 0, 0);

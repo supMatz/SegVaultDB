@@ -101,6 +101,9 @@ nella query string: `POST /api/v1/query?database=shop&rows=objects`.
 }
 ```
 
+Un `INSERT` in una tabella con `AUTO_INCREMENT` riporta anche l'ultimo id generato:
+`{ "rows_affected": 1, "last_insert_id": 42, "time_ms": 0.03 }`.
+
 Tipi dei valori: `INT`/`BIGINT`/`FLOAT` → numero JSON, `BOOL` → `true`/`false`, `NULL` → `null`,
 tutto il resto (`VARCHAR`, `TEXT`, `DATE`, ...) → stringa. Le date sono stringhe `AAAA-MM-GG`.
 

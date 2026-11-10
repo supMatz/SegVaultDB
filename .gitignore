@@ -32,3 +32,5 @@ build-server/
 test_server
 test_server_asan
 __pycache__/
+test_grid_edit
+test_grid_edit_asan

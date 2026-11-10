@@ -307,6 +307,10 @@ void db_result_free(QueryResult* r) {
     }
     free(r->col_names);
     free(r->col_types);
+    for (int i = 0; r->col_tables && i < r->num_cols; i++) { free(r->col_tables[i]); free(r->col_columns[i]); }
+    free(r->col_tables);
+    free(r->col_columns);
+    free(r->sql);
     for (int i = 0; i < r->num_rows; i++)
         free(r->rows[i].cells);
     free(r->rows);
@@ -516,6 +520,7 @@ static ColumnInfo* db_list_columns_impl(const char* db_name, const char* table,
         cols[i].nullable       = t->columns[i].nullable;
         cols[i].primary_key    = t->columns[i].primary_key;
         cols[i].auto_increment = t->columns[i].auto_increment;
+        snprintf(cols[i].default_val, sizeof(cols[i].default_val), "%.127s", t->columns[i].default_val);
     }
     *out_count = t->num_columns;
     return cols;

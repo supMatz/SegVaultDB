@@ -278,7 +278,12 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
                 Cell* cell = &row_at(tv, row)->cells[c];
                 int ty = ui_text_y(win, (Rect){0, ry, 0, rh}, CELL_FONT, FONT_MONO);
                 int max_w = cw - CELL_PAD * 2;
-                if (cell->is_null) {
+                bool draft = tv->draft_row >= 0 && table_view_source_row(tv, row) == tv->draft_row;
+                if (draft && (!tv->draft_set || !tv->draft_set[c])) {        // riga nuova: valore di default
+                    ui_text_clipped(win, tv->col_editable && tv->col_editable[c] ? "DEFAULT" : "",
+                                    cx + CELL_PAD, ui_text_y(win, (Rect){0, ry, 0, rh}, TH_FONT_SMALL, FONT_MONO),
+                                    max_w, TH_TEXT_FAINT, TH_FONT_SMALL, FONT_MONO);
+                } else if (cell->is_null) {
                     ui_text_clipped(win, tv->null_text, cx + CELL_PAD,
                                     ui_text_y(win, (Rect){0, ry, 0, rh}, TH_FONT_SMALL, FONT_MONO),
                                     max_w, tv->color_text_null, TH_FONT_SMALL, FONT_MONO);
@@ -304,6 +309,9 @@ static void table_view_draw(Widget* self, PlatformWindow* win) {
             cx += cw;
         }
         platform_reset_clip(win);
+
+        if (tv->draft_row >= 0 && table_view_source_row(tv, row) == tv->draft_row)
+            platform_fill_rect(win, (Rect){b.x, ry, 3, rh}, TH_ACCENT);     // riga nuova, non ancora salvata
 
         // numero di riga
         if (!tv->show_rownum) continue;
@@ -571,6 +579,7 @@ TableView* table_view_create(int x, int y, int w, int h) {
     tv->zebra        = true;
     tv->null_text    = "NULL";
     tv->font_size    = CELL_FONT;
+    tv->draft_row    = -1;
 
     for (int i = 0; i < TABLE_VIEW_MAX_COLS; i++)
         tv->col_widths[i] = 120;
@@ -706,6 +715,39 @@ static void rebuild_view(TableView* tv) {
     }
     tv->hover_row = -1;
     table_view_clamp_scroll(tv);
+}
+
+void table_view_refresh(TableView* tv) {
+    if (!tv) return;
+    if (tv->filter[0] || tv->sort_col >= 0) rebuild_view(tv);
+    else {
+        free(tv->order);
+        tv->order = NULL;
+        tv->view_rows = 0;
+        if (tv->selected_row >= nrows(tv)) tv->selected_row = nrows(tv) - 1;
+        table_view_clamp_scroll(tv);
+    }
+}
+
+int table_view_view_row(const TableView* tv, int src) {
+    if (!tv || !has_grid(tv)) return -1;
+    if (!tv->order) return src < tv->result->num_rows ? src : -1;
+    for (int i = 0; i < tv->view_rows; i++) if (tv->order[i] == src) return i;
+    return -1;
+}
+
+bool table_view_cell_rect(TableView* tv, int view_row, int col, Rect* out) {
+    if (!tv || !has_grid(tv) || col < 0 || col >= num_cols(tv) || view_row < tv->scroll_y) return false;
+    Rect b = tv->base.bounds;
+    int y = b.y + TABLE_VIEW_HEADER_H + (view_row - tv->scroll_y) * tv->row_h;
+    if (y + tv->row_h > b.y + b.h) return false;
+    int x = col_x(tv, col), w = tv->col_widths[col];
+    int left = b.x + tv->rownum_w;
+    if (x < left) { w -= left - x; x = left; }               // colonna scrollata in parte a sinistra
+    if (x + w > b.x + b.w) w = b.x + b.w - x;
+    if (w < 24) return false;
+    *out = (Rect){ x, y, w, tv->row_h };
+    return true;
 }
 
 void table_view_sort(TableView* tv, int col, bool asc) {

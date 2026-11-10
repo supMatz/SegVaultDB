@@ -85,6 +85,11 @@ typedef struct {
     void (*on_row_activate)(int row_index, void* user_data);   // doppio click o Invio su una riga
     uint64_t last_row_click;
     int      last_row_clicked;
+
+    // modifica dei dati (window.c): riga nuova non ancora salvata e colonne modificabili
+    int         draft_row;        // indice nel risultato della riga nuova (-1 = nessuna)
+    const bool* draft_set;        // colonne già scritte nella riga nuova (le altre: DEFAULT)
+    const bool* col_editable;     // colonne modificabili (NULL = sola lettura)
 } TableView ;
 
 TableView* table_view_create(int x, int y, int w, int h);
@@ -98,6 +103,12 @@ void table_view_set_message(TableView* tv, TableMessageKind kind, const char* ti
 void table_view_clear(TableView* tv); // il risultato viene liberato in mem prima, lo fa chi chiama questa funzione
 
 void table_view_scroll_to(TableView* tv, int row); // scroll alla riga specifica
+// rettangolo della cella (riga visualizzata, colonna); false se non è visibile
+bool table_view_cell_rect(TableView* tv, int view_row, int col, Rect* out);
+// rifà la vista dopo una modifica delle righe del risultato (mantiene ordinamento, filtro e selezione)
+void table_view_refresh(TableView* tv);
+// riga visualizzata che mostra la riga del risultato src (-1 se filtrata)
+int  table_view_view_row(const TableView* tv, int src);
 
 // metriche per scrollbar
 int  table_view_content_width(TableView* tv);  // pixel

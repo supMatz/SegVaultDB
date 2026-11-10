@@ -125,6 +125,20 @@ static void tl(const char* fmt, const char* a, const char* b, const char* expect
     free(q);
 }
 
+// origine delle colonne: "tabella.colonna" o "-" per le calcolate; "" se il risultato non è modificabile
+static void origin(const char* sql, const char* expect) {
+    tests++;
+    QueryResult* r = db_execute(sql);
+    char got[512] = "";
+    if (!r || !r->success) snprintf(got, sizeof(got), "ERR:%.400s", r ? r->error : "null");
+    else if (r->col_tables)
+        for (int c = 0; c < r->num_cols; c++)
+            snprintf(got + strlen(got), sizeof(got) - strlen(got), "%s%s%s%s", c ? "|" : "",
+                     r->col_tables[c] ? r->col_tables[c] : "-", r->col_tables[c] ? "." : "", r->col_columns[c] ? r->col_columns[c] : "");
+    if (strcmp(got, expect)) { failed++; printf("FAIL %d: %s\n   expected: %s\n   got:      %s\n", tests, sql, expect, got); }
+    db_result_free(r);
+}
+
 int main(void) {
     if (system("rm -rf /tmp/sv_sql_test && mkdir -p /tmp/sv_sql_test") != 0) return 1;
     if (!db_init("/tmp/sv_sql_test")) { printf("FAIL: db_init\n"); return 1; }
@@ -828,6 +842,19 @@ int main(void) {
     t("ROLLBACK TO ciclo", "OK:0");
     t("SELECT v FROM c WHERE id = 2", "50");
     t("COMMIT", "OK:0");
+
+    // ── origine delle colonne (griglia modificabile) ──
+    t("USE tx", "OK:0");
+    t("CREATE TABLE riga (k INT PRIMARY KEY, w VARCHAR(10))", "OK:0");
+    t("INSERT INTO riga VALUES (1, 'a')", "OK:1");
+    origin("SELECT * FROM c", "c.id|c.v");
+    origin("SELECT v AS valore, v + 1, id FROM c x WHERE id > 0 ORDER BY id", "c.v|-|c.id");
+    origin("SELECT c.id, r.w FROM c JOIN riga r ON r.k = c.id", "c.id|riga.w");
+    origin("SELECT v, COUNT(*) FROM c GROUP BY v", "");
+    origin("SELECT DISTINCT v FROM c", "");
+    origin("SELECT id FROM c UNION SELECT k FROM riga", "");
+    origin("SELECT * FROM (SELECT id FROM c) d", "-");
+    origin("WITH q AS (SELECT id FROM c) SELECT id FROM q", "-");
 
     // ── testi lunghi (oltre i vecchi 511 byte): niente troncamenti, chiavi senza collisioni ──
     {

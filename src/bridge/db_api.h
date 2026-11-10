@@ -68,6 +68,13 @@ typedef struct {
     char** col_names;    // nomi delle colonne (puntatore al puntatore della colonna singola -> array di puntatori)
     char** col_types;   // tipi delle colonne (puntatore al puntatore)
     int num_cols;       // numero colonne
+    // origine delle colonne (griglia modificabile): tabella e colonna di base, NULL per le colonne
+    // calcolate; presenti solo se ogni riga del risultato è una riga reale (niente GROUP BY,
+    // DISTINCT, UNION, viste), altrimenti col_tables == NULL
+    char** col_tables;
+    char** col_columns;
+    char   source_db[64];   // database delle tabelle di origine
+    char*  sql;             // statement che ha prodotto il risultato (impostato da chi esegue; liberato con il risultato)
 
     // righe (SELECT)
     Row* rows;           // puntatore alla riga
