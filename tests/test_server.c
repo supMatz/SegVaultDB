@@ -201,6 +201,11 @@ int main(void) {
     c = cell_at(&r, 0, 0, 0);
     CHECK(resp_ok(&r) && c && c->number == 0, "injection is a plain string: %s", r.body);
     resp_free(&r);
+    {
+        SvLogEntry last;
+        CHECK(sv_server_recent(s, &last, 1) == 1 && strstr(last.detail, "nome = ?") && !strstr(last.detail, "DROP"),
+              "log shows the SQL with '?', not the parameter values: %s", last.detail);
+    }
     r = query(port, "{\"database\":\"t\",\"sql\":\"SELECT '?' -- ?\\n, id - ? /* ? */ FROM p WHERE id = 1\",\"params\":[-5]}");
     c = cell_at(&r, 0, 0, 1);
     const JsonVal* c0 = cell_at(&r, 0, 0, 0);

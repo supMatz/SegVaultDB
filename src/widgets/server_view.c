@@ -2,6 +2,7 @@
 #include "theme.h"
 #include "settings.h"
 #include "line_edit.h"
+#include "button.h"
 #include "../server/server.h"
 #include "../bridge/db_api.h"
 #include "../../include/common.h"
@@ -138,13 +139,23 @@ ViewAction start_screen_event(StartScreen* s, const sEvent* evt) {
 
 // ═════════════════════════════════════════════════════════════════
 //  Pannello del server
+//  Stessa struttura dell'editor: toolbar, sidebar a sinistra (qui le opzioni del server al posto
+//  dell'explorer), intestazione "REQUESTS" come "RESULTS", griglia del registro, barra di stato.
 // ═════════════════════════════════════════════════════════════════
 
+#define SP_TOOLBAR_H  52
+#define SP_HEADER_H   38          // intestazioni "SERVER" e "REQUESTS" (come EXPLORER / RESULTS)
+#define SP_FOOTER_H   26
+#define SP_ROW_H      26          // righe del registro
+#define SP_SIDEBAR_W  296
+
 enum {
-    HIT_EDITOR, HIT_TOGGLE, HIT_COPY_URL, HIT_COPY_LAN, HIT_PORT_MINUS, HIT_PORT_PLUS, HIT_ACCESS_LOCAL, HIT_ACCESS_LAN,
+    HIT_COPY_URL, HIT_COPY_LAN, HIT_PORT_MINUS, HIT_PORT_PLUS, HIT_ACCESS_LOCAL, HIT_ACCESS_LAN,
     HIT_TOKEN_OFF, HIT_TOKEN_ON, HIT_COPY_TOKEN, HIT_NEW_TOKEN, HIT_CORS_OFF, HIT_CORS_ON, HIT_TIME_MINUS,
     HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_COUNT
 };
+
+enum { ACT_NONE, ACT_TOGGLE, ACT_EDITOR, ACT_COPY };
 
 struct ServerPanel {
     PlatformWindow* win;
@@ -165,12 +176,20 @@ struct ServerPanel {
     uint64_t        last_poll;
     int             last_uptime;
     LineEdit*       port_edit;
+    Button*         btn_toggle;      // Start / Stop (F5)
+    Button*         btn_copy;        // Copy address
+    Button*         btn_editor;      // Open SQL editor
+    int             pending;         // azione chiesta da un pulsante (ACT_*)
     Rect            hit[HIT_COUNT];
     int             mx, my;
-    char            flash[64];        // "Copied" vicino al pulsante
+    char            flash[64];       // "Copied" al posto del testo del controllo
     int             flash_hit;
     uint64_t        flash_until;
 };
+
+static void on_toggle(void* ud) { ((ServerPanel*)ud)->pending = ACT_TOGGLE; }
+static void on_editor(void* ud) { ((ServerPanel*)ud)->pending = ACT_EDITOR; }
+static void on_copy(void* ud)   { ((ServerPanel*)ud)->pending = ACT_COPY; }
 
 static bool token_required(void);
 static bool token_load(ServerPanel* p, bool regenerate);
@@ -181,6 +200,10 @@ ServerPanel* server_panel_create(PlatformWindow* win) {
     p->win = win;
     p->port_edit = line_edit_create("8484");
     if (p->port_edit) p->port_edit->win = win;
+    p->btn_toggle = button_create(0, 0, 0, 0, "Start server", on_toggle, p);
+    p->btn_copy   = button_create(0, 0, 0, 0, "Copy address", on_copy, p);
+    p->btn_editor = button_create(0, 0, 0, 0, "Open SQL editor", on_editor, p);
+    if (p->btn_toggle) button_set_hint(p->btn_toggle, "F5");
     p->flash_hit = -1;
     return p;
 }
@@ -279,6 +302,9 @@ void server_panel_destroy(ServerPanel* p) {
     if (!p) return;
     server_panel_stop(p);
     if (p->port_edit) widget_destroy((Widget*)p->port_edit);
+    if (p->btn_toggle) widget_destroy((Widget*)p->btn_toggle);
+    if (p->btn_copy) widget_destroy((Widget*)p->btn_copy);
+    if (p->btn_editor) widget_destroy((Widget*)p->btn_editor);
     free(p);
 }
 
@@ -311,56 +337,62 @@ bool server_panel_tick(ServerPanel* p, uint64_t now_ms) {
 
 // ── disegno ─────────────────────────────────────────────────────
 
-enum { BTN_NORMAL, BTN_PRIMARY, BTN_DANGER, BTN_GHOST };
-
-static void button(ServerPanel* p, int id, Rect r, const char* label, int kind, bool enabled) {
+// testo cliccabile piccolo (Copy, New, Clear): come i pulsanti "ghost" dell'editor
+static void link_btn(ServerPanel* p, int id, Rect r, const char* label, bool enabled) {
     PlatformWindow* win = p->win;
     p->hit[id] = enabled ? r : (Rect){0, 0, 0, 0};
     bool hov = enabled && in_rect(r, p->mx, p->my);
-    Color fill, border, text;
-    switch (kind) {
-        case BTN_PRIMARY: fill = hov ? TH_ACCENT_HOVER : TH_ACCENT; border = fill; text = TH_ON_ACCENT; break;
-        case BTN_DANGER:  fill = hov ? TH_ERROR_SOFT : TH_ELEVATED; border = hov ? TH_ERROR : TH_BORDER; text = TH_ERROR_TEXT; break;
-        case BTN_GHOST:   fill = hov ? TH_ELEVATED_HOVER : TH_SURFACE; border = TH_SURFACE; text = TH_TEXT_MUTED; break;
-        default:          fill = hov ? TH_ELEVATED_HOVER : TH_ELEVATED; border = TH_BORDER; text = TH_TEXT; break;
-    }
-    if (!enabled) { fill = TH_SURFACE; border = TH_BORDER; text = TH_TEXT_FAINT; }
-    ui_round_box(win, r, fill, border, TH_RADIUS);
-    const char* l = (p->flash_hit == id) ? p->flash : label;
-    text_center(win, r, l, text, TH_FONT_UI, kind == BTN_PRIMARY ? FONT_UI_BOLD : FONT_UI);
+    if (hov) platform_fill_rect_rounded(win, r, TH_HOVER, 5);
+    const char* l = p->flash_hit == id ? p->flash : label;
+    Color c = !enabled ? TH_TEXT_FAINT : p->flash_hit == id ? TH_SUCCESS : hov ? TH_TEXT : TH_TEXT_MUTED;
+    text_center(win, r, l, c, TH_FONT_SMALL + 1, FONT_UI);
 }
 
-static int button_w(ServerPanel* p, const char* label) {
-    return platform_measure_text_ex(p->win, label, -1, TH_FONT_UI, FONT_UI_BOLD) + 28;
+static int link_w(ServerPanel* p, const char* label) {
+    return platform_measure_text_ex(p->win, label, -1, TH_FONT_SMALL + 1, FONT_UI) + 16;
 }
 
-// controllo a due posizioni
+// controllo a due posizioni (stesso stile delle schede dei risultati)
 static void segmented(ServerPanel* p, int id0, Rect r, const char* a, const char* b, int sel, bool enabled) {
     PlatformWindow* win = p->win;
-    ui_round_box(win, r, TH_SURFACE_2, TH_BORDER, TH_RADIUS);
+    ui_round_box(win, r, TH_SURFACE_2, TH_BORDER, 6);
     for (int k = 0; k < 2; k++) {
         Rect h = { r.x + 2 + k * (r.w - 4) / 2, r.y + 2, (r.w - 4) / 2, r.h - 4 };
         p->hit[id0 + k] = enabled ? h : (Rect){0, 0, 0, 0};
-        bool on = sel == k, hov = enabled && in_rect(h, p->mx, p->my);
-        if (on) ui_round_box(win, h, enabled ? TH_ACCENT_SOFT : TH_ELEVATED, enabled ? TH_ACCENT : TH_BORDER_STRONG, TH_RADIUS - 1);
-        else if (hov) platform_fill_rect_rounded(win, h, TH_HOVER, TH_RADIUS - 1);
-        // bloccato (es. token obbligatorio in rete): la scelta attiva resta leggibile, l'altra sbiadita
-        Color tc = on ? (enabled ? TH_ACCENT_TEXT : TH_TEXT) : (enabled ? TH_TEXT_MUTED : TH_TEXT_FAINT);
-        text_center(win, h, k ? b : a, tc, TH_FONT_UI, on ? FONT_UI_BOLD : FONT_UI);
+        bool on = sel == k, hov = enabled && !on && in_rect(h, p->mx, p->my);
+        if (on) platform_fill_rect_rounded(win, h, enabled ? TH_ACCENT_SOFT : TH_ELEVATED, 5);
+        else if (hov) platform_fill_rect_rounded(win, h, TH_HOVER, 5);
+        // bloccato (es. token obbligatorio in rete): la scelta attiva resta leggibile
+        Color tc = on ? (enabled ? TH_ACCENT_TEXT : TH_TEXT_MUTED) : (enabled ? TH_TEXT_MUTED : TH_TEXT_FAINT);
+        text_center(win, h, k ? b : a, tc, TH_FONT_SMALL + 1, on ? FONT_UI_BOLD : FONT_UI);
     }
 }
 
-static void stepper(ServerPanel* p, int id_minus, int id_plus, Rect r, const char* value, bool enabled) {
+// [−] valore [+]
+static void stepper(ServerPanel* p, int id_minus, int id_plus, Rect r, const char* value, Widget* field) {
     PlatformWindow* win = p->win;
     Rect m = { r.x, r.y, r.h, r.h }, pl = { r.x + r.w - r.h, r.y, r.h, r.h };
-    button(p, id_minus, m, "\xe2\x88\x92", BTN_NORMAL, enabled);
-    button(p, id_plus, pl, "+", BTN_NORMAL, enabled);
+    for (int k = 0; k < 2; k++) {
+        Rect b = k ? pl : m;
+        int id = k ? id_plus : id_minus;
+        p->hit[id] = b;
+        bool hov = in_rect(b, p->mx, p->my);
+        ui_round_box(win, b, hov ? TH_ELEVATED_HOVER : TH_ELEVATED, hov ? TH_BORDER_STRONG : TH_BORDER, 6);
+        text_center(win, b, k ? "+" : "\xe2\x88\x92", TH_TEXT_MUTED, TH_FONT_UI, FONT_UI);
+    }
     Rect v = { m.x + m.w + 4, r.y, r.w - 2 * r.h - 8, r.h };
-    ui_round_box(win, v, TH_SURFACE_2, TH_BORDER, TH_RADIUS);
-    text_center(win, v, value, enabled ? TH_TEXT : TH_TEXT_FAINT, TH_FONT_UI, FONT_MONO);
+    if (field) { field->bounds = v; field->visible = true; widget_draw(field, win); }
+    else {
+        ui_round_box(win, v, TH_EDITOR_BG, TH_BORDER, 6);
+        text_center(win, v, value, TH_TEXT, TH_FONT_SMALL + 1, FONT_MONO);
+    }
 }
 
-static void card(PlatformWindow* win, Rect r) { ui_round_box(win, r, TH_SURFACE, TH_BORDER, 10); }
+// etichetta di sezione della sidebar (come "EXPLORER")
+static int section_label(PlatformWindow* win, const char* t, int x, int y) {
+    platform_draw_text_ex(win, t, -1, (Point){x, y}, TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI_BOLD);
+    return y + platform_text_height(win, TH_FONT_SMALL, FONT_UI_BOLD) + 6;
+}
 
 static void format_uptime(double s, char* out, size_t n) {
     long t = (long)s;
@@ -369,7 +401,7 @@ static void format_uptime(double s, char* out, size_t n) {
     else snprintf(out, n, "%ldh %02ldm", t / 3600, t / 60 % 60);
 }
 
-// masked: il token a schermo solo per metà (chi guarda lo schermo non lo legge); la copia è completa
+// masked: il token a schermo solo in parte (chi guarda lo schermo non lo legge); la copia è completa
 static void example_text(ServerPanel* p, char* out, size_t n, bool masked) {
     const char* url = p->srv ? p->url : "http://127.0.0.1:8484/api/v1";
     char auth[120] = "";
@@ -378,229 +410,267 @@ static void example_text(ServerPanel* p, char* out, size_t n, bool masked) {
     snprintf(out, n, "curl %s/query -H \"Content-Type: application/json\"%s -d \"{\\\"sql\\\": \\\"SHOW DATABASES\\\"}\"", url, auth);
 }
 
-void server_panel_draw(ServerPanel* p, int W, int H) {
-    if (!p) return;
+static void draw_toolbar(ServerPanel* p, int W) {
     PlatformWindow* win = p->win;
-    memset(p->hit, 0, sizeof(p->hit));
-    platform_clear(win, TH_BG);
     bool running = p->srv != NULL;
-    bool editable = true;                          // le opzioni si cambiano anche col server attivo (riavvio)
+    platform_fill_rect(win, (Rect){0, 0, W, SP_TOOLBAR_H}, TH_SURFACE_2);
+    platform_fill_rect(win, (Rect){0, SP_TOOLBAR_H - 1, W, 1}, TH_BORDER);
+    int cy = SP_TOOLBAR_H / 2;
+    ui_icon_logo(win, 30, cy, 26);
+    int ty = ui_text_y(win, (Rect){0, 0, 0, SP_TOOLBAR_H}, 16, FONT_UI_BOLD);
+    int nw = platform_draw_text_ex(win, SV_NAME, -1, (Point){52, ty}, TH_TEXT, 16, FONT_UI_BOLD);
+    char ver[32];
+    snprintf(ver, sizeof(ver), "v%s", SV_VERSION_STR);
+    Rect vr = { 52 + nw + 8, cy - 9, platform_measure_text_ex(win, ver, -1, TH_FONT_SMALL, FONT_MONO) + 12, 18 };
+    platform_fill_rect_rounded(win, vr, TH_ELEVATED, 9);
+    platform_draw_text_ex(win, ver, -1, (Point){vr.x + 6, ui_text_y(win, vr, TH_FONT_SMALL, FONT_MONO)}, TH_TEXT_DIM, TH_FONT_SMALL, FONT_MONO);
 
-    // ── intestazione ──
-    Rect head = { 0, 0, W, 56 };
-    platform_fill_rect(win, head, TH_SURFACE);
-    platform_fill_rect(win, (Rect){0, 55, W, 1}, TH_BORDER);
-    ui_icon_logo(win, 30, 28, 26);
-    platform_draw_text_ex(win, SV_NAME, -1, (Point){52, ui_text_y(win, head, 16, FONT_UI_BOLD)}, TH_TEXT, 16, FONT_UI_BOLD);
-    int tx = 52 + platform_measure_text_ex(win, SV_NAME, -1, 16, FONT_UI_BOLD) + 10;
-    platform_draw_text_ex(win, "API server", -1, (Point){tx, ui_text_y(win, head, TH_FONT_UI, FONT_UI)}, TH_TEXT_MUTED, TH_FONT_UI, FONT_UI);
-    const char* ed = "Open SQL editor";
-    int ew = button_w(p, ed);
-    button(p, HIT_EDITOR, (Rect){W - ew - 16, 12, ew, 32}, ed, BTN_NORMAL, true);
+    // pulsanti: avvia / ferma, copia indirizzo (come Run e Run statement)
+    int x = vr.x + vr.w + 24;
+    Button* t = p->btn_toggle;
+    if (t) {
+        button_set_label(t, running ? "Stop server" : "Start server");
+        button_set_style(t, running ? BUTTON_STYLE_SECONDARY : BUTTON_STYLE_PRIMARY);
+        button_set_icon(t, running ? BUTTON_ICON_STOP : BUTTON_ICON_PLAY, running ? TH_ERROR : (Color){0, 0, 0, 0});
+        int w = button_preferred_width(t, win);
+        t->base.bounds = (Rect){x, cy - 16, w, 32};
+        widget_draw((Widget*)t, win);
+        x += w + 8;
+    }
+    if (p->btn_copy) {
+        button_set_label(p->btn_copy, p->flash_hit == HIT_COPY_URL && p->flash_until ? "Copied" : "Copy address");
+        button_set_enabled(p->btn_copy, running);
+        int w = button_preferred_width(p->btn_copy, win);
+        p->btn_copy->base.bounds = (Rect){x, cy - 16, w, 32};
+        widget_draw((Widget*)p->btn_copy, win);
+        x += w;
+    }
 
-    int pad = 20, cw = SV_MIN(1180, W - 2 * pad), x0 = (W - cw) / 2, y = 56 + 16;
+    // a destra: Open SQL editor e la pillola dello stato (come quella del database)
+    int right = W - 16;
+    if (p->btn_editor) {
+        int w = button_preferred_width(p->btn_editor, win);
+        right -= w;
+        p->btn_editor->base.bounds = (Rect){right, cy - 16, w, 32};
+        widget_draw((Widget*)p->btn_editor, win);
+        right -= 10;
+    }
+    char st[96];
+    if (running) snprintf(st, sizeof(st), "%s \xc2\xb7 port %d", p->stats.busy ? "Busy" : "Running", g_settings.server_port);
+    else snprintf(st, sizeof(st), "%s", p->error[0] ? "Not running" : "Stopped");
+    int sw = platform_measure_text_ex(win, st, -1, TH_FONT_UI, FONT_UI_BOLD);
+    Rect pill = { right - (sw + 40), cy - 15, sw + 40, 30 };
+    if (pill.x > x + 16) {
+        ui_round_box(win, pill, TH_ELEVATED, TH_BORDER_STRONG, 15);
+        Color dot = running ? (p->stats.busy ? TH_WARNING : TH_SUCCESS) : p->error[0] ? TH_ERROR : TH_TEXT_FAINT;
+        ui_circle(win, pill.x + 17, cy, 4, dot);
+        platform_draw_text_ex(win, st, -1, (Point){pill.x + 28, ui_text_y(win, pill, TH_FONT_UI, FONT_UI_BOLD)},
+                              running ? TH_TEXT : TH_TEXT_DIM, TH_FONT_UI, FONT_UI_BOLD);
+    }
+}
 
-    // ── stato ──
-    Rect sc = { x0, y, cw, p->lan_url[0] && running ? 108 : 92 };
-    card(win, sc);
-    Color dot = running ? TH_SUCCESS : p->error[0] ? TH_ERROR : TH_TEXT_FAINT;
-    if (running && p->stats.busy) dot = TH_WARNING;
-    ui_circle(win, sc.x + 24, sc.y + 26, 6, dot);
-    if (running) ui_circle(win, sc.x + 24, sc.y + 26, 10, ui_alpha(dot, 50));
-    const char* st = running ? (p->stats.busy ? "Running \xc2\xb7 executing a request" : "Running")
-                   : p->error[0] ? "Not running" : "Stopped";
-    platform_draw_text_ex(win, st, -1, (Point){sc.x + 42, sc.y + 16}, TH_TEXT, 16, FONT_UI_BOLD);
-    int bx = sc.x + sc.w - 16;
-    const char* tl = running ? "Stop server" : "Start server";
-    int tw = button_w(p, tl);
-    bx -= tw;
-    button(p, HIT_TOGGLE, (Rect){bx, sc.y + 14, tw, 32}, tl, running ? BTN_DANGER : BTN_PRIMARY, true);
-    int text_max = bx - (sc.x + 42) - 16;
+static void draw_sidebar(ServerPanel* p, int SW, int H) {
+    PlatformWindow* win = p->win;
+    int top = SP_TOOLBAR_H, bottom = H - SP_FOOTER_H;
+    platform_fill_rect(win, (Rect){0, top, SW, bottom - top}, TH_SURFACE);
+    Rect hdr = { 0, top, SW - 1, SP_HEADER_H };
+    platform_draw_text_ex(win, "SERVER", -1, (Point){18, ui_text_y(win, hdr, TH_FONT_SMALL, FONT_UI_BOLD)}, TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI_BOLD);
+    platform_fill_rect(win, (Rect){SW - 1, top, 1, bottom - top}, TH_BORDER);
+    platform_set_clip(win, (Rect){0, top, SW - 1, bottom - top});
+
+    int x = 18, w = SW - 36, y = top + SP_HEADER_H + 4;
+    char buf[64];
+    bool running = p->srv != NULL;
+
+    // indirizzi
+    y = section_label(win, "ADDRESS", x, y);
     if (running) {
-        const char* cu = "Copy";
-        int cuw = button_w(p, cu);
-        int ux = sc.x + 42, uy = sc.y + 54;
-        int uw = platform_measure_text_ex(win, p->url, -1, 15, FONT_MONO);
-        platform_draw_text_ex(win, p->url, -1, (Point){ux, uy}, TH_ACCENT_TEXT, 15, FONT_MONO);
-        button(p, HIT_COPY_URL, (Rect){ux + uw + 12, uy - 6, cuw, 28}, cu, BTN_NORMAL, true);
+        int cw = link_w(p, "Copy");
+        ui_text_clipped(win, p->url, x, y + 4, w - cw - 4, TH_ACCENT_TEXT, TH_FONT_SMALL + 1, FONT_MONO);
+        link_btn(p, HIT_COPY_URL, (Rect){x + w - cw, y, cw, 24}, "Copy", true);
+        y += 26;
         if (p->lan_url[0]) {
-            uy += 30;
-            int lw = platform_measure_text_ex(win, p->lan_url, -1, 15, FONT_MONO);
-            platform_draw_text_ex(win, p->lan_url, -1, (Point){ux, uy}, TH_TEXT, 15, FONT_MONO);
-            button(p, HIT_COPY_LAN, (Rect){ux + lw + 12, uy - 6, cuw, 28}, cu, BTN_NORMAL, true);
-            platform_draw_text_ex(win, "(local network)", -1, (Point){ux + lw + cuw + 24, uy + 1}, TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI);
+            ui_text_clipped(win, p->lan_url, x, y + 4, w - cw - 4, TH_TEXT, TH_FONT_SMALL + 1, FONT_MONO);
+            link_btn(p, HIT_COPY_LAN, (Rect){x + w - cw, y, cw, 24}, "Copy", true);
+            y += 26;
         }
     } else {
-        const char* msg = p->error[0] ? p->error : "Start the server to let web and desktop apps use this database.";
-        ui_text_clipped(win, msg, sc.x + 42, sc.y + 54, SV_MAX(80, text_max), p->error[0] ? TH_ERROR_TEXT : TH_TEXT_MUTED, TH_FONT_UI, FONT_UI);
+        y += text_wrap(win, p->error[0] ? p->error : "Not running. Press F5 or Start server.", x, y + 4, w,
+                       p->error[0] ? TH_ERROR_TEXT : TH_TEXT_FAINT, TH_FONT_SMALL + 1) + 2;
     }
-    y += sc.h + 12;
+    y += 14;
 
-    // ── statistiche ──
-    char v[5][32];
-    snprintf(v[0], 32, "%lld", running ? p->stats.requests : 0LL);
-    snprintf(v[1], 32, "%lld", running ? p->stats.errors : 0LL);
-    snprintf(v[2], 32, "%lld", running ? p->stats.rows_sent : 0LL);
-    snprintf(v[3], 32, "%d", running ? p->stats.connections : 0);
-    if (running) format_uptime(p->stats.uptime_s, v[4], 32); else snprintf(v[4], 32, "\xe2\x80\x94");
-    static const char* const LBL[5] = { "Requests", "Errors", "Rows sent", "Connections", "Uptime" };
-    int tiles = cw >= 620 ? 5 : 3, tg = 12, tile_w = (cw - tg * (tiles - 1)) / tiles;
-    for (int i = 0; i < tiles; i++) {
-        int k = tiles == 5 ? i : (int[]){0, 1, 4}[i];
-        Rect t = { x0 + i * (tile_w + tg), y, tile_w, 64 };
-        card(win, t);
-        platform_draw_text_ex(win, LBL[k], -1, (Point){t.x + 14, t.y + 10}, TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI);
-        Color c = (k == 1 && running && p->stats.errors) ? TH_ERROR_TEXT : TH_TEXT;
-        platform_draw_text_ex(win, v[k], -1, (Point){t.x + 14, t.y + 30}, c, 20, FONT_UI_BOLD);
+    // opzioni
+    y = section_label(win, "PORT", x, y);
+    snprintf(buf, sizeof(buf), "%d", g_settings.server_port);
+    if (p->port_edit && !line_edit_focused(p->port_edit) && strcmp(p->port_edit->text, buf)) line_edit_set_text(p->port_edit, buf);
+    stepper(p, HIT_PORT_MINUS, HIT_PORT_PLUS, (Rect){x, y, SV_MIN(w, 170), 28}, buf, p->port_edit ? (Widget*)p->port_edit : NULL);
+    y += 28 + 16;
+
+    y = section_label(win, "REACHABLE FROM", x, y);
+    segmented(p, HIT_ACCESS_LOCAL, (Rect){x, y, w, 28}, "This computer", "Local network", g_settings.server_lan ? 1 : 0, true);
+    y += 28 + 16;
+
+    y = section_label(win, "TOKEN", x, y);
+    bool forced = g_settings.server_lan || g_settings.server_cors;
+    segmented(p, HIT_TOKEN_OFF, (Rect){x, y, w, 28}, "Off", forced ? "Required (forced)" : "Required", token_required() ? 1 : 0, !forced);
+    y += 28 + 4;
+    if (token_required() && p->token[0]) {
+        int cw = link_w(p, "Copy"), nw2 = link_w(p, "New");
+        char shown[40];
+        snprintf(shown, sizeof(shown), "%.10s\xe2\x80\xa6", p->token);
+        ui_text_clipped(win, shown, x, y + 5, w - cw - nw2 - 8, TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_MONO);
+        link_btn(p, HIT_COPY_TOKEN, (Rect){x + w - cw - nw2 - 2, y, cw, 24}, "Copy", true);
+        link_btn(p, HIT_NEW_TOKEN, (Rect){x + w - nw2, y, nw2, 24}, "New", true);
+        y += 26;
     }
-    y += 64 + 12;
+    y += 12;
 
-    // ── opzioni ──
-    bool two = cw >= 900;
-    int rows = two ? 3 : 5, row_h = 40;
-    Rect oc = { x0, y, cw, 40 + rows * row_h + 8 };
-    card(win, oc);
-    platform_draw_text_ex(win, "Options", -1, (Point){oc.x + 16, oc.y + 12}, TH_TEXT, TH_FONT_UI, FONT_UI_BOLD);
-    platform_draw_text_ex(win, running ? "changes restart the server" : "saved for the next start", -1,
-                          (Point){oc.x + 16 + platform_measure_text_ex(win, "Options", -1, TH_FONT_UI, FONT_UI_BOLD) + 10, oc.y + 13},
-                          TH_TEXT_FAINT, TH_FONT_SMALL, FONT_UI);
-    int col_w = two ? (cw - 32) / 2 : cw - 32, lab_w = 150;
-    for (int item = 0; item < 5; item++) {
-        int col = two ? (item < 3 ? 0 : 1) : 0, row = two ? (item < 3 ? item : item - 3) : item;
-        int ix = oc.x + 16 + col * (col_w + (two ? 16 : 0)), iy = oc.y + 40 + row * row_h;
-        Rect lab = { ix, iy, lab_w, 30 };
-        Rect ctl = { ix + lab_w, iy, SV_MIN(260, col_w - lab_w), 30 };
-        static const char* const NAMES[5] = { "Port", "Reachable from", "Time limit", "Token", "Web apps (CORS)" };
-        platform_draw_text_ex(win, NAMES[item], -1, (Point){lab.x, ui_text_y(win, lab, TH_FONT_UI, FONT_UI)}, TH_TEXT_MUTED, TH_FONT_UI, FONT_UI);
-        char buf[32];
-        switch (item) {
-            case 0: {
-                Rect r = { ctl.x, ctl.y, SV_MIN(ctl.w, 170), 30 };
-                Rect m = { r.x, r.y, 30, 30 }, pl = { r.x + r.w - 30, r.y, 30, 30 };
-                button(p, HIT_PORT_MINUS, m, "\xe2\x88\x92", BTN_NORMAL, editable);
-                button(p, HIT_PORT_PLUS, pl, "+", BTN_NORMAL, editable);
-                if (p->port_edit) {
-                    if (!line_edit_focused(p->port_edit)) {
-                        snprintf(buf, sizeof(buf), "%d", g_settings.server_port);
-                        if (strcmp(p->port_edit->text, buf)) line_edit_set_text(p->port_edit, buf);
-                    }
-                    p->port_edit->base.bounds = (Rect){m.x + 34, r.y, r.w - 68, 30};
-                    p->port_edit->base.visible = true;
-                    widget_draw((Widget*)p->port_edit, win);
-                }
-                break;
-            }
-            case 1:
-                segmented(p, HIT_ACCESS_LOCAL, ctl, "This computer", "Local network", g_settings.server_lan ? 1 : 0, editable);
-                break;
-            case 2:
-                if (g_settings.server_timeout) snprintf(buf, sizeof(buf), "%d s", g_settings.server_timeout);
-                else snprintf(buf, sizeof(buf), "no limit");
-                stepper(p, HIT_TIME_MINUS, HIT_TIME_PLUS, (Rect){ctl.x, ctl.y, SV_MIN(ctl.w, 170), 30}, buf, editable);
-                break;
-            case 3: {
-                bool forced = g_settings.server_lan || g_settings.server_cors;
-                Rect sg = { ctl.x, ctl.y, SV_MIN(ctl.w, 170), 30 };
-                segmented(p, HIT_TOKEN_OFF, sg, "Off", "Required", token_required() ? 1 : 0, editable && !forced);
-                if (token_required()) {
-                    int bx2 = sg.x + sg.w + 8;
-                    int cw2 = button_w(p, "Copy"), nw = button_w(p, "New");
-                    int avail = ix + col_w - bx2;
-                    if (avail >= cw2 + nw + 8) {
-                        button(p, HIT_COPY_TOKEN, (Rect){bx2, ctl.y, cw2, 30}, "Copy", BTN_NORMAL, p->token[0] != 0);
-                        button(p, HIT_NEW_TOKEN, (Rect){bx2 + cw2 + 6, ctl.y, nw, 30}, "New", BTN_NORMAL, true);
-                        if (avail > cw2 + nw + 60 && p->token[0]) {
-                            char shown[24];
-                            snprintf(shown, sizeof(shown), "%.8s\xe2\x80\xa6", p->token);
-                            ui_text_clipped(win, shown, bx2 + cw2 + nw + 18, ui_text_y(win, ctl, TH_FONT_SMALL, FONT_MONO),
-                                            avail - cw2 - nw - 18, TH_TEXT_DIM, TH_FONT_SMALL, FONT_MONO);
-                        }
-                    }
-                }
-                break;
-            }
-            case 4:
-                segmented(p, HIT_CORS_OFF, (Rect){ctl.x, ctl.y, SV_MIN(ctl.w, 260), 30}, "Same origin", "Any origin",
-                          g_settings.server_cors ? 1 : 0, editable);
-                break;
-        }
-    }
-    y += oc.h + 12;
+    y = section_label(win, "WEB APPS (CORS)", x, y);
+    segmented(p, HIT_CORS_OFF, (Rect){x, y, w, 28}, "Same origin", "Any origin", g_settings.server_cors ? 1 : 0, true);
+    y += 28 + 16;
 
-    // ── prova rapida ──
-    Rect xc = { x0, y, cw, 48 };
-    card(win, xc);
+    y = section_label(win, "TIME LIMIT", x, y);
+    if (g_settings.server_timeout) snprintf(buf, sizeof(buf), "%d s", g_settings.server_timeout);
+    else snprintf(buf, sizeof(buf), "none");
+    stepper(p, HIT_TIME_MINUS, HIT_TIME_PLUS, (Rect){x, y, SV_MIN(w, 170), 28}, buf, NULL);
+    y += 28 + 16;
+
+    // prova rapida
+    y = section_label(win, "TRY IT", x, y);
     char ex[400];
     example_text(p, ex, sizeof(ex), true);
-    const char* cl = "Copy";
-    int clw = button_w(p, cl);
-    platform_draw_text_ex(win, "Try it", -1, (Point){xc.x + 16, ui_text_y(win, xc, TH_FONT_UI, FONT_UI_BOLD)}, TH_TEXT, TH_FONT_UI, FONT_UI_BOLD);
-    ui_text_clipped(win, ex, xc.x + 76, ui_text_y(win, xc, TH_FONT_SMALL + 1, FONT_MONO), xc.w - 76 - clw - 28, TH_TEXT_MUTED,
-                    TH_FONT_SMALL + 1, FONT_MONO);
-    button(p, HIT_COPY_EXAMPLE, (Rect){xc.x + xc.w - clw - 10, xc.y + 9, clw, 30}, cl, BTN_NORMAL, true);
-    y += xc.h + 12;
+    int cw = link_w(p, "Copy curl");
+    y += text_wrap(win, ex, x, y + 2, w, TH_TEXT_MUTED, TH_FONT_SMALL) + 2;
+    link_btn(p, HIT_COPY_EXAMPLE, (Rect){x - 8, y, cw, 24}, "Copy curl", true);
+    y += 30;
+    if (y < bottom - 24)
+        platform_draw_text_ex(win, running ? "Option changes restart the server" : "Saved in settings.ini", -1,
+                              (Point){x, y}, TH_TEXT_FAINT, TH_FONT_SMALL, FONT_UI);
+    platform_reset_clip(win);
+}
 
-    // ── registro delle richieste ──
-    Rect lc = { x0, y, cw, SV_MAX(110, H - y - 16) };
-    card(win, lc);
-    platform_draw_text_ex(win, "Requests", -1, (Point){lc.x + 16, lc.y + 12}, TH_TEXT, TH_FONT_UI, FONT_UI_BOLD);
+static void draw_requests(ServerPanel* p, int SW, int W, int H) {
+    PlatformWindow* win = p->win;
+    bool running = p->srv != NULL;
+    int x0 = SW, cw = W - SW, top = SP_TOOLBAR_H, bottom = H - SP_FOOTER_H;
+    platform_fill_rect(win, (Rect){x0, top, cw, bottom - top}, TH_EDITOR_BG);
+
+    // intestazione (come RESULTS)
+    Rect st = { x0, top, cw, SP_HEADER_H };
+    platform_fill_rect(win, st, TH_SURFACE);
+    platform_fill_rect(win, (Rect){x0, st.y + st.h - 1, cw, 1}, TH_BORDER);
+    platform_draw_text_ex(win, "REQUESTS", -1, (Point){x0 + 18, ui_text_y(win, st, TH_FONT_SMALL, FONT_UI_BOLD)}, TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI_BOLD);
+    int hx = x0 + 18 + platform_measure_text_ex(win, "REQUESTS", -1, TH_FONT_SMALL, FONT_UI_BOLD) + 14;
+    Color dot = running ? (p->stats.errors ? TH_WARNING : TH_SUCCESS) : TH_TEXT_FAINT;
+    ui_circle(win, hx + 4, st.y + st.h / 2, 4, dot);
+    char msg[200], up[32];
+    if (running) {
+        format_uptime(p->stats.uptime_s, up, sizeof(up));
+        snprintf(msg, sizeof(msg), "%lld request%s \xc2\xb7 %lld error%s \xc2\xb7 %lld rows sent \xc2\xb7 %d open \xc2\xb7 up %s",
+                 p->stats.requests, p->stats.requests == 1 ? "" : "s", p->stats.errors, p->stats.errors == 1 ? "" : "s",
+                 p->stats.rows_sent, p->stats.connections, up);
+    } else snprintf(msg, sizeof(msg), "Server stopped");
+    int clw = link_w(p, "Clear");
     int shown = 0;
     for (int i = 0; i < p->nlog; i++) if (p->log[i].seq > p->log_cleared) shown++;
-    char cnt[64];
-    snprintf(cnt, sizeof(cnt), shown ? "last %d" : "none yet", shown);
-    platform_draw_text_ex(win, cnt, -1, (Point){lc.x + 16 + platform_measure_text_ex(win, "Requests", -1, TH_FONT_UI, FONT_UI_BOLD) + 10, lc.y + 13},
-                          TH_TEXT_FAINT, TH_FONT_SMALL, FONT_UI);
-    int clrw = button_w(p, "Clear");
-    button(p, HIT_CLEAR_LOG, (Rect){lc.x + lc.w - clrw - 10, lc.y + 7, clrw, 26}, "Clear", BTN_GHOST, shown > 0);
+    link_btn(p, HIT_CLEAR_LOG, (Rect){x0 + cw - clw - 12, st.y + 7, clw, st.h - 14}, "Clear", shown > 0);
+    ui_text_clipped(win, msg, hx + 16, ui_text_y(win, st, TH_FONT_UI, FONT_UI), x0 + cw - clw - 28 - (hx + 16),
+                    TH_TEXT, TH_FONT_UI, FONT_UI);
 
-    // colonne: tempo, client, metodo, percorso, stato, ms, dettaglio
-    static const char* const COLS[7] = { "Time", "Client", "Method", "Path", "Status", "ms", "SQL / message" };
+    // griglia del registro
+    static const char* const COLS[7] = { "time", "client", "method", "path", "status", "ms", "sql / message" };
+    int widths[6] = { 78, 118, 66, 190, 60, 64 };
+    if (cw < 820) { widths[1] = 0; widths[3] = 150; }
+    if (cw < 600) { widths[2] = 0; widths[5] = 0; }
     int cx[8];
-    int widths[6] = { 72, 112, 62, 170, 56, 64 };
-    if (cw < 760) { widths[1] = 0; widths[3] = 130; }
-    cx[0] = lc.x + 16;
+    cx[0] = x0 + 16;
     for (int i = 0; i < 6; i++) cx[i + 1] = cx[i] + widths[i];
-    cx[7] = lc.x + lc.w - 16;
-    int hy = lc.y + 40;
-    platform_fill_rect(win, (Rect){lc.x + 1, hy, lc.w - 2, 24}, TH_SURFACE_2);
+    cx[7] = x0 + cw - 12;
+    Rect gh = { x0, top + SP_HEADER_H, cw, 30 };
+    platform_fill_rect(win, gh, TH_SURFACE_2);
+    platform_fill_rect(win, (Rect){x0, gh.y + gh.h - 1, cw, 1}, TH_BORDER);
     for (int i = 0; i < 7; i++) {
         if (cx[i + 1] - cx[i] <= 0) continue;
-        platform_draw_text_ex(win, COLS[i], -1, (Point){cx[i], ui_text_y(win, (Rect){0, hy, 0, 24}, TH_FONT_SMALL, FONT_UI_BOLD)},
-                              TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI_BOLD);
+        platform_draw_text_ex(win, COLS[i], -1, (Point){cx[i], ui_text_y(win, gh, TH_FONT_SMALL + 1, FONT_UI_BOLD)},
+                              TH_TEXT_MUTED, TH_FONT_SMALL + 1, FONT_UI_BOLD);
     }
-    int ry = hy + 26, rh = 24;
-    p->log_rect = (Rect){lc.x, ry, lc.w, lc.y + lc.h - ry - 6};
-    int visible = SV_MAX(1, p->log_rect.h / rh);
+    int ry = gh.y + gh.h;
+    p->log_rect = (Rect){x0, ry, cw, bottom - ry};
+    int visible = SV_MAX(1, p->log_rect.h / SP_ROW_H);
     p->log_scroll = SV_CLAMP(p->log_scroll, 0, SV_MAX(0, shown - visible));
-    platform_set_clip(win, p->log_rect);
-    if (!shown) {
-        const char* empty = running ? "Waiting for the first request\xe2\x80\xa6 (try the curl command above)"
-                                    : "Requests appear here while the server is running.";
-        platform_draw_text_ex(win, empty, -1, (Point){lc.x + 16, ry + 8}, TH_TEXT_FAINT, TH_FONT_UI, FONT_UI);
+
+    if (!shown) {                                       // stato vuoto (come "No results yet")
+        int ccx = x0 + cw / 2, ccy = ry + (bottom - ry) / 2 - 30;
+        ui_icon_table(win, ccx, ccy, 34, TH_TEXT_FAINT);
+        const char* title = running ? "No requests yet" : "Server stopped";
+        const char* detail = running ? "Call the address from an app, or copy the curl command on the left"
+                                     : "Press F5 or Start server to accept requests from web and desktop apps";
+        int tw = platform_measure_text_ex(win, title, -1, TH_FONT_UI + 2, FONT_UI_BOLD);
+        platform_draw_text_ex(win, title, -1, (Point){ccx - tw / 2, ccy + 36}, TH_TEXT_MUTED, TH_FONT_UI + 2, FONT_UI_BOLD);
+        int dw = platform_measure_text_ex(win, detail, -1, TH_FONT_UI, FONT_UI);
+        ui_text_clipped(win, detail, SV_MAX(x0 + 16, ccx - dw / 2), ccy + 62, cw - 32, TH_TEXT_DIM, TH_FONT_UI, FONT_UI);
+        return;
     }
+    platform_set_clip(win, p->log_rect);
     int row = 0;
     for (int i = 0; i < p->nlog; i++) {
         const SvLogEntry* e = &p->log[i];
         if (e->seq <= p->log_cleared) continue;
         if (row++ < p->log_scroll) continue;
-        int yy = ry + (row - 1 - p->log_scroll) * rh;
-        if (yy > p->log_rect.y + p->log_rect.h) break;
-        Rect rr = { lc.x + 1, yy, lc.w - 2, rh };
+        int yy = ry + (row - 1 - p->log_scroll) * SP_ROW_H;
+        if (yy > bottom) break;
+        Rect rr = { x0, yy, cw, SP_ROW_H };
         if ((row & 1) == 0) platform_fill_rect(win, rr, TH_ROW_ODD);
+        platform_fill_rect(win, (Rect){x0, yy + SP_ROW_H - 1, cw, 1}, ui_alpha(TH_BORDER, 120));
         int ty = ui_text_y(win, rr, TH_FONT_SMALL + 1, FONT_MONO);
         char ms[24], status[8];
         snprintf(ms, sizeof(ms), "%.1f", e->ms);
         snprintf(status, sizeof(status), "%d", e->status);
-        Color sc2 = e->status >= 500 ? TH_ERROR_TEXT : e->status >= 400 ? TH_WARNING : TH_SUCCESS;
+        Color sc = e->status >= 500 ? TH_ERROR_TEXT : e->status >= 400 ? TH_WARNING : TH_SUCCESS;
         const char* vals[7] = { e->when, e->client, e->method, e->path, status, ms, e->detail };
         for (int k = 0; k < 7; k++) {
-            int w = cx[k + 1] - cx[k] - 8;
-            if (w <= 0) continue;
-            Color c = k == 4 ? sc2 : k == 6 ? TH_TEXT_MUTED : TH_TEXT;
-            ui_text_clipped(win, vals[k], cx[k], ty, w, c, TH_FONT_SMALL + 1, FONT_MONO);
+            int cwk = cx[k + 1] - cx[k] - 10;
+            if (cwk <= 0) continue;
+            Color c = k == 4 ? sc : k == 6 ? (e->status >= 400 ? TH_ERROR_TEXT : TH_CELL_TEXT) : k == 0 ? TH_TEXT_DIM : TH_CELL_TEXT;
+            ui_text_clipped(win, vals[k], cx[k], ty, cwk, c, TH_FONT_SMALL + 1, FONT_MONO);
         }
     }
     platform_reset_clip(win);
+}
+
+static void draw_footer(ServerPanel* p, int W, int H) {
+    PlatformWindow* win = p->win;
+    Rect f = { 0, H - SP_FOOTER_H, W, SP_FOOTER_H };
+    platform_fill_rect(win, f, TH_SURFACE_2);
+    platform_fill_rect(win, (Rect){0, f.y, W, 1}, TH_BORDER);
+    int fs = TH_FONT_SMALL + 1, ty = ui_text_y(win, f, fs, FONT_UI), cy = f.y + SP_FOOTER_H / 2;
+    bool running = p->srv != NULL;
+    const char* help = "F5 Start / Stop";
+    int hw = platform_measure_text_ex(win, help, -1, fs, FONT_UI_BOLD);
+    platform_draw_text_ex(win, help, -1, (Point){W - 16 - hw, ty}, TH_ACCENT_TEXT, fs, FONT_UI_BOLD);
+    char buf[200];
+    snprintf(buf, sizeof(buf), "%s engine %s", SV_NAME, SV_VERSION_STR);
+    int x = 16;
+    ui_circle(win, x + 3, cy, 3, running ? TH_SUCCESS : TH_TEXT_FAINT);
+    x += 12;
+    x += platform_draw_text_ex(win, buf, -1, (Point){x, ty}, TH_TEXT_DIM, fs, FONT_UI) + 18;
+    snprintf(buf, sizeof(buf), "API server %s", running ? "running" : "stopped");
+    x += platform_draw_text_ex(win, buf, -1, (Point){x, ty}, running ? TH_TEXT_MUTED : TH_TEXT_DIM, fs, FONT_UI) + 18;
+    snprintf(buf, sizeof(buf), "%s%s%s", g_settings.server_lan ? "local network" : "this computer only",
+             token_required() ? " \xc2\xb7 token required" : "", g_settings.server_cors ? " \xc2\xb7 CORS any origin" : "");
+    ui_text_clipped(win, buf, x, ty, W - 16 - hw - 18 - x, TH_TEXT_DIM, fs, FONT_UI);
+}
+
+void server_panel_draw(ServerPanel* p, int W, int H) {
+    if (!p) return;
+    memset(p->hit, 0, sizeof(p->hit));
+    platform_clear(p->win, TH_BG);
+    int SW = W >= 900 ? SP_SIDEBAR_W : SV_MAX(220, W * 32 / 100);
+    draw_requests(p, SW, W, H);
+    draw_sidebar(p, SW, H);
+    draw_toolbar(p, W);
+    draw_footer(p, W, H);
 }
 
 // ── eventi ──────────────────────────────────────────────────────
@@ -623,9 +693,26 @@ static void commit_port(ServerPanel* p) {
     }
 }
 
+static void toggle(ServerPanel* p) {
+    if (p->srv) server_panel_stop(p);
+    else server_panel_start(p);
+}
+
 ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
     if (!p) return VIEW_NONE;
     LineEdit* pe = p->port_edit;
+    Widget* btns[3] = { (Widget*)p->btn_toggle, (Widget*)p->btn_copy, (Widget*)p->btn_editor };
+
+    // pulsanti della toolbar (stesso widget dell'editor: hover, pressione, click al rilascio)
+    if (evt->type == EVT_MOUSE_MOVE || evt->type == EVT_MOUSE_DOWN || evt->type == EVT_MOUSE_UP) {
+        p->pending = ACT_NONE;
+        for (int i = 0; i < 3; i++) if (btns[i]) widget_handle_event(btns[i], evt);
+        int act = p->pending;
+        p->pending = ACT_NONE;
+        if (act == ACT_EDITOR) return VIEW_OPEN_EDITOR;
+        if (act == ACT_TOGGLE) { toggle(p); return VIEW_REDRAW; }
+        if (act == ACT_COPY && p->srv) { copy_text(p, HIT_COPY_URL, p->url); return VIEW_REDRAW; }
+    }
     if (evt->type == EVT_MOUSE_MOVE) {
         p->mx = evt->mouse_x; p->my = evt->mouse_y;
         if (pe) widget_handle_event((Widget*)pe, evt);
@@ -648,15 +735,12 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
         return VIEW_REDRAW;
     }
     if (evt->type == EVT_KEY_DOWN) {
+        if (evt->key == KEY_F5) { toggle(p); return VIEW_REDRAW; }
         if (evt->key == KEY_DOWN) { p->log_scroll++; return VIEW_REDRAW; }
         if (evt->key == KEY_UP && p->log_scroll > 0) { p->log_scroll--; return VIEW_REDRAW; }
         if (evt->key == KEY_PAGEDOWN) { p->log_scroll += 10; return VIEW_REDRAW; }
         if (evt->key == KEY_PAGEUP) { p->log_scroll = SV_MAX(0, p->log_scroll - 10); return VIEW_REDRAW; }
         if (evt->key == KEY_HOME) { p->log_scroll = 0; return VIEW_REDRAW; }
-        if (evt->key == KEY_F5) {                      // F5 = avvia / ferma
-            if (p->srv) server_panel_stop(p); else server_panel_start(p);
-            return VIEW_REDRAW;
-        }
         return VIEW_NONE;
     }
     if (evt->type != EVT_MOUSE_DOWN || evt->mouse_button != SV_MOUSE_LEFT) return VIEW_NONE;
@@ -674,8 +758,6 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
     for (int i = 0; i < HIT_COUNT && hit < 0; i++) if (in_rect(p->hit[i], x, y)) hit = i;
     char ex[400];
     switch (hit) {
-        case HIT_EDITOR: return VIEW_OPEN_EDITOR;
-        case HIT_TOGGLE: if (p->srv) server_panel_stop(p); else server_panel_start(p); break;
         case HIT_COPY_URL: copy_text(p, hit, p->url); break;
         case HIT_COPY_LAN: copy_text(p, hit, p->lan_url); break;
         case HIT_PORT_MINUS: case HIT_PORT_PLUS:

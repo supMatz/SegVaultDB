@@ -501,7 +501,7 @@ static void handle_query(SvServer* s, Request* rq, Response* rs) {
     }
 
     double t0 = now_ms();
-    one_line(rs->detail, sizeof(rs->detail), script);
+    one_line(rs->detail, sizeof(rs->detail), sql);   // con i '?': i valori dei parametri non finiscono nel registro
     exec_begin(s);
     // il database corrente si ripristina alla fine: una richiesta non cambia quello delle successive
     char prev_db[128] = "";
