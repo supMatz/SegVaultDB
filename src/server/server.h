@@ -22,10 +22,34 @@ typedef struct {
     const char* static_dir;   // se non NULL: file statici serviti fuori da /api (una web app)
     size_t      max_body;     // byte massimi del corpo di una richiesta (0 = 16 MB)
     int         max_clients;  // connessioni contemporanee (0 = 64)
+    int         timeout_ms;   // una richiesta che lavora più a lungo viene interrotta (0 = mai)
     bool        quiet;        // niente log delle richieste su stderr
 } SvServerConfig;
 
 typedef struct SvServer SvServer;
+
+// statistiche (per il pannello della GUI e GET /api/v1/status)
+typedef struct {
+    long long requests;       // richieste servite
+    long long errors;         // risposte 4xx / 5xx
+    long long rows_sent;      // righe restituite dalle query
+    int       connections;    // connessioni aperte adesso
+    double    uptime_s;
+    bool      busy;           // una richiesta sta usando il motore
+} SvStats;
+
+// una richiesta servita (registro delle ultime SV_LOG_MAX)
+#define SV_LOG_MAX 200
+typedef struct {
+    long long seq;            // numero progressivo (1 = la prima)
+    char      when[9];        // "HH:MM:SS"
+    char      method[8];
+    char      path[96];
+    char      client[48];     // indirizzo del client
+    char      detail[120];    // primo statement SQL o messaggio d'errore
+    int       status;
+    double    ms;
+} SvLogEntry;
 
 // apre il socket in ascolto (il motore deve essere già inizializzato con db_init)
 SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz);
@@ -33,5 +57,15 @@ int       sv_server_port(const SvServer* s);
 void      sv_server_run(SvServer* s);     // accetta connessioni finché non viene chiamato sv_server_stop
 void      sv_server_stop(SvServer* s);    // chiamabile da un altro thread o da un gestore di segnale
 void      sv_server_free(SvServer* s);    // chiude le connessioni rimaste e libera tutto
+
+// lettura thread-safe (copie): statistiche e ultime richieste, dalla più recente
+void      sv_server_stats(SvServer* s, SvStats* out);
+int       sv_server_recent(SvServer* s, SvLogEntry* out, int max);
+
+// token casuale (hex, 2*bytes caratteri + NUL) dalla sorgente casuale del sistema
+bool      sv_random_token(char* out, int bytes);
+
+// indirizzo IPv4 di questa macchina sulla rete locale (per mostrare l'URL raggiungibile da altri)
+bool      sv_local_ip(char* out, size_t n);
 
 #endif

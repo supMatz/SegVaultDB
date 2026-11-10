@@ -3677,6 +3677,9 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
     st.combos.w = w;
     Tuple* cur[MAX_SOURCES] = {0};
     #define AFAIL(...) do { snprintf(p->err, sizeof(p->err), __VA_ARGS__); arm_state_free(&st, p->nsrc); return false; } while (0)
+    // annullamento: controllato a ogni esecuzione, così si fermano anche le subquery
+    // correlate (eseguite una volta per riga esterna)
+    if (atomic_load(&g_sv_scan_cancel)) AFAIL("Query cancelled");
 
     // 1. righe di ogni sorgente che passano i filtri dipendenti dalla query esterna
     for (int s = 0; s < p->nsrc; s++) {

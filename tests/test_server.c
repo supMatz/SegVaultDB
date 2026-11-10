@@ -79,7 +79,7 @@ static Resp request(int port, const char* method, const char* path, const char* 
     if (fd < 0) return r;
     char head[4096];
     size_t bl = body ? strlen(body) : 0;
-    int n = snprintf(head, sizeof(head), "%s %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n%s%s", method, path, headers ? headers : "",
+    int n = snprintf(head, sizeof(head), "%s %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n%s%s", method, path, headers ? headers : "",
                      body ? "" : "\r\n");
     if (body) n += snprintf(head + n, sizeof(head) - (size_t)n, "Content-Length: %zu\r\n\r\n", bl);
     send_str(fd, head, (size_t)n);
@@ -153,7 +153,7 @@ int main(void) {
     pthread_t th;
     pthread_create(&th, NULL, run_server, s);
 
-    SvServerConfig cfg2 = { .port = 0, .token = "s3cret", .default_db = "t", .quiet = true };
+    SvServerConfig cfg2 = { .port = 0, .token = "s3cret", .default_db = "t", .quiet = true, .timeout_ms = 150 };
     SvServer* s2 = sv_server_start(&cfg2, err, sizeof(err));
     if (!s2) { printf("start 2: %s\n", err); return 1; }
     int port2 = sv_server_port(s2);
@@ -311,6 +311,37 @@ int main(void) {
         close(fd);
     }
 
+    // ── siti non ammessi: niente esecuzione (CSRF con text/plain, DNS rebinding) ──
+    r = request(port, "POST", "/api/v1/query?database=t", "Content-Type: text/plain\r\nOrigin: http://evil.example\r\n",
+                "DELETE FROM p");
+    CHECK(r.status == 403, "foreign origin rejected: %d %s", r.status, r.body);
+    resp_free(&r);
+    {
+        int fd = connect_to(port);
+        const char* q = "POST /api/v1/query?database=t HTTP/1.1\r\nHost: evil.example:8484\r\nContent-Type: text/plain\r\n"
+                        "Content-Length: 13\r\nConnection: close\r\n\r\nDELETE FROM p";
+        send_str(fd, q, strlen(q));
+        char* buf = NULL; size_t len = 0, cap = 0;
+        r = read_resp(fd, &buf, &len, &cap);
+        CHECK(r.status == 403, "rebinding host rejected: %d", r.status);
+        resp_free(&r); free(buf); close(fd);
+    }
+    {
+        char hdr[128];
+        snprintf(hdr, sizeof(hdr), "Origin: http://localhost:%d\r\nContent-Type: application/json\r\n", port);
+        int fd = connect_to(port);
+        char q[512];
+        const char* body = "{\"database\":\"t\",\"sql\":\"SELECT COUNT(*) FROM p\"}";
+        snprintf(q, sizeof(q), "POST /api/v1/query HTTP/1.1\r\nHost: localhost:%d\r\n%sContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
+                 port, hdr, strlen(body), body);
+        send_str(fd, q, strlen(q));
+        char* buf = NULL; size_t len = 0, cap = 0;
+        r = read_resp(fd, &buf, &len, &cap);
+        c = cell_at(&r, 0, 0, 0);
+        CHECK(r.status == 200 && c && c->number == 3, "same origin allowed, nothing deleted: %d %s", r.status, r.body);
+        resp_free(&r); free(buf); close(fd);
+    }
+
     // ── keep-alive e pipelining: tre richieste in un solo invio ──
     {
         int fd = connect_to(port);
@@ -341,6 +372,30 @@ int main(void) {
     CHECK(r.status == 404, "encoded traversal blocked: %d", r.status);
     resp_free(&r);
 
+    // ── una richiesta non cambia il database corrente delle successive ──
+    r = query(port, "{\"sql\":\"CREATE DATABASE t2; USE t2\"}");
+    CHECK(resp_ok(&r), "create t2: %s", r.body);
+    resp_free(&r);
+    r = query(port, "{\"sql\":\"SELECT COUNT(*) FROM p\"}");
+    c = cell_at(&r, 0, 0, 0);
+    CHECK(resp_ok(&r) && c && c->number == 3, "current database restored after USE: %s", r.body);
+    resp_free(&r);
+
+    // ── stato e registro ──
+    r = request(port, "GET", "/api/v1/status", NULL, NULL);
+    const JsonVal* nreq = json_get(r.json, "requests");
+    CHECK(resp_ok(&r) && nreq && nreq->number > 10, "status: %s", r.body);
+    resp_free(&r);
+    {
+        SvLogEntry log[3];
+        int n = sv_server_recent(s, log, 3);
+        CHECK(n == 3 && !strcmp(log[0].path, "/api/v1/status") && strstr(log[1].detail, "SELECT COUNT(*) FROM p")
+              && !strcmp(log[0].client, "127.0.0.1") && log[0].seq == log[1].seq + 1, "recent log: %d %s %s", n, log[0].path, log[1].detail);
+        SvStats st;
+        sv_server_stats(s, &st);
+        CHECK(st.requests >= 30 && st.errors >= 10 && st.rows_sent > 0, "stats: %lld %lld %lld", st.requests, st.errors, st.rows_sent);
+    }
+
     // ── token e database di default (secondo server) ──
     r = request(port2, "GET", "/api/v1/health", NULL, NULL);
     CHECK(r.status == 200, "health without token: %d", r.status);
@@ -366,9 +421,21 @@ int main(void) {
     CHECK(c && c->number == 200, "concurrent inserts: %s", r.body);
     resp_free(&r);
 
+    // ── timeout: una query troppo lunga viene fermata e il server resta utilizzabile ──
+    r = request(port2, "POST", "/api/v1/query", "Content-Type: application/json\r\nAuthorization: Bearer s3cret\r\n",
+                "{\"sql\":\"CREATE TABLE big (id INT, w INT); INSERT INTO big SELECT a.id * 10000 + b.id, a.w FROM conc a, conc b;"
+                " SELECT COUNT(*) FROM big a WHERE (SELECT COUNT(*) FROM big b WHERE b.w > a.w + b.id % 7) > 0\"}");
+    CHECK(r.status == 400 && strstr(err_msg(&r), "longer than"), "timeout: %s", r.body);
+    resp_free(&r);
+    r = request(port2, "POST", "/api/v1/query", "Content-Type: application/json\r\nAuthorization: Bearer s3cret\r\n", "{\"sql\":\"SELECT 5\"}");
+    c = cell_at(&r, 0, 0, 0);
+    CHECK(resp_ok(&r) && c && c->number == 5, "after timeout: %s", r.body);
+    resp_free(&r);
+
     // ── risultato grande: JSON valido ──
     r = query(port, "{\"database\":\"t\",\"sql\":\"SELECT a.id, b.id, a.w FROM conc a, conc b\"}");
-    const JsonVal* rc = json_get(&json_get(r.json, "results")->items[0], "row_count");
+    const JsonVal* rs0 = json_get(r.json, "results");
+    const JsonVal* rc = rs0 && rs0->count ? json_get(&rs0->items[0], "row_count") : NULL;
     CHECK(r.json && rc && rc->number == 40000, "large result parses: status %d", r.status);
     resp_free(&r);
 

@@ -26,20 +26,24 @@ static void usage(const char* argv0) {
            "Usage: %s [options] [data-directory]   (default data directory: ./data)\n\n"
            "  -p, --port N          TCP port (default 8484; 0 = any free port)\n"
            "  -b, --bind ADDR       IPv4 address to listen on (default 127.0.0.1 = this machine only)\n"
-           "  -t, --token TOKEN     require \"Authorization: Bearer TOKEN\" on /api (or env SEGVAULT_TOKEN)\n"
+           "  -t, --token TOKEN     require \"Authorization: Bearer TOKEN\" on /api (or env SEGVAULT_TOKEN);\n"
+           "                        \"auto\" generates a random token and prints it\n"
            "  -d, --database NAME   database used when a request does not name one\n"
            "      --cors ORIGIN     allow browser calls from ORIGIN (e.g. http://localhost:5173, or *)\n"
            "      --static DIR      also serve the files in DIR (a web app) outside /api\n"
            "      --max-body MB     largest request body (default 16)\n"
+           "      --timeout S       stop a request that runs longer than S seconds (default 30, 0 = never)\n"
            "      --no-auth         allow listening on a non-local address without a token\n"
            "  -q, --quiet           do not log requests\n"
            "  -h, --help            this help\n\n"
-           "API: GET /api/v1/health, POST /api/v1/query, GET /api/v1/databases[/DB/tables[/TABLE]]\n",
+           "API: GET /api/v1/health, GET /api/v1/status, POST /api/v1/query,\n"
+           "     GET /api/v1/databases[/DB/tables[/TABLE]]   (see docs/API.md)\n",
            SV_VERSION_STR, argv0);
 }
 
 int main(int argc, char** argv) {
-    SvServerConfig cfg = { .bind_addr = "127.0.0.1", .port = 8484 };
+    SvServerConfig cfg = { .bind_addr = "127.0.0.1", .port = 8484, .timeout_ms = 30000 };
+    char auto_token[65];
     const char* data_dir = "./data";
     bool no_auth = false;
     cfg.token = getenv("SEGVAULT_TOKEN");
@@ -56,6 +60,7 @@ int main(int argc, char** argv) {
         else if (ARG("--cors", "--cors")) cfg.cors_origin = argv[++i];
         else if (ARG("--static", "--static")) cfg.static_dir = argv[++i];
         else if (ARG("--max-body", "--max-body")) cfg.max_body = (size_t)atoi(argv[++i]) << 20;
+        else if (ARG("--timeout", "--timeout")) cfg.timeout_ms = atoi(argv[++i]) * 1000;
         else if (!strcmp(a, "--no-auth")) no_auth = true;
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) cfg.quiet = true;
         else if (a[0] == '-') { fprintf(stderr, "unknown or incomplete option: %s (see --help)\n", a); return 2; }
@@ -63,6 +68,12 @@ int main(int argc, char** argv) {
         #undef ARG
     }
     if (cfg.port < 0 || cfg.port > 65535) { fprintf(stderr, "invalid port\n"); return 2; }
+    if (cfg.timeout_ms < 0) cfg.timeout_ms = 0;
+    if (cfg.token && !strcmp(cfg.token, "auto")) {
+        if (!sv_random_token(auto_token, 24)) { fprintf(stderr, "cannot generate a random token\n"); return 1; }
+        cfg.token = auto_token;
+        printf("token: %s\n", auto_token);
+    }
 
     // una porta aperta sulla rete senza token = chiunque esegue SQL arbitrario
     bool local = !strncmp(cfg.bind_addr, "127.", 4);

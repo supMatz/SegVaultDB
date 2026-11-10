@@ -2,6 +2,9 @@
 SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h.
        Nessuna dipendenza esterna. Vedi server.h e docs/API.md.
 */
+#ifdef _WIN32
+  #define _CRT_RAND_S                 // rand_s(): numeri casuali del sistema (token)
+#endif
 #include "server.h"
 #include "json.h"
 #include "../bridge/db_api.h"
@@ -16,6 +19,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #ifdef _WIN32
   #include <winsock2.h>
@@ -72,12 +76,19 @@ struct SvServer {
     sock_t*        conns;               // socket aperti (per chiuderli allo stop)
     int            active;
     sv_mutex       exec_mx;             // una richiesta alla volta sul motore
+    // statistiche e registro (protetti da conn_mx)
+    double         started_ms;
+    long long      n_requests, n_errors, n_rows;
+    double         exec_since;          // inizio della richiesta che usa il motore (0 = libero)
+    bool           timed_out;           // il watchdog ha interrotto la richiesta in corso
+    SvLogEntry     log[SV_LOG_MAX];     // anello: log[(seq - 1) % SV_LOG_MAX]
 };
 
 typedef struct {
     SvServer* s;
     sock_t    fd;
     int       slot;
+    char      client[48];
 } Conn;
 
 // ── richiesta / risposta ────────────────────────────────────────
@@ -94,6 +105,7 @@ typedef struct {
     char   content_type[128];
     char   auth[512];
     char   origin[256];
+    char   host[256];
     char*  body;                        // NUL-terminato
     size_t body_len;
 } Request;
@@ -104,6 +116,8 @@ typedef struct {
     JsonBuf     body;
     const char* extra_headers;          // righe "Nome: valore\r\n" già formattate
     bool        close;
+    char        detail[120];            // per il registro: SQL eseguito o errore
+    long long   rows;                   // righe restituite
 } Response;
 
 static const char* status_text(int st) {
@@ -112,6 +126,7 @@ static const char* status_text(int st) {
         case 204: return "No Content";
         case 400: return "Bad Request";
         case 401: return "Unauthorized";
+        case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 408: return "Request Timeout";
@@ -171,6 +186,18 @@ static bool send_response(SvServer* s, sock_t fd, const Request* rq, Response* r
     return head_only || blen == 0 || send_all(fd, rs->body.data, blen);
 }
 
+// testo su una riga, accorciato (per il registro)
+static void one_line(char* out, size_t outsz, const char* s) {
+    size_t k = 0;
+    bool sp = false;
+    for (; *s && k + 4 < outsz; s++) {
+        if (isspace((unsigned char)*s)) { if (k && !sp) out[k++] = ' '; sp = true; }
+        else { out[k++] = *s; sp = false; }
+    }
+    if (*s) { memcpy(out + k, "...", 3); k += 3; }
+    out[k] = '\0';
+}
+
 static void json_error(Response* rs, int status, const char* fmt, ...) __attribute__((format(printf, 3, 4)));
 static void json_error(Response* rs, int status, const char* fmt, ...) {
     char msg[1024];
@@ -180,6 +207,7 @@ static void json_error(Response* rs, int status, const char* fmt, ...) {
     va_end(ap);
     rs->status = status;
     rs->body.len = 0;
+    one_line(rs->detail, sizeof(rs->detail), msg);
     jb_lit(&rs->body, "{\"ok\":false,\"error\":{\"message\":");
     jb_str(&rs->body, msg);
     jb_lit(&rs->body, "}}");
@@ -388,6 +416,31 @@ static bool in_transaction(void) {
     return r;
 }
 
+// il motore è occupato da questa richiesta: il watchdog (sv_server_run) la può interrompere
+static void exec_begin(SvServer* s) {
+    mx_lock(&s->exec_mx);
+    mx_lock(&s->conn_mx);
+    s->exec_since = now_ms();
+    s->timed_out = false;
+    mx_unlock(&s->conn_mx);
+}
+
+static bool exec_timed_out(SvServer* s) {
+    mx_lock(&s->conn_mx);
+    bool t = s->timed_out;
+    mx_unlock(&s->conn_mx);
+    return t;
+}
+
+static void exec_end(SvServer* s) {
+    mx_lock(&s->conn_mx);
+    s->exec_since = 0;
+    if (s->timed_out) db_clear_cancel();
+    s->timed_out = false;
+    mx_unlock(&s->conn_mx);
+    mx_unlock(&s->exec_mx);
+}
+
 // ── POST /api/v1/query ──────────────────────────────────────────
 
 static void handle_query(SvServer* s, Request* rq, Response* rs) {
@@ -448,7 +501,12 @@ static void handle_query(SvServer* s, Request* rq, Response* rs) {
     }
 
     double t0 = now_ms();
-    mx_lock(&s->exec_mx);
+    one_line(rs->detail, sizeof(rs->detail), script);
+    exec_begin(s);
+    // il database corrente si ripristina alla fine: una richiesta non cambia quello delle successive
+    char prev_db[128] = "";
+    const char* cur = db_current_database();
+    if (cur) snprintf(prev_db, sizeof(prev_db), "%s", cur);
 
     JsonBuf res = {0}, *b = &res;               // i risultati; la risposta si compone alla fine
     bool failed = false, first = true;
@@ -478,16 +536,19 @@ static void handle_query(SvServer* s, Request* rq, Response* rs) {
         script[e] = '\0';
         QueryResult* r = db_execute(script + a);
         script[e] = saved;
-        if (!r || !r->success) {
+        bool timeout = exec_timed_out(s);
+        if (!r || !r->success || timeout) {
             failed = true;
             err_stmt = idx;
-            snprintf(errmsg, sizeof(errmsg), "%s", r ? r->error : "out of memory");
+            if (timeout) snprintf(errmsg, sizeof(errmsg), "the request took longer than %d ms and was stopped", s->cfg.timeout_ms);
+            else snprintf(errmsg, sizeof(errmsg), "%s", r ? r->error : "out of memory");
             if (r && r->error_line > 0) { err_line = line_of(script, a) + r->error_line - 1; err_col = r->error_col; }
             else err_line = line_of(script, a);
         } else {
             if (!first) jb_lit(b, ",");
             first = false;
             result_json(b, r, objects);
+            rs->rows += r->num_rows;
         }
         db_result_free(r);
         idx++;
@@ -501,7 +562,13 @@ static void handle_query(SvServer* s, Request* rq, Response* rs) {
         warning = failed ? "the open transaction was rolled back"
                          : "a transaction was left open and has been rolled back (end it with COMMIT)";
     }
-    mx_unlock(&s->exec_mx);
+    cur = db_current_database();
+    if (prev_db[0] && (!cur || strcmp(cur, prev_db))) {
+        char use[160];
+        snprintf(use, sizeof(use), "USE %s", prev_db);
+        db_result_free(db_execute(use));        // fallisce solo se il database è stato eliminato
+    }
+    exec_end(s);
 
     b = &rs->body;
     jb_raw(b, failed ? "{\"ok\":false,\"results\":[" : "{\"ok\":true,\"results\":[", failed ? 23 : 22);
@@ -510,6 +577,7 @@ static void handle_query(SvServer* s, Request* rq, Response* rs) {
     free(res.data);
     jb_lit(b, "]");
     if (failed) {
+        one_line(rs->detail, sizeof(rs->detail), errmsg);
         jb_lit(b, ",\"error\":{\"message\":");
         jb_str(b, errmsg);
         if (err_stmt >= 0) jb_printf(b, ",\"statement\":%d,\"line\":%d", err_stmt, err_line);
@@ -645,10 +713,38 @@ static void handle_static(SvServer* s, const Request* rq, Response* rs) {
 
 // ── instradamento ───────────────────────────────────────────────
 
+// "localhost", "127.x.x.x" o "[::1]", con o senza porta
+static bool is_loopback_host(const char* h) {
+    char name[256];
+    snprintf(name, sizeof(name), "%s", h);
+    char* colon = name[0] == '[' ? strchr(name, ']') : strrchr(name, ':');
+    if (colon && name[0] == '[') colon[1] = '\0';
+    else if (colon) *colon = '\0';
+    return !strcasecmp(name, "localhost") || !strncmp(name, "127.", 4) || !strcmp(name, "[::1]");
+}
+
+// Difesa dai siti aperti nel browser dell'utente:
+// - un'altra pagina può inviare un POST text/plain senza preflight CORS: con un Origin non
+//   ammesso la richiesta viene rifiutata prima di eseguire qualsiasi cosa;
+// - DNS rebinding (un dominio che punta a 127.0.0.1): senza token l'Host deve essere locale.
+static const char* origin_problem(SvServer* s, const Request* rq) {
+    if (!s->token && rq->host[0] && !is_loopback_host(rq->host) && !strncmp(s->cfg.bind_addr, "127.", 4))
+        return "Host not allowed (the server only answers to localhost)";
+    if (!rq->origin[0]) return NULL;                       // non da un browser (curl, app, backend)
+    if (s->cors && (!strcmp(s->cors, "*") || !strcmp(s->cors, rq->origin))) return NULL;
+    // stessa origine: la pagina è servita da questo server (--static)
+    const char* o = rq->origin;
+    if (!strncmp(o, "http://", 7) && rq->host[0] && !strcasecmp(o + 7, rq->host)) return NULL;
+    return "Origin not allowed (start the server with --cors to allow this web app)";
+}
+
 static void route(SvServer* s, Request* rq, Response* rs) {
     bool api = !strncmp(rq->path, API_PREFIX, sizeof(API_PREFIX) - 1) &&
                (rq->path[sizeof(API_PREFIX) - 1] == '\0' || rq->path[sizeof(API_PREFIX) - 1] == '/');
     const char* sub = api ? rq->path + sizeof(API_PREFIX) - 1 : NULL;
+
+    const char* bad_origin = api ? origin_problem(s, rq) : NULL;
+    if (bad_origin) { json_error(rs, 403, "%s", bad_origin); return; }
 
     if (!strcmp(rq->method, "OPTIONS")) {        // preflight CORS
         rs->status = 204;
@@ -662,7 +758,7 @@ static void route(SvServer* s, Request* rq, Response* rs) {
         jb_lit(&rs->body, "{\"ok\":true,\"server\":\"SegVault\",\"version\":\"" SV_VERSION_STR "\"}");
         return;
     }
-    if (api && s->token) {
+    if (api && s->token && strcmp(rq->method, "OPTIONS")) {
         const char* a = rq->auth;
         bool ok = !strncasecmp(a, "Bearer ", 7) && secret_equal(a + 7, s->token);
         if (!ok) {
@@ -673,6 +769,16 @@ static void route(SvServer* s, Request* rq, Response* rs) {
     }
     if (api) {
         rs->extra_headers = "Cache-Control: no-store\r\n";
+        if (!strcmp(sub, "/status")) {
+            SvStats st;
+            sv_server_stats(s, &st);
+            rs->status = 200;
+            jb_printf(&rs->body, "{\"ok\":true,\"version\":\"" SV_VERSION_STR "\",\"uptime_s\":%.0f,\"requests\":%lld,"
+                      "\"errors\":%lld,\"rows_sent\":%lld,\"connections\":%d,\"busy\":%s,\"timeout_ms\":%d}",
+                      st.uptime_s, st.requests, st.errors, st.rows_sent, st.connections, st.busy ? "true" : "false",
+                      s->cfg.timeout_ms);
+            return;
+        }
         if (!strcmp(sub, "/query")) {
             if (strcmp(rq->method, "POST")) { json_error(rs, 405, "use POST"); return; }
             handle_query(s, rq, rs);
@@ -754,6 +860,7 @@ static int parse_head(SvServer* s, char* head, Request* rq) {
             else if (!strcasecmp(p, "Content-Type"))  header_value(v, rq->content_type, sizeof(rq->content_type));
             else if (!strcasecmp(p, "Authorization")) header_value(v, rq->auth, sizeof(rq->auth));
             else if (!strcasecmp(p, "Origin"))        header_value(v, rq->origin, sizeof(rq->origin));
+            else if (!strcasecmp(p, "Host"))          header_value(v, rq->host, sizeof(rq->host));
         }
         p = e + 2;
     }
@@ -791,6 +898,31 @@ static bool fill(sock_t fd, InBuf* in, size_t need, volatile int* stop) {
     }
     in->data[in->len] = '\0';
     return true;
+}
+
+static void log_request(SvServer* s, const char* client, const Request* rq, const Response* rs, double ms) {
+    time_t now = time(NULL);
+    struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &now);
+#else
+    localtime_r(&now, &tmv);
+#endif
+    mx_lock(&s->conn_mx);
+    s->n_requests++;
+    if (rs->status >= 400) s->n_errors++;
+    s->n_rows += rs->rows;
+    SvLogEntry* e = &s->log[(s->n_requests - 1) % SV_LOG_MAX];
+    memset(e, 0, sizeof(*e));
+    e->seq = s->n_requests;
+    strftime(e->when, sizeof(e->when), "%H:%M:%S", &tmv);
+    snprintf(e->method, sizeof(e->method), "%s", rq->method);
+    one_line(e->path, sizeof(e->path), rq->path);
+    snprintf(e->client, sizeof(e->client), "%s", client);
+    one_line(e->detail, sizeof(e->detail), rs->detail);
+    e->status = rs->status;
+    e->ms = ms;
+    mx_unlock(&s->conn_mx);
 }
 
 static void serve_connection(Conn* c) {
@@ -837,9 +969,11 @@ static void serve_connection(Conn* c) {
         rs.close = !rq.keep_alive || s->stop;
         in.data[head_len + rq.content_length] = after;
         bool sent = send_response(s, c->fd, &rq, &rs);
+        double ms = now_ms() - t0;
         if (!s->cfg.quiet)
-            fprintf(stderr, "[segvault-server] %s %s -> %d (%zu bytes, %.1f ms)\n",
-                    rq.method, rq.path, rs.status, rs.body.len, now_ms() - t0);
+            fprintf(stderr, "[segvault-server] %s %s %s -> %d (%zu bytes, %.1f ms)\n",
+                    c->client, rq.method, rq.path, rs.status, rs.body.len, ms);
+        if (strcmp(rq.method, "OPTIONS")) log_request(s, c->client, &rq, &rs, ms);
         free(rs.body.data);
         if (!sent || rs.close) goto done;
         // richieste in coda (pipelining): si sposta il resto all'inizio
@@ -910,6 +1044,7 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
     mx_init(&s->exec_mx);
     if (!s->conns) { snprintf(err, errsz, "out of memory"); sv_server_free(s); return NULL; }
     for (int i = 0; i < s->cfg.max_clients; i++) s->conns[i] = BAD_SOCK;
+    s->started_ms = now_ms();
     if (s->default_db && !valid_ident(s->default_db)) { snprintf(err, errsz, "invalid default database name"); sv_server_free(s); return NULL; }
 
     struct sockaddr_in addr;
@@ -953,8 +1088,18 @@ void sv_server_run(SvServer* s) {
         FD_SET(s->listen_fd, &rd);
         struct timeval tv = { 0, 200000 };           // si ricontrolla stop 5 volte al secondo
         int r = select((int)s->listen_fd + 1, &rd, NULL, NULL, &tv);
+        // watchdog: una richiesta oltre timeout_ms viene interrotta (le SELECT si fermano subito,
+        // le modifiche alla fine dello statement in corso)
+        mx_lock(&s->conn_mx);
+        if (s->cfg.timeout_ms > 0 && s->exec_since > 0 && !s->timed_out && now_ms() - s->exec_since > s->cfg.timeout_ms) {
+            s->timed_out = true;
+            db_request_cancel();
+        }
+        mx_unlock(&s->conn_mx);
         if (r <= 0) continue;
-        sock_t fd = accept(s->listen_fd, NULL, NULL);
+        struct sockaddr_in peer;
+        socklen_t pl = sizeof(peer);
+        sock_t fd = accept(s->listen_fd, (struct sockaddr*)&peer, &pl);
         if (fd == BAD_SOCK) continue;
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
@@ -973,7 +1118,11 @@ void sv_server_run(SvServer* s) {
             continue;
         }
         Conn* c = malloc(sizeof(Conn));
-        if (c) { c->s = s; c->fd = fd; c->slot = slot; }
+        if (c) {
+            c->s = s; c->fd = fd; c->slot = slot;
+            const unsigned char* ip = (const unsigned char*)&peer.sin_addr.s_addr;
+            snprintf(c->client, sizeof(c->client), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+        }
         if (!c || !spawn(c)) {
             mx_lock(&s->conn_mx);
             s->conns[slot] = BAD_SOCK;
@@ -1012,4 +1161,66 @@ void sv_server_free(SvServer* s) {
 #ifdef _WIN32
     WSACleanup();
 #endif
+}
+
+void sv_server_stats(SvServer* s, SvStats* out) {
+    mx_lock(&s->conn_mx);
+    out->requests    = s->n_requests;
+    out->errors      = s->n_errors;
+    out->rows_sent   = s->n_rows;
+    out->connections = s->active;
+    out->busy        = s->exec_since > 0;
+    out->uptime_s    = (now_ms() - s->started_ms) / 1000.0;
+    mx_unlock(&s->conn_mx);
+}
+
+int sv_server_recent(SvServer* s, SvLogEntry* out, int max) {
+    mx_lock(&s->conn_mx);
+    int n = 0;
+    for (long long q = s->n_requests; q >= 1 && n < max && n < SV_LOG_MAX; q--)
+        out[n++] = s->log[(q - 1) % SV_LOG_MAX];
+    mx_unlock(&s->conn_mx);
+    return n;
+}
+
+bool sv_random_token(char* out, int bytes) {
+    unsigned char raw[64];
+    if (bytes <= 0 || bytes > (int)sizeof(raw)) return false;
+#ifdef _WIN32
+    for (int i = 0; i < bytes; i += 4) {
+        unsigned int v;
+        if (rand_s(&v) != 0) return false;
+        for (int k = 0; k < 4 && i + k < bytes; k++) raw[i + k] = (unsigned char)(v >> (8 * k));
+    }
+#else
+    FILE* f = fopen("/dev/urandom", "rb");
+    if (!f) return false;
+    size_t got = fread(raw, 1, (size_t)bytes, f);
+    fclose(f);
+    if (got != (size_t)bytes) return false;
+#endif
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < bytes; i++) { out[2 * i] = hex[raw[i] >> 4]; out[2 * i + 1] = hex[raw[i] & 15]; }
+    out[2 * bytes] = '\0';
+    return true;
+}
+
+bool sv_local_ip(char* out, size_t n) {
+    // l'indirizzo con cui questa macchina esce in rete: un socket UDP "connesso" non invia nulla
+    sock_t fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd == BAD_SOCK) return false;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons(53);
+    a.sin_addr.s_addr = inet_addr("192.0.2.1");          // TEST-NET: mai raggiunto davvero
+    bool ok = connect(fd, (struct sockaddr*)&a, sizeof(a)) == 0;
+    socklen_t al = sizeof(a);
+    if (ok) ok = getsockname(fd, (struct sockaddr*)&a, &al) == 0 && a.sin_addr.s_addr != 0;
+    sock_close(fd);
+    if (ok) {
+        const unsigned char* ip = (const unsigned char*)&a.sin_addr.s_addr;
+        snprintf(out, n, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+    }
+    return ok;
 }
