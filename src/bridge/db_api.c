@@ -187,6 +187,7 @@ static QueryResult* exec_atomic(ASTNode* stmt) {
     }
     int before = g_num_savepoints;
     bool sp = db_savepoint("__sv_statement");
+    if (!sp) return result_error("Too many savepoints in this transaction (max 64): COMMIT or ROLLBACK first");
     QueryResult* r = executor_run(&g_db.exec_ctx, stmt);
     if (sp && (!r || !r->success)) db_rollback_to("__sv_statement");
     if (sp) g_num_savepoints = before;          // il savepoint interno non resta visibile
@@ -368,17 +369,26 @@ static int g_num_savepoints = 0;   // (dichiarato prima di exec_atomic)
 static bool db_savepoint_impl(const char* name) {
     if (!g_db.initialized) return false;
     if (!g_db.exec_ctx.tx_id) return false;
+    // stesso nome: sostituisce il precedente (come MySQL), così un SAVEPOINT ripetuto non riempie l'elenco
+    for (int i = 0; i < g_num_savepoints; i++) {
+        if (strcmp(g_savepoints[i].name, name) == 0) {
+            memmove(&g_savepoints[i], &g_savepoints[i + 1], sizeof(g_savepoints[0]) * (size_t)(g_num_savepoints - i - 1));
+            g_num_savepoints--;
+            break;
+        }
+    }
+    // elenco pieno: errore, mai un savepoint "riuscito" ma non registrato (exec_atomic ci conta
+    // per annullare uno statement con trigger fallito)
+    if (g_num_savepoints >= 64) return false;
     // Write LOG_SAVEPOINT to WAL
     wal_write(g_db.wal, LOG_SAVEPOINT, g_db.exec_ctx.tx_id, 0,
               (SVRID){0,0}, (const uint8_t*)name, strlen(name) + 1, NULL, 0);
     wal_flush(g_db.wal);
 
     // Record offset
-    if (g_num_savepoints < 64) {
-        snprintf(g_savepoints[g_num_savepoints].name, sizeof(g_savepoints[g_num_savepoints].name), "%s", name);
-        g_savepoints[g_num_savepoints].offset = sv_lseek(g_db.wal->fd, 0, SEEK_CUR);
-        g_num_savepoints++;
-    }
+    snprintf(g_savepoints[g_num_savepoints].name, sizeof(g_savepoints[g_num_savepoints].name), "%s", name);
+    g_savepoints[g_num_savepoints].offset = sv_lseek(g_db.wal->fd, 0, SEEK_CUR);
+    g_num_savepoints++;
     return true;
 }
 

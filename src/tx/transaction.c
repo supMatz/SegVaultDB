@@ -10,9 +10,15 @@ TxManager* txm_create(void) {
 
 Transaction* txm_begin(TxManager* txm) {
     if (!txm) return NULL;
-    if (txm->num_transactions >= SV_MAX_TRANSACTIONS) return NULL;
-
-    Transaction* t = &txm->transactions[txm->num_transactions++];
+    // si riusa il posto di una transazione già conclusa: prima ogni BEGIN ne occupava uno
+    // nuovo e dopo 64 transazioni nella vita del processo BEGIN falliva per sempre
+    Transaction* t = NULL;
+    for (int i = 0; i < txm->num_transactions && !t; i++)
+        if (!txm->transactions[i].active) t = &txm->transactions[i];
+    if (!t) {
+        if (txm->num_transactions >= SV_MAX_TRANSACTIONS) return NULL;   // 64 transazioni aperte insieme
+        t = &txm->transactions[txm->num_transactions++];
+    }
     memset(t, 0, sizeof(Transaction));
     t->tx_id = txm->next_tx_id++;
     t->active = true;

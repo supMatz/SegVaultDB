@@ -2178,6 +2178,30 @@ static size_t row_sig(const OVal* row, int ncols, char* buf, size_t cap) {
     return len;
 }
 
+// stessa espressione (dopo il binding): stesse colonne, operatori, funzioni e costanti
+static bool expr_same(const ASTExpr* a, const ASTExpr* b) {
+    if (!a || !b) return a == b;
+    if (a->type == EXPR_COLUMN && b->type == EXPR_COLUMN)
+        return a->bound != 0 && a->bound == b->bound && a->outer == b->outer;
+    if (a->type != b->type || a->op != b->op || a->nargs != b->nargs || a->agg_distinct != b->agg_distinct ||
+        strcasecmp(a->func, b->func)) return false;
+    switch (a->type) {
+        case EXPR_INT:    if (a->int_val != b->int_val) return false; break;
+        case EXPR_FLOAT:  if (a->float_val != b->float_val) return false; break;
+        case EXPR_STRING: if (strcmp(a->str_val ? a->str_val : "", b->str_val ? b->str_val : "")) return false; break;
+        case EXPR_SUBQUERY: case EXPR_WINDOW: {          // stesso testo
+            char x[512], y[512];
+            ast_expr_format(a, x, sizeof(x));
+            ast_expr_format(b, y, sizeof(y));
+            return !strcasecmp(x, y);
+        }
+        default: break;
+    }
+    if (!expr_same(a->left, b->left) || !expr_same(a->right, b->right)) return false;
+    for (int i = 0; i < a->nargs; i++) if (!expr_same(a->args[i], b->args[i])) return false;
+    return true;
+}
+
 // ── colonne di output ──
 
 typedef struct {
@@ -2997,6 +3021,20 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
         }
         if (b.saw_agg) has_agg = true;
         if (b.err[0]) FAIL("%s", b.err);
+        // SELECT DISTINCT: l'ordine deve dipendere solo dalle colonne restituite (come MySQL 5.7+ e
+        // PostgreSQL); con un'altra espressione ogni riga distinta ne avrebbe più valori e l'ordine
+        // sarebbe arbitrario
+        for (int i = 0; n->select_stmt.distinct && !p->compound && i < n->select_stmt.num_order; i++) {
+            ASTExpr* o = n->select_stmt.order_exprs[i];
+            if (o->type == EXPR_INT || (o->type == EXPR_COLUMN && o->bound < 0)) continue;
+            bool found = false;
+            for (int k = 0; k < p->nout && !found; k++) found = expr_same(o, p->out[k].e);
+            if (!found) {
+                char t[128];
+                ast_expr_format(o, t, sizeof(t));
+                FAIL("ORDER BY %.100s must also appear in the SELECT list when DISTINCT is used", t);
+            }
+        }
     }
     for (int i = 0; i < p->nout; i++) {
         OutCol* oc = &p->out[i];

@@ -243,6 +243,17 @@ int main(void) {
     CHECK(resp_ok(&r), "tx commit: %s", r.body);
     resp_free(&r);
 
+    // regressione: dopo 64 transazioni "transaction": true veniva rifiutato per sempre
+    {
+        int ok_n = 0;
+        for (int i = 0; i < 100; i++) {
+            r = query(port, "{\"database\":\"t\",\"transaction\":true,\"sql\":\"UPDATE p SET prezzo = prezzo + 0 WHERE id = 3\"}");
+            if (resp_ok(&r)) ok_n++;
+            resp_free(&r);
+        }
+        CHECK(ok_n == 100, "100 transactions in a row: %d ok", ok_n);
+    }
+
     // ── corpo text/plain ──
     r = request(port, "POST", "/api/v1/query?database=t", "Content-Type: text/plain\r\n", "SELECT prezzo FROM p WHERE id = 3");
     c = cell_at(&r, 0, 0, 0);

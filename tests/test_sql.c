@@ -788,6 +788,28 @@ int main(void) {
     t("ROLLBACK TO s1", "OK:0");                                         // il savepoint resta
     t("COMMIT", "OK:0");
     t("SELECT id, v FROM c ORDER BY id", "1|100;2|0;3|30");
+    // regressione: dopo 64 transazioni BEGIN falliva per sempre (i posti non venivano riusati)
+    for (int i = 0; i < 100; i++) {
+        t("BEGIN", "OK:0");
+        t("UPDATE c SET v = v + 1 WHERE id = 2", "OK:1");
+        t(i % 2 ? "COMMIT" : "ROLLBACK", "OK:0");
+    }
+    t("SELECT v FROM c WHERE id = 2", "50");
+    // DISTINCT + ORDER BY: solo colonne restituite (posizione, alias, stessa colonna o espressione)
+    t("SELECT DISTINCT v FROM c ORDER BY v", "30;50;100");
+    t("SELECT DISTINCT v AS w FROM c ORDER BY w DESC", "100;50;30");
+    t("SELECT DISTINCT v FROM c ORDER BY 1 DESC", "100;50;30");
+    t("SELECT DISTINCT c.v, v + 1 FROM c ORDER BY v + 1", "30|31;50|51;100|101");
+    t("SELECT DISTINCT v FROM c ORDER BY id", "ERR:must also appear in the SELECT list when DISTINCT is used");
+    t("SELECT DISTINCT v FROM c ORDER BY v * 2", "ERR:must also appear in the SELECT list");
+    t("SELECT v FROM c ORDER BY id", "100;50;30");
+    // SAVEPOINT ripetuto con lo stesso nome: sostituisce, non riempie l'elenco (max 64)
+    t("BEGIN", "OK:0");
+    for (int i = 0; i < 100; i++) t("SAVEPOINT ciclo", "OK:0");
+    t("UPDATE c SET v = 7 WHERE id = 2", "OK:1");
+    t("ROLLBACK TO ciclo", "OK:0");
+    t("SELECT v FROM c WHERE id = 2", "50");
+    t("COMMIT", "OK:0");
 
     // ── trigger (basi di dati attive) ──
     t("CREATE DATABASE att", "OK:0");
