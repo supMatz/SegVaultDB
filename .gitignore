@@ -38,3 +38,5 @@ test_table_design
 test_table_design_asan
 test_schema_model
 test_schema_model_asan
+test_db_tools
+test_db_tools_asan

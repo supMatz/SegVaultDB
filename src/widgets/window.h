@@ -55,7 +55,7 @@ typedef enum { STATUS_IDLE, STATUS_OK, STATUS_ERROR, STATUS_INFO } StatusKind;
 
 // barra comandi sovrapposta all'editor
 typedef enum { BAR_NONE, BAR_FIND, BAR_GOTO, BAR_OPEN, BAR_SAVE_AS, BAR_EXPORT,
-               BAR_IMPORT_CSV, BAR_RUN_FILE, BAR_DUMP } BarMode;
+               BAR_IMPORT_CSV, BAR_RUN_FILE, BAR_DUMP, BAR_SEARCH_DB } BarMode;
 
 #define HISTORY_MAX 500
 
@@ -168,6 +168,14 @@ typedef struct {
 
     // -- visualizzatore di cella (doppio click / Invio su una cella) --
     bool         cell_open;
+
+    // -- conferma di un'azione distruttiva (svuota / elimina tabella o database) --
+    bool         conf_open;
+    char         conf_title[200], conf_text[300], conf_btn[32], conf_db[64], conf_done[160];
+    char*        conf_sql;          // statement separati da ";\n"
+    bool         conf_drop_db;      // DROP DATABASE: non serve USE
+    Rect         conf_rect, conf_ok, conf_cancel;
+    char         search_db[64];     // database della ricerca (barra "Search in")
     int          cell_scroll;       // righe di testo scrollate
     int          cell_lines;        // righe totali (calcolate nel disegno)
     Rect         cell_rect, cell_btn_copy, cell_btn_close;

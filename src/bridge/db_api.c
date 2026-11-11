@@ -529,6 +529,11 @@ static ColumnInfo* db_list_columns_impl(const char* db_name, const char* table,
                 snprintf(cols[i].unique_name, sizeof(cols[i].unique_name), "%.63s", c->name);
             }
         }
+        for (int k = 0; k < t->num_indexes; k++)
+            if (!strcasecmp(t->indexes[k].col_name, t->columns[i].name)) {
+                cols[i].indexed = true;
+                snprintf(cols[i].index_name, sizeof(cols[i].index_name), "%.63s", t->indexes[k].name);
+            }
     }
     *out_count = t->num_columns;
     return cols;
@@ -768,6 +773,22 @@ ForeignKeyInfo* db_list_foreign_keys(const char* db_name, int* out_count) {
 }
 
 void db_foreign_keys_free(ForeignKeyInfo* fks) { free(fks); }
+
+bool db_table_info(const char* db_name, const char* table, TableInfo* out, int* num_indexes) {
+    memset(out, 0, sizeof(*out));
+    db_lock();
+    TableSchema* t = catalog_get_table(g_db.catalog, db_name, table);
+    if (t) {
+        snprintf(out->name, sizeof(out->name), "%.63s", t->name);
+        snprintf(out->engine, sizeof(out->engine), "SegVault");
+        snprintf(out->comment, sizeof(out->comment), "%.255s", t->comment);
+        out->num_rows = t->num_rows;
+        out->size_bytes = (uint64_t)t->num_pages * SV_PAGE_SIZE;
+        if (num_indexes) *num_indexes = t->num_indexes;
+    }
+    db_unlock();
+    return t != NULL;
+}
 
 bool db_use(const char* name) {
     db_lock();

@@ -45,6 +45,8 @@ bool design_load(DesignTable* t, const char* db, const char* table) {
         c->unique = cols[i].unique;
         snprintf(c->unique_name, sizeof(c->unique_name), "%s", cols[i].unique_name);
         c->autoinc = cols[i].auto_increment;
+        c->index = cols[i].indexed;
+        snprintf(c->index_name, sizeof(c->index_name), "%s", cols[i].index_name);
     }
     db_columns_free(cols, n);
     return true;
@@ -171,6 +173,14 @@ static bool validate(const DesignTable* t, char* err, size_t errn) {
     return true;
 }
 
+// CREATE INDEX per la colonna (nome ix_<tabella>_<colonna>)
+static void index_sql(DBuf* b, const char* table, const char* col) {
+    char in[80];
+    snprintf(in, sizeof(in), "ix_%.30s_%.30s", table, col);
+    db_add(b, "CREATE INDEX "); db_ident(b, in); db_add(b, " ON "); db_ident(b, table);
+    db_add(b, " ("); db_ident(b, col); db_add(b, ")");
+}
+
 static char* create_sql(const DesignTable* t) {
     DBuf b = {0};
     int npk = 0;
@@ -191,6 +201,8 @@ static char* create_sql(const DesignTable* t) {
         db_add(&b, ")\n");
     }
     db_add(&b, ")");
+    for (int i = 0; i < t->ncols; i++)
+        if (t->cols[i].index && !t->cols[i].pk) { db_add(&b, ";\n"); index_sql(&b, t->name, t->cols[i].name); }
     if (b.oom) { free(b.p); return NULL; }
     return b.p;
 }
@@ -250,11 +262,15 @@ char* design_sql(const DesignTable* orig, const DesignTable* cur, char* err, siz
         }
         stmt_begin(&b, tn); db_add(&b, "DROP COLUMN "); db_ident(&b, orig->cols[i].name);
     }
-    // 3. il resto delle colonne esistenti: UNIQUE e NOT NULL tolti, DEFAULT, nome
+    // 3. il resto delle colonne esistenti: indici e UNIQUE e NOT NULL tolti, DEFAULT, nome
     for (int i = 0; i < cur->ncols; i++) {
         const DesignCol* c = &cur->cols[i];
         if (c->orig < 0) continue;
         const DesignCol* o = &orig->cols[c->orig];
+        if (!c->index && o->index && o->index_name[0]) {
+            if (b.n) db_add(&b, ";\n");
+            db_add(&b, "DROP INDEX "); db_ident(&b, o->index_name); db_add(&b, " ON "); db_ident(&b, tn);
+        }
         if (!c->unique && o->unique && !c->pk) {
             if (!o->unique_name[0]) {
                 free(b.p);
@@ -281,6 +297,14 @@ char* design_sql(const DesignTable* orig, const DesignTable* cur, char* err, siz
         if (c->orig >= 0) continue;
         if (c->pk || c->autoinc) { free(b.p); snprintf(err, errn, "A new column cannot be part of the primary key of an existing table ('%.60s')", c->name); return NULL; }
         stmt_begin(&b, tn); db_add(&b, "ADD COLUMN "); column_sql(&b, c, false);
+    }
+    // indici nuovi (con i nomi di colonna finali, prima della rinomina della tabella)
+    for (int i = 0; i < cur->ncols; i++) {
+        const DesignCol* c = &cur->cols[i];
+        bool had = c->orig >= 0 && orig->cols[c->orig].index;
+        if (!c->index || had || c->pk) continue;
+        if (b.n) db_add(&b, ";\n");
+        index_sql(&b, tn, c->name);
     }
     // 5. nome della tabella
     if (strcmp(cur->name, orig->name)) { stmt_begin(&b, tn); db_add(&b, "RENAME TO "); db_ident(&b, cur->name); }

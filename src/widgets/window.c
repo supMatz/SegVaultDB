@@ -8,6 +8,8 @@
 #include "csv_import.h"
 #include "table_designer.h"
 #include "schema_view.h"
+#include "schema_model.h"
+#include "db_tools.h"
 #include <stdio.h>
 #include <strings.h>
 #include <string.h>
@@ -752,6 +754,7 @@ static const char* bar_label(const AppWindow* app) {
         case BAR_IMPORT_CSV: return "Import CSV";
         case BAR_RUN_FILE: return "Run SQL file";
         case BAR_DUMP:    return "Database dump";
+        case BAR_SEARCH_DB: return "Search in database";
         default:       return NULL;
     }
 }
@@ -833,6 +836,14 @@ static void bar_open(AppWindow* app, BarMode mode, bool replace) {
         join_path(buf, sizeof(buf), app->data_dir[0] ? app->data_dir : ".", "result.csv");
         line_edit_set_text(app->bar_input, buf);
         app->bar_input->placeholder = "File path: .csv .tsv .json .md .html .sql choose the format";
+        textbox_set_search(app->editor, NULL, false, false);
+    } else if (mode == BAR_SEARCH_DB) {
+        char* w = textbox_word_or_selection(app->editor);
+        line_edit_set_text(app->bar_input, w && textbox_has_selection(app->editor) ? w : "");
+        free(w);
+        static char ph[120];
+        snprintf(ph, sizeof(ph), "Text to find in every table of %.60s (any column, any case)", app->search_db);
+        app->bar_input->placeholder = ph;
         textbox_set_search(app->editor, NULL, false, false);
     } else if (mode == BAR_IMPORT_CSV || mode == BAR_RUN_FILE || mode == BAR_DUMP) {
         char buf[1100];
@@ -956,6 +967,27 @@ static void bar_submit(AppWindow* app, bool shift, bool ctrl) {
                 set_status(app, STATUS_ERROR, msg, "");
                 in->error = true;
             }
+            break;
+        }
+        case BAR_SEARCH_DB: {
+            if (!in->text[0]) { in->error = true; return; }
+            if (busy_guard(app)) return;
+            if (!use_database(app, app->search_db)) { set_status(app, STATUS_ERROR, "Cannot use the database", app->search_db); return; }
+            int tables = 0;
+            bool truncated = false;
+            uint64_t t0 = platform_time_ms();
+            QueryResult* r = dbt_search(app->search_db, in->text, 1000, &tables, &truncated);
+            if (!r) { in->error = true; return; }
+            r->exec_time_ms = (double)(platform_time_ms() - t0);
+            int found = r->num_rows;
+            show_result(app, r);
+            char msg[300], meta[96];
+            if (found) snprintf(msg, sizeof(msg), "'%.100s': %d value%s found in %d table%s%s", in->text, found, found == 1 ? "" : "s",
+                                tables, tables == 1 ? "" : "s", truncated ? " (first 1000 shown)" : "");
+            else snprintf(msg, sizeof(msg), "'%.100s' was not found in %.60s", in->text, app->search_db);
+            snprintf(meta, sizeof(meta), "%.1f ms", r->exec_time_ms);
+            set_status(app, found ? STATUS_OK : STATUS_INFO, msg, meta);
+            in->error = found == 0;
             break;
         }
         case BAR_IMPORT_CSV: case BAR_RUN_FILE: case BAR_DUMP: {
@@ -2094,6 +2126,7 @@ typedef enum {
     // struttura ed explorer
     CTX_NEW_TABLE, CTX_EDIT_STRUCTURE, CTX_TREE_BROWSE, CTX_TREE_USE_DB, CTX_TREE_COPY_NAME, CTX_TREE_SELECT_SQL,
     CTX_TREE_DDL, CTX_TREE_DESIGNER, CTX_PAGE_SQL, CTX_PAGE_DESIGNER,
+    CTX_SEARCH_DB, CTX_DB_OVERVIEW, CTX_TRUNCATE_TABLE, CTX_DROP_TABLE, CTX_DROP_DB,
     // Settings / Help
     CTX_SETTINGS, CTX_SETTINGS_RESET, CTX_SHORTCUTS, CTX_SQL_REFERENCE, CTX_DOCS, CTX_ABOUT,
     CTX_ACTION_COUNT
@@ -2189,6 +2222,11 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
     [CTX_TREE_SELECT_SQL] = { "Insert SELECT into editor", NULL },
     [CTX_TREE_DDL]      = { "Insert CREATE TABLE into editor", NULL },
     [CTX_TREE_DESIGNER] = { "Show in the designer",      NULL },
+    [CTX_SEARCH_DB]     = { "Search in database\xe2\x80\xa6", "Ctrl+Shift+G" },
+    [CTX_DB_OVERVIEW]   = { "Database overview",         NULL },
+    [CTX_TRUNCATE_TABLE] = { "Empty table\xe2\x80\xa6",   NULL },
+    [CTX_DROP_TABLE]    = { "Drop table\xe2\x80\xa6",     NULL },
+    [CTX_DROP_DB]       = { "Drop database\xe2\x80\xa6",  NULL },
     [CTX_PAGE_SQL]      = { "SQL editor",                "Ctrl+Shift+D" },
     [CTX_PAGE_DESIGNER] = { "Schema designer (ER / UML)", "Ctrl+Shift+D" },
     [CTX_SETTINGS]      = { "Settings\xe2\x80\xa6",      "Ctrl+," },
@@ -2217,7 +2255,8 @@ static const int M_VIEW[] = { CTX_PAGE_SQL, CTX_PAGE_DESIGNER, CTX_SEP, CTX_TOGG
                               CTX_HISTORY, CTX_REFRESH_TREE };
 static const int M_QUERY[] = { CTX_RUN, CTX_RUN_STMT, CTX_EXPLAIN, CTX_STOP, CTX_SEP, CTX_BEGIN, CTX_COMMIT, CTX_ROLLBACK,
                                CTX_SEP, CTX_SNIP_SELECT, CTX_SNIP_JOIN, CTX_SNIP_GROUP, CTX_SNIP_INSERT, CTX_SNIP_UPDATE,
-                               CTX_SNIP_DELETE, CTX_SNIP_CREATE, CTX_SEP, CTX_NEW_TABLE, CTX_EDIT_STRUCTURE };
+                               CTX_SNIP_DELETE, CTX_SNIP_CREATE, CTX_SEP, CTX_NEW_TABLE, CTX_EDIT_STRUCTURE, CTX_SEP,
+                               CTX_SEARCH_DB, CTX_DB_OVERVIEW };
 static const int M_IMPORT[] = { CTX_IMPORT_CSV, CTX_SEP, CTX_OPEN, CTX_RUN_FILE };
 static const int M_EXPORT[] = { CTX_EXPORT_CSV, CTX_EXPORT_TSV, CTX_EXPORT_JSON, CTX_EXPORT_MD, CTX_EXPORT_HTML,
                                 CTX_EXPORT_SQL, CTX_SEP, CTX_COPY_ALL, CTX_COPY_JSON, CTX_COPY_MD, CTX_COPY_SQL, CTX_SEP,
@@ -2307,6 +2346,8 @@ static bool ctx_enabled(AppWindow* app, int a) {
         case CTX_NEW_TABLE: { char d[64]; return idle && design_db(app, d, sizeof(d)); }
         case CTX_EDIT_STRUCTURE: { char d[64], t[64]; return idle && design_table(app, d, sizeof(d), t, sizeof(t)); }
         case CTX_TREE_BROWSE: case CTX_TREE_USE_DB: case CTX_TREE_DDL: case CTX_TREE_DESIGNER: return idle;
+        case CTX_TRUNCATE_TABLE: case CTX_DROP_TABLE: case CTX_DROP_DB: return idle && !app->in_transaction;
+        case CTX_SEARCH_DB: case CTX_DB_OVERVIEW: { char d[64]; return idle && design_db(app, d, sizeof(d)); }
         case CTX_BEGIN: return idle && !app->in_transaction;
         case CTX_COMMIT: case CTX_ROLLBACK: return idle;
         case CTX_DUMP_DB: {   // il motore si interroga solo se libero (il thread di lavoro lo tiene occupato)
@@ -2378,11 +2419,13 @@ static void ctx_open(AppWindow* app, int kind, int x, int y) {
         CTX_CUT, CTX_COPY, CTX_PASTE, CTX_SELECT_ALL, CTX_SEP,
         CTX_RUN, CTX_RUN_STMT, CTX_EXPLAIN, CTX_SEP, CTX_FORMAT, CTX_COMMENT,
     };
-    static const int TREE_DB[] = { CTX_TREE_DESIGNER, CTX_TREE_USE_DB, CTX_NEW_TABLE, CTX_SEP, CTX_TREE_COPY_NAME, CTX_REFRESH_TREE };
+    static const int TREE_DB[] = { CTX_TREE_DESIGNER, CTX_TREE_USE_DB, CTX_DB_OVERVIEW, CTX_SEARCH_DB, CTX_NEW_TABLE, CTX_SEP,
+                                   CTX_TREE_COPY_NAME, CTX_REFRESH_TREE, CTX_SEP, CTX_DROP_DB };
     static const int TREE_TABLE[] = {
         CTX_TREE_BROWSE, CTX_EDIT_STRUCTURE, CTX_TREE_DESIGNER, CTX_SEP,
         CTX_TREE_SELECT_SQL, CTX_TREE_DDL, CTX_TREE_COPY_NAME, CTX_SEP,
-        CTX_NEW_TABLE, CTX_REFRESH_TREE,
+        CTX_NEW_TABLE, CTX_REFRESH_TREE, CTX_SEP,
+        CTX_TRUNCATE_TABLE, CTX_DROP_TABLE,
     };
     static const int TREE_VIEW[] = { CTX_TREE_BROWSE, CTX_SEP, CTX_TREE_SELECT_SQL, CTX_TREE_COPY_NAME, CTX_SEP, CTX_REFRESH_TREE };
     if (kind == CTXK_TREE) {
@@ -2625,6 +2668,128 @@ static void schema_action(AppWindow* app, SchemaViewAction a) {
         }
         default: break;
     }
+}
+
+// ── conferma delle azioni distruttive ───────────────────────────
+
+static void confirm_open(AppWindow* app, const char* db, char* sql, bool drop_db) {
+    free(app->conf_sql);
+    app->conf_sql = sql;
+    snprintf(app->conf_db, sizeof(app->conf_db), "%.63s", db);
+    app->conf_drop_db = drop_db;
+    app->conf_open = sql != NULL;
+    app->ctx_kind = CTXK_NONE;
+}
+
+static long long count_rows(const char* table) {
+    char sql[200];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM `%.120s`", table);
+    QueryResult* r = db_execute(sql);
+    long long n = r && r->success && r->num_rows ? atoll(r->rows[0].cells[0].value) : -1;
+    db_result_free(r);
+    return n;
+}
+
+static void confirm_table_action(AppWindow* app, const char* db, const char* table, bool drop) {
+    if (!use_database(app, db)) return;
+    long long n = count_rows(table);
+    char rows[64];
+    if (n >= 0) snprintf(rows, sizeof(rows), "%lld row%s", n, n == 1 ? "" : "s");
+    else snprintf(rows, sizeof(rows), "rows");
+    char* sql = NULL;
+    if (drop) {
+        // le chiavi esterne delle altre tabelle verso questa vanno tolte prima
+        SchemaModel m;
+        int refs = 0;
+        if (sm_load(&m, db)) {
+            int i = sm_find(&m, table);
+            for (int k = 0; i >= 0 && k < m.nr; k++) refs += m.r[k].parent == i && m.r[k].child != i;
+            if (i >= 0) sql = sm_drop_table_sql(&m, i);
+            sm_free(&m);
+        }
+        snprintf(app->conf_title, sizeof(app->conf_title), "Drop table %.60s?", table);
+        if (refs) snprintf(app->conf_text, sizeof(app->conf_text), "The table and its %s are deleted; %d foreign key%s pointing to it removed.",
+                           rows, refs, refs == 1 ? "" : "s");
+        else snprintf(app->conf_text, sizeof(app->conf_text), "The table and its %s are deleted.", rows);
+        snprintf(app->conf_btn, sizeof(app->conf_btn), "Drop table");
+        snprintf(app->conf_done, sizeof(app->conf_done), "Table %.60s dropped", table);
+    } else {
+        size_t len = strlen(table) + 32;
+        sql = malloc(len);
+        if (sql) snprintf(sql, len, "TRUNCATE TABLE `%s`", table);
+        snprintf(app->conf_title, sizeof(app->conf_title), "Empty table %.60s?", table);
+        snprintf(app->conf_text, sizeof(app->conf_text), "All its %s are deleted; the structure stays.", rows);
+        snprintf(app->conf_btn, sizeof(app->conf_btn), "Empty");
+        snprintf(app->conf_done, sizeof(app->conf_done), "Table %.60s emptied", table);
+    }
+    confirm_open(app, db, sql, false);
+}
+
+static void confirm_drop_db(AppWindow* app, const char* db) {
+    NameList* t = db_list_tables(db);
+    int n = t ? t->count : 0;
+    if (t) db_namelist_free(t);
+    size_t len = strlen(db) + 32;
+    char* sql = malloc(len);
+    if (sql) snprintf(sql, len, "DROP DATABASE %s", db);
+    snprintf(app->conf_title, sizeof(app->conf_title), "Drop database %.60s?", db);
+    snprintf(app->conf_text, sizeof(app->conf_text), "Its %d table%s and all their data are deleted. This cannot be undone.", n, n == 1 ? "" : "s");
+    snprintf(app->conf_btn, sizeof(app->conf_btn), "Drop database");
+    snprintf(app->conf_done, sizeof(app->conf_done), "Database %.60s dropped", db);
+    confirm_open(app, db, sql, true);
+}
+
+static void confirm_run(AppWindow* app) {
+    app->conf_open = false;
+    if (!app->conf_sql || busy_guard(app)) return;
+    if (!app->conf_drop_db && !use_database(app, app->conf_db)) { set_status(app, STATUS_ERROR, "Cannot use the database", app->conf_db); return; }
+    int total = 0;
+    char err[400];
+    int done = exec_statements(app->conf_sql, &total, err, sizeof(err));
+    update_session(app);
+    refresh_tree(app);
+    schema_view_invalidate(app->schema);
+    if (done == total) {
+        set_status(app, STATUS_OK, app->conf_done, "");
+    } else set_status(app, STATUS_ERROR, err, "");
+    free(app->conf_sql);
+    app->conf_sql = NULL;
+}
+
+static void confirm_event(AppWindow* app, sEvent* evt) {
+    if (evt->type == EVT_KEY_DOWN) {
+        if (evt->key == KEY_ESCAPE) app->conf_open = false;
+        else if (evt->key == KEY_ENTER) confirm_run(app);
+        return;
+    }
+    if (evt->type == EVT_MOUSE_MOVE) { app->mouse_x = evt->mouse_x; app->mouse_y = evt->mouse_y; platform_set_cursor(app->win, CURSOR_ARROW); return; }
+    if (evt->type != EVT_MOUSE_DOWN || evt->mouse_button != SV_MOUSE_LEFT) return;
+    int x = evt->mouse_x, y = evt->mouse_y;
+    if (rect_has(app->conf_ok, x, y)) confirm_run(app);
+    else if (rect_has(app->conf_cancel, x, y) || !rect_has(app->conf_rect, x, y)) app->conf_open = false;
+}
+
+static void draw_confirm(AppWindow* app) {
+    if (!app->conf_open) return;
+    PlatformWindow* win = app->win;
+    platform_fill_rect(win, (Rect){0, 0, app->win_w, app->win_h}, ui_alpha(TH_BG, 170));
+    int w = SV_MIN(500, app->win_w - 40), h = 156;
+    Rect r = { (app->win_w - w) / 2, (app->win_h - h) / 2, w, h };
+    app->conf_rect = r;
+    ui_round_box(win, r, TH_SURFACE, TH_BORDER_STRONG, 10);
+    platform_draw_text_ex(win, app->conf_title, -1, (Point){r.x + 22, r.y + 20}, TH_TEXT, 15, FONT_UI_BOLD);
+    ui_text_clipped(win, app->conf_text, r.x + 22, r.y + 52, w - 44, TH_TEXT_MUTED, TH_FONT_UI, FONT_UI);
+    int bw = platform_measure_text_ex(win, app->conf_btn, -1, TH_FONT_UI, FONT_UI_BOLD) + 30;
+    app->conf_ok = (Rect){ r.x + w - 22 - bw, r.y + h - 22 - 34, bw, 34 };
+    app->conf_cancel = (Rect){ app->conf_ok.x - 10 - 90, app->conf_ok.y, 90, 34 };
+    bool hc = rect_has(app->conf_cancel, app->mouse_x, app->mouse_y), ho = rect_has(app->conf_ok, app->mouse_x, app->mouse_y);
+    ui_round_box(win, app->conf_cancel, hc ? TH_ELEVATED_HOVER : TH_ELEVATED, TH_BORDER, 6);
+    int cw = platform_measure_text_ex(win, "Cancel", -1, TH_FONT_UI, FONT_UI);
+    platform_draw_text_ex(win, "Cancel", -1, (Point){app->conf_cancel.x + (90 - cw) / 2, ui_text_y(win, app->conf_cancel, TH_FONT_UI, FONT_UI)},
+                          TH_TEXT, TH_FONT_UI, FONT_UI);
+    platform_fill_rect_rounded(win, app->conf_ok, ho ? ui_mix(TH_ERROR, TH_TEXT, 0.15f) : TH_ERROR, 6);
+    platform_draw_text_ex(win, app->conf_btn, -1, (Point){app->conf_ok.x + 15, ui_text_y(win, app->conf_ok, TH_FONT_UI, FONT_UI_BOLD)},
+                          TH_ON_ACCENT, TH_FONT_UI, FONT_UI_BOLD);
 }
 
 // testo in fondo all'editor (su righe nuove), con il cursore alla fine
@@ -2901,6 +3066,39 @@ static void ctx_run(AppWindow* app, int a) {
             TreeNode* t = tree_sel_table(app);
             const char* d = sel ? find_db_name(sel) : NULL;
             if (d) { schema_view_show_db(app->schema, d, t ? t->label : NULL); set_page(app, PAGE_DESIGNER); }
+            break;
+        }
+        case CTX_SEARCH_DB: {
+            char d[64];
+            if (!design_db(app, d, sizeof(d))) break;
+            snprintf(app->search_db, sizeof(app->search_db), "%s", d);
+            set_page(app, PAGE_SQL);
+            bar_open(app, BAR_SEARCH_DB, false);
+            break;
+        }
+        case CTX_DB_OVERVIEW: {
+            char d[64];
+            if (!design_db(app, d, sizeof(d)) || !use_database(app, d)) break;
+            QueryResult* r = dbt_overview(d);
+            set_page(app, PAGE_SQL);
+            show_result(app, r);
+            char msg[160], meta[64];
+            snprintf(msg, sizeof(msg), "Overview of %.60s: rows, keys, relationships and space of every table", d);
+            snprintf(meta, sizeof(meta), "%d tables", r && r->num_rows ? r->num_rows - 1 : 0);
+            set_status(app, STATUS_OK, msg, meta);
+            break;
+        }
+        case CTX_TRUNCATE_TABLE: case CTX_DROP_TABLE: {
+            TreeNode* t = tree_sel_table(app);
+            const char* d = t ? find_db_name(t) : NULL;
+            if (!d || t->type != TREE_NODE_TABLE) break;
+            confirm_table_action(app, d, t->label, a == CTX_DROP_TABLE);
+            break;
+        }
+        case CTX_DROP_DB: {
+            TreeNode* sel = app->tree->selected;
+            const char* d = sel ? find_db_name(sel) : NULL;
+            if (d) confirm_drop_db(app, d);
             break;
         }
         case CTX_PAGE_SQL:      set_page(app, PAGE_SQL); break;
@@ -3578,7 +3776,7 @@ static const Shortcut SC_RUN[] = {
 static const Shortcut SC_FILE[] = {
     { "Ctrl+N", "New script" }, { "Ctrl+O", "Open file" },
     { "Ctrl+S", "Save" }, { "Ctrl+Shift+S", "Save as" },
-    { "Ctrl+Shift+D", "SQL editor / schema designer" }, { "Designer: Enter / Del", "Edit / drop selected table" },
+    { "Ctrl+Shift+D", "SQL editor / schema designer" }, { "Ctrl+Shift+G", "Search in the whole database" }, { "Designer: Enter / Del", "Edit / drop selected table" },
 };
 static const Shortcut SC_FIND[] = {
     { "Ctrl+F", "Find" }, { "Ctrl+H", "Find and replace" }, { "F3 / Shift+F3", "Next / previous match" },
@@ -4114,6 +4312,7 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
 
     // pannelli modali: designer di tabelle, Settings, informazioni
     if (td_is_open(app->td)) { designer_event(app, evt); return; }
+    if (app->conf_open) { confirm_event(app, evt); return; }
     if (app->settings_open && evt->type != EVT_MOUSE_UP) { settings_handle_event(app, evt); return; }
     if (app->info_page && evt->type != EVT_MOUSE_UP) {
         if (evt->type == EVT_MOUSE_WHEEL) app->info_scroll -= evt->wheel_delta * 3;
@@ -4195,7 +4394,9 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
                     else bar_open(app, BAR_FIND, false);
                     return;
                 case 'h': if (shift) history_toggle(app); else bar_open(app, BAR_FIND, true); return;
-                case 'g': bar_open(app, BAR_GOTO, false); return;
+                case 'g':
+                    if (shift) { ctx_run(app, CTX_SEARCH_DB); return; }
+                    bar_open(app, BAR_GOTO, false); return;
                 case 't':
                     if (shift) { set_theme(app, (theme_current() + 1) % theme_count(), true); return; }
                     break;
@@ -4717,6 +4918,7 @@ void app_window_draw(AppWindow* app) {
     draw_cell_view(app);
     draw_settings(app);
     td_draw(app->td, app->win_w, app->win_h);
+    draw_confirm(app);
     draw_info(app);
     draw_help(app);
 
@@ -5121,6 +5323,7 @@ void app_window_destroy(AppWindow* app) {
     widget_destroy((Widget*)app->filter_input);
     if (app->cell_edit) widget_destroy((Widget*)app->cell_edit);
     td_destroy(app->td);
+    free(app->conf_sql);
     schema_view_destroy(app->schema);
     for (int c = 0; c < 64; c++) free(app->draft_vals[c]);
     free(app);

@@ -130,6 +130,30 @@ int main(void) {
     CHECK(design_load(&after, "d", "clienti") && col(&after, "punti") >= 0 && !strcmp(after.cols[col(&after, "punti")].def, "0"),
           "nothing applied after the failure");
 
+    // indici: nella tabella nuova, aggiunto, mantenuto con la rinomina, tolto
+    DesignTable ix;
+    design_new(&ix);
+    snprintf(ix.name, 64, "ordine");
+    design_add_column(&ix); snprintf(ix.cols[1].name, 64, "cliente"); ix.cols[1].index = true;
+    design_add_column(&ix); snprintf(ix.cols[2].name, 64, "nota");
+    sql = design_sql(NULL, &ix, err, sizeof(err));
+    CHECK(sql && strstr(sql, "CREATE INDEX `ix_ordine_cliente` ON `ordine` (`cliente`)") && exec_all(sql, err, sizeof(err)), "index on create: %s", sql ? sql : err);
+    free(sql);
+    CHECK(design_load(&orig, "d", "ordine") && orig.cols[col(&orig, "cliente")].index && !orig.cols[col(&orig, "nota")].index, "index loaded");
+    cur = orig;
+    cur.cols[col(&cur, "nota")].index = true;
+    snprintf(cur.cols[col(&cur, "cliente")].name, 64, "cliente_id");
+    sql = design_sql(&orig, &cur, err, sizeof(err));
+    CHECK(sql && strstr(sql, "CREATE INDEX `ix_ordine_nota`") && exec_all(sql, err, sizeof(err)), "add index: %s", sql ? sql : err);
+    free(sql);
+    CHECK(design_load(&after, "d", "ordine") && after.cols[col(&after, "cliente_id")].index && after.cols[col(&after, "nota")].index, "indexes after rename");
+    orig = after; cur = after;
+    cur.cols[col(&cur, "cliente_id")].index = false;
+    sql = design_sql(&orig, &cur, err, sizeof(err));
+    CHECK(sql && strstr(sql, "DROP INDEX `ix_ordine_cliente` ON `ordine`") && exec_all(sql, err, sizeof(err)), "drop index: %s", sql ? sql : err);
+    free(sql);
+    CHECK(design_load(&after, "d", "ordine") && !after.cols[col(&after, "cliente_id")].index, "index gone");
+
     // chiave composta
     DesignTable k;
     memset(&k, 0, sizeof(k));

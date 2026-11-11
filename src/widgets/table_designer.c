@@ -11,9 +11,10 @@
 #define TD_HEAD_H  52
 #define TD_FOOT_H  60
 
-// colonne del modulo: nome, tipo, lunghezza, default, 4 caselle, elimina
-enum { F_NAME, F_TYPE, F_SIZE, F_DEF, F_PK, F_NN, F_UQ, F_AI, F_DEL, F_COUNT };
-static const char* const FIELD_TITLE[F_COUNT] = { "NAME", "TYPE", "LENGTH", "DEFAULT", "PRIMARY", "NOT NULL", "UNIQUE", "AUTO INC", "" };
+// colonne del modulo: nome, tipo, lunghezza, default, 5 caselle, elimina
+enum { F_NAME, F_TYPE, F_SIZE, F_DEF, F_PK, F_NN, F_UQ, F_IX, F_AI, F_DEL, F_COUNT };
+#define NCHECK 5
+static const char* const FIELD_TITLE[F_COUNT] = { "NAME", "TYPE", "LENGTH", "DEFAULT", "PRIMARY", "NOT NULL", "UNIQUE", "INDEX", "AUTO INC", "" };
 
 struct TableDesigner {
     PlatformWindow* win;
@@ -203,8 +204,9 @@ void td_draw(TableDesigner* td, int W, int H) {
 
     // colonne del modulo
     int inner = pw - 48;
-    int wfix[F_COUNT] = { 0, 130, 80, 0, 74, 74, 74, 74, 34 };
-    int rest = inner - (wfix[1] + wfix[2] + wfix[4] + wfix[5] + wfix[6] + wfix[7] + wfix[8]) - 8 * 10;
+    int wfix[F_COUNT] = { 0, 130, 80, 0, 70, 70, 70, 70, 70, 34 };
+    int rest = inner - (F_COUNT - 1) * 10;
+    for (int f = 0; f < F_COUNT; f++) rest -= wfix[f];
     wfix[F_NAME] = SV_MAX(120, rest * 45 / 100);
     wfix[F_DEF] = SV_MAX(100, rest - wfix[F_NAME]);
     td->fx[0] = x0;
@@ -249,10 +251,10 @@ void td_draw(TableDesigner* td, int W, int H) {
             widget_draw((Widget*)df, win);
         } else platform_draw_text_ex(win, "generated", -1, (Point){td->fx[F_DEF] + 8, ui_text_y(win, tr, TH_FONT_SMALL, FONT_UI)},
                                      TH_TEXT_FAINT, TH_FONT_SMALL, FONT_UI);
-        bool vals[4] = { c->pk, c->notnull || c->pk, c->unique || c->pk, c->autoinc };
-        for (int k = 0; k < 4; k++) {
+        bool vals[NCHECK] = { c->pk, c->notnull || c->pk, c->unique || c->pk, c->index || c->pk, c->autoinc };
+        for (int k = 0; k < NCHECK; k++) {
             int f = F_PK + k;
-            bool enabled = !existing_key && !(k == 0 && !td->is_new) && !(k == 3 && !td->is_new) && !((k == 1 || k == 2) && c->pk);
+            bool enabled = !existing_key && !(k == 0 && !td->is_new) && !(k == 4 && !td->is_new) && !((k == 1 || k == 2 || k == 3) && c->pk);
             int cx = td->fx[f] + wfix[f] / 2;
             checkbox(win, cx, cy, vals[k], enabled, enabled && in_rect((Rect){cx - 14, ry, 28, TD_ROW_H}, td->mx, td->my));
         }
@@ -431,14 +433,15 @@ TdAction td_event(TableDesigner* td, sEvent* evt) {
     DesignCol* c = &td->cur.cols[i];
     bool existing_key = !td->is_new && c->orig >= 0 && (c->pk || c->autoinc);
     if (x >= td->fx[F_TYPE] && x < td->fx[F_TYPE + 1] - 10) { td->type_menu = i; return TD_REDRAW; }
-    for (int k = 0; k < 4; k++) {
+    for (int k = 0; k < NCHECK; k++) {
         int fx = td->fx[F_PK + k], fw = td->fx[F_PK + k + 1] - 10 - fx;
         if (x < fx || x >= fx + fw || existing_key) continue;
         switch (k) {
             case 0: if (td->is_new) { c->pk = !c->pk; if (!c->pk) c->autoinc = false; } break;
             case 1: if (!c->pk) c->notnull = !c->notnull; break;
             case 2: if (!c->pk) c->unique = !c->unique; break;
-            case 3:
+            case 3: if (!c->pk) c->index = !c->index; break;
+            case 4:
                 if (td->is_new) {
                     c->autoinc = !c->autoinc;
                     if (c->autoinc) { c->pk = true; if (c->type != 0 && c->type != 1) c->type = 0; line_edit_set_text(td->le[i][2], ""); }

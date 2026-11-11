@@ -18,7 +18,9 @@ typedef struct {
     char size[16];           // VARCHAR / CHAR: lunghezza
     char def[128];           // DEFAULT come scritto ("" = nessuno, "NULL" = DEFAULT NULL)
     bool pk, notnull, unique, autoinc;
+    bool index;              // CREATE INDEX sulla colonna
     char unique_name[64];    // nome del vincolo UNIQUE esistente (per eliminarlo)
+    char index_name[64];     // nome dell'indice esistente
 } DesignCol;
 
 typedef struct {

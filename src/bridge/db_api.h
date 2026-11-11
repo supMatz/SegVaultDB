@@ -128,6 +128,8 @@ typedef struct {
     char extra[128];        // extra info (auto_increment, ecc.)
     bool unique;            // chiave UNIQUE su questa sola colonna
     char unique_name[64];   // nome del vincolo UNIQUE ("" se è un attributo della colonna senza nome)
+    bool indexed;           // ha un indice (CREATE INDEX) su questa sola colonna
+    char index_name[64];
 } ColumnInfo;
 
 // chiave esterna (per il diagramma dello schema)
@@ -252,6 +254,8 @@ void db_columns_free(ColumnInfo* cols, int count);
 
 // tutte le chiavi esterne delle tabelle di un database (NULL se il database non esiste o è vuoto)
 ForeignKeyInfo* db_list_foreign_keys(const char* db_name, int* out_count);
+// righe (stima del catalogo), dimensione su disco e numero di indici di una tabella; false se non esiste
+bool db_table_info(const char* db_name, const char* table, TableInfo* out, int* num_indexes);
 void db_foreign_keys_free(ForeignKeyInfo* fks);
 
 #endif

@@ -221,6 +221,15 @@ modifiche ne fanno parte (`COMMIT` / `ROLLBACK`). Restano in sola lettura (con i
 di stato) le colonne calcolate e i risultati di `GROUP BY`, `DISTINCT`, `UNION`, viste, e le tabelle
 senza chiave primaria.
 
+**Strumenti sul database** (tasto destro su un database nell'explorer, o menu *Query*):
+- *Search in database…* (`Ctrl+Shift+G`): cerca un testo in tutte le colonne di tutte le tabelle, senza
+  distinguere maiuscole e minuscole (anche numeri e date); il risultato ha una riga per valore trovato
+  con tabella, colonna, valore e chiave della riga (`id=3`), fino a 1000 valori;
+- *Database overview*: una riga per tabella con righe, colonne, chiave primaria, indici, chiavi esterne,
+  tabelle che la riferiscono e spazio su disco, più i totali;
+- *Drop database…*; su una tabella *Empty table…* (`TRUNCATE`) e *Drop table…*, con una conferma che
+  dice quante righe si perdono (le chiavi esterne che puntano alla tabella vengono tolte prima).
+
 **Explorer:** click per espandere database e tabelle; doppio click su un database = `USE`, su una tabella = anteprima dei dati (`SELECT * … LIMIT 200`), su una colonna = inserisce il nome nell'editor.
 
 **Tasto destro sull'explorer:** su un database *Use this database* e *New table…*; su una tabella
@@ -250,7 +259,7 @@ Dall'explorer, tasto destro su un database o una tabella › *Show in the design
 
 **Designer di tabelle** (come la scheda *Struttura* di phpMyAdmin): un modulo con una riga per
 colonna — nome, tipo (menu), lunghezza per `VARCHAR` / `CHAR`, `DEFAULT`, *Primary*, *Not null*,
-*Unique*, *Auto inc* — e l'aggiunta o l'eliminazione di colonne. Sotto, l'SQL che verrà eseguito si
+*Unique*, *Index* (`CREATE INDEX` / `DROP INDEX`), *Auto inc* — e l'aggiunta o l'eliminazione di colonne. Sotto, l'SQL che verrà eseguito si
 aggiorna mentre si scrive (`CREATE TABLE` per una tabella nuova, gli `ALTER TABLE` per le modifiche:
 rinomina di tabella e colonne, tipo, default, `NOT NULL`, `UNIQUE`, colonne aggiunte ed eliminate),
 con l'errore se la struttura non è valida. *Create table* / *Apply changes* (`Ctrl+Invio`) lo esegue
@@ -942,6 +951,7 @@ Ogni widget estende `Widget` mettendolo come **primo campo** della propria struc
 | `Panel` / `Splitter` | `panel.*`, `splitter.*` | Contenitore; divisore ridimensionabile |
 | *(finestra)* | `window.h` / `window.c` | Layout dell'editor, menu, impostazioni, esecuzione in background |
 | *(schermate)* | `server_view.h` / `server_view.c` | Scelta iniziale e pannello del server |
+| *(strumenti)* | `db_tools.h` / `db_tools.c` | Ricerca in tutto il database e panoramica delle tabelle |
 | *(designer)* | `table_design.*`, `table_designer.*` | Struttura di una tabella e SQL che la realizza (`CREATE` / `ALTER`); il modulo del designer |
 | *(griglia)* | `grid_edit.h` / `grid_edit.c` | SQL per modificare i dati nella griglia dei risultati |
 | *(tema)* | `theme.h` / `theme.c` | Temi e palette, testo con ellissi, icone vettoriali antialiasing |
