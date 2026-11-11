@@ -285,6 +285,10 @@ rispettano la tabella resta com'era. La chiave primaria di una tabella esistente
 - `Ctrl+F` sulla griglia, o il campo nell'intestazione, filtra le righe;
 - tasto destro: copia di cella, riga, colonna o valore come letterale SQL, filtri, ordinamento, export.
 
+**Chiavi esterne dalla griglia:** Ctrl+clic su un valore di chiave esterna (o tasto destro → *Open
+referenced row*) apre la riga riferita; su una chiave primaria, *Show rows that reference this*
+mostra le righe che la riferiscono.
+
 **Export** (menu *Export*): CSV, TSV, JSON, Markdown, HTML o `INSERT` SQL, su file o negli appunti (`Ctrl+Shift+C` copia tutto come TSV, da incollare in un foglio di calcolo; `Ctrl+E` esporta in CSV). *Database dump* scrive in un file `.sql` le istruzioni che ricreano il database corrente (tabelle, dati, chiavi esterne, viste, trigger e procedure).
 **Import** (menu *Import*): un file CSV diventa una tabella (tipi delle colonne riconosciuti dai dati); *Run SQL file / MySQL dump* esegue uno script senza aprirlo. Un **dump di MySQL / MariaDB / phpMyAdmin** viene riconosciuto e tradotto prima: `SET`, `LOCK TABLES` e simili saltati, tipi MySQL convertiti (`tinyint`, `mediumtext`, `json`, `timestamp`, `enum`, `set`, ...), attributi e opzioni (`unsigned`, `COLLATE`, `COMMENT`, `ENGINE=`, ...) tolti, `KEY` → `CREATE INDEX`, `UNIQUE KEY` → vincolo `UNIQUE`, chiavi esterne mantenute, viste, trigger e procedure ricreati (`DELIMITER` e i commenti `/*!50001 ... */` compresi; anche gli indici su più colonne; i `FULLTEXT` restano fuori, ma `MATCH ... AGAINST` funziona lo stesso).
 
@@ -1298,7 +1302,8 @@ Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
    GUI; `SHOW DATABASES` e l'elenco `/api/v1/databases` mostrano a ogni utente solo ciò su cui ha
    permessi; registro di audit (`--audit`); servizio systemd e avvio automatico su Windows; HTTPS tramite
    reverse proxy (documentato). Da fare: HTTPS integrato senza proxy.
-6. **GUI** — costruttore visuale di query, navigazione delle chiavi esterne dalla griglia, grafici dai
+6. **GUI** — fatto: navigazione delle chiavi esterne dalla griglia (Ctrl+clic), backup e ripristino
+   dal menu File. Da fare: costruttore visuale di query, grafici dai
    risultati, export XLSX/PDF, editor di trigger e viste, manutenzione delle tabelle, query salvate.
 7. **Portata** — interfaccia web, versione macOS, interfaccia in italiano e altre lingue, accessibilità.
 

@@ -22,6 +22,7 @@
 #include <stdatomic.h>
 
 static void refresh_tree(AppWindow* app);
+static Cell* grid_cell(AppWindow* app);
 static void update_session(AppWindow* app);
 static bool busy_guard(AppWindow* app);
 static void finish_run(AppWindow* app);
@@ -710,6 +711,72 @@ static void preview_table(AppWindow* app, const char* db, const char* table) {
         set_status(app, STATUS_ERROR, msg, "");
         if (r) db_result_free(r);
     }
+}
+
+// chiavi esterne dalla griglia: dal valore della cella selezionata alla riga riferita (parent) o
+// alle righe che la riferiscono (!parent). Solo verifica con run = false (menu abilitato o no)
+static bool fk_follow(AppWindow* app, bool parent, bool run) {
+    TableView* tv = app->results;
+    Cell* cell = grid_cell(app);
+    QueryResult* res = tv->result;
+    int col = tv->selected_col;
+    if (!cell || cell->is_null || !res || !res->col_tables || col < 0 || col >= res->num_cols ||
+        !res->col_tables[col] || !res->col_columns || !res->col_columns[col]) return false;
+    const char* db = res->source_db[0] ? res->source_db : db_current_database();
+    if (!db || !db[0]) return false;
+    char tbl[64], colname[64];
+    snprintf(tbl, sizeof(tbl), "%s", res->col_tables[col]);
+    snprintf(colname, sizeof(colname), "%s", res->col_columns[col]);
+    int nfk = 0;
+    ForeignKeyInfo* fks = db_list_foreign_keys(db, &nfk);
+    char target[64] = "", tcol[64] = "";
+    for (int i = 0; fks && i < nfk && !target[0]; i++) {
+        const ForeignKeyInfo* f = &fks[i];
+        if (f->ncols != 1) continue;                    // chiavi composte: non da una sola cella
+        if (parent && !strcasecmp(f->table, tbl) && !strcasecmp(f->cols[0], colname)) {
+            snprintf(target, sizeof(target), "%s", f->ref_table);
+            snprintf(tcol, sizeof(tcol), "%s", f->ref_cols[0]);
+            if (!tcol[0]) {                              // la chiave primaria del genitore
+                int nc = 0;
+                ColumnInfo* ci = db_list_columns(db, f->ref_table, &nc);
+                for (int k = 0; ci && k < nc; k++) if (ci[k].primary_key) { snprintf(tcol, sizeof(tcol), "%s", ci[k].name); break; }
+                db_columns_free(ci, nc);
+            }
+        } else if (!parent && !strcasecmp(f->ref_table, tbl)) {
+            const char* rc = f->ref_cols[0];
+            bool match = rc[0] ? !strcasecmp(rc, colname) : false;
+            if (!rc[0]) {
+                int nc = 0;
+                ColumnInfo* ci = db_list_columns(db, tbl, &nc);
+                for (int k = 0; ci && k < nc; k++) if (ci[k].primary_key && !strcasecmp(ci[k].name, colname)) match = true;
+                db_columns_free(ci, nc);
+            }
+            if (match) { snprintf(target, sizeof(target), "%s", f->table); snprintf(tcol, sizeof(tcol), "%s", f->cols[0]); }
+        }
+    }
+    db_foreign_keys_free(fks);
+    if (!target[0] || !tcol[0]) return false;
+    if (!run) return true;
+    char* lit = export_sql_literal(cell);
+    char sql[1400];
+    snprintf(sql, sizeof(sql), "SELECT * FROM `%.63s` WHERE `%.63s` = %.1000s LIMIT 200;", target, tcol, lit ? lit : "NULL");
+    free(lit);
+    if (db) use_database(app, db);
+    QueryResult* r = db_execute(sql);
+    char msg[300], meta[128];
+    if (r && r->success) {
+        r->sql = strdup(sql);
+        show_result(app, r);
+        snprintf(msg, sizeof(msg), parent ? "Row of %.60s referenced by %.60s.%.60s" : "Rows of %.60s that reference %.60s.%.60s",
+                 target, tbl, colname);
+        snprintf(meta, sizeof(meta), "%d row%s", r->num_rows, r->num_rows == 1 ? "" : "s");
+        set_status(app, STATUS_OK, msg, meta);
+    } else {
+        snprintf(msg, sizeof(msg), "Error: %.240s", r ? r->error : "no response");
+        set_status(app, STATUS_ERROR, msg, "");
+        if (r) db_result_free(r);
+    }
+    return true;
 }
 
 // doppio click: azione rapida sul nodo
@@ -2138,6 +2205,7 @@ typedef enum {
     CTX_SORT_ASC, CTX_SORT_DESC, CTX_SORT_CLEAR, CTX_FIT_COL, CTX_COPY_ALL, CTX_EXPORT,
     CTX_FILTER_VALUE, CTX_FILTER_ROWS, CTX_FILTER_CLEAR,
     CTX_EDIT_CELL, CTX_SET_NULL, CTX_ADD_ROW, CTX_SAVE_ROW, CTX_DISCARD_ROW, CTX_DELETE_ROW,
+    CTX_FK_PARENT, CTX_FK_CHILDREN,
     // editor
     CTX_CUT, CTX_COPY, CTX_PASTE, CTX_SELECT_ALL, CTX_RUN, CTX_RUN_STMT, CTX_FORMAT, CTX_COMMENT,
     // File
@@ -2239,6 +2307,8 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
     [CTX_COPY_MD]       = { "Copy results as Markdown",  NULL },
     [CTX_COPY_SQL]      = { "Copy results as SQL INSERTs", NULL },
     [CTX_EDIT_CELL]     = { "Edit cell",                 "F2" },
+    [CTX_FK_PARENT]     = { "Open referenced row",       "Ctrl+Click" },
+    [CTX_FK_CHILDREN]   = { "Show rows that reference this", NULL },
     [CTX_SET_NULL]      = { "Set to NULL",               NULL },
     [CTX_ADD_ROW]       = { "Add row",                   NULL },
     [CTX_SAVE_ROW]      = { "Save new row",              "Ctrl+Enter" },
@@ -2366,6 +2436,7 @@ static bool ctx_enabled(AppWindow* app, int a) {
         case CTX_EXPORT_SQL: case CTX_COPY_JSON: case CTX_COPY_MD: case CTX_COPY_SQL:
             return grid_ready(app);
         case CTX_FILTER_VALUE: return grid_cell(app) != NULL;
+        case CTX_FK_PARENT: case CTX_FK_CHILDREN: return idle && fk_follow(app, a == CTX_FK_PARENT, false);
         case CTX_FILTER_CLEAR: return table_view_filtered(tv);
         case CTX_CUT: case CTX_COPY: return textbox_has_selection(app->editor);
         case CTX_UNDO: return app->editor->undo_count > 0;
@@ -2445,6 +2516,7 @@ static void ctx_open_items(AppWindow* app, int kind, const int* items, int n, in
 static void ctx_open(AppWindow* app, int kind, int x, int y) {
     static const int GRID[] = {
         CTX_VIEW, CTX_EDIT_CELL, CTX_SET_NULL, CTX_SEP,
+        CTX_FK_PARENT, CTX_FK_CHILDREN, CTX_SEP,
         CTX_ADD_ROW, CTX_SAVE_ROW, CTX_DISCARD_ROW, CTX_DELETE_ROW, CTX_SEP,
         CTX_COPY_VALUE, CTX_COPY_LITERAL, CTX_INSERT_VALUE, CTX_SEP,
         CTX_COPY_ROW, CTX_COPY_COLUMN, CTX_COPY_COL_NAME, CTX_SEP,
@@ -2993,6 +3065,7 @@ static void ctx_run(AppWindow* app, int a) {
         case CTX_FIT_COL:    table_view_fit_column(tv, tv->selected_col); break;
         case CTX_COPY_ALL:   copy_results_as(app, EXPORT_TSV); break;
         case CTX_EXPORT:     bar_open(app, BAR_EXPORT, false); break;
+        case CTX_FK_PARENT: case CTX_FK_CHILDREN: fk_follow(app, a == CTX_FK_PARENT, true); break;
         case CTX_FILTER_VALUE: {
             Cell* c = grid_cell(app);
             const char* name = tv->result->col_names[tv->selected_col];
@@ -4584,6 +4657,13 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         return;
     }
 
+    // Ctrl+click su un valore di chiave esterna: apre la riga riferita
+    if (evt->type == EVT_MOUSE_DOWN && evt->mouse_button == SV_MOUSE_LEFT && (evt->modifiers & SV_MOD_CTRL) &&
+        !app->job && grid_ready(app) && widget_contains_point((Widget*)app->results, evt->mouse_x, evt->mouse_y)) {
+        widget_handle_event((Widget*)app->results, evt);   // seleziona la cella
+        if (!fk_follow(app, true, true)) set_status(app, STATUS_INFO, "This value is not a foreign key (Ctrl+click opens the referenced row)", "");
+        return;
+    }
     if (ctx_try_open(app, evt)) {
         platform_set_cursor(app->win, CURSOR_ARROW);
         return;
