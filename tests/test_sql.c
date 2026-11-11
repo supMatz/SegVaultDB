@@ -164,6 +164,13 @@ int main(void) {
     t("SELECT id FROM n WHERE b BETWEEN a AND a + 10", "2");
     t("SELECT id FROM n WHERE s LIKE 'h%' AND s NOT LIKE '%x%'", "1");
     t("SELECT id FROM n WHERE s LIKE NULL", "");
+    // date-time con i decimali dei secondi (come datetime(3) di MySQL)
+    t("CREATE TABLE dtf (id INT PRIMARY KEY, d DATETIME)", "OK:0");
+    t("INSERT INTO dtf VALUES (1, '2024-03-01 09:00:00.123'), (2, '2024-03-01 09:00:00')", "OK:2");
+    t("INSERT INTO dtf VALUES (3, '2024-03-01 09:00:00.1234567')", "ERR:date-time");
+    t("INSERT INTO dtf VALUES (3, '2024-03-01 09:00:00.')", "ERR:date-time");
+    t("SELECT id FROM dtf ORDER BY d", "2;1");
+    t("DROP TABLE dtf", "OK:0");
     // LIKE ... ESCAPE: il carattere dopo l'escape vale per sé
     t("CREATE TABLE lk (id INT PRIMARY KEY, s VARCHAR(30))", "OK:0");
     t("INSERT INTO lk VALUES (1, '100%'), (2, '100 euro'), (3, 'a_b'), (4, 'axb'), (5, 'c!d')", "OK:5");

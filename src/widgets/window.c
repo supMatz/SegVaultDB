@@ -11,6 +11,7 @@
 #include "schema_model.h"
 #include "db_tools.h"
 #include "users_view.h"
+#include "mysql_import.h"
 #include <stdio.h>
 #include <strings.h>
 #include <string.h>
@@ -2198,7 +2199,7 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
     [CTX_SNIP_DELETE]   = { "Insert DELETE template",    NULL },
     [CTX_SNIP_CREATE]   = { "Insert CREATE TABLE template", NULL },
     [CTX_IMPORT_CSV]    = { "Import CSV into a table\xe2\x80\xa6", NULL },
-    [CTX_RUN_FILE]      = { "Run SQL file\xe2\x80\xa6",  NULL },
+    [CTX_RUN_FILE]      = { "Run SQL file / MySQL dump\xe2\x80\xa6", NULL },
     [CTX_EXPORT_CSV]    = { "Results as CSV\xe2\x80\xa6", NULL },
     [CTX_EXPORT_TSV]    = { "Results as TSV\xe2\x80\xa6", NULL },
     [CTX_EXPORT_JSON]   = { "Results as JSON\xe2\x80\xa6", NULL },
@@ -3719,6 +3720,18 @@ static bool run_file(AppWindow* app, const char* path) {
         return false;
     }
     char label[300];
+    if (mysql_looks_like_dump(sql)) {           // dump di MySQL / MariaDB / phpMyAdmin: tradotto prima
+        MyImportStats st;
+        char* tr = mysql_translate(sql, &st);
+        if (tr) {
+            free(sql);
+            sql = tr;
+            snprintf(label, sizeof(label), "Import of MySQL dump %.200s (%d skipped%s)", base_name(path), st.skipped,
+                     st.indexes_dropped ? ", multi-column indexes left out" : "");
+            run_text(app, sql, 0, false, label);
+            return true;
+        }
+    }
     snprintf(label, sizeof(label), "Run of %s", base_name(path));
     run_text(app, sql, 0, false, label);
     return true;

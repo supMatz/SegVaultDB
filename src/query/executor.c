@@ -649,6 +649,15 @@ static bool valid_date(const char* s, const char** rest) {
 }
 
 // NULL se il testo è un valore valido per la colonna, altrimenti scrive il motivo in msg
+// fine di un orario: niente, o i decimali dei secondi (".123", fino a 6 cifre: datetime(3) di MySQL)
+static bool frac_secs_ok(const char* p) {
+    if (!*p) return true;
+    if (*p != '.') return false;
+    int d = 0;
+    for (p++; *p >= '0' && *p <= '9'; p++) d++;
+    return !*p && d >= 1 && d <= 6;
+}
+
 static const char* check_value(const Column* c, const char* v, char* msg, size_t n) {
     const char* p = v;
     while (isspace((unsigned char)*p)) p++;
@@ -699,7 +708,7 @@ static const char* check_value(const Column* c, const char* v, char* msg, size_t
             int hh = 0, mm = 0, ss = 0, k = 0;
             if (valid_date(p, &rest) &&
                 (!*rest || ((sscanf(rest, " %2d:%2d:%2d%n", &hh, &mm, &ss, &k) == 3 ||
-                             (ss = 0, sscanf(rest, " %2d:%2d%n", &hh, &mm, &k) == 2)) && !rest[k] &&
+                             (ss = 0, sscanf(rest, " %2d:%2d%n", &hh, &mm, &k) == 2)) && frac_secs_ok(rest + k) &&
                             hh >= 0 && hh < 24 && mm >= 0 && mm < 60 && ss >= 0 && ss < 60)))
                 return NULL;
             snprintf(msg, n, "Column '%s' expects a date-time YYYY-MM-DD HH:MM:SS, got '%.40s'", c->name, v);

@@ -286,7 +286,7 @@ rispettano la tabella resta com'era. La chiave primaria di una tabella esistente
 - tasto destro: copia di cella, riga, colonna o valore come letterale SQL, filtri, ordinamento, export.
 
 **Export** (menu *Export*): CSV, TSV, JSON, Markdown, HTML o `INSERT` SQL, su file o negli appunti (`Ctrl+Shift+C` copia tutto come TSV, da incollare in un foglio di calcolo; `Ctrl+E` esporta in CSV). *Database dump* scrive in un file `.sql` le istruzioni che ricreano il database corrente (tabelle, dati, chiavi esterne).
-**Import** (menu *Import*): un file CSV diventa una tabella (tipi delle colonne riconosciuti dai dati); *Run SQL file* esegue uno script senza aprirlo.
+**Import** (menu *Import*): un file CSV diventa una tabella (tipi delle colonne riconosciuti dai dati); *Run SQL file / MySQL dump* esegue uno script senza aprirlo. Un **dump di MySQL / MariaDB / phpMyAdmin** viene riconosciuto e tradotto prima: `SET`, `LOCK TABLES` e simili saltati, tipi MySQL convertiti (`tinyint`, `mediumtext`, `json`, `timestamp`, `enum`, `set`, ...), attributi e opzioni (`unsigned`, `COLLATE`, `COMMENT`, `ENGINE=`, ...) tolti, `KEY` → `CREATE INDEX`, `UNIQUE KEY` → vincolo `UNIQUE`, chiavi esterne mantenute (gli indici su più colonne e `FULLTEXT` restano fuori).
 
 ### Menu e impostazioni
 
@@ -975,6 +975,7 @@ Ogni widget estende `Widget` mettendolo come **primo campo** della propria struc
 | *(schermate)* | `server_view.h` / `server_view.c` | Scelta iniziale e pannello del server |
 | *(utenti)* | `users_view.*`; `src/bridge/auth.*` | Pannello Users & permissions; utenti, password, `GRANT` e controllo dei permessi nel motore |
 | *(immagini)* | `png_write.h` / `png_write.c` | Encoder PNG senza librerie (deflate con LZ77 e Huffman fisso) |
+| *(import MySQL)* | `mysql_import.h` / `mysql_import.c` | Traduzione dei dump di MySQL / MariaDB nel dialetto di SegVault |
 | *(strumenti)* | `db_tools.h` / `db_tools.c` | Ricerca in tutto il database e panoramica delle tabelle |
 | *(designer)* | `table_design.*`, `table_designer.*` | Struttura di una tabella e SQL che la realizza (`CREATE` / `ALTER`); il modulo del designer |
 | *(griglia)* | `grid_edit.h` / `grid_edit.c` | SQL per modificare i dati nella griglia dei risultati |
@@ -1210,8 +1211,9 @@ Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
    annullamento per thread; verificato con ThreadSanitizer: `make test-tsan`). Da fare: scritture
    concorrenti (lock sulle righe o MVCC).
 2. **Righe grandi** — pagine di overflow per testi e `BLOB` oltre i 4080 byte di una riga.
-3. **Compatibilità MySQL** — import dei dump di `mysqldump`, poi il protocollo di rete MySQL (le app
-   PHP come WordPress si collegherebbero senza modifiche).
+3. **Compatibilità MySQL** — fatto: import dei dump di `mysqldump` / phpMyAdmin (anche date con i
+   decimali dei secondi). Da fare: il protocollo di rete MySQL (le app PHP come WordPress si
+   collegherebbero senza modifiche).
 4. **Limiti del motore** — indici composti e `UNIQUE INDEX`, stored procedure, nomi `db.tabella`, più
    tabelle / colonne / indici, ricerca full-text, tipo JSON.
 5. **Sicurezza e gestione** — HTTPS integrato, backup pianificati e ripristino dalla GUI, avvio come

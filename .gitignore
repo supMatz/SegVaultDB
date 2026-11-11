@@ -49,3 +49,5 @@ test_sessions_asan
 test_parallel
 test_parallel_asan
 test_parallel_tsan
+test_mysql_import
+test_mysql_import_asan
