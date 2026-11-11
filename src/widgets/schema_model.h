@@ -24,6 +24,8 @@ typedef struct {
     SmCol cols[SM_MAX_COLS];
     int   x, y, w, h;          // coordinate del diagramma (w, h calcolati da chi disegna)
     bool  placed;              // posizione letta dal file o scelta dall'utente
+    bool  link;                // tabella di collegamento: la chiave primaria è fatta dalle colonne di
+                               // due chiavi esterne e nessuno la riferisce (in ER = relazione N:M)
 } SmTable;
 
 typedef struct {
@@ -42,6 +44,7 @@ typedef struct {
     int      nt;
     SmRel*   r;
     int      nr;
+    char     view[128];    // riga "v ..." del file delle posizioni (stato della vista, letto da chi disegna)
 } SchemaModel;
 
 bool sm_load(SchemaModel* m, const char* db);   // dal catalogo; false se il database non esiste
@@ -57,9 +60,13 @@ bool sm_save_positions(const SchemaModel* m, const char* path);
 void sm_auto_layout(SchemaModel* m, bool all, int gap_x, int gap_y);
 
 // ── SQL (malloc'd; NULL + messaggio in err se l'azione non è possibile) ──
-// relazione: col = colonna della figlia ("" = ne crea una nuova con il tipo della chiave del genitore)
+// relazione: col = colonna della figlia ("" = crea le colonne per la chiave del genitore, anche composta)
 char* sm_relation_sql(const SchemaModel* m, int child, const char* col, int parent, char* err, size_t errn);
-char* sm_drop_relation_sql(const SchemaModel* m, int rel);
+// molti-a-molti: tabella di collegamento con le due chiavi (nome scelto in table)
+char* sm_many_to_many_sql(const SchemaModel* m, int a, int b, char* table, size_t tn, char* err, size_t errn);
+// elimina la chiave esterna; drop_columns: anche le sue colonne che non servono ad altro
+char* sm_drop_relation_sql(const SchemaModel* m, int rel, bool drop_columns);
+bool  sm_droppable_column(const SchemaModel* m, int rel, int k);
 char* sm_relation_required_sql(const SchemaModel* m, int rel, bool required);   // SET / DROP NOT NULL
 char* sm_drop_table_sql(const SchemaModel* m, int table);
 

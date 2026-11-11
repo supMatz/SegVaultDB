@@ -18,6 +18,9 @@
 #define U_PADB    8
 #define U_MARK    30      // UML: colonna dei simboli PK / FK
 #define E_ENT     40      // ER: rettangolo dell'entità
+#define E_LINK    60      // ER: rombo di una relazione N:M (tabella di collegamento)
+#define E_DIAM    27      // ER: mezza altezza del rombo di una relazione 1:N
+#define EH(t)     ((t)->link ? E_LINK : E_ENT)
 #define E_ROW     20      // ER: riga di un attributo
 #define F_NAME    14
 #define F_ROW     13
@@ -31,13 +34,14 @@ enum { NOT_ER = 0, NOT_UML = 1 };
 enum { DRAG_NONE, DRAG_MOVE, DRAG_PAN, DRAG_LINK };
 enum { MENU_NONE, MENU_TABLE, MENU_REL, MENU_CANVAS };
 enum { CONF_NONE, CONF_DROP_TABLE, CONF_DROP_REL };
-enum { MI_EDIT = 1, MI_BROWSE, MI_LINK, MI_DROP_TABLE, MI_REQUIRED, MI_OPTIONAL, MI_DROP_REL, MI_NEW_HERE, MI_ARRANGE, MI_FIT };
+enum { MI_EDIT = 1, MI_BROWSE, MI_LINK, MI_LINK_NM, MI_DROP_TABLE, MI_REQUIRED, MI_OPTIONAL, MI_DROP_REL, MI_NEW_HERE, MI_ARRANGE, MI_FIT };
 
 static const char* menu_label(int id) {
     switch (id) {
         case MI_EDIT: return "Edit structure\xe2\x80\xa6";
         case MI_BROWSE: return "Browse data";
         case MI_LINK: return "Add relationship\xe2\x80\xa6";
+        case MI_LINK_NM: return "Add many-to-many relationship\xe2\x80\xa6";
         case MI_DROP_TABLE: return "Drop table\xe2\x80\xa6";
         case MI_REQUIRED: return "Make mandatory (NOT NULL)";
         case MI_OPTIONAL: return "Make optional (NULL allowed)";
@@ -66,7 +70,13 @@ struct SchemaView {
     float pan0x, pan0y;
     bool drag_moved;
     int  link_src, link_col, link_target;
-    bool link_sticky;                 // "Add relationship…": il click successivo sceglie la tabella
+    bool  link_sticky;                 // "Add relationship…": il click successivo sceglie la tabella
+    bool  link_nm;                     // molti-a-molti (tabella di collegamento)
+    bool  conf_cols;                   // conferma: elimina anche le colonne della relazione
+    char  conf_cols_text[160];
+    Rect  conf_check;
+    bool  view_dirty;                  // zoom / spostamento da salvare
+    uint64_t view_changed;
     int  mx, my;
     uint64_t last_click;
     int  last_click_target, last_click_x, last_click_y;
@@ -130,6 +140,8 @@ static void positions_path(const SchemaView* v, char* out, size_t n) {
 
 static void save_positions(SchemaView* v) {
     if (!v->loaded) return;
+    snprintf(v->m.view, sizeof(v->m.view), "v %d %.3f %.1f %.1f", v->notation, (double)v->zoom, (double)v->pan_x, (double)v->pan_y);
+    v->view_dirty = false;
     char p[600];
     positions_path(v, p, sizeof(p));
     sm_save_positions(&v->m, p);
@@ -156,6 +168,7 @@ SchemaView* schema_view_create(PlatformWindow* win) {
 
 void schema_view_destroy(SchemaView* v) {
     if (!v) return;
+    if (v->view_dirty) save_positions(v);
     sm_free(&v->m);
     free(v->entw);
     free(v->sql);
@@ -231,14 +244,33 @@ void schema_view_sync(SchemaView* v) {
     char p[600];
     positions_path(v, p, sizeof(p));
     v->had_positions = sm_load_positions(&v->m, p);
+    int nt;
+    float z, px, py;
+    if (sscanf(v->m.view, "v %d %f %f %f", &nt, &z, &px, &py) == 4 && v->need_fit) {   // la vista com'era
+        v->notation = nt == NOT_UML ? NOT_UML : NOT_ER;
+        v->zoom = fmaxf(ZOOM_MIN, fminf(ZOOM_MAX, z));
+        v->pan_x = px;
+        v->pan_y = py;
+        v->need_fit = false;
+    }
     v->sizes_dirty = true;
 }
 
 // ── misure dei riquadri ─────────────────────────────────────────
 
-static bool er_visible(const SmCol* c) { return !c->fk || c->pk; }
+// attributi mostrati in ER: le chiavi esterne sono le relazioni; in una relazione N:M anche la chiave
+static bool er_visible(const SmTable* t, const SmCol* c) { return t->link ? !c->pk : (!c->fk || c->pk); }
+
+// in ER la tabella di collegamento è una relazione: un rombo tra le due entità
+static bool er_link(const SchemaView* v, int i) { return v->notation == NOT_ER && v->m.t[i].link; }
 
 static int tw(SchemaView* v, const char* s, int size, FontStyle st) { return platform_measure_text_ex(v->win, s, -1, size, st); }
+
+// mezza larghezza di un rombo alto 2*hh che contiene al centro un testo largo text_w e alto text_h
+static float diamond_hw(float text_w, float text_h, float hh) {
+    float k = 1.0f - (text_h / 2 + 3) / hh;
+    return (text_w / 2 + 10) / (k > 0.25f ? k : 0.25f);
+}
 
 static void measure(SchemaView* v) {
     for (int i = 0; i < v->m.nt; i++) {
@@ -255,16 +287,17 @@ static void measure(SchemaView* v) {
             t->w = SV_MAX(w, 170);
             t->h = U_HEAD + t->ncols * U_ROW + U_PADB;
         } else {
-            int ew = SV_MAX(name_w + 40, 110), w = ew, n = 0;
+            int ew = t->link ? (int)(2 * diamond_hw((float)name_w, (float)platform_text_height(v->win, F_NAME, FONT_UI_BOLD), E_LINK / 2.0f))
+                             : SV_MAX(name_w + 40, 110), w = ew, n = 0;
             for (int c = 0; c < t->ncols; c++) {
-                if (!er_visible(&t->cols[c])) continue;
+                if (!er_visible(t, &t->cols[c])) continue;
                 n++;
-                int rw = 46 + tw(v, t->cols[c].name, F_ROW, FONT_UI) + 8;
+                int rw = (t->link ? ew / 2 - 18 : 0) + 46 + tw(v, t->cols[c].name, F_ROW, FONT_UI) + 8;
                 if (rw > w) w = rw;
             }
             v->entw[i] = ew;
             t->w = w;
-            t->h = E_ENT + (n ? 10 + n * E_ROW : 0);
+            t->h = EH(t) + (n ? 10 + n * E_ROW : 0);
         }
     }
 }
@@ -274,10 +307,12 @@ static void anchor(const SchemaView* v, int i, float* x, float* y, float* w, flo
     const SmTable* t = &v->m.t[i];
     *x = (float)t->x; *y = (float)t->y;
     *w = (float)(v->notation == NOT_ER ? v->entw[i] : t->w);
-    *h = (float)(v->notation == NOT_ER ? E_ENT : t->h);
+    *h = (float)(v->notation == NOT_ER ? EH(t) : t->h);
 }
 
 static void fit(SchemaView* v) {
+    v->view_dirty = true;
+    v->view_changed = platform_time_ms();
     if (!v->loaded || v->m.nt == 0 || v->canvas.w <= 0) { v->zoom = 1.0f; v->pan_x = v->pan_y = -20; return; }
     int x0 = 1 << 30, y0 = 1 << 30, x1 = -(1 << 30), y1 = -(1 << 30);
     for (int i = 0; i < v->m.nt; i++) {
@@ -305,6 +340,28 @@ static bool table_visible(const SchemaView* v, int i) {
            y + SL(v, (float)t->h) <= v->canvas.y + v->canvas.h;
 }
 
+// sposta la tabella i (già posizionata) in un punto libero vicino, se ne copre un'altra
+static void place_free(SchemaView* v, int i) {
+    SmTable* t = &v->m.t[i];
+    int x0 = t->x, y0 = t->y;
+    for (int ring = 0; ring < 40; ring++) {
+        for (int k = 0; k < 8; k++) {
+            static const int DX[8] = { 0, 1, 0, -1, 1, 1, -1, -1 }, DY[8] = { 1, 0, -1, 0, 1, -1, 1, -1 };
+            t->x = x0 + DX[k] * ring * 30;
+            t->y = y0 + DY[k] * ring * 30;
+            bool hit = false;
+            for (int j = 0; j < v->m.nt && !hit; j++) {
+                const SmTable* o = &v->m.t[j];
+                if (j == i || !o->placed) continue;
+                hit = t->x < o->x + o->w + 40 && o->x < t->x + t->w + 40 && t->y < o->y + o->h + 40 && o->y < t->y + t->h + 40;
+            }
+            if (!hit) return;
+            if (ring == 0) break;
+        }
+    }
+    t->x = x0; t->y = y0;
+}
+
 static void ensure_layout(SchemaView* v) {
     if (!v->loaded || !v->sizes_dirty) return;
     v->sizes_dirty = false;
@@ -315,6 +372,7 @@ static void ensure_layout(SchemaView* v) {
         if (t->placed) continue;
         if (v->pending_place && !strcasecmp(t->name, v->pending_table)) {
             t->x = (int)v->pending_x; t->y = (int)v->pending_y; t->placed = true;
+            place_free(v, i);
         } else any_unplaced = true;
     }
     v->pending_place = false;
@@ -351,6 +409,8 @@ static void rect_exit(float x, float y, float w, float h, float cx, float cy, fl
     *oy = cy + dy * t;
 }
 
+static void diamond_half(SchemaView* v, const SmRel* r, float* hw, float* hh);
+
 static void rel_geo(const SchemaView* v, int k, RelGeo* g) {
     const SmRel* r = &v->m.r[k];
     float ax, ay, aw, ah, bx, by, bw, bh;
@@ -378,6 +438,21 @@ static void rel_geo(const SchemaView* v, int k, RelGeo* g) {
         same++;
     }
     float acx = ax + aw / 2, acy = ay + ah / 2, bcx = bx + bw / 2, bcy = by + bh / 2;
+    if (v->notation == NOT_ER && fabsf(bcx - acx) < fabsf(bcy - acy)) {
+        // ER, una sopra l'altra: a gomito dal lato destro, così la linea non passa sugli attributi
+        const SmTable *A = &v->m.t[r->child], *B = &v->m.t[r->parent];
+        float hw = 0, hh;
+        if (!er_link(v, r->child)) diamond_half((SchemaView*)v, r, &hw, &hh);
+        float xr = (float)SV_MAX(A->x + A->w, B->x + B->w) + 30 + hw + (float)idx * 18;
+        float ya = acy + ((float)idx - (float)(same - 1) / 2) * 6, yb = bcy + ((float)idx - (float)(same - 1) / 2) * 6;
+        g->n = 4;
+        float pts[4][2] = { { ax + aw, ya }, { xr, ya }, { xr, yb }, { bx + bw, yb } };
+        memcpy(g->p, pts, sizeof(pts));
+        if (er_link(v, r->child)) g->p[0][1] = acy;
+        g->mx = xr;
+        g->my = (ya + yb) / 2;
+        return;
+    }
     float dx = bcx - acx, dy = bcy - acy, len = sqrtf(dx * dx + dy * dy);
     if (len < 1) { dx = 1; dy = 0; len = 1; }
     dx /= len; dy /= len;
@@ -388,6 +463,11 @@ static void rel_geo(const SchemaView* v, int k, RelGeo* g) {
     g->n = 2;
     rect_exit(ax, ay, aw, ah, sax, say, dx, dy, &g->p[0][0], &g->p[0][1]);
     rect_exit(bx, by, bw, bh, sbx, sby, -dx, -dy, &g->p[1][0], &g->p[1][1]);
+    if (er_link(v, r->child)) {      // uscita dal rombo, dal centro
+        float t = 1.0f / (fabsf(dx) / (aw / 2) + fabsf(dy) / (ah / 2));
+        g->p[0][0] = acx + dx * t;
+        g->p[0][1] = acy + dy * t;
+    }
     g->mx = (g->p[0][0] + g->p[1][0]) / 2;
     g->my = (g->p[0][1] + g->p[1][1]) / 2;
 }
@@ -411,8 +491,8 @@ static const char* rel_label(const SchemaView* v, const SmRel* r) {
 }
 
 static void diamond_half(SchemaView* v, const SmRel* r, float* hw, float* hh) {
-    *hw = (float)tw(v, rel_label(v, r), F_SMALL, FONT_UI) / 2 + 22;
-    *hh = 17;
+    *hh = E_DIAM;
+    *hw = diamond_hw((float)tw(v, rel_label(v, r), F_ROW, FONT_UI_BOLD), (float)platform_text_height(v->win, F_ROW, FONT_UI_BOLD), *hh);
 }
 
 static float seg_dist(float px, float py, float ax, float ay, float bx, float by) {
@@ -443,7 +523,7 @@ static int rel_at(SchemaView* v, int sx, int sy) {
         for (int s = 0; s + 1 < g.n; s++)
             if (seg_dist((float)sx, (float)sy, (float)SX(v, g.p[s][0]), (float)SY(v, g.p[s][1]),
                          (float)SX(v, g.p[s + 1][0]), (float)SY(v, g.p[s + 1][1])) < 6) return k;
-        if (v->notation == NOT_ER) {
+        if (v->notation == NOT_ER && !er_link(v, v->m.r[k].child)) {
             float hw, hh;
             diamond_half(v, &v->m.r[k], &hw, &hh);
             float dx = fabsf(WX(v, sx) - g.mx) / hw, dy = fabsf(WY(v, sy) - g.my) / hh;
@@ -459,7 +539,7 @@ static bool handle_pos(SchemaView* v, int i, int col, int* hx, int* hy) {
     if (v->notation == NOT_ER) {
         if (col >= 0) return false;
         *hx = SX(v, (float)(t->x + v->entw[i]));
-        *hy = SY(v, (float)t->y + E_ENT / 2.0f);
+        *hy = SY(v, (float)t->y + EH(t) / 2.0f);
         return true;
     }
     *hx = SX(v, (float)(t->x + t->w));
@@ -541,27 +621,38 @@ static void draw_table_uml(SchemaView* v, int i, bool sel, bool hover, bool targ
 static void draw_table_er(SchemaView* v, int i, bool sel, bool hover, bool target) {
     PlatformWindow* win = v->win;
     const SmTable* t = &v->m.t[i];
-    Rect e = { SX(v, (float)t->x), SY(v, (float)t->y), SL(v, (float)v->entw[i]), SL(v, E_ENT) };
-    platform_fill_rect(win, (Rect){e.x + 2, e.y + 3, e.w, e.h}, ui_alpha(TH_BG, 120));
+    Rect e = { SX(v, (float)t->x), SY(v, (float)t->y), SL(v, (float)v->entw[i]), SL(v, EH(t)) };
     Color border = sel || target ? TH_ACCENT : hover ? TH_TEXT : TH_TEXT_MUTED;
-    platform_fill_rect(win, e, TH_ELEVATED);
-    platform_draw_rect(win, e, border, sel || target ? 2 : 1);
     int nw = platform_measure_text_ex(win, t->name, -1, FS(v, F_NAME), FONT_UI_BOLD);
-    text_at(v, t->name, e.x + (e.w - nw) / 2, ui_text_y(win, e, FS(v, F_NAME), FONT_UI_BOLD), TH_TEXT, F_NAME, FONT_UI_BOLD);
-    // attributi: lecca-lecca appesi all'entità (pieno = identificatore)
+    if (t->link) {   // relazione N:M: rombo con il nome
+        float cx = (float)e.x + (float)e.w / 2, cy = (float)e.y + (float)e.h / 2, w = (float)e.w / 2, h = (float)e.h / 2;
+        float b = sel || target ? 2.0f : 1.0f;
+        float outer[8] = { cx - w - b, cy, cx, cy - h - b, cx + w + b, cy, cx, cy + h + b };
+        float inner[8] = { cx - w + 1.5f, cy, cx, cy - h + 1.2f, cx + w - 1.5f, cy, cx, cy + h - 1.2f };
+        ui_fill_polygon(win, outer, 4, border);
+        ui_fill_polygon(win, inner, 4, sel ? TH_ACCENT_SOFT : TH_ELEVATED);
+        text_at(v, t->name, (int)cx - nw / 2, ui_text_y(win, e, FS(v, F_NAME), FONT_UI_BOLD), TH_TEXT, F_NAME, FONT_UI_BOLD);
+    } else {
+        platform_fill_rect(win, (Rect){e.x + 2, e.y + 3, e.w, e.h}, ui_alpha(TH_BG, 120));
+        platform_fill_rect(win, e, TH_ELEVATED);
+        platform_draw_rect(win, e, border, sel || target ? 2 : 1);
+        text_at(v, t->name, e.x + (e.w - nw) / 2, ui_text_y(win, e, FS(v, F_NAME), FONT_UI_BOLD), TH_TEXT, F_NAME, FONT_UI_BOLD);
+    }
+    // attributi: lecca-lecca appesi all'entità (pieno = identificatore) o alla relazione
     int n = 0;
-    for (int c = 0; c < t->ncols; c++) n += er_visible(&t->cols[c]);
+    for (int c = 0; c < t->ncols; c++) n += er_visible(t, &t->cols[c]);
     if (!n) return;
-    int spine = SX(v, (float)t->x + 18);
-    int y0 = e.y + e.h, last = SY(v, (float)(t->y + E_ENT + 10 + (n - 1) * E_ROW) + E_ROW / 2.0f);
+    float sx0 = t->link ? (float)t->x + (float)v->entw[i] / 2 : (float)t->x + 18;
+    int spine = SX(v, sx0);
+    int y0 = e.y + e.h, last = SY(v, (float)(t->y + EH(t) + 10 + (n - 1) * E_ROW) + E_ROW / 2.0f);
     Color line = TH_TEXT_DIM;
     ui_line(win, (float)spine, (float)y0, (float)spine, (float)last, fmaxf(1, v->zoom), line);
     int k = 0;
     for (int c = 0; c < t->ncols; c++) {
         const SmCol* col = &t->cols[c];
-        if (!er_visible(col)) continue;
-        int cy = SY(v, (float)(t->y + E_ENT + 10 + k * E_ROW) + E_ROW / 2.0f);
-        int cx = SX(v, (float)t->x + 34);
+        if (!er_visible(t, col)) continue;
+        int cy = SY(v, (float)(t->y + EH(t) + 10 + k * E_ROW) + E_ROW / 2.0f);
+        int cx = SX(v, sx0 + 16);
         ui_line(win, (float)spine, (float)cy, (float)cx, (float)cy, fmaxf(1, v->zoom), line);
         int rr = SV_MAX(3, SL(v, 5));
         if (col->pk) ui_circle(win, cx, cy, rr, TH_TEXT);
@@ -607,6 +698,10 @@ static void draw_rel(SchemaView* v, int k) {
         ui_line(v->win, (float)SX(v, g.p[s][0]), (float)SY(v, g.p[s][1]), (float)SX(v, g.p[s + 1][0]), (float)SY(v, g.p[s + 1][1]), th, c);
     float ax = g.p[0][0], ay = g.p[0][1], bx = g.p[g.n - 1][0], by = g.p[g.n - 1][1];
     float adx = g.p[1][0] - ax, ady = g.p[1][1] - ay, bdx = g.p[g.n - 2][0] - bx, bdy = g.p[g.n - 2][1] - by;
+    if (g.n == 4) {   // a gomito: le cardinalità accanto al tratto verticale, vicino agli angoli
+        ax = g.p[1][0]; ay = g.p[1][1]; adx = 0; ady = g.p[2][1] - ay;
+        bx = g.p[2][0]; by = g.p[2][1]; bdx = 0; bdy = g.p[1][1] - by;
+    }
     Color lc = sel ? TH_ACCENT_TEXT : TH_TEXT_MUTED;
     float cax, cay, caw, cah, pbx, pby, pbw, pbh;
     anchor(v, r->child, &cax, &cay, &caw, &cah);
@@ -624,6 +719,8 @@ static void draw_rel(SchemaView* v, int k) {
             ui_line(v->win, tx, ty, l1x, l1y, th, c);
             ui_line(v->win, tx, ty, l2x, l2y, th, c);
         }
+    } else if (er_link(v, r->child)) {
+        card_label(v, bx, by, bdx, bdy, r->one_to_one ? "(0,1)" : "(0,N)", lc, pbx, pby, pbw, pbh);
     } else {
         card_label(v, ax, ay, adx, ady, r->optional ? "(0,1)" : "(1,1)", lc, cax, cay, caw, cah);
         card_label(v, bx, by, bdx, bdy, r->one_to_one ? "(0,1)" : "(0,N)", lc, pbx, pby, pbw, pbh);
@@ -635,9 +732,9 @@ static void draw_rel(SchemaView* v, int k) {
         ui_fill_polygon(v->win, outer, 4, sel ? TH_ACCENT : hov ? TH_TEXT : TH_TEXT_MUTED);
         ui_fill_polygon(v->win, inner, 4, sel ? TH_ACCENT_SOFT : TH_SURFACE);
         const char* lbl = rel_label(v, r);
-        int lw = platform_measure_text_ex(v->win, lbl, -1, FS(v, F_SMALL), FONT_UI);
-        int lh = platform_text_height(v->win, FS(v, F_SMALL), FONT_UI);
-        text_at(v, lbl, (int)cx - lw / 2, (int)cy - lh / 2, TH_TEXT, F_SMALL, FONT_UI);
+        int lw = platform_measure_text_ex(v->win, lbl, -1, FS(v, F_ROW), FONT_UI_BOLD);
+        int lh = platform_text_height(v->win, FS(v, F_ROW), FONT_UI_BOLD);
+        text_at(v, lbl, (int)cx - lw / 2, (int)cy - lh / 2, TH_TEXT, F_ROW, FONT_UI_BOLD);
     }
 }
 
@@ -779,12 +876,23 @@ static void draw_confirm(SchemaView* v) {
     if (v->confirm == CONF_NONE) return;
     PlatformWindow* win = v->win;
     platform_fill_rect(win, v->area, ui_alpha(TH_BG, 150));
-    int w = 460, h = 150;
+    int w = 480, h = v->confirm == CONF_DROP_REL && v->conf_cols_text[0] ? 180 : 150;
     Rect r = { v->area.x + (v->area.w - w) / 2, v->area.y + (v->area.h - h) / 2, w, h };
     v->conf_rect = r;
     ui_round_box(win, r, TH_SURFACE, TH_BORDER_STRONG, 10);
     platform_draw_text_ex(win, v->confirm_text[0], -1, (Point){r.x + 22, r.y + 20}, TH_TEXT, 15, FONT_UI_BOLD);
     ui_text_clipped(win, v->confirm_text[1], r.x + 22, r.y + 50, w - 44, TH_TEXT_MUTED, TH_FONT_UI, FONT_UI);
+    v->conf_check = (Rect){0, 0, 0, 0};
+    if (v->confirm == CONF_DROP_REL && v->conf_cols_text[0]) {
+        Rect cb = { r.x + 22, r.y + 80, 16, 16 };
+        int tw2 = platform_measure_text_ex(win, v->conf_cols_text, -1, TH_FONT_UI, FONT_UI);
+        v->conf_check = (Rect){ cb.x - 4, cb.y - 4, SV_MIN(tw2 + 34, w - 40), 24 };
+        bool hov = in_rect(v->conf_check, v->mx, v->my);
+        ui_round_box(win, cb, v->conf_cols ? TH_ACCENT : TH_SURFACE, v->conf_cols || hov ? TH_ACCENT : TH_BORDER_STRONG, 4);
+        if (v->conf_cols) ui_icon_check(win, cb.x + 8, cb.y + 8, 11, TH_ON_ACCENT);
+        ui_text_clipped(win, v->conf_cols_text, cb.x + 26, ui_text_y(win, (Rect){cb.x, cb.y - 2, 0, 20}, TH_FONT_UI, FONT_UI),
+                        w - 44 - 26, TH_TEXT, TH_FONT_UI, FONT_UI);
+    }
     v->conf_ok = (Rect){ r.x + w - 22 - 100, r.y + h - 22 - 34, 100, 34 };
     v->conf_cancel = (Rect){ v->conf_ok.x - 10 - 90, v->conf_ok.y, 90, 34 };
     draw_button(v, v->conf_cancel, "Cancel", false, false);
@@ -851,7 +959,8 @@ void schema_view_draw(SchemaView* v, Rect r) {
         }
         // suggerimento in basso
         const char* hint = v->drag == DRAG_LINK
-            ? "Release on the table it refers to  \xc2\xb7  Esc to cancel"
+            ? (v->link_nm ? "Click the other table of the many-to-many relationship  \xc2\xb7  Esc to cancel"
+                          : "Release on the table it refers to  \xc2\xb7  hold Shift for many-to-many (link table)  \xc2\xb7  Esc to cancel")
             : v->notation == NOT_UML
               ? "Drag a table to move it  \xc2\xb7  drag from a + handle to another table to link them (on a column: that column becomes the key)  \xc2\xb7  double-click to edit  \xc2\xb7  right-click for more"
               : "Drag a table to move it  \xc2\xb7  drag from the + handle to the table it refers to  \xc2\xb7  double-click to edit  \xc2\xb7  right-click for more";
@@ -934,9 +1043,19 @@ static void confirm_drop_table(SchemaView* v, int i) {
 static void confirm_drop_rel(SchemaView* v, int k) {
     v->confirm = CONF_DROP_REL;
     v->confirm_target = k;
-    snprintf(v->confirm_text[0], sizeof(v->confirm_text[0]), "Delete relationship %.60s?", v->m.r[k].name);
-    snprintf(v->confirm_text[1], sizeof(v->confirm_text[1]), "The foreign key of %.60s is removed; its column and data stay.",
-             v->m.t[v->m.r[k].child].name);
+    const SmRel* r = &v->m.r[k];
+    snprintf(v->confirm_text[0], sizeof(v->confirm_text[0]), "Delete relationship %.60s?", r->name);
+    // colonne che possono andare via con la relazione
+    char cols[120] = "";
+    size_t n = 0;
+    for (int i = 0; i < r->ncols && n < sizeof(cols) - 1; i++)
+        if (sm_droppable_column(&v->m, k, i))
+            n += (size_t)snprintf(cols + n, sizeof(cols) - n, "%s%.40s", n ? ", " : "", r->cols[i]);
+    v->conf_cols = false;
+    v->conf_cols_text[0] = '\0';
+    if (n) snprintf(v->conf_cols_text, sizeof(v->conf_cols_text), "Also drop the column%s %.100s and its data",
+                    strchr(cols, ',') ? "s" : "", cols);
+    snprintf(v->confirm_text[1], sizeof(v->confirm_text[1]), "The foreign key of %.60s is removed.", v->m.t[r->child].name);
 }
 
 static void open_menu(SchemaView* v, int kind, int target, int x, int y) {
@@ -947,8 +1066,8 @@ static void open_menu(SchemaView* v, int kind, int target, int x, int y) {
     v->menu_wx = WX(v, x);
     v->menu_wy = WY(v, y);
     if (kind == MENU_TABLE) {
-        int items[] = { MI_EDIT, MI_BROWSE, MI_LINK, MI_DROP_TABLE };
-        memcpy(v->menu_items, items, sizeof(items)); v->menu_n = 4;
+        int items[] = { MI_EDIT, MI_BROWSE, MI_LINK, MI_LINK_NM, MI_DROP_TABLE };
+        memcpy(v->menu_items, items, sizeof(items)); v->menu_n = 5;
     } else if (kind == MENU_REL) {
         v->menu_items[v->menu_n++] = v->m.r[target].optional ? MI_REQUIRED : MI_OPTIONAL;
         v->menu_items[v->menu_n++] = MI_DROP_REL;
@@ -971,8 +1090,9 @@ static SchemaViewAction run_menu(SchemaView* v, int id) {
         case MI_EDIT: case MI_BROWSE:
             snprintf(v->table, sizeof(v->table), "%s", v->m.t[t].name);
             return id == MI_EDIT ? SCV_EDIT_TABLE : SCV_BROWSE_TABLE;
-        case MI_LINK:
+        case MI_LINK: case MI_LINK_NM:
             v->drag = DRAG_LINK; v->link_src = t; v->link_col = -1; v->link_target = -1; v->link_sticky = true;
+            v->link_nm = id == MI_LINK_NM;
             return SCV_REDRAW;
         case MI_DROP_TABLE: confirm_drop_table(v, t); return SCV_REDRAW;
         case MI_REQUIRED: case MI_OPTIONAL:
@@ -992,8 +1112,35 @@ static SchemaViewAction finish_link(SchemaView* v, int target) {
     v->drag = DRAG_NONE;
     v->link_src = -1;
     v->link_sticky = false;
+    bool nm = v->link_nm;
+    v->link_nm = false;
     if (target < 0) return SCV_REDRAW;
     char err[300];
+    if (nm) {
+        char link[64];
+        char* sql = sm_many_to_many_sql(&v->m, src, target, link, sizeof(link), err, sizeof(err));
+        if (!sql) { set_msg(v, err, true); return SCV_REDRAW; }
+        // la tabella di collegamento va tra le due
+        const SmTable *a = &v->m.t[src], *b = &v->m.t[target];
+        snprintf(v->pending_table, sizeof(v->pending_table), "%s", link);
+        float acx = (float)a->x + (float)a->w / 2, acy = (float)a->y + (float)a->h / 2;
+        float bcx = (float)b->x + (float)b->w / 2, bcy = (float)b->y + (float)b->h / 2;
+        if (fabsf(acx - bcx) >= fabsf(acy - bcy)) {    // affiancate: in mezzo
+            v->pending_x = (acx + bcx) / 2 - 80;
+            v->pending_y = (acy + bcy) / 2 - 20;
+        } else {                                       // una sopra l'altra: a destra, a metà altezza
+            v->pending_x = (float)SV_MAX(a->x + a->w, b->x + b->w) + 140;
+            v->pending_y = (acy + bcy) / 2 - 20;
+        }
+        v->pending_x = floorf(v->pending_x / GRID) * GRID;
+        v->pending_y = floorf(v->pending_y / GRID) * GRID;
+        if (src == target) { v->pending_x = (float)(a->x + a->w + 120); v->pending_y = (float)a->y; }
+        v->pending_place = true;
+        char what[200];
+        snprintf(what, sizeof(what), "Many-to-many: link table %.60s created", link);
+        v->sel_table = -1;
+        return exec(v, sql, what);
+    }
     const char* cname = col >= 0 && col < v->m.t[src].ncols ? v->m.t[src].cols[col].name : "";
     char* sql = sm_relation_sql(&v->m, src, cname, target, err, sizeof(err));
     if (!sql) { set_msg(v, err, true); return SCV_REDRAW; }
@@ -1005,6 +1152,8 @@ static SchemaViewAction finish_link(SchemaView* v, int target) {
 
 static void set_zoom(SchemaView* v, float z, int ax, int ay) {
     z = fmaxf(ZOOM_MIN, fminf(ZOOM_MAX, z));
+    v->view_dirty = true;
+    v->view_changed = platform_time_ms();
     float wx = WX(v, ax), wy = WY(v, ay);
     v->zoom = z;
     v->pan_x = wx - (float)(ax - v->canvas.x) / z;
@@ -1072,6 +1221,7 @@ SchemaViewAction schema_view_event(SchemaView* v, sEvent* evt) {
             ok = in_rect(v->conf_ok, v->mx, v->my);
             cancel = in_rect(v->conf_cancel, v->mx, v->my) || !in_rect(v->conf_rect, v->mx, v->my);
         }
+        if (evt->type == EVT_MOUSE_DOWN && in_rect(v->conf_check, v->mx, v->my)) { v->conf_cols = !v->conf_cols; return SCV_REDRAW; }
         if (cancel) { v->confirm = CONF_NONE; return SCV_REDRAW; }
         if (ok) {
             int kind = v->confirm, t = v->confirm_target;
@@ -1085,7 +1235,7 @@ SchemaViewAction schema_view_event(SchemaView* v, sEvent* evt) {
             if (kind == CONF_DROP_REL && t < v->m.nr) {
                 snprintf(what, sizeof(what), "Relationship %.60s deleted", v->m.r[t].name);
                 v->sel_rel = -1;
-                return exec(v, sm_drop_relation_sql(&v->m, t), what);
+                return exec(v, sm_drop_relation_sql(&v->m, t, v->conf_cols), what);
             }
         }
         return SCV_REDRAW;
@@ -1178,17 +1328,20 @@ SchemaViewAction schema_view_event(SchemaView* v, sEvent* evt) {
                 if (v->drag_moved) save_positions(v);
                 return SCV_REDRAW;
             }
-            if (d == DRAG_PAN) { v->drag = DRAG_NONE; return SCV_REDRAW; }
+            if (d == DRAG_PAN) { v->drag = DRAG_NONE; save_positions(v); return SCV_REDRAW; }
             if (d == DRAG_LINK && !v->link_sticky) {
                 int t = table_at(v, v->mx, v->my);
                 // rilasciato sulla stessa tabella senza muoversi: resta in attesa del click sulla destinazione
                 if (t == v->link_src && abs(v->mx - v->drag_sx) + abs(v->my - v->drag_sy) < 6) { v->link_sticky = true; return SCV_REDRAW; }
+                if (evt->modifiers & SV_MOD_SHIFT) v->link_nm = true;
                 return finish_link(v, t);
             }
             return SCV_NONE;
         }
         case EVT_MOUSE_WHEEL: {
             if (!in_rect(v->canvas, evt->mouse_x, evt->mouse_y)) return SCV_NONE;
+            v->view_dirty = true;
+            v->view_changed = platform_time_ms();
             if (evt->modifiers & SV_MOD_CTRL) { set_zoom(v, v->zoom * (evt->wheel_delta > 0 ? 1.1f : 1 / 1.1f), evt->mouse_x, evt->mouse_y); return SCV_REDRAW; }
             float step = 60 / v->zoom * (float)evt->wheel_delta;
             if (evt->modifiers & SV_MOD_SHIFT) v->pan_x -= step;
@@ -1197,7 +1350,7 @@ SchemaViewAction schema_view_event(SchemaView* v, sEvent* evt) {
         }
         case EVT_KEY_DOWN: {
             if (evt->key == KEY_ESCAPE) {
-                if (v->drag == DRAG_LINK) { v->drag = DRAG_NONE; v->link_src = -1; v->link_sticky = false; }
+                if (v->drag == DRAG_LINK) { v->drag = DRAG_NONE; v->link_src = -1; v->link_sticky = false; v->link_nm = false; }
                 else { v->sel_table = v->sel_rel = -1; }
                 return SCV_REDRAW;
             }
@@ -1242,7 +1395,7 @@ SchemaViewAction schema_view_event(SchemaView* v, sEvent* evt) {
         if (in_rect(v->b_newdb, x, y)) { open_newdb(v); return SCV_REDRAW; }
         if (in_rect(v->b_er, x, y) || in_rect(v->b_uml, x, y)) {
             int n = in_rect(v->b_er, x, y) ? NOT_ER : NOT_UML;
-            if (n != v->notation) { v->notation = n; v->sizes_dirty = true; }
+            if (n != v->notation) { v->notation = n; v->sizes_dirty = true; save_positions(v); }
             return SCV_REDRAW;
         }
         int cx = v->canvas.x + v->canvas.w / 2, cy = v->canvas.y + v->canvas.h / 2;
@@ -1267,7 +1420,10 @@ SchemaViewAction schema_view_event(SchemaView* v, sEvent* evt) {
     update_hover(v);
     int t = v->hover_table, k = v->hover_rel;
 
-    if (v->drag == DRAG_LINK && v->link_sticky) return finish_link(v, t);
+    if (v->drag == DRAG_LINK && v->link_sticky) {
+        if (evt->modifiers & SV_MOD_SHIFT) v->link_nm = true;
+        return finish_link(v, t);
+    }
 
     if (evt->mouse_button == SV_MOUSE_RIGHT) {
         if (t >= 0) { v->sel_table = t; v->sel_rel = -1; open_menu(v, MENU_TABLE, t, x, y); }
@@ -1286,7 +1442,7 @@ SchemaViewAction schema_view_event(SchemaView* v, sEvent* evt) {
     v->last_click_y = y;
 
     if (t >= 0 && v->hover_handle != -2) {         // relazione: dal pallino a un'altra tabella
-        v->drag = DRAG_LINK; v->link_src = t; v->link_col = v->hover_handle; v->link_target = -1; v->link_sticky = false;
+        v->drag = DRAG_LINK; v->link_src = t; v->link_col = v->hover_handle; v->link_target = -1; v->link_sticky = false; v->link_nm = false;
         v->drag_sx = x; v->drag_sy = y;
         return SCV_REDRAW;
     }
@@ -1328,5 +1484,6 @@ bool schema_view_tick(SchemaView* v, uint64_t now_ms) {
     bool r = false;
     if (v->newdb_open) r = line_edit_tick(v->newdb, now_ms);
     if (v->msg[0] && now_ms >= v->msg_until) { v->msg[0] = '\0'; r = true; }
+    if (v->view_dirty && now_ms - v->view_changed > 800) save_positions(v);
     return r;
 }

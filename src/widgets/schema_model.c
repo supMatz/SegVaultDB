@@ -22,6 +22,32 @@ void sm_free(SchemaModel* m) {
     memset(m, 0, sizeof(*m));
 }
 
+// chiave primaria = unione delle colonne di esattamente due chiavi esterne, nessuno la riferisce
+static bool is_link_table(const SchemaModel* m, int i) {
+    const SmTable* t = &m->t[i];
+    int fk[2], n = 0;
+    for (int k = 0; k < m->nr; k++) {
+        if (m->r[k].parent == i) return false;
+        if (m->r[k].child == i) { if (n == 2) return false; fk[n++] = k; }
+    }
+    if (n != 2) return false;
+    int npk = 0;
+    for (int c = 0; c < t->ncols; c++) {
+        if (!t->cols[c].pk) continue;
+        npk++;
+        bool in = false;
+        for (int a = 0; a < 2 && !in; a++)
+            for (int j = 0; j < m->r[fk[a]].ncols && !in; j++) in = !strcasecmp(m->r[fk[a]].cols[j], t->cols[c].name);
+        if (!in) return false;
+    }
+    for (int a = 0; a < 2; a++)
+        for (int j = 0; j < m->r[fk[a]].ncols; j++) {
+            int c = sm_col(t, m->r[fk[a]].cols[j]);
+            if (c < 0 || !t->cols[c].pk) return false;
+        }
+    return npk > 0;
+}
+
 bool sm_load(SchemaModel* m, const char* db) {
     memset(m, 0, sizeof(*m));
     if (!db || !db[0]) return false;
@@ -76,6 +102,7 @@ bool sm_load(SchemaModel* m, const char* db) {
         r->one_to_one = (fk_pk == r->ncols && npk == r->ncols) || (c0 >= 0 && t->cols[c0].unique);
     }
     db_foreign_keys_free(fks);
+    for (int i = 0; i < m->nt; i++) m->t[i].link = is_link_table(m, i);
     return true;
 }
 
@@ -87,6 +114,11 @@ bool sm_load_positions(SchemaModel* m, const char* path) {
     char line[256], name[64];
     int x, y;
     while (fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, "v ", 2)) {
+            snprintf(m->view, sizeof(m->view), "%.120s", line);
+            m->view[strcspn(m->view, "\r\n")] = '\0';
+            continue;
+        }
         if (sscanf(line, "t %63s %d %d", name, &x, &y) != 3) continue;
         int i = sm_find(m, name);
         if (i < 0) continue;
@@ -102,6 +134,7 @@ bool sm_save_positions(const SchemaModel* m, const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) return false;
     fprintf(f, "# SegVault schema diagram: %s\n", m->db);
+    if (m->view[0]) fprintf(f, "%s\n", m->view);
     for (int i = 0; i < m->nt; i++)
         if (m->t[i].placed) fprintf(f, "t %s %d %d\n", m->t[i].name, m->t[i].x, m->t[i].y);
     return fclose(f) == 0;
@@ -261,20 +294,70 @@ static void fk_name(const SchemaModel* m, const char* child, const char* parent,
     }
 }
 
+// testo che cresce (SQL di più statement)
+typedef struct { char* p; size_t n, cap; bool oom; } SBuf;
+
+static void sb_add(SBuf* b, const char* s) {
+    size_t n = strlen(s);
+    if (b->oom) return;
+    if (b->n + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 256;
+        while (cap < b->n + n + 1) cap *= 2;
+        char* p = realloc(b->p, cap);
+        if (!p) { b->oom = true; return; }
+        b->p = p;
+        b->cap = cap;
+    }
+    memcpy(b->p + b->n, s, n + 1);
+    b->n += n;
+}
+
+static void sb_id(SBuf* b, const char* name) { sb_add(b, "`"); sb_add(b, name); sb_add(b, "`"); }
+
+static char* sb_done(SBuf* b, char* err, size_t errn) {
+    if (b->oom || !b->p) { free(b->p); if (err) snprintf(err, errn, "Out of memory"); return NULL; }
+    return b->p;
+}
+
+// colonne della chiave primaria di una tabella (posizioni); 0 se non ne ha
+static int pk_cols(const SmTable* t, int* out) {
+    int n = 0;
+    for (int i = 0; i < t->ncols && n < 8; i++) if (t->cols[i].pk) out[n++] = i;
+    return n;
+}
+
+// nome di colonna per riferirsi alla chiave `key` di `parent`: <parent>_id per "id", altrimenti il nome
+// della chiave (con prefix se richiesto); mai uguale a una colonna di `t` né a quelli già in `taken`
+static void ref_col_name(const char* parent, const char* key, bool prefix, const SmTable* t,
+                         char taken[][64], int ntaken, char* out) {
+    char base[64];
+    if (!strcasecmp(key, "id")) snprintf(base, sizeof(base), "%.55s_id", parent);
+    else if (prefix) snprintf(base, sizeof(base), "%.30s_%.30s", parent, key);
+    else snprintf(base, sizeof(base), "%.60s", key);
+    snprintf(out, 64, "%s", base);
+    for (int k = 2; k < 100; k++) {
+        bool used = t && sm_col(t, out) >= 0;
+        for (int i = 0; i < ntaken && !used; i++) used = !strcasecmp(taken[i], out);
+        if (!used) return;
+        snprintf(out, 64, "%.58s_%d", base, k);
+    }
+}
+
 char* sm_relation_sql(const SchemaModel* m, int child, const char* col, int parent, char* err, size_t errn) {
     if (child < 0 || child >= m->nt || parent < 0 || parent >= m->nt) { snprintf(err, errn, "Unknown table"); return NULL; }
     const SmTable* C = &m->t[child];
     const SmTable* P = &m->t[parent];
-    int pk = -1, npk = 0;
-    for (int i = 0; i < P->ncols; i++) if (P->cols[i].pk) { pk = i; npk++; }
+    int pk[8];
+    int npk = pk_cols(P, pk);
     if (npk == 0) { snprintf(err, errn, "Table '%.60s' has no primary key to refer to", P->name); return NULL; }
-    if (npk > 1) { snprintf(err, errn, "Table '%.60s' has a composite primary key: write this relationship in SQL", P->name); return NULL; }
-    const SmCol* key = &P->cols[pk];
-    char type[64];
-    snprintf(type, sizeof(type), "%.63s", key->type);
     char cname[80];
     fk_name(m, C->name, P->name, cname, sizeof(cname));
+    SBuf b = {0};
     if (col && col[0]) {
+        if (npk > 1) {
+            snprintf(err, errn, "The key of '%.60s' has %d columns: drag from the table's + handle instead", P->name, npk);
+            return NULL;
+        }
         int c = sm_col(C, col);
         if (c < 0) { snprintf(err, errn, "Column '%.60s' not found in '%.60s'", col, C->name); return NULL; }
         if (child == parent && C->cols[c].pk) { snprintf(err, errn, "A column cannot refer to itself"); return NULL; }
@@ -283,28 +366,98 @@ char* sm_relation_sql(const SchemaModel* m, int child, const char* col, int pare
                 snprintf(err, errn, "Column '%.60s' is already a foreign key (%.60s)", col, m->r[k].name);
                 return NULL;
             }
-        return dupf("ALTER TABLE `%s` ADD CONSTRAINT `%s` FOREIGN KEY (`%s`) REFERENCES `%s` (`%s`)",
-                    C->name, cname, C->cols[c].name, P->name, key->name);
+        sb_add(&b, "ALTER TABLE "); sb_id(&b, C->name); sb_add(&b, " ADD CONSTRAINT "); sb_id(&b, cname);
+        sb_add(&b, " FOREIGN KEY ("); sb_id(&b, C->cols[c].name); sb_add(&b, ") REFERENCES "); sb_id(&b, P->name);
+        sb_add(&b, " ("); sb_id(&b, P->cols[pk[0]].name); sb_add(&b, ")");
+        return sb_done(&b, err, errn);
     }
-    // colonna nuova: <genitore>_id (o il nome della chiave), senza ripetere un nome esistente
-    char base[64], name[64];
-    if (!strcasecmp(key->name, "id")) snprintf(base, sizeof(base), "%.55s_id", P->name);
-    else snprintf(base, sizeof(base), "%.60s", key->name);
-    snprintf(name, sizeof(name), "%s", base);
-    for (int k = 2; sm_col(C, name) >= 0 && k < 100; k++) snprintf(name, sizeof(name), "%.58s_%d", base, k);
-    char* add = dupf("ALTER TABLE `%s` ADD COLUMN `%s` %s", C->name, name, type, "", "");
-    char* fk = dupf("ALTER TABLE `%s` ADD CONSTRAINT `%s` FOREIGN KEY (`%s`) REFERENCES `%s` (`%s`)",
-                    C->name, cname, name, P->name, key->name);
-    char* out = add && fk ? dupf("%s;\n%s", add, fk, "", "", "") : NULL;
-    free(add);
-    free(fk);
-    if (!out) snprintf(err, errn, "Out of memory");
-    return out;
+    // colonne nuove, una per colonna della chiave del genitore, dello stesso tipo
+    char names[8][64];
+    for (int k = 0; k < npk; k++) {
+        ref_col_name(P->name, P->cols[pk[k]].name, npk > 1, C, names, k, names[k]);
+        sb_add(&b, "ALTER TABLE "); sb_id(&b, C->name); sb_add(&b, " ADD COLUMN "); sb_id(&b, names[k]);
+        sb_add(&b, " "); sb_add(&b, P->cols[pk[k]].type); sb_add(&b, ";\n");
+    }
+    sb_add(&b, "ALTER TABLE "); sb_id(&b, C->name); sb_add(&b, " ADD CONSTRAINT "); sb_id(&b, cname); sb_add(&b, " FOREIGN KEY (");
+    for (int k = 0; k < npk; k++) { if (k) sb_add(&b, ", "); sb_id(&b, names[k]); }
+    sb_add(&b, ") REFERENCES "); sb_id(&b, P->name); sb_add(&b, " (");
+    for (int k = 0; k < npk; k++) { if (k) sb_add(&b, ", "); sb_id(&b, P->cols[pk[k]].name); }
+    sb_add(&b, ")");
+    return sb_done(&b, err, errn);
 }
 
-char* sm_drop_relation_sql(const SchemaModel* m, int rel) {
+char* sm_many_to_many_sql(const SchemaModel* m, int a, int b, char* table, size_t tn, char* err, size_t errn) {
+    if (a < 0 || a >= m->nt || b < 0 || b >= m->nt) { snprintf(err, errn, "Unknown table"); return NULL; }
+    const SmTable* A = &m->t[a];
+    const SmTable* B = &m->t[b];
+    int pa[8], pb[8];
+    int na = pk_cols(A, pa), nb = pk_cols(B, pb);
+    if (!na || !nb) { snprintf(err, errn, "Table '%.60s' has no primary key", !na ? A->name : B->name); return NULL; }
+    if (na + nb > 8) { snprintf(err, errn, "The keys are too large for a link table"); return NULL; }
+    // nome della tabella di collegamento: a_b, senza ripetere una tabella esistente
+    char base[64];
+    snprintf(base, sizeof(base), "%.30s_%.30s", A->name, B->name);
+    snprintf(table, tn, "%s", base);
+    for (int k = 2; sm_find(m, table) >= 0 && k < 100; k++) snprintf(table, tn, "%.58s_%d", base, k);
+    char names[16][64];
+    int n = 0;
+    for (int k = 0; k < na; k++, n++) ref_col_name(A->name, A->cols[pa[k]].name, true, NULL, names, n, names[n]);
+    for (int k = 0; k < nb; k++, n++) {
+        // auto-relazione molti-a-molti: la seconda copia della chiave prende il suffisso _2
+        ref_col_name(B->name, B->cols[pb[k]].name, true, NULL, names, n, names[n]);
+    }
+    SBuf s = {0};
+    sb_add(&s, "CREATE TABLE "); sb_id(&s, table); sb_add(&s, " (\n");
+    for (int k = 0; k < n; k++) {
+        const SmCol* src = k < na ? &A->cols[pa[k]] : &B->cols[pb[k - na]];
+        sb_add(&s, "    "); sb_id(&s, names[k]); sb_add(&s, " "); sb_add(&s, src->type); sb_add(&s, " NOT NULL,\n");
+    }
+    sb_add(&s, "    PRIMARY KEY (");
+    for (int k = 0; k < n; k++) { if (k) sb_add(&s, ", "); sb_id(&s, names[k]); }
+    sb_add(&s, "),\n");
+    char cn[80];
+    for (int side = 0; side < 2; side++) {
+        const SmTable* T = side ? B : A;
+        const int* pk = side ? pb : pa;
+        int cnt = side ? nb : na, off = side ? na : 0;
+        if (side && a == b) snprintf(cn, sizeof(cn), "fk_%.28s_%.26s_2", table, T->name);
+        else snprintf(cn, sizeof(cn), "fk_%.28s_%.28s", table, T->name);
+        sb_add(&s, "    CONSTRAINT "); sb_id(&s, cn); sb_add(&s, " FOREIGN KEY (");
+        for (int k = 0; k < cnt; k++) { if (k) sb_add(&s, ", "); sb_id(&s, names[off + k]); }
+        sb_add(&s, ") REFERENCES "); sb_id(&s, T->name); sb_add(&s, " (");
+        for (int k = 0; k < cnt; k++) { if (k) sb_add(&s, ", "); sb_id(&s, T->cols[pk[k]].name); }
+        sb_add(&s, side ? ")\n" : "),\n");
+    }
+    sb_add(&s, ")");
+    return sb_done(&s, err, errn);
+}
+
+char* sm_drop_relation_sql(const SchemaModel* m, int rel, bool drop_columns) {
     if (rel < 0 || rel >= m->nr) return NULL;
-    return dupf("ALTER TABLE `%s` DROP CONSTRAINT `%s`", m->t[m->r[rel].child].name, m->r[rel].name, "", "", "");
+    const SmRel* r = &m->r[rel];
+    const SmTable* C = &m->t[r->child];
+    SBuf b = {0};
+    sb_add(&b, "ALTER TABLE "); sb_id(&b, C->name); sb_add(&b, " DROP CONSTRAINT "); sb_id(&b, r->name);
+    for (int k = 0; drop_columns && k < r->ncols; k++) {
+        if (!sm_droppable_column(m, rel, k)) continue;
+        sb_add(&b, ";\nALTER TABLE "); sb_id(&b, C->name); sb_add(&b, " DROP COLUMN "); sb_id(&b, r->cols[k]);
+    }
+    return sb_done(&b, NULL, 0);
+}
+
+// la colonna k della relazione si può eliminare insieme a lei: non è chiave primaria, non serve a
+// un'altra chiave esterna e non è l'ultima colonna della tabella
+bool sm_droppable_column(const SchemaModel* m, int rel, int k) {
+    if (rel < 0 || rel >= m->nr || k < 0 || k >= m->r[rel].ncols) return false;
+    const SmRel* r = &m->r[rel];
+    const SmTable* C = &m->t[r->child];
+    int c = sm_col(C, r->cols[k]);
+    if (c < 0 || C->cols[c].pk || C->ncols <= 1) return false;
+    for (int q = 0; q < m->nr; q++) {
+        if (q == rel || m->r[q].child != r->child) continue;
+        for (int j = 0; j < m->r[q].ncols; j++) if (!strcasecmp(m->r[q].cols[j], r->cols[k])) return false;
+    }
+    return true;
 }
 
 char* sm_relation_required_sql(const SchemaModel* m, int rel, bool required) {

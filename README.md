@@ -234,15 +234,16 @@ senza scrivere SQL.
 
 | Azione | Come |
 |---|---|
-| Notazione | *ER* (entità, attributi a lecca-lecca — pieno = identificatore —, relazioni a rombo con le cardinalità `(1,1)` / `(0,N)`) o *UML* (classi con attributi e tipi, molteplicità `1` / `0..1` / `*`, freccia verso la tabella riferita) |
+| Notazione | *ER* (entità, attributi a lecca-lecca — pieno = identificatore —, relazioni a rombo con le cardinalità `(1,1)` / `(0,N)`; una tabella di collegamento, la cui chiave è fatta dalle due chiavi esterne, è disegnata come relazione molti-a-molti con i suoi attributi, come `esame(voto, data)` tra `studente` e `corso`) o *UML* (classi con attributi e tipi, molteplicità `1` / `0..1` / `*`, freccia verso la tabella riferita). Notazione, zoom e posizione della vista sono ricordati per ogni database |
 | Spostare una tabella | trascinarla (posizioni salvate per database in `diagram_<db>.txt` nella cartella dei dati); frecce = sposta la selezionata |
 | Navigare | trascinare lo sfondo o rotella (`Shift` = orizzontale), `Ctrl` + rotella o *− / +* = zoom, *Fit* adatta, *Arrange* ridispone (genitori a sinistra, senza linee sopra le tabelle) |
 | Nuovo database | *+ Database* (o il menu del database) |
 | Nuova tabella | *+ Table*, doppio click su un punto vuoto o tasto destro › *New table here*: si apre il modulo della struttura e la tabella va in quel punto |
 | Modificare una tabella | doppio click, `Invio` o tasto destro › *Edit structure* |
-| Relazione (chiave esterna) | trascinare dal **+** sul bordo di una tabella alla tabella a cui si riferisce (crea la colonna `<tabella>_id` del tipo giusto); in UML anche dal pallino di una colonna: diventa lei la chiave esterna. Oppure tasto destro › *Add relationship…* e click sulla destinazione |
+| Relazione (chiave esterna) | trascinare dal **+** sul bordo di una tabella alla tabella a cui si riferisce (crea la colonna `<tabella>_id` del tipo giusto, o una colonna per ogni parte se la chiave è composta); in UML anche dal pallino di una colonna: diventa lei la chiave esterna. Oppure tasto destro › *Add relationship…* e click sulla destinazione |
+| Relazione molti-a-molti | come sopra tenendo premuto `Shift` al rilascio, o tasto destro › *Add many-to-many relationship…*: crea la tabella di collegamento `a_b` con le due chiavi (chiave primaria composta) e la mette tra le due tabelle |
 | Relazione obbligatoria / facoltativa | tasto destro sulla linea (`SET` / `DROP NOT NULL` sulle colonne della chiave) |
-| Eliminare | selezione + `Canc`, o tasto destro: tabella (con conferma; le relazioni verso di lei vengono tolte) o relazione (la colonna resta) |
+| Eliminare | selezione + `Canc`, o tasto destro: tabella (con conferma; le relazioni verso di lei vengono tolte) o relazione (con la casella *Also drop the column* anche le sue colonne, se non servono ad altro) |
 | Dati | tasto destro › *Browse data* apre l'anteprima nella pagina SQL |
 
 Dall'explorer, tasto destro su un database o una tabella › *Show in the designer*.

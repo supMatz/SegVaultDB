@@ -52,6 +52,7 @@ int main(void) {
     CHECK(sm_load(&m, "u") && m.nt == 4 && m.nr == 3, "load: %d tables %d rels", m.nt, m.nr);
     int k = rel_between(&m, "esame", "studente");
     CHECK(k >= 0 && !m.r[k].optional && !m.r[k].one_to_one, "esame -> studente (1,1) / N");
+    CHECK(m.t[sm_find(&m, "esame")].link, "esame is a relationship (key = both foreign keys)");
     k = rel_between(&m, "esame", "corso");
     CHECK(k >= 0 && !strcmp(m.r[k].on_delete, "CASCADE"), "on delete cascade");
     k = rel_between(&m, "tessera", "studente");
@@ -118,8 +119,8 @@ int main(void) {
     sm_load(&m, "u");
     CHECK(!sm_relation_sql(&m, sm_find(&m, "prenotazione"), "chi", sm_find(&m, "studente"), err, sizeof(err)) && strstr(err, "already"),
           "duplicate fk refused: %s", err);
-    CHECK(!sm_relation_sql(&m, sm_find(&m, "studente"), "", sm_find(&m, "esame"), err, sizeof(err)) && strstr(err, "composite"),
-          "composite key refused: %s", err);
+    CHECK(!sm_relation_sql(&m, sm_find(&m, "studente"), "nome", sm_find(&m, "esame"), err, sizeof(err)) && strstr(err, "2 columns"),
+          "single column to composite key refused: %s", err);
     // la colonna nuova non ripete un nome esistente
     sql = sm_relation_sql(&m, sm_find(&m, "corso"), "", sm_find(&m, "aula"), err, sizeof(err));
     CHECK(sql && strstr(sql, "`aula_id_2`"), "unique column name: %s", sql ? sql : err);
@@ -135,12 +136,77 @@ int main(void) {
     CHECK(!m.r[rel_between(&m, "prenotazione", "studente")].optional, "now (1,1)");
 
     // relazione eliminata
-    sql = sm_drop_relation_sql(&m, rel_between(&m, "prenotazione", "studente"));
+    sql = sm_drop_relation_sql(&m, rel_between(&m, "prenotazione", "studente"), false);
     CHECK(sql && exec_all(sql, err, sizeof(err)), "drop relation: %s", err);
     free(sql);
     sm_free(&m);
     sm_load(&m, "u");
     CHECK(rel_between(&m, "prenotazione", "studente") < 0, "relation gone");
+
+    // relazione verso una chiave composta: una colonna nuova per ogni colonna della chiave
+    run("CREATE TABLE ricorso (id INT PRIMARY KEY, motivo VARCHAR(40))");
+    sm_free(&m);
+    sm_load(&m, "u");
+    sql = sm_relation_sql(&m, sm_find(&m, "ricorso"), "", sm_find(&m, "esame"), err, sizeof(err));
+    CHECK(sql && strstr(sql, "`esame_studente`") && strstr(sql, "`esame_corso`")
+          && strstr(sql, "REFERENCES `esame` (`studente`, `corso`)"), "composite fk: %s", sql ? sql : err);
+    CHECK(sql && exec_all(sql, err, sizeof(err)), "composite fk runs: %s", err);
+    free(sql);
+    sm_free(&m);
+    sm_load(&m, "u");
+    k = rel_between(&m, "ricorso", "esame");
+    CHECK(k >= 0 && m.r[k].ncols == 2, "composite relation loaded");
+    // eliminata con le sue colonne
+    CHECK(sm_droppable_column(&m, k, 0) && sm_droppable_column(&m, k, 1), "columns droppable");
+    sql = sm_drop_relation_sql(&m, k, true);
+    CHECK(sql && strstr(sql, "DROP COLUMN `esame_studente`") && exec_all(sql, err, sizeof(err)), "drop with columns: %s", err);
+    free(sql);
+    sm_free(&m);
+    sm_load(&m, "u");
+    int ri = sm_find(&m, "ricorso");
+    CHECK(rel_between(&m, "ricorso", "esame") < 0 && sm_col(&m.t[ri], "esame_corso") < 0 && m.t[ri].ncols == 2, "columns gone");
+    // la chiave primaria della figlia non si elimina con la relazione
+    k = rel_between(&m, "tessera", "studente");
+    CHECK(!sm_droppable_column(&m, k, 0), "pk column kept");
+
+    // molti-a-molti: tabella di collegamento
+    char link[64];
+    sql = sm_many_to_many_sql(&m, sm_find(&m, "studente"), sm_find(&m, "aula"), link, sizeof(link), err, sizeof(err));
+    CHECK(sql && !strcmp(link, "studente_aula") && strstr(sql, "`studente_matricola` INT NOT NULL") && strstr(sql, "`aula_id` INT NOT NULL")
+          && strstr(sql, "PRIMARY KEY (`studente_matricola`, `aula_id`)"), "n:m sql: %s", sql ? sql : err);
+    CHECK(sql && exec_all(sql, err, sizeof(err)), "n:m runs: %s", err);
+    free(sql);
+    sm_free(&m);
+    sm_load(&m, "u");
+    CHECK(rel_between(&m, "studente_aula", "studente") >= 0 && rel_between(&m, "studente_aula", "aula") >= 0, "n:m relations");
+    CHECK(m.t[sm_find(&m, "studente_aula")].link && !m.t[sm_find(&m, "studente")].link && !m.t[sm_find(&m, "tessera")].link, "link table recognised");
+    run("INSERT INTO aula VALUES (1, 'A1')");
+    run("INSERT INTO studente VALUES (1, 'Anna')");
+    run("INSERT INTO studente_aula VALUES (1, 1)");
+    QueryResult* r = db_execute("INSERT INTO studente_aula VALUES (1, 1)");
+    CHECK(r && !r->success && strstr(r->error, "Duplicate"), "n:m pair unique: %s", r ? r->error : "");
+    db_result_free(r);
+    r = db_execute("INSERT INTO studente_aula VALUES (1, 99)");
+    CHECK(r && !r->success && strstr(r->error, "oreign"), "n:m foreign key enforced: %s", r ? r->error : "");
+    db_result_free(r);
+    // auto-relazione molti-a-molti (es. propedeuticità tra corsi)
+    sql = sm_many_to_many_sql(&m, sm_find(&m, "corso"), sm_find(&m, "corso"), link, sizeof(link), err, sizeof(err));
+    CHECK(sql && strstr(sql, "`corso_id`") && strstr(sql, "`corso_id_2`") && exec_all(sql, err, sizeof(err)), "self n:m: %s", sql ? sql : err);
+    free(sql);
+    // nome libero se la tabella esiste già
+    sm_free(&m);
+    sm_load(&m, "u");
+    sql = sm_many_to_many_sql(&m, sm_find(&m, "studente"), sm_find(&m, "aula"), link, sizeof(link), err, sizeof(err));
+    CHECK(sql && !strcmp(link, "studente_aula_2"), "link name taken: %s", link);
+    free(sql);
+
+    // stato della vista conservato nel file delle posizioni
+    snprintf(m.view, sizeof(m.view), "v 1 0.800 -10.0 20.0");
+    sm_save_positions(&m, "/tmp/sv_schema_test/pos2.txt");
+    sm_free(&m);
+    sm_load(&m, "u");
+    sm_load_positions(&m, "/tmp/sv_schema_test/pos2.txt");
+    CHECK(!strcmp(m.view, "v 1 0.800 -10.0 20.0"), "view line: '%s'", m.view);
 
     // tabella riferita da altre: prima le loro chiavi esterne, poi il DROP
     sql = sm_drop_table_sql(&m, sm_find(&m, "studente"));
