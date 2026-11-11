@@ -1,5 +1,6 @@
 #include "result_export.h"
 #include "grid_edit.h"
+#include "export_bin.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,8 +25,10 @@ static void put(Buf* b, const char* s, size_t n) {
 static void puts_(Buf* b, const char* s) { put(b, s, strlen(s)); }
 static void putc_(Buf* b, char c) { put(b, &c, 1); }
 
-static const char* const EXT[]   = { "csv", "tsv", "json", "md", "html", "sql" };
-static const char* const NAMES[] = { "CSV", "TSV", "JSON", "Markdown", "HTML", "SQL INSERT" };
+static const char* const EXT[]   = { "csv", "tsv", "json", "md", "html", "sql", "xlsx", "pdf" };
+static const char* const NAMES[] = { "CSV", "TSV", "JSON", "Markdown", "HTML", "SQL INSERT", "Excel XLSX", "PDF" };
+
+bool export_is_binary(ExportFormat f) { return f == EXPORT_XLSX || f == EXPORT_PDF; }
 
 const char* export_format_ext(ExportFormat f)  { return (f >= 0 && f < EXPORT_FORMAT_COUNT) ? EXT[f] : "csv"; }
 const char* export_format_name(ExportFormat f) { return (f >= 0 && f < EXPORT_FORMAT_COUNT) ? NAMES[f] : "CSV"; }
@@ -110,7 +113,24 @@ static void md_text(Buf* b, const char* s) {
     }
 }
 
+unsigned char* export_result_bin(const TableView* tv, ExportFormat f, const ExportOptions* opt, const char* title, size_t* len) {
+    if (!export_is_binary(f)) {
+        char* t = export_result(tv, f, opt);
+        if (t) *len = strlen(t);
+        return (unsigned char*)t;
+    }
+    if (!tv || !tv->result || tv->result->num_cols <= 0 || tv->msg_kind != TABLE_MSG_NONE) return NULL;
+    int nr = table_view_row_count(tv);
+    int* order = malloc(sizeof(int) * (size_t)(nr ? nr : 1));
+    if (!order) return NULL;
+    for (int i = 0; i < nr; i++) order[i] = table_view_source_row(tv, i);
+    uint8_t* b = f == EXPORT_XLSX ? export_xlsx(tv->result, order, nr, len) : export_pdf(tv->result, order, nr, title, len);
+    free(order);
+    return b;
+}
+
 char* export_result(const TableView* tv, ExportFormat f, const ExportOptions* opt) {
+    if (export_is_binary(f)) return NULL;
     if (!tv || !tv->result || tv->result->num_cols <= 0 || tv->msg_kind != TABLE_MSG_NONE) return NULL;
     const QueryResult* r = tv->result;
     int nc = r->num_cols, nr = table_view_row_count(tv);

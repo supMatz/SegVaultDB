@@ -17,6 +17,7 @@ SCOPO: Layout principale dell'applicazione SegVault.
   └──────────────────────────────────────────────────────────────┘
 */
 
+#include "chart_view.h"
 #include "widget.h"
 #include "button.h"
 #include "label.h"
@@ -216,6 +217,9 @@ typedef struct {
     int          del_src;            // riga in attesa di conferma della cancellazione
     uint64_t     del_until;
     Rect         eb_add, eb_save, eb_discard;   // pulsanti nell'intestazione dei risultati
+    Rect         eb_chart, eb_chart_kind;       // Chart / Table e Bars / Lines
+    bool         chart_on;                      // risultati come grafico
+    ChartModel   chart;
 
     // -- stato --
     QueryResult* last_result;     // risultato mostrato (= tabs[cur_tab])

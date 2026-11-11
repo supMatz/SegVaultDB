@@ -55,3 +55,5 @@ test_overflow
 test_overflow_asan
 test_backup
 test_backup_asan
+test_export
+test_export_asan

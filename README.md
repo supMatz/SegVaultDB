@@ -289,7 +289,7 @@ rispettano la tabella resta com'era. La chiave primaria di una tabella esistente
 referenced row*) apre la riga riferita; su una chiave primaria, *Show rows that reference this*
 mostra le righe che la riferiscono.
 
-**Export** (menu *Export*): CSV, TSV, JSON, Markdown, HTML o `INSERT` SQL, su file o negli appunti (`Ctrl+Shift+C` copia tutto come TSV, da incollare in un foglio di calcolo; `Ctrl+E` esporta in CSV). *Database dump* scrive in un file `.sql` le istruzioni che ricreano il database corrente (tabelle, dati, chiavi esterne, viste, trigger e procedure).
+**Export** (menu *Export*): **Excel (`.xlsx`)** con numeri veri, intestazione in grassetto e prima riga bloccata, **PDF** (tabella su pagine A4 orizzontali), CSV, TSV, JSON, Markdown, HTML o `INSERT` SQL, su file o negli appunti (`Ctrl+Shift+C` copia tutto come TSV, da incollare in un foglio di calcolo; `Ctrl+E` esporta in CSV). *Database dump* scrive in un file `.sql` le istruzioni che ricreano il database corrente (tabelle, dati, chiavi esterne, viste, trigger e procedure).
 **Import** (menu *Import*): un file CSV diventa una tabella (tipi delle colonne riconosciuti dai dati); *Run SQL file / MySQL dump* esegue uno script senza aprirlo. Un **dump di MySQL / MariaDB / phpMyAdmin** viene riconosciuto e tradotto prima: `SET`, `LOCK TABLES` e simili saltati, tipi MySQL convertiti (`tinyint`, `mediumtext`, `json`, `timestamp`, `enum`, `set`, ...), attributi e opzioni (`unsigned`, `COLLATE`, `COMMENT`, `ENGINE=`, ...) tolti, `KEY` → `CREATE INDEX`, `UNIQUE KEY` → vincolo `UNIQUE`, chiavi esterne mantenute, viste, trigger e procedure ricreati (`DELIMITER` e i commenti `/*!50001 ... */` compresi; anche gli indici su più colonne; i `FULLTEXT` restano fuori, ma `MATCH ... AGAINST` funziona lo stesso).
 
 ### Menu e impostazioni
@@ -1073,6 +1073,7 @@ make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitize
 | `test_examples` (166) | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
 | `test_grid_edit` (22) | Modifica dei dati nella griglia: analisi dei risultati, `UPDATE` / `INSERT` / `DELETE` generati ed eseguiti, chiavi composte, join, apici e backslash, letterali di export e dump |
 | `test_server` (115) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici, utenti e permessi, audit, protocollo MySQL (login, permessi, errori, più istruzioni, transazioni) |
+| `test_export` (9) | Export XLSX (zip con CRC giusti, parti XML complete, numeri, testo con caratteri speciali, NULL) e PDF (xref, pagine, testo WinAnsi) |
 | `test_backup` (29) | `BACKUP TO`, apertura della copia, ripristino sui dati in uso (con i dati precedenti conservati), righe grandi, viste, procedure e utenti |
 
 La CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) compila su Ubuntu con `-D_FORTIFY_SOURCE=2` e fallisce a qualunque warning, esegue `make test` e `make test-asan`, e compila per Windows con MinGW-w64. Durante lo sviluppo il motore è stato anche verificato con un fuzzer di SQL mutato e uno di richieste HTTP malformate (sotto ASan), con un confronto dei risultati contro SQLite su centinaia di migliaia di query e modifiche casuali, e con arresti forzati (`kill -9`) durante scritture concorrenti senza perdere nessuna scrittura confermata.
@@ -1303,8 +1304,8 @@ Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
    permessi; registro di audit (`--audit`); servizio systemd e avvio automatico su Windows; HTTPS tramite
    reverse proxy (documentato). Da fare: HTTPS integrato senza proxy.
 6. **GUI** — fatto: navigazione delle chiavi esterne dalla griglia (Ctrl+clic), backup e ripristino
-   dal menu File. Da fare: costruttore visuale di query, grafici dai
-   risultati, export XLSX/PDF, editor di trigger e viste, manutenzione delle tabelle, query salvate.
+   dal menu File, export XLSX e PDF. Da fare: costruttore visuale di query, grafici dai
+   risultati, editor di trigger e viste, manutenzione delle tabelle, query salvate.
 7. **Portata** — interfaccia web, versione macOS, interfaccia in italiano e altre lingue, accessibilità.
 
 ## Licenza

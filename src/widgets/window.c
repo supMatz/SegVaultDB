@@ -713,6 +713,57 @@ static void preview_table(AppWindow* app, const char* db, const char* table) {
     }
 }
 
+// ── grafico dei risultati ────────────────────────────────────────
+
+static bool chart_showing(AppWindow* app) { return app->chart_on && grid_ready(app) && !app->showing_history; }
+
+// righe mostrate dalla griglia (filtro e ordinamento), al massimo 5000; malloc'd
+static int* chart_rows(AppWindow* app, int* n) {
+    int nr = table_view_row_count(app->results);
+    if (nr > 5000) nr = 5000;
+    int* rows = malloc(sizeof(int) * (size_t)(nr ? nr : 1));
+    if (!rows) { *n = 0; return NULL; }
+    for (int i = 0; i < nr; i++) rows[i] = table_view_source_row(app->results, i);
+    *n = nr;
+    return rows;
+}
+
+static void chart_toggle(AppWindow* app) {
+    if (app->chart_on) { app->chart_on = false; set_status(app, STATUS_IDLE, "Table view", ""); return; }
+    int n = 0;
+    int* rows = chart_rows(app, &n);
+    char why[160];
+    app->chart.line_auto = true;
+    if (!rows || !chart_model_build(app->results->result, rows, n, &app->chart, why, sizeof(why))) {
+        set_status(app, STATUS_INFO, why, "");
+        free(rows);
+        return;
+    }
+    free(rows);
+    app->chart_on = true;
+}
+
+static void draw_chart(AppWindow* app) {
+    int n = 0;
+    int* rows = chart_rows(app, &n);
+    char why[160];
+    // il modello segue i dati (nuova query, filtro): se non c'è più niente da disegnare si torna alla tabella
+    ChartModel m = app->chart;
+    if (!rows || !chart_model_build(app->results->result, rows, n, &m, why, sizeof(why))) {
+        app->chart_on = false;
+        free(rows);
+        widget_draw((Widget*)app->results, app->win);
+        return;
+    }
+    app->chart.label_col = m.label_col;
+    app->chart.nseries = m.nseries;
+    memcpy(app->chart.series, m.series, sizeof(m.series));
+    if (app->chart.line_auto) app->chart.line = m.line;
+    chart_draw(app->win, app->results->base.bounds, app->results->result, rows, n, &app->chart,
+               app->mouse_x, app->mouse_y, !g_theme.light);
+    free(rows);
+}
+
 // chiavi esterne dalla griglia: dal valore della cella selezionata alla riga riferita (parent) o
 // alle righe che la riferiscono (!parent). Solo verifica con run = false (menu abilitato o no)
 static bool fk_follow(AppWindow* app, bool parent, bool run) {
@@ -906,7 +957,7 @@ static void bar_open(AppWindow* app, BarMode mode, bool replace) {
         char buf[1100];
         join_path(buf, sizeof(buf), app->data_dir[0] ? app->data_dir : ".", "result.csv");
         line_edit_set_text(app->bar_input, buf);
-        app->bar_input->placeholder = "File path: .csv .tsv .json .md .html .sql choose the format";
+        app->bar_input->placeholder = "File path: .csv .tsv .json .md .html .sql .xlsx .pdf choose the format";
         textbox_set_search(app->editor, NULL, false, false);
     } else if (mode == BAR_SEARCH_DB) {
         char* w = textbox_word_or_selection(app->editor);
@@ -1034,9 +1085,13 @@ static void bar_submit(AppWindow* app, bool shift, bool ctrl) {
             ExportFormat fmt = export_format_from_path(path);
             csv_table_name_from_path(path, app->export_table, sizeof(app->export_table));
             ExportOptions o = export_options(app->export_table);
-            char* out = export_result(app->results, fmt, &o);
+            size_t olen = 0;
+            const char* title = app->results->result && app->results->result->sql ? app->results->result->sql : "SegVault export";
+            unsigned char* out = export_result_bin(app->results, fmt, &o, title, &olen);
             if (!out) { set_status(app, STATUS_INFO, "Nothing to export: run a query first", ""); bar_close(app); return; }
-            bool ok = write_text_file(path, out);
+            FILE* ef = fopen(path, "wb");
+            bool ok = ef && fwrite(out, 1, olen, ef) == olen;
+            if (ef && fclose(ef) != 0) ok = false;
             free(out);
             char msg[1200];
             if (ok) {
@@ -1853,6 +1908,9 @@ static bool gedit_handle_event(AppWindow* app, sEvent* evt) {
     // pulsanti nell'intestazione dei risultati
     if (evt->type == EVT_MOUSE_DOWN && evt->mouse_button == SV_MOUSE_LEFT) {
         int x = evt->mouse_x, y = evt->mouse_y;
+        if (rect_has(app->eb_chart, x, y))   { chart_toggle(app); return true; }
+        if (rect_has(app->eb_chart_kind, x, y)) { app->chart.line = !app->chart.line; app->chart.line_auto = false; return true; }
+        if (chart_showing(app) && rect_has(app->results->base.bounds, x, y)) return true;   // il grafico non si clicca
         if (rect_has(app->eb_add, x, y))     { draft_add(app); return true; }
         if (rect_has(app->eb_save, x, y))    { draft_save(app); return true; }
         if (rect_has(app->eb_discard, x, y)) { draft_discard(app); return true; }
@@ -2220,7 +2278,7 @@ typedef enum {
     CTX_SNIP_SELECT, CTX_SNIP_JOIN, CTX_SNIP_GROUP, CTX_SNIP_INSERT, CTX_SNIP_UPDATE, CTX_SNIP_DELETE, CTX_SNIP_CREATE,
     // Import / Export
     CTX_IMPORT_CSV, CTX_RUN_FILE,
-    CTX_EXPORT_CSV, CTX_EXPORT_TSV, CTX_EXPORT_JSON, CTX_EXPORT_MD, CTX_EXPORT_HTML, CTX_EXPORT_SQL,
+    CTX_EXPORT_CSV, CTX_EXPORT_TSV, CTX_EXPORT_JSON, CTX_EXPORT_MD, CTX_EXPORT_HTML, CTX_EXPORT_SQL, CTX_EXPORT_XLSX, CTX_EXPORT_PDF,
     CTX_COPY_JSON, CTX_COPY_MD, CTX_COPY_SQL, CTX_DUMP_DB, CTX_BACKUP, CTX_RESTORE,
     // struttura ed explorer
     CTX_NEW_TABLE, CTX_EDIT_STRUCTURE, CTX_TREE_BROWSE, CTX_TREE_USE_DB, CTX_TREE_COPY_NAME, CTX_TREE_SELECT_SQL,
@@ -2303,6 +2361,8 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
     [CTX_EXPORT_MD]     = { "Results as Markdown\xe2\x80\xa6", NULL },
     [CTX_EXPORT_HTML]   = { "Results as HTML\xe2\x80\xa6", NULL },
     [CTX_EXPORT_SQL]    = { "Results as SQL INSERTs\xe2\x80\xa6", NULL },
+    [CTX_EXPORT_XLSX]   = { "Results as Excel (.xlsx)\xe2\x80\xa6", NULL },
+    [CTX_EXPORT_PDF]    = { "Results as PDF\xe2\x80\xa6", NULL },
     [CTX_COPY_JSON]     = { "Copy results as JSON",      NULL },
     [CTX_COPY_MD]       = { "Copy results as Markdown",  NULL },
     [CTX_COPY_SQL]      = { "Copy results as SQL INSERTs", NULL },
@@ -2363,8 +2423,8 @@ static const int M_QUERY[] = { CTX_RUN, CTX_RUN_STMT, CTX_EXPLAIN, CTX_STOP, CTX
                                CTX_SNIP_DELETE, CTX_SNIP_CREATE, CTX_SEP, CTX_NEW_TABLE, CTX_EDIT_STRUCTURE, CTX_SEP,
                                CTX_SEARCH_DB, CTX_DB_OVERVIEW };
 static const int M_IMPORT[] = { CTX_IMPORT_CSV, CTX_SEP, CTX_OPEN, CTX_RUN_FILE };
-static const int M_EXPORT[] = { CTX_EXPORT_CSV, CTX_EXPORT_TSV, CTX_EXPORT_JSON, CTX_EXPORT_MD, CTX_EXPORT_HTML,
-                                CTX_EXPORT_SQL, CTX_SEP, CTX_COPY_ALL, CTX_COPY_JSON, CTX_COPY_MD, CTX_COPY_SQL, CTX_SEP,
+static const int M_EXPORT[] = { CTX_EXPORT_XLSX, CTX_EXPORT_PDF, CTX_EXPORT_CSV, CTX_EXPORT_TSV, CTX_EXPORT_JSON, CTX_EXPORT_MD,
+                                CTX_EXPORT_HTML, CTX_EXPORT_SQL, CTX_SEP, CTX_COPY_ALL, CTX_COPY_JSON, CTX_COPY_MD, CTX_COPY_SQL, CTX_SEP,
                                 CTX_DUMP_DB };
 static const int M_SETTINGS[] = { CTX_SETTINGS, CTX_USERS, CTX_SEP, CTX_NEXT_THEME, CTX_TOGGLE_SIDEBAR, CTX_TOGGLE_FOOTER,
                                   CTX_TOGGLE_LINENUMS, CTX_TOGGLE_ROWNUMS, CTX_SEP, CTX_SETTINGS_RESET };
@@ -2433,7 +2493,7 @@ static bool ctx_enabled(AppWindow* app, int a) {
         case CTX_SORT_CLEAR: return grid_ready(app) && tv->sort_col >= 0;
         case CTX_COPY_ALL: case CTX_EXPORT: case CTX_FILTER_ROWS:
         case CTX_EXPORT_CSV: case CTX_EXPORT_TSV: case CTX_EXPORT_JSON: case CTX_EXPORT_MD: case CTX_EXPORT_HTML:
-        case CTX_EXPORT_SQL: case CTX_COPY_JSON: case CTX_COPY_MD: case CTX_COPY_SQL:
+        case CTX_EXPORT_SQL: case CTX_EXPORT_XLSX: case CTX_EXPORT_PDF: case CTX_COPY_JSON: case CTX_COPY_MD: case CTX_COPY_SQL:
             return grid_ready(app);
         case CTX_FILTER_VALUE: return grid_cell(app) != NULL;
         case CTX_FK_PARENT: case CTX_FK_CHILDREN: return idle && fk_follow(app, a == CTX_FK_PARENT, false);
@@ -3268,6 +3328,8 @@ static void ctx_run(AppWindow* app, int a) {
         case CTX_EXPORT_MD:   open_export_bar(app, EXPORT_MARKDOWN); break;
         case CTX_EXPORT_HTML: open_export_bar(app, EXPORT_HTML); break;
         case CTX_EXPORT_SQL:  open_export_bar(app, EXPORT_SQL); break;
+        case CTX_EXPORT_XLSX: open_export_bar(app, EXPORT_XLSX); break;
+        case CTX_EXPORT_PDF:  open_export_bar(app, EXPORT_PDF); break;
         case CTX_COPY_JSON:   copy_results_as(app, EXPORT_JSON); break;
         case CTX_COPY_MD:     copy_results_as(app, EXPORT_MARKDOWN); break;
         case CTX_COPY_SQL:    copy_results_as(app, EXPORT_SQL); break;
@@ -4879,9 +4941,27 @@ static void draw_splitter_and_status(AppWindow* app) {
         widget_draw((Widget*)fe, win);
         right = fe->base.bounds.x - 14;
     }
+    // grafico dei risultati: Chart / Table, Bars / Lines
+    app->eb_chart = app->eb_chart_kind = (Rect){0, 0, 0, 0};
+    if (!app->showing_history && grid_ready(app) && app->draft_src < 0) {
+        int fs = TH_FONT_SMALL + 1, bh = 24, by = st.y + (st.h - bh) / 2;
+        const char* labels[2] = { app->chart_on ? "Table" : "Chart", app->chart.line ? "Bars" : "Lines" };
+        Rect* rects[2] = { &app->eb_chart, &app->eb_chart_kind };
+        for (int i = 0; i < (app->chart_on ? 2 : 1); i++) {
+            int bw = platform_measure_text_ex(win, labels[i], -1, fs, FONT_UI) + 20;
+            if (right - bw < lb->x + 160) break;
+            Rect b = { right - bw, by, bw, bh };
+            *rects[i] = b;
+            bool hov = rect_has(b, app->mouse_x, app->mouse_y);
+            ui_round_box(win, b, hov ? TH_ELEVATED_HOVER : TH_ELEVATED, i == 0 && app->chart_on ? TH_ACCENT : TH_BORDER, 6);
+            int tw = platform_measure_text_ex(win, labels[i], -1, fs, FONT_UI);
+            platform_draw_text_ex(win, labels[i], -1, (Point){b.x + (bw - tw) / 2, ui_text_y(win, b, fs, FONT_UI)}, TH_TEXT, fs, FONT_UI);
+            right = b.x - 8;
+        }
+    }
     // modifica dei dati: + Row / Save row · Discard, e "Editable" se la griglia si può modificare
     app->eb_add = app->eb_save = app->eb_discard = (Rect){0, 0, 0, 0};
-    if (!app->showing_history && grid_ready(app) && grid_edit_any(&app->gedit)) {
+    if (!app->showing_history && !app->chart_on && grid_ready(app) && grid_edit_any(&app->gedit)) {
         int fs = TH_FONT_SMALL + 1, bh = 24, by = st.y + (st.h - bh) / 2;
         const char* labels[2];
         Rect* rects[2];
@@ -5056,6 +5136,8 @@ void app_window_draw(AppWindow* app) {
     } else {
     widget_draw((Widget*)app->editor,           win);
     widget_draw((Widget*)app->editor_scroll,    win);
+    if (chart_showing(app)) draw_chart(app);
+    else {
     widget_draw((Widget*)app->results,          win);
     if (gedit_editing(app)) {                   // editor della cella sopra la griglia
         gedit_place_editor(app);
@@ -5063,6 +5145,7 @@ void app_window_draw(AppWindow* app) {
     }
     widget_draw((Widget*)app->results_scroll_v, win);
     widget_draw((Widget*)app->results_scroll_h, win);
+    }
     draw_bar(app);
 
     draw_splitter_and_status(app);

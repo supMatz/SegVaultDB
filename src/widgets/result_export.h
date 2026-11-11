@@ -10,7 +10,7 @@ SCOPO: esportazione dei risultati della griglia in vari formati (CSV, TSV, JSON,
 #include "table_view.h"
 
 typedef enum {
-    EXPORT_CSV, EXPORT_TSV, EXPORT_JSON, EXPORT_MARKDOWN, EXPORT_HTML, EXPORT_SQL, EXPORT_FORMAT_COUNT
+    EXPORT_CSV, EXPORT_TSV, EXPORT_JSON, EXPORT_MARKDOWN, EXPORT_HTML, EXPORT_SQL, EXPORT_XLSX, EXPORT_PDF, EXPORT_FORMAT_COUNT
 } ExportFormat;
 
 typedef struct {
@@ -25,8 +25,11 @@ ExportFormat export_format_from_path(const char* path);   // dall'estensione (de
 const char*  export_format_ext(ExportFormat f);           // "csv", "json", ...
 const char*  export_format_name(ExportFormat f);          // "CSV", "JSON", ...
 
-// testo malloc'd (free() del chiamante) o NULL se non c'è una griglia
+// testo malloc'd (free() del chiamante) o NULL se non c'è una griglia (o il formato è binario)
 char* export_result(const TableView* tv, ExportFormat f, const ExportOptions* opt);
+bool  export_is_binary(ExportFormat f);                   // XLSX, PDF
+// qualunque formato, anche binario: byte malloc'd, lunghezza in *len; title per il PDF
+unsigned char* export_result_bin(const TableView* tv, ExportFormat f, const ExportOptions* opt, const char* title, size_t* len);
 
 // letterale SQL di un valore: NULL, numeri così come sono, testo tra apici con '' raddoppiati
 char* export_sql_literal(const Cell* c);
