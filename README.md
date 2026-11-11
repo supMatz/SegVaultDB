@@ -53,7 +53,7 @@ database per piccoli siti web e app desktop.
 | **Ottimizzatore** | Pushdown delle selezioni, hash join (anche per `FROM a, b WHERE a.x = b.y`), accesso con indice per uguaglianza o per intervallo (scelto solo se conviene), subquery decorrelate per chiave; `EXPLAIN` con stime alla System R e `EXPLAIN ANALYZE` con le righe reali |
 | **Transazioni** | Write-Ahead Log con undo/redo, `BEGIN` / `COMMIT` / `ROLLBACK`, `SAVEPOINT`, recovery dopo un crash, `CHECKPOINT` (anche automatico) |
 | **Basi di dati attive** | Trigger `BEFORE` / `AFTER`, `FOR EACH ROW` / `FOR EACH STATEMENT`, `NEW` / `OLD`, `WHEN`, `SET NEW.col`, `SIGNAL`, `IF` |
-| **Testi** | Nessun limite fisso sulla lunghezza dei testi; una riga salvata deve stare in una pagina (al massimo 4080 byte) |
+| **Testi e righe grandi** | Testi fino a 16 MB, righe fino a 64 MB: una riga oltre 2 KB va in pagine di overflow (anche dopo `ROLLBACK`, riavvio e crash) |
 | **Strumenti visuali** | Designer dello schema ER (notazione di Chen) / UML a trascinamento, export PNG; modulo della struttura con SQL live; modifica dei dati nella griglia; ricerca in tutto il database; panoramica; utenti e permessi; monitor del server |
 | **Piattaforme** | Linux nativo; Windows con `make windows` da Linux (MinGW-w64): `segvault.exe` e `segvault-server.exe` statici |
 
@@ -517,8 +517,8 @@ DROP TRIGGER [IF EXISTS] nome;   SHOW TRIGGERS [FROM tabella];
 | Database / tabelle per database | 64 / 256 |
 | Colonne / indici / vincoli per tabella | 64 / 16 / 16 |
 | Viste / trigger per database | 64 / 64 |
-| Dimensione di una riga salvata | 4080 byte (una pagina da 4 KB: non ci sono pagine di overflow); oltre, l'`INSERT` / `UPDATE` è rifiutato senza scrivere nulla |
-| Un testo | Nessun limite fisso (letterali fino a 1 MB), ma deve stare nella riga |
+| Dimensione di una riga salvata | 64 MB: le righe oltre 2 KB vanno in una catena di pagine di overflow; oltre il limite l'`INSERT` / `UPDATE` è rifiutato senza scrivere nulla |
+| Un testo | 16 MB (anche i letterali e i risultati di `CONCAT`, `REPLACE`, ...) |
 | Savepoint per transazione / livelli di trigger | 64 / 16 |
 | Passi di `WITH RECURSIVE` | 1000 |
 | Testo nell'editor | 64 KB per script (i file più grandi si eseguono con *Run SQL file*) |
@@ -621,8 +621,8 @@ Regole da ricordare, valide per tutti i linguaggi:
   `DATE`, `AAAA-MM-GG`) → stringa.
 - Con colonne qualificate (`p.nome`) la chiave JSON è `"p.nome"`: usa un alias (`p.nome AS nome`).
 - I testi (letterali, parametri, risultati di `CONCAT` / `REPLACE` / ...) possono essere lunghi
-  quanto serve; una riga salvata deve però stare in 4080 byte: oltre, l'`INSERT` / `UPDATE` viene
-  rifiutato con un messaggio chiaro e non scrive nulla.
+  fino a 16 MB, una riga fino a 64 MB (le righe grandi vanno in pagine di overflow); oltre,
+  l'`INSERT` / `UPDATE` viene rifiutato con un messaggio chiaro e non scrive nulla.
 
 Gli esempi usano lo stesso schema:
 
@@ -1210,7 +1210,8 @@ Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
    lettori/scrittori con precedenza alle scritture, latch del buffer pool, database corrente e
    annullamento per thread; verificato con ThreadSanitizer: `make test-tsan`). Da fare: scritture
    concorrenti (lock sulle righe o MVCC).
-2. **Righe grandi** — pagine di overflow per testi e `BLOB` oltre i 4080 byte di una riga.
+2. **Righe grandi** — fatto: pagine di overflow (righe fino a 64 MB, testi fino a 16 MB). Da fare:
+   recuperare lo spazio delle catene non più usate (oggi restano nel file, mai riusate).
 3. **Compatibilità MySQL** — fatto: import dei dump di `mysqldump` / phpMyAdmin (anche date con i
    decimali dei secondi). Da fare: il protocollo di rete MySQL (le app PHP come WordPress si
    collegherebbero senza modifiche).

@@ -36,6 +36,7 @@ SCOPO: Header incluso da TUTTI i moduli del progetto.
 #define SV_MAX_INDEXES      16   // max index per tabella
 #define SV_MAX_NAME_LEN     64   // max lunghezza nomi tabelle, colonne
 #define SV_MAX_SQL_LEN     65536 // max lunghezza di una query SQL
+#define SV_MAX_TEXT_BYTES  (16u << 20) // un testo al massimo (le righe grandi vanno in pagine di overflow)
 #define SV_PAGE_SIZE       4096  // max dimensione pagina in byte (4 KB)
 #define SV_BUFFER_POOL_CAP 1024  // max pagine in cache RAM
 

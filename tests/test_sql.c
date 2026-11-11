@@ -926,9 +926,10 @@ int main(void) {
         tl("INSERT INTO nota VALUES (1, '%s')", M, NULL, "OK:1");
         t("SELECT LENGTH(s), RIGHT(s, 2) FROM nota", "3006|-M");
         free(M);
-        // riga più grande di una pagina: errore chiaro, nessuna modifica
-        tl("INSERT INTO nota VALUES (2, CONCAT('%s', '%s'))", L, L, "ERR:Row too large");
-        t("SELECT COUNT(*) FROM nota", "1");
+        // riga più grande di una pagina: va nelle pagine di overflow e si rilegge intera
+        tl("INSERT INTO nota VALUES (2, CONCAT('%s', '%s'))", L, L, "OK:1");
+        t("SELECT COUNT(*) FROM nota", "2");
+        t("SELECT LENGTH(s) > 4096, RIGHT(s, 3) = RIGHT(SUBSTR(s, 1, LENGTH(s) / 3), 3) FROM nota WHERE id = 2", "1|1");
         free(A); free(B); free(L);
     }
 

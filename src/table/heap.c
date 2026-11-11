@@ -1,5 +1,6 @@
 #include "heap.h"
 #include "platform_compat.h"
+#include "overflow.h"
 
 // limite di sicurezza contro catene corrotte (cicli)
 #define HEAP_MAX_CHAIN SV_MAX_PAGE_ID
@@ -191,7 +192,14 @@ int heap_insert(HeapFile* hf, Tuple* t, TableSchema* schema, RID* out_rid) {
     size_t tuple_len;
     uint8_t* data = tuple_serialize(t, schema, &tuple_len);
     if (!data) return SV_ERR;
-    if (tuple_len > SV_PAGE_SIZE - SV_PAGE_HEADER_SIZE - SV_SLOT_ENTRY_SIZE) { free(data); return SV_FULL; }
+    if (tuple_len > OV_INLINE_MAX) {            // riga grande: in pagine di overflow, nello slot lo stub
+        uint8_t* stub = malloc(OV_STUB_LEN);
+        int rc = stub ? ov_store_bp(hf->bp, data, tuple_len, stub) : SV_ERR;
+        free(data);
+        if (rc != SV_OK) { free(stub); return rc; }
+        data = stub;
+        tuple_len = OV_STUB_LEN;
+    }
     uint16_t data_len = (uint16_t)tuple_len;
     uint32_t need = (uint32_t)data_len + SV_SLOT_ENTRY_SIZE;
 
@@ -292,7 +300,19 @@ Tuple* heap_get(HeapFile* hf, RID rid, TableSchema* schema) {
     const void* data = page_get_slot(p, rid.slot_id, &len);
     if (!data) { bp_unpin(hf->bp, rid.page_id, false); return NULL; }
 
-    Tuple* t = tuple_deserialize((const uint8_t*)data, len, schema);
+    Tuple* t;
+    if (ov_is_stub(data, len, NULL, NULL)) {    // riga grande: ricomposta dalle pagine di overflow
+        uint8_t stub[OV_STUB_LEN];
+        memcpy(stub, data, OV_STUB_LEN);
+        bp_unpin(hf->bp, rid.page_id, false);
+        size_t n = 0;
+        uint8_t* full = ov_load_bp(hf->bp, stub, OV_STUB_LEN, &n);
+        t = full ? tuple_deserialize(full, n, schema) : NULL;
+        free(full);
+        if (t) t->rid = rid;
+        return t;
+    }
+    t = tuple_deserialize((const uint8_t*)data, len, schema);
     if (t) t->rid = rid;
 
     bp_unpin(hf->bp, rid.page_id, false);
@@ -358,7 +378,7 @@ static void scan_release(HeapScan* scan) {
     if (scan->page) { bp_unpin(scan->hf->bp, scan->page->page_id, false); scan->page = NULL; }
 }
 
-const uint8_t* heap_scan_next_raw(HeapScan* scan, RID* out_rid, uint16_t* out_len) {
+const uint8_t* heap_scan_next_raw(HeapScan* scan, RID* out_rid, size_t* out_len) {
     if (!scan || scan->done) return NULL;
     if (sv_scan_cancelled()) { scan_release(scan); scan->done = true; return NULL; }
     while (scan->current_page != 0) {
@@ -375,6 +395,14 @@ const uint8_t* heap_scan_next_raw(HeapScan* scan, RID* out_rid, uint16_t* out_le
             uint16_t slot = scan->current_slot++;
             if (data) {
                 if (out_rid) *out_rid = (RID){scan->current_page, slot};
+                if (ov_is_stub(data, len, NULL, NULL)) {        // riga grande: ricomposta
+                    free(scan->ovbuf);
+                    size_t n = 0;
+                    scan->ovbuf = ov_load_bp(scan->hf->bp, data, len, &n);
+                    if (!scan->ovbuf) continue;                 // catena illeggibile: riga saltata
+                    if (out_len) *out_len = n;
+                    return scan->ovbuf;
+                }
                 if (out_len) *out_len = len;
                 return (const uint8_t*)data;
             }
@@ -391,7 +419,7 @@ const uint8_t* heap_scan_next_raw(HeapScan* scan, RID* out_rid, uint16_t* out_le
 
 Tuple* heap_scan_next(HeapScan* scan, RID* out_rid) {
     RID rid;
-    uint16_t len;
+    size_t len;
     const uint8_t* data;
     while ((data = heap_scan_next_raw(scan, &rid, &len)) != NULL) {
         Tuple* t = tuple_deserialize(data, len, scan->schema);
@@ -406,5 +434,6 @@ Tuple* heap_scan_next(HeapScan* scan, RID* out_rid) {
 void heap_scan_close(HeapScan* scan) {
     if (!scan) return;
     scan_release(scan);
+    free(scan->ovbuf);
     free(scan);
 }

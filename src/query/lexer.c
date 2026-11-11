@@ -23,9 +23,9 @@ typedef struct {
     size_t      ext_len;
 } LexTok;
 
-// letterale stringa più lungo accettato (un TEXT ne conserva al massimo 65535 byte: il limite
+// letterale stringa più lungo accettato (un testo ne conserva al massimo SV_MAX_TEXT_BYTES: il limite
 // della colonna lo controlla l'executor con un messaggio preciso)
-#define LEX_MAX_STRING (1u << 20)
+#define LEX_MAX_STRING SV_MAX_TEXT_BYTES
 
 // riempie t (senza azzerare tutto il buffer: un token è lungo pochi byte)
 static void make_token_into(LexTok* t, Lexer* lx, TokenType type) {

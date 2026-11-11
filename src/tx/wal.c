@@ -1,4 +1,5 @@
 #include "wal.h"
+#include "../table/overflow.h"
 #include "../storage/page.h"
 #include "platform_compat.h"
 #include <string.h>
@@ -103,7 +104,7 @@ static void replay_move(int db_fd, uint32_t page_id, uint16_t slot_id, const uin
     if (p) {
         uint16_t len = 0;
         const void* cur = page_get_slot(p, slot_id, &len);
-        if (cur && old_data && len == old_data_len && memcmp(cur, old_data, len) == 0) {
+        if (cur && old_data && ov_slot_equals(db_fd, cur, len, old_data, old_data_len)) {
             page_delete_slot(p, slot_id);
             page_write(p, db_fd);
         }
@@ -112,7 +113,7 @@ static void replay_move(int db_fd, uint32_t page_id, uint16_t slot_id, const uin
     // 2. la riga nuova compare nella sua posizione (se non è già stata scritta)
     p = page_read(npid, db_fd);
     if (p) {
-        if (nslot == p->num_slots && page_insert(p, data + 6, (uint16_t)(data_len - 6)) >= 0) page_write(p, db_fd);
+        if (nslot == p->num_slots && ov_slot_put(db_fd, p, data + 6, data_len - 6) >= 0) page_write(p, db_fd);
         page_free(p);
     }
 }
@@ -126,7 +127,7 @@ static void undo_move(int db_fd, uint32_t page_id, const uint8_t* data, uint32_t
     if (p) { page_delete_slot(p, nslot); page_write(p, db_fd); page_free(p); }
     p = page_read(page_id, db_fd);
     if (p) {
-        if (old_data && old_data_len > 0) page_insert(p, old_data, (uint16_t)old_data_len);
+        if (old_data && old_data_len > 0) ov_slot_put(db_fd, p, old_data, old_data_len);
         page_write(p, db_fd);
         page_free(p);
     }
@@ -153,7 +154,7 @@ static void replay_entry(int db_fd, uint8_t type, uint32_t page_id,
     // duplicava le righe a ogni riavvio.
     switch (type) {
         case LOG_INSERT:
-            if (slot_id == p->num_slots) page_insert(p, data, data_len);   // < num_slots: già applicato
+            if (slot_id == p->num_slots) ov_slot_put(db_fd, p, data, data_len);   // < num_slots: già applicato
             break;
         case LOG_DELETE:
             page_delete_slot(p, slot_id);                                   // no-op se già eliminato
@@ -162,9 +163,9 @@ static void replay_entry(int db_fd, uint8_t type, uint32_t page_id,
             // ancora da applicare solo se lo slot contiene la versione precedente
             uint16_t len = 0;
             const void* cur = page_get_slot(p, slot_id, &len);
-            if (cur && old_data && len == old_data_len && memcmp(cur, old_data, len) == 0) {
+            if (cur && old_data && ov_slot_equals(db_fd, cur, len, old_data, old_data_len)) {
                 page_delete_slot(p, slot_id);
-                page_insert(p, data, data_len);
+                ov_slot_put(db_fd, p, data, data_len);
             }
             break;
         }
@@ -190,13 +191,13 @@ static void undo_entry(int db_fd, uint8_t type, uint32_t page_id,
         case LOG_DELETE:
             // Undo delete = re-insert old data
             if (old_data && old_data_len > 0)
-                page_insert(p, old_data, old_data_len);
+                ov_slot_put(db_fd, p, old_data, old_data_len);
             break;
         case LOG_UPDATE:
             // Undo update = restore old data (delete new, insert old)
             page_delete_slot(p, slot_id);
             if (old_data && old_data_len > 0)
-                page_insert(p, old_data, old_data_len);
+                ov_slot_put(db_fd, p, old_data, old_data_len);
             break;
     }
     page_write(p, db_fd);

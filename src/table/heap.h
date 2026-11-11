@@ -32,12 +32,14 @@ typedef struct {
     uint32_t pages_seen;
     Page* page;            // pagina corrente, pinnata finché la scansione è su di essa
     bool done;
+    uint8_t* ovbuf;        // riga grande ricomposta dalle pagine di overflow (fino alla riga seguente)
 } HeapScan;
 
 HeapScan* heap_scan_open(HeapFile* hf, TableSchema* schema);
 Tuple* heap_scan_next(HeapScan* scan, RID* out_rid);
 // riga successiva senza deserializzarla: puntatore dentro la pagina, valido fino alla chiamata seguente
-const uint8_t* heap_scan_next_raw(HeapScan* scan, RID* out_rid, uint16_t* out_len);
+// (le righe grandi sono ricomposte dalle pagine di overflow: vedi overflow.h)
+const uint8_t* heap_scan_next_raw(HeapScan* scan, RID* out_rid, size_t* out_len);
 
 // scarta le free-space map (da chiamare quando le pagine cambiano fuori da heap.c: ROLLBACK)
 void heap_cache_clear(void);

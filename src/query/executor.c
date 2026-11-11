@@ -1,5 +1,6 @@
 #include "executor.h"
 #include "../platform_lock.h"
+#include "../table/overflow.h"
 #include "platform_compat.h"
 #include <string.h>
 #include <ctype.h>
@@ -1647,7 +1648,7 @@ static const char* utf8_at(const char* s, int ci) {
 
 // Testi calcolati più lunghi del buffer di EvalVal (CONCAT, REPLACE, ...): copiati in un'arena
 // che vive quanto lo statement (liberata quando executor_run torna al livello più esterno).
-#define EV_TEXT_MAX (1u << 20)
+#define EV_TEXT_MAX SV_MAX_TEXT_BYTES
 // per-thread: preparazione all'esecuzione in parallelo (ogni thread ha la sua arena e la sua profondità)
 static _Thread_local Arena g_text_arena;
 static _Thread_local int   g_run_depth;
@@ -1667,7 +1668,7 @@ static bool ev_text_long(EvalVal* out, const char* s, size_t n) {
 
 static void ev_set_text(EvalCtx* c, EvalVal* out, const char* s, size_t n) {
     if (!ev_text_long(out, s, n)) {
-        ctx_error(c, "%s", n > EV_TEXT_MAX ? "String result longer than 1 MB" : "Out of memory");
+        ctx_error(c, "%s", n > EV_TEXT_MAX ? "String result longer than 16 MB" : "Out of memory");
         ev_null(out);
     }
 }
@@ -1689,7 +1690,7 @@ static void tb_put(TextBuf* t, const char* s, size_t n) {
     t->d[t->n] = '\0';
 }
 static void tb_result(EvalCtx* c, EvalVal* out, TextBuf* t) {
-    if (t->err) { ctx_error(c, "%s", "String result longer than 1 MB"); ev_null(out); }
+    if (t->err) { ctx_error(c, "%s", "String result longer than 16 MB"); ev_null(out); }
     else ev_set_text(c, out, t->d ? t->d : "", t->n);
     free(t->d);
 }
@@ -3361,13 +3362,20 @@ static bool plan_load(SelectPlan* p) {
                 // scansione: le righe vengono lette senza allocare e copiate solo se passano i filtri
                 HeapScan* scan = heap_scan_open(hf, S->ts);
                 Tuple* view = tuple_create(S->ts->num_columns);
-                char* sbuf = malloc(SV_PAGE_SIZE + 64);
+                size_t scap = SV_PAGE_SIZE + 64;
+                char* sbuf = malloc(scap);
                 bool ok = scan && view && sbuf;
                 RID rid;
-                uint16_t len;
+                size_t len;
                 const uint8_t* data;
                 while (ok && (data = heap_scan_next_raw(scan, &rid, &len)) != NULL) {
-                    if (!tuple_view(view, data, len, S->ts, sbuf, SV_PAGE_SIZE + 64)) continue;
+                    if (len + 64 > scap) {              // riga grande (pagine di overflow): buffer più grande
+                        char* nb = realloc(sbuf, len + 64);
+                        if (!nb) { ok = false; break; }
+                        sbuf = nb;
+                        scap = len + 64;
+                    }
+                    if (!tuple_view(view, data, len, S->ts, sbuf, scap)) continue;
                     p->st_scanned[s]++;
                     if (f->n) {
                         cur[s] = view;
@@ -5186,15 +5194,15 @@ static void fk_message(const TableSchema* C, const Constraint* f, const char* ke
 }
 
 // controlla le righe modificate (NOT NULL, CHECK, chiavi, chiavi esterne)
-// la riga deve stare in una pagina (non ci sono pagine di overflow): controllo prima di scrivere,
-// così lo statement fallisce senza lasciare modifiche a metà
-#define SV_MAX_ROW_BYTES (SV_PAGE_SIZE - SV_PAGE_HEADER_SIZE - SV_SLOT_ENTRY_SIZE)
+// le righe grandi vanno in pagine di overflow (overflow.h) fino a OV_MAX_ROW: controllo prima di
+// scrivere, così lo statement fallisce senza lasciare modifiche a metà
+#define SV_MAX_ROW_BYTES OV_MAX_ROW
 static const char* row_fits(const TableSchema* ts, const Tuple* t, char* msg, size_t mn) {
     bool too_long = false;
     size_t sz = tuple_serialized_size(t, ts, &too_long);
-    if (too_long) { snprintf(msg, mn, "A text value in table '%.64s' is longer than 65535 bytes", ts->name); return msg; }
+    if (too_long) { snprintf(msg, mn, "A text value in table '%.64s' is longer than %d MB", ts->name, (int)(SV_MAX_TEXT_BYTES >> 20)); return msg; }
     if (sz > SV_MAX_ROW_BYTES) {
-        snprintf(msg, mn, "Row too large for table '%.64s' (%llu bytes, at most %d per row)", ts->name, (unsigned long long)sz, (int)SV_MAX_ROW_BYTES);
+        snprintf(msg, mn, "Row too large for table '%.64s' (%llu bytes, at most %d MB per row)", ts->name, (unsigned long long)sz, (int)(SV_MAX_ROW_BYTES >> 20));
         return msg;
     }
     return NULL;

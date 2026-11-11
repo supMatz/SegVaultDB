@@ -35,8 +35,8 @@ size_t tuple_serialized_size(const Tuple* t, const TableSchema* s, bool* too_lon
         int sz = datatype_size(s->columns[i].type);
         if (sz > 0) { total += (size_t)sz; continue; }
         size_t slen = strlen(t->values[i].str_val ? t->values[i].str_val : "");
-        if (slen > 65535 && too_long) *too_long = true;
-        total += 2 + slen;
+        if (slen > SV_MAX_TEXT_BYTES && too_long) *too_long = true;
+        total += (slen >= 0xFFFF ? 6 : 2) + slen;
     }
     return total;
 }
@@ -56,8 +56,8 @@ uint8_t* tuple_serialize(Tuple* t, TableSchema* s, size_t* out_len) {
         } else {
             // VARCHAR/TEXT: lunghezza + contenuto
             size_t slen = strlen(t->values[i].str_val ? t->values[i].str_val : "");
-            if (slen > 65535) slen = 65535;
-            total += 2 + slen; // 2 byte per la lunghezza
+            if (slen > SV_MAX_TEXT_BYTES) slen = SV_MAX_TEXT_BYTES;
+            total += (slen >= 0xFFFF ? 6 : 2) + slen; // lunghezza: 2 byte, o 0xFFFF + 4 byte
         }
     }
 
@@ -90,8 +90,15 @@ uint8_t* tuple_serialize(Tuple* t, TableSchema* s, size_t* out_len) {
             default: {   // testo: VARCHAR, CHAR, TEXT, DATE, DATETIME, DECIMAL, BLOB
                 const char* s = v->str_val ? v->str_val : "";
                 size_t full = strlen(s);
-                uint16_t slen = (uint16_t)(full > 65535 ? 65535 : full);
-                memcpy(buf + pos, &slen, 2); pos += 2;
+                uint32_t slen = (uint32_t)(full > SV_MAX_TEXT_BYTES ? SV_MAX_TEXT_BYTES : full);
+                if (slen >= 0xFFFF) {                 // testo lungo: 0xFFFF poi la lunghezza a 32 bit
+                    uint16_t esc = 0xFFFF;
+                    memcpy(buf + pos, &esc, 2); pos += 2;
+                    memcpy(buf + pos, &slen, 4); pos += 4;
+                } else {
+                    uint16_t s16 = (uint16_t)slen;
+                    memcpy(buf + pos, &s16, 2); pos += 2;
+                }
                 memcpy(buf + pos, s, slen);  pos += slen;
                 break;
             }
@@ -134,8 +141,11 @@ Tuple* tuple_deserialize(const uint8_t* data, size_t len,
             case SV_TYPE_BOOL:
                 NEED(1); v->bool_val = data[pos++]; break;
             default: {   // testo con prefisso di lunghezza
-                uint16_t slen;
-                NEED(2); memcpy(&slen, data + pos, 2); pos += 2;
+                uint16_t s16;
+                uint32_t slen;
+                NEED(2); memcpy(&s16, data + pos, 2); pos += 2;
+                slen = s16;
+                if (s16 == 0xFFFF) { NEED(4); memcpy(&slen, data + pos, 4); pos += 4; }
                 NEED(slen);
                 v->str_val = (char*)malloc(slen + 1);
                 v->owns_str = v->str_val != NULL;
@@ -168,9 +178,12 @@ bool tuple_view(Tuple* t, const uint8_t* data, size_t len, const TableSchema* s,
             case SV_TYPE_FLOAT:  if (pos + 8 > len) return false; memcpy(&v->float_val, data + pos, 8); pos += 8; break;
             case SV_TYPE_BOOL:   if (pos + 1 > len) return false; v->bool_val = data[pos++]; break;
             default: {
-                uint16_t sl;
+                uint16_t s16;
+                uint32_t sl;
                 if (pos + 2 > len) return false;
-                memcpy(&sl, data + pos, 2); pos += 2;
+                memcpy(&s16, data + pos, 2); pos += 2;
+                sl = s16;
+                if (s16 == 0xFFFF) { if (pos + 4 > len) return false; memcpy(&sl, data + pos, 4); pos += 4; }
                 if (pos + sl > len || sp + sl + 1 > strcap) return false;
                 memcpy(strbuf + sp, data + pos, sl);
                 strbuf[sp + sl] = '\0';

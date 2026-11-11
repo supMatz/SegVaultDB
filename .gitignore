@@ -51,3 +51,5 @@ test_parallel_asan
 test_parallel_tsan
 test_mysql_import
 test_mysql_import_asan
+test_overflow
+test_overflow_asan
