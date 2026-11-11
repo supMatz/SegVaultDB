@@ -1119,6 +1119,13 @@ bool db_login(const char* name, const char* password) {
     return ok;
 }
 
+int db_login_native(const char* user, const uint8_t scramble[20], const uint8_t* resp, size_t rlen) {
+    db_lock();
+    int r = user && user[0] ? auth_login_native(user, scramble, resp, rlen) : 0;
+    db_unlock();
+    return r;
+}
+
 bool db_user_can_see(const char* user, const char* db, const char* table) {
     if (!user || !user[0]) return true;
     db_lock();

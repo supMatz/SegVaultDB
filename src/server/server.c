@@ -7,6 +7,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #endif
 #include "server.h"
 #include "json.h"
+#include "mysql_wire.h"
 #include "../bridge/db_api.h"
 #include "../bridge/auth.h"
 #include "../widgets/sql_text.h"
@@ -84,6 +85,9 @@ struct SvServer {
     char*          static_dir;
     sock_t         listen_fd;
     int            port;
+    sock_t         mysql_fd;            // protocollo MySQL (BAD_SOCK = spento)
+    int            mysql_port;
+    uint32_t       mysql_ids;           // id delle connessioni MySQL
     volatile int   stop;
     sv_mutex       conn_mx;             // conns[] e active
     sock_t*        conns;               // socket aperti (per chiuderli allo stop)
@@ -105,6 +109,7 @@ typedef struct {
     sock_t    fd;
     int       slot;
     char      client[48];
+    bool      mysql;                   // connessione col protocollo MySQL
 } Conn;
 
 // ── richiesta / risposta ────────────────────────────────────────
@@ -1511,6 +1516,262 @@ static void serve_connection(Conn* c) {
     free(in.data);
 }
 
+// ── protocollo MySQL ────────────────────────────────────────────
+// Una connessione MySQL è una sessione del motore (database e transazione propri), con l'utente
+// del login. Ogni comando prende il motore come una richiesta HTTP (exec_mx).
+
+typedef struct { uint8_t* p; size_t n; uint8_t seq; } MyPkt;
+
+// legge un pacchetto (anche spezzato in più parti da 16 MB); false su chiusura o errore
+static bool my_read(SvServer* s, Conn* c, InBuf* in, MyPkt* out, size_t max) {
+    size_t total = 0;
+    uint8_t* buf = NULL;
+    for (;;) {
+        if (!fill(c->fd, in, 4, &s->stop)) { free(buf); return false; }
+        const uint8_t* h = (const uint8_t*)in->data;
+        size_t len = (size_t)h[0] | (size_t)h[1] << 8 | (size_t)h[2] << 16;
+        out->seq = h[3];
+        if (total + len > max) { free(buf); return false; }
+        if (!fill(c->fd, in, 4 + len, &s->stop)) { free(buf); return false; }
+        uint8_t* nb = realloc(buf, total + len + 1);
+        if (!nb) { free(buf); return false; }
+        buf = nb;
+        memcpy(buf + total, in->data + 4, len);
+        total += len;
+        memmove(in->data, in->data + 4 + len, in->len - 4 - len);
+        in->len -= 4 + len;
+        if (len < 0xffffff) break;
+    }
+    buf[total] = 0;
+    out->p = buf;
+    out->n = total;
+    return true;
+}
+
+static bool my_send(Conn* c, MwOut* o) {
+    bool ok = !o->oom && send_all(c->fd, (const char*)o->p, o->n);
+    o->n = 0;
+    return ok;
+}
+
+// codice d'errore MySQL dal messaggio (i driver ne usano alcuni: 1062 duplicato, 1146 tabella, ...)
+static unsigned my_errcode(const char* m, const char** state) {
+    *state = "HY000";
+    if (strstr(m, "Access denied")) { *state = "42000"; return 1142; }
+    if (strstr(m, "Duplicate") || strstr(m, "duplicate") || strstr(m, "UNIQUE")) { *state = "23000"; return 1062; }
+    if (strstr(m, "FOREIGN KEY") || strstr(m, "foreign key")) { *state = "23000"; return 1452; }
+    if (strstr(m, "cannot be NULL") || strstr(m, "NOT NULL")) { *state = "23000"; return 1048; }
+    if (strstr(m, "Unknown column")) { *state = "42S22"; return 1054; }
+    if (strstr(m, "Unknown database") || strstr(m, "Database not found") || strstr(m, "database not found")) { *state = "42000"; return 1049; }
+    if ((strstr(m, "Table") || strstr(m, "table")) && strstr(m, "not found")) { *state = "42S02"; return 1146; }
+    if (strstr(m, "already exists")) { *state = "42S01"; return 1050; }
+    if (strstr(m, "Expected") || strstr(m, "Unexpected") || strstr(m, "syntax")) { *state = "42000"; return 1064; }
+    return 1105;
+}
+
+static void my_error(MwOut* o, const char* msg) {
+    const char* st;
+    unsigned code = my_errcode(msg, &st);
+    mw_err(o, code, st, msg);
+}
+
+// login: utenti di SegVault (verificatore mysql_native_password); "root" col token = accesso completo;
+// server senza token né --users = locale e aperto: qualunque nome entra come root
+static int my_login(SvServer* s, const MwLogin* lg, const uint8_t* resp, size_t rlen, const uint8_t scramble[20], char* user, size_t un) {
+    user[0] = '\0';
+    int r = db_login_native(lg->user, scramble, resp, rlen);
+    if (r == 1) { snprintf(user, un, "%s", lg->user); return 1; }
+    if (r == -1) return -1;
+    if (s->token && !strcmp(lg->user, "root")) {
+        uint8_t a[20], b[20];
+        auth_sha1(s->token, strlen(s->token), a);
+        auth_sha1(a, 20, b);
+        uint8_t buf[40], x[20], cand[20], chk[20];
+        memcpy(buf, scramble, 20);
+        memcpy(buf + 20, b, 20);
+        auth_sha1(buf, 40, x);
+        for (int i = 0; i < 20 && rlen == 20; i++) cand[i] = resp[i] ^ x[i];
+        auth_sha1(cand, 20, chk);
+        if (rlen == 20 && !memcmp(chk, b, 20)) return 1;          // root
+        return 0;
+    }
+    if (!s->token && !s->cfg.require_login) return 1;          // locale, aperto (come l'HTTP senza token)
+    return 0;
+}
+
+static bool my_enter(SvServer* s, DbSession* ds) {
+    exec_begin(s);
+    for (double waited = 0; !db_session_enter(ds); waited += 20) {
+        exec_end(s);
+        if (waited >= SESSION_WAIT_MS || s->stop) return false;
+        sleep_ms(20);
+        exec_begin(s);
+    }
+    return true;
+}
+
+static void my_leave(SvServer* s, DbSession* ds) {
+    db_session_leave(ds);
+    exec_end(s);
+}
+
+// COM_QUERY: le istruzioni una dopo l'altra; ogni risultato è un resultset o un OK
+static void my_query(SvServer* s, Conn* c, MwOut* o, char* sql, const char* user) {
+    int len = (int)strlen(sql), cap = 32, nst;
+    SqlRange* ranges = NULL;
+    for (;;) {
+        free(ranges);
+        ranges = malloc(sizeof(SqlRange) * (size_t)cap);
+        if (!ranges) { mw_err(o, 1105, "HY000", "out of memory"); return; }
+        nst = sql_split(sql, len, ranges, cap);
+        if (nst < cap) break;
+        cap *= 2;
+    }
+    int last = -1;
+    for (int k = 0; k < nst; k++) if (ranges[k].has_code) last = k;
+    if (last < 0) { mw_ok(o, 0, 0, MW_STATUS_AUTOCOMMIT, NULL); free(ranges); return; }
+    Response rs = {0};
+    snprintf(rs.client, sizeof(rs.client), "%s", c->client);
+    for (int k = 0; k <= last; k++) {
+        if (!ranges[k].has_code) continue;
+        int a = ranges[k].code_start, e = ranges[k].end;
+        char saved = sql[e];
+        sql[e] = '\0';
+        unsigned more = k < last ? MW_STATUS_MORE_RESULTS : 0;
+        unsigned st = (in_transaction() ? MW_STATUS_IN_TRANS : MW_STATUS_AUTOCOMMIT) | more;
+        if (mw_client_noise(o, sql + a, st)) { sql[e] = saved; continue; }
+        QueryResult* r = db_execute(sql + a);
+        audit_stmt(s, &rs, user, sql + a, r);
+        sql[e] = saved;
+        bool timeout = exec_timed_out(s);
+        if (!r || !r->success || timeout) {
+            my_error(o, timeout ? "Query execution was interrupted (time limit)" : r ? r->error : "out of memory");
+            db_result_free(r);
+            break;
+        }
+        st = (in_transaction() ? MW_STATUS_IN_TRANS : MW_STATUS_AUTOCOMMIT) | more;
+        const char* cur = db_current_database();
+        if (r->num_cols > 0) mw_resultset(o, r, cur ? cur : "", st);
+        else mw_ok(o, (uint64_t)(r->rows_affected > 0 ? r->rows_affected : 0),
+                   (uint64_t)(r->last_insert_id > 0 ? r->last_insert_id : 0), st, NULL);
+        db_result_free(r);
+    }
+    free(ranges);
+}
+
+static void serve_mysql(Conn* c) {
+    SvServer* s = c->s;
+    InBuf in = {0};
+    MwOut o = {0};
+    set_timeout(c->fd, 8 * 3600 * 1000);                 // wait_timeout di MySQL: 8 ore
+    uint8_t scramble[20];
+    char tok[48];
+    if (!sv_random_token(tok, 20)) return;
+    for (int i = 0; i < 20; i++) scramble[i] = (uint8_t)((tok[i] % 94) + 33);   // byte stampabili, mai 0
+    mx_lock(&s->conn_mx);
+    uint32_t id = ++s->mysql_ids;
+    mx_unlock(&s->conn_mx);
+    mw_handshake(&o, id, scramble);
+    if (!my_send(c, &o)) { free(o.p); return; }
+
+    MyPkt pk;
+    if (!my_read(s, c, &in, &pk, 65536)) { free(o.p); free(in.data); return; }
+    MwLogin lg;
+    bool parsed = mw_parse_login(pk.p, pk.n, &lg);
+    o.seq = (uint8_t)(pk.seq + 1);
+    free(pk.p);
+    if (!parsed) { mw_err(&o, 1043, "08S01", "Bad handshake (protocol 4.1 required)"); my_send(c, &o); free(o.p); free(in.data); return; }
+    uint8_t resp[64];
+    size_t rlen = lg.auth_len;
+    memcpy(resp, lg.auth, rlen);
+    if (lg.plugin[0] && strcmp(lg.plugin, "mysql_native_password")) {     // es. caching_sha2_password: si chiede l'altro
+        mw_auth_switch(&o, scramble);
+        if (!my_send(c, &o) || !my_read(s, c, &in, &pk, 4096)) { free(o.p); free(in.data); return; }
+        o.seq = (uint8_t)(pk.seq + 1);
+        rlen = pk.n < sizeof(resp) ? pk.n : sizeof(resp);
+        memcpy(resp, pk.p, rlen);
+        free(pk.p);
+    }
+    char user[64];
+    int lr = my_login(s, &lg, resp, rlen, scramble, user, sizeof(user));
+    if (lr != 1) {
+        char m[300];
+        if (lr == -1) snprintf(m, sizeof(m), "User '%.63s' was created before MySQL logins were supported: set the password again (ALTER USER %.63s IDENTIFIED BY '...')", lg.user, lg.user);
+        else snprintf(m, sizeof(m), "Access denied for user '%.63s' (using password: %s)", lg.user, rlen ? "YES" : "NO");
+        sleep_ms(300);                                      // rallenta i tentativi
+        mw_err(&o, 1045, "28000", m);
+        my_send(c, &o);
+        if (!s->cfg.quiet) fprintf(stderr, "%s mysql login refused for '%s'\n", c->client, lg.user);
+        free(o.p); free(in.data);
+        return;
+    }
+    mx_lock(&s->exec_mx);
+    DbSession* ds = db_session_new();
+    mx_unlock(&s->exec_mx);
+    if (!ds) { mw_err(&o, 1040, "08004", "Too many connections"); my_send(c, &o); free(o.p); free(in.data); return; }
+    const char* first_db = lg.db[0] ? lg.db : s->default_db;
+    bool ok = true;
+    if (first_db && first_db[0]) {
+        if (!my_enter(s, ds)) ok = false;
+        else {
+            db_set_user(user);
+            char use[96];
+            snprintf(use, sizeof(use), "USE `%.63s`", first_db);
+            QueryResult* r = db_execute(use);
+            if (!r || !r->success) { my_error(&o, r ? r->error : "out of memory"); ok = false; }
+            db_result_free(r);
+            db_set_user(NULL);
+            my_leave(s, ds);
+        }
+    }
+    if (ok) mw_ok(&o, 0, 0, MW_STATUS_AUTOCOMMIT, NULL);
+    else if (!o.n) mw_err(&o, 1205, "HY000", "Lock wait timeout exceeded");
+    if (!my_send(c, &o) || !ok) goto done;
+    if (!s->cfg.quiet) fprintf(stderr, "%s mysql login '%s'\n", c->client, user[0] ? user : "root");
+
+    size_t max = s->cfg.max_body ? s->cfg.max_body : (16u << 20);
+    while (!s->stop && my_read(s, c, &in, &pk, max)) {
+        o.seq = (uint8_t)(pk.seq + 1);
+        uint8_t cmd = pk.n ? pk.p[0] : 0;
+        if (cmd == MW_COM_QUIT) { free(pk.p); break; }
+        if (cmd == MW_COM_PING) mw_ok(&o, 0, 0, MW_STATUS_AUTOCOMMIT, NULL);
+        else if (cmd == MW_COM_FIELD_LIST) mw_eof(&o, MW_STATUS_AUTOCOMMIT);
+        else if (cmd == MW_COM_STMT_PREPARE)
+            mw_err(&o, 1295, "HY000", "Server-side prepared statements are not supported: use client-side (emulated) prepares, e.g. PDO::ATTR_EMULATE_PREPARES");
+        else if (cmd == MW_COM_QUERY || cmd == MW_COM_INIT_DB || cmd == MW_COM_RESET_CONNECTION) {
+            if (!my_enter(s, ds)) mw_err(&o, 1205, "HY000", "Lock wait timeout exceeded: another session has an open transaction");
+            else {
+                if (!db_set_user(user)) mw_err(&o, 1045, "28000", "The user no longer exists");
+                else if (cmd == MW_COM_QUERY) {
+                    char* sql = (char*)pk.p + 1;
+                    pk.p[pk.n] = 0;
+                    my_query(s, c, &o, sql, user);
+                } else if (cmd == MW_COM_INIT_DB) {
+                    char use[160];
+                    snprintf(use, sizeof(use), "USE `%.100s`", (char*)pk.p + 1);
+                    QueryResult* r = db_execute(use);
+                    if (r && r->success) mw_ok(&o, 0, 0, MW_STATUS_AUTOCOMMIT, NULL);
+                    else my_error(&o, r ? r->error : "out of memory");
+                    db_result_free(r);
+                } else {                                   // COM_RESET_CONNECTION: transazione annullata
+                    if (in_transaction()) db_rollback();
+                    mw_ok(&o, 0, 0, MW_STATUS_AUTOCOMMIT, NULL);
+                }
+                db_set_user(NULL);
+                my_leave(s, ds);
+            }
+        } else mw_err(&o, 1047, "08S01", "Unknown command");
+        free(pk.p);
+        if (!my_send(c, &o)) break;
+    }
+done:
+    mx_lock(&s->exec_mx);
+    db_session_end(ds);                                    // una transazione lasciata aperta viene annullata
+    mx_unlock(&s->exec_mx);
+    free(o.p);
+    free(in.data);
+}
+
 // ── thread, accettazione ────────────────────────────────────────
 
 static void conn_finish(Conn* c) {
@@ -1524,7 +1785,7 @@ static void conn_finish(Conn* c) {
 }
 
 #ifdef _WIN32
-static DWORD WINAPI conn_thread(LPVOID arg) { serve_connection((Conn*)arg); conn_finish((Conn*)arg); return 0; }
+static DWORD WINAPI conn_thread(LPVOID arg) { Conn* c = (Conn*)arg; if (c->mysql) serve_mysql(c); else serve_connection(c); conn_finish(c); return 0; }
 static bool spawn(Conn* c) {
     HANDLE h = CreateThread(NULL, 0, conn_thread, c, 0, NULL);
     if (!h) return false;
@@ -1532,7 +1793,7 @@ static bool spawn(Conn* c) {
     return true;
 }
 #else
-static void* conn_thread(void* arg) { serve_connection((Conn*)arg); conn_finish((Conn*)arg); return NULL; }
+static void* conn_thread(void* arg) { Conn* c = (Conn*)arg; if (c->mysql) serve_mysql(c); else serve_connection(c); conn_finish(c); return NULL; }
 static bool spawn(Conn* c) {
     pthread_t t;
     pthread_attr_t a;
@@ -1551,6 +1812,8 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
 #endif
     SvServer* s = calloc(1, sizeof(SvServer));
     if (!s) { snprintf(err, errsz, "out of memory"); return NULL; }
+    s->listen_fd = BAD_SOCK;
+    s->mysql_fd = BAD_SOCK;
     s->cfg = *cfg;
     if (!s->cfg.bind_addr) s->cfg.bind_addr = "127.0.0.1";
     if (!s->cfg.max_body) s->cfg.max_body = 16u << 20;
@@ -1565,6 +1828,7 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
     }
     s->conns = malloc(sizeof(sock_t) * (size_t)s->cfg.max_clients);
     s->listen_fd = BAD_SOCK;
+    s->mysql_fd = BAD_SOCK;
     mx_init(&s->conn_mx);
     mx_init(&s->exec_mx);
     if (!s->conns) { snprintf(err, errsz, "out of memory"); sv_server_free(s); return NULL; }
@@ -1604,8 +1868,29 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
     socklen_t al = sizeof(addr);
     getsockname(s->listen_fd, (struct sockaddr*)&addr, &al);
     s->port = ntohs(addr.sin_port);
+    if (cfg->mysql) {
+        s->mysql_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (s->mysql_fd == BAD_SOCK) { snprintf(err, errsz, "socket() failed"); sv_server_free(s); return NULL; }
+#ifndef _WIN32
+        setsockopt(s->mysql_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#else
+        setsockopt(s->mysql_fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&one, sizeof(one));
+#endif
+        addr.sin_port = htons((unsigned short)cfg->mysql_port);
+        addr.sin_addr.s_addr = inet_addr(s->cfg.bind_addr);
+        if (bind(s->mysql_fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(s->mysql_fd, 64) != 0) {
+            snprintf(err, errsz, "cannot listen on %s:%d for the MySQL protocol (port in use?)", s->cfg.bind_addr, cfg->mysql_port);
+            sv_server_free(s);
+            return NULL;
+        }
+        al = sizeof(addr);
+        getsockname(s->mysql_fd, (struct sockaddr*)&addr, &al);
+        s->mysql_port = ntohs(addr.sin_port);
+    }
     return s;
 }
+
+int sv_server_mysql_port(const SvServer* s) { return s->mysql_fd != BAD_SOCK ? s->mysql_port : 0; }
 
 int sv_server_port(const SvServer* s) { return s->port; }
 
@@ -1616,8 +1901,10 @@ void sv_server_run(SvServer* s) {
         fd_set rd;
         FD_ZERO(&rd);
         FD_SET(s->listen_fd, &rd);
+        sock_t top = s->listen_fd;
+        if (s->mysql_fd != BAD_SOCK) { FD_SET(s->mysql_fd, &rd); if (s->mysql_fd > top) top = s->mysql_fd; }
         struct timeval tv = { 0, 200000 };           // si ricontrolla stop 5 volte al secondo
-        int r = select((int)s->listen_fd + 1, &rd, NULL, NULL, &tv);
+        int r = select((int)top + 1, &rd, NULL, NULL, &tv);
         // watchdog: una richiesta oltre timeout_ms viene interrotta (le SELECT si fermano subito,
         // le modifiche alla fine dello statement in corso)
         mx_lock(&s->conn_mx);
@@ -1629,7 +1916,8 @@ void sv_server_run(SvServer* s) {
         if (r <= 0) continue;
         struct sockaddr_in peer;
         socklen_t pl = sizeof(peer);
-        sock_t fd = accept(s->listen_fd, (struct sockaddr*)&peer, &pl);
+        bool is_mysql = s->mysql_fd != BAD_SOCK && FD_ISSET(s->mysql_fd, &rd);
+        sock_t fd = accept(is_mysql ? s->mysql_fd : s->listen_fd, (struct sockaddr*)&peer, &pl);
         if (fd == BAD_SOCK) continue;
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
@@ -1638,6 +1926,14 @@ void sv_server_run(SvServer* s) {
         for (int i = 0; i < s->cfg.max_clients && slot < 0; i++) if (s->conns[i] == BAD_SOCK) slot = i;
         if (slot >= 0) { s->conns[slot] = fd; s->active++; }
         mx_unlock(&s->conn_mx);
+        if (slot < 0 && is_mysql) {
+            MwOut o = {0};
+            mw_err(&o, 1040, "08004", "Too many connections");
+            if (!o.oom) send_all(fd, (const char*)o.p, o.n);
+            free(o.p);
+            sock_close(fd);
+            continue;
+        }
         if (slot < 0) {
             Response rs = { .close = true };
             json_error(&rs, 503, "too many connections");
@@ -1649,7 +1945,7 @@ void sv_server_run(SvServer* s) {
         }
         Conn* c = malloc(sizeof(Conn));
         if (c) {
-            c->s = s; c->fd = fd; c->slot = slot;
+            c->s = s; c->fd = fd; c->slot = slot; c->mysql = is_mysql;
             const unsigned char* ip = (const unsigned char*)&peer.sin_addr.s_addr;
             snprintf(c->client, sizeof(c->client), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
         }
@@ -1668,6 +1964,7 @@ void sv_server_free(SvServer* s) {
     if (!s) return;
     s->stop = 1;
     if (s->listen_fd != BAD_SOCK) sock_close(s->listen_fd);
+    if (s->mysql_fd != BAD_SOCK) sock_close(s->mysql_fd);
     // le connessioni aperte vengono interrotte; si aspetta che i thread finiscano
     for (int tries = 0; s->conns; tries++) {
         mx_lock(&s->conn_mx);

@@ -333,6 +333,12 @@ int main(void) {
     t("DROP VIEW vc", "OK:0");
     t("DROP VIEW vg", "OK:0");
     t("DROP TABLE vt", "OK:0");
+    // funzioni chieste dai driver MySQL
+    t("SELECT DATABASE(), SCHEMA(), VERSION()", "shop|shop|8.0.35-SegVault");
+    t("CREATE TABLE li (id INT PRIMARY KEY AUTO_INCREMENT, x INT)", "OK:0");
+    t("INSERT INTO li (x) VALUES (1), (2)", "OK:2");
+    t("SELECT LAST_INSERT_ID()", "2");
+    t("DROP TABLE li", "OK:0");
     t("SELECT TRUE + TRUE, FALSE FROM n WHERE id = 1", "2|0");
 
     // ── funzioni ──

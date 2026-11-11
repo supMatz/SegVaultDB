@@ -310,6 +310,8 @@ bool        db_set_user(const char* name);        // utente della sessione: NULL
 const char* db_session_user(void);
 bool        db_login(const char* name, const char* password);   // credenziali giuste?
 // l'utente ha qualche permesso nel database (table NULL) o sulla tabella? "" = root, sempre
+// login col protocollo MySQL: 1 = ok, 0 = no, -1 = password da reimpostare (utente creato prima)
+int         db_login_native(const char* user, const uint8_t scramble[20], const uint8_t* resp, size_t rlen);
 bool        db_user_can_see(const char* user, const char* db, const char* table);
 bool        db_has_users(void);
 int         db_list_users(DbUserInfo* out, int max);

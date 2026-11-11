@@ -3,6 +3,7 @@
 #include "src/server/server.h"
 #include "src/server/json.h"
 #include "src/bridge/db_api.h"
+#include "src/bridge/auth.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -29,6 +30,123 @@ static int connect_to(int port) {
     struct timeval tv = { 10, 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     return fd;
+}
+
+// ── client MySQL minimo (protocollo 4.1, mysql_native_password) ──
+typedef struct { int fd; uint8_t seq; } My;
+
+static bool my_rd(My* m, uint8_t** out, size_t* n) {
+    uint8_t h[4];
+    size_t got = 0;
+    while (got < 4) { ssize_t r = recv(m->fd, h + got, 4 - got, 0); if (r <= 0) return false; got += (size_t)r; }
+    size_t len = (size_t)h[0] | (size_t)h[1] << 8 | (size_t)h[2] << 16;
+    m->seq = (uint8_t)(h[3] + 1);
+    uint8_t* b = malloc(len + 1);
+    got = 0;
+    while (got < len) { ssize_t r = recv(m->fd, b + got, len - got, 0); if (r <= 0) { free(b); return false; } got += (size_t)r; }
+    b[len] = 0;
+    *out = b; *n = len;
+    return true;
+}
+
+static bool my_wr(My* m, const uint8_t* p, size_t n) {
+    uint8_t h[4] = { (uint8_t)n, (uint8_t)(n >> 8), (uint8_t)(n >> 16), m->seq++ };
+    return send(m->fd, h, 4, 0) == 4 && send(m->fd, p, n, 0) == (ssize_t)n;
+}
+
+// connessione e login; NULL + messaggio in err se rifiutata
+static bool my_connect(My* m, int port, const char* user, const char* pw, const char* db, char* err, size_t en) {
+    err[0] = '\0';
+    m->fd = connect_to(port);
+    uint8_t* p; size_t n;
+    if (m->fd < 0 || !my_rd(m, &p, &n)) { snprintf(err, en, "no handshake"); return false; }
+    uint8_t scr[20];
+    size_t pos = 1 + strlen((char*)p + 1) + 1 + 4;      // protocollo, versione, id
+    memcpy(scr, p + pos, 8);
+    pos += 8 + 1 + 2 + 1 + 2 + 2 + 1 + 10;
+    memcpy(scr + 8, p + pos, 12);
+    free(p);
+    uint8_t a[20], b[20], buf[40], x[20], tokn[20];
+    auth_sha1(pw, strlen(pw), a);
+    auth_sha1(a, 20, b);
+    memcpy(buf, scr, 20); memcpy(buf + 20, b, 20);
+    auth_sha1(buf, 40, x);
+    for (int i = 0; i < 20; i++) tokn[i] = a[i] ^ x[i];
+    uint8_t lg[300];
+    size_t k = 0;
+    uint32_t caps = 0x200 | 0x8000 | 0x80000 | (db ? 8 : 0) | 0x10000 | 0x20000;
+    lg[k++] = (uint8_t)caps; lg[k++] = (uint8_t)(caps >> 8); lg[k++] = (uint8_t)(caps >> 16); lg[k++] = (uint8_t)(caps >> 24);
+    memset(lg + k, 0, 4); k += 4;
+    lg[k++] = 45;
+    memset(lg + k, 0, 23); k += 23;
+    memcpy(lg + k, user, strlen(user) + 1); k += strlen(user) + 1;
+    lg[k++] = 20; memcpy(lg + k, tokn, 20); k += 20;
+    if (db) { memcpy(lg + k, db, strlen(db) + 1); k += strlen(db) + 1; }
+    memcpy(lg + k, "mysql_native_password", 22); k += 22;
+    if (!my_wr(m, lg, k) || !my_rd(m, &p, &n)) { snprintf(err, en, "no reply to login"); return false; }
+    bool ok = p[0] == 0;
+    if (!ok && p[0] == 0xff && n > 9) snprintf(err, en, "%u %s", (unsigned)(p[1] | p[2] << 8), (char*)p + 9);
+    free(p);
+    return ok;
+}
+
+static uint64_t my_lenenc(const uint8_t* p, size_t* pos) {
+    uint8_t c = p[(*pos)++];
+    if (c < 0xfb) return c;
+    int k = c == 0xfc ? 2 : c == 0xfd ? 3 : 8;
+    uint64_t v = 0;
+    for (int i = 0; i < k; i++) v |= (uint64_t)p[*pos + i] << (8 * i);
+    *pos += (size_t)k;
+    return v;
+}
+
+// esegue una query: "OK:n" / "ERR:codice messaggio" / righe "a|b;c|d" (più risultati separati da " / ")
+static void my_query(My* m, const char* sql, char* out, size_t on) {
+    out[0] = '\0';
+    size_t ol = 0;
+    uint8_t q[4096];
+    q[0] = 3;
+    size_t sl = strlen(sql);
+    memcpy(q + 1, sql, sl);
+    m->seq = 0;
+    if (!my_wr(m, q, sl + 1)) { snprintf(out, on, "send failed"); return; }
+    for (bool more = true; more; ) {
+        more = false;
+        uint8_t* p; size_t n;
+        if (!my_rd(m, &p, &n)) { snprintf(out + ol, on - ol, "read failed"); return; }
+        if (ol) ol += (size_t)snprintf(out + ol, on - ol, " / ");
+        if (p[0] == 0) {
+            size_t pos = 1;
+            uint64_t aff = my_lenenc(p, &pos);
+            my_lenenc(p, &pos);
+            unsigned st = p[pos] | p[pos + 1] << 8;
+            more = (st & 8) != 0;
+            ol += (size_t)snprintf(out + ol, on - ol, "OK:%llu", (unsigned long long)aff);
+            free(p);
+            continue;
+        }
+        if (p[0] == 0xff) { ol += (size_t)snprintf(out + ol, on - ol, "ERR:%u %s", (unsigned)(p[1] | p[2] << 8), (char*)p + 9); free(p); return; }
+        size_t pos = 0;
+        int ncols = (int)my_lenenc(p, &pos);
+        free(p);
+        for (int i = 0; i <= ncols; i++) { if (!my_rd(m, &p, &n)) return; free(p); }   // colonne + EOF
+        bool first = true;
+        for (;;) {
+            if (!my_rd(m, &p, &n)) return;
+            if (p[0] == 0xfe && n < 9) { unsigned st = p[3] | p[4] << 8; more = (st & 8) != 0; free(p); break; }
+            if (!first) ol += (size_t)snprintf(out + ol, on - ol, ";");
+            first = false;
+            pos = 0;
+            for (int c = 0; c < ncols; c++) {
+                if (c) ol += (size_t)snprintf(out + ol, on - ol, "|");
+                if (p[pos] == 0xfb) { pos++; ol += (size_t)snprintf(out + ol, on - ol, "NULL"); continue; }
+                uint64_t l = my_lenenc(p, &pos);
+                ol += (size_t)snprintf(out + ol, on - ol, "%.*s", (int)l, (char*)p + pos);
+                pos += (size_t)l;
+            }
+            free(p);
+        }
+    }
 }
 
 static void send_str(int fd, const char* s, size_t n) {
@@ -675,6 +793,47 @@ int main(void) {
         CHECK(strstr(audit, "127.0.0.1  anna  t  ERROR Access denied") && strstr(audit, "DELETE FROM p"), "audit: denied delete logged: %s", audit);
         CHECK(!strstr(audit, "SELECT"), "audit: reads not logged: %s", audit);
         remove("/tmp/sv_audit_test.log");
+    }
+
+    // ── protocollo MySQL (quarto server: --mysql-port con utenti) ──
+    {
+        QueryResult* q;
+        q = db_execute("CREATE USER mia IDENTIFIED BY 'mia-pass'"); db_result_free(q);
+        q = db_execute("GRANT SELECT, INSERT ON t.* TO mia"); db_result_free(q);
+        SvServerConfig cfg4 = { .port = 0, .token = "tok4", .quiet = true, .require_login = true, .mysql = true, .mysql_port = 0 };
+        SvServer* s4 = sv_server_start(&cfg4, err, sizeof(err));
+        int mp = s4 ? sv_server_mysql_port(s4) : 0;
+        pthread_t th4;
+        if (s4) pthread_create(&th4, NULL, run_server, s4);
+        CHECK(mp > 0, "mysql port: %s", err);
+        My m;
+        char e[300], out[4096];
+        CHECK(!my_connect(&m, mp, "mia", "sbagliata", NULL, e, sizeof(e)) && strstr(e, "1045"), "wrong password refused: %s", e);
+        close(m.fd);
+        CHECK(my_connect(&m, mp, "mia", "mia-pass", "t", e, sizeof(e)), "login: %s", e);
+        my_query(&m, "SELECT COUNT(*) FROM p", out, sizeof(out));
+        CHECK(!strcmp(out, "3"), "select: %s", out);
+        my_query(&m, "SELECT DATABASE(), @@version", out, sizeof(out));
+        CHECK(!strncmp(out, "ERR", 3) || strstr(out, "t|"), "database(): %s", out);
+        my_query(&m, "SELECT @@version_comment LIMIT 1", out, sizeof(out));
+        CHECK(!strcmp(out, "SegVault"), "client variable: %s", out);
+        my_query(&m, "SET NAMES utf8mb4", out, sizeof(out));
+        CHECK(!strcmp(out, "OK:0"), "set names: %s", out);
+        my_query(&m, "DELETE FROM p", out, sizeof(out));
+        CHECK(strstr(out, "ERR:1142"), "privileges enforced: %s", out);
+        my_query(&m, "SELECT * FROM nessuna", out, sizeof(out));
+        CHECK(strstr(out, "ERR:1146"), "missing table code: %s", out);
+        my_query(&m, "SELECT 1; SELECT 2, NULL", out, sizeof(out));
+        CHECK(!strcmp(out, "1 / 2|NULL"), "multi statements: %s", out);
+        close(m.fd);
+        CHECK(my_connect(&m, mp, "root", "tok4", NULL, e, sizeof(e)), "root with the token: %s", e);
+        my_query(&m, "USE t", out, sizeof(out));
+        my_query(&m, "BEGIN; DELETE FROM p WHERE id = 1; SELECT COUNT(*) FROM p; ROLLBACK", out, sizeof(out));
+        CHECK(!strcmp(out, "OK:0 / OK:1 / 2 / OK:0"), "transaction: %s", out);
+        my_query(&m, "SELECT COUNT(*) FROM p", out, sizeof(out));
+        CHECK(!strcmp(out, "3"), "rolled back: %s", out);
+        close(m.fd);
+        if (s4) { sv_server_stop(s4); pthread_join(th4, NULL); sv_server_free(s4); }
     }
 
     sv_server_stop(s);

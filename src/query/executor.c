@@ -1434,6 +1434,7 @@ static const FuncDef FUNCS[] = {
     { "JSON_EXTRACT", 2, 2 }, { "JSON_UNQUOTE", 1, 1 }, { "JSON_VALID", 1, 1 }, { "JSON_TYPE", 1, 1 },
     { "JSON_LENGTH", 1, 2 }, { "JSON_OBJECT", 0, 32 }, { "JSON_ARRAY", 0, 32 },
     { "MATCH_AGAINST", 3, 18 },
+    { "DATABASE", 0, 0 }, { "SCHEMA", 0, 0 }, { "VERSION", 0, 0 }, { "LAST_INSERT_ID", 0, 0 },
 };
 
 static const FuncDef* find_func(const char* name) {
@@ -1781,6 +1782,9 @@ static double ft_score(const char* const* docs, int nd, char* q, bool boolean) {
     return round(score * 10000.0) / 10000.0;
 }
 
+// ultimo AUTO_INCREMENT generato da questo thread (LAST_INSERT_ID(); una connessione MySQL è un thread)
+static _Thread_local int64_t g_last_insert_id;
+
 static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     const char* f = e->func;
     EvalVal a[3];
@@ -1869,6 +1873,13 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         tb_result(c, out, &tb);
         return;
     }
+    if (!strcmp(f, "DATABASE") || !strcmp(f, "SCHEMA")) {          // database corrente (NULL se nessuno)
+        Database* db = c->x ? catalog_current_db(c->x->catalog) : NULL;
+        if (db) ev_set_text(c, out, db->name, strlen(db->name)); else ev_null(out);
+        return;
+    }
+    if (!strcmp(f, "VERSION")) { ev_set_text(c, out, "8.0.35-SegVault", 15); return; }
+    if (!strcmp(f, "LAST_INSERT_ID")) { ev_int(out, g_last_insert_id); return; }
     if (!strcmp(f, "NOW") || !strcmp(f, "CURRENT_TIMESTAMP") || !strcmp(f, "CURDATE") || !strcmp(f, "CURRENT_DATE")) {
         char buf[32];
         now_text(buf, sizeof(buf), !strcmp(f, "CURDATE") || !strcmp(f, "CURRENT_DATE"));
@@ -6368,6 +6379,7 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     }
     QueryResult* ok = result_ok_msg(done);
     if (ok && last_generated > 0 && last_generated <= INT32_MAX) ok->last_insert_id = (int)last_generated;
+    if (last_generated > 0) g_last_insert_id = last_generated;
     return ok;
 }
 

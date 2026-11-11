@@ -69,6 +69,56 @@ static void hex(const uint8_t* b, size_t n, char* out) {
     out[n * 2] = '\0';
 }
 
+// ── SHA-1 ────────────────────────────────────────────────────────
+
+#define ROL(x, k) (((x) << (k)) | ((x) >> (32 - (k))))
+static void sha1_block(uint32_t h[5], const uint8_t* b) {
+    uint32_t w[80];
+    for (int i = 0; i < 16; i++) w[i] = (uint32_t)b[i * 4] << 24 | (uint32_t)b[i * 4 + 1] << 16 | (uint32_t)b[i * 4 + 2] << 8 | b[i * 4 + 3];
+    for (int i = 16; i < 80; i++) w[i] = ROL(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    uint32_t a = h[0], bb = h[1], c = h[2], d = h[3], e = h[4];
+    for (int i = 0; i < 80; i++) {
+        uint32_t f, k;
+        if (i < 20)      { f = (bb & c) | (~bb & d);           k = 0x5A827999u; }
+        else if (i < 40) { f = bb ^ c ^ d;                     k = 0x6ED9EBA1u; }
+        else if (i < 60) { f = (bb & c) | (bb & d) | (c & d);  k = 0x8F1BBCDCu; }
+        else             { f = bb ^ c ^ d;                     k = 0xCA62C1D6u; }
+        uint32_t t = ROL(a, 5) + f + e + k + w[i];
+        e = d; d = c; c = ROL(bb, 30); bb = a; a = t;
+    }
+    h[0] += a; h[1] += bb; h[2] += c; h[3] += d; h[4] += e;
+}
+
+void auth_sha1(const void* data, size_t n, uint8_t out[20]) {
+    uint32_t h[5] = { 0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u };
+    const uint8_t* p = (const uint8_t*)data;
+    size_t left = n;
+    while (left >= 64) { sha1_block(h, p); p += 64; left -= 64; }
+    uint8_t last[128] = {0};
+    memcpy(last, p, left);
+    last[left] = 0x80;
+    size_t blocks = left + 9 > 64 ? 2 : 1;
+    uint64_t bits = (uint64_t)n * 8;
+    for (int i = 0; i < 8; i++) last[blocks * 64 - 1 - i] = (uint8_t)(bits >> (8 * i));
+    for (size_t i = 0; i < blocks; i++) sha1_block(h, last + 64 * i);
+    for (int i = 0; i < 5; i++) { out[i * 4] = (uint8_t)(h[i] >> 24); out[i * 4 + 1] = (uint8_t)(h[i] >> 16); out[i * 4 + 2] = (uint8_t)(h[i] >> 8); out[i * 4 + 3] = (uint8_t)h[i]; }
+}
+
+// risposta = SHA1(pw) XOR SHA1(scramble + SHA1(SHA1(pw))): se ne ricava SHA1(pw) e lo si confronta
+static bool native_ok(const uint8_t stored[20], const uint8_t scramble[20], const uint8_t* resp, size_t rlen) {
+    if (rlen != 20) return false;
+    uint8_t buf[40], x[20], cand[20], chk[20];
+    memcpy(buf, scramble, 20);
+    memcpy(buf + 20, stored, 20);
+    auth_sha1(buf, 40, x);
+    for (int i = 0; i < 20; i++) cand[i] = resp[i] ^ x[i];
+    auth_sha1(cand, 20, chk);
+    unsigned diff = 0;
+    for (int i = 0; i < 20; i++) diff |= (unsigned)(chk[i] ^ stored[i]);
+    return diff == 0;
+}
+
+
 #define HASH_ROUNDS 20000
 
 // hash della password: SHA-256(sale + password), poi ripetuto (rallenta i tentativi a forza bruta)
@@ -110,7 +160,8 @@ static void random_salt(char out[33]) {
 // ── archivio degli utenti ───────────────────────────────────────
 
 typedef struct { char db[64], table[64]; unsigned privs; } Grant;
-typedef struct { char name[64], salt[33], hash[65]; bool admin; Grant* g; int ng; } User;
+// native: SHA1(SHA1(password)) in esadecimale, per il login col protocollo MySQL (mysql_native_password)
+typedef struct { char name[64], salt[33], hash[65], native[41]; bool admin; Grant* g; int ng; } User;
 
 static User* g_users;
 static int   g_nusers;
@@ -130,7 +181,7 @@ static bool save_users(void) {
     fprintf(f, "# SegVault users: do not edit by hand while the database is running\n");
     for (int i = 0; i < g_nusers; i++) {
         User* u = &g_users[i];
-        fprintf(f, "user %s %s %s %d\n", u->name, u->salt, u->hash, u->admin ? 1 : 0);
+        fprintf(f, "user %s %s %s %d %s\n", u->name, u->salt, u->hash, u->admin ? 1 : 0, u->native[0] ? u->native : "-");
         for (int k = 0; k < u->ng; k++) fprintf(f, "grant %s %s %s %u\n", u->name, u->g[k].db, u->g[k].table, u->g[k].privs);
     }
     bool ok = fclose(f) == 0;
@@ -162,11 +213,14 @@ void auth_init(const char* data_dir) {
         char a[64], b[64], c[80], d[80];
         int adm;
         unsigned pr;
-        if (sscanf(line, "user %63s %63s %79s %d", a, b, c, &adm) == 4) {
+        d[0] = '\0';
+        int nf = sscanf(line, "user %63s %63s %79s %d %79s", a, b, c, &adm, d);
+        if (nf >= 4) {
             User* u = find_user(a) ? NULL : add_user(a);
             if (!u) continue;
             snprintf(u->salt, sizeof(u->salt), "%.32s", b);
             snprintf(u->hash, sizeof(u->hash), "%.64s", c);
+            if (nf == 5 && strlen(d) == 40) snprintf(u->native, sizeof(u->native), "%.40s", d);
             u->admin = adm != 0;
         } else if (sscanf(line, "grant %63s %63s %79s %u", a, b, c, &pr) == 4) {
             User* u = find_user(a);
@@ -194,6 +248,19 @@ bool auth_user_exists(const char* user) { return find_user(user) != NULL; }
 bool auth_is_admin(const char* user) { User* u = find_user(user); return u && u->admin; }
 int  auth_user_count(void) { return g_nusers; }
 const char* auth_user_name(int i) { return i >= 0 && i < g_nusers ? g_users[i].name : NULL; }
+
+int auth_login_native(const char* user, const uint8_t scramble[20], const uint8_t* resp, size_t rlen) {
+    User* u = find_user(user);
+    if (!u) return 0;
+    if (!u->native[0]) return -1;
+    uint8_t stored[20];
+    for (int i = 0; i < 20; i++) {
+        unsigned v = 0;
+        if (sscanf(u->native + i * 2, "%2x", &v) != 1) return 0;
+        stored[i] = (uint8_t)v;
+    }
+    return native_ok(stored, scramble, resp, rlen) ? 1 : 0;
+}
 
 bool auth_login(const char* user, const char* password) {
     User* u = find_user(user);
@@ -479,6 +546,11 @@ bool auth_statement(const void* tokens, const char* session_user, const char* cu
         if (!us) { *out = res_err("Out of memory%s", ""); return true; }
         random_salt(us->salt);
         password_hash(us->salt, pw, us->hash);
+        uint8_t s1[20], s2[20];
+        auth_sha1(pw, strlen(pw), s1);
+        auth_sha1(s1, 20, s2);
+        hex(s2, 20, us->native);
+        memset(s1, 0, sizeof(s1));
         memset(pw, 0, sizeof(pw));
         *out = save_users() ? res_new(0, NULL) : res_err("Cannot write the users file%s", "");
         return true;

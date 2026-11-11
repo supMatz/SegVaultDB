@@ -27,6 +27,8 @@ typedef struct {
     bool        quiet;        // niente log delle richieste su stderr
     bool        require_login;// le richieste /api devono avere utente e password (Authorization: Basic)
                               // o il token; ogni query gira con i permessi dell'utente (vedi auth.h)
+    bool        mysql;        // ascolta anche col protocollo di rete MySQL (driver mysqli, PDO, JDBC, client mysql)
+    int         mysql_port;   // porta MySQL (0 = libera scelta dal sistema; vedi sv_server_mysql_port)
     const char* audit_file;   // se non NULL: ogni istruzione che non è una lettura viene aggiunta a questo
                               // file (ora, client, utente, database, esito, testo)
 } SvServerConfig;
@@ -69,6 +71,7 @@ typedef struct {
 // apre il socket in ascolto (il motore deve essere già inizializzato con db_init)
 SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz);
 int       sv_server_port(const SvServer* s);
+int       sv_server_mysql_port(const SvServer* s);   // 0 se il protocollo MySQL è spento
 void      sv_server_run(SvServer* s);     // accetta connessioni finché non viene chiamato sv_server_stop
 void      sv_server_stop(SvServer* s);    // chiamabile da un altro thread o da un gestore di segnale
 void      sv_server_free(SvServer* s);    // chiude le connessioni rimaste e libera tutto

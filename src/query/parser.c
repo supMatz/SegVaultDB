@@ -681,6 +681,9 @@ static ASTExpr* parse_primary(ParserState* ps) {
             if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')'", peek(ps)); ast_expr_free(e); return NULL; }
             return e;
         }
+        case TOK_DATABASE:                                       // DATABASE() (come MySQL)
+            if (next_is(ps, 1, TOK_LPAREN)) return parse_call(ps);
+            break;
         case TOK_IDENTIFIER: case TOK_LEFT: case TOK_RIGHT:   // LEFT(...)/RIGHT(...) sono funzioni
             if (t.type == TOK_IDENTIFIER && next_is(ps, 1, TOK_LPAREN) && !strcasecmp(t.text, "MATCH")) return parse_match(ps);
             if (next_is(ps, 1, TOK_LPAREN)) return parse_call(ps);

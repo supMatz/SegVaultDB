@@ -42,6 +42,10 @@ bool     auth_login(const char* user, const char* password);
 bool     auth_user_exists(const char* user);
 bool     auth_is_admin(const char* user);
 unsigned auth_privs(const char* user, const char* db, const char* table);   // permessi effettivi
+void auth_sha1(const void* data, size_t n, uint8_t out[20]);
+// login col protocollo MySQL (mysql_native_password): 1 = giusto, 0 = sbagliato,
+// -1 = utente creato prima del supporto MySQL (va reimpostata la password con ALTER USER)
+int  auth_login_native(const char* user, const uint8_t scramble[20], const uint8_t* resp, size_t rlen);
 bool auth_can_see_db(const char* user, const char* db);              // qualche permesso nel database?
 int      auth_user_count(void);
 const char* auth_user_name(int i);

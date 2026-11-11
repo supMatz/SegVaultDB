@@ -52,7 +52,7 @@ WIDGET_SRCS = \
 	src/widgets/window.c
 
 # ── server HTTP/JSON (usato anche dalla GUI, modalità "API server") ──
-NET_SRCS = src/server/server.c src/server/json.c
+NET_SRCS = src/server/server.c src/server/json.c src/server/mysql_wire.c
 
 # ── DB engine source files ──
 ENGINE_SRCS = \
@@ -202,7 +202,7 @@ TEST_GRID_SRCS = tests/test_grid_edit.c src/widgets/grid_edit.c $(ENGINE_SRCS)
 test_grid_edit: $(TEST_GRID_SRCS) src/widgets/grid_edit.h
 	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_grid_edit $(TEST_GRID_SRCS) -lm -pthread
 
-TEST_SERVER_SRCS = tests/test_server.c src/server/server.c src/server/json.c src/widgets/sql_text.c $(ENGINE_SRCS)
+TEST_SERVER_SRCS = tests/test_server.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
 # il server HTTP: richieste reali su un socket locale
 test_server: $(TEST_SERVER_SRCS) src/server/server.h src/server/json.h

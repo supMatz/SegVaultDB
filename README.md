@@ -44,7 +44,7 @@ database per piccoli siti web e app desktop.
 | **Linguaggio** | C11, zero dipendenze per il motore e per il server |
 | **Versione** | 1.2.0 |
 | **App desktop** | Win32 / GDI (Windows) · Xlib/X11 + Xft (Linux); all'avvio si sceglie **editor SQL** o **server API** |
-| **Server API** | `segvault-server` (o il pannello dell'app): HTTP/JSON, parametri `?` contro la SQL injection, sessioni con transazioni su più richieste, utenti e permessi (`GRANT`), token, CORS, limite di tempo, registro e monitor delle richieste |
+| **Server API** | `segvault-server` (o il pannello dell'app): HTTP/JSON, parametri `?` contro la SQL injection, sessioni con transazioni su più richieste, utenti e permessi (`GRANT`), token, CORS, limite di tempo, registro e monitor delle richieste, audit, backup pianificati; anche il **protocollo di rete MySQL** (PHP, Python, Java senza modifiche) |
 | **Client** | TypeScript/JavaScript e Python pronti in [`clients/`](clients/); esempi per C# e Java; `libsegvault.a` per incorporare il motore in C/C++ |
 | **SQL** | Lexer e parser a discesa ricorsiva scritti a mano; subquery anche correlate, `UNION` / `INTERSECT` / `EXCEPT`, `WITH [RECURSIVE]`, funzioni finestra con frame, `FULL` / `NATURAL` / `USING` join, `CASE`, viste, vincoli, trigger, `ALTER TABLE ... COLUMN` |
 | **Vincoli** | `PRIMARY KEY` (anche composta), `UNIQUE`, `NOT NULL`, `CHECK`, `FOREIGN KEY` con `ON DELETE` / `ON UPDATE` `CASCADE`, `SET NULL`, `SET DEFAULT`, `RESTRICT` |
@@ -602,6 +602,22 @@ make server                                   # ./segvault-server (make windows:
 | `--backup-dir DIR` | backup automatici in `DIR/segvault-AAAAMMGG-HHMMSS` |
 | `--backup-every M` / `--backup-keep N` | minuti fra due backup (default 60) / quanti tenerne (default 7) |
 | `--audit FILE` | registro delle modifiche (chi, quando, da dove, cosa) |
+| `--mysql-port N` | parla anche il protocollo di rete di MySQL sulla porta `N` (vedi sotto) |
+
+**Protocollo MySQL.** Con `--mysql-port 3306` il server accetta anche i driver MySQL, senza
+cambiare il codice dell'app: PHP (`mysqli`, `PDO`), Python (`PyMySQL`, `mysql-connector`), Java (JDBC),
+Node.js, il client `mysql` e gli strumenti grafici. Ogni connessione è una sessione con il suo
+database e la sua transazione; il login usa gli utenti di SegVault (`CREATE USER`, con i loro
+permessi), oppure `root` con il token come password; un server locale senza token né `--users`
+accetta qualunque nome. Le istruzioni di avvio dei driver (`SET NAMES`, `SELECT @@version`,
+`SHOW VARIABLES`, ...) hanno una risposta. Limiti: niente TLS e niente prepared statement lato
+server (PDO li emula già da sé; con `mysqli` si usa `query()` o `real_escape_string`); gli utenti
+creati prima di questa versione devono reimpostare la password (`ALTER USER u IDENTIFIED BY '...'`).
+
+```php
+$db = new PDO('mysql:host=127.0.0.1;port=3306;dbname=shop', 'anna', 'segreta1');
+foreach ($db->query('SELECT nome, prezzo FROM prodotto') as $r) echo $r['nome'], "\n";
+```
 
 Ogni istruzione che modifica dati o schema può essere registrata con `--audit FILE` (una riga con
 ora, client, utente, database, esito e testo; anche i tentativi rifiutati per mancanza di permessi).
@@ -1049,10 +1065,10 @@ make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitize
 |---|---|
 | `test_btree` | B+Tree sotto stress contro un modello di riferimento: inserimenti, aggiornamenti, cancellazioni e scansioni ordinate, con un buffer pool piccolo che costringe a riscrivere e rileggere le pagine |
 | `test_engine` (128) | Motore: pagine, heap, catalogo, WAL e recovery, import CSV |
-| `test_sql` (1147) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, procedure, viste, transazioni, crash e recovery, testi lunghi, JSON, full-text, 100 transazioni di fila |
+| `test_sql` (1152) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, procedure, viste, transazioni, crash e recovery, testi lunghi, JSON, full-text, 100 transazioni di fila |
 | `test_examples` (166) | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
 | `test_grid_edit` (22) | Modifica dei dati nella griglia: analisi dei risultati, `UPDATE` / `INSERT` / `DELETE` generati ed eseguiti, chiavi composte, join, apici e backslash, letterali di export e dump |
-| `test_server` (102) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici, utenti e permessi |
+| `test_server` (115) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici, utenti e permessi, audit, protocollo MySQL (login, permessi, errori, più istruzioni, transazioni) |
 | `test_backup` (29) | `BACKUP TO`, apertura della copia, ripristino sui dati in uso (con i dati precedenti conservati), righe grandi, viste, procedure e utenti |
 
 La CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) compila su Ubuntu con `-D_FORTIFY_SOURCE=2` e fallisce a qualunque warning, esegue `make test` e `make test-asan`, e compila per Windows con MinGW-w64. Durante lo sviluppo il motore è stato anche verificato con un fuzzer di SQL mutato e uno di richieste HTTP malformate (sotto ASan), con un confronto dei risultati contro SQLite su centinaia di migliaia di query e modifiche casuali, e con arresti forzati (`kill -9`) durante scritture concorrenti senza perdere nessuna scrittura confermata.
@@ -1269,8 +1285,10 @@ Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
 2. **Righe grandi** — fatto: pagine di overflow (righe fino a 64 MB, testi fino a 16 MB); `VACUUM`
    rende riusabili le pagine delle righe grandi aggiornate o eliminate.
 3. **Compatibilità MySQL** — fatto: import dei dump di `mysqldump` / phpMyAdmin (anche date con i
-   decimali dei secondi). Da fare: il protocollo di rete MySQL (le app PHP come WordPress si
-   collegherebbero senza modifiche).
+   decimali dei secondi), con viste, trigger e procedure; **protocollo di rete MySQL**
+   (`--mysql-port`: PHP, Python, Java e il client `mysql` si collegano senza modifiche). Da fare:
+   prepared statement lato server e TLS; le funzioni e le variabili di MySQL che mancano ancora
+   (un'app complessa come WordPress va provata).
 4. **Limiti del motore** — fatto: `CREATE UNIQUE INDEX`, indici su più colonne (anche dall'import
    MySQL), funzioni JSON e operatori `->` / `->>`, nomi `db.tabella` (un database per istruzione),
    stored procedure (`CREATE PROCEDURE` / `CALL`, parametri `IN`), ricerca full-text

@@ -135,6 +135,8 @@ static void usage(const char* argv0) {
            "      --max-body MB     largest request body (default 16)\n"
            "      --timeout S       stop a request that runs longer than S seconds (default 30, 0 = never)\n"
            "      --no-auth         allow listening on a non-local address without a token\n"
+           "      --mysql-port N    also speak the MySQL protocol on port N (3306 is MySQL's): PHP mysqli / PDO,\n"
+           "                        JDBC, Python and the mysql client connect unchanged (users: CREATE USER)\n"
            "      --audit FILE      append every statement that changes data or schema to FILE\n"
            "                        (time, client, user, database, result, SQL)\n"
            "      --backup-dir DIR  write a backup of all data to DIR/segvault-DATE-TIME (see --backup-every)\n"
@@ -171,6 +173,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--users")) cfg.require_login = true;
         else if (ARG("--backup-dir", "--backup-dir")) g_bk_dir = argv[++i];
         else if (ARG("--audit", "--audit")) cfg.audit_file = argv[++i];
+        else if (ARG("--mysql-port", "--mysql-port")) { cfg.mysql = true; cfg.mysql_port = atoi(argv[++i]); }
         else if (ARG("--backup-every", "--backup-every")) g_bk_every = atoi(argv[++i]);
         else if (ARG("--backup-keep", "--backup-keep")) g_bk_keep = atoi(argv[++i]);
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) cfg.quiet = true;
@@ -246,6 +249,7 @@ int main(int argc, char** argv) {
            cfg.require_login ? ", login required" : cfg.token && cfg.token[0] ? ", token required" : "");
     if (cfg.static_dir) printf("  web site: http://%s:%d/          (files of %s)\n", host, port, cfg.static_dir);
     printf("  API:      http://%s:%d/api/v1\n", host, port);
+    if (cfg.mysql) printf("  MySQL:    %s:%d   (e.g. mysql -h %s -P %d -u root)\n", host, sv_server_mysql_port(g_server), host, sv_server_mysql_port(g_server));
     if (g_bk_dir) {
 #ifdef _WIN32
         _mkdir(g_bk_dir);
