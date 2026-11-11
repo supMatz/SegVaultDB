@@ -145,6 +145,8 @@ typedef struct {
     Rect         menu_rects[10];    // titoli dei menu (calcolati nel disegno)
     int          menu_hover;        // titolo sotto il mouse (-1 = nessuno)
 
+    struct TableDesigner* td;       // designer di tabelle (creazione / struttura)
+
     // -- pannello Settings (Ctrl+,) --
     bool         settings_open;
     int          settings_section;  // sezione selezionata

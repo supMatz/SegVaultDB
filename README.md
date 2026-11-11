@@ -223,6 +223,22 @@ senza chiave primaria.
 
 **Explorer:** click per espandere database e tabelle; doppio click su un database = `USE`, su una tabella = anteprima dei dati (`SELECT * … LIMIT 200`), su una colonna = inserisce il nome nell'editor.
 
+**Tasto destro sull'explorer:** su un database *Use this database* e *New table…*; su una tabella
+*Browse data*, *Structure of …*, *Insert SELECT into editor*, *Insert CREATE TABLE into editor* e
+*Copy name*. Le stesse voci per tabelle sono nel menu *Query* (sulla tabella selezionata
+nell'explorer o su quella del risultato modificabile).
+
+**Designer di tabelle** (come la scheda *Struttura* di phpMyAdmin): un modulo con una riga per
+colonna — nome, tipo (menu), lunghezza per `VARCHAR` / `CHAR`, `DEFAULT`, *Primary*, *Not null*,
+*Unique*, *Auto inc* — e l'aggiunta o l'eliminazione di colonne. Sotto, l'SQL che verrà eseguito si
+aggiorna mentre si scrive (`CREATE TABLE` per una tabella nuova, gli `ALTER TABLE` per le modifiche:
+rinomina di tabella e colonne, tipo, default, `NOT NULL`, `UNIQUE`, colonne aggiunte ed eliminate),
+con l'errore se la struttura non è valida. *Create table* / *Apply changes* (`Ctrl+Invio`) lo esegue
+e aggiorna l'explorer; *Open in editor* lo aggiunge allo script invece di eseguirlo. Le modifiche che
+dipendono dai dati (tipo, `NOT NULL`, `UNIQUE`) vengono eseguite per prime, così se i dati non le
+rispettano la tabella resta com'era. La chiave primaria di una tabella esistente si cambia con
+`ALTER TABLE` nell'editor.
+
 **Risultati:**
 - click su una cella e `Ctrl+C` per copiarla, frecce per navigare, doppio click o `Enter` per vederne il valore intero;
 - trascina il bordo dell'intestazione per ridimensionare una colonna (doppio click = adatta al contenuto), `Shift` + rotella per lo scroll orizzontale;
@@ -906,6 +922,8 @@ Ogni widget estende `Widget` mettendolo come **primo campo** della propria struc
 | `Panel` / `Splitter` | `panel.*`, `splitter.*` | Contenitore; divisore ridimensionabile |
 | *(finestra)* | `window.h` / `window.c` | Layout dell'editor, menu, impostazioni, esecuzione in background |
 | *(schermate)* | `server_view.h` / `server_view.c` | Scelta iniziale e pannello del server |
+| *(designer)* | `table_design.*`, `table_designer.*` | Struttura di una tabella e SQL che la realizza (`CREATE` / `ALTER`); il modulo del designer |
+| *(griglia)* | `grid_edit.h` / `grid_edit.c` | SQL per modificare i dati nella griglia dei risultati |
 | *(tema)* | `theme.h` / `theme.c` | Temi e palette, testo con ellissi, icone vettoriali antialiasing |
 | *(SQL)* | `sql_text.h` / `sql_text.c` | Divisione degli statement, statement sotto il cursore, parole per highlighting e completamento, formattatore |
 

@@ -126,6 +126,8 @@ typedef struct {
     bool auto_increment;
     char default_val[128];  // valore di default (NULL, 0, ciao)
     char extra[128];        // extra info (auto_increment, ecc.)
+    bool unique;            // chiave UNIQUE su questa sola colonna
+    char unique_name[64];   // nome del vincolo UNIQUE ("" se è un attributo della colonna senza nome)
 } ColumnInfo;
 
 // informazioni su una tabella

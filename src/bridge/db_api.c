@@ -521,6 +521,14 @@ static ColumnInfo* db_list_columns_impl(const char* db_name, const char* table,
         cols[i].primary_key    = t->columns[i].primary_key;
         cols[i].auto_increment = t->columns[i].auto_increment;
         snprintf(cols[i].default_val, sizeof(cols[i].default_val), "%.127s", t->columns[i].default_val);
+        cols[i].unique = t->columns[i].unique;
+        for (int k = 0; k < t->num_constraints; k++) {
+            const Constraint* c = &t->constraints[k];
+            if (c->kind == CONS_UNIQUE && c->ncols == 1 && c->cols[0] == i) {
+                cols[i].unique = true;
+                snprintf(cols[i].unique_name, sizeof(cols[i].unique_name), "%.63s", c->name);
+            }
+        }
     }
     *out_count = t->num_columns;
     return cols;

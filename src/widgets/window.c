@@ -6,6 +6,7 @@
 #include "settings.h"
 #include "result_export.h"
 #include "csv_import.h"
+#include "table_designer.h"
 #include <stdio.h>
 #include <strings.h>
 #include <string.h>
@@ -2085,6 +2086,9 @@ typedef enum {
     CTX_IMPORT_CSV, CTX_RUN_FILE,
     CTX_EXPORT_CSV, CTX_EXPORT_TSV, CTX_EXPORT_JSON, CTX_EXPORT_MD, CTX_EXPORT_HTML, CTX_EXPORT_SQL,
     CTX_COPY_JSON, CTX_COPY_MD, CTX_COPY_SQL, CTX_DUMP_DB,
+    // struttura ed explorer
+    CTX_NEW_TABLE, CTX_EDIT_STRUCTURE, CTX_TREE_BROWSE, CTX_TREE_USE_DB, CTX_TREE_COPY_NAME, CTX_TREE_SELECT_SQL,
+    CTX_TREE_DDL,
     // Settings / Help
     CTX_SETTINGS, CTX_SETTINGS_RESET, CTX_SHORTCUTS, CTX_SQL_REFERENCE, CTX_DOCS, CTX_ABOUT,
     CTX_ACTION_COUNT
@@ -2172,6 +2176,13 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
     [CTX_DISCARD_ROW]   = { "Discard new row",           "Esc" },
     [CTX_DELETE_ROW]    = { "Delete row",                "Del" },
     [CTX_DUMP_DB]       = { "Database dump (.sql)\xe2\x80\xa6", NULL },
+    [CTX_NEW_TABLE]     = { "New table\xe2\x80\xa6",     NULL },
+    [CTX_EDIT_STRUCTURE] = { "Edit table structure\xe2\x80\xa6", NULL },
+    [CTX_TREE_BROWSE]   = { "Browse data",               "Double click" },
+    [CTX_TREE_USE_DB]   = { "Use this database",         "Double click" },
+    [CTX_TREE_COPY_NAME] = { "Copy name",                NULL },
+    [CTX_TREE_SELECT_SQL] = { "Insert SELECT into editor", NULL },
+    [CTX_TREE_DDL]      = { "Insert CREATE TABLE into editor", NULL },
     [CTX_SETTINGS]      = { "Settings\xe2\x80\xa6",      "Ctrl+," },
     [CTX_SETTINGS_RESET] = { "Reset all settings",       NULL },
     [CTX_SHORTCUTS]     = { "Keyboard shortcuts",        "F1" },
@@ -2185,7 +2196,7 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
 #define CTX_W     272
 #define CTX_MENU_W 300
 
-enum { CTXK_NONE = 0, CTXK_GRID, CTXK_EDITOR, CTXK_MENU };
+enum { CTXK_NONE = 0, CTXK_GRID, CTXK_EDITOR, CTXK_MENU, CTXK_TREE };
 
 // ── barra dei menu ───────────────────────────────────────────────
 
@@ -2198,7 +2209,7 @@ static const int M_VIEW[] = { CTX_TOGGLE_SIDEBAR, CTX_TOGGLE_FOOTER, CTX_TOGGLE_
                               CTX_HISTORY, CTX_REFRESH_TREE };
 static const int M_QUERY[] = { CTX_RUN, CTX_RUN_STMT, CTX_EXPLAIN, CTX_STOP, CTX_SEP, CTX_BEGIN, CTX_COMMIT, CTX_ROLLBACK,
                                CTX_SEP, CTX_SNIP_SELECT, CTX_SNIP_JOIN, CTX_SNIP_GROUP, CTX_SNIP_INSERT, CTX_SNIP_UPDATE,
-                               CTX_SNIP_DELETE, CTX_SNIP_CREATE };
+                               CTX_SNIP_DELETE, CTX_SNIP_CREATE, CTX_SEP, CTX_NEW_TABLE, CTX_EDIT_STRUCTURE };
 static const int M_IMPORT[] = { CTX_IMPORT_CSV, CTX_SEP, CTX_OPEN, CTX_RUN_FILE };
 static const int M_EXPORT[] = { CTX_EXPORT_CSV, CTX_EXPORT_TSV, CTX_EXPORT_JSON, CTX_EXPORT_MD, CTX_EXPORT_HTML,
                                 CTX_EXPORT_SQL, CTX_SEP, CTX_COPY_ALL, CTX_COPY_JSON, CTX_COPY_MD, CTX_COPY_SQL, CTX_SEP,
@@ -2215,6 +2226,44 @@ static const MenuDef MENUS[] = {
     MENU("Help", M_HELP, 'h'),
 };
 #define MENU_COUNT ((int)(sizeof(MENUS) / sizeof(MENUS[0])))
+
+// ── bersaglio del designer di tabelle ────────────────────────────
+
+// nodo tabella / vista selezionato nell'explorer (una colonna vale come la sua tabella), NULL se nessuno
+static TreeNode* tree_sel_table(AppWindow* app) {
+    TreeNode* n = app->tree ? app->tree->selected : NULL;
+    if (n && n->type == TREE_NODE_COLUMN) n = n->parent;
+    return n && (n->type == TREE_NODE_TABLE || n->type == TREE_NODE_VIEW) ? n : NULL;
+}
+
+// database per "New table": quello selezionato nell'explorer, altrimenti quello in uso
+static bool design_db(AppWindow* app, char* db, size_t n) {
+    TreeNode* sel = app->tree ? app->tree->selected : NULL;
+    const char* d = sel ? find_db_name(sel) : NULL;
+    if (!d) d = db_current_database();
+    if (!d || !d[0]) return false;
+    snprintf(db, n, "%.63s", d);
+    return true;
+}
+
+// tabella per "Edit structure": quella selezionata nell'explorer, altrimenti quella del risultato modificabile
+static bool design_table(AppWindow* app, char* db, size_t dn, char* table, size_t tn) {
+    TreeNode* t = tree_sel_table(app);
+    if (t) {
+        if (t->type != TREE_NODE_TABLE) return false;
+        const char* d = find_db_name(t);
+        if (!d) return false;
+        snprintf(db, dn, "%.63s", d);
+        snprintf(table, tn, "%.63s", t->label);
+        return true;
+    }
+    if (!app->showing_history && app->last_result && app->gedit.r == app->last_result && app->gedit.row_table >= 0) {
+        snprintf(db, dn, "%.63s", app->gedit.db);
+        snprintf(table, tn, "%.63s", app->gedit.t[app->gedit.row_table].name);
+        return db[0] != '\0';
+    }
+    return false;
+}
 
 // ── stato delle voci ─────────────────────────────────────────────
 
@@ -2247,6 +2296,9 @@ static bool ctx_enabled(AppWindow* app, int a) {
         case CTX_SAVE_ROW: case CTX_DISCARD_ROW: return idle && app->draft_src >= 0;
         case CTX_DELETE_ROW: return idle && !app->showing_history && grid_has_row(app) && grid_edit_rows_ok(&app->gedit);
         case CTX_SERVER: return idle && !app->in_transaction;
+        case CTX_NEW_TABLE: { char d[64]; return idle && design_db(app, d, sizeof(d)); }
+        case CTX_EDIT_STRUCTURE: { char d[64], t[64]; return idle && design_table(app, d, sizeof(d), t, sizeof(t)); }
+        case CTX_TREE_BROWSE: case CTX_TREE_USE_DB: case CTX_TREE_DDL: return idle;
         case CTX_BEGIN: return idle && !app->in_transaction;
         case CTX_COMMIT: case CTX_ROLLBACK: return idle;
         case CTX_DUMP_DB: {   // il motore si interroga solo se libero (il thread di lavoro lo tiene occupato)
@@ -2272,6 +2324,16 @@ static int ctx_checked(AppWindow* app, int a) {
 
 static const char* ctx_label(AppWindow* app, int a) {
     if (a == CTX_RUN && textbox_has_selection(app->editor)) return "Run selection";
+    if (a == CTX_EDIT_STRUCTURE && app->job == NULL) {     // il nome della tabella: si vede su cosa agisce
+        static char lbl[120];
+        char d[64], t[64];
+        if (design_table(app, d, sizeof(d), t, sizeof(t))) { snprintf(lbl, sizeof(lbl), "Structure of %.60s\xe2\x80\xa6", t); return lbl; }
+    }
+    if (a == CTX_NEW_TABLE && app->job == NULL && app->ctx_kind != CTXK_TREE) {
+        static char lbl[120];
+        char d[64];
+        if (design_db(app, d, sizeof(d))) { snprintf(lbl, sizeof(lbl), "New table in %.60s\xe2\x80\xa6", d); return lbl; }
+    }
     return CTX_INFO[a].label;
 }
 
@@ -2306,6 +2368,20 @@ static void ctx_open(AppWindow* app, int kind, int x, int y) {
         CTX_CUT, CTX_COPY, CTX_PASTE, CTX_SELECT_ALL, CTX_SEP,
         CTX_RUN, CTX_RUN_STMT, CTX_EXPLAIN, CTX_SEP, CTX_FORMAT, CTX_COMMENT,
     };
+    static const int TREE_DB[] = { CTX_TREE_USE_DB, CTX_NEW_TABLE, CTX_SEP, CTX_TREE_COPY_NAME, CTX_REFRESH_TREE };
+    static const int TREE_TABLE[] = {
+        CTX_TREE_BROWSE, CTX_EDIT_STRUCTURE, CTX_SEP,
+        CTX_TREE_SELECT_SQL, CTX_TREE_DDL, CTX_TREE_COPY_NAME, CTX_SEP,
+        CTX_NEW_TABLE, CTX_REFRESH_TREE,
+    };
+    static const int TREE_VIEW[] = { CTX_TREE_BROWSE, CTX_SEP, CTX_TREE_SELECT_SQL, CTX_TREE_COPY_NAME, CTX_SEP, CTX_REFRESH_TREE };
+    if (kind == CTXK_TREE) {
+        TreeNode* t = tree_sel_table(app);
+        if (!t)                                ctx_open_items(app, kind, TREE_DB, (int)(sizeof(TREE_DB) / sizeof(TREE_DB[0])), x, y);
+        else if (t->type == TREE_NODE_TABLE)   ctx_open_items(app, kind, TREE_TABLE, (int)(sizeof(TREE_TABLE) / sizeof(TREE_TABLE[0])), x, y);
+        else                                   ctx_open_items(app, kind, TREE_VIEW, (int)(sizeof(TREE_VIEW) / sizeof(TREE_VIEW[0])), x, y);
+        return;
+    }
     if (kind == CTXK_GRID) ctx_open_items(app, kind, GRID, (int)(sizeof(GRID) / sizeof(GRID[0])), x, y);
     else                   ctx_open_items(app, kind, EDITOR, (int)(sizeof(EDITOR) / sizeof(EDITOR[0])), x, y);
 }
@@ -2452,6 +2528,92 @@ static void open_export_bar(AppWindow* app, ExportFormat f) {
     size_t n = strlen(buf);
     snprintf(buf + n, sizeof(buf) - n, "%s", export_format_ext(f));
     line_edit_set_text(app->bar_input, buf);
+}
+
+// testo in fondo all'editor (su righe nuove), con il cursore alla fine
+static void editor_append(AppWindow* app, const char* text) {
+    TextBox* tb = app->editor;
+    textbox_focus(tb, true);
+    tb->cursor_pos = tb->text_len;
+    tb->sel_anchor = -1;
+    size_t n = strlen(text);
+    char* buf = malloc(n + 8);
+    if (!buf) return;
+    const char* sep = tb->text_len == 0 ? "" : tb->text[tb->text_len - 1] == '\n' ? "\n" : "\n\n";
+    bool semi = n > 0 && text[n - 1] != ';';
+    snprintf(buf, n + 8, "%s%s%s\n", sep, text, semi ? ";" : "");
+    textbox_insert(tb, buf);
+    free(buf);
+}
+
+// esegue l'SQL del designer statement per statement (separati da ";\n")
+static void designer_apply(AppWindow* app) {
+    const char* s = td_sql(app->td);
+    if (!s) return;
+    char* sql = strdup(s);
+    if (!sql) return;
+    char db[64], name[64], orig[64];
+    snprintf(db, sizeof(db), "%.63s", td_db(app->td));
+    snprintf(name, sizeof(name), "%.63s", td_table(app->td));
+    snprintf(orig, sizeof(orig), "%.63s", td_orig_table(app->td));
+    bool is_new = td_is_new(app->td);
+    if (!use_database(app, db)) {
+        free(sql);
+        td_set_error(app->td, "Cannot use the database of the table");
+        return;
+    }
+    int total = 1, done = 0;
+    for (const char* p = sql; (p = strstr(p, ";\n")); p += 2) total++;
+    char err[400] = "";
+    for (char* p = sql; p; ) {
+        char* e = strstr(p, ";\n");
+        if (e) *e = '\0';
+        QueryResult* r = db_execute(p);
+        bool ok = r && r->success;
+        if (!ok) snprintf(err, sizeof(err), "%.380s", r ? r->error : "no response");
+        db_result_free(r);
+        if (!ok) break;
+        done++;
+        p = e ? e + 2 : NULL;
+    }
+    free(sql);
+    if (done > 0) { update_session(app); refresh_tree(app); }
+    if (done == total) {
+        td_close(app->td);
+        char msg[160], meta[64];
+        snprintf(msg, sizeof(msg), is_new ? "Table %.60s created" : "Structure of %.60s updated", name);
+        snprintf(meta, sizeof(meta), "%d statement%s", total, total == 1 ? "" : "s");
+        set_status(app, STATUS_OK, msg, meta);
+        return;
+    }
+    if (done > 0) {     // una parte è stata applicata: il modulo riparte dalla struttura attuale
+        char full[460];
+        snprintf(full, sizeof(full), "Statement %d of %d failed (the previous ones were applied): %.380s", done + 1, total, err);
+        if (!is_new) td_open(app->td, db, orig);
+        td_set_error(app->td, full);
+        return;
+    }
+    td_set_error(app->td, err);
+}
+
+static void designer_event(AppWindow* app, sEvent* evt) {
+    switch (td_event(app->td, evt)) {
+        case TD_CLOSE: td_close(app->td); break;
+        case TD_APPLY: designer_apply(app); break;
+        case TD_TO_EDITOR: {
+            const char* sql = td_sql(app->td);
+            if (!sql) break;
+            char* copy = strdup(sql);
+            td_close(app->td);
+            if (copy) {
+                editor_append(app, copy);
+                set_status(app, STATUS_INFO, "Table SQL inserted into the editor", "Select it and press F5 to run it");
+            }
+            free(copy);
+            break;
+        }
+        default: break;
+    }
 }
 
 static void settings_store(AppWindow* app);
@@ -2607,6 +2769,62 @@ static void ctx_run(AppWindow* app, int a) {
         case CTX_IMPORT_CSV: bar_open(app, BAR_IMPORT_CSV, false); break;
         case CTX_DUMP_DB:    bar_open(app, BAR_DUMP, false); break;
 
+        // struttura ed explorer
+        case CTX_NEW_TABLE: {
+            char d[64];
+            if (design_db(app, d, sizeof(d))) td_open(app->td, d, NULL);
+            break;
+        }
+        case CTX_EDIT_STRUCTURE: {
+            char d[64], t[64];
+            if (design_table(app, d, sizeof(d), t, sizeof(t)) && !td_open(app->td, d, t))
+                set_status(app, STATUS_ERROR, "Cannot read the structure of the table", t);
+            break;
+        }
+        case CTX_TREE_BROWSE: {
+            TreeNode* t = tree_sel_table(app);
+            if (t) on_tree_activate(t, app);
+            break;
+        }
+        case CTX_TREE_USE_DB: {
+            TreeNode* sel = app->tree->selected;
+            const char* d = sel ? find_db_name(sel) : NULL;
+            if (d) {
+                char msg[160];
+                bool ok = use_database(app, d);
+                snprintf(msg, sizeof(msg), ok ? "Using database %.100s" : "Cannot use database %.100s", d);
+                set_status(app, ok ? STATUS_OK : STATUS_ERROR, msg, "");
+            }
+            break;
+        }
+        case CTX_TREE_COPY_NAME: {
+            TreeNode* sel = app->tree->selected;
+            if (sel) copy_and_report(app, sel->label, "the name");
+            break;
+        }
+        case CTX_TREE_SELECT_SQL: {
+            TreeNode* t = tree_sel_table(app);
+            if (!t) break;
+            char sql[256];
+            snprintf(sql, sizeof(sql), "SELECT *\nFROM %.120s\nLIMIT 100;", t->label);
+            insert_snippet(app, sql);
+            break;
+        }
+        case CTX_TREE_DDL: {
+            TreeNode* t = tree_sel_table(app);
+            const char* d = t ? find_db_name(t) : NULL;
+            if (!d || !use_database(app, d)) break;
+            char sql[256];
+            snprintf(sql, sizeof(sql), "SHOW CREATE TABLE %.120s", t->label);
+            QueryResult* r = db_execute(sql);
+            if (r && r->success && r->num_rows > 0 && r->num_cols > 1 && !r->rows[0].cells[1].is_null) {
+                editor_append(app, r->rows[0].cells[1].value);
+                set_status(app, STATUS_OK, "CREATE TABLE inserted into the editor", t->label);
+            } else set_status(app, STATUS_ERROR, "Cannot read the CREATE statement", r ? r->error : "");
+            db_result_free(r);
+            break;
+        }
+
         // export
         case CTX_EXPORT_CSV:  open_export_bar(app, EXPORT_CSV); break;
         case CTX_EXPORT_TSV:  open_export_bar(app, EXPORT_TSV); break;
@@ -2752,6 +2970,16 @@ static bool menubar_handle_event(AppWindow* app, sEvent* evt) {
 static bool ctx_try_open(AppWindow* app, sEvent* evt) {
     if (evt->type != EVT_MOUSE_DOWN || evt->mouse_button != SV_MOUSE_RIGHT) return false;
     int x = evt->mouse_x, y = evt->mouse_y;
+    if (app->tree->base.visible && widget_contains_point((Widget*)app->tree, x, y)) {
+        app->tree->last_click_node = NULL;                 // un tasto destro non completa un doppio click
+        widget_handle_event((Widget*)app->tree, evt);       // seleziona il nodo sotto il mouse
+        TreeNode* n = app->tree->selected;
+        if (n && n->type != TREE_NODE_ROOT && n->type != TREE_NODE_CATEGORY) {
+            textbox_focus(app->editor, false);
+            ctx_open(app, CTXK_TREE, x, y);
+        }
+        return true;
+    }
     if (grid_ready(app) && widget_contains_point((Widget*)app->results, x, y)) {
         textbox_focus(app->editor, false);
         widget_handle_event((Widget*)app->results, evt);
@@ -3648,6 +3876,7 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
     app->filter_input->base.user_data = app;
     app->filter_input->on_change = on_filter_change;
     app->filter_input->win = win;
+    app->td = td_create(win);
     app->cell_edit = line_edit_create("");
     if (app->cell_edit) { app->cell_edit->win = win; app->cell_edit->base.visible = false; }
     app->edit_src = app->edit_col = app->draft_src = app->del_src = -1;
@@ -3730,7 +3959,8 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         if (evt->type != EVT_MOUSE_MOVE) return;
     }
 
-    // pannelli modali: Settings, informazioni
+    // pannelli modali: designer di tabelle, Settings, informazioni
+    if (td_is_open(app->td)) { designer_event(app, evt); return; }
     if (app->settings_open && evt->type != EVT_MOUSE_UP) { settings_handle_event(app, evt); return; }
     if (app->info_page && evt->type != EVT_MOUSE_UP) {
         if (evt->type == EVT_MOUSE_WHEEL) app->info_scroll -= evt->wheel_delta * 3;
@@ -3946,6 +4176,7 @@ bool app_window_tick(AppWindow* app, uint64_t now_ms) {
     bool c = line_edit_tick(app->bar_replace_input, now_ms);
     c = line_edit_tick(app->filter_input, now_ms) || c;
     if (app->cell_edit && gedit_editing(app)) c = line_edit_tick(app->cell_edit, now_ms) || c;
+    c = td_tick(app->td, now_ms) || c;
     // esecuzione in background: completamento e stato con il tempo trascorso
     if (app->job) {
         if (atomic_load(&app->job->done)) {
@@ -4289,6 +4520,7 @@ void app_window_draw(AppWindow* app) {
     draw_tooltip(app);
     draw_cell_view(app);
     draw_settings(app);
+    td_draw(app->td, app->win_w, app->win_h);
     draw_info(app);
     draw_help(app);
 
@@ -4691,6 +4923,7 @@ void app_window_destroy(AppWindow* app) {
     widget_destroy((Widget*)app->bar_replace_input);
     widget_destroy((Widget*)app->filter_input);
     if (app->cell_edit) widget_destroy((Widget*)app->cell_edit);
+    td_destroy(app->td);
     for (int c = 0; c < 64; c++) free(app->draft_vals[c]);
     free(app);
 }
@@ -4778,6 +5011,7 @@ void app_window_set_mode(AppWindow* app, AppMode mode) {
         app->menu_open = -1;
         app->ctx_kind = 0;
         app->settings_open = false;
+        td_close(app->td);
         app->theme_menu_open = false;
         app->mode = APP_MODE_SERVER;
         server_panel_start(app->server);      // un errore (es. porta occupata) resta visibile nel pannello
