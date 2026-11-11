@@ -66,6 +66,7 @@ ENGINE_SRCS = \
 	src/query/lexer.c \
 	src/query/parser.c \
 	src/query/executor.c \
+	src/query/sqljson.c \
 	src/tx/wal.c \
 	src/tx/transaction.c \
 	src/bridge/db_api.c \

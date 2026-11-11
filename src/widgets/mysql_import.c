@@ -187,11 +187,24 @@ static void create_table(Buf* out, const char* s, int n, MyImportStats* st) {
             int pi = -1;
             for (int i = 0; i < m; i++) if (it[i].t == T_PAREN) { pi = i; break; }
             char col[80];
-            if ((is(&it[0], "KEY") || is(&it[0], "INDEX")) && pi > 0 && paren_cols(&it[pi], col, sizeof(col)) == 1) {
-                char line[400];
-                if (pi >= 2) snprintf(line, sizeof(line), "CREATE INDEX %.*s ON %.*s (%s);\n", it[1].n, it[1].s, name->n, name->s, col);
-                else snprintf(line, sizeof(line), "CREATE INDEX ix_%.*s_%s ON %.*s (%s);\n", name->n, name->s, col, name->n, name->s, col);
-                puts_(&post, line);
+            int nc = pi > 0 ? paren_cols(&it[pi], col, sizeof(col)) : 0;
+            if ((is(&it[0], "KEY") || is(&it[0], "INDEX")) && nc >= 1) {
+                // anche a più colonne (con lunghezze di prefisso e ASC/DESC): il motore le accetta
+                puts_(&post, "CREATE INDEX ");
+                if (pi >= 2) tk_put(&post, &it[1]);
+                else {                                         // senza nome: ix_tabella_colonna (senza backtick)
+                    char ix[200];
+                    snprintf(ix, sizeof(ix), "`ix_%.*s_%.60s`", name->n, name->s, col);
+                    size_t w = 1;
+                    for (size_t r = 1; ix[r]; r++) if (ix[r] != '`' || !ix[r + 1]) ix[w++] = ix[r];
+                    ix[w] = '\0';
+                    puts_(&post, ix);
+                }
+                puts_(&post, " ON ");
+                tk_put(&post, name);
+                puts_(&post, " ");
+                tk_put(&post, &it[pi]);
+                puts_(&post, ";\n");
             } else st->indexes_dropped++;
             continue;
         }

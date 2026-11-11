@@ -164,6 +164,8 @@ enum { SETOP_NONE, SETOP_UNION, SETOP_INTERSECT, SETOP_EXCEPT };
 typedef struct ASTNode {
     StmtType type;
     bool     if_exists;        // DROP ... IF EXISTS / CREATE ... IF NOT EXISTS
+    char     qual_db[64];      // database dei nomi qualificati (shop.prodotto); "" = quello corrente
+    bool     qual_mixed;       // anche tabelle senza database: valide solo se il corrente è qual_db
     union {
         struct {
             ASTExpr*   columns[64];

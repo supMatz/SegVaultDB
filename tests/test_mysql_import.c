@@ -49,6 +49,7 @@ static const char* DUMP =
 "  `stato` set('nuovo','pagato','spedito') DEFAULT NULL,\n"
 "  PRIMARY KEY (`id`),\n"
 "  KEY `fk_cliente` (`cliente_id`),\n"
+"  KEY (`quando`),\n"
 "  CONSTRAINT `fk_ordine_cliente` FOREIGN KEY (`cliente_id`) REFERENCES `cliente` (`id`) ON DELETE CASCADE\n"
 ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n"
 "LOCK TABLES `ordine` WRITE;\n"
@@ -71,7 +72,9 @@ int main(void) {
     char* sql = mysql_translate(DUMP, &st);
     CHECK(sql && !strstr(sql, "ENGINE") && !strstr(sql, "unsigned") && !strstr(sql, "COLLATE") && !strstr(sql, "LOCK TABLES"), "cleaned:\n%s", sql ? sql : "");
     CHECK(sql && strstr(sql, "CREATE INDEX `ix_nome` ON `cliente` (`nome`)") && strstr(sql, "CONSTRAINT `uq_email` UNIQUE (`email`)"), "indexes: %s", sql ? sql : "");
-    CHECK(st.indexes_dropped == 2, "multi-column and fulltext indexes reported: %d", st.indexes_dropped);
+    CHECK(sql && strstr(sql, "CREATE INDEX `ix_tipo_attivo` ON `cliente` (`tipo`,`attivo`)"), "multi-column index kept");
+    CHECK(sql && strstr(sql, "CREATE INDEX `ix_ordine_quando` ON `ordine` (`quando`)"), "unnamed index: %s", sql ? sql : "");
+    CHECK(st.indexes_dropped == 1, "fulltext index reported: %d", st.indexes_dropped);
     CHECK(st.skipped >= 5, "skipped SET/LOCK/...: %d", st.skipped);
 
     if (system("rm -rf /tmp/sv_my_test && mkdir -p /tmp/sv_my_test") != 0) return 1;

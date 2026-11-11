@@ -268,7 +268,40 @@ static QueryResult* exec_atomic(ASTNode* stmt) {
 }
 
 // esegue uno statement già analizzato (transazioni e CHECKPOINT gestiti qui)
+// database di uno statement con nomi qualificati (shop.prodotto): indice, o -1 con un messaggio
+static int qual_db_index(const ASTNode* stmt, int cur, char* err, size_t errn) {
+    if (!stmt->qual_db[0]) return cur;
+    int q = -1;
+    for (int i = 0; i < g_db.catalog->num_databases; i++)
+        if (!strcasecmp(g_db.catalog->databases[i].name, stmt->qual_db)) q = i;
+    if (q < 0) { snprintf(err, errn, "Unknown database '%.63s'", stmt->qual_db); return -1; }
+    if (stmt->qual_mixed && cur != q) {
+        snprintf(err, errn, "Tables of different databases in one statement are not supported yet: "
+                 "qualify every table with '%.63s.' or run USE %.63s first", stmt->qual_db, stmt->qual_db);
+        return -1;
+    }
+    return q;
+}
+
+static QueryResult* exec_one_in(ASTNode* stmt);
+
+// statement con shop.prodotto: gira nel database shop (solo per questo statement e questo thread)
 static QueryResult* exec_one(ASTNode* stmt) {
+    if (!stmt->qual_db[0]) return exec_one_in(stmt);
+    char err[300];
+    Database* cur = catalog_current_db(g_db.catalog);
+    int ci = cur ? (int)(cur - g_db.catalog->databases) : -1;
+    int q = qual_db_index(stmt, ci, err, sizeof(err));
+    if (q < 0) return result_error(err);
+    if (q == ci) return exec_one_in(stmt);
+    int prev = catalog_get_thread_db();
+    catalog_set_thread_db(q);
+    QueryResult* r = exec_one_in(stmt);
+    catalog_set_thread_db(prev);
+    return r;
+}
+
+static QueryResult* exec_one_in(ASTNode* stmt) {
     QueryResult* result = NULL;
     if (g_session_user[0]) {         // permessi dell'utente della sessione
         char err[300];
@@ -987,8 +1020,13 @@ QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char
     // solo una SELECT, in un database esistente, con un utente che esiste; il resto va per la via normale
     bool ok = parsed && parsed->success && parsed->count == 1 && parsed->statements[0]->type == NODE_SELECT &&
               (!dbname || !dbname[0] || idx >= 0) && (!user || !user[0] || auth_user_exists(user));
+    char err[300];
+    if (ok && parsed->statements[0]->qual_db[0]) {           // shop.prodotto: il database dello statement
+        int q = qual_db_index(parsed->statements[0], idx, err, sizeof(err));
+        if (q < 0) ok = false;                               // l'errore lo dà la via normale
+        else idx = q;
+    }
     if (ok) {
-        char err[300];
         const char* dn = idx >= 0 ? g_db.catalog->databases[idx].name : "";
         if (user && user[0] && !auth_check(user, parsed->statements[0], dn, err, sizeof(err))) r = result_error(err);
         else {

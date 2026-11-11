@@ -275,6 +275,7 @@ int catalog_use_db(Catalog* c, const char* name) {
 static _Thread_local int g_thread_db = -2;
 
 void catalog_set_thread_db(int index) { g_thread_db = index; }
+int  catalog_get_thread_db(void) { return g_thread_db; }
 
 Database* catalog_current_db(Catalog* c) {
     int i = g_thread_db != -2 ? g_thread_db : c ? c->current_db : -1;

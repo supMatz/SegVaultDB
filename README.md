@@ -449,6 +449,8 @@ LIMIT n [OFFSET m];
 | Funzioni finestra | `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `NTILE(n)`, `LAG(x [, k [, def]])`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `COUNT/SUM/AVG/MIN/MAX(...)` con `OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS \| RANGE BETWEEN ... AND ...])`: frame con `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`, `UNBOUNDED FOLLOWING` |
 | `CASE` | `CASE WHEN voto >= 28 THEN 'alto' ELSE 'basso' END`, `CASE cfu WHEN 6 THEN ... END` |
 | Funzioni | `UPPER`, `LOWER`, `LENGTH`, `CHAR_LENGTH`, `TRIM`, `CONCAT`, `CONCAT_WS`, `SUBSTRING`, `LEFT`, `RIGHT`, `REPLACE`, `REVERSE`, `ABS`, `ROUND`, `FLOOR`, `CEIL`, `MOD`, `POWER`, `SQRT`, `SIGN`, `COALESCE`, `IFNULL`, `NULLIF`, `IF`, `NOW`, `CURDATE`, `YEAR`, `MONTH`, `DAY` |
+| Nomi qualificati | `SELECT * FROM shop.prodotto`, `INSERT INTO shop.prodotto ...`, `DROP TABLE shop.vecchia`, `shop.prodotto.nome`: l'istruzione usa quel database senza cambiare quello corrente (`USE`); per ora un solo database per istruzione |
+| JSON | Su colonne di testo, come MySQL: `JSON_VALID(doc)`, `JSON_EXTRACT(doc, '$.cliente.nome')` (percorsi `$`, `.chiave`, `."con spazi"`, `[n]`; `NULL` se il percorso manca), `doc->'$.tag[0]'` (= `JSON_EXTRACT`), `doc->>'$.nome'` (senza virgolette, = `JSON_UNQUOTE(JSON_EXTRACT(...))`), `JSON_UNQUOTE`, `JSON_TYPE`, `JSON_LENGTH(doc [, percorso])`, `JSON_OBJECT('a', 1, 'b', x)`, `JSON_ARRAY(1, 'z', NULL)`. Esempio: `SELECT id FROM ordine WHERE dati->>'$.stato' = 'pagato'` |
 
 Un alias nasconde il nome della tabella, come in SQL standard: in `... FROM esame e2 WHERE e2.corso = esame.corso` il secondo `esame` è la query esterna.
 Con `SELECT DISTINCT`, `ORDER BY` può usare solo ciò che la query restituisce (una colonna, un alias, una posizione o la stessa espressione), come in MySQL e PostgreSQL: altrimenti l'ordine non sarebbe definito e la query viene rifiutata.
@@ -526,7 +528,7 @@ DROP TRIGGER [IF EXISTS] nome;   SHOW TRIGGERS [FROM tabella];
 
 ### Non supportato
 
-Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), stored procedure, nomi qualificati con il database (`shop.prodotto`: si usa `USE shop`), scritture in parallelo: le richieste di sola lettura girano insieme, quelle che scrivono una alla volta, e una sola sessione per volta può avere una transazione aperta (vedi [Roadmap](#roadmap)).
+Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), stored procedure, tabelle di database diversi nella stessa istruzione (`shop.prodotto JOIN uni.esame`), scritture in parallelo: le richieste di sola lettura girano insieme, quelle che scrivono una alla volta, e una sola sessione per volta può avere una transazione aperta (vedi [Roadmap](#roadmap)).
 
 ---
 
@@ -996,7 +998,7 @@ make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitize
 |---|---|
 | `test_btree` | B+Tree sotto stress contro un modello di riferimento: inserimenti, aggiornamenti, cancellazioni e scansioni ordinate, con un buffer pool piccolo che costringe a riscrivere e rileggere le pagine |
 | `test_engine` (128) | Motore: pagine, heap, catalogo, WAL e recovery, import CSV |
-| `test_sql` (994) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, transazioni, crash e recovery, testi lunghi, 100 transazioni di fila |
+| `test_sql` (1070) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, transazioni, crash e recovery, testi lunghi, JSON, 100 transazioni di fila |
 | `test_examples` (166) | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
 | `test_grid_edit` (22) | Modifica dei dati nella griglia: analisi dei risultati, `UPDATE` / `INSERT` / `DELETE` generati ed eseguiti, chiavi composte, join, apici e backslash, letterali di export e dump |
 | `test_server` (78) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici |
@@ -1060,7 +1062,8 @@ SegVaultDB/
 │   ├── query/                 # SQL: lexer → parser → executor
 │   │   ├── lexer.h / .c
 │   │   ├── parser.h / .c
-│   │   └── executor.h / .c    # Piani, valutazione, indici in memoria, vincoli, trigger
+│   │   ├── executor.h / .c    # Piani, valutazione, indici in memoria, vincoli, trigger
+│   │   └── sqljson.h / .c     # Funzioni JSON: validazione, percorsi, tipo, lunghezza
 │   ├── catalog/schema.h / .c  # Catalogo: database, tabelle, colonne, vincoli, viste, trigger
 │   ├── storage/               # Pagine e buffer pool
 │   ├── table/                 # Heap file e tuple
@@ -1216,8 +1219,9 @@ Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
 3. **Compatibilità MySQL** — fatto: import dei dump di `mysqldump` / phpMyAdmin (anche date con i
    decimali dei secondi). Da fare: il protocollo di rete MySQL (le app PHP come WordPress si
    collegherebbero senza modifiche).
-4. **Limiti del motore** — indici composti e `UNIQUE INDEX`, stored procedure, nomi `db.tabella`, più
-   tabelle / colonne / indici, ricerca full-text, tipo JSON.
+4. **Limiti del motore** — fatto: `CREATE UNIQUE INDEX`, indici su più colonne (anche dall'import
+   MySQL), funzioni JSON e operatori `->` / `->>`, nomi `db.tabella` (un database per istruzione). Da fare:
+   più tabelle / colonne / indici, stored procedure, ricerca full-text.
 5. **Sicurezza e gestione** — HTTPS integrato, backup pianificati e ripristino dalla GUI, avvio come
    servizio di sistema, registro di audit, `SHOW DATABASES` filtrato per utente.
 6. **GUI** — costruttore visuale di query, navigazione delle chiavi esterne dalla griglia, grafici dai

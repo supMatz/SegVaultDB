@@ -1,6 +1,7 @@
 #include "executor.h"
 #include "../platform_lock.h"
 #include "../table/overflow.h"
+#include "sqljson.h"
 #include "platform_compat.h"
 #include <string.h>
 #include <ctype.h>
@@ -1430,6 +1431,8 @@ static const FuncDef FUNCS[] = {
     { "COALESCE", 1, 32 }, { "IFNULL", 2, 2 }, { "NULLIF", 2, 2 }, { "IF", 3, 3 },
     { "NOW", 0, 0 }, { "CURRENT_TIMESTAMP", 0, 0 }, { "CURDATE", 0, 0 }, { "CURRENT_DATE", 0, 0 },
     { "YEAR", 1, 1 }, { "MONTH", 1, 1 }, { "DAY", 1, 1 },
+    { "JSON_EXTRACT", 2, 2 }, { "JSON_UNQUOTE", 1, 1 }, { "JSON_VALID", 1, 1 }, { "JSON_TYPE", 1, 1 },
+    { "JSON_LENGTH", 1, 2 }, { "JSON_OBJECT", 0, 32 }, { "JSON_ARRAY", 0, 32 },
 };
 
 static const FuncDef* find_func(const char* name) {
@@ -1711,6 +1714,29 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     EvalVal a[3];
     int na = e->nargs < 3 ? e->nargs : 3;
 
+    // JSON_OBJECT / JSON_ARRAY: tutti gli argomenti (anche oltre 3); numeri così come sono, NULL -> null
+    if (!strcmp(f, "JSON_OBJECT") || !strcmp(f, "JSON_ARRAY")) {
+        bool obj = f[5] == 'O';
+        if (obj && e->nargs % 2) { ctx_error(c, "%s", "JSON_OBJECT needs key, value pairs"); ev_null(out); return; }
+        TextBuf tb = {0};
+        tb_put(&tb, obj ? "{" : "[", 1);
+        for (int i = 0; i < e->nargs; i++) {
+            EvalVal v;
+            eval_expr(e->args[i], c, &v);
+            if (i) tb_put(&tb, obj && i % 2 ? ": " : ", ", 2);
+            bool key = obj && i % 2 == 0;
+            if (v.null) { if (key) { free(tb.d); ctx_error(c, "%s", "JSON_OBJECT key is NULL"); ev_null(out); return; } tb_put(&tb, "null", 4); continue; }
+            const char* s = ev_s(&v);
+            if (!key && (v.is_num || v.is_int)) { tb_put(&tb, s, strlen(s)); continue; }
+            if (!key && sj_valid(s) && (*s == '{' || *s == '[')) { tb_put(&tb, s, strlen(s)); continue; }   // JSON annidato
+            char* q = sj_quote(s);
+            if (q) { tb_put(&tb, q, strlen(q)); free(q); }
+        }
+        tb_put(&tb, obj ? "}" : "]", 1);
+        tb_result(c, out, &tb);
+        return;
+    }
+
     // funzioni che non valutano tutti gli argomenti subito
     if (!strcmp(f, "COALESCE")) {
         for (int i = 0; i < e->nargs; i++) {
@@ -1776,6 +1802,26 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         return;
     }
     if (!strcmp(f, "LENGTH"))        { ev_int(out, (int64_t)strlen(ev_s(&a[0]))); return; }
+    if (!strncmp(f, "JSON_", 5)) {
+        const char* doc = ev_s(&a[0]);
+        if (!strcmp(f, "JSON_VALID")) { ev_int(out, sj_valid(doc)); return; }
+        if (!strcmp(f, "JSON_UNQUOTE")) {
+            char* u = sj_unquote(doc, strlen(doc));
+            if (!u) { ev_null(out); return; }
+            ev_set_text(c, out, u, strlen(u));
+            free(u);
+            return;
+        }
+        const char* vs = doc;
+        size_t vl = strlen(doc);
+        if (!strcmp(f, "JSON_EXTRACT") || (!strcmp(f, "JSON_LENGTH") && na == 2)) {
+            if (!sj_extract(doc, ev_s(&a[1]), &vs, &vl)) { ev_null(out); return; }   // percorso assente: NULL
+        } else if (!sj_valid(doc)) { ctx_error(c, "Invalid JSON text in argument 1 to %s", f); ev_null(out); return; }
+        if (!strcmp(f, "JSON_EXTRACT")) { ev_set_text(c, out, vs, vl); return; }
+        if (!strcmp(f, "JSON_TYPE")) { const char* t = sj_type(vs, vl); ev_set_text(c, out, t, strlen(t)); return; }
+        ev_int(out, sj_length(vs, vl));
+        return;
+    }
     if (!strncmp(f, "CHAR", 4))      { ev_int(out, utf8_chars(ev_s(&a[0]))); return; }
     if (!strcmp(f, "TRIM") || !strcmp(f, "LTRIM") || !strcmp(f, "RTRIM")) {
         const char* s = ev_s(&a[0]);

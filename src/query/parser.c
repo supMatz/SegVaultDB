@@ -11,6 +11,8 @@ typedef struct {
     int        pos;
     ParseResult* result;
     int        depth;          // annidamento corrente delle espressioni
+    char       qual_db[64];    // database dei nomi db.tabella dello statement ("" = nessuno)
+    bool       plain_table;    // lo statement usa anche tabelle senza database
 } ParserState;
 
 #define MAX_EXPR_DEPTH 128     // parentesi, operatori e funzioni annidati
@@ -64,6 +66,26 @@ static bool expect(ParserState* ps, TokenType tt) {
                  token_name(tt), t.text, t.line);
     ps->result->success = false;
     return false;
+}
+
+// nome di tabella, anche qualificato col database (shop.prodotto): il database va nello statement.
+// Per ora un solo database per statement (quello dei nomi qualificati)
+static bool next_is(ParserState* ps, int ahead, TokenType tt);
+static void parse_fail(ParserState* ps, const char* msg, Token at);
+static Token table_tok(ParserState* ps) {
+    Token t = consume(ps);
+    if (t.type != TOK_IDENTIFIER) return t;
+    if (peek(ps).type == TOK_DOT && next_is(ps, 1, TOK_IDENTIFIER)) {
+        consume(ps);
+        Token n = consume(ps);
+        if (strlen(t.text) >= sizeof(ps->qual_db)) parse_fail(ps, "Database name is too long", t);
+        else if (ps->qual_db[0] && strcasecmp(ps->qual_db, t.text))
+            parse_fail(ps, "Tables of different databases in one statement are not supported yet", t);
+        else snprintf(ps->qual_db, sizeof(ps->qual_db), "%s", t.text);
+        return n;
+    }
+    ps->plain_table = true;
+    return t;
 }
 
 static void add_stmt(ParserState* ps, ASTNode* stmt) {
@@ -668,6 +690,14 @@ static ASTExpr* parse_primary(ParserState* ps) {
                 Token c = consume(ps);
                 if (c.type == TOK_STAR) { parse_fail(ps, "table.* is only allowed in the SELECT list", c); ast_expr_free(e); return NULL; }
                 if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name after '.'", c); ast_expr_free(e); return NULL; }
+                if (peek(ps).type == TOK_DOT && next_is(ps, 1, TOK_IDENTIFIER)) {   // db.tabella.colonna
+                    consume(ps);
+                    Token col = consume(ps);
+                    if (ps->qual_db[0] && strcasecmp(ps->qual_db, t.text))
+                        parse_fail(ps, "Tables of different databases in one statement are not supported yet", t);
+                    t = c;
+                    c = col;
+                }
                 copy_text(ps, e->table_name, sizeof(e->table_name), t.text);
                 copy_text(ps, e->col_name, sizeof(e->col_name), c.text);
             } else {
@@ -711,9 +741,39 @@ static ASTExpr* parse_multiplicative(ParserState* ps) {
     return e;
 }
 
+// a -> '$.x' = JSON_EXTRACT(a, '$.x'); a ->> '$.x' = JSON_UNQUOTE(JSON_EXTRACT(...)) (come MySQL)
+static ASTExpr* json_call(const char* name, ASTExpr* a, ASTExpr* b) {
+    ASTExpr* f = new_expr(EXPR_FUNC);
+    if (!f) { ast_expr_free(a); ast_expr_free(b); return NULL; }
+    snprintf(f->func, sizeof(f->func), "%s", name);
+    f->args = calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
+    if (!f->args) { ast_expr_free(f); ast_expr_free(a); ast_expr_free(b); return NULL; }
+    f->args[f->nargs++] = a;
+    if (b) f->args[f->nargs++] = b;
+    f->depth = 1 + (a ? a->depth : 0) + (b ? b->depth : 0);
+    return f;
+}
+
+static bool adjacent(ParserState* ps, int ahead) {           // token ahead subito dopo il precedente
+    int i = ps->pos + ahead;
+    if (i <= 0 || i >= ps->tokens->count) return false;
+    const Token* a = &ps->tokens->tokens[i - 1], *b = &ps->tokens->tokens[i];
+    return a->line == b->line && b->col == a->col;      // col del lexer conta solo gli spazi
+}
+
 static ASTExpr* parse_additive(ParserState* ps) {
     ASTExpr* e = parse_multiplicative(ps);
     while (e && ps->result->success) {
+        if (peek(ps).type == TOK_MINUS && next_is(ps, 1, TOK_GT) && adjacent(ps, 1)) {
+            consume(ps); consume(ps);
+            bool unquote = peek(ps).type == TOK_GT && adjacent(ps, 0);
+            if (unquote) consume(ps);
+            ASTExpr* path = parse_multiplicative(ps);
+            if (!path) { ast_expr_free(e); return NULL; }
+            e = json_call("JSON_EXTRACT", e, path);
+            if (e && unquote) e = json_call("JSON_UNQUOTE", e, NULL);
+            continue;
+        }
         OpType op;
         if (match(ps, TOK_PLUS))       op = OP_PLUS;
         else if (match(ps, TOK_MINUS)) op = OP_MINUS;
@@ -893,7 +953,7 @@ static void parse_from_clause(ParserState* ps, ASTNode* n) {
         n->select_stmt.from_sub = parse_derived(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name));
         memcpy(n->select_stmt.table_alias, n->select_stmt.table_name, sizeof(n->select_stmt.table_alias));
     } else {
-        Token first = consume(ps);
+        Token first = table_tok(ps);
         if (first.type != TOK_IDENTIFIER) parse_fail(ps, "Expected a table name after FROM", first);
         copy_text(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name), first.text);
         parse_table_alias(ps, n->select_stmt.table_alias, sizeof(n->select_stmt.table_alias));
@@ -922,7 +982,7 @@ static void parse_from_clause(ParserState* ps, ASTNode* n) {
             memcpy(j->alias, j->table_name, sizeof(j->alias));
             if (!ps->result->success) break;
         } else {
-            Token tt = consume(ps);
+            Token tt = table_tok(ps);
             if (tt.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name after JOIN", tt); break; }
             copy_text(ps, j->table_name, sizeof(j->table_name), tt.text);
             parse_table_alias(ps, j->alias, sizeof(j->alias));
@@ -1115,7 +1175,7 @@ static ASTNode* parse_select(ParserState* ps) { return parse_query(ps); }
 static void parse_insert(ParserState* ps, ASTNode* n) {
     n->type = NODE_INSERT;
     expect(ps, TOK_INTO);
-    Token tn = consume(ps);
+    Token tn = table_tok(ps);
     if (tn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name after INSERT INTO", tn); return; }
     copy_text(ps, n->insert_stmt.table_name, sizeof(n->insert_stmt.table_name), tn.text);
     if (match(ps, TOK_LPAREN)) {
@@ -1169,7 +1229,7 @@ static void parse_insert(ParserState* ps, ASTNode* n) {
 // UPDATE t SET col = espr {, col = espr} [WHERE condizione]
 static void parse_update(ParserState* ps, ASTNode* n) {
     n->type = NODE_UPDATE;
-    Token tn = consume(ps);
+    Token tn = table_tok(ps);
     if (tn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name after UPDATE", tn); return; }
     copy_text(ps, n->update_stmt.table_name, sizeof(n->update_stmt.table_name), tn.text);
     if (!match(ps, TOK_SET)) { parse_fail(ps, "Expected SET", peek(ps)); return; }
@@ -1391,7 +1451,7 @@ TrigProgram* parser_parse_trigger(TokenList* tokens) {
     ParseResult r;
     memset(&r, 0, sizeof(r));
     r.success = true;
-    ParserState ps = { tokens, 0, &r, 0 };
+    ParserState ps = { tokens, 0, &r, 0, "", false };
     parse_trigger_rest(&ps, p);
     match(&ps, TOK_SEMICOLON);
     if (r.success && peek(&ps).type != TOK_EOF) parse_fail(&ps, "Unexpected text after the trigger body", peek(&ps));
@@ -1420,7 +1480,7 @@ static ASTNode* parse_create_trigger(ParserState* ps, ASTNode* n) {
     }
     int of_end = ps->pos;
     if (!expect(ps, TOK_ON)) return n;
-    Token tbl = consume(ps);
+    Token tbl = table_tok(ps);
     if (tbl.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the table name after ON", tbl); return n; }
     copy_text(ps, n->create_trigger.table_name, sizeof(n->create_trigger.table_name), tbl.text);
     // il resto viene controllato ora e salvato come testo (OF ... + FOR EACH ... + corpo)
@@ -1690,7 +1750,7 @@ static void parse_column_def(ParserState* ps, ASTNode* n) {
 
 static void parse_create_table(ParserState* ps, ASTNode* n) {
     n->type = NODE_CREATE_TABLE;
-    Token tn = consume(ps);
+    Token tn = table_tok(ps);
     if (tn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name after CREATE TABLE", tn); return; }
     copy_text(ps, n->create_table.table_name, sizeof(n->create_table.table_name), tn.text);
     if (!expect(ps, TOK_LPAREN)) return;
@@ -1740,7 +1800,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             consume(ps);
             n->type = NODE_DELETE;
             expect(ps, TOK_FROM);
-            Token tn = consume(ps);
+            Token tn = table_tok(ps);
             if (tn.type != TOK_IDENTIFIER) parse_fail(ps, "Expected a table name after DELETE FROM", tn);
             copy_text(ps, n->delete_stmt.table_name, sizeof(n->delete_stmt.table_name), tn.text);
             if (ps->result->success && match(ps, TOK_WHERE)) n->delete_stmt.where = parse_expr(ps);
@@ -1773,7 +1833,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                 Token in = consume(ps);
                 copy_text(ps, n->create_index.index_name, sizeof(n->create_index.index_name), in.text);
                 expect(ps, TOK_ON);
-                Token tn = consume(ps);
+                Token tn = table_tok(ps);
                 copy_text(ps, n->create_index.table_name, sizeof(n->create_index.table_name), tn.text);
                 expect(ps, TOK_LPAREN);
                 char cols[8][64];
@@ -1858,7 +1918,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             consume(ps);
             expect(ps, TOK_TABLE);
             n->type = NODE_ALTER_TABLE;
-            Token tn = consume(ps);
+            Token tn = table_tok(ps);
             copy_text(ps, n->alter_table.table_name, sizeof(n->alter_table.table_name), tn.text);
             if (match(ps, TOK_RENAME) && ident_is(ps, "COLUMN")) {         // RENAME COLUMN a TO b
                 consume(ps);
@@ -1959,7 +2019,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                 copy_text(ps, n->drop_db.db_name, sizeof(n->drop_db.db_name), dn.text);
             } else if (sub.type == TOK_TABLE) {
                 n->type = NODE_DROP_TABLE;
-                Token tn = consume(ps);
+                Token tn = table_tok(ps);
                 copy_text(ps, n->drop_table.table_name, sizeof(n->drop_table.table_name), tn.text);
             } else if (sub.type == TOK_VIEW) {
                 n->type = NODE_DROP_VIEW;
@@ -1970,7 +2030,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                 Token in = consume(ps);
                 copy_text(ps, n->drop_index.index_name, sizeof(n->drop_index.index_name), in.text);
                 expect(ps, TOK_ON);
-                Token tn = consume(ps);
+                Token tn = table_tok(ps);
                 copy_text(ps, n->drop_index.table_name, sizeof(n->drop_index.table_name), tn.text);
             } else if (sub.type == TOK_TRIGGER) {
                 n->type = NODE_DROP_TRIGGER;
@@ -2003,14 +2063,14 @@ static ASTNode* parse_statement(ParserState* ps) {
             else if (what.type == TOK_INDEX || !strcasecmp(what.text, "INDEXES") || !strcasecmp(what.text, "KEYS")) { kind = "INDEXES"; needs_table = true; }
             if (!kind) { parse_fail(ps, "Expected DATABASES, TABLES, STATUS, TRIGGERS, CREATE TABLE, CONSTRAINTS or INDEXES after SHOW", what); break; }
             if (!strcmp(kind, "TRIGGERS") && (match(ps, TOK_FROM) || match(ps, TOK_IN))) {      // SHOW TRIGGERS [FROM t]
-                Token tn = consume(ps);
+                Token tn = table_tok(ps);
                 if (tn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name", tn); break; }
                 copy_text(ps, n->select_stmt.table_alias, sizeof(n->select_stmt.table_alias), tn.text);
             }
             snprintf(n->select_stmt.table_name, sizeof(n->select_stmt.table_name), "%s", kind);
             if (needs_table) {
                 if (strcmp(kind, "CREATE") && !match(ps, TOK_FROM) && !match(ps, TOK_IN)) { parse_fail(ps, "Expected FROM table", peek(ps)); break; }
-                Token tn = consume(ps);
+                Token tn = table_tok(ps);
                 if (tn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name", tn); break; }
                 copy_text(ps, n->select_stmt.table_alias, sizeof(n->select_stmt.table_alias), tn.text);
             }
@@ -2020,7 +2080,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             consume(ps);
             n->type = NODE_DESCRIBE;
             if (peek(ps).type == TOK_TABLE) consume(ps);          // DESCRIBE TABLE t
-            Token tn = consume(ps);
+            Token tn = table_tok(ps);
             if (tn.type == TOK_IDENTIFIER) {
                 // table name stored in select_stmt.table_name for convenience
                 copy_text(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name), tn.text);
@@ -2070,7 +2130,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             consume(ps);
             n->type = NODE_TRUNCATE;
             expect(ps, TOK_TABLE);
-            Token tn = consume(ps);
+            Token tn = table_tok(ps);
             copy_text(ps, n->delete_stmt.table_name, sizeof(n->delete_stmt.table_name), tn.text);
             break;
         }
@@ -2100,6 +2160,8 @@ ParseResult* parser_parse(TokenList* tokens) {
     ps.pos = 0;
     ps.result = r;
     ps.depth = 0;
+    ps.qual_db[0] = '\0';
+    ps.plain_table = false;
 
     // errori del lexer (stringa non chiusa o troppo lunga): sono più precisi di quelli del parser
     for (int i = 0; i < tokens->count; i++) {
@@ -2112,8 +2174,14 @@ ParseResult* parser_parse(TokenList* tokens) {
     }
 
     while (peek(&ps).type != TOK_EOF) {
+        ps.qual_db[0] = '\0';
+        ps.plain_table = false;
         ASTNode* stmt = parse_statement(&ps);
-        if (stmt) add_stmt(&ps, stmt);
+        if (stmt) {
+            memcpy(stmt->qual_db, ps.qual_db, sizeof(stmt->qual_db));
+            stmt->qual_mixed = ps.qual_db[0] && ps.plain_table;
+            add_stmt(&ps, stmt);
+        }
         match(&ps, TOK_SEMICOLON);
         if (!ps.result->success) break;
     }
@@ -2125,7 +2193,7 @@ ASTExpr* parser_parse_expr(TokenList* tokens, char* err, size_t errn) {
     ParseResult r;
     memset(&r, 0, sizeof(r));
     r.success = true;
-    ParserState ps = { tokens, 0, &r, 0 };
+    ParserState ps = { tokens, 0, &r, 0, "", false };
     ASTExpr* e = parse_expr(&ps);
     if (r.success && peek(&ps).type != TOK_EOF) parse_fail(&ps, "Unexpected text after the condition", peek(&ps));
     if (!r.success) { ast_expr_free(e); snprintf(err, errn, "%s", r.error); return NULL; }

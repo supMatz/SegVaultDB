@@ -148,6 +148,7 @@ int catalog_use_db(Catalog* c, const char* name);
 Database* catalog_current_db(Catalog* c);
 // database corrente solo per questo thread (letture in parallelo); -2 = torna a quello del catalogo
 void catalog_set_thread_db(int index);
+int  catalog_get_thread_db(void);
 
 // Tabelle
 TableSchema* catalog_get_table(Catalog* c, const char* db, const char* table);

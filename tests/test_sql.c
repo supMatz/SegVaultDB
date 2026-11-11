@@ -202,6 +202,49 @@ int main(void) {
     t("SELECT * FROM lkv", "3");
     t("DROP VIEW lkv", "OK:0");
     t("DROP TABLE lk", "OK:0");
+    // JSON (come MySQL): funzioni e operatori -> / ->>
+    t("CREATE TABLE js (id INT PRIMARY KEY, doc TEXT)", "OK:0");
+    t("INSERT INTO js VALUES (1, '{\"nome\": \"Ada\", \"età\": 36, \"tag\": [\"a\", \"b\", {\"x\": 1.5}], \"ok\": true, \"n\": null}'), (2, '[1, 2, 3]'), (3, 'non json')", "OK:3");
+    t("SELECT JSON_VALID(doc) FROM js ORDER BY id", "1;1;0");
+    t("SELECT JSON_EXTRACT(doc, '$.nome') FROM js WHERE id = 1", "\"Ada\"");
+    t("SELECT JSON_UNQUOTE(JSON_EXTRACT(doc, '$.nome')) FROM js WHERE id = 1", "Ada");
+    t("SELECT doc->'$.nome', doc->>'$.nome', doc->>'$.\"età\"' FROM js WHERE id = 1", "\"Ada\"|Ada|36");
+    t("SELECT doc->'$.tag[2].x', doc->>'$.tag[1]', doc->'$.manca' FROM js WHERE id = 1", "1.5|b|NULL");
+    t("SELECT JSON_TYPE(doc), JSON_LENGTH(doc), JSON_LENGTH(doc, '$.tag') FROM js WHERE id = 1", "OBJECT|5|3");
+    t("SELECT JSON_TYPE(doc->'$.ok'), JSON_TYPE(doc->'$.n'), JSON_TYPE(doc->'$.tag[2].x') FROM js WHERE id = 1", "BOOLEAN|NULL|DOUBLE");
+    t("SELECT doc->'$[1]', JSON_LENGTH(doc), JSON_TYPE(doc->'$[0]') FROM js WHERE id = 2", "2|3|INTEGER");
+    t("SELECT id FROM js WHERE doc->>'$.nome' = 'Ada'", "1");
+    t("SELECT id FROM js WHERE JSON_VALID(doc) AND doc->'$[0]' = 1", "2");
+    t("SELECT JSON_TYPE(doc) FROM js WHERE id = 3", "ERR:Invalid JSON");
+    t("SELECT JSON_OBJECT('a', 1, 'b', 'x\"y', 'c', NULL, 'd', JSON_ARRAY(1, 'z')) FROM js WHERE id = 1",
+      "{\"a\": 1, \"b\": \"x\\\"y\", \"c\": null, \"d\": [1, \"z\"]}");
+    t("SELECT JSON_ARRAY(), JSON_OBJECT() FROM js WHERE id = 1", "[]|{}");
+    t("SELECT JSON_OBJECT('a') FROM js WHERE id = 1", "ERR:key, value");
+    t("SELECT JSON_UNQUOTE('\"a\\\\nb\\\\u00e8\"') FROM js WHERE id = 1", "a\nb\xc3\xa8");
+    t("SELECT 5 - -3, 7 -1 FROM js WHERE id = 1", "8|6");
+    t("DROP TABLE js", "OK:0");
+    // nomi qualificati col database: db.tabella (lo statement gira in quel database)
+    t("CREATE DATABASE altro", "OK:0");
+    t("CREATE TABLE altro.p (id INT PRIMARY KEY, nome VARCHAR(20))", "OK:0");
+    t("CREATE TABLE altro.q (id INT PRIMARY KEY, p_id INT REFERENCES p(id))", "OK:0");
+    t("INSERT INTO altro.p VALUES (1, 'uno'), (2, 'due')", "OK:2");
+    t("INSERT INTO `altro`.`q` VALUES (10, 1), (11, 2)", "OK:2");
+    t("SELECT altro.p.nome, x.id FROM altro.p JOIN altro.q x ON x.p_id = altro.p.id ORDER BY x.id", "uno|10;due|11");
+    t("SELECT nome FROM altro.p WHERE id IN (SELECT p_id FROM altro.q WHERE id = 11)", "due");
+    t("UPDATE altro.p SET nome = 'UNO' WHERE id = 1", "OK:1");
+    t("DELETE FROM altro.q WHERE id = 11", "OK:1");
+    t("SELECT COUNT(*) FROM altro.q", "1");
+    t("SELECT nome FROM altro.p p WHERE p.id = 1", "UNO");
+    t("SELECT * FROM p", "ERR:");                                       // il database corrente non cambia
+    t("SELECT * FROM altro.p JOIN js ON 1 = 1", "ERR:different databases");
+    t("SELECT * FROM nessuno.p", "ERR:Unknown database");
+    t("SELECT * FROM altro.p, shop.js", "ERR:different databases");
+    t("CREATE INDEX ix_nome ON altro.p (nome)", "OK:0");
+    t("DROP INDEX ix_nome ON altro.p", "OK:0");
+    t("ALTER TABLE altro.p ADD COLUMN eta INT", "OK:0");
+    t("DROP TABLE altro.q", "OK:0");
+    t("DROP TABLE altro.p", "OK:0");
+    t("DROP DATABASE altro", "OK:0");
     t("SELECT TRUE + TRUE, FALSE FROM n WHERE id = 1", "2|0");
 
     // ── funzioni ──
