@@ -89,6 +89,7 @@ struct SvServer {
     sock_t*        conns;               // socket aperti (per chiuderli allo stop)
     int            active;
     sv_mutex       exec_mx;             // una richiesta alla volta sul motore
+    FILE*          audit;               // registro di audit (scritto con exec_mx)
     // statistiche e registro (protetti da conn_mx)
     double         started_ms;
     long long      n_requests, n_errors, n_rows;
@@ -135,6 +136,7 @@ typedef struct {
     bool        close;
     char        detail[120];            // per il registro: SQL eseguito o errore
     long long   rows;                   // righe restituite
+    char        client[48];             // indirizzo del client (registro di audit)
 } Response;
 
 static const char* status_text(int st) {
@@ -553,6 +555,40 @@ static bool reads_only(const char* script, const SqlRange* ranges, int n) {
     return any > 0;
 }
 
+// registro di audit: una riga per ogni istruzione che può cambiare qualcosa (anche se fallisce)
+//   2026-11-11 17:20:01  127.0.0.1  anna  shop  ok 3 rows  INSERT INTO ...
+static void audit_stmt(SvServer* s, const Response* rs, const char* user, const char* stmt, const QueryResult* r) {
+    if (!s->audit) return;
+    const char* p = stmt;
+    while (isspace((unsigned char)*p)) p++;
+    static const char* const READS[] = { "SELECT", "WITH", "SHOW", "DESCRIBE", "DESC", "EXPLAIN" };
+    for (int i = 0; i < 6; i++) {
+        size_t l = strlen(READS[i]);
+        if (!strncasecmp(p, READS[i], l) && !isalnum((unsigned char)p[l]) && p[l] != '_') return;
+    }
+    time_t t = time(NULL);
+    struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    char when[32], text[1024];
+    strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", &tmv);
+    one_line(text, sizeof(text), p);
+    const char* db = db_current_database();
+    if (r && r->success)
+        fprintf(s->audit, "%s  %s  %s  %s  ok %d rows  %s\n", when, rs->client[0] ? rs->client : "-", user && user[0] ? user : "root",
+                db && db[0] ? db : "-", r->rows_affected, text);
+    else {
+        char e[200];
+        one_line(e, sizeof(e), r ? r->error : "out of memory");
+        fprintf(s->audit, "%s  %s  %s  %s  ERROR %s  %s\n", when, rs->client[0] ? rs->client : "-", user && user[0] ? user : "root",
+                db && db[0] ? db : "-", e, text);
+    }
+    fflush(s->audit);
+}
+
 // esegue lo script (già con i parametri) nel database indicato e scrive la risposta;
 // sql_for_log: il testo originale, con i segnaposto, per il registro. Libera script.
 static void run_script(SvServer* s, Response* rs, char* script, const char* sql_for_log, const char* dbname,
@@ -666,6 +702,7 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
         char saved = script[e];
         script[e] = '\0';
         QueryResult* r = db_execute(script + a);
+        audit_stmt(s, rs, user, script + a, r);
         script[e] = saved;
         bool timeout = exec_timed_out(s);
         if (!r || !r->success || timeout) {
@@ -1433,6 +1470,7 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
     int perr = parse_head(s, in->data, &rq);
     in->data[head_len - 2] = saved;
     Response rs = {0};
+    snprintf(rs.client, sizeof(rs.client), "%s", c->client);
     if (perr) {
         rs.close = true;
         json_error(&rs, perr, "%s", perr == 413 ? "request body too large" :
@@ -1533,6 +1571,11 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
     for (int i = 0; i < s->cfg.max_clients; i++) s->conns[i] = BAD_SOCK;
     s->started_ms = now_ms();
     if (s->default_db && !valid_ident(s->default_db)) { snprintf(err, errsz, "invalid default database name"); sv_server_free(s); return NULL; }
+    if (cfg->audit_file && cfg->audit_file[0]) {
+        s->audit = fopen(cfg->audit_file, "a");
+        if (!s->audit) { snprintf(err, errsz, "cannot open the audit log %.200s: %s", cfg->audit_file, strerror(errno)); sv_server_free(s); return NULL; }
+    }
+    s->cfg.audit_file = NULL;                              // il file è già aperto: la stringa non serve più
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -1646,6 +1689,7 @@ void sv_server_free(SvServer* s) {
     free(s->cors);
     free(s->default_db);
     free(s->static_dir);
+    if (s->audit) fclose(s->audit);
     free(s);
 #ifdef _WIN32
     WSACleanup();

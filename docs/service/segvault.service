@@ -1,0 +1,36 @@
+# segvault-server come servizio systemd (Linux)
+#
+#   sudo useradd --system --home /var/lib/segvault --create-home segvault
+#   sudo cp segvault-server /usr/local/bin/
+#   sudo cp docs/service/segvault.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now segvault
+#   journalctl -u segvault -f            # registro delle richieste
+#
+# All'arresto (systemctl stop) il server riceve SIGTERM e chiude il database in modo pulito.
+
+[Unit]
+Description=SegVault database server (HTTP/JSON API)
+After=network.target
+
+[Service]
+Type=simple
+User=segvault
+Group=segvault
+WorkingDirectory=/var/lib/segvault
+# --users: utenti e permessi (CREATE USER / GRANT); backup ogni ora, gli ultimi 24; registro di audit
+ExecStart=/usr/local/bin/segvault-server --port 8484 --users \
+          --backup-dir /var/lib/segvault/backups --backup-every 60 --backup-keep 24 \
+          --audit /var/lib/segvault/audit.log \
+          /var/lib/segvault/data
+Restart=on-failure
+RestartSec=3
+# protezioni di systemd: il servizio scrive solo nella sua cartella
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/segvault
+
+[Install]
+WantedBy=multi-user.target

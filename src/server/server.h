@@ -27,6 +27,8 @@ typedef struct {
     bool        quiet;        // niente log delle richieste su stderr
     bool        require_login;// le richieste /api devono avere utente e password (Authorization: Basic)
                               // o il token; ogni query gira con i permessi dell'utente (vedi auth.h)
+    const char* audit_file;   // se non NULL: ogni istruzione che non è una lettura viene aggiunta a questo
+                              // file (ora, client, utente, database, esito, testo)
 } SvServerConfig;
 
 typedef struct SvServer SvServer;

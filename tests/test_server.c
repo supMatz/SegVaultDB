@@ -609,7 +609,9 @@ int main(void) {
         q = db_execute("USE t"); db_result_free(q);
         q = db_execute("CREATE USER boss IDENTIFIED BY 'boss-pass'"); db_result_free(q);
         q = db_execute("GRANT ALL ON *.* TO boss WITH GRANT OPTION"); db_result_free(q);
-        SvServerConfig cfg3 = { .port = 0, .token = "tok3", .default_db = "t", .quiet = true, .require_login = true };
+        remove("/tmp/sv_audit_test.log");
+        SvServerConfig cfg3 = { .port = 0, .token = "tok3", .default_db = "t", .quiet = true, .require_login = true,
+                                .audit_file = "/tmp/sv_audit_test.log" };
         SvServer* s3 = sv_server_start(&cfg3, err, sizeof(err));
         int port3 = s3 ? sv_server_port(s3) : 0;
         pthread_t th3;
@@ -664,6 +666,15 @@ int main(void) {
         CHECK(r.status == 401, "dropped user: %d %s", r.status, r.body);
         resp_free(&r);
         if (s3) { sv_server_stop(s3); pthread_join(th3, NULL); sv_server_free(s3); }
+        // registro di audit: le modifiche (anche rifiutate) con utente e client, non le letture
+        FILE* af = fopen("/tmp/sv_audit_test.log", "r");
+        char audit[8192] = "";
+        size_t an = af ? fread(audit, 1, sizeof(audit) - 1, af) : 0;
+        audit[an] = '\0';
+        if (af) fclose(af);
+        CHECK(strstr(audit, "127.0.0.1  anna  t  ERROR Access denied") && strstr(audit, "DELETE FROM p"), "audit: denied delete logged: %s", audit);
+        CHECK(!strstr(audit, "SELECT"), "audit: reads not logged: %s", audit);
+        remove("/tmp/sv_audit_test.log");
     }
 
     sv_server_stop(s);

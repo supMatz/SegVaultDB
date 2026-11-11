@@ -593,7 +593,7 @@ make server                                   # ./segvault-server (make windows:
 | `-p, --port N` | porta TCP (default 8484) |
 | `-b, --bind ADDR` | indirizzo (default `127.0.0.1`: solo questa macchina); in rete serve un token |
 | `-t, --token T` | richiede `Authorization: Bearer T` (anche `SEGVAULT_TOKEN`; `auto` ne genera uno) |
-| `--users` | richiede utente e password (HTTP Basic); ogni query ha i permessi dell'utente (`CREATE USER`, `GRANT`: vedi [docs/API.md](docs/API.md#utenti-e-permessi)) |
+| `--users` | richiede utente e password (HTTP Basic); ogni query ha i permessi dell'utente (`CREATE USER`, `GRANT`: vedi [docs/API.md](docs/API.md#utenti-e-permessi)). Senza utenti e senza `--token`, all'avvio viene stampato un token per creare il primo |
 | `-d, --database DB` | database usato se la richiesta non ne indica uno |
 | `--cors ORIGIN` | permette le chiamate dal browser da `ORIGIN` (`*` = tutte) |
 | `--static DIR` | serve i file di `DIR` fuori da `/api` |
@@ -601,6 +601,20 @@ make server                                   # ./segvault-server (make windows:
 | `--max-body MB` | corpo massimo di una richiesta (default 16) |
 | `--backup-dir DIR` | backup automatici in `DIR/segvault-AAAAMMGG-HHMMSS` |
 | `--backup-every M` / `--backup-keep N` | minuti fra due backup (default 60) / quanti tenerne (default 7) |
+| `--audit FILE` | registro delle modifiche (chi, quando, da dove, cosa) |
+
+Ogni istruzione che modifica dati o schema può essere registrata con `--audit FILE` (una riga con
+ora, client, utente, database, esito e testo; anche i tentativi rifiutati per mancanza di permessi).
+
+**Come servizio.** Su Linux: [docs/service/segvault.service](docs/service/segvault.service) per
+systemd (avvio automatico, riavvio dopo un errore, backup e audit già configurati). Su Windows:
+`schtasks /create /tn SegVault /sc onstart /ru SYSTEM /tr "C:\SegVault\segvault-server.exe --users C:\SegVault\data"`
+avvia il server all'accensione.
+
+**HTTPS.** Il server parla HTTP; per esporlo su Internet si mette davanti un reverse proxy che
+gestisce i certificati, ad esempio [Caddy](https://caddyserver.com) (`caddy reverse-proxy --from
+db.example.com --to 127.0.0.1:8484` ottiene il certificato da solo) o nginx. Il server resta su
+`127.0.0.1`, raggiungibile solo dal proxy.
 
 Endpoint: `GET /api/v1/health`, `GET /api/v1/status`, `POST /api/v1/query`,
 `GET /api/v1/databases`, `GET /api/v1/databases/{db}/tables`, `GET /api/v1/databases/{db}/tables/{t}`,
@@ -1038,7 +1052,7 @@ make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitize
 | `test_sql` (1147) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, procedure, viste, transazioni, crash e recovery, testi lunghi, JSON, full-text, 100 transazioni di fila |
 | `test_examples` (166) | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
 | `test_grid_edit` (22) | Modifica dei dati nella griglia: analisi dei risultati, `UPDATE` / `INSERT` / `DELETE` generati ed eseguiti, chiavi composte, join, apici e backslash, letterali di export e dump |
-| `test_server` (100) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici, utenti e permessi |
+| `test_server` (102) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici, utenti e permessi |
 | `test_backup` (29) | `BACKUP TO`, apertura della copia, ripristino sui dati in uso (con i dati precedenti conservati), righe grandi, viste, procedure e utenti |
 
 La CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) compila su Ubuntu con `-D_FORTIFY_SOURCE=2` e fallisce a qualunque warning, esegue `make test` e `make test-asan`, e compila per Windows con MinGW-w64. Durante lo sviluppo il motore è stato anche verificato con un fuzzer di SQL mutato e uno di richieste HTTP malformate (sotto ASan), con un confronto dei risultati contro SQLite su centinaia di migliaia di query e modifiche casuali, e con arresti forzati (`kill -9`) durante scritture concorrenti senza perdere nessuna scrittura confermata.
@@ -1264,7 +1278,8 @@ Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
    full-text (ora la ricerca legge ogni riga).
 5. **Sicurezza e gestione** — fatto: `BACKUP TO`, backup pianificati del server, ripristino dalla
    GUI; `SHOW DATABASES` e l'elenco `/api/v1/databases` mostrano a ogni utente solo ciò su cui ha
-   permessi. Da fare: HTTPS integrato, avvio come servizio di sistema, registro di audit.
+   permessi; registro di audit (`--audit`); servizio systemd e avvio automatico su Windows; HTTPS tramite
+   reverse proxy (documentato). Da fare: HTTPS integrato senza proxy.
 6. **GUI** — costruttore visuale di query, navigazione delle chiavi esterne dalla griglia, grafici dai
    risultati, export XLSX/PDF, editor di trigger e viste, manutenzione delle tabelle, query salvate.
 7. **Portata** — interfaccia web, versione macOS, interfaccia in italiano e altre lingue, accessibilità.

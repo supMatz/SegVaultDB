@@ -135,6 +135,8 @@ static void usage(const char* argv0) {
            "      --max-body MB     largest request body (default 16)\n"
            "      --timeout S       stop a request that runs longer than S seconds (default 30, 0 = never)\n"
            "      --no-auth         allow listening on a non-local address without a token\n"
+           "      --audit FILE      append every statement that changes data or schema to FILE\n"
+           "                        (time, client, user, database, result, SQL)\n"
            "      --backup-dir DIR  write a backup of all data to DIR/segvault-DATE-TIME (see --backup-every)\n"
            "      --backup-every M  minutes between backups (default 60 when --backup-dir is given)\n"
            "      --backup-keep N   keep only the last N backups (default 7)\n"
@@ -168,6 +170,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--no-auth")) no_auth = true;
         else if (!strcmp(a, "--users")) cfg.require_login = true;
         else if (ARG("--backup-dir", "--backup-dir")) g_bk_dir = argv[++i];
+        else if (ARG("--audit", "--audit")) cfg.audit_file = argv[++i];
         else if (ARG("--backup-every", "--backup-every")) g_bk_every = atoi(argv[++i]);
         else if (ARG("--backup-keep", "--backup-keep")) g_bk_keep = atoi(argv[++i]);
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) cfg.quiet = true;
@@ -194,14 +197,34 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    {                                       // anche le cartelle intermedie (come mkdir -p)
+        char part[1024];
+        snprintf(part, sizeof(part), "%s", data_dir);
+        for (char* q = part + 1; ; q++) {
+            if (*q == '/' || *q == '\\' || !*q) {
+                char c = *q;
+                *q = '\0';
 #ifdef _WIN32
-    _mkdir(data_dir);
+                _mkdir(part);
 #else
-    mkdir(data_dir, 0755);
+                mkdir(part, 0755);
 #endif
+                *q = c;
+                if (!c) break;
+            }
+        }
+    }
     if (!db_init(data_dir)) {
         fprintf(stderr, "cannot open the data directory '%s': %s\n", data_dir, db_init_error());
         return 1;
+    }
+
+    // --users senza utenti né token: nessuno potrebbe entrare per creare il primo utente
+    if (cfg.require_login && !(cfg.token && cfg.token[0]) && !db_has_users()) {
+        if (!sv_random_token(auto_token, 24)) { fprintf(stderr, "cannot generate a random token\n"); db_shutdown(); return 1; }
+        cfg.token = auto_token;
+        printf("no users yet: create the first one with this token (Authorization: Bearer %s),\n"
+               "  e.g. CREATE USER admin IDENTIFIED BY '...'; GRANT ALL ON *.* TO admin WITH GRANT OPTION\n", auto_token);
     }
 
     char err[256];
