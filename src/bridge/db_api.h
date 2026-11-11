@@ -252,6 +252,19 @@ ColumnInfo* db_list_columns(const char* db_name, const char* table, int* out_cou
 
 void db_columns_free(ColumnInfo* cols, int count);
 
+// ── statistiche del motore (pagina Monitor del server; come SHOW STATUS, senza sessione) ──
+typedef struct {
+    int       page_size;
+    long long db_pages;            // pagine del file dei dati
+    int       pool_frames, pool_used;
+    unsigned long long pool_requests, pool_hits, pool_misses, pool_evictions, pages_written;
+    long long wal_bytes;
+    unsigned long long wal_records, checkpoints;
+    int       databases, tables;
+    bool      in_transaction;
+} DbEngineStats;
+bool db_engine_stats(DbEngineStats* out);
+
 // ── utenti e permessi (auth.c) ──
 // SQL: CREATE USER u IDENTIFIED BY 'pw' | ALTER USER ... | DROP USER u |
 //      GRANT ALL | SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER ON *.* | db.* | db.t | t TO u [WITH GRANT OPTION] |

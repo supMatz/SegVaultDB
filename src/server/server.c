@@ -83,6 +83,7 @@ struct SvServer {
     double         exec_since;          // inizio della richiesta che usa il motore (0 = libero)
     bool           timed_out;           // il watchdog ha interrotto la richiesta in corso
     SvLogEntry     log[SV_LOG_MAX];     // anello: log[(seq - 1) % SV_LOG_MAX]
+    SvBucket       series[SV_SERIES_MAX]; // anello per secondo: series[sec % SV_SERIES_MAX]
 };
 
 typedef struct {
@@ -1217,8 +1218,17 @@ static void log_request(SvServer* s, const char* client, const Request* rq, cons
     one_line(e->path, sizeof(e->path), rq->path);
     snprintf(e->client, sizeof(e->client), "%s", client);
     one_line(e->detail, sizeof(e->detail), rs->detail);
+    snprintf(e->user, sizeof(e->user), "%s", rq->user);
     e->status = rs->status;
     e->ms = ms;
+    long long sec = (long long)((now_ms() - s->started_ms) / 1000.0);
+    SvBucket* b = &s->series[sec % SV_SERIES_MAX];
+    if (b->sec != sec) { memset(b, 0, sizeof(*b)); b->sec = sec; }
+    b->requests++;
+    if (rs->status >= 400) b->errors++;
+    b->total_ms += ms;
+    if (ms > b->max_ms) b->max_ms = ms;
+    b->rows += rs->rows;
     mx_unlock(&s->conn_mx);
 }
 
@@ -1471,6 +1481,21 @@ void sv_server_stats(SvServer* s, SvStats* out) {
     out->busy        = s->exec_since > 0;
     out->uptime_s    = (now_ms() - s->started_ms) / 1000.0;
     mx_unlock(&s->conn_mx);
+}
+
+int sv_server_series(SvServer* s, SvBucket* out, int n) {
+    if (n > SV_SERIES_MAX) n = SV_SERIES_MAX;
+    mx_lock(&s->conn_mx);
+    long long now = (long long)((now_ms() - s->started_ms) / 1000.0);
+    for (int i = 0; i < n; i++) {
+        long long sec = now - (n - 1) + i;
+        out[i] = (SvBucket){ .sec = sec };
+        if (sec < 0) continue;
+        const SvBucket* b = &s->series[sec % SV_SERIES_MAX];
+        if (b->sec == sec) out[i] = *b;
+    }
+    mx_unlock(&s->conn_mx);
+    return n;
 }
 
 int sv_server_recent(SvServer* s, SvLogEntry* out, int max) {

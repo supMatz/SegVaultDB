@@ -49,9 +49,19 @@ typedef struct {
     char      path[96];
     char      client[48];     // indirizzo del client
     char      detail[120];    // primo statement SQL o messaggio d'errore
+    char      user[64];       // utente del login ("" = token o nessun login)
     int       status;
     double    ms;
 } SvLogEntry;
+
+// attività di un secondo (pagina Monitor): gli ultimi SV_SERIES_MAX secondi
+#define SV_SERIES_MAX 300
+typedef struct {
+    long long sec;            // secondi dall'avvio del server
+    int       requests, errors;
+    double    total_ms, max_ms;
+    long long rows;
+} SvBucket;
 
 // apre il socket in ascolto (il motore deve essere già inizializzato con db_init)
 SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz);
@@ -63,6 +73,8 @@ void      sv_server_free(SvServer* s);    // chiude le connessioni rimaste e lib
 // lettura thread-safe (copie): statistiche e ultime richieste, dalla più recente
 void      sv_server_stats(SvServer* s, SvStats* out);
 int       sv_server_recent(SvServer* s, SvLogEntry* out, int max);
+// gli ultimi n secondi fino ad adesso, dal più vecchio (i secondi senza richieste valgono zero)
+int       sv_server_series(SvServer* s, SvBucket* out, int n);
 
 // token casuale (hex, 2*bytes caratteri + NUL) dalla sorgente casuale del sistema
 bool      sv_random_token(char* out, int bytes);

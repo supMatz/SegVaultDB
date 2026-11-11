@@ -153,10 +153,12 @@ ViewAction start_screen_event(StartScreen* s, const sEvent* evt) {
 enum {
     HIT_COPY_URL, HIT_COPY_LAN, HIT_PORT_MINUS, HIT_PORT_PLUS, HIT_ACCESS_LOCAL, HIT_ACCESS_LAN,
     HIT_TOKEN_OFF, HIT_TOKEN_ON, HIT_COPY_TOKEN, HIT_NEW_TOKEN, HIT_CORS_OFF, HIT_CORS_ON, HIT_TIME_MINUS,
-    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_COUNT
+    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_TAB_REQ, HIT_TAB_MON, HIT_COUNT
 };
 
 enum { ACT_NONE, ACT_TOGGLE, ACT_EDITOR, ACT_COPY };
+
+#define MON_SECS 120             // secondi mostrati nei grafici
 
 struct ServerPanel {
     PlatformWindow* win;
@@ -189,6 +191,13 @@ struct ServerPanel {
     char            site_url[96];
     int             flash_hit;
     uint64_t        flash_until;
+    // pagina Monitor
+    int             tab;             // 0 = registro delle richieste, 1 = Monitor
+    SvBucket        series[MON_SECS];
+    DbEngineStats   es;
+    bool            have_es;
+    uint64_t        last_mon;
+    Rect            chart_req, chart_lat;   // aree dei grafici (per il tooltip)
 };
 
 static void on_toggle(void* ud) { ((ServerPanel*)ud)->pending = ACT_TOGGLE; }
@@ -375,6 +384,12 @@ bool server_panel_tick(ServerPanel* p, uint64_t now_ms) {
     if (p->port_edit && line_edit_tick(p->port_edit, now_ms)) redraw = true;
     if (p->web_edit && line_edit_tick(p->web_edit, now_ms)) redraw = true;
     if (p->flash_hit >= 0 && now_ms >= p->flash_until) { p->flash_hit = -1; redraw = true; }
+    if (p->tab == 1 && now_ms - p->last_mon >= 1000) {      // Monitor: dati una volta al secondo
+        p->last_mon = now_ms;
+        if (p->srv) sv_server_series(p->srv, p->series, MON_SECS);
+        p->have_es = db_engine_stats(&p->es);
+        redraw = true;
+    }
     if (!p->srv || now_ms - p->last_poll < 250) return redraw;
     p->last_poll = now_ms;
     SvStats st;
@@ -641,6 +656,267 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
     platform_reset_clip(win);
 }
 
+// schede Requests / Monitor nell'intestazione; ritorna la x dopo le schede
+static int draw_tabs(ServerPanel* p, int x0, Rect st) {
+    PlatformWindow* win = p->win;
+    static const char* const T[2] = { "REQUESTS", "MONITOR" };
+    int x = x0 + 10;
+    for (int i = 0; i < 2; i++) {
+        int w = platform_measure_text_ex(win, T[i], -1, TH_FONT_SMALL, FONT_UI_BOLD) + 20;
+        Rect r = { x, st.y + 7, w, st.h - 14 };
+        p->hit[i == 0 ? HIT_TAB_REQ : HIT_TAB_MON] = r;
+        bool on = p->tab == i, hov = in_rect(r, p->mx, p->my);
+        if (on || hov) platform_fill_rect_rounded(win, r, on ? TH_ACCENT_SOFT : TH_HOVER, 6);
+        platform_draw_text_ex(win, T[i], -1, (Point){r.x + 10, ui_text_y(win, r, TH_FONT_SMALL, FONT_UI_BOLD)},
+                              on ? TH_ACCENT_TEXT : TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI_BOLD);
+        x += w + 4;
+    }
+    return x + 10;
+}
+
+// ── pagina Monitor ──────────────────────────────────────────────
+
+static void fmt_count(double v, char* out, size_t n) {
+    if (v >= 1e6) snprintf(out, n, "%.1fM", v / 1e6);
+    else if (v >= 1e4) snprintf(out, n, "%.1fk", v / 1e3);
+    else if (v == (double)(long long)v) snprintf(out, n, "%lld", (long long)v);
+    else snprintf(out, n, "%.1f", v);
+}
+
+static void fmt_bytes(double b, char* out, size_t n) {
+    if (b < 1024) snprintf(out, n, "%.0f B", b);
+    else if (b < 1024.0 * 1024) snprintf(out, n, "%.1f KB", b / 1024);
+    else if (b < 1024.0 * 1024 * 1024) snprintf(out, n, "%.1f MB", b / (1024.0 * 1024));
+    else snprintf(out, n, "%.2f GB", b / (1024.0 * 1024 * 1024));
+}
+
+// riquadro con un numero: etichetta, valore grande, dettaglio
+static void stat_tile(PlatformWindow* win, Rect r, const char* label, const char* value, const char* detail, Color vc) {
+    ui_round_box(win, r, TH_SURFACE, TH_BORDER, 8);
+    platform_draw_text_ex(win, label, -1, (Point){r.x + 14, r.y + 12}, TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI_BOLD);
+    platform_draw_text_ex(win, value, -1, (Point){r.x + 14, r.y + 32}, vc, 22, FONT_UI_BOLD);
+    if (detail) ui_text_clipped(win, detail, r.x + 14, r.y + r.h - 22, r.w - 28, TH_TEXT_FAINT, TH_FONT_SMALL, FONT_UI);
+}
+
+// scala "bella" per l'asse: 1, 2, 5 x 10^k sopra il massimo
+static double nice_max(double v) {
+    if (v <= 0) return 1;
+    double p = 1;
+    while (p * 10 <= v) p *= 10;
+    while (p > v) p /= 10;
+    double m = v / p;
+    return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p;
+}
+
+// griglia orizzontale discreta con 3 valori sull'asse
+static void chart_grid(PlatformWindow* win, Rect plot, double max, const char* unit) {
+    for (int k = 0; k <= 2; k++) {
+        int y = plot.y + plot.h - plot.h * k / 2;
+        platform_fill_rect(win, (Rect){plot.x, y, plot.w, 1}, k ? ui_alpha(TH_BORDER, 140) : TH_BORDER_STRONG);
+        char t[32];
+        double v = max * k / 2;
+        if (v == (double)(long long)v) snprintf(t, sizeof(t), "%lld%s", (long long)v, k == 2 ? unit : "");
+        else snprintf(t, sizeof(t), "%.1f%s", v, k == 2 ? unit : "");
+        int tw = platform_measure_text_ex(win, t, -1, TH_FONT_SMALL, FONT_MONO);
+        platform_draw_text_ex(win, t, -1, (Point){plot.x - tw - 8, y - 7}, TH_TEXT_FAINT, TH_FONT_SMALL, FONT_MONO);
+    }
+    platform_draw_text_ex(win, "2 min ago", -1, (Point){plot.x, plot.y + plot.h + 6}, TH_TEXT_FAINT, TH_FONT_SMALL, FONT_UI);
+    int nw = platform_measure_text_ex(win, "now", -1, TH_FONT_SMALL, FONT_UI);
+    platform_draw_text_ex(win, "now", -1, (Point){plot.x + plot.w - nw, plot.y + plot.h + 6}, TH_TEXT_FAINT, TH_FONT_SMALL, FONT_UI);
+}
+
+static void legend_item(PlatformWindow* win, int* x, int y, Color c, const char* t, bool dot) {
+    if (dot) ui_circle(win, *x + 5, y + 7, 4, c);
+    else platform_fill_rect_rounded(win, (Rect){*x, y + 2, 10, 10}, c, 3);
+    *x += 16;
+    *x += platform_draw_text_ex(win, t, -1, (Point){*x, y}, TH_TEXT_MUTED, TH_FONT_SMALL, FONT_UI) + 14;
+}
+
+// indice del secondo sotto il mouse nel grafico (-1 = fuori)
+static int chart_hover(ServerPanel* p, Rect plot) {
+    if (!in_rect((Rect){plot.x, plot.y - 4, plot.w, plot.h + 8}, p->mx, p->my)) return -1;
+    int i = (p->mx - plot.x) * MON_SECS / SV_MAX(1, plot.w);
+    return SV_CLAMP(i, 0, MON_SECS - 1);
+}
+
+static void tooltip(PlatformWindow* win, int x, int y, const char* l1, const char* l2, Rect bounds) {
+    int w = SV_MAX(platform_measure_text_ex(win, l1, -1, TH_FONT_SMALL + 1, FONT_UI_BOLD), platform_measure_text_ex(win, l2, -1, TH_FONT_SMALL + 1, FONT_UI)) + 20;
+    Rect r = { x + 12, y - 48, w, 44 };
+    if (r.x + r.w > bounds.x + bounds.w) r.x = x - 12 - w;
+    if (r.y < bounds.y) r.y = y + 12;
+    platform_fill_rect_rounded(win, (Rect){r.x - 1, r.y + 2, r.w + 2, r.h + 2}, ui_alpha(TH_BG, 150), 7);
+    ui_round_box(win, r, TH_ELEVATED, TH_BORDER_STRONG, 6);
+    platform_draw_text_ex(win, l1, -1, (Point){r.x + 10, r.y + 6}, TH_TEXT, TH_FONT_SMALL + 1, FONT_UI_BOLD);
+    platform_draw_text_ex(win, l2, -1, (Point){r.x + 10, r.y + 24}, TH_TEXT_MUTED, TH_FONT_SMALL + 1, FONT_UI);
+}
+
+static void draw_monitor(ServerPanel* p, int x0, int cw, int top, int bottom) {
+    PlatformWindow* win = p->win;
+    bool running = p->srv != NULL;
+    if (!running) {
+        int ccx = x0 + cw / 2, ccy = top + (bottom - top) / 2 - 30;
+        const char* t = "Server stopped";
+        int tw = platform_measure_text_ex(win, t, -1, TH_FONT_UI + 2, FONT_UI_BOLD);
+        platform_draw_text_ex(win, t, -1, (Point){ccx - tw / 2, ccy}, TH_TEXT_MUTED, TH_FONT_UI + 2, FONT_UI_BOLD);
+        const char* d = "Start it (F5) to watch requests, response times and the engine live";
+        int dw = platform_measure_text_ex(win, d, -1, TH_FONT_UI, FONT_UI);
+        platform_draw_text_ex(win, d, -1, (Point){ccx - dw / 2, ccy + 28}, TH_TEXT_DIM, TH_FONT_UI, FONT_UI);
+        return;
+    }
+    // aggregati: ultimi 10 s (ritmo) e 60 s (tempi, errori)
+    double r10 = 0, r60 = 0, e60 = 0, ms60 = 0, rows60 = 0, peak = 0;
+    for (int i = 0; i < MON_SECS; i++) {
+        const SvBucket* b = &p->series[i];
+        if (i >= MON_SECS - 10) r10 += b->requests;
+        if (i >= MON_SECS - 60) { r60 += b->requests; e60 += b->errors; ms60 += b->total_ms; rows60 += (double)b->rows; }
+        if (b->requests > peak) peak = b->requests;
+    }
+    // p95 dei tempi dalle ultime richieste del registro
+    double lat[SV_LOG_MAX];
+    int nl = 0;
+    for (int i = 0; i < p->nlog && nl < SV_LOG_MAX; i++) lat[nl++] = p->log[i].ms;
+    for (int a = 1; a < nl; a++) for (int b = a; b > 0 && lat[b] < lat[b - 1]; b--) { double t = lat[b]; lat[b] = lat[b - 1]; lat[b - 1] = t; }
+    double p95 = nl ? lat[(int)((nl - 1) * 0.95)] : 0;
+
+    int pad = 16, x = x0 + pad, w = cw - pad * 2, y = top + pad;
+    // ── riquadri ──
+    char v[6][32], d[6][64];
+    snprintf(v[0], 32, "%.1f", r10 / 10.0);                       snprintf(d[0], 64, "peak %.0f/s in 2 min", peak);
+    snprintf(v[1], 32, "%.1f ms", r60 ? ms60 / r60 : 0.0);         snprintf(d[1], 64, "p95 %.1f ms (last %d)", p95, nl);
+    snprintf(v[2], 32, "%.1f%%", r60 ? 100.0 * e60 / r60 : 0.0);  snprintf(d[2], 64, "%.0f in the last minute", e60);
+    fmt_count(rows60, v[3], 32);                                   snprintf(d[3], 64, "rows sent in the last minute");
+    snprintf(v[4], 32, "%d", p->stats.connections);                snprintf(d[4], 64, "%s", p->stats.busy ? "engine busy now" : "engine idle");
+    double hit = p->have_es && p->es.pool_requests ? 100.0 * (double)p->es.pool_hits / (double)p->es.pool_requests : 100.0;
+    snprintf(v[5], 32, "%.1f%%", hit);                             snprintf(d[5], 64, "page cache hits");
+    static const char* const L[6] = { "REQUESTS / S", "AVG RESPONSE", "ERRORS", "ROWS / MIN", "CONNECTIONS", "CACHE" };
+    int cols = cw >= 980 ? 6 : 3, tw = (w - (cols - 1) * 10) / cols, th = 92;
+    for (int i = 0; i < 6; i++) {
+        Rect r = { x + (i % cols) * (tw + 10), y + (i / cols) * (th + 10), tw, th };
+        Color vc = i == 2 && e60 > 0 ? TH_ERROR_TEXT : TH_TEXT;
+        stat_tile(win, r, L[i], v[i], d[i], vc);
+    }
+    y += (6 / cols) * (th + 10) + 8;
+
+    // ── grafici: un asse ciascuno ──
+    int remain = bottom - y - pad;
+    int ch = SV_MAX(110, SV_MIN(200, (remain - 230) / 2));
+    // 1. richieste al secondo (errori in rosso nella stessa barra)
+    platform_draw_text_ex(win, "Requests per second", -1, (Point){x, y}, TH_TEXT, TH_FONT_UI, FONT_UI_BOLD);
+    int lx = x + w - 160;
+    legend_item(win, &lx, y + 2, TH_ACCENT, "ok", false);
+    legend_item(win, &lx, y + 2, TH_ERROR, "errors", false);
+    y += 26;
+    Rect plot = { x + 44, y, w - 44, ch };
+    p->chart_req = plot;
+    double maxr = nice_max(peak);
+    chart_grid(win, plot, maxr, "");
+    float bw = (float)plot.w / MON_SECS;
+    for (int i = 0; i < MON_SECS; i++) {
+        const SvBucket* b = &p->series[i];
+        if (!b->requests) continue;
+        int bx = plot.x + (int)(i * bw), bwi = SV_MAX(1, (int)bw - 1);
+        int hok = (int)((double)(b->requests - b->errors) / maxr * plot.h), her = (int)((double)b->errors / maxr * plot.h);
+        if (b->requests && hok + her < 2) hok = 2;
+        int base = plot.y + plot.h;
+        if (hok) platform_fill_rect(win, (Rect){bx, base - hok, bwi, hok}, TH_ACCENT);
+        if (her) platform_fill_rect(win, (Rect){bx, base - hok - her - (hok ? 1 : 0), bwi, her}, TH_ERROR);
+    }
+    y += ch + 30;
+    // 2. tempo di risposta: media (linea) e massimo (punti) per secondo
+    platform_draw_text_ex(win, "Response time", -1, (Point){x, y}, TH_TEXT, TH_FONT_UI, FONT_UI_BOLD);
+    lx = x + w - 170;
+    legend_item(win, &lx, y + 2, TH_ACCENT, "average", false);
+    legend_item(win, &lx, y + 2, TH_TEXT_DIM, "slowest", true);
+    y += 26;
+    Rect pl2 = { x + 44, y, w - 44, ch };
+    p->chart_lat = pl2;
+    double maxl = 0;
+    for (int i = 0; i < MON_SECS; i++) if (p->series[i].max_ms > maxl) maxl = p->series[i].max_ms;
+    maxl = nice_max(maxl);
+    chart_grid(win, pl2, maxl, " ms");
+    float px = -1, py = 0;
+    for (int i = 0; i < MON_SECS; i++) {
+        const SvBucket* b = &p->series[i];
+        float cx = (float)pl2.x + ((float)i + 0.5f) * bw;
+        if (!b->requests) { px = -1; continue; }
+        float cy = (float)(pl2.y + pl2.h) - (float)(b->total_ms / b->requests / maxl * pl2.h);
+        if (px >= 0) ui_line(win, px, py, cx, cy, 2, TH_ACCENT);
+        else ui_circle(win, (int)cx, (int)cy, 2, TH_ACCENT);
+        int my = pl2.y + pl2.h - (int)(b->max_ms / maxl * pl2.h);
+        if (b->max_ms > b->total_ms / b->requests * 1.05) ui_circle(win, (int)cx, my, 3, TH_TEXT_DIM);
+        px = cx; py = cy;
+    }
+    y += ch + 30;
+
+    // ── in basso: richieste più lente e motore ──
+    int colw = (w - 16) / 2, by = y, bh = bottom - by - pad;
+    if (bh > 60) {
+        // richieste più lente (dal registro)
+        Rect a = { x, by, colw, bh };
+        ui_round_box(win, a, TH_SURFACE, TH_BORDER, 8);
+        platform_draw_text_ex(win, "SLOWEST RECENT REQUESTS", -1, (Point){a.x + 14, a.y + 12}, TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI_BOLD);
+        int idx[SV_LOG_MAX], n = 0;
+        for (int i = 0; i < p->nlog; i++) idx[n++] = i;
+        for (int i = 1; i < n; i++) for (int k = i; k > 0 && p->log[idx[k]].ms > p->log[idx[k - 1]].ms; k--) { int t = idx[k]; idx[k] = idx[k - 1]; idx[k - 1] = t; }
+        int rowy = a.y + 34;
+        for (int i = 0; i < n && rowy + 20 <= a.y + a.h - 6; i++, rowy += 22) {
+            const SvLogEntry* e = &p->log[idx[i]];
+            char ms[24], who[80];
+            snprintf(ms, sizeof(ms), "%.1f ms", e->ms);
+            snprintf(who, sizeof(who), "%s", e->user[0] ? e->user : e->client);
+            platform_draw_text_ex(win, ms, -1, (Point){a.x + 14, rowy}, e->status >= 400 ? TH_ERROR_TEXT : TH_TEXT, TH_FONT_SMALL + 1, FONT_MONO);
+            ui_text_clipped(win, who, a.x + 92, rowy, 90, TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_UI);
+            ui_text_clipped(win, e->detail[0] ? e->detail : e->path, a.x + 190, rowy, a.w - 204, TH_CELL_TEXT, TH_FONT_SMALL + 1, FONT_MONO);
+        }
+        if (!n) platform_draw_text_ex(win, "No requests yet", -1, (Point){a.x + 14, a.y + 36}, TH_TEXT_FAINT, TH_FONT_UI, FONT_UI);
+        // motore
+        Rect e = { x + colw + 16, by, w - colw - 16, bh };
+        ui_round_box(win, e, TH_SURFACE, TH_BORDER, 8);
+        platform_draw_text_ex(win, "ENGINE", -1, (Point){e.x + 14, e.y + 12}, TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI_BOLD);
+        if (p->have_es) {
+            char rows[8][2][64];
+            int nr = 0;
+            char t1[32], t2[32];
+            fmt_bytes((double)p->es.db_pages * p->es.page_size, t1, sizeof(t1));
+            snprintf(rows[nr][0], 64, "Data file"); snprintf(rows[nr++][1], 64, "%s (%lld pages)", t1, p->es.db_pages);
+            snprintf(rows[nr][0], 64, "Page cache"); snprintf(rows[nr++][1], 64, "%d of %d pages used", p->es.pool_used, p->es.pool_frames);
+            snprintf(rows[nr][0], 64, "Disk reads"); snprintf(rows[nr++][1], 64, "%llu pages (%llu evicted)", p->es.pool_misses, p->es.pool_evictions);
+            fmt_bytes((double)p->es.wal_bytes, t2, sizeof(t2));
+            snprintf(rows[nr][0], 64, "Write-ahead log"); snprintf(rows[nr++][1], 64, "%s, %llu checkpoints", t2, p->es.checkpoints);
+            snprintf(rows[nr][0], 64, "Databases"); snprintf(rows[nr++][1], 64, "%d (%d tables)", p->es.databases, p->es.tables);
+            snprintf(rows[nr][0], 64, "Transaction"); snprintf(rows[nr++][1], 64, "%s", p->es.in_transaction ? "open" : "none");
+            int ry = e.y + 34;
+            for (int i = 0; i < nr && ry + 20 <= e.y + e.h - 6; i++, ry += 22) {
+                platform_draw_text_ex(win, rows[i][0], -1, (Point){e.x + 14, ry}, TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_UI);
+                ui_text_clipped(win, rows[i][1], e.x + 140, ry, e.w - 154, TH_TEXT, TH_FONT_SMALL + 1, FONT_UI);
+            }
+            // barra della cache
+            if (ry + 14 <= e.y + e.h - 6) {
+                Rect bar = { e.x + 14, ry + 4, e.w - 28, 6 };
+                platform_fill_rect_rounded(win, bar, TH_ELEVATED, 3);
+                int fw = (int)(bar.w * hit / 100.0);
+                if (fw > 0) platform_fill_rect_rounded(win, (Rect){bar.x, bar.y, fw, bar.h}, TH_SUCCESS, 3);
+            }
+        }
+    }
+
+    // tooltip sul secondo sotto il mouse
+    int hi = chart_hover(p, p->chart_req), hl = chart_hover(p, p->chart_lat);
+    if (hi >= 0 || hl >= 0) {
+        int i = hi >= 0 ? hi : hl;
+        Rect pr = hi >= 0 ? p->chart_req : p->chart_lat;
+        const SvBucket* b = &p->series[i];
+        int cx = pr.x + (int)((i + 0.5f) * bw);
+        platform_fill_rect(win, (Rect){cx, pr.y, 1, pr.h}, ui_alpha(TH_TEXT_DIM, 120));
+        char l1[64], l2[96];
+        snprintf(l1, sizeof(l1), "%d s ago", MON_SECS - 1 - i);
+        if (b->requests) snprintf(l2, sizeof(l2), "%d req Â· %d err Â· avg %.1f ms Â· max %.1f ms",
+                                  b->requests, b->errors, b->total_ms / b->requests, b->max_ms);
+        else snprintf(l2, sizeof(l2), "no requests");
+        tooltip(win, p->mx, p->my, l1, l2, (Rect){x0, top, cw, bottom - top});
+    }
+}
+
 static void draw_requests(ServerPanel* p, int SW, int W, int H) {
     PlatformWindow* win = p->win;
     bool running = p->srv != NULL;
@@ -651,8 +927,7 @@ static void draw_requests(ServerPanel* p, int SW, int W, int H) {
     Rect st = { x0, top, cw, SP_HEADER_H };
     platform_fill_rect(win, st, TH_SURFACE);
     platform_fill_rect(win, (Rect){x0, st.y + st.h - 1, cw, 1}, TH_BORDER);
-    platform_draw_text_ex(win, "REQUESTS", -1, (Point){x0 + 18, ui_text_y(win, st, TH_FONT_SMALL, FONT_UI_BOLD)}, TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI_BOLD);
-    int hx = x0 + 18 + platform_measure_text_ex(win, "REQUESTS", -1, TH_FONT_SMALL, FONT_UI_BOLD) + 14;
+    int hx = draw_tabs(p, x0, st);
     Color dot = running ? (p->stats.errors ? TH_WARNING : TH_SUCCESS) : TH_TEXT_FAINT;
     ui_circle(win, hx + 4, st.y + st.h / 2, 4, dot);
     char msg[200], up[32];
@@ -665,9 +940,11 @@ static void draw_requests(ServerPanel* p, int SW, int W, int H) {
     int clw = link_w(p, "Clear");
     int shown = 0;
     for (int i = 0; i < p->nlog; i++) if (p->log[i].seq > p->log_cleared) shown++;
-    link_btn(p, HIT_CLEAR_LOG, (Rect){x0 + cw - clw - 12, st.y + 7, clw, st.h - 14}, "Clear", shown > 0);
+    if (p->tab == 0) link_btn(p, HIT_CLEAR_LOG, (Rect){x0 + cw - clw - 12, st.y + 7, clw, st.h - 14}, "Clear", shown > 0);
     ui_text_clipped(win, msg, hx + 16, ui_text_y(win, st, TH_FONT_UI, FONT_UI), x0 + cw - clw - 28 - (hx + 16),
                     TH_TEXT, TH_FONT_UI, FONT_UI);
+
+    if (p->tab == 1) { draw_monitor(p, x0, cw, top + SP_HEADER_H, bottom); return; }
 
     // griglia del registro
     static const char* const COLS[7] = { "time", "client", "method", "path", "status", "ms", "sql / message" };
@@ -719,7 +996,10 @@ static void draw_requests(ServerPanel* p, int SW, int W, int H) {
         snprintf(ms, sizeof(ms), "%.1f", e->ms);
         snprintf(status, sizeof(status), "%d", e->status);
         Color sc = e->status >= 500 ? TH_ERROR_TEXT : e->status >= 400 ? TH_WARNING : TH_SUCCESS;
-        const char* vals[7] = { e->when, e->client, e->method, e->path, status, ms, e->detail };
+        char who[120];
+        if (e->user[0]) snprintf(who, sizeof(who), "%.60s@%.48s", e->user, e->client);
+        else snprintf(who, sizeof(who), "%.48s", e->client);
+        const char* vals[7] = { e->when, who, e->method, e->path, status, ms, e->detail };
         for (int k = 0; k < 7; k++) {
             int cwk = cx[k + 1] - cx[k] - 10;
             if (cwk <= 0) continue;
@@ -895,6 +1175,10 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
             break;
         case HIT_TOKEN_OFF: case HIT_TOKEN_ON:
             if (g_settings.server_token != (hit == HIT_TOKEN_ON)) { g_settings.server_token = hit == HIT_TOKEN_ON; config_changed(p); }
+            break;
+        case HIT_TAB_REQ: case HIT_TAB_MON:
+            p->tab = hit == HIT_TAB_MON;
+            p->last_mon = 0;
             break;
         case HIT_USERS_OFF: case HIT_USERS_ON:
             if (g_settings.server_users != (hit == HIT_USERS_ON)) { g_settings.server_users = hit == HIT_USERS_ON; config_changed(p); }

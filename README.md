@@ -337,6 +337,12 @@ delle richieste al posto dei risultati.
 - **Opzioni:** porta, *This computer* / *Local network*, *User login* (utente e password per ogni richiesta, con i permessi definiti in *Settings › Users & permissions*), token (obbligatorio in rete o con CORS; *Copy* e *New*, salvato in `<data>/server.token`), *Same origin* / *Any origin* per le web app, limite di tempo. Una modifica riavvia il server.
 - **Registro** in tempo reale delle ultime 200 richieste, con l'SQL così come è stato inviato (con i `?`: i valori dei parametri, come password o dati personali, non compaiono a schermo).
 - **Web folder:** una cartella con il sito (come la `htdocs` di XAMPP) viene servita su `/` insieme all'API su `/api/v1`, sulla stessa porta e quindi senza CORS; *Open site* lo apre nel browser. Il percorso è salvato in `<data>/server.ini`.
+- **Monitor** (scheda accanto a *Requests*): richieste al secondo, tempo medio e p95, percentuale di
+  errori, righe inviate, connessioni aperte e percentuale di pagine trovate in cache; due grafici degli
+  ultimi 2 minuti (richieste al secondo con gli errori in rosso, tempo di risposta medio e massimo, con
+  i valori al passaggio del mouse), le richieste recenti più lente con l'utente che le ha fatte e lo
+  stato del motore (file dei dati, cache delle pagine, letture dal disco, WAL, checkpoint). Il registro
+  delle richieste mostra `utente@indirizzo` quando c'è il login.
 - **Try it:** il comando `curl` pronto da copiare (a schermo il token è mostrato solo in parte).
 
 ### Temi

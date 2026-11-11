@@ -813,6 +813,32 @@ bool db_table_info(const char* db_name, const char* table, TableInfo* out, int* 
     return t != NULL;
 }
 
+bool db_engine_stats(DbEngineStats* out) {
+    memset(out, 0, sizeof(*out));
+    db_lock();
+    bool ok = g_db.initialized && g_db.bp;
+    if (ok) {
+        const BufferStats* st = &g_db.bp->stats;
+        out->page_size = SV_PAGE_SIZE;
+        out->db_pages = (long long)(sv_lseek(g_db.bp->db_fd, 0, SEEK_END) / SV_PAGE_SIZE);
+        out->pool_frames = g_db.bp->capacity;
+        out->pool_used = g_db.bp->num_used;
+        out->pool_requests = st->requests;
+        out->pool_hits = st->hits;
+        out->pool_misses = st->misses;
+        out->pool_evictions = st->evictions;
+        out->pages_written = st->dirty_writes;
+        out->wal_bytes = g_db.wal ? (long long)wal_size(g_db.wal) : 0;
+        out->wal_records = g_db.wal ? (unsigned long long)g_db.wal->sequence : 0;
+        out->checkpoints = g_db.wal ? (unsigned long long)g_db.wal->checkpoints : 0;
+        out->databases = g_db.catalog ? g_db.catalog->num_databases : 0;
+        for (int i = 0; g_db.catalog && i < g_db.catalog->num_databases; i++) out->tables += g_db.catalog->databases[i].num_tables;
+        out->in_transaction = g_db.exec_ctx.tx_id != 0;
+    }
+    db_unlock();
+    return ok;
+}
+
 bool db_set_user(const char* name) {
     db_lock();
     bool ok = !name || !name[0] || auth_user_exists(name);
