@@ -65,6 +65,9 @@ int main(void) {
     ok("INSERT INTO prodotto VALUES (1, 'pane', 1.5), (2, 'latte', 1.2)");
     ok("INSERT INTO ordine VALUES (1, 1, 3)");
     ok("INSERT INTO segreto VALUES (1, 'shh')");
+    ok("CREATE PROCEDURE leggi() SELECT nome FROM prodotto WHERE id = 1");
+    ok("CREATE PROCEDURE azzera() UPDATE prodotto SET prezzo = 0");
+    ok("CREATE PROCEDURE spia() BEGIN SELECT 1; SELECT x FROM segreto; END");
     ok("USE hr");
     ok("CREATE TABLE stipendio (id INT PRIMARY KEY, euro INT)");
     ok("USE shop");
@@ -122,6 +125,12 @@ int main(void) {
     CHECK(denied("SELECT * FROM prodotto WHERE EXISTS (SELECT 1 FROM ordine)"), "exists");
     CHECK(denied("EXPLAIN SELECT * FROM segreto"), "explain");
     CHECK(denied("UPDATE prodotto SET prezzo = 0"), "bob cannot update");
+    // procedure: ogni istruzione con i permessi di chi chiama; nomi db.tabella controllati su quel database
+    CHECK(rows("CALL leggi()") == 1, "bob calls a reading procedure: %s", g_err);
+    CHECK(denied("CALL azzera()") && rows("SELECT * FROM prodotto WHERE prezzo = 0") == 0, "procedure cannot update for bob");
+    CHECK(denied("CALL spia()"), "procedure cannot read a hidden table");
+    CHECK(denied("CREATE PROCEDURE p2() SELECT 1") && denied("DROP PROCEDURE leggi"), "no procedure DDL");
+    CHECK(rows("SELECT * FROM shop.prodotto") == 2 && denied("SELECT * FROM hr.stipendio") && denied("SELECT * FROM shop.segreto"), "qualified names");
 
     // ── capo: amministratore ──
     db_set_user("capo");

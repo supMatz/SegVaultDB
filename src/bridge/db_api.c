@@ -251,7 +251,8 @@ static const char* cur_db_name(void) {
 static QueryResult* exec_atomic(ASTNode* stmt) {
     Database* db = catalog_current_db(g_db.catalog);
     bool dml = stmt->type == NODE_INSERT || stmt->type == NODE_UPDATE || stmt->type == NODE_DELETE;
-    if (!dml || !db || db->num_triggers == 0) return executor_run(&g_db.exec_ctx, stmt);
+    // CALL: la procedura è atomica come uno statement (se un'istruzione fallisce si annulla tutto)
+    if (stmt->type != NODE_CALL && (!dml || !db || db->num_triggers == 0)) return executor_run(&g_db.exec_ctx, stmt);
     if (!g_db.exec_ctx.tx_id) {
         if (!db_begin()) return executor_run(&g_db.exec_ctx, stmt);
         QueryResult* r = executor_run(&g_db.exec_ctx, stmt);
@@ -267,7 +268,6 @@ static QueryResult* exec_atomic(ASTNode* stmt) {
     return r;
 }
 
-// esegue uno statement già analizzato (transazioni e CHECKPOINT gestiti qui)
 // database di uno statement con nomi qualificati (shop.prodotto): indice, o -1 con un messaggio
 static int qual_db_index(const ASTNode* stmt, int cur, char* err, size_t errn) {
     if (!stmt->qual_db[0]) return cur;
@@ -301,8 +301,15 @@ static QueryResult* exec_one(ASTNode* stmt) {
     return r;
 }
 
+// istruzioni dentro una procedura: con i permessi dell'utente che la chiama
+static bool proc_auth(const ASTNode* st, char* err, size_t errn) {
+    return auth_check(g_session_user, st, cur_db_name(), err, errn);
+}
+
+// esegue uno statement già analizzato (transazioni e CHECKPOINT gestiti qui)
 static QueryResult* exec_one_in(ASTNode* stmt) {
     QueryResult* result = NULL;
+    g_db.exec_ctx.auth_hook = g_session_user[0] ? proc_auth : NULL;
     if (g_session_user[0]) {         // permessi dell'utente della sessione
         char err[300];
         if (!auth_check(g_session_user, stmt, cur_db_name(), err, sizeof(err))) return result_error(err);
@@ -346,6 +353,7 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
             case NODE_CREATE_DB: case NODE_CREATE_TABLE: case NODE_CREATE_INDEX: case NODE_CREATE_VIEW:
             case NODE_DROP_DB: case NODE_DROP_TABLE: case NODE_DROP_VIEW: case NODE_DROP_INDEX:
             case NODE_ALTER_TABLE: case NODE_TRUNCATE: case NODE_CREATE_TRIGGER: case NODE_DROP_TRIGGER:
+            case NODE_CREATE_PROCEDURE: case NODE_DROP_PROCEDURE:
                 bp_flush_all(g_db.bp);
                 catalog_save(g_db.catalog, g_db.cat_path);
                 break;
@@ -1163,6 +1171,58 @@ char* db_get_create_statement(const char* db_name, const char* table) {
 char* db_get_create_statement_nofk(const char* db_name, const char* table) {
     db_lock();
     char* r = db_get_create_statement_nofk_impl(db_name, table);
+    db_unlock();
+    return r;
+}
+
+// viste, trigger e procedure del database come istruzioni SQL (per il dump)
+static void sb_cat(char** p, size_t* n, size_t* cap, const char* a) {
+    size_t l = strlen(a);
+    if (!*p) return;
+    if (*n + l + 1 > *cap) {
+        size_t nc = (*n + l + 1) * 2;
+        char* q = realloc(*p, nc);
+        if (!q) { free(*p); *p = NULL; return; }
+        *p = q; *cap = nc;
+    }
+    memcpy(*p + *n, a, l + 1);
+    *n += l;
+}
+
+static char* db_get_objects_sql_impl(const char* db_name, int what) {
+    Database* db = g_db.initialized ? catalog_get_db(g_db.catalog, db_name) : NULL;
+    if (!db) return NULL;
+    size_t n = 0, cap = 4096;
+    char* out = malloc(cap);
+    if (!out) return NULL;
+    out[0] = '\0';
+    char head[400];
+    for (int i = 0; what == 0 && i < db->num_views; i++) {
+        snprintf(head, sizeof(head), "CREATE VIEW %.64s AS ", db->views[i].name);
+        sb_cat(&out, &n, &cap, head);
+        sb_cat(&out, &n, &cap, db->views[i].definition);
+        sb_cat(&out, &n, &cap, ";\n");
+    }
+    for (int i = 0; what == 1 && i < db->num_triggers; i++) {
+        TriggerSchema* t = &db->triggers[i];
+        snprintf(head, sizeof(head), "CREATE TRIGGER %.64s %s %.15s ON %.64s ", t->name, t->before ? "BEFORE" : "AFTER", t->event, t->table_name);
+        sb_cat(&out, &n, &cap, head);
+        sb_cat(&out, &n, &cap, t->body);
+        sb_cat(&out, &n, &cap, ";\n");
+    }
+    for (int i = 0; what == 2 && i < db->num_routines; i++) {
+        if (db->routines[i].is_function) continue;
+        snprintf(head, sizeof(head), "CREATE PROCEDURE %.64s", db->routines[i].name);
+        sb_cat(&out, &n, &cap, head);
+        sb_cat(&out, &n, &cap, db->routines[i].body);
+        sb_cat(&out, &n, &cap, ";\n");
+    }
+    return out;
+}
+
+char* db_get_objects_sql(const char* db_name, int what) {
+    db_lock();
+    char* r = db_get_objects_sql_impl(db_name, what);
     db_unlock();
     return r;
 }

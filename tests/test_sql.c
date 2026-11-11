@@ -245,6 +245,47 @@ int main(void) {
     t("DROP TABLE altro.q", "OK:0");
     t("DROP TABLE altro.p", "OK:0");
     t("DROP DATABASE altro", "OK:0");
+    // stored procedure: parametri IN, IF / SIGNAL, risultato dell'ultima SELECT, atomiche
+    t("CREATE TABLE conto (id INT PRIMARY KEY, saldo INT CHECK (saldo >= 0))", "OK:0");
+    t("INSERT INTO conto VALUES (1, 100), (2, 50)", "OK:2");
+    t("CREATE PROCEDURE bonifico(IN da INT, a INT, importo INT)\n"
+      "BEGIN\n"
+      "  IF importo <= 0 THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'importo non valido'; END IF;\n"
+      "  UPDATE conto SET saldo = saldo - importo WHERE id = da;\n"
+      "  UPDATE conto SET saldo = saldo + importo WHERE id = a;\n"
+      "  SELECT id, saldo FROM conto ORDER BY id;\n"
+      "END", "OK:0");
+    t("CALL bonifico(1, 2, 30)", "1|70;2|80");
+    t("CALL bonifico(1, 2, 0)", "ERR:importo non valido");
+    t("CALL bonifico(1, 2, 500)", "ERR:CHECK");                            // il primo UPDATE viola il vincolo
+    t("CALL bonifico(2, 1, 80)", "1|150;2|0");
+    t("CALL bonifico(2, 1, 1)", "ERR:Procedure 'bonifico'");               // il secondo passo fallisce: niente cambia
+    t("SELECT saldo FROM conto ORDER BY id", "150;0");
+    t("CALL bonifico(1, 2)", "ERR:expects 3 arguments");
+    t("CALL nessuna()", "ERR:not found");
+    t("CREATE PROCEDURE bonifico() SELECT 1", "ERR:already exists");
+    t("CREATE PROCEDURE IF NOT EXISTS bonifico() SELECT 1", "OK:0");
+    t("CREATE PROCEDURE nome_di(cid INT) SELECT CONCAT('conto ', id, ': ', saldo) FROM conto WHERE id = cid", "OK:0");
+    t("CALL nome_di(1 + 1)", "conto 2: 0");
+    t("CREATE PROCEDURE testo(s VARCHAR(20)) SELECT UPPER(s), LENGTH(s) FROM conto WHERE id = 1", "OK:0");
+    t("CALL testo('l''ape')", "L'APE|5");
+    t("CALL testo(NULL)", "NULL|NULL");
+    t("CREATE PROCEDURE doppio(x INT) BEGIN CALL nome_di(x); INSERT INTO conto VALUES (x + 10, 5); END", "OK:0");
+    t("CALL doppio(1)", "conto 1: 150");                                // la SELECT della CALL annidata
+    t("SELECT COUNT(*) FROM conto", "3");
+    t("CREATE PROCEDURE ricorsiva() CALL ricorsiva()", "OK:0");
+    t("CALL ricorsiva()", "ERR:nested too deeply");
+    t("CREATE PROCEDURE cattiva(OUT x INT) SELECT 1", "ERR:OUT and INOUT");
+    t("CREATE PROCEDURE cattiva(x INT) BEGIN DROP TABLE conto; END", "ERR:");
+    t("CREATE PROCEDURE cattiva(x INT, x INT) SELECT 1", "ERR:Duplicate parameter");
+    t("DROP PROCEDURE ricorsiva", "OK:0");
+    t("DROP PROCEDURE ricorsiva", "ERR:not found");
+    t("DROP PROCEDURE IF EXISTS ricorsiva", "OK:0");
+    t("DROP PROCEDURE doppio", "OK:0");
+    t("DROP PROCEDURE testo", "OK:0");
+    t("DROP PROCEDURE nome_di", "OK:0");
+    t("DROP PROCEDURE bonifico", "OK:0");
+    t("DROP TABLE conto", "OK:0");
     t("SELECT TRUE + TRUE, FALSE FROM n WHERE id = 1", "2|0");
 
     // ── funzioni ──
@@ -1035,7 +1076,7 @@ int main(void) {
     t("CREATE TRIGGER bad AFTER INSERT ON r FOR EACH ROW SET NEW.x = 1", "ERR:only allowed in BEFORE");
     t("CREATE TRIGGER bad BEFORE INSERT ON nope FOR EACH ROW SIGNAL 'x'", "ERR:Table 'nope' not found");
     t("CREATE TRIGGER bad BEFORE INSERT ON r FOR EACH ROW WHEN (NEW.y > 0) SIGNAL 'x'", "ERR:Unknown column 'y'");
-    t("CREATE TRIGGER bad BEFORE INSERT ON r FOR EACH ROW DROP TABLE r", "ERR:A trigger can contain");
+    t("CREATE TRIGGER bad BEFORE INSERT ON r FOR EACH ROW DROP TABLE r", "ERR:can contain INSERT");
     t("CREATE TRIGGER storico AFTER INSERT ON r FOR EACH ROW SIGNAL 'x'", "ERR:already exists");
     // i trigger scattano anche per le modifiche a cascata delle chiavi esterne
     t("CREATE TABLE pa (id INT PRIMARY KEY)", "OK:0");

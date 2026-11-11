@@ -13,6 +13,7 @@ typedef enum {
     NODE_EXPLAIN, NODE_BEGIN, NODE_COMMIT, NODE_ROLLBACK,
     NODE_TRUNCATE, NODE_SAVEPOINT, NODE_ROLLBACK_TO,
     NODE_CREATE_TRIGGER, NODE_DROP_TRIGGER,
+    NODE_CREATE_PROCEDURE, NODE_DROP_PROCEDURE, NODE_CALL,   // usano create_trigger / drop_trigger / call
     NODE_CHECKPOINT,
     NODE_VACUUM,       // recupera le pagine di overflow non più usate
 } StmtType;
@@ -282,6 +283,11 @@ typedef struct ASTNode {
             char       name[64];
         } drop_trigger;
         struct {
+            char       name[64];
+            ASTExpr*   args[32];
+            int        nargs;
+        } call;
+        struct {
             void*      stmt;           // ASTNode* della SELECT da spiegare
             bool       analyze;        // EXPLAIN ANALYZE: esegue la query e mostra le righe reali
         } explain;
@@ -336,6 +342,8 @@ typedef struct {
 } TrigProgram;
 
 TrigProgram* parser_parse_trigger(TokenList* tokens);
+// corpo di una procedura dal token start: BEGIN ... END oppure una sola istruzione
+TrigProgram* parser_parse_procedure(TokenList* tokens, int start);
 void         trig_program_free(TrigProgram* p);
 
 #endif

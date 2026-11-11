@@ -1401,8 +1401,8 @@ static TrigStmt* parse_trig_stmt(ParserState* ps) {
         return t;
     }
     Token k = peek(ps);
-    if (k.type != TOK_INSERT && k.type != TOK_UPDATE && k.type != TOK_DELETE && !query_starts(ps, 0)) {
-        parse_fail(ps, "A trigger can contain INSERT, UPDATE, DELETE, SELECT, SET NEW.column, SIGNAL and IF", k);
+    if (k.type != TOK_INSERT && k.type != TOK_UPDATE && k.type != TOK_DELETE && !query_starts(ps, 0) && !ident_is(ps, "CALL")) {
+        parse_fail(ps, "A trigger or procedure can contain INSERT, UPDATE, DELETE, SELECT, CALL, SET NEW.column, SIGNAL and IF", k);
         free(t);
         return NULL;
     }
@@ -1458,6 +1458,76 @@ TrigProgram* parser_parse_trigger(TokenList* tokens) {
     p->success = r.success;
     snprintf(p->error, sizeof(p->error), "%s", r.error);
     return p;
+}
+
+TrigProgram* parser_parse_procedure(TokenList* tokens, int start) {
+    TrigProgram* p = calloc(1, sizeof(TrigProgram));
+    if (!p) return NULL;
+    ParseResult r;
+    memset(&r, 0, sizeof(r));
+    r.success = true;
+    ParserState ps = { tokens, start, &r, 0, "", false };
+    p->for_each_row = false;
+    if (match(&ps, TOK_BEGIN)) {
+        parse_trig_list(&ps, &p->v, &p->n);
+        if (r.success && !match(&ps, TOK_END)) parse_fail(&ps, "Expected END to close the procedure body", peek(&ps));
+    } else {
+        TrigStmt* st = parse_trig_stmt(&ps);
+        if (st) trig_push(&ps, &p->v, &p->n, st);
+    }
+    match(&ps, TOK_SEMICOLON);
+    if (r.success && peek(&ps).type != TOK_EOF) parse_fail(&ps, "Unexpected text after the procedure body", peek(&ps));
+    p->success = r.success;
+    snprintf(p->error, sizeof(p->error), "%s", r.error);
+    return p;
+}
+
+// CREATE PROCEDURE nome ([IN] p tipo, ...) corpo: salvato come testo "(parametri) corpo"
+static ASTNode* parse_create_procedure(ParserState* ps, ASTNode* n) {
+    n->type = NODE_CREATE_PROCEDURE;
+    Token nm = consume(ps);
+    if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the procedure name", nm); return n; }
+    copy_text(ps, n->create_trigger.name, sizeof(n->create_trigger.name), nm.text);
+    int start = ps->pos;
+    if (!expect(ps, TOK_LPAREN)) return n;
+    for (int d = 1; d > 0; ) {                              // parametri: controllati all'esecuzione di CREATE
+        Token t = consume(ps);
+        if (t.type == TOK_EOF) { parse_fail(ps, "Expected ')' after the parameters", t); return n; }
+        if (t.type == TOK_LPAREN) d++;
+        else if (t.type == TOK_RPAREN) d--;
+    }
+    TrigProgram* prog = calloc(1, sizeof(TrigProgram));
+    if (!prog) { parse_fail(ps, "Out of memory", peek(ps)); return n; }
+    if (match(ps, TOK_BEGIN)) {
+        parse_trig_list(ps, &prog->v, &prog->n);
+        if (ps->result->success && !match(ps, TOK_END)) parse_fail(ps, "Expected END to close the procedure body", peek(ps));
+    } else {
+        TrigStmt* st = parse_trig_stmt(ps);
+        if (st) trig_push(ps, &prog->v, &prog->n, st);
+    }
+    trig_program_free(prog);
+    if (!ps->result->success) return n;
+    if (!tokens_text(ps, start, ps->pos, n->create_trigger.body, sizeof(n->create_trigger.body)))
+        parse_fail(ps, "Procedure is too long", peek(ps));
+    return n;
+}
+
+// CALL nome(argomenti)
+static void parse_call_stmt(ParserState* ps, ASTNode* n) {
+    consume(ps);
+    n->type = NODE_CALL;
+    Token nm = consume(ps);
+    if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the procedure name after CALL", nm); return; }
+    copy_text(ps, n->call.name, sizeof(n->call.name), nm.text);
+    if (!match(ps, TOK_LPAREN)) return;                   // CALL p senza parentesi
+    if (match(ps, TOK_RPAREN)) return;
+    do {
+        if (n->call.nargs >= 32) { parse_fail(ps, "Too many arguments (max 32)", peek(ps)); return; }
+        ASTExpr* e = parse_expr(ps);
+        if (!e) return;
+        n->call.args[n->call.nargs++] = e;
+    } while (match(ps, TOK_COMMA));
+    expect(ps, TOK_RPAREN);
 }
 
 // CREATE TRIGGER nome {BEFORE | AFTER} {INSERT | UPDATE [OF colonne] | DELETE} ON tabella resto
@@ -1783,6 +1853,7 @@ static ASTNode* parse_statement(ParserState* ps) {
     ASTNode* n = calloc(1, sizeof(ASTNode));
     if (!n) return NULL;
     Token t = peek(ps);
+    if (ident_is(ps, "CALL") && next_is(ps, 1, TOK_IDENTIFIER)) { parse_call_stmt(ps, n); return n; }
 
     switch (t.type) {
         case TOK_SELECT:
@@ -1819,7 +1890,9 @@ static ASTNode* parse_statement(ParserState* ps) {
                 if (!match(ps, TOK_NOT) || !match(ps, TOK_EXISTS)) { parse_fail(ps, "Expected IF NOT EXISTS", peek(ps)); break; }
                 n->if_exists = true;
             }
-            if (sub.type == TOK_DATABASE) {
+            if (sub.type == TOK_IDENTIFIER && sub.text && !strcasecmp(sub.text, "PROCEDURE")) {
+                return parse_create_procedure(ps, n);
+            } else if (sub.type == TOK_DATABASE) {
                 n->type = NODE_CREATE_DB;
                 Token dn = consume(ps);
                 copy_text(ps, n->create_db.db_name, sizeof(n->create_db.db_name), dn.text);
@@ -2032,6 +2105,11 @@ static ASTNode* parse_statement(ParserState* ps) {
                 expect(ps, TOK_ON);
                 Token tn = table_tok(ps);
                 copy_text(ps, n->drop_index.table_name, sizeof(n->drop_index.table_name), tn.text);
+            } else if (sub.type == TOK_IDENTIFIER && sub.text && !strcasecmp(sub.text, "PROCEDURE")) {
+                n->type = NODE_DROP_PROCEDURE;
+                Token pn = consume(ps);
+                if (pn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the procedure name", pn); break; }
+                copy_text(ps, n->drop_trigger.name, sizeof(n->drop_trigger.name), pn.text);
             } else if (sub.type == TOK_TRIGGER) {
                 n->type = NODE_DROP_TRIGGER;
                 Token tg = consume(ps);
@@ -2237,6 +2315,9 @@ static void free_node(ASTNode* n) {
             break;
         case NODE_ALTER_TABLE:
             free_node(n->alter_table.add_column);
+            break;
+        case NODE_CALL:
+            for (int j = 0; j < n->call.nargs; j++) ast_expr_free(n->call.args[j]);
             break;
         default:
             break;

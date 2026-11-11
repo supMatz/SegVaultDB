@@ -5623,6 +5623,9 @@ typedef struct {
     Tuple*  cur[2];
     BindCtx b;
     EvalCtx e;
+    bool    proc;         // corpo di una procedura: tiene l'ultimo risultato e controlla i permessi
+    QueryResult* last;    // ultimo risultato con colonne (SELECT) della procedura
+    int     affected;
 } TrigScope;
 
 static void trig_scope_init(TrigScope* sc, ExecCtx* ctx, TableSchema* ts, Tuple* newt, Tuple* oldt) {
@@ -5674,11 +5677,20 @@ static const char* trig_run(ExecCtx* ctx, TrigScope* sc, TableSchema* ts, TrigSt
         sc->e.err[0] = '\0';
         switch (t->kind) {
             case TS_SQL: {
+                if (sc->proc && ctx->auth_hook && !ctx->auth_hook(t->sql, msg, mn)) return msg;
                 QueryResult* r = executor_run(ctx, t->sql);
                 if (!r || !r->success) {
                     snprintf(msg, mn, "%.280s", r ? r->error : "statement failed");
                     db_result_free(r);
                     return msg;
+                }
+                if (sc->proc) {
+                    sc->affected += r->rows_affected;
+                    if (r->num_cols > 0) {                       // il risultato di CALL è l'ultima SELECT
+                        if (sc->last) db_result_free(sc->last);
+                        sc->last = r;
+                        break;
+                    }
                 }
                 db_result_free(r);
                 break;
@@ -5821,6 +5833,197 @@ static QueryResult* exec_create_trigger(ExecCtx* ctx, ASTNode* n) {
     snprintf(tg->event, sizeof(tg->event), "%s", n->create_trigger.event);
     snprintf(tg->body, sizeof(tg->body), "%s", n->create_trigger.body);
     return result_ok_msg(0);
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  Stored procedure (come MySQL, parametri solo IN):
+//    CREATE PROCEDURE nome([IN] p tipo, ...) BEGIN istruzioni; END    CALL nome(valori)
+//  Il corpo è quello dei trigger (INSERT, UPDATE, DELETE, SELECT, CALL, IF, SIGNAL): i parametri
+//  diventano valori costanti nel testo; il risultato è quello dell'ultima SELECT.
+// ═════════════════════════════════════════════════════════════════
+#define MAX_PROC_PARAMS 32
+
+// parametri del testo "(...)" della procedura: nomi in names; indice del primo token del corpo, -1 se non validi
+static int proc_params(TokenList* tk, char names[][64], int* np, char* msg, size_t mn) {
+    *np = 0;
+    Token* T = tk->tokens;
+    int n = tk->count, i = 1;
+    if (n < 2 || T[0].type != TOK_LPAREN) { snprintf(msg, mn, "Expected the parameter list"); return -1; }
+    if (T[i].type == TOK_RPAREN) return i + 1;
+    for (;;) {
+        if (T[i].type == TOK_IN) i++;
+        else if (T[i].type == TOK_IDENTIFIER && (!strcasecmp(T[i].text, "OUT") || !strcasecmp(T[i].text, "INOUT")) &&
+                 i + 1 < n && T[i + 1].type == TOK_IDENTIFIER) {
+            snprintf(msg, mn, "OUT and INOUT parameters are not supported: return values with a SELECT");
+            return -1;
+        }
+        if (T[i].type != TOK_IDENTIFIER) { snprintf(msg, mn, "Expected a parameter name near '%.40s'", T[i].text); return -1; }
+        if (*np >= MAX_PROC_PARAMS) { snprintf(msg, mn, "Too many parameters (max %d)", MAX_PROC_PARAMS); return -1; }
+        for (int k = 0; k < *np; k++)
+            if (!strcasecmp(names[k], T[i].text)) { snprintf(msg, mn, "Duplicate parameter '%.64s'", T[i].text); return -1; }
+        snprintf(names[*np], 64, "%s", T[i].text);
+        i++;
+        int d = 0, typed = 0;
+        for (; i < n - 1; i++, typed++) {                   // tipo: fino a ',' o ')' allo stesso livello
+            if (d == 0 && (T[i].type == TOK_COMMA || T[i].type == TOK_RPAREN)) break;
+            if (T[i].type == TOK_LPAREN) d++;
+            else if (T[i].type == TOK_RPAREN) d--;
+        }
+        if (!typed) { snprintf(msg, mn, "Expected the type of parameter '%.64s'", names[*np]); return -1; }
+        (*np)++;
+        if (T[i].type == TOK_COMMA) { i++; continue; }
+        if (T[i].type == TOK_RPAREN) return i + 1;
+        snprintf(msg, mn, "Expected ')' after the parameters");
+        return -1;
+    }
+}
+
+// sostituisce i parametri nel corpo con i valori (lit[k] tipo typ[k]) e lo analizza
+static TrigProgram* proc_program(TokenList* tk, int body, char names[][64], int np, char** lit, const TokenType* typ) {
+    for (int i = body; i < tk->count - 1; i++) {
+        Token* t = &tk->tokens[i];
+        if (t->type != TOK_IDENTIFIER) continue;
+        if (i > 0 && tk->tokens[i - 1].type == TOK_DOT) continue;
+        if (tk->tokens[i + 1].type == TOK_DOT || tk->tokens[i + 1].type == TOK_LPAREN) continue;
+        for (int k = 0; k < np; k++)
+            if (!strcasecmp(t->text, names[k])) { t->type = typ[k]; t->text = lit[k]; break; }
+    }
+    return parser_parse_procedure(tk, body);
+}
+
+static RoutineSchema* find_procedure(Database* db, const char* name) {
+    for (int i = 0; db && i < db->num_routines; i++)
+        if (!db->routines[i].is_function && !strcasecmp(db->routines[i].name, name)) return &db->routines[i];
+    return NULL;
+}
+
+static QueryResult* exec_create_procedure(ExecCtx* ctx, ASTNode* n) {
+    Database* db = catalog_current_db(ctx->catalog);
+    if (!db) return result_error_msg("No database selected");
+    char msg[300];
+    for (int i = 0; i < db->num_routines; i++)
+        if (!strcasecmp(db->routines[i].name, n->create_trigger.name)) {
+            snprintf(msg, sizeof(msg), "Procedure '%.64s' already exists", n->create_trigger.name);
+            return result_error_msg(msg);
+        }
+    if (db->num_routines >= 64) return result_error_msg("Too many procedures (max 64 per database)");
+    TokenList* tk = lexer_tokenize(n->create_trigger.body);
+    if (!tk) return result_error_msg("Out of memory");
+    char names[MAX_PROC_PARAMS][64];
+    int np = 0;
+    int body = proc_params(tk, names, &np, msg, sizeof(msg));
+    if (body >= 0) {                                       // controllo del corpo con parametri NULL
+        char* lit[MAX_PROC_PARAMS];
+        TokenType typ[MAX_PROC_PARAMS];
+        for (int k = 0; k < np; k++) { lit[k] = (char*)"NULL"; typ[k] = TOK_NULL; }
+        TrigProgram* prog = proc_program(tk, body, names, np, lit, typ);
+        if (!prog || !prog->success) { snprintf(msg, sizeof(msg), "Invalid procedure: %.250s", prog ? prog->error : "out of memory"); body = -1; }
+        trig_program_free(prog);
+    }
+    lexer_free(tk);
+    if (body < 0) return result_error_msg(msg);
+    RoutineSchema* rt = &db->routines[db->num_routines++];
+    memset(rt, 0, sizeof(*rt));
+    snprintf(rt->name, sizeof(rt->name), "%s", n->create_trigger.name);
+    rt->is_function = false;
+    snprintf(rt->body, sizeof(rt->body), "%s", n->create_trigger.body);
+    return result_ok_msg(0);
+}
+
+static QueryResult* exec_drop_procedure(ExecCtx* ctx, ASTNode* n) {
+    Database* db = catalog_current_db(ctx->catalog);
+    if (!db) return result_error_msg("No database selected");
+    RoutineSchema* rt = find_procedure(db, n->drop_trigger.name);
+    char msg[200];
+    if (!rt) { snprintf(msg, sizeof(msg), "Procedure '%.64s' not found", n->drop_trigger.name); return result_error_msg(msg); }
+    int i = (int)(rt - db->routines);
+    memmove(&db->routines[i], &db->routines[i + 1], sizeof(RoutineSchema) * (size_t)(db->num_routines - i - 1));
+    db->num_routines--;
+    return result_ok_msg(0);
+}
+
+static QueryResult* exec_call(ExecCtx* ctx, ASTNode* n) {
+    Database* db = catalog_current_db(ctx->catalog);
+    if (!db) return result_error_msg("No database selected");
+    char msg[400], inner[300];
+    RoutineSchema* rt = find_procedure(db, n->call.name);
+    if (!rt) { snprintf(msg, sizeof(msg), "Procedure '%.64s' not found", n->call.name); return result_error_msg(msg); }
+    if (ctx->trig_depth >= MAX_TRIGGER_DEPTH) return result_error_msg("Procedures are nested too deeply (a procedure keeps calling itself?)");
+    char pname[64];
+    snprintf(pname, sizeof(pname), "%s", rt->name);
+    TokenList* tk = lexer_tokenize(rt->body);
+    if (!tk) return result_error_msg("Out of memory");
+    char names[MAX_PROC_PARAMS][64];
+    int np = 0;
+    const char* fail = NULL;
+    int body = proc_params(tk, names, &np, inner, sizeof(inner));
+    if (body < 0) fail = inner;
+    if (!fail && np != n->call.nargs) {
+        snprintf(inner, sizeof(inner), "expects %d argument%s, got %d", np, np == 1 ? "" : "s", n->call.nargs);
+        fail = inner;
+    }
+    // argomenti: espressioni senza colonne, valutate una volta
+    char* lit[MAX_PROC_PARAMS] = {0};
+    TokenType typ[MAX_PROC_PARAMS];
+    if (!fail) {
+        BindCtx b;
+        memset(&b, 0, sizeof(b));
+        b.mode = BIND_ROW; b.clause = "CALL"; b.x = ctx; b.outer = ctx->trig_bind;
+        EvalCtx ec;
+        memset(&ec, 0, sizeof(ec));
+        ec.x = ctx; ec.outer = ctx->trig_eval;
+        for (int k = 0; k < np && !fail; k++) {
+            bind_expr(n->call.args[k], &b);
+            if (b.err[0]) { snprintf(inner, sizeof(inner), "%.250s", b.err); fail = inner; break; }
+            EvalVal v;
+            eval_expr(n->call.args[k], &ec, &v);
+            if (ec.err[0]) { snprintf(inner, sizeof(inner), "%.250s", ec.err); fail = inner; break; }
+            typ[k] = v.null ? TOK_NULL : v.is_int ? TOK_INTEGER : v.is_num ? TOK_FLOAT : TOK_STRING;
+            lit[k] = strdup(v.null ? "NULL" : ev_s(&v));
+            if (!lit[k]) fail = "Out of memory";
+        }
+    }
+    TrigProgram* prog = NULL;
+    TableSchema* none = NULL;
+    TrigScope* sc = NULL;
+    if (!fail) {
+        prog = proc_program(tk, body, names, np, lit, typ);
+        if (!prog || !prog->success) { snprintf(inner, sizeof(inner), "%.250s", prog ? prog->error : "out of memory"); fail = inner; }
+    }
+    if (!fail) {
+        none = calloc(1, sizeof(TableSchema));            // nessuna riga NEW / OLD
+        sc = malloc(sizeof(TrigScope));
+        if (!none || !sc) fail = "Out of memory";
+    }
+    if (!fail) {
+        trig_scope_init(sc, ctx, none, NULL, NULL);
+        sc->proc = true;
+        fail = trig_bind_all(sc, none, prog->v, prog->n, inner, sizeof(inner));
+        if (!fail) {
+            struct BindCtx* sb = ctx->trig_bind;
+            struct EvalCtx* se = ctx->trig_eval;
+            ctx->trig_bind = NULL;
+            ctx->trig_eval = NULL;
+            ctx->trig_depth++;
+            fail = trig_run(ctx, sc, none, prog->v, prog->n, NULL, inner, sizeof(inner));
+            ctx->trig_depth--;
+            ctx->trig_bind = sb;
+            ctx->trig_eval = se;
+        }
+    }
+    QueryResult* r;
+    if (fail) {
+        if (!strncmp(fail, "Procedure '", 11)) snprintf(msg, sizeof(msg), "%s", fail);   // dalla procedura più interna
+        else snprintf(msg, sizeof(msg), "Procedure '%.64s': %.300s", pname, fail);
+        r = result_error_msg(msg);
+        if (sc && sc->last) db_result_free(sc->last);
+    } else r = sc->last ? sc->last : result_ok_msg(sc->affected);
+    free(sc);
+    free(none);
+    trig_program_free(prog);
+    lexer_free(tk);                                        // dopo il programma: i token puntano a lit
+    for (int k = 0; k < np; k++) free(lit[k]);
+    return r;
 }
 
 static QueryResult* exec_drop_trigger(ExecCtx* ctx, ASTNode* n) {
@@ -6782,6 +6985,12 @@ static bool if_exists_noop(ExecCtx* ctx, ASTNode* n) {
         case NODE_CREATE_TABLE: return db && catalog_get_table(ctx->catalog, dbn, n->create_table.table_name);
         case NODE_DROP_VIEW:    return db && !catalog_get_view(ctx->catalog, dbn, n->drop_view.view_name);
         case NODE_CREATE_VIEW:  return db && catalog_get_view(ctx->catalog, dbn, n->create_view.view_name);
+        case NODE_DROP_PROCEDURE: return db && !find_procedure(db, n->drop_trigger.name);
+        case NODE_CREATE_PROCEDURE: {
+            if (!db) return false;
+            for (int i = 0; i < db->num_routines; i++) if (!strcasecmp(db->routines[i].name, n->create_trigger.name)) return true;
+            return false;
+        }
         case NODE_DROP_TRIGGER: case NODE_CREATE_TRIGGER: {
             if (!db) return false;
             const char* nm = n->type == NODE_DROP_TRIGGER ? n->drop_trigger.name : n->create_trigger.name;
@@ -6843,6 +7052,9 @@ static QueryResult* executor_run_impl(ExecCtx* ctx, ASTNode* stmt) {
         case NODE_SAVEPOINT:    return result_ok_msg(0);
         case NODE_ROLLBACK_TO:  return result_ok_msg(0);
         case NODE_CREATE_TRIGGER: return exec_create_trigger(ctx, stmt);
+        case NODE_CREATE_PROCEDURE: return exec_create_procedure(ctx, stmt);
+        case NODE_DROP_PROCEDURE: return exec_drop_procedure(ctx, stmt);
+        case NODE_CALL: return exec_call(ctx, stmt);
         case NODE_CHECKPOINT:   return result_ok_msg(0);
         case NODE_VACUUM:       return result_ok_msg(0);
         case NODE_DROP_TRIGGER: return exec_drop_trigger(ctx, stmt);

@@ -39,7 +39,7 @@ static bool word_eq(const char* s, int a, int b, const char* w) {
 }
 
 // Divide lo script negli statement separati da ';' (fuori da stringhe e commenti).
-// Dentro CREATE TRIGGER ... BEGIN ... END i ';' del corpo non separano: si conta la
+// Dentro CREATE TRIGGER / PROCEDURE ... BEGIN ... END i ';' del corpo non separano: si conta la
 // profondità dei blocchi (BEGIN e CASE aprono, END chiude; END IF chiude un IF).
 int sql_split(const char* s, int len, SqlRange* out, int max_out) {
     int n = 0, i = 0, start = 0, code_start = -1;
@@ -77,7 +77,7 @@ int sql_split(const char* s, int len, SqlRange* out, int max_out) {
             int e = i;
             while (e < len && (isalnum((unsigned char)s[e]) || s[e] == '_')) e++;
             words++;
-            if (words <= 4 && word_eq(s, i, e, "TRIGGER") && word_eq(s, code_start, code_start + 6, "CREATE")) trigger = true;
+            if (words <= 4 && (word_eq(s, i, e, "TRIGGER") || word_eq(s, i, e, "PROCEDURE")) && word_eq(s, code_start, code_start + 6, "CREATE")) trigger = true;
             if (trigger) {
                 bool closes_if = prev_end && (word_eq(s, i, e, "IF") || word_eq(s, i, e, "LOOP") || word_eq(s, i, e, "WHILE"));
                 if (closes_if) depth++;                          // "END IF": l'END non chiudeva un BEGIN
@@ -143,7 +143,7 @@ static bool sql_statement_in(const char* s, int pos, SqlRange* ranges, int n, Sq
 
 static const char* KEYWORDS[] = {
     "SELECT","FROM","WHERE","INSERT","INTO","VALUES","UPDATE","SET","DELETE","CREATE","DROP",
-    "TABLE","DATABASE","DATABASES","TABLES","INDEX","VIEW","TRIGGER","PROCEDURE","FUNCTION","USE","SHOW",
+    "TABLE","DATABASE","DATABASES","TABLES","INDEX","VIEW","TRIGGER","PROCEDURE","FUNCTION","CALL","USE","SHOW",
     "DESCRIBE","DESC","ASC","ORDER","BY","GROUP","HAVING","LIMIT","OFFSET","DISTINCT","AS","ON",
     "JOIN","INNER","LEFT","RIGHT","OUTER","CROSS","FULL","NATURAL","AND","OR","NOT","IN","IS",
     "LIKE","BETWEEN","EXISTS","UNION","ALL","ANY","CASE","WHEN","THEN","ELSE","END","BEGIN",

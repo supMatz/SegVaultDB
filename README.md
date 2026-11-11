@@ -52,7 +52,7 @@ database per piccoli siti web e app desktop.
 | **Buffer pool** | 1024 frame, tabella hash per la ricerca, sostituzione **CLOCK**; statistiche con `SHOW STATUS` |
 | **Ottimizzatore** | Pushdown delle selezioni, hash join (anche per `FROM a, b WHERE a.x = b.y`), accesso con indice per uguaglianza o per intervallo (scelto solo se conviene), subquery decorrelate per chiave; `EXPLAIN` con stime alla System R e `EXPLAIN ANALYZE` con le righe reali |
 | **Transazioni** | Write-Ahead Log con undo/redo, `BEGIN` / `COMMIT` / `ROLLBACK`, `SAVEPOINT`, recovery dopo un crash, `CHECKPOINT` (anche automatico) |
-| **Basi di dati attive** | Trigger `BEFORE` / `AFTER`, `FOR EACH ROW` / `FOR EACH STATEMENT`, `NEW` / `OLD`, `WHEN`, `SET NEW.col`, `SIGNAL`, `IF` |
+| **Basi di dati attive** | Trigger `BEFORE` / `AFTER`, `FOR EACH ROW` / `FOR EACH STATEMENT`, `NEW` / `OLD`, `WHEN`, `SET NEW.col`, `SIGNAL`, `IF`; stored procedure (`CREATE PROCEDURE`, `CALL`) |
 | **Testi e righe grandi** | Testi fino a 16 MB, righe fino a 64 MB: una riga oltre 2 KB va in pagine di overflow (anche dopo `ROLLBACK`, riavvio e crash) |
 | **Strumenti visuali** | Designer dello schema ER (notazione di Chen) / UML a trascinamento, export PNG; modulo della struttura con SQL live; modifica dei dati nella griglia; ricerca in tutto il database; panoramica; utenti e permessi; monitor del server |
 | **Piattaforme** | Linux nativo; Windows con `make windows` da Linux (MinGW-w64): `segvault.exe` e `segvault-server.exe` statici |
@@ -285,7 +285,7 @@ rispettano la tabella resta com'era. La chiave primaria di una tabella esistente
 - `Ctrl+F` sulla griglia, o il campo nell'intestazione, filtra le righe;
 - tasto destro: copia di cella, riga, colonna o valore come letterale SQL, filtri, ordinamento, export.
 
-**Export** (menu *Export*): CSV, TSV, JSON, Markdown, HTML o `INSERT` SQL, su file o negli appunti (`Ctrl+Shift+C` copia tutto come TSV, da incollare in un foglio di calcolo; `Ctrl+E` esporta in CSV). *Database dump* scrive in un file `.sql` le istruzioni che ricreano il database corrente (tabelle, dati, chiavi esterne).
+**Export** (menu *Export*): CSV, TSV, JSON, Markdown, HTML o `INSERT` SQL, su file o negli appunti (`Ctrl+Shift+C` copia tutto come TSV, da incollare in un foglio di calcolo; `Ctrl+E` esporta in CSV). *Database dump* scrive in un file `.sql` le istruzioni che ricreano il database corrente (tabelle, dati, chiavi esterne, viste, trigger e procedure).
 **Import** (menu *Import*): un file CSV diventa una tabella (tipi delle colonne riconosciuti dai dati); *Run SQL file / MySQL dump* esegue uno script senza aprirlo. Un **dump di MySQL / MariaDB / phpMyAdmin** viene riconosciuto e tradotto prima: `SET`, `LOCK TABLES` e simili saltati, tipi MySQL convertiti (`tinyint`, `mediumtext`, `json`, `timestamp`, `enum`, `set`, ...), attributi e opzioni (`unsigned`, `COLLATE`, `COMMENT`, `ENGINE=`, ...) tolti, `KEY` → `CREATE INDEX`, `UNIQUE KEY` → vincolo `UNIQUE`, chiavi esterne mantenute (gli indici su più colonne e `FULLTEXT` restano fuori).
 
 ### Menu e impostazioni
@@ -497,6 +497,27 @@ DROP TRIGGER [IF EXISTS] nome;   SHOW TRIGGERS [FROM tabella];
 
 `NEW` e `OLD` si usano nel corpo come le colonne di una query esterna (`WHERE id = NEW.conto`). Un trigger può attivarne altri fino a 16 livelli; se fallisce, l'intero statement che lo ha attivato viene annullato. Scattano anche per le righe modificate dalle azioni `CASCADE` / `SET NULL` / `SET DEFAULT` delle chiavi esterne.
 
+### Stored procedure
+
+```sql
+CREATE PROCEDURE bonifico(IN da INT, a INT, importo INT)
+BEGIN
+    IF importo <= 0 THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'importo non valido'; END IF;
+    UPDATE conto SET saldo = saldo - importo WHERE id = da;
+    UPDATE conto SET saldo = saldo + importo WHERE id = a;
+    SELECT id, saldo FROM conto;
+END;
+
+CALL bonifico(1, 2, 30);         -- restituisce il risultato dell'ultima SELECT
+DROP PROCEDURE [IF EXISTS] bonifico;
+```
+
+Il corpo ha le stesse istruzioni dei trigger (`INSERT`, `UPDATE`, `DELETE`, `SELECT`, `CALL`, `IF`,
+`SIGNAL`); i parametri sono solo `IN` (i valori si restituiscono con una `SELECT`). Una `CALL` è
+atomica: se un'istruzione fallisce (un vincolo, un `SIGNAL`) tutte le modifiche della procedura
+vengono annullate. Con gli utenti del server ogni istruzione è controllata con i permessi di chi
+chiama la procedura. Le procedure compaiono nell'albero a sinistra e nel *Database dump*.
+
 ### Tipi di dato
 
 | Tipo | Descrizione |
@@ -506,7 +527,7 @@ DROP TRIGGER [IF EXISTS] nome;   SHOW TRIGGERS [FROM tabella];
 | `FLOAT` / `DOUBLE` | 8 byte, virgola mobile |
 | `VARCHAR(n)` | Testo fino a `n` caratteri |
 | `CHAR(n)` | Testo di `n` caratteri |
-| `TEXT` | Testo lungo (fino a 65535 byte, nei limiti della riga) |
+| `TEXT` | Testo lungo (fino a 16 MB) |
 | `BOOL` / `BOOLEAN` | `TRUE` / `FALSE` (0 / 1) |
 | `DATE` | `AAAA-MM-GG`, controllata |
 | `DATETIME` | `AAAA-MM-GG HH:MM:SS`, controllata |
@@ -528,7 +549,7 @@ DROP TRIGGER [IF EXISTS] nome;   SHOW TRIGGERS [FROM tabella];
 
 ### Non supportato
 
-Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), stored procedure, tabelle di database diversi nella stessa istruzione (`shop.prodotto JOIN uni.esame`), scritture in parallelo: le richieste di sola lettura girano insieme, quelle che scrivono una alla volta, e una sola sessione per volta può avere una transazione aperta (vedi [Roadmap](#roadmap)).
+Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), funzioni definite dall'utente e parametri `OUT` delle procedure, tabelle di database diversi nella stessa istruzione (`shop.prodotto JOIN uni.esame`), scritture in parallelo: le richieste di sola lettura girano insieme, quelle che scrivono una alla volta, e una sola sessione per volta può avere una transazione aperta (vedi [Roadmap](#roadmap)).
 
 ---
 
@@ -998,7 +1019,7 @@ make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitize
 |---|---|
 | `test_btree` | B+Tree sotto stress contro un modello di riferimento: inserimenti, aggiornamenti, cancellazioni e scansioni ordinate, con un buffer pool piccolo che costringe a riscrivere e rileggere le pagine |
 | `test_engine` (128) | Motore: pagine, heap, catalogo, WAL e recovery, import CSV |
-| `test_sql` (1070) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, transazioni, crash e recovery, testi lunghi, JSON, 100 transazioni di fila |
+| `test_sql` (1104) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, transazioni, crash e recovery, testi lunghi, JSON, 100 transazioni di fila |
 | `test_examples` (166) | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
 | `test_grid_edit` (22) | Modifica dei dati nella griglia: analisi dei risultati, `UPDATE` / `INSERT` / `DELETE` generati ed eseguiti, chiavi composte, join, apici e backslash, letterali di export e dump |
 | `test_server` (78) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici |
@@ -1220,8 +1241,9 @@ Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
    decimali dei secondi). Da fare: il protocollo di rete MySQL (le app PHP come WordPress si
    collegherebbero senza modifiche).
 4. **Limiti del motore** — fatto: `CREATE UNIQUE INDEX`, indici su più colonne (anche dall'import
-   MySQL), funzioni JSON e operatori `->` / `->>`, nomi `db.tabella` (un database per istruzione). Da fare:
-   più tabelle / colonne / indici, stored procedure, ricerca full-text.
+   MySQL), funzioni JSON e operatori `->` / `->>`, nomi `db.tabella` (un database per istruzione),
+   stored procedure (`CREATE PROCEDURE` / `CALL`, parametri `IN`). Da fare:
+   più tabelle / colonne / indici, ricerca full-text.
 5. **Sicurezza e gestione** — HTTPS integrato, backup pianificati e ripristino dalla GUI, avvio come
    servizio di sistema, registro di audit, `SHOW DATABASES` filtrato per utente.
 6. **GUI** — costruttore visuale di query, navigazione delle chiavi esterne dalla griglia, grafici dai

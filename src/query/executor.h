@@ -23,6 +23,8 @@ typedef struct {
     struct BindCtx* trig_bind;
     struct EvalCtx* trig_eval;
     int         trig_depth;       // trigger annidati (un trigger che ne attiva altri)
+    // permessi delle istruzioni di una procedura (utente che la chiama); NULL = tutto permesso
+    bool      (*auth_hook)(const ASTNode* stmt, char* err, size_t errn);
 } ExecCtx;
 
 QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt);

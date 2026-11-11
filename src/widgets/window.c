@@ -3600,6 +3600,7 @@ static const char* const SQL_LINES[] = {
     "Window: ROW_NUMBER() RANK() DENSE_RANK() NTILE LAG LEAD SUM/AVG/COUNT(..) OVER (PARTITION BY .. ORDER BY .. [ROWS BETWEEN 2 PRECEDING AND CURRENT ROW])",
     "Operators: + - * / = <> < > <= >= AND OR NOT LIKE [ESCAPE] BETWEEN IN IS [NOT] NULL;  COUNT SUM AVG MIN MAX",
     "Functions: UPPER LOWER LENGTH TRIM CONCAT SUBSTRING REPLACE ABS ROUND FLOOR CEIL MOD COALESCE NULLIF IF NOW YEAR",
+    "JSON: JSON_EXTRACT(doc, '$.a[0]')  doc->'$.a'  doc->>'$.a'  JSON_VALID JSON_TYPE JSON_LENGTH JSON_OBJECT JSON_ARRAY;  db.table names",
     "",
     "#Changing data",
     "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y');  INSERT INTO t SELECT ...;   all rows or none",
@@ -3609,6 +3610,7 @@ static const char* const SQL_LINES[] = {
     "BEGIN;  COMMIT;  ROLLBACK;  SAVEPOINT s;  ROLLBACK TO s;  CHECKPOINT;",
     "CREATE TRIGGER n {BEFORE|AFTER} {INSERT|UPDATE [OF c]|DELETE} ON t FOR EACH {ROW|STATEMENT} [WHEN (...)]",
     "    BEGIN ...; END   with NEW.col / OLD.col, SET NEW.col = ..., SIGNAL 'message', IF ... THEN ... END IF",
+    "CREATE PROCEDURE p([IN] a INT, ...) BEGIN ...; END;   CALL p(1);   DROP PROCEDURE p   (result: the last SELECT)",
     "",
     "#Inside the engine",
     "EXPLAIN SELECT ...  plan with estimated rows;  EXPLAIN ANALYZE SELECT ...  also the actual rows and times",
@@ -3786,6 +3788,12 @@ static bool dump_database(AppWindow* app, const char* path) {
         db_free_string(fk);
     }
     db_namelist_free(nl);
+    // viste dopo le tabelle; trigger dopo i dati (non devono scattare durante il ripristino); procedure
+    for (int w = 0; w < 3; w++) {
+        char* objs = db_get_objects_sql(dbname, w);
+        if (objs && objs[0]) { sb_add(&b, "\n"); sb_add(&b, objs); }
+        db_free_string(objs);
+    }
     bool ok = b.p && write_text_file(path, b.p);
     free(b.p);
     char msg[1300];
