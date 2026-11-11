@@ -64,7 +64,8 @@ typedef enum { OP_EQ, OP_NEQ, OP_LT, OP_GT, OP_LE, OP_GE,
                OP_AND, OP_OR, OP_NOT, OP_PLUS, OP_MINUS, OP_MUL, OP_DIV,
                OP_IS_NULL, OP_IS_NOT_NULL, OP_LIKE, OP_NOT_LIKE,
                OP_NEG,      // meno unario (EXPR_UNARY)
-               OP_MOD       // a % b
+               OP_MOD,      // a % b
+               OP_ESCAPE    // a LIKE (p ESCAPE e): pattern e carattere di escape, solo come destra di LIKE
 } OpType;
 
 typedef struct ASTExpr {

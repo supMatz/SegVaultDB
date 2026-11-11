@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 // ── risultati costruiti qui ─────────────────────────────────────
 
@@ -46,13 +47,14 @@ static bool ci_contains(const char* hay, const char* needle) {
     return false;
 }
 
-// testo tra apici per LIKE: apici raddoppiati, backslash raddoppiato
+// '%testo%' per LIKE ... ESCAPE '!': % _ e ! del testo valgono per sé, apici e backslash raddoppiati
 static void like_literal(const char* needle, char* out, size_t n) {
     size_t k = 0;
     if (k + 2 < n) { out[k++] = '\''; out[k++] = '%'; }
-    for (const char* s = needle; *s && k + 4 < n; s++) {
-        char c = (char)tolower((unsigned char)*s);
-        if (c == '\'' || c == '\\') out[k++] = c;
+    for (const char* s = needle; *s && k + 5 < n; s++) {
+        char c = *s;
+        if (c == '%' || c == '_' || c == '!') out[k++] = '!';
+        else if (c == '\'' || c == '\\') out[k++] = c;
         out[k++] = c;
     }
     if (k + 3 <= n) { out[k++] = '%'; out[k++] = '\''; }
@@ -70,7 +72,7 @@ char* dbt_search_select(const char* db, const char* table, const char* needle) {
     if (!s) { db_columns_free(cols, n); return NULL; }
     len += (size_t)snprintf(s + len, cap - len, "SELECT * FROM `%s` WHERE ", table);
     for (int i = 0; i < n; i++)
-        len += (size_t)snprintf(s + len, cap - len, "%sLOWER(`%s`) LIKE %s", i ? " OR " : "", cols[i].name, lit);
+        len += (size_t)snprintf(s + len, cap - len, "%s`%s` LIKE %s ESCAPE '!'", i ? " OR " : "", cols[i].name, lit);
     db_columns_free(cols, n);
     return s;
 }
@@ -139,13 +141,25 @@ QueryResult* dbt_overview(const char* db) {
     ForeignKeyInfo* fks = db_list_foreign_keys(db, &nf);
     int cap = 0;
     uint64_t tot_rows = 0, tot_size = 0;
+    clock_t start = clock();
+    bool estimated = false;
     for (int t = 0; t < tables->count; t++) {
         const char* name = tables->names[t];
         char sql[200], rows[32] = "?", ncols[16], pk[200] = "", nidx[16] = "0", fko[16], refs[300] = "", size[32] = "";
-        snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM `%.120s`", name);
-        QueryResult* c = db_execute(sql);
-        if (c && c->success && c->num_rows) { snprintf(rows, sizeof(rows), "%s", c->rows[0].cells[0].value); tot_rows += strtoull(rows, NULL, 10); }
-        db_result_free(c);
+        TableInfo ti;
+        int ni = 0;
+        bool have_info = db_table_info(db, name, &ti, &ni);
+        // righe contate; dopo ~1,5 s di conteggi il contatore del catalogo ("~")
+        if ((double)(clock() - start) / CLOCKS_PER_SEC < 1.5 || !have_info) {
+            snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM `%.120s`", name);
+            QueryResult* c = db_execute(sql);
+            if (c && c->success && c->num_rows) { snprintf(rows, sizeof(rows), "%s", c->rows[0].cells[0].value); tot_rows += strtoull(rows, NULL, 10); }
+            db_result_free(c);
+        } else {
+            snprintf(rows, sizeof(rows), "~%llu", (unsigned long long)ti.num_rows);
+            tot_rows += ti.num_rows;
+            estimated = true;
+        }
         int n = 0;
         ColumnInfo* cols = db_list_columns(db, name, &n);
         snprintf(ncols, sizeof(ncols), "%d", n);
@@ -154,9 +168,7 @@ QueryResult* dbt_overview(const char* db) {
             if (cols[k].primary_key && pl + 2 < sizeof(pk))
                 pl += (size_t)snprintf(pk + pl, sizeof(pk) - pl, "%s%.60s", pl ? ", " : "", cols[k].name);
         db_columns_free(cols, n);
-        TableInfo ti;
-        int ni = 0;
-        if (db_table_info(db, name, &ti, &ni)) {
+        if (have_info) {
             snprintf(nidx, sizeof(nidx), "%d", ni);
             human_size(ti.size_bytes, size, sizeof(size));
             tot_size += ti.size_bytes;
@@ -179,7 +191,7 @@ QueryResult* dbt_overview(const char* db) {
     }
     // riga dei totali
     char trows[32], tsize[32], tcount[48];
-    snprintf(trows, sizeof(trows), "%llu", (unsigned long long)tot_rows);
+    snprintf(trows, sizeof(trows), "%s%llu", estimated ? "~" : "", (unsigned long long)tot_rows);
     human_size(tot_size, tsize, sizeof(tsize));
     snprintf(tcount, sizeof(tcount), "%d tables", tables->count);
     const char* v[8] = { tcount, trows, "", "", "", "", "", tsize };

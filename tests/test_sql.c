@@ -164,6 +164,23 @@ int main(void) {
     t("SELECT id FROM n WHERE b BETWEEN a AND a + 10", "2");
     t("SELECT id FROM n WHERE s LIKE 'h%' AND s NOT LIKE '%x%'", "1");
     t("SELECT id FROM n WHERE s LIKE NULL", "");
+    // LIKE ... ESCAPE: il carattere dopo l'escape vale per sé
+    t("CREATE TABLE lk (id INT PRIMARY KEY, s VARCHAR(30))", "OK:0");
+    t("INSERT INTO lk VALUES (1, '100%'), (2, '100 euro'), (3, 'a_b'), (4, 'axb'), (5, 'c!d')", "OK:5");
+    t("SELECT id FROM lk WHERE s LIKE '100!%' ESCAPE '!'", "1");
+    t("SELECT id FROM lk WHERE s LIKE '%!%%' ESCAPE '!' ORDER BY id", "1");
+    t("SELECT id FROM lk WHERE s LIKE 'a\\_b' ESCAPE '\\\\'", "3");      // in SQL il backslash si scrive '\\'
+    t("SELECT id FROM lk WHERE s LIKE 'a#_b' ESCAPE '#'", "3");
+    t("SELECT id FROM lk WHERE s LIKE 'a_b' ORDER BY id", "3;4");
+    t("SELECT id FROM lk WHERE s LIKE 'c!!d' ESCAPE '!'", "5");
+    t("SELECT id FROM lk WHERE s NOT LIKE '%!%%' ESCAPE '!' ORDER BY id", "2;3;4;5");
+    t("SELECT id FROM lk WHERE s LIKE 'A!_B' ESCAPE '!'", "3");
+    t("SELECT id FROM lk WHERE s LIKE '1%' ESCAPE 'ab'", "ERR:single character");
+    t("SELECT '50%' LIKE '50!%' ESCAPE '!', '50x' LIKE '50!%' ESCAPE '!' FROM lk WHERE id = 1", "1|0");
+    t("CREATE VIEW lkv AS SELECT id FROM lk WHERE s LIKE '%!_%' ESCAPE '!'", "OK:0");
+    t("SELECT * FROM lkv", "3");
+    t("DROP VIEW lkv", "OK:0");
+    t("DROP TABLE lk", "OK:0");
     t("SELECT TRUE + TRUE, FALSE FROM n WHERE id = 1", "2|0");
 
     // ── funzioni ──

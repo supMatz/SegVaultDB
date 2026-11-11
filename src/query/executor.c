@@ -53,13 +53,19 @@ static DataType parse_type(const char* type_name) {
     return SV_TYPE_VARCHAR;
 }
 
-// LIKE con % (qualsiasi sequenza) e _ (un carattere), senza distinzione maiuscole/minuscole
-static bool like_match(const char* s, const char* p) {
+// LIKE con % (qualsiasi sequenza) e _ (un carattere), senza distinzione maiuscole/minuscole;
+// esc (0 = nessuno): il carattere che lo segue nel pattern vale per sé (ESCAPE '!': '100!%')
+static bool like_match_esc(const char* s, const char* p, char esc) {
     while (*p) {
+        if (esc && *p == esc && p[1]) {
+            if (tolower((unsigned char)p[1]) != tolower((unsigned char)*s) || !*s) return false;
+            s++; p += 2;
+            continue;
+        }
         if (*p == '%') {
             while (*p == '%') p++;
             if (!*p) return true;
-            for (; *s; s++) if (like_match(s, p)) return true;
+            for (; *s; s++) if (like_match_esc(s, p, esc)) return true;
             return false;
         }
         if (!*s) return false;
@@ -68,6 +74,8 @@ static bool like_match(const char* s, const char* p) {
     }
     return *s == '\0';
 }
+
+static bool like_match(const char* s, const char* p) { return like_match_esc(s, p, 0); }
 
 static QueryResult* unknown_column_error(const char* col, const char* clause) {
     char msg[200];
@@ -1982,6 +1990,18 @@ static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out) {
                 return;
             }
             EvalVal a, b;
+            if ((e->op == OP_LIKE || e->op == OP_NOT_LIKE) && e->right && e->right->type == EXPR_BINARY && e->right->op == OP_ESCAPE) {
+                EvalVal x;
+                eval_expr(e->left, c, &a);
+                eval_expr(e->right->left, c, &b);
+                eval_expr(e->right->right, c, &x);
+                if (a.null || b.null || x.null) { ev_null(out); return; }
+                const char* es = ev_s(&x);
+                if (strlen(es) != 1) { ev_null(out); return; }     // ESCAPE vuoto o lungo: nessun risultato
+                bool m = like_match_esc(ev_s(&a), ev_s(&b), es[0]);
+                ev_int(out, e->op == OP_LIKE ? m : !m);
+                return;
+            }
             eval_expr(e->left, c, &a);
             eval_expr(e->right, c, &b);
             if (a.null || b.null) { ev_null(out); return; }

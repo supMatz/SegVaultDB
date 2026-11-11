@@ -61,7 +61,20 @@ int main(void) {
     CHECK(r && r->num_rows == 2 && trunc, "limit");
     db_result_free(r);
     char* sql = dbt_search_select("s", "cliente", "a'b");
-    CHECK(sql && strstr(sql, "LOWER(`nome`) LIKE '%a''b%'"), "select: %s", sql ? sql : "null");
+    CHECK(sql && strstr(sql, "`nome` LIKE '%a''b%' ESCAPE '!'"), "select: %s", sql ? sql : "null");
+    free(sql);
+    // % e _ cercati come caratteri
+    run("INSERT INTO ordine VALUES (12, 3, 'sconto 100% sul_totale!', 1.0)");
+    r = dbt_search("s", "100%", 0, &hit, NULL);
+    CHECK(r && r->num_rows == 1 && !strcmp(r->rows[0].cells[1].value, "nota"), "percent literal: %d", r ? r->num_rows : -1);
+    db_result_free(r);
+    r = dbt_search("s", "l_t", 0, &hit, NULL);
+    CHECK(r && r->num_rows == 1, "underscore literal: %d", r ? r->num_rows : -1);
+    db_result_free(r);
+    r = dbt_search("s", "e!", 0, &hit, NULL);
+    CHECK(r && r->num_rows == 1, "escape char literal: %d", r ? r->num_rows : -1);
+    db_result_free(r);
+    sql = dbt_search_select("s", "cliente", "x");
     free(sql);
 
     // panoramica
@@ -75,7 +88,7 @@ int main(void) {
     CHECK(i >= 0 && !strcmp(r->rows[i].cells[5].value, "1") && !r->rows[i].cells[6].value[0], "ordine stats");
     i = r ? find_row(r, 0, "vuota") : -1;
     CHECK(i >= 0 && r->rows[i].cells[3].is_null && !strcmp(r->rows[i].cells[1].value, "0"), "table without key");
-    CHECK(r && !strcmp(r->rows[r->num_rows - 1].cells[0].value, "3 tables") && !strcmp(r->rows[r->num_rows - 1].cells[1].value, "5"), "totals");
+    CHECK(r && !strcmp(r->rows[r->num_rows - 1].cells[0].value, "3 tables") && !strcmp(r->rows[r->num_rows - 1].cells[1].value, "6"), "totals");
     db_result_free(r);
 
     db_shutdown();

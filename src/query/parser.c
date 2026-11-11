@@ -229,6 +229,7 @@ static const char* op_text(OpType op) {
         case OP_PLUS: return " + "; case OP_MINUS: return " - "; case OP_MUL: return " * "; case OP_DIV: return " / ";
         case OP_MOD: return " % ";
         case OP_LIKE: return " LIKE "; case OP_NOT_LIKE: return " NOT LIKE ";
+        case OP_ESCAPE: return " ESCAPE ";
         default: return " ? ";
     }
 }
@@ -732,7 +733,20 @@ static ASTExpr* parse_predicate(ParserState* ps) {
         return new_unary(neg ? OP_IS_NOT_NULL : OP_IS_NULL, left);
     }
     bool neg = match(ps, TOK_NOT);
-    if (match(ps, TOK_LIKE)) return new_binary(neg ? OP_NOT_LIKE : OP_LIKE, left, parse_additive(ps));
+    if (match(ps, TOK_LIKE)) {
+        ASTExpr* pat = parse_additive(ps);
+        if (pat && ident_is(ps, "ESCAPE")) {      // a LIKE p ESCAPE 'c'
+            consume(ps);
+            ASTExpr* esc = parse_additive(ps);
+            if (esc && esc->type == EXPR_STRING && esc->str_val && strlen(esc->str_val) != 1) {
+                parse_fail(ps, "ESCAPE needs a single character", peek(ps));
+                ast_expr_free(left); ast_expr_free(pat); ast_expr_free(esc);
+                return NULL;
+            }
+            pat = new_binary(OP_ESCAPE, pat, esc);
+        }
+        return new_binary(neg ? OP_NOT_LIKE : OP_LIKE, left, pat);
+    }
     if (match(ps, TOK_BETWEEN)) {
         // x BETWEEN a AND b  ->  x >= a AND x <= b   (NOT: x < a OR x > b)
         ASTExpr* lo = parse_additive(ps);

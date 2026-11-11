@@ -223,10 +223,11 @@ senza chiave primaria.
 
 **Strumenti sul database** (tasto destro su un database nell'explorer, o menu *Query*):
 - *Search in database…* (`Ctrl+Shift+G`): cerca un testo in tutte le colonne di tutte le tabelle, senza
-  distinguere maiuscole e minuscole (anche numeri e date); il risultato ha una riga per valore trovato
+  distinguere maiuscole e minuscole (anche numeri e date; `%` e `_` sono cercati come caratteri); il risultato ha una riga per valore trovato
   con tabella, colonna, valore e chiave della riga (`id=3`), fino a 1000 valori;
 - *Database overview*: una riga per tabella con righe, colonne, chiave primaria, indici, chiavi esterne,
-  tabelle che la riferiscono e spazio su disco, più i totali;
+  tabelle che la riferiscono e spazio su disco, più i totali (oltre ~1,5 s di conteggi le righe
+  delle tabelle restanti vengono dal catalogo, segnate con `~`);
 - *Drop database…*; su una tabella *Empty table…* (`TRUNCATE`) e *Drop table…*, con una conferma che
   dice quante righe si perdono (le chiavi esterne che puntano alla tabella vengono tolte prima).
 
@@ -423,7 +424,7 @@ LIMIT n [OFFSET m];
 
 | Costrutto | Esempio |
 |---|---|
-| Operatori | `+ - * / %`, `= <> != < > <= >=`, `AND OR NOT` (logica a tre valori), `IS [NOT] NULL`, `[NOT] LIKE 'a%_'`, `[NOT] BETWEEN`, `[NOT] IN (lista)`; `/` fra interi dà un decimale (`7 / 2` = 3.5, come MySQL), la divisione per zero dà `NULL` |
+| Operatori | `+ - * / %`, `= <> != < > <= >=`, `AND OR NOT` (logica a tre valori), `IS [NOT] NULL`, `[NOT] LIKE 'a%_'` (senza distinzione maiuscole/minuscole; `ESCAPE '!'` rende letterali `%` e `_`: `LIKE '100!%' ESCAPE '!'`), `[NOT] BETWEEN`, `[NOT] IN (lista)`; `/` fra interi dà un decimale (`7 / 2` = 3.5, come MySQL), la divisione per zero dà `NULL` |
 | Aggregati | `COUNT(*)`, `COUNT([DISTINCT] x)`, `SUM`, `AVG`, `MIN`, `MAX` (anche su espressioni) |
 | Subquery | `x IN (SELECT ...)`, `NOT IN`, `EXISTS`, `NOT EXISTS`, `x > ALL (SELECT ...)`, `x = ANY / SOME (...)`, subquery scalari `(SELECT MAX(voto) FROM esame)` in `SELECT`, `WHERE`, `HAVING`, `SET`; correlate a qualunque profondità |
 | Insiemi | `UNION [ALL]`, `INTERSECT`, `EXCEPT` (`INTERSECT` lega più degli altri), `ORDER BY` / `LIMIT` sul risultato |

@@ -11,7 +11,8 @@ SCOPO: strumenti sul database intero, senza GUI (come la ricerca e la panoramica
 
 #include "../bridge/db_api.h"
 
-// SELECT * FROM `table` WHERE <ogni colonna> LIKE '%needle%' (malloc'd; NULL se la tabella non esiste)
+// SELECT * FROM `table` WHERE <ogni colonna> LIKE '%needle%' ESCAPE '!' (% e _ del testo valgono per sé;
+// malloc'd; NULL se la tabella non esiste)
 char* dbt_search_select(const char* db, const char* table, const char* needle);
 
 // ricerca senza distinzione tra maiuscole e minuscole; limit = valori al massimo (0 = 1000).
