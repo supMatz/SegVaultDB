@@ -271,10 +271,16 @@ int catalog_use_db(Catalog* c, const char* name) {
     return SV_NOT_FOUND;
 }
 
+// database corrente di questo thread (letture in parallelo: ognuna il suo); -2 = quello del catalogo
+static _Thread_local int g_thread_db = -2;
+
+void catalog_set_thread_db(int index) { g_thread_db = index; }
+
 Database* catalog_current_db(Catalog* c) {
-    if (!c || c->current_db < 0 || c->current_db >= c->num_databases)
+    int i = g_thread_db != -2 ? g_thread_db : c ? c->current_db : -1;
+    if (!c || i < 0 || i >= c->num_databases)
         return NULL;
-    return &c->databases[c->current_db];
+    return &c->databases[i];
 }
 
 TableSchema* catalog_get_table(Catalog* c, const char* db, const char* table) {

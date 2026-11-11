@@ -1,4 +1,5 @@
 #include "executor.h"
+#include "../platform_lock.h"
 #include "platform_compat.h"
 #include <string.h>
 #include <ctype.h>
@@ -1201,7 +1202,20 @@ static bool col_is_indexed(const TableSchema* ts, int ci) {
 
 // indice sulle colonne indicate (costruito leggendo la tabella se manca). NULL se manca
 // memoria o la lettura è stata annullata.
+static MemIndex* mi_get_cols_locked(ExecCtx* ctx, const char* db, TableSchema* ts, const int* cols, int ncols);
+
+// letture in parallelo: la ricerca e la costruzione dell'elenco degli indici sono serializzate;
+// un indice costruito è poi solo letto (le scritture hanno il motore in esclusiva)
+static SvRwLock g_mi_lock = SV_RWLOCK_INIT;
+
 static MemIndex* mi_get_cols(ExecCtx* ctx, const char* db, TableSchema* ts, const int* cols, int ncols) {
+    sv_rw_wr(&g_mi_lock);
+    MemIndex* ix = mi_get_cols_locked(ctx, db, ts, cols, ncols);
+    sv_rw_wrunlock(&g_mi_lock);
+    return ix;
+}
+
+static MemIndex* mi_get_cols_locked(ExecCtx* ctx, const char* db, TableSchema* ts, const int* cols, int ncols) {
     if (ncols < 1 || ncols > SV_MAX_KEY_COLS) return NULL;
     char name[SV_MAX_NAME_LEN * 2];
     size_t len = 0;
@@ -1232,7 +1246,7 @@ static MemIndex* mi_get_cols(ExecCtx* ctx, const char* db, TableSchema* ts, cons
     }
     if (scan) heap_scan_close(scan);
     free(hf);
-    if (!ok || atomic_load(&g_sv_scan_cancel)) { mi_free(ix); return NULL; }   // incompleto: scartato
+    if (!ok || sv_scan_cancelled()) { mi_free(ix); return NULL; }   // incompleto: scartato
     ix->next = g_mem_indexes;
     g_mem_indexes = ix;
     return ix;
@@ -2721,7 +2735,7 @@ static int cte_recursive(ExecCtx* x, Source* s, ASTCte* c, const CteScope* sc, i
             ok = false;
             break;
         }
-        if (atomic_load(&g_sv_scan_cancel)) { snprintf(err, errn, "Query cancelled"); ok = false; break; }
+        if (sv_scan_cancelled()) { snprintf(err, errn, "Query cancelled"); ok = false; break; }
         WorkTable wt = { &work, ts };
         c->work = &wt;
         ok = run_arms(x, arms, nanchor, na, depth, &self, &step, NULL, err, errn);
@@ -3402,7 +3416,7 @@ static bool plan_load(SelectPlan* p) {
             }
         }
     }
-    if (atomic_load(&g_sv_scan_cancel)) { snprintf(p->err, sizeof(p->err), "Query cancelled"); return false; }
+    if (sv_scan_cancelled()) { snprintf(p->err, sizeof(p->err), "Query cancelled"); return false; }
     return true;
 }
 
@@ -3480,7 +3494,7 @@ static const char* join_step(EvalCtx* ec, Combos* in, Combos* out, int k, JoinTy
     const char* fail = NULL;
     DataType ot = hashed ? ec->src[os].ts->columns[oc].type : SV_TYPE_INT;
     for (int i = 0; i < in->n && !fail; i++) {
-        if ((i & 1023) == 0 && atomic_load(&g_sv_scan_cancel)) { fail = "Query cancelled"; break; }
+        if ((i & 1023) == 0 && sv_scan_cancelled()) { fail = "Query cancelled"; break; }
         Tuple** base = COMBO(in, i);
         ec->cur = base;
         bool matched = false;
@@ -3844,7 +3858,7 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
     #define AFAIL(...) do { snprintf(p->err, sizeof(p->err), __VA_ARGS__); arm_state_free(&st, p->nsrc); return false; } while (0)
     // annullamento: controllato a ogni esecuzione, così si fermano anche le subquery
     // correlate (eseguite una volta per riga esterna)
-    if (atomic_load(&g_sv_scan_cancel)) AFAIL("Query cancelled");
+    if (sv_scan_cancelled()) AFAIL("Query cancelled");
 
     // 1. righe di ogni sorgente che passano i filtri dipendenti dalla query esterna
     for (int s = 0; s < p->nsrc; s++) {
@@ -4027,7 +4041,7 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
         int* unit_of = malloc(sizeof(int) * (size_t)(nunits ? nunits : 1));
         if (!unit_of) ok = false;
         for (int i = 0; ok && i < nunits; i++) {
-            if ((i & 1023) == 0 && atomic_load(&g_sv_scan_cancel)) { ok = false; break; }
+            if ((i & 1023) == 0 && sv_scan_cancelled()) { ok = false; break; }
             SET_UNIT(st.units[i]);
             OVal* row = orows_add(&all);
             if (!row) { ok = false; break; }
@@ -4044,7 +4058,7 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
         sm_free(&seen);
         if (ok) { for (int i = 0; i < nkeep; i++) st.units[i] = unit_of[i]; }
         free(unit_of);
-        if (!ok) { free(order); orows_free(&all); AFAIL("%s", atomic_load(&g_sv_scan_cancel) ? "Query cancelled" : "Out of memory"); }
+        if (!ok) { free(order); orows_free(&all); AFAIL("%s", sv_scan_cancelled() ? "Query cancelled" : "Out of memory"); }
         nunits = nkeep;
     } else {
         for (int i = 0; i < nunits; i++) order[nkeep++] = i;
@@ -4120,7 +4134,7 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
     ec.cur = NULL;
     ec.grp = NULL;
     if (ec.err[0]) AFAIL("%s", ec.err);
-    if (atomic_load(&g_sv_scan_cancel)) AFAIL("Query cancelled");
+    if (sv_scan_cancelled()) AFAIL("Query cancelled");
     #undef SET_UNIT
     #undef AFAIL
     p->st_out += res->nrows;

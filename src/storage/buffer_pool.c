@@ -17,6 +17,7 @@ BufferPool* bp_create(int capacity, int db_fd) {
     for (int i = 0; i < nb; i++) bp->buckets[i] = -1;
     for (int i = 0; i < capacity; i++) bp->frames[i].hnext = -1;
     bp->nbuckets = nb;
+    sv_rw_init(&bp->latch);
     bp->capacity = capacity;
     bp->db_fd    = db_fd;
     return bp;
@@ -96,7 +97,7 @@ static void frame_install(BufferPool* bp, int idx, Page* p) {
     bp->num_used++;
 }
 
-Page* bp_fetch(BufferPool* bp, uint32_t page_id) {
+static Page* bp_fetch_nl(BufferPool* bp, uint32_t page_id) {
     bp->stats.requests++;
     int idx = bp_find(bp, page_id);
     if (idx >= 0) {
@@ -119,7 +120,7 @@ Page* bp_fetch(BufferPool* bp, uint32_t page_id) {
     return p;
 }
 
-void bp_unpin(BufferPool* bp, uint32_t page_id, bool dirty) {
+static void bp_unpin_nl(BufferPool* bp, uint32_t page_id, bool dirty) {
     int idx = bp_find(bp, page_id);
     if (idx < 0) return;
     if (bp->frames[idx].pin_count > 0)
@@ -127,7 +128,7 @@ void bp_unpin(BufferPool* bp, uint32_t page_id, bool dirty) {
     if (dirty) bp->frames[idx].dirty = true;
 }
 
-int bp_new_page(BufferPool* bp, uint32_t* out_page_id) {
+static int bp_new_page_nl(BufferPool* bp, uint32_t* out_page_id) {
     // La nuova pagina va sempre in fondo al file (le pagine non vengono riusate: il WAL
     // identifica le righe con page_id + slot).
     long end = sv_lseek(bp->db_fd, 0, SEEK_END);
@@ -159,7 +160,7 @@ int bp_new_page(BufferPool* bp, uint32_t* out_page_id) {
     return SV_OK;
 }
 
-int bp_flush_page(BufferPool* bp, uint32_t page_id) {
+static int bp_flush_page_nl(BufferPool* bp, uint32_t page_id) {
     int idx = bp_find(bp, page_id);
     if (idx < 0) return SV_NOT_FOUND;
     if (!bp->frames[idx].dirty) return SV_OK;
@@ -176,7 +177,7 @@ static int cmp_frame_page(const void* a, const void* b) {
     return x < y ? -1 : x > y;
 }
 
-int bp_flush_all(BufferPool* bp) {
+static int bp_flush_all_nl(BufferPool* bp) {
     before_write(bp);
     int* dirty = malloc(sizeof(int) * (size_t)bp->capacity);
     int n = 0;
@@ -201,23 +202,71 @@ int bp_flush_all(BufferPool* bp) {
     return SV_OK;
 }
 
-void bp_remove_page(BufferPool* bp, uint32_t page_id) {
+static void bp_remove_page_nl(BufferPool* bp, uint32_t page_id) {
     if (!bp) return;
     int idx = bp_find(bp, page_id);
     if (idx >= 0) frame_release(bp, idx);
 }
 
-void bp_remove_all(BufferPool* bp) {
+static void bp_remove_all_nl(BufferPool* bp) {
     if (!bp) return;
     for (int i = 0; i < bp->capacity; i++) frame_release(bp, i);
 }
 
 void bp_destroy(BufferPool* bp) {
     if (!bp) return;
-    bp_flush_all(bp);
+    bp_flush_all_nl(bp);
     for (int i = 0; i < bp->capacity; i++)
         if (bp->frames[i].page) page_free(bp->frames[i].page);
     free(bp->frames);
     free(bp->buckets);
     free(bp);
 }
+
+// ── latch: letture in parallelo (tabella hash, CLOCK, pin e statistiche condivisi) ──
+Page* bp_fetch(BufferPool* bp, uint32_t page_id) {
+    sv_rw_wr(&bp->latch);
+    Page* r = bp_fetch_nl(bp, page_id);
+    sv_rw_wrunlock(&bp->latch);
+    return r;
+}
+
+void bp_unpin(BufferPool* bp, uint32_t page_id, bool dirty) {
+    sv_rw_wr(&bp->latch);
+    bp_unpin_nl(bp, page_id, dirty);
+    sv_rw_wrunlock(&bp->latch);
+}
+
+int bp_new_page(BufferPool* bp, uint32_t* out_page_id) {
+    sv_rw_wr(&bp->latch);
+    int r = bp_new_page_nl(bp, out_page_id);
+    sv_rw_wrunlock(&bp->latch);
+    return r;
+}
+
+int bp_flush_page(BufferPool* bp, uint32_t page_id) {
+    sv_rw_wr(&bp->latch);
+    int r = bp_flush_page_nl(bp, page_id);
+    sv_rw_wrunlock(&bp->latch);
+    return r;
+}
+
+int bp_flush_all(BufferPool* bp) {
+    sv_rw_wr(&bp->latch);
+    int r = bp_flush_all_nl(bp);
+    sv_rw_wrunlock(&bp->latch);
+    return r;
+}
+
+void bp_remove_page(BufferPool* bp, uint32_t page_id) {
+    sv_rw_wr(&bp->latch);
+    bp_remove_page_nl(bp, page_id);
+    sv_rw_wrunlock(&bp->latch);
+}
+
+void bp_remove_all(BufferPool* bp) {
+    sv_rw_wr(&bp->latch);
+    bp_remove_all_nl(bp);
+    sv_rw_wrunlock(&bp->latch);
+}
+

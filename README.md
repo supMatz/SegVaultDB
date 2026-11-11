@@ -525,7 +525,7 @@ DROP TRIGGER [IF EXISTS] nome;   SHOW TRIGGERS [FROM tabella];
 
 ### Non supportato
 
-Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), stored procedure, nomi qualificati con il database (`shop.prodotto`: si usa `USE shop`), esecuzione in parallelo: le sessioni del server hanno stato e transazioni proprie, ma le richieste girano una alla volta e una sola sessione per volta può avere una transazione aperta (vedi [Roadmap](#roadmap)).
+Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), stored procedure, nomi qualificati con il database (`shop.prodotto`: si usa `USE shop`), scritture in parallelo: le richieste di sola lettura girano insieme, quelle che scrivono una alla volta, e una sola sessione per volta può avere una transazione aperta (vedi [Roadmap](#roadmap)).
 
 ---
 
@@ -610,8 +610,9 @@ Regole da ricordare, valide per tutti i linguaggi:
   transazione restano tra le richieste (`BEGIN` in una, `COMMIT` in un'altra). Mentre una sessione ha
   una transazione aperta le altre richieste aspettano (fino a 10 s, poi HTTP 409); una transazione
   ferma da 30 s viene annullata. Dettagli in [docs/API.md](docs/API.md#sessioni).
-- Le richieste vengono eseguite una alla volta sul motore: è pensato per app, siti piccoli e medi,
-  laboratori, non per migliaia di scritture concorrenti al secondo.
+- Le richieste di sola lettura (`SELECT`) girano in parallelo tra loro; quelle che scrivono usano il
+  motore una alla volta: è pensato per app, siti piccoli e medi, laboratori, non per migliaia di
+  scritture concorrenti al secondo.
   Una richiesta che supera il limite di tempo (default 30 s) viene fermata.
 - Una pagina web di un'altra origine può chiamare il server solo se è ammessa (`--cors`, o
   *Web apps: Any origin* nel pannello); le altre ricevono 403 senza che nulla venga eseguito
@@ -1204,9 +1205,10 @@ SegVault implementa lexer e parser da zero, senza Flex né Bison.
 Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
 
 1. **Concorrenza** — fatto: sessioni del server con database, utente e transazione propri, anche su
-   più richieste, con un solo proprietario delle transazioni; stato dell'executor per thread. Da fare:
-   latch del buffer pool, database corrente e contesto per thread, lock lettori/scrittori per eseguire
-   le letture in parallelo; poi lock sulle righe o MVCC per le scritture concorrenti.
+   più richieste, con un solo proprietario delle transazioni; **letture in parallelo** (lock
+   lettori/scrittori con precedenza alle scritture, latch del buffer pool, database corrente e
+   annullamento per thread; verificato con ThreadSanitizer: `make test-tsan`). Da fare: scritture
+   concorrenti (lock sulle righe o MVCC).
 2. **Righe grandi** — pagine di overflow per testi e `BLOB` oltre i 4080 byte di una riga.
 3. **Compatibilità MySQL** — import dei dump di `mysqldump`, poi il protocollo di rete MySQL (le app
    PHP come WordPress si collegherebbero senza modifiche).

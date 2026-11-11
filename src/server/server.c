@@ -538,6 +538,21 @@ static void handle_sessions(SvServer* s, Request* rq, Response* rs, const char* 
     json_error(rs, 405, "use POST /api/v1/sessions or DELETE /api/v1/sessions/ID");
 }
 
+// tutti gli statement cominciano con SELECT o WITH (dopo spazi e commenti)? Il motore lo ricontrolla
+static bool reads_only(const char* script, const SqlRange* ranges, int n) {
+    int any = 0;
+    for (int k = 0; k < n; k++) {
+        if (!ranges[k].has_code) continue;
+        const char* p = script + ranges[k].code_start;
+        while (isspace((unsigned char)*p)) p++;
+        if (strncasecmp(p, "SELECT", 6) && strncasecmp(p, "WITH", 4)) return false;
+        char c = p[toupper((unsigned char)p[0]) == 'S' ? 6 : 4];
+        if (isalnum((unsigned char)c) || c == '_') return false;
+        any++;
+    }
+    return any > 0;
+}
+
 // esegue lo script (già con i parametri) nel database indicato e scrive la risposta;
 // sql_for_log: il testo originale, con i segnaposto, per il registro. Libera script.
 static void run_script(SvServer* s, Response* rs, char* script, const char* sql_for_log, const char* dbname,
@@ -555,6 +570,50 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
 
     double t0 = now_ms();
     one_line(rs->detail, sizeof(rs->detail), sql_for_log);   // con i '?': i valori dei parametri non finiscono nel registro
+    JsonBuf res = {0}, *b = &res;               // i risultati; la risposta si compone alla fine
+    bool failed = false, first = true;
+    char errmsg[1100] = "";
+    int err_stmt = -1, err_line = 0, err_col = 0;
+    const char* warning = NULL;
+    bool session_tx = false;
+    // solo SELECT, senza sessione né transazione: in parallelo con le altre letture
+    bool parallel = !ss && !want_tx && reads_only(script, ranges, nst);
+    if (parallel) {
+        int idx = 0;
+        for (int k = 0; k < nst; k++) {
+            if (!ranges[k].has_code) continue;
+            int a = ranges[k].code_start, e = ranges[k].end;
+            char saved = script[e];
+            script[e] = '\0';
+            bool refused = false;
+            QueryResult* r = db_execute_readonly(script + a, dbname, user, s->cfg.timeout_ms, &refused);
+            script[e] = saved;
+            if (refused) { parallel = false; break; }   // la via normale rifà tutto (sono solo letture)
+            if (!r->success) {
+                failed = true;
+                err_stmt = idx;
+                if (strstr(r->error, "time limit")) snprintf(errmsg, sizeof(errmsg), "the request took longer than %d ms and was stopped", s->cfg.timeout_ms);
+                else snprintf(errmsg, sizeof(errmsg), "%s", r->error);
+                err_line = r->error_line > 0 ? line_of(script, a) + r->error_line - 1 : line_of(script, a);
+                if (r->error_line > 0) err_col = r->error_col;
+                db_result_free(r);
+                break;
+            }
+            if (!first) jb_lit(b, ",");
+            first = false;
+            result_json(b, r, objects);
+            rs->rows += r->num_rows;
+            db_result_free(r);
+            idx++;
+        }
+        if (!parallel) {                        // si ricomincia per la via normale
+            free(res.data);
+            memset(&res, 0, sizeof(res));
+            failed = false; first = true; errmsg[0] = '\0'; err_stmt = -1; err_line = err_col = 0;
+            rs->rows = 0;
+        }
+    }
+    if (!parallel) {
     exec_begin(s);
     expire_sessions(s);
     // un'altra sessione ha una transazione aperta: si aspetta che finisca (o che scada)
@@ -585,11 +644,6 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
     const char* cur = db_current_database();
     if (cur) snprintf(prev_db, sizeof(prev_db), "%s", cur);
 
-    JsonBuf res = {0}, *b = &res;               // i risultati; la risposta si compone alla fine
-    bool failed = false, first = true;
-    char errmsg[1100] = "";
-    int err_stmt = -1, err_line = 0, err_col = 0;
-    const char* warning = NULL;
 
     if (dbname[0]) {
         char use[96];
@@ -634,7 +688,6 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
         if (failed) { if (in_transaction()) db_rollback(); }
         else if (!db_commit()) { failed = true; snprintf(errmsg, sizeof(errmsg), "COMMIT failed"); }
     }
-    bool session_tx = false;
     if (ss) {                                   // la sessione conserva database e transazione
         session_tx = in_transaction();
         db_session_leave(ss->db);
@@ -653,6 +706,7 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
         db_result_free(db_execute(use));        // fallisce solo se il database è stato eliminato
     }
     exec_end(s);
+    }
 
     b = &rs->body;
     jb_raw(b, failed ? "{\"ok\":false,\"results\":[" : "{\"ok\":true,\"results\":[", failed ? 23 : 22);

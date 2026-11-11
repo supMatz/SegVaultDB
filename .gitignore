@@ -46,3 +46,6 @@ test_auth
 test_auth_asan
 test_sessions
 test_sessions_asan
+test_parallel
+test_parallel_asan
+test_parallel_tsan

@@ -171,9 +171,11 @@ resta una stringa.
 
 ## Transazioni e concorrenza
 
-Le richieste vengono eseguite **una alla volta** sul motore (le connessioni sono comunque servite da
-thread separati: un client lento a inviare o ricevere non blocca gli altri). Senza sessione ogni
-richiesta è un'unità chiusa:
+Le connessioni sono servite da thread separati. Una richiesta **di sola lettura** (solo `SELECT` /
+`WITH ... SELECT`, senza sessione e senza `"transaction": true`) viene eseguita **in parallelo** con
+le altre letture; tutte le altre richieste usano il motore una alla volta, e mentre una scrive le
+letture aspettano (le scritture hanno la precedenza, così un flusso continuo di letture non le blocca).
+Senza sessione ogni richiesta è un'unità chiusa:
 
 - con `"transaction": true` lo script è atomico (commit alla fine, rollback al primo errore);
 - `BEGIN` ... `COMMIT` dentro lo stesso `sql` funzionano; una transazione lasciata aperta a fine

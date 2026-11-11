@@ -1,4 +1,5 @@
 #include "heap.h"
+#include "platform_compat.h"
 
 // limite di sicurezza contro catene corrotte (cicli)
 #define HEAP_MAX_CHAIN SV_MAX_PAGE_ID
@@ -339,6 +340,19 @@ HeapScan* heap_scan_open(HeapFile* hf, TableSchema* schema) {
 }
 
 atomic_int g_sv_scan_cancel = 0;
+static _Thread_local double g_scan_deadline;
+static _Thread_local unsigned g_scan_ticks;
+
+void sv_scan_set_deadline(double deadline_ms) { g_scan_deadline = deadline_ms; g_scan_ticks = 0; }
+
+bool sv_scan_cancelled(void) {
+    if (atomic_load(&g_sv_scan_cancel)) return true;
+    if (g_scan_deadline > 0 && (++g_scan_ticks & 255) == 0 && sv_get_time_ms() > g_scan_deadline) {
+        g_scan_ticks = 255;                  // da qui in poi si controlla ogni volta
+        return true;
+    }
+    return false;
+}
 
 static void scan_release(HeapScan* scan) {
     if (scan->page) { bp_unpin(scan->hf->bp, scan->page->page_id, false); scan->page = NULL; }
@@ -346,7 +360,7 @@ static void scan_release(HeapScan* scan) {
 
 const uint8_t* heap_scan_next_raw(HeapScan* scan, RID* out_rid, uint16_t* out_len) {
     if (!scan || scan->done) return NULL;
-    if (atomic_load(&g_sv_scan_cancel)) { scan_release(scan); scan->done = true; return NULL; }
+    if (sv_scan_cancelled()) { scan_release(scan); scan->done = true; return NULL; }
     while (scan->current_page != 0) {
         // la pagina resta pinnata finché la scansione non passa alla successiva
         if (!scan->page || scan->page->page_id != scan->current_page) {

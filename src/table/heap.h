@@ -47,6 +47,10 @@ void heap_cache_forget(BufferPool* bp, uint32_t root_page_id);
 // Viene attivato solo durante le query in sola lettura, mai a metà di una modifica.
 #include <stdatomic.h>
 extern atomic_int g_sv_scan_cancel;
+// scadenza delle letture di questo thread (ms di sv_get_time_ms, 0 = nessuna)
+void sv_scan_set_deadline(double deadline_ms);
+// la lettura in corso va interrotta? (annullamento globale o scadenza del thread)
+bool sv_scan_cancelled(void);
 void heap_scan_close(HeapScan* scan);
 
 #endif

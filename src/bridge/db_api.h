@@ -267,6 +267,13 @@ void db_session_end(DbSession* s);              // annulla la sua transazione e 
 bool db_session_in_transaction(const DbSession* s);
 bool db_session_blocked(void);                  // una sessione ha una transazione aperta
 
+// ── letture in parallelo ──
+// Esegue una sola SELECT accanto ad altre letture (lock condiviso): dbname = database (NULL / "" =
+// quello corrente), user = permessi (NULL / "" = root), timeout_ms = limite (0 = nessuno).
+// *refused = true (e NULL) se non si può fare in parallelo: non è una SELECT, una transazione è
+// aperta, il database non esiste, ...: allora va eseguita con db_execute.
+QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char* user, int timeout_ms, bool* refused);
+
 // ── statistiche del motore (pagina Monitor del server; come SHOW STATUS, senza sessione) ──
 typedef struct {
     int       page_size;

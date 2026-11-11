@@ -34,6 +34,8 @@ typedef struct {
     uint64_t new_pages;    // pagine allocate
 } BufferStats;
 
+#include "../platform_lock.h"
+
 typedef struct {
     Frame*    frames;      // array di frame (dimensione = capacity)
     int       capacity;    // numero massimo di frame
@@ -48,6 +50,7 @@ typedef struct {
     // chiamata prima di scrivere una pagina su disco (regola del WAL: prima il log)
     void      (*before_write)(void* ctx);
     void*     before_write_ctx;
+    SvRwLock  latch;       // usato come mutex: più thread leggono in parallelo
 } BufferPool;
 
 BufferPool* bp_create(int capacity, int db_fd);

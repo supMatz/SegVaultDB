@@ -28,13 +28,6 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
   // grande della struttura reale (40 byte a 64 bit)
   #include <io.h>
   #include <sys/locking.h>
-  __declspec(dllimport) void __stdcall InitializeCriticalSection(void* cs);
-  __declspec(dllimport) void __stdcall EnterCriticalSection(void* cs);
-  __declspec(dllimport) void __stdcall LeaveCriticalSection(void* cs);
-  static _Alignas(16) unsigned char g_db_mutex[64];
-  static void db_mutex_init(void)   { InitializeCriticalSection(g_db_mutex); }
-  static void db_lock(void)         { EnterCriticalSection(g_db_mutex); }
-  static void db_unlock(void)       { LeaveCriticalSection(g_db_mutex); }
   static int  db_lock_file(int fd) {
       long cur = _lseek(fd, 0, SEEK_CUR);
       _lseek(fd, 0, SEEK_SET);
@@ -45,18 +38,17 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
 #else
   #include <pthread.h>
   #include <sys/file.h>
-  static pthread_mutex_t g_db_mutex;
-  static void db_mutex_init(void) {
-      pthread_mutexattr_t a;
-      pthread_mutexattr_init(&a);
-      pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
-      pthread_mutex_init(&g_db_mutex, &a);
-      pthread_mutexattr_destroy(&a);
-  }
-  static void db_lock(void)        { pthread_mutex_lock(&g_db_mutex); }
-  static void db_unlock(void)      { pthread_mutex_unlock(&g_db_mutex); }
   static int  db_lock_file(int fd) { return flock(fd, LOCK_EX | LOCK_NB); }
 #endif
+
+// Lock del motore: le SELECT di db_execute_readonly lo prendono in lettura (in parallelo tra loro),
+// tutto il resto in scrittura (esclusivo). L'esclusivo è rientrante con un contatore per thread.
+#include "../platform_lock.h"
+static SvRwLock g_db_rw;
+static _Thread_local int g_lock_depth;
+static void db_mutex_init(void) { sv_rw_init(&g_db_rw); }
+static void db_lock(void)       { if (g_lock_depth++ == 0) sv_rw_wr(&g_db_rw); }
+static void db_unlock(void)     { if (--g_lock_depth == 0) sv_rw_wrunlock(&g_db_rw); }
 
 static char g_init_error[256];
 const char* db_init_error(void) { return g_init_error; }
@@ -896,6 +888,53 @@ bool db_session_blocked(void) {
     bool b = g_tx_owner != NULL;
     db_unlock();
     return b;
+}
+
+// ── letture in parallelo ────────────────────────────────────────
+
+QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char* user, int timeout_ms, bool* refused) {
+    *refused = false;
+    if (!g_db.initialized || !sql) { *refused = true; return NULL; }
+    double t0 = get_time_ms();
+    sv_rw_rd(&g_db_rw);
+    // una transazione aperta (di una sessione o della GUI): niente letture accanto ai suoi dati non
+    // confermati; e un thread che ha già il lock esclusivo non può prenderlo anche in lettura
+    if (g_tx_owner || g_db.exec_ctx.tx_id || g_active || g_lock_depth) { sv_rw_rdunlock(&g_db_rw); *refused = true; return NULL; }
+    TokenList* tokens = lexer_tokenize(sql);
+    ParseResult* parsed = tokens ? parser_parse(tokens) : NULL;
+    QueryResult* r = NULL;
+    int idx = g_db.catalog->current_db;
+    if (dbname && dbname[0]) {
+        idx = -1;
+        for (int i = 0; i < g_db.catalog->num_databases; i++) if (!strcasecmp(g_db.catalog->databases[i].name, dbname)) idx = i;
+    }
+    // solo una SELECT, in un database esistente, con un utente che esiste; il resto va per la via normale
+    bool ok = parsed && parsed->success && parsed->count == 1 && parsed->statements[0]->type == NODE_SELECT &&
+              (!dbname || !dbname[0] || idx >= 0) && (!user || !user[0] || auth_user_exists(user));
+    if (ok) {
+        char err[300];
+        const char* dn = idx >= 0 ? g_db.catalog->databases[idx].name : "";
+        if (user && user[0] && !auth_check(user, parsed->statements[0], dn, err, sizeof(err))) r = result_error(err);
+        else {
+            catalog_set_thread_db(idx);
+            sv_scan_set_deadline(timeout_ms > 0 ? t0 + timeout_ms : 0);
+            ExecCtx ctx = g_db.exec_ctx;              // copia: nessuna transazione, niente stato condiviso
+            ctx.tx_id = 0;
+            r = executor_run(&ctx, parsed->statements[0]);
+            bool late = timeout_ms > 0 && get_time_ms() > t0 + timeout_ms && (!r || !r->success);
+            sv_scan_set_deadline(0);
+            catalog_set_thread_db(-2);
+            if (late || !r) {
+                if (r) db_result_free(r);
+                r = result_error(late ? "Query cancelled: time limit reached" : "Out of memory");
+            }
+        }
+        if (r) r->exec_time_ms = get_time_ms() - t0;
+    } else *refused = true;
+    if (parsed) parse_result_free(parsed);
+    if (tokens) lexer_free(tokens);
+    sv_rw_rdunlock(&g_db_rw);
+    return r;
 }
 
 bool db_engine_stats(DbEngineStats* out) {
