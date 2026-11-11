@@ -461,6 +461,7 @@ EXPLAIN ANALYZE SELECT ...;    -- esegue la query: righe stimate e reali, esecuz
 SHOW STATUS;                   -- buffer pool (hit ratio, sostituzioni CLOCK), pagine scritte, log, checkpoint
 SHOW INDEXES FROM t;           -- chiavi e indici, costruiti o no, numero di chiavi distinte
 CHECKPOINT;                    -- pagine modificate su disco e log svuotato
+VACUUM;                        -- recupera le pagine delle righe grandi non più usate (fuori da una transazione)
 ```
 
 ### Transazioni
@@ -1210,8 +1211,8 @@ Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
    lettori/scrittori con precedenza alle scritture, latch del buffer pool, database corrente e
    annullamento per thread; verificato con ThreadSanitizer: `make test-tsan`). Da fare: scritture
    concorrenti (lock sulle righe o MVCC).
-2. **Righe grandi** — fatto: pagine di overflow (righe fino a 64 MB, testi fino a 16 MB). Da fare:
-   recuperare lo spazio delle catene non più usate (oggi restano nel file, mai riusate).
+2. **Righe grandi** — fatto: pagine di overflow (righe fino a 64 MB, testi fino a 16 MB); `VACUUM`
+   rende riusabili le pagine delle righe grandi aggiornate o eliminate.
 3. **Compatibilità MySQL** — fatto: import dei dump di `mysqldump` / phpMyAdmin (anche date con i
    decimali dei secondi). Da fare: il protocollo di rete MySQL (le app PHP come WordPress si
    collegherebbero senza modifiche).

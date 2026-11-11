@@ -437,3 +437,23 @@ void heap_scan_close(HeapScan* scan) {
     free(scan->ovbuf);
     free(scan);
 }
+
+void heap_mark_overflow(HeapFile* hf, uint8_t* bitmap, uint32_t nbits) {
+    uint32_t pid = hf ? hf->root_page_id : 0, count = 0;
+    while (pid && count++ < HEAP_MAX_CHAIN) {
+        Page* p = bp_fetch(hf->bp, pid);
+        if (!p) break;
+        for (uint16_t s = 0; s < p->num_slots; s++) {
+            uint16_t len;
+            const void* d = page_get_slot(p, s, &len);
+            if (d && ov_is_stub(d, len, NULL, NULL)) {
+                uint8_t stub[OV_STUB_LEN];
+                memcpy(stub, d, OV_STUB_LEN);
+                ov_mark_bp(hf->bp, stub, OV_STUB_LEN, bitmap, nbits);
+            }
+        }
+        uint32_t next = page_next(p);
+        bp_unpin(hf->bp, pid, false);
+        pid = next;
+    }
+}

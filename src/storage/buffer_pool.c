@@ -128,9 +128,39 @@ static void bp_unpin_nl(BufferPool* bp, uint32_t page_id, bool dirty) {
     if (dirty) bp->frames[idx].dirty = true;
 }
 
+static void bp_remove_page_nl(BufferPool* bp, uint32_t page_id);
+
+// una pagina liberata da VACUUM, se su disco è ancora libera (l'elenco può essere vecchio dopo un
+// crash: il flag sul disco decide). 0 = nessuna
+static uint32_t take_free(BufferPool* bp) {
+    while (bp->nfree > 0) {
+        uint32_t id = bp->free_ids[--bp->nfree];
+        Page* d = page_read(id, bp->db_fd);
+        bool ok = d && (d->flags & PAGE_FLAG_FREE);
+        page_free(d);
+        if (ok) {
+            bp_remove_page_nl(bp, id);                       // via la copia vecchia dalla cache
+            return id;
+        }
+    }
+    return 0;
+}
+
 static int bp_new_page_nl(BufferPool* bp, uint32_t* out_page_id) {
-    // La nuova pagina va sempre in fondo al file (le pagine non vengono riusate: il WAL
-    // identifica le righe con page_id + slot).
+    // Prima una pagina liberata da VACUUM (dopo un checkpoint nessun record del WAL la nomina);
+    // altrimenti in fondo al file.
+    uint32_t reuse = take_free(bp);
+    if (reuse) {
+        int idx = bp_evict(bp);
+        if (idx < 0) { bp->free_ids[bp->nfree++] = reuse; return SV_ERR; }
+        Page* p = page_create(reuse);
+        if (!p) return SV_ERR;
+        page_write(p, bp->db_fd);                         // il flag FREE sparisce subito dal disco
+        bp->stats.new_pages++;
+        frame_install(bp, idx, p);
+        if (out_page_id) *out_page_id = reuse;
+        return SV_OK;
+    }
     long end = sv_lseek(bp->db_fd, 0, SEEK_END);
     uint32_t new_id = end > 0 ? (uint32_t)((end + SV_PAGE_SIZE - 1) / SV_PAGE_SIZE) : 0;
     if (new_id == 0) {
@@ -220,6 +250,7 @@ void bp_destroy(BufferPool* bp) {
         if (bp->frames[i].page) page_free(bp->frames[i].page);
     free(bp->frames);
     free(bp->buckets);
+    free(bp->free_ids);
     free(bp);
 }
 
@@ -270,3 +301,28 @@ void bp_remove_all(BufferPool* bp) {
     sv_rw_wrunlock(&bp->latch);
 }
 
+void bp_add_free(BufferPool* bp, uint32_t page_id) {
+    sv_rw_wr(&bp->latch);
+    if (bp->nfree >= bp->free_cap) {
+        int nc = bp->free_cap ? bp->free_cap * 2 : 256;
+        uint32_t* n = realloc(bp->free_ids, sizeof(uint32_t) * (size_t)nc);
+        if (n) { bp->free_ids = n; bp->free_cap = nc; }
+    }
+    if (bp->nfree < bp->free_cap) bp->free_ids[bp->nfree++] = page_id;
+    sv_rw_wrunlock(&bp->latch);
+}
+
+int bp_free_count(BufferPool* bp) {
+    sv_rw_wr(&bp->latch);
+    int n = bp->nfree;
+    sv_rw_wrunlock(&bp->latch);
+    return n;
+}
+
+int bp_free_list(BufferPool* bp, uint32_t* out, int max) {
+    sv_rw_wr(&bp->latch);
+    int n = bp->nfree < max ? bp->nfree : max;
+    if (n > 0) memcpy(out, bp->free_ids, sizeof(uint32_t) * (size_t)n);
+    sv_rw_wrunlock(&bp->latch);
+    return n;
+}

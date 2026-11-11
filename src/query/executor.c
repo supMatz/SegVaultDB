@@ -6648,6 +6648,16 @@ static QueryResult* exec_drop_index(ExecCtx* ctx, ASTNode* n) {
             return result_ok_msg(0);
         }
     }
+    // indice creato con CREATE UNIQUE INDEX: è un vincolo UNIQUE con quel nome
+    for (int k = 0; k < ts->num_constraints; k++)
+        if (ts->constraints[k].kind == CONS_UNIQUE && !strcasecmp(ts->constraints[k].name, n->drop_index.index_name)) {
+            ASTNode alt;
+            memset(&alt, 0, sizeof(alt));
+            alt.type = NODE_ALTER_TABLE;
+            snprintf(alt.alter_table.table_name, sizeof(alt.alter_table.table_name), "%s", ts->name);
+            snprintf(alt.alter_table.drop_constraint, sizeof(alt.alter_table.drop_constraint), "%s", n->drop_index.index_name);
+            return exec_alter_table(ctx, &alt);
+        }
     return result_error_msg("Index not found");
 }
 
@@ -6788,6 +6798,7 @@ static QueryResult* executor_run_impl(ExecCtx* ctx, ASTNode* stmt) {
         case NODE_ROLLBACK_TO:  return result_ok_msg(0);
         case NODE_CREATE_TRIGGER: return exec_create_trigger(ctx, stmt);
         case NODE_CHECKPOINT:   return result_ok_msg(0);
+        case NODE_VACUUM:       return result_ok_msg(0);
         case NODE_DROP_TRIGGER: return exec_drop_trigger(ctx, stmt);
         default:
             return result_error_msg("Unsupported statement type");

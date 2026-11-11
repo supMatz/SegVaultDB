@@ -1749,6 +1749,11 @@ static ASTNode* parse_statement(ParserState* ps) {
         case TOK_CREATE: {
             consume(ps);
             Token sub = consume(ps);
+            bool unique_index = false;                          // CREATE UNIQUE INDEX
+            if (sub.type == TOK_IDENTIFIER && sub.text && !strcasecmp(sub.text, "UNIQUE") && peek(ps).type == TOK_INDEX) {
+                unique_index = true;
+                sub = consume(ps);
+            }
             if (ident_is(ps, "IF")) {                            // CREATE ... IF NOT EXISTS
                 consume(ps);
                 if (!match(ps, TOK_NOT) || !match(ps, TOK_EXISTS)) { parse_fail(ps, "Expected IF NOT EXISTS", peek(ps)); break; }
@@ -1763,6 +1768,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             } else if (sub.type == TOK_TABLE) {
                 parse_create_table(ps, n);
             } else if (sub.type == TOK_INDEX) {
+                // CREATE [UNIQUE] INDEX nome ON t (c1 [ASC|DESC] [, c2 ...]) [USING BTREE|HASH]
                 n->type = NODE_CREATE_INDEX;
                 Token in = consume(ps);
                 copy_text(ps, n->create_index.index_name, sizeof(n->create_index.index_name), in.text);
@@ -1770,9 +1776,35 @@ static ASTNode* parse_statement(ParserState* ps) {
                 Token tn = consume(ps);
                 copy_text(ps, n->create_index.table_name, sizeof(n->create_index.table_name), tn.text);
                 expect(ps, TOK_LPAREN);
-                Token cn = consume(ps);
-                copy_text(ps, n->create_index.col_name, sizeof(n->create_index.col_name), cn.text);
-                expect(ps, TOK_RPAREN);
+                char cols[8][64];
+                int ncols = 0;
+                while (ps->result->success) {
+                    Token cn = consume(ps);
+                    if (cn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name in the index", cn); break; }
+                    if (ncols < 8) copy_text(ps, cols[ncols++], sizeof(cols[0]), cn.text);
+                    if (peek(ps).type == TOK_LPAREN) { consume(ps); consume(ps); expect(ps, TOK_RPAREN); }   // prefisso: col(10)
+                    if (peek(ps).type == TOK_ASC || peek(ps).type == TOK_DESC) consume(ps);
+                    if (match(ps, TOK_COMMA)) continue;
+                    expect(ps, TOK_RPAREN);
+                    break;
+                }
+                if (ident_is(ps, "USING")) { consume(ps); consume(ps); }
+                if (ncols > 0) copy_text(ps, n->create_index.col_name, sizeof(n->create_index.col_name), cols[0]);
+                if (unique_index && ps->result->success) {
+                    // = ALTER TABLE t ADD CONSTRAINT nome UNIQUE (colonne): il vincolo fa da indice
+                    char table[64], name[64];
+                    snprintf(table, sizeof(table), "%s", n->create_index.table_name);
+                    snprintf(name, sizeof(name), "%s", n->create_index.index_name);
+                    memset(&n->alter_table, 0, sizeof(n->alter_table));
+                    n->type = NODE_ALTER_TABLE;
+                    snprintf(n->alter_table.table_name, sizeof(n->alter_table.table_name), "%s", table);
+                    snprintf(n->alter_table.add.name, sizeof(n->alter_table.add.name), "%s", name);
+                    n->alter_table.add.kind = CONS_UNIQUE;
+                    n->alter_table.add.ncols = ncols;
+                    for (int k = 0; k < ncols; k++) snprintf(n->alter_table.add.cols[k], sizeof(n->alter_table.add.cols[k]), "%.63s", cols[k]);
+                    n->alter_table.has_add = true;
+                }
+                // più colonne: l'indice accelera tramite la prima (come il prefisso di un indice composto)
             } else if (sub.type == TOK_VIEW) {
                 n->type = NODE_CREATE_VIEW;
                 Token vn = consume(ps);
@@ -2045,6 +2077,7 @@ static ASTNode* parse_statement(ParserState* ps) {
         default:
             if (query_starts(ps, 0)) { free(n); return parse_query(ps); }   // WITH ...
             if (ident_is(ps, "CHECKPOINT")) { consume(ps); n->type = NODE_CHECKPOINT; break; }
+            if (ident_is(ps, "VACUUM")) { consume(ps); n->type = NODE_VACUUM; break; }
             snprintf(ps->result->error, sizeof(ps->result->error),
                      "Unexpected token: %.200s at line %d", t.text, t.line);
             ps->result->success = false;

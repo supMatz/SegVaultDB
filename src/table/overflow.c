@@ -158,3 +158,18 @@ bool ov_slot_equals(int db_fd, const uint8_t* cur, size_t cur_len, const uint8_t
     free(full);
     return eq;
 }
+
+void ov_mark_bp(BufferPool* bp, const uint8_t* stub, size_t stub_len, uint8_t* bitmap, uint32_t nbits) {
+    uint32_t total, pid;
+    if (!ov_is_stub(stub, stub_len, &total, &pid)) return;
+    uint32_t guard = chunks_for(total) + 1;
+    while (pid && pid < nbits && guard--) {
+        if (bitmap[pid / 8] & (1u << (pid % 8))) break;          // già vista: niente cicli
+        bitmap[pid / 8] |= (uint8_t)(1u << (pid % 8));
+        Page* p = bp_fetch(bp, pid);
+        if (!p) break;
+        uint32_t next = (p->flags & PAGE_FLAG_OVERFLOW) ? page_next(p) : 0;
+        bp_unpin(bp, pid, false);
+        pid = next;
+    }
+}

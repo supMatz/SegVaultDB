@@ -32,6 +32,9 @@ uint8_t* ov_load_bp(BufferPool* bp, const uint8_t* stub, size_t stub_len, size_t
 int      ov_store_fd(int db_fd, const uint8_t* data, size_t n, uint8_t* stub);
 uint8_t* ov_load_fd(int db_fd, const uint8_t* stub, size_t stub_len, size_t* n);
 
+// VACUUM: segna nella bitmap (bit = page_id) le pagine della catena di uno stub
+void ov_mark_bp(BufferPool* bp, const uint8_t* stub, size_t stub_len, uint8_t* bitmap, uint32_t nbits);
+
 // per il WAL: inserisce la riga nella pagina (con uno stub se è grande); slot o < 0
 int  ov_slot_put(int db_fd, void* page, const uint8_t* data, size_t n);
 // il contenuto dello slot (anche uno stub) è proprio data?

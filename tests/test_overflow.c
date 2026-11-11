@@ -118,6 +118,30 @@ int main(void) {
     CHECK(text_ok(3, 9, 's'), "committed update survives");
     CHECK(num("SELECT COUNT(*) FROM big WHERE id = 62") == 0, "uncommitted large insert rolled back");
     CHECK(text_ok(6, (2u << 20) + 3, 'f') && text_ok(1, 80000, 'x'), "older large rows intact");
+
+    // VACUUM: le catene non più usate tornano disponibili e il file smette di crescere
+    for (int i = 0; i < 3; i++) ok("UPDATE big SET body = CONCAT(SUBSTR(body, 2), 'f') WHERE id = 6");
+    QueryResult* v = db_execute("VACUUM");
+    int freed = v && v->success ? v->rows_affected : -1;
+    db_result_free(v);
+    CHECK(freed > 1000, "vacuum freed pages: %d", freed);
+    FILE* fd = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+    long before = 0, after = 0;
+    if (fd) { fseek(fd, 0, SEEK_END); before = ftell(fd); fclose(fd); }
+    for (int i = 0; i < 3; i++) ok("UPDATE big SET body = CONCAT(SUBSTR(body, 2), 'f') WHERE id = 6");
+    fd = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+    if (fd) { fseek(fd, 0, SEEK_END); after = ftell(fd); fclose(fd); }
+    CHECK(after == before, "freed pages reused: file %ld -> %ld", before, after);
+    CHECK(text_ok(6, (2u << 20) + 3, 'f') && text_ok(60, 200000, 'k') && text_ok(1, 80000, 'x'), "data intact after vacuum and reuse");
+    CHECK(ok("BEGIN") && !ok("VACUUM") && strstr(g_err, "transaction") && ok("ROLLBACK"), "vacuum refused inside a transaction");
+    db_shutdown();
+    CHECK(db_init(dir), "reopen after vacuum");
+    ok("USE o");
+    CHECK(text_ok(6, (2u << 20) + 3, 'f') && text_ok(3, 9, 's') && num("SELECT COUNT(*) FROM big") == 207, "all rows after restart: %lld", num("SELECT COUNT(*) FROM big"));
+    v = db_execute("VACUUM");
+    CHECK(v && v->success, "second vacuum");
+    db_result_free(v);
+    CHECK(insert_text(80, 500000, 'n', "after") && text_ok(80, 500000, 'n'), "insert after vacuum");
     db_shutdown();
     if (system("rm -rf /tmp/sv_ovf_test")) {}
     if (g_fail) { printf("overflow tests: %d of %d FAILED\n", g_fail, g_tests); return 1; }

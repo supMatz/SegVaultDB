@@ -19,6 +19,7 @@ SCOPO: Struttura e operazioni su una pagina disco (4 KB).
 #define PAGE_FLAG_DIRTY   0x01  // Pagina modificata ma non scritta su disco
 #define PAGE_FLAG_DELETED 0x02  // Pagina marcata per eliminazione
 #define PAGE_FLAG_CHAINED 0x04  // Pagina di heap collegata alla successiva tramite next (vedi page_next)
+#define PAGE_FLAG_FREE    0x10  // Pagina liberata da VACUUM: riusabile (vedi bp_new_page)
 
 #pragma pack(push, 1)  // evita padding: la struttura deve essere esattamente PAGE_SIZE byte
 typedef struct {

@@ -8,6 +8,9 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
 #include "auth.h"
 #include "../catalog/schema.h"
 #include "../storage/buffer_pool.h"
+#include "../storage/page.h"
+#include "../table/overflow.h"
+#include "../table/heap.h"
 #include "../query/lexer.h"
 #include "../query/parser.h"
 #include "../query/executor.h"
@@ -55,6 +58,8 @@ const char* db_init_error(void) { return g_init_error; }
 
 // ── Forward declarations ─────────────────────────────────────────
 static QueryResult* result_error(const char* msg);
+static void free_list_load(void);
+static struct DbSession* g_tx_owner;      // (sessioni: vedi più avanti)
 static QueryResult* result_ok(int rows_affected);
 
 // ── Stato globale del DB engine ──────────────────────────────────
@@ -127,6 +132,7 @@ static bool db_init_impl(const char* data_directory) {
 
     g_db.initialized = true;
     auth_init(data_directory);
+    free_list_load();
     return true;
 }
 
@@ -158,6 +164,71 @@ static bool do_checkpoint(void) {
     bp_flush_all(g_db.bp);
     if (catalog_save(g_db.catalog, g_db.cat_path) != SV_OK) return false;
     return wal_truncate(g_db.wal) == SV_OK;
+}
+
+// ── VACUUM: pagine di overflow non più usate -> riusabili ───────
+
+static void free_list_path(char* out, size_t n) { snprintf(out, n, "%s" SV_PATH_SEP "segvault.free", g_db.data_dir); }
+
+static void free_list_save(void) {
+    int n = bp_free_count(g_db.bp);
+    uint32_t* ids = malloc(sizeof(uint32_t) * (size_t)(n ? n : 1));
+    if (!ids) return;
+    n = bp_free_list(g_db.bp, ids, n);
+    char p[600];
+    free_list_path(p, sizeof(p));
+    FILE* f = fopen(p, "w");
+    if (f) { for (int i = 0; i < n; i++) fprintf(f, "%u\n", ids[i]); fclose(f); }
+    free(ids);
+}
+
+static void free_list_load(void) {
+    char p[600];
+    free_list_path(p, sizeof(p));
+    FILE* f = fopen(p, "r");
+    if (!f) return;
+    unsigned id;
+    while (fscanf(f, "%u", &id) == 1) if (id) bp_add_free(g_db.bp, id);   // validi solo se su disco sono FREE
+    fclose(f);
+}
+
+static bool do_checkpoint(void);
+
+static bool do_vacuum(int* freed) {
+    *freed = 0;
+    if (!do_checkpoint()) return false;                 // log vuoto: nessun record nomina le pagine
+    long end = sv_lseek(g_db.db_fd, 0, SEEK_END);
+    uint32_t npages = end > 0 ? (uint32_t)(end / SV_PAGE_SIZE) : 0;
+    uint8_t* used = calloc((size_t)npages / 8 + 1, 1);
+    if (!used) return false;
+    for (int d = 0; d < g_db.catalog->num_databases; d++) {
+        Database* db = &g_db.catalog->databases[d];
+        for (int t = 0; t < db->num_tables; t++) {
+            HeapFile* hf = heap_open(g_db.bp, db->tables[t].root_page_id, db->tables[t].num_pages);
+            if (hf) heap_mark_overflow(hf, used, npages);
+            free(hf);
+        }
+    }
+    // l'elenco si ricostruisce da capo: tutte le pagine libere (anche quelle di VACUUM precedenti)
+    g_db.bp->nfree = 0;
+    for (uint32_t id = 1; id < npages; id++) {
+        Page* p = bp_fetch(g_db.bp, id);
+        if (!p) continue;
+        bool overflow_unused = (p->flags & PAGE_FLAG_OVERFLOW) && !(used[id / 8] & (1u << (id % 8)));
+        bool was_free = (p->flags & PAGE_FLAG_FREE) != 0;
+        if (overflow_unused) {
+            p->flags = PAGE_FLAG_FREE;                  // anche il "successivo" della catena azzerato
+            p->next_page_id = 0;
+            (*freed)++;
+        }
+        bp_unpin(g_db.bp, id, overflow_unused);
+        if (overflow_unused || was_free) bp_add_free(g_db.bp, id);
+    }
+    free(used);
+    bp_flush_all(g_db.bp);
+    sv_fsync(g_db.db_fd);
+    free_list_save();
+    return true;
 }
 
 static void maybe_checkpoint(void) {
@@ -209,6 +280,10 @@ static QueryResult* exec_one(ASTNode* stmt) {
         result = db_commit() ? result_ok(0) : result_error("Failed to commit");
     } else if (stmt->type == NODE_ROLLBACK && stmt->rollback_to.name[0] == 0) {
         result = db_rollback() ? result_ok(0) : result_error("Failed to rollback");
+    } else if (stmt->type == NODE_VACUUM) {
+        int freed = 0;
+        result = g_db.exec_ctx.tx_id || g_tx_owner ? result_error("VACUUM is not allowed while a transaction is open")
+               : do_vacuum(&freed) ? result_ok(freed) : result_error("VACUUM failed");
     } else if (stmt->type == NODE_CHECKPOINT) {
         result = g_db.exec_ctx.tx_id ? result_error("CHECKPOINT is not allowed inside a transaction")
                : do_checkpoint() ? result_ok(0) : result_error("Checkpoint failed");
@@ -617,6 +692,7 @@ static void db_shutdown_impl(void) {
     bp_flush_all(g_db.bp);
     catalog_save(g_db.catalog, g_db.cat_path);
     sv_fsync(g_db.db_fd);
+    free_list_save();
     wal_flush(g_db.wal);
     g_db.bp->before_write = NULL;          // il log sta per essere chiuso
     wal_destroy(g_db.wal);

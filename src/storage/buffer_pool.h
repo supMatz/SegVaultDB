@@ -46,6 +46,8 @@ typedef struct {
     int       nbuckets;    // potenza di 2
     int       hand;        // lancetta di CLOCK
     uint32_t  next_new_id; // prossima pagina da allocare in fondo al file (0 = da calcolare)
+    uint32_t* free_ids;    // pagine liberate da VACUUM (flag PAGE_FLAG_FREE su disco), riusate per prime
+    int       nfree, free_cap;
     BufferStats stats;
     // chiamata prima di scrivere una pagina su disco (regola del WAL: prima il log)
     void      (*before_write)(void* ctx);
@@ -81,5 +83,10 @@ void bp_remove_all(BufferPool* bp);
 
 // dealloca il buffer pool (fa flush prima di liberare)
 void bp_destroy(BufferPool* bp);
+
+// pagine libere (VACUUM): riusate da bp_new_page solo se su disco hanno ancora PAGE_FLAG_FREE
+void bp_add_free(BufferPool* bp, uint32_t page_id);
+int  bp_free_count(BufferPool* bp);
+int  bp_free_list(BufferPool* bp, uint32_t* out, int max);
 
 #endif

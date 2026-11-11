@@ -14,6 +14,7 @@ typedef enum {
     NODE_TRUNCATE, NODE_SAVEPOINT, NODE_ROLLBACK_TO,
     NODE_CREATE_TRIGGER, NODE_DROP_TRIGGER,
     NODE_CHECKPOINT,
+    NODE_VACUUM,       // recupera le pagine di overflow non più usate
 } StmtType;
 
 typedef enum { JOIN_INNER, JOIN_LEFT, JOIN_RIGHT, JOIN_CROSS, JOIN_FULL } JoinType;

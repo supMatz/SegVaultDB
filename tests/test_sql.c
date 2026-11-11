@@ -171,6 +171,20 @@ int main(void) {
     t("INSERT INTO dtf VALUES (3, '2024-03-01 09:00:00.')", "ERR:date-time");
     t("SELECT id FROM dtf ORDER BY d", "2;1");
     t("DROP TABLE dtf", "OK:0");
+    // indici: UNIQUE (= vincolo) e su più colonne (accelera con la prima), sintassi di MySQL
+    t("CREATE TABLE ux (id INT PRIMARY KEY, a INT, b VARCHAR(10))", "OK:0");
+    t("INSERT INTO ux VALUES (1, 1, 'x'), (2, 1, 'y')", "OK:2");
+    t("CREATE UNIQUE INDEX uq_ab ON ux (a, b)", "OK:0");
+    t("INSERT INTO ux VALUES (3, 1, 'x')", "ERR:Duplicate");
+    t("INSERT INTO ux VALUES (3, 1, 'z')", "OK:1");
+    t("CREATE UNIQUE INDEX uq_a ON ux (a)", "ERR:duplicate values");
+    t("CREATE INDEX ix_ab ON ux (a DESC, b(5)) USING BTREE", "OK:0");
+    t("SELECT id FROM ux WHERE a = 1 AND b = 'z'", "3");
+    t("DROP INDEX uq_ab ON ux", "OK:0");
+    t("INSERT INTO ux VALUES (4, 1, 'x')", "OK:1");
+    t("DROP INDEX ix_ab ON ux", "OK:0");
+    t("DROP INDEX nope ON ux", "ERR:Index not found");
+    t("DROP TABLE ux", "OK:0");
     // LIKE ... ESCAPE: il carattere dopo l'escape vale per sé
     t("CREATE TABLE lk (id INT PRIMARY KEY, s VARCHAR(30))", "OK:0");
     t("INSERT INTO lk VALUES (1, '100%'), (2, '100 euro'), (3, 'a_b'), (4, 'axb'), (5, 'c!d')", "OK:5");

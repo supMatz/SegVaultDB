@@ -43,6 +43,8 @@ const uint8_t* heap_scan_next_raw(HeapScan* scan, RID* out_rid, size_t* out_len)
 
 // scarta le free-space map (da chiamare quando le pagine cambiano fuori da heap.c: ROLLBACK)
 void heap_cache_clear(void);
+// VACUUM: segna nella bitmap le pagine di overflow usate dalle righe della tabella
+void heap_mark_overflow(HeapFile* hf, uint8_t* bitmap, uint32_t nbits);
 void heap_cache_forget(BufferPool* bp, uint32_t root_page_id);
 
 // != 0: le scansioni in corso terminano subito (cancellazione di una SELECT dalla GUI).
