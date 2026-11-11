@@ -171,21 +171,45 @@ resta una stringa.
 
 ## Transazioni e concorrenza
 
-Il motore ha un solo stato di sessione, quindi le richieste vengono eseguite **una alla volta**
-(le connessioni sono comunque servite da thread separati: un client lento a inviare o ricevere non
-blocca gli altri). Ogni richiesta è un'unità chiusa:
+Le richieste vengono eseguite **una alla volta** sul motore (le connessioni sono comunque servite da
+thread separati: un client lento a inviare o ricevere non blocca gli altri). Senza sessione ogni
+richiesta è un'unità chiusa:
 
 - con `"transaction": true` lo script è atomico (commit alla fine, rollback al primo errore);
 - `BEGIN` ... `COMMIT` dentro lo stesso `sql` funzionano; una transazione lasciata aperta a fine
   richiesta viene annullata e la risposta contiene `"warning"`;
-- non esistono transazioni che attraversano più richieste: ciò che deve essere atomico va in una
-  richiesta sola.
+- per una transazione che attraversa più richieste si usa una **sessione** (sotto).
 
 Uno statement che fallisce non lascia mai modifiche a metà (come nella GUI); senza
 `"transaction": true` gli statement **precedenti** della stessa richiesta restano invece applicati.
 
 Il database corrente viene ripristinato alla fine di ogni richiesta: un `USE` dentro una richiesta
 non cambia quello delle successive (passa sempre `database`, o avvia il server con `--database`).
+
+### Sessioni
+
+Una sessione conserva tra le richieste il database corrente, l'utente e la transazione aperta:
+
+```bash
+curl -X POST http://127.0.0.1:8484/api/v1/sessions          # {"ok":true,"session":"3f9a...","idle_timeout_s":300,...}
+curl http://127.0.0.1:8484/api/v1/query -H "X-SegVault-Session: 3f9a..." -H "Content-Type: application/json" \
+     -d '{"database":"shop","sql":"BEGIN; UPDATE conto SET saldo = saldo - 10 WHERE id = 1"}'
+# ... altre richieste nella stessa transazione (anche dopo aver chiesto qualcosa all'utente) ...
+curl http://127.0.0.1:8484/api/v1/query -H "X-SegVault-Session: 3f9a..." -H "Content-Type: application/json" \
+     -d '{"sql":"UPDATE conto SET saldo = saldo + 10 WHERE id = 2; COMMIT"}'
+curl -X DELETE http://127.0.0.1:8484/api/v1/sessions/3f9a...   # chiusa: una transazione aperta viene annullata
+```
+
+- La risposta di una query in sessione contiene `"session":{"id":...,"in_transaction":true|false}`.
+- **Una transazione alla volta.** Mentre una sessione ha una transazione aperta, le richieste delle
+  altre sessioni (e quelle senza sessione) aspettano il suo `COMMIT` / `ROLLBACK`, fino a 10 s; poi
+  ricevono HTTP 409. Così nessuno legge dati non ancora confermati e un `ROLLBACK` non annulla il
+  lavoro di altri (isolamento serializzabile). Tieni le transazioni brevi.
+- Una transazione ferma da **30 s** viene annullata e una sessione inattiva da **5 minuti** viene
+  chiusa: un client che si blocca o sparisce non ferma gli altri.
+- Con il login (`--users`) la sessione appartiene all'utente che l'ha creata.
+- Fino a 256 sessioni aperte. Il database indicato con `"database"` vale per la richiesta e resta
+  quello corrente della sessione.
 
 **Limite di tempo.** Una richiesta che lavora più di `--timeout` secondi (default 30) viene fermata
 con HTTP 400 `"the request took longer than ... and was stopped"`: le `SELECT` (anche con subquery

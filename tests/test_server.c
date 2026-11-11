@@ -120,6 +120,18 @@ static void* run_server(void* s) { sv_server_run((SvServer*)s); return NULL; }
 
 // ── concorrenza: più client che scrivono insieme ──
 static int g_port;
+static volatile int g_waiter_done, g_waiter_count = -1;
+// richiesta senza sessione mentre un'altra sessione ha una transazione aperta
+static void* count_after_commit(void* arg) {
+    (void)arg;
+    Resp r = request(g_port, "POST", "/api/v1/query", "Content-Type: application/json\r\nAuthorization: Bearer s3cret\r\n",
+                     "{\"sql\":\"SELECT COUNT(*) FROM conc WHERE id = 900001\"}");
+    const JsonVal* c = cell_at(&r, 0, 0, 0);
+    g_waiter_count = c ? (int)c->number : -2;
+    resp_free(&r);
+    g_waiter_done = 1;
+    return NULL;
+}
 static void* writer(void* arg) {
     int id = (int)(long)arg;
     for (int i = 0; i < 25; i++) {
@@ -540,6 +552,53 @@ int main(void) {
     const JsonVal* rc = rs0 && rs0->count ? json_get(&rs0->items[0], "row_count") : NULL;
     CHECK(r.json && rc && rc->number == 40000, "large result parses: status %d", r.status);
     resp_free(&r);
+
+    // ── sessioni: stato e transazioni che durano più richieste; gli altri aspettano il COMMIT ──
+    {
+        r = request(port2, "POST", "/api/v1/sessions", "Authorization: Bearer s3cret\r\n", "");
+        const JsonVal* sid = json_get(r.json, "session");
+        char id[64] = "";
+        if (sid && sid->str) snprintf(id, sizeof(id), "%s", sid->str);
+        CHECK(r.status == 200 && strlen(id) == 32, "new session: %s", r.body);
+        resp_free(&r);
+        char hdr[256];
+        snprintf(hdr, sizeof(hdr), "Content-Type: application/json\r\nAuthorization: Bearer s3cret\r\nX-SegVault-Session: %s\r\n", id);
+        r = request(port2, "POST", "/api/v1/query", hdr, "{\"sql\":\"BEGIN; INSERT INTO conc VALUES (900001, 1)\"}");
+        CHECK(resp_ok(&r) && strstr(r.body, "\"in_transaction\":true"), "begin in session: %s", r.body);
+        resp_free(&r);
+        r = request(port2, "POST", "/api/v1/query", hdr, "{\"sql\":\"SELECT COUNT(*) FROM conc WHERE id = 900001\"}");
+        c = cell_at(&r, 0, 0, 0);
+        CHECK(resp_ok(&r) && c && c->number == 1, "own uncommitted row visible in the session: %s", r.body);
+        resp_free(&r);
+        // una richiesta senza sessione aspetta il COMMIT, poi vede la riga
+        g_port = port2;
+        pthread_t waiter;
+        pthread_create(&waiter, NULL, count_after_commit, NULL);
+        struct timespec ts = { 0, 300 * 1000000L };
+        nanosleep(&ts, NULL);
+        CHECK(!g_waiter_done, "other request waits while the session holds a transaction");
+        r = request(port2, "POST", "/api/v1/query", hdr, "{\"sql\":\"COMMIT\"}");
+        CHECK(resp_ok(&r) && strstr(r.body, "\"in_transaction\":false"), "commit in a later request: %s", r.body);
+        resp_free(&r);
+        pthread_join(waiter, NULL);
+        CHECK(g_waiter_count == 1, "the waiting request ran after the commit and saw the row: %d", g_waiter_count);
+        // il database resta impostato nella sessione; chiusa con una transazione aperta = rollback
+        r = request(port2, "POST", "/api/v1/query", hdr, "{\"sql\":\"BEGIN; DELETE FROM conc\"}");
+        resp_free(&r);
+        char path[128];
+        snprintf(path, sizeof(path), "/api/v1/sessions/%s", id);
+        r = request(port2, "DELETE", path, "Authorization: Bearer s3cret\r\n", NULL);
+        CHECK(r.status == 200, "delete session: %d %s", r.status, r.body);
+        resp_free(&r);
+        r = request(port2, "POST", "/api/v1/query", "Content-Type: application/json\r\nAuthorization: Bearer s3cret\r\n",
+                    "{\"sql\":\"SELECT COUNT(*) FROM conc WHERE id = 900001\"}");
+        c = cell_at(&r, 0, 0, 0);
+        CHECK(resp_ok(&r) && c && c->number == 1, "closing the session rolled back its delete: %s", r.body);
+        resp_free(&r);
+        r = request(port2, "POST", "/api/v1/query", hdr, "{\"sql\":\"SELECT 1\"}");
+        CHECK(r.status == 404, "closed session: %d", r.status);
+        resp_free(&r);
+    }
 
     // ── utenti (terzo server con --users): login Basic, permessi dell'utente, token = accesso completo ──
     {

@@ -44,3 +44,5 @@ test_png
 test_png_asan
 test_auth
 test_auth_asan
+test_sessions
+test_sessions_asan

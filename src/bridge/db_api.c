@@ -813,6 +813,91 @@ bool db_table_info(const char* db_name, const char* table, TableInfo* out, int* 
     return t != NULL;
 }
 
+// ── sessioni ────────────────────────────────────────────────────
+
+typedef struct { char name[64]; off_t offset; } SavepointRec;
+
+struct DbSession {
+    int          cur_db;            // indice nel catalogo (-1 = nessuno)
+    uint64_t     tx_id;
+    SavepointRec sp[64];
+    int          nsp;
+    char         user[64];
+};
+
+static DbSession  g_default_session;            // stato salvato della sessione predefinita
+static DbSession* g_active;                     // sessione attiva (NULL = predefinita)
+static DbSession* g_tx_owner;                   // sessione con una transazione aperta (sospesa)
+
+static void session_save(DbSession* s) {
+    s->cur_db = g_db.catalog ? g_db.catalog->current_db : -1;
+    s->tx_id = g_db.exec_ctx.tx_id;
+    s->nsp = g_num_savepoints;
+    memcpy(s->sp, g_savepoints, sizeof(s->sp));
+    snprintf(s->user, sizeof(s->user), "%s", g_session_user);
+}
+
+static void session_load(const DbSession* s) {
+    if (g_db.catalog) g_db.catalog->current_db = s->cur_db < g_db.catalog->num_databases ? s->cur_db : -1;
+    g_db.exec_ctx.tx_id = s->tx_id;
+    g_num_savepoints = s->nsp;
+    memcpy(g_savepoints, s->sp, sizeof(g_savepoints));
+    snprintf(g_session_user, sizeof(g_session_user), "%s", s->user);
+}
+
+DbSession* db_session_new(void) {
+    DbSession* s = calloc(1, sizeof(DbSession));
+    if (s) s->cur_db = -1;
+    return s;
+}
+
+bool db_session_enter(DbSession* s) {
+    db_lock();
+    // una transazione aperta (di una sessione sospesa, o della sessione predefinita) blocca le altre
+    bool busy = (g_tx_owner && g_tx_owner != s) || (s && g_db.exec_ctx.tx_id && !g_active);
+    if (!busy && s && !g_active) {
+        session_save(&g_default_session);
+        session_load(s);
+        g_active = s;
+    }
+    db_unlock();
+    return !busy;
+}
+
+void db_session_leave(DbSession* s) {
+    if (!s) return;
+    db_lock();
+    if (g_active == s) {
+        session_save(s);
+        if (s->tx_id) g_tx_owner = s;
+        else if (g_tx_owner == s) g_tx_owner = NULL;
+        session_load(&g_default_session);
+        g_active = NULL;
+    }
+    db_unlock();
+}
+
+void db_session_end(DbSession* s) {
+    if (!s) return;
+    if (s->tx_id && db_session_enter(s)) {
+        db_rollback();
+        db_session_leave(s);
+    }
+    db_lock();
+    if (g_tx_owner == s) g_tx_owner = NULL;
+    db_unlock();
+    free(s);
+}
+
+bool db_session_in_transaction(const DbSession* s) { return s && s->tx_id != 0; }
+
+bool db_session_blocked(void) {
+    db_lock();
+    bool b = g_tx_owner != NULL;
+    db_unlock();
+    return b;
+}
+
 bool db_engine_stats(DbEngineStats* out) {
     memset(out, 0, sizeof(*out));
     db_lock();

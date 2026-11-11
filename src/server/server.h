@@ -3,7 +3,8 @@ SCOPO: server HTTP/JSON di SegVault: espone il motore (db_api.h) a siti web,
        app desktop e qualsiasi linguaggio con un client HTTP.
 
        Il motore ha un solo stato di sessione (database corrente, transazione aperta):
-       le richieste vengono eseguite una alla volta e ognuna è un'unità chiusa
+       le richieste vengono eseguite una alla volta; senza sessione ognuna è un'unità chiusa,
+       con una sessione (POST /api/v1/sessions) database e transazione restano tra le richieste
        (vedi docs/API.md). Le connessioni sono servite da thread separati, quindi un
        client lento non blocca gli altri mentre invia o riceve.
 */

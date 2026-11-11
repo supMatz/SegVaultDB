@@ -252,6 +252,21 @@ ColumnInfo* db_list_columns(const char* db_name, const char* table, int* out_cou
 
 void db_columns_free(ColumnInfo* cols, int count);
 
+// ── sessioni (client del server con stato proprio) ──
+// Ogni sessione ha database corrente, utente, transazione e savepoint propri. Una sola sessione
+// alla volta può avere una transazione aperta: finché non fa COMMIT / ROLLBACK le altre non entrano
+// (non vedono dati non confermati e un ROLLBACK non tocca il lavoro altrui).
+// La sessione predefinita (NULL) è quella della GUI e delle richieste senza sessione.
+typedef struct DbSession DbSession;
+DbSession* db_session_new(void);
+// rende attiva s (NULL = una richiesta senza sessione); false se un'altra sessione ha una transazione
+// aperta (riprovare più tardi)
+bool db_session_enter(DbSession* s);
+void db_session_leave(DbSession* s);            // salva lo stato di s e torna alla sessione predefinita
+void db_session_end(DbSession* s);              // annulla la sua transazione e la libera (non attiva)
+bool db_session_in_transaction(const DbSession* s);
+bool db_session_blocked(void);                  // una sessione ha una transazione aperta
+
 // ── statistiche del motore (pagina Monitor del server; come SHOW STATUS, senza sessione) ──
 typedef struct {
     int       page_size;

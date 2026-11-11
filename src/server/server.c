@@ -64,6 +64,18 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #define IDLE_TIMEOUT_MS 15000          // connessione keep-alive inattiva
 #define MAX_PARAMS      1024
 
+// sessione di un client: stato del motore che resta tra le richieste (vedi db_session_*)
+#define SV_MAX_SESSIONS   256
+#define SESSION_IDLE_MS   (5 * 60 * 1000)   // una sessione inattiva si chiude
+#define TX_IDLE_MS        (30 * 1000)       // una transazione ferma si annulla (non blocca gli altri)
+#define SESSION_WAIT_MS   10000             // attesa massima di una richiesta per una transazione altrui
+typedef struct {
+    char       id[33];
+    DbSession* db;
+    char       user[64];
+    double     last_ms;
+} SvSess;
+
 struct SvServer {
     SvServerConfig cfg;
     char*          token;               // copie delle stringhe della configurazione
@@ -84,6 +96,7 @@ struct SvServer {
     bool           timed_out;           // il watchdog ha interrotto la richiesta in corso
     SvLogEntry     log[SV_LOG_MAX];     // anello: log[(seq - 1) % SV_LOG_MAX]
     SvBucket       series[SV_SERIES_MAX]; // anello per secondo: series[sec % SV_SERIES_MAX]
+    SvSess         sess[SV_MAX_SESSIONS];  // sessioni dei client (protette da exec_mx)
 };
 
 typedef struct {
@@ -107,6 +120,7 @@ typedef struct {
     char   content_type[128];
     char   auth[512];
     char   user[64];                    // utente autenticato (Basic) o "" (root: token o nessun login)
+    char   session[80];                 // header X-SegVault-Session
     char   origin[256];
     char   host[256];
     char*  body;                        // NUL-terminato
@@ -464,10 +478,70 @@ static void exec_end(SvServer* s) {
 
 // ── POST /api/v1/query ──────────────────────────────────────────
 
+// ── sessioni ────────────────────────────────────────────────────
+
+// chiude le sessioni inattive e annulla le transazioni ferme (con exec_mx preso)
+static void expire_sessions(SvServer* s) {
+    double now = now_ms();
+    for (int i = 0; i < SV_MAX_SESSIONS; i++) {
+        SvSess* x = &s->sess[i];
+        if (!x->db) continue;
+        double idle = now - x->last_ms;
+        if (idle > SESSION_IDLE_MS || (db_session_in_transaction(x->db) && idle > TX_IDLE_MS)) {
+            db_session_end(x->db);
+            memset(x, 0, sizeof(*x));
+        }
+    }
+}
+
+// (con exec_mx preso dal chiamante oppure no: si prende qui per la ricerca)
+static SvSess* find_session(SvServer* s, const char* id) {
+    mx_lock(&s->exec_mx);
+    SvSess* r = NULL;
+    for (int i = 0; i < SV_MAX_SESSIONS && !r; i++)
+        if (s->sess[i].db && secret_equal(s->sess[i].id, id)) r = &s->sess[i];
+    mx_unlock(&s->exec_mx);
+    return r;
+}
+
+// POST /api/v1/sessions (nuova) | DELETE /api/v1/sessions/ID (chiusa, transazione annullata)
+static void handle_sessions(SvServer* s, Request* rq, Response* rs, const char* rest) {
+    if (!strcmp(rq->method, "POST") && !rest[0]) {
+        mx_lock(&s->exec_mx);
+        expire_sessions(s);
+        SvSess* x = NULL;
+        for (int i = 0; i < SV_MAX_SESSIONS && !x; i++) if (!s->sess[i].db) x = &s->sess[i];
+        if (x && sv_random_token(x->id, 16) && (x->db = db_session_new())) {
+            snprintf(x->user, sizeof(x->user), "%s", rq->user);
+            x->last_ms = now_ms();
+            rs->status = 200;
+            jb_printf(&rs->body, "{\"ok\":true,\"session\":\"%s\",\"idle_timeout_s\":%d,\"transaction_idle_timeout_s\":%d}",
+                      x->id, SESSION_IDLE_MS / 1000, TX_IDLE_MS / 1000);
+        } else {
+            if (x) memset(x, 0, sizeof(*x));
+            json_error(rs, 503, "too many open sessions (max %d): close some with DELETE", SV_MAX_SESSIONS);
+        }
+        mx_unlock(&s->exec_mx);
+        return;
+    }
+    if (!strcmp(rq->method, "DELETE") && rest[0] == '/' && rest[1]) {
+        SvSess* x = find_session(s, rest + 1);
+        if (!x || strcmp(x->user, rq->user)) { json_error(rs, 404, "session not found"); return; }
+        mx_lock(&s->exec_mx);
+        db_session_end(x->db);                   // una transazione aperta viene annullata
+        memset(x, 0, sizeof(*x));
+        mx_unlock(&s->exec_mx);
+        rs->status = 200;
+        jb_lit(&rs->body, "{\"ok\":true}");
+        return;
+    }
+    json_error(rs, 405, "use POST /api/v1/sessions or DELETE /api/v1/sessions/ID");
+}
+
 // esegue lo script (già con i parametri) nel database indicato e scrive la risposta;
 // sql_for_log: il testo originale, con i segnaposto, per il registro. Libera script.
 static void run_script(SvServer* s, Response* rs, char* script, const char* sql_for_log, const char* dbname,
-                       bool want_tx, bool objects, const char* user) {
+                       bool want_tx, bool objects, const char* user, SvSess* ss) {
     int len = (int)strlen(script), cap = 64, nst;
     SqlRange* ranges = NULL;
     for (;;) {                                  // quanti statement: si raddoppia finché bastano
@@ -482,8 +556,24 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
     double t0 = now_ms();
     one_line(rs->detail, sizeof(rs->detail), sql_for_log);   // con i '?': i valori dei parametri non finiscono nel registro
     exec_begin(s);
+    expire_sessions(s);
+    // un'altra sessione ha una transazione aperta: si aspetta che finisca (o che scada)
+    for (double waited = 0; !db_session_enter(ss ? ss->db : NULL); waited += 20) {
+        exec_end(s);
+        if (waited >= SESSION_WAIT_MS) {
+            free(ranges);
+            free(script);
+            json_error(rs, 409, "another session has an open transaction: retry after its COMMIT / ROLLBACK "
+                                "(an idle transaction is rolled back after %d s)", TX_IDLE_MS / 1000);
+            return;
+        }
+        sleep_ms(20);
+        exec_begin(s);
+        expire_sessions(s);
+    }
     // permessi dell'utente della richiesta (vuoto = root), solo per gli statement di questa richiesta
     if (!db_set_user(user)) {
+        if (ss) db_session_leave(ss->db);
         exec_end(s);
         free(ranges);
         free(script);
@@ -544,7 +634,13 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
         if (failed) { if (in_transaction()) db_rollback(); }
         else if (!db_commit()) { failed = true; snprintf(errmsg, sizeof(errmsg), "COMMIT failed"); }
     }
-    if (in_transaction()) {                     // BEGIN senza COMMIT: la richiesta è un'unità chiusa
+    bool session_tx = false;
+    if (ss) {                                   // la sessione conserva database e transazione
+        session_tx = in_transaction();
+        db_session_leave(ss->db);
+        ss->last_ms = now_ms();
+        prev_db[0] = '\0';
+    } else if (in_transaction()) {              // BEGIN senza COMMIT: la richiesta è un'unità chiusa
         db_rollback();
         warning = failed ? "the open transaction was rolled back"
                          : "a transaction was left open and has been rolled back (end it with COMMIT)";
@@ -573,6 +669,7 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
         jb_lit(b, "}");
     }
     if (warning) { jb_lit(b, ",\"warning\":"); jb_str(b, warning); }
+    if (ss) jb_printf(b, ",\"session\":{\"id\":\"%s\",\"in_transaction\":%s}", ss->id, session_tx ? "true" : "false");
     jb_printf(b, ",\"time_ms\":%.3f}", now_ms() - t0);
     rs->status = failed ? 400 : 200;
     if (b->oom) json_error(rs, 500, "result too large for memory");
@@ -632,7 +729,15 @@ static void handle_query(SvServer* s, Request* rq, Response* rs) {
         char err[512];
         char* script = bind_params(sql, params, err, sizeof(err));
         if (!script) json_error(rs, 400, "%s", err);
-        else run_script(s, rs, script, sql, dbname, want_tx, objects, rq->user);   // libera script
+        else {
+            SvSess* ss = NULL;
+            if (rq->session[0]) {
+                ss = find_session(s, rq->session);
+                if (!ss) { free(script); json_free(root); json_error(rs, 404, "session not found or expired: create one with POST /api/v1/sessions"); return; }
+                if (strcmp(ss->user, rq->user)) { free(script); json_free(root); json_error(rs, 403, "this session belongs to another user"); return; }
+            }
+            run_script(s, rs, script, sql, dbname, want_tx, objects, rq->user, ss);   // libera script
+        }
     }
     json_free(root);
 }
@@ -737,7 +842,7 @@ static void handle_endpoint(SvServer* s, Request* rq, Response* rs, const char* 
     if (!script) { json_error(rs, 400, "endpoint '%s': %s", name, err); return; }
     char label[200];
     snprintf(label, sizeof(label), "endpoint %.60s: %.120s", name, sql);
-    run_script(s, rs, script, label, db, true, objects, NULL);   // sempre atomico; con i permessi di chi l'ha salvato
+    run_script(s, rs, script, label, db, true, objects, NULL, NULL);   // sempre atomico; con i permessi di chi l'ha salvato
 }
 
 static void handle_endpoint_list(SvServer* s, Request* rq, Response* rs, const char* db) {
@@ -1023,8 +1128,8 @@ static void route(SvServer* s, Request* rq, Response* rs) {
                             "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
                             "Access-Control-Allow-Headers: Content-Type\r\n"
                             "Access-Control-Max-Age: 600\r\n" :
-                            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-                            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+                            "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
+                            "Access-Control-Allow-Headers: Content-Type, Authorization, X-SegVault-Session\r\n"
                             "Access-Control-Max-Age: 600\r\n";
         return;
     }
@@ -1075,6 +1180,10 @@ static void route(SvServer* s, Request* rq, Response* rs) {
         if (!strcmp(sub, "/endpoints")) {
             if (strcmp(rq->method, "GET")) { json_error(rs, 405, "use GET"); return; }
             handle_endpoint_list(s, rq, rs, ep_db);
+            return;
+        }
+        if (!strncmp(sub, "/sessions", 9) && (sub[9] == '\0' || sub[9] == '/')) {
+            handle_sessions(s, rq, rs, sub + 9);
             return;
         }
         if (!strcmp(sub, "/query")) {
@@ -1157,6 +1266,7 @@ static int parse_head(SvServer* s, char* head, Request* rq) {
             }
             else if (!strcasecmp(p, "Content-Type"))  header_value(v, rq->content_type, sizeof(rq->content_type));
             else if (!strcasecmp(p, "Authorization")) header_value(v, rq->auth, sizeof(rq->auth));
+            else if (!strcasecmp(p, "X-SegVault-Session")) header_value(v, rq->session, sizeof(rq->session));
             else if (!strcasecmp(p, "Origin"))        header_value(v, rq->origin, sizeof(rq->origin));
             else if (!strcasecmp(p, "Host"))          header_value(v, rq->host, sizeof(rq->host));
         }
@@ -1459,6 +1569,8 @@ void sv_server_free(SvServer* s) {
         if (tries > 500) return;   // un thread non risponde: meglio non liberare ciò che usa ancora
         sleep_ms(10);
     }
+    for (int i = 0; i < SV_MAX_SESSIONS; i++)            // le transazioni rimaste aperte si annullano
+        if (s->sess[i].db) { db_session_end(s->sess[i].db); s->sess[i].db = NULL; }
     mx_destroy(&s->conn_mx);
     mx_destroy(&s->exec_mx);
     free(s->conns);

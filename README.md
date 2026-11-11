@@ -26,6 +26,7 @@
 - [Struttura dei sorgenti](#struttura-dei-sorgenti)
 - [Compilazione](#compilazione)
 - [Documentazione e riferimenti](#documentazione-e-riferimenti)
+- [Roadmap](#roadmap)
 - [Licenza](#licenza)
 
 ---
@@ -43,7 +44,7 @@ database per piccoli siti web e app desktop.
 | **Linguaggio** | C11, zero dipendenze per il motore e per il server |
 | **Versione** | 1.2.0 |
 | **App desktop** | Win32 / GDI (Windows) · Xlib/X11 + Xft (Linux); all'avvio si sceglie **editor SQL** o **server API** |
-| **Server API** | `segvault-server` (o il pannello dell'app): HTTP/JSON, parametri `?` contro la SQL injection, transazioni per richiesta, token, CORS, limite di tempo, registro delle richieste |
+| **Server API** | `segvault-server` (o il pannello dell'app): HTTP/JSON, parametri `?` contro la SQL injection, sessioni con transazioni su più richieste, utenti e permessi (`GRANT`), token, CORS, limite di tempo, registro e monitor delle richieste |
 | **Client** | TypeScript/JavaScript e Python pronti in [`clients/`](clients/); esempi per C# e Java; `libsegvault.a` per incorporare il motore in C/C++ |
 | **SQL** | Lexer e parser a discesa ricorsiva scritti a mano; subquery anche correlate, `UNION` / `INTERSECT` / `EXCEPT`, `WITH [RECURSIVE]`, funzioni finestra con frame, `FULL` / `NATURAL` / `USING` join, `CASE`, viste, vincoli, trigger, `ALTER TABLE ... COLUMN` |
 | **Vincoli** | `PRIMARY KEY` (anche composta), `UNIQUE`, `NOT NULL`, `CHECK`, `FOREIGN KEY` con `ON DELETE` / `ON UPDATE` `CASCADE`, `SET NULL`, `SET DEFAULT`, `RESTRICT` |
@@ -53,6 +54,7 @@ database per piccoli siti web e app desktop.
 | **Transazioni** | Write-Ahead Log con undo/redo, `BEGIN` / `COMMIT` / `ROLLBACK`, `SAVEPOINT`, recovery dopo un crash, `CHECKPOINT` (anche automatico) |
 | **Basi di dati attive** | Trigger `BEFORE` / `AFTER`, `FOR EACH ROW` / `FOR EACH STATEMENT`, `NEW` / `OLD`, `WHEN`, `SET NEW.col`, `SIGNAL`, `IF` |
 | **Testi** | Nessun limite fisso sulla lunghezza dei testi; una riga salvata deve stare in una pagina (al massimo 4080 byte) |
+| **Strumenti visuali** | Designer dello schema ER (notazione di Chen) / UML a trascinamento, export PNG; modulo della struttura con SQL live; modifica dei dati nella griglia; ricerca in tutto il database; panoramica; utenti e permessi; monitor del server |
 | **Piattaforme** | Linux nativo; Windows con `make windows` da Linux (MinGW-w64): `segvault.exe` e `segvault-server.exe` statici |
 
 ---
@@ -523,7 +525,7 @@ DROP TRIGGER [IF EXISTS] nome;   SHOW TRIGGERS [FROM tabella];
 
 ### Non supportato
 
-Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), stored procedure, nomi qualificati con il database (`shop.prodotto`: si usa `USE shop`), più sessioni contemporanee (il motore ha una sessione: il server esegue le richieste una alla volta, e una transazione non dura oltre una richiesta).
+Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), stored procedure, nomi qualificati con il database (`shop.prodotto`: si usa `USE shop`), esecuzione in parallelo: le sessioni del server hanno stato e transazioni proprie, ma le richieste girano una alla volta e una sola sessione per volta può avere una transazione aperta (vedi [Roadmap](#roadmap)).
 
 ---
 
@@ -602,10 +604,14 @@ Regole da ricordare, valide per tutti i linguaggi:
   letterali sicuri (niente SQL injection). Mai concatenare stringhe nell'SQL.
 - Più statement separati da `;` in una richiesta danno un risultato ciascuno; con
   `"transaction": true` vengono applicati **tutti o nessuno**.
-- Ogni richiesta è un'unità chiusa: una transazione lasciata aperta viene annullata a fine
-  richiesta, e il database corrente torna quello di prima (un `USE` non vale per le richieste successive).
-- Le richieste vengono eseguite una alla volta (il motore ha una sola sessione): è pensato per
-  app, siti piccoli e medi, laboratori, non per migliaia di scritture concorrenti al secondo.
+- Senza sessione ogni richiesta è un'unità chiusa: una transazione lasciata aperta viene annullata a
+  fine richiesta, e il database corrente torna quello di prima.
+- **Sessioni** (`POST /api/v1/sessions`, poi l'header `X-SegVault-Session`): database, utente e
+  transazione restano tra le richieste (`BEGIN` in una, `COMMIT` in un'altra). Mentre una sessione ha
+  una transazione aperta le altre richieste aspettano (fino a 10 s, poi HTTP 409); una transazione
+  ferma da 30 s viene annullata. Dettagli in [docs/API.md](docs/API.md#sessioni).
+- Le richieste vengono eseguite una alla volta sul motore: è pensato per app, siti piccoli e medi,
+  laboratori, non per migliaia di scritture concorrenti al secondo.
   Una richiesta che supera il limite di tempo (default 30 s) viene fermata.
 - Una pagina web di un'altra origine può chiamare il server solo se è ammessa (`--cors`, o
   *Web apps: Any origin* nel pannello); le altre ricevono 403 senza che nulla venga eseguito
@@ -1192,6 +1198,24 @@ SegVault implementa lexer e parser da zero, senza Flex né Bison.
 | **MinGW-w64** | Compilare per Windows da Linux | [mingw-w64.org](https://www.mingw-w64.org/) |
 
 ---
+
+## Roadmap
+
+Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
+
+1. **Concorrenza** — fatto: sessioni del server con database, utente e transazione propri, anche su
+   più richieste, con un solo proprietario delle transazioni. Da fare: esecuzione in parallelo
+   (lock sulle righe o MVCC, letture concorrenti).
+2. **Righe grandi** — pagine di overflow per testi e `BLOB` oltre i 4080 byte di una riga.
+3. **Compatibilità MySQL** — import dei dump di `mysqldump`, poi il protocollo di rete MySQL (le app
+   PHP come WordPress si collegherebbero senza modifiche).
+4. **Limiti del motore** — indici composti e `UNIQUE INDEX`, stored procedure, nomi `db.tabella`, più
+   tabelle / colonne / indici, ricerca full-text, tipo JSON.
+5. **Sicurezza e gestione** — HTTPS integrato, backup pianificati e ripristino dalla GUI, avvio come
+   servizio di sistema, registro di audit, `SHOW DATABASES` filtrato per utente.
+6. **GUI** — costruttore visuale di query, navigazione delle chiavi esterne dalla griglia, grafici dai
+   risultati, export XLSX/PDF, editor di trigger e viste, manutenzione delle tabelle, query salvate.
+7. **Portata** — interfaccia web, versione macOS, interfaccia in italiano e altre lingue, accessibilità.
 
 ## Licenza
 

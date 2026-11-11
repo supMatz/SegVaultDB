@@ -114,7 +114,7 @@ SQL_TEST_SRCS = tests/test_sql.c $(ENGINE_SRCS)
 
 EXAMPLES_TEST_SRCS = tests/test_examples.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
-test: test_engine test_btree test_sql test_examples test_server test_grid_edit test_table_design test_schema_model test_db_tools test_png test_auth
+test: test_engine test_btree test_sql test_examples test_server test_grid_edit test_table_design test_schema_model test_db_tools test_png test_auth test_sessions
 	./test_btree
 	./test_engine
 	./test_sql
@@ -126,6 +126,7 @@ test: test_engine test_btree test_sql test_examples test_server test_grid_edit t
 	./test_db_tools
 	./test_png
 	./test_auth
+	./test_sessions
 
 TEST_DESIGN_SRCS = tests/test_table_design.c src/widgets/table_design.c $(ENGINE_SRCS)
 
@@ -154,6 +155,12 @@ TEST_AUTH_SRCS = tests/test_auth.c $(ENGINE_SRCS)
 # utenti e permessi
 test_auth: $(TEST_AUTH_SRCS) src/bridge/auth.h
 	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_auth $(TEST_AUTH_SRCS) -lm -pthread
+
+TEST_SESS_SRCS = tests/test_sessions.c $(ENGINE_SRCS)
+
+# sessioni: stato separato e proprietario unico delle transazioni
+test_sessions: $(TEST_SESS_SRCS)
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_sessions $(TEST_SESS_SRCS) -lm -pthread
 
 TEST_GRID_SRCS = tests/test_grid_edit.c src/widgets/grid_edit.c $(ENGINE_SRCS)
 
@@ -213,6 +220,9 @@ test-asan: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
 	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
 		-I. $(BASE_INCLUDES) -o test_auth_asan $(TEST_AUTH_SRCS) -lm -pthread
 	ASAN_OPTIONS=detect_leaks=1 ./test_auth_asan
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
+		-I. $(BASE_INCLUDES) -o test_sessions_asan $(TEST_SESS_SRCS) -lm -pthread
+	ASAN_OPTIONS=detect_leaks=1 ./test_sessions_asan
 
 test_engine: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o test_engine test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c -lm -pthread
@@ -239,7 +249,7 @@ build-win/%.o: %.c
 
 clean:
 	$(RM) $(FULL_OBJS) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql test_examples test_examples_asan
-	$(RM) segvault-server segvault-server.exe libsegvault.a test_server test_server_asan test_grid_edit test_grid_edit_asan test_table_design test_table_design_asan test_schema_model test_schema_model_asan test_db_tools test_db_tools_asan test_png test_png_asan test_auth test_auth_asan
+	$(RM) segvault-server segvault-server.exe libsegvault.a test_server test_server_asan test_grid_edit test_grid_edit_asan test_table_design test_table_design_asan test_schema_model test_schema_model_asan test_db_tools test_db_tools_asan test_png test_png_asan test_auth test_auth_asan test_sessions test_sessions_asan
 	$(RM) -r obj build-win build-server
 
 -include $(FULL_OBJS:.o=.d) $(WIN_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(WIN_SERVER_OBJS:.o=.d)
