@@ -252,6 +252,27 @@ ColumnInfo* db_list_columns(const char* db_name, const char* table, int* out_cou
 
 void db_columns_free(ColumnInfo* cols, int count);
 
+// ── utenti e permessi (auth.c) ──
+// SQL: CREATE USER u IDENTIFIED BY 'pw' | ALTER USER ... | DROP USER u |
+//      GRANT ALL | SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER ON *.* | db.* | db.t | t TO u [WITH GRANT OPTION] |
+//      REVOKE ... FROM u | SHOW USERS | SHOW GRANTS [FOR u]
+#define DB_PRIV_SELECT 0x01u
+#define DB_PRIV_INSERT 0x02u
+#define DB_PRIV_UPDATE 0x04u
+#define DB_PRIV_DELETE 0x08u
+#define DB_PRIV_CREATE 0x10u
+#define DB_PRIV_DROP   0x20u
+#define DB_PRIV_ALTER  0x40u
+#define DB_PRIV_ALL    0x7Fu
+typedef struct { char name[64]; bool admin; } DbUserInfo;
+bool        db_set_user(const char* name);        // utente della sessione: NULL / "" = root (tutto permesso)
+const char* db_session_user(void);
+bool        db_login(const char* name, const char* password);   // credenziali giuste?
+bool        db_has_users(void);
+int         db_list_users(DbUserInfo* out, int max);
+unsigned    db_user_grant(const char* user, const char* db, const char* table);   // permessi dati proprio lì
+int         db_user_table_grants(const char* user, char (*db)[64], char (*table)[64], unsigned* privs, int max);
+
 // tutte le chiavi esterne delle tabelle di un database (NULL se il database non esiste o è vuoto)
 ForeignKeyInfo* db_list_foreign_keys(const char* db_name, int* out_count);
 // righe (stima del catalogo), dimensione su disco e numero di indici di una tabella; false se non esiste

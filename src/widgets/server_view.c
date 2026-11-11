@@ -153,7 +153,7 @@ ViewAction start_screen_event(StartScreen* s, const sEvent* evt) {
 enum {
     HIT_COPY_URL, HIT_COPY_LAN, HIT_PORT_MINUS, HIT_PORT_PLUS, HIT_ACCESS_LOCAL, HIT_ACCESS_LAN,
     HIT_TOKEN_OFF, HIT_TOKEN_ON, HIT_COPY_TOKEN, HIT_NEW_TOKEN, HIT_CORS_OFF, HIT_CORS_ON, HIT_TIME_MINUS,
-    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_COUNT
+    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_COUNT
 };
 
 enum { ACT_NONE, ACT_TOGGLE, ACT_EDITOR, ACT_COPY };
@@ -315,6 +315,7 @@ bool server_panel_start(ServerPanel* p) {
         .cors_origin = g_settings.server_cors ? "*" : NULL,
         .timeout_ms  = g_settings.server_timeout * 1000,
         .quiet       = true,
+        .require_login = g_settings.server_users != 0,
     };
     char err[256];
     p->srv = sv_server_start(&cfg, err, sizeof(err));
@@ -459,7 +460,9 @@ static void format_uptime(double s, char* out, size_t n) {
 static void example_text(ServerPanel* p, char* out, size_t n, bool masked) {
     const char* url = p->srv ? p->url : "http://127.0.0.1:8484/api/v1";
     char auth[120] = "";
-    if (token_required() && p->token[0])
+    if (g_settings.server_users)
+        snprintf(auth, sizeof(auth), " -u user:password");
+    else if (token_required() && p->token[0])
         snprintf(auth, sizeof(auth), " -H \"Authorization: Bearer %.*s%s\"", masked ? 8 : 64, p->token, masked ? "\xe2\x80\xa6" : "");
     snprintf(out, n, "curl %s/query -H \"Content-Type: application/json\"%s -d \"{\\\"sql\\\": \\\"SHOW DATABASES\\\"}\"", url, auth);
 }
@@ -577,6 +580,18 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
         link_btn(p, HIT_COPY_TOKEN, (Rect){x + w - cw - nw2 - 2, y, cw, 24}, "Copy", true);
         link_btn(p, HIT_NEW_TOKEN, (Rect){x + w - nw2, y, nw2, 24}, "New", true);
         y += 26;
+    }
+    y += 12;
+
+    y = section_label(win, "USER LOGIN", x, y);
+    segmented(p, HIT_USERS_OFF, (Rect){x, y, w, 28}, "Off", "Required", g_settings.server_users ? 1 : 0, true);
+    y += 28 + 4;
+    if (g_settings.server_users) {
+        int nu = 0;
+        if (!running) { DbUserInfo tmp[1]; nu = db_list_users(tmp, 1); }
+        y += text_wrap(win, running || nu ? "Apps send user:password (HTTP Basic); the token, if set, still gives full access."
+                                          : "No users yet: create them in Settings \xe2\x80\xba Users & permissions.",
+                       x, y + 2, w, running || nu ? TH_TEXT_FAINT : TH_WARNING, TH_FONT_SMALL) + 2;
     }
     y += 12;
 
@@ -880,6 +895,9 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
             break;
         case HIT_TOKEN_OFF: case HIT_TOKEN_ON:
             if (g_settings.server_token != (hit == HIT_TOKEN_ON)) { g_settings.server_token = hit == HIT_TOKEN_ON; config_changed(p); }
+            break;
+        case HIT_USERS_OFF: case HIT_USERS_ON:
+            if (g_settings.server_users != (hit == HIT_USERS_ON)) { g_settings.server_users = hit == HIT_USERS_ON; config_changed(p); }
             break;
         case HIT_COPY_TOKEN: copy_text(p, hit, p->token); break;
         case HIT_NEW_TOKEN:

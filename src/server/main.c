@@ -30,6 +30,8 @@ static void usage(const char* argv0) {
            "                        \"auto\" generates a random token and prints it\n"
            "  -d, --database NAME   database used when a request does not name one\n"
            "      --cors ORIGIN     allow browser calls from ORIGIN (e.g. http://localhost:5173, or *)\n"
+           "      --users           require a user and password (Authorization: Basic); each query\n"
+           "                        runs with that user's privileges (CREATE USER / GRANT in SQL)\n"
            "      --static DIR      also serve the files in DIR (a web app) outside /api\n"
            "      --max-body MB     largest request body (default 16)\n"
            "      --timeout S       stop a request that runs longer than S seconds (default 30, 0 = never)\n"
@@ -62,6 +64,7 @@ int main(int argc, char** argv) {
         else if (ARG("--max-body", "--max-body")) cfg.max_body = (size_t)atoi(argv[++i]) << 20;
         else if (ARG("--timeout", "--timeout")) cfg.timeout_ms = atoi(argv[++i]) * 1000;
         else if (!strcmp(a, "--no-auth")) no_auth = true;
+        else if (!strcmp(a, "--users")) cfg.require_login = true;
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) cfg.quiet = true;
         else if (a[0] == '-') { fprintf(stderr, "unknown or incomplete option: %s (see --help)\n", a); return 2; }
         else data_dir = a;
@@ -77,9 +80,9 @@ int main(int argc, char** argv) {
 
     // una porta aperta sulla rete senza token = chiunque esegue SQL arbitrario
     bool local = !strncmp(cfg.bind_addr, "127.", 4);
-    if (!local && !(cfg.token && cfg.token[0]) && !no_auth) {
+    if (!local && !(cfg.token && cfg.token[0]) && !cfg.require_login && !no_auth) {
         fprintf(stderr, "refusing to listen on %s without a token: anyone on the network could run any SQL.\n"
-                        "Use --token TOKEN (or SEGVAULT_TOKEN), or --no-auth if you really mean it.\n", cfg.bind_addr);
+                        "Use --token TOKEN (or SEGVAULT_TOKEN), --users (logins), or --no-auth if you really mean it.\n", cfg.bind_addr);
         return 2;
     }
 
@@ -107,7 +110,7 @@ int main(int argc, char** argv) {
 #endif
     printf("SegVault %s server: http://%s:%d" "/api/v1  (data: %s%s%s)\n", SV_VERSION_STR,
            cfg.bind_addr, sv_server_port(g_server), data_dir,
-           cfg.token && cfg.token[0] ? ", token required" : "", cfg.static_dir ? ", static files" : "");
+           cfg.require_login ? ", login required" : cfg.token && cfg.token[0] ? ", token required" : "", cfg.static_dir ? ", static files" : "");
     fflush(stdout);
 
     sv_server_run(g_server);

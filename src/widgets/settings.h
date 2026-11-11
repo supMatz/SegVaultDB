@@ -62,6 +62,7 @@ typedef struct {
     int server_port;
     int server_lan;         // raggiungibile dalla rete locale (richiede il token)
     int server_token;       // richiede il token anche in locale
+    int server_users;       // richiede utente e password (permessi per utente, vedi auth.h)
     int server_cors;        // le web app di qualsiasi origine possono chiamarlo (richiede il token)
     int server_timeout;     // secondi (0 = nessun limite)
 } Settings;

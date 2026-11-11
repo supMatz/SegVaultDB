@@ -24,6 +24,8 @@ typedef struct {
     int         max_clients;  // connessioni contemporanee (0 = 64)
     int         timeout_ms;   // una richiesta che lavora più a lungo viene interrotta (0 = mai)
     bool        quiet;        // niente log delle richieste su stderr
+    bool        require_login;// le richieste /api devono avere utente e password (Authorization: Basic)
+                              // o il token; ogni query gira con i permessi dell'utente (vedi auth.h)
 } SvServerConfig;
 
 typedef struct SvServer SvServer;

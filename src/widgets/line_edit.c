@@ -89,12 +89,21 @@ static void move_to(LineEdit* le, int p, bool select) {
     reset_blink(le);
 }
 
+// testo da misurare e disegnare: per una password un * per byte (stesse posizioni del testo vero)
+static const char* shown_text(const LineEdit* le) {
+    static char stars[LINE_EDIT_MAX];
+    if (!le->secret) return le->text;
+    memset(stars, '*', (size_t)le->len);
+    stars[le->len] = '\0';
+    return stars;
+}
+
 static int hit(LineEdit* le, int mx) {
     if (!le->win) return le->len;
     int x = le->base.bounds.x + LE_PAD - le->scroll_x;
     int best = 0, best_d = 1 << 30;
     for (int p = 0; ; p = next_pos(le, p)) {
-        int w = platform_measure_text_ex(le->win, le->text, p, LE_FONT, FONT_UI);
+        int w = platform_measure_text_ex(le->win, shown_text(le), p, LE_FONT, FONT_UI);
         int d = abs(x + w - mx);
         if (d < best_d) { best_d = d; best = p; }
         if (p >= le->len) break;
@@ -178,7 +187,7 @@ static bool line_edit_handle_event(Widget* self, sEvent* evt) {
                     switch (evt->character) {
                         case 'a': line_edit_select_all(le); return true;
                         case 'c': case 'x': {
-                            if (!has_sel(le) || !le->win) return true;
+                            if (!has_sel(le) || !le->win || le->secret) return true;
                             int a, b;
                             sel_range(le, &a, &b);
                             char tmp[LINE_EDIT_MAX];
@@ -215,10 +224,11 @@ static void line_edit_draw(Widget* self, PlatformWindow* win) {
     ui_round_box(win, b, TH_EDITOR_BG, border, 5);
 
     int inner_w = b.w - LE_PAD * 2;
-    int cur_x = platform_measure_text_ex(win, le->text, le->cursor, LE_FONT, FONT_UI);
+    const char* txt = shown_text(le);
+    int cur_x = platform_measure_text_ex(win, txt, le->cursor, LE_FONT, FONT_UI);
     if (cur_x - le->scroll_x > inner_w) le->scroll_x = cur_x - inner_w;
     if (cur_x - le->scroll_x < 0)       le->scroll_x = cur_x;
-    int full_w = platform_measure_text_ex(win, le->text, le->len, LE_FONT, FONT_UI);
+    int full_w = platform_measure_text_ex(win, txt, le->len, LE_FONT, FONT_UI);
     le->scroll_x = SV_CLAMP(le->scroll_x, 0, SV_MAX(0, full_w - inner_w));
 
     int tx = b.x + LE_PAD - le->scroll_x;
@@ -228,14 +238,14 @@ static void line_edit_draw(Widget* self, PlatformWindow* win) {
     if (has_sel(le)) {
         int a, e;
         sel_range(le, &a, &e);
-        int xa = platform_measure_text_ex(win, le->text, a, LE_FONT, FONT_UI);
-        int xe = platform_measure_text_ex(win, le->text, e, LE_FONT, FONT_UI);
+        int xa = platform_measure_text_ex(win, txt, a, LE_FONT, FONT_UI);
+        int xe = platform_measure_text_ex(win, txt, e, LE_FONT, FONT_UI);
         platform_fill_rect(win, (Rect){tx + xa, b.y + 5, xe - xa, b.h - 10}, TH_EDITOR_SELECT);
     }
     if (le->len == 0 && le->placeholder)
         platform_draw_text_ex(win, le->placeholder, -1, (Point){b.x + LE_PAD, ty}, TH_TEXT_FAINT, LE_FONT, FONT_UI);
     else
-        platform_draw_text_ex(win, le->text, le->len, (Point){tx, ty}, TH_TEXT, LE_FONT, FONT_UI);
+        platform_draw_text_ex(win, txt, le->len, (Point){tx, ty}, TH_TEXT, LE_FONT, FONT_UI);
 
     if (focused && le->cursor_visible)
         platform_fill_rect(win, (Rect){tx + cur_x, b.y + 6, 1, b.h - 12}, TH_ACCENT_TEXT);

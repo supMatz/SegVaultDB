@@ -23,6 +23,7 @@ typedef struct LineEdit {
 
     const char* placeholder;
     bool  error;           // bordo rosso (es. nessun risultato)
+    bool  secret;          // password: si vede un * per byte, niente copia
     bool  dragging;
     uint64_t blink_ms;
     bool  cursor_visible;

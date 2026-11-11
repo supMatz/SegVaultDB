@@ -212,9 +212,44 @@ db_result_free(r);
 db_shutdown();
 ```
 
+## Utenti e permessi
+
+Con `--users` (o *USER LOGIN: Required* nel pannello del server) ogni richiesta `/api` deve presentare
+utente e password con HTTP Basic, e le sue query girano con i permessi di quell'utente:
+
+```bash
+curl -u anna:password http://127.0.0.1:8484/api/v1/query -H "Content-Type: application/json" \
+     -d '{"database":"shop","sql":"SELECT * FROM prodotto"}'
+```
+
+Gli utenti si gestiscono in SQL (dall'editor, che lavora come amministratore, o da un utente
+amministratore) o dal pannello *Settings › Users & permissions*:
+
+```sql
+CREATE USER anna IDENTIFIED BY 'una-password';
+GRANT SELECT, INSERT ON shop.* TO anna;          -- tutto il database
+GRANT UPDATE ON shop.ordine TO anna;             -- una tabella
+GRANT ALL ON *.* TO capo WITH GRANT OPTION;      -- amministratore: tutto, anche gestire gli utenti
+REVOKE INSERT ON shop.* FROM anna;
+ALTER USER anna IDENTIFIED BY 'nuova-password';
+SHOW USERS;  SHOW GRANTS FOR anna;
+DROP USER anna;
+```
+
+- Permessi: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE` (tabelle, viste, database),
+  `DROP` (anche `TRUNCATE`), `ALTER` (anche indici e trigger), `ALL`.
+- Il controllo copre tutte le tabelle toccate da uno statement: subquery, `JOIN`, tabelle derivate,
+  CTE, rami di `UNION`, `INSERT ... SELECT`, `EXPLAIN`. Una vista si autorizza come una tabella.
+- Le password sono salvate in `<data>/users.dat` come hash SHA-256 con sale, ripetuto 20.000 volte;
+  dopo un tentativo sbagliato il server aspetta 300 ms. Le credenziali giuste restano in memoria al
+  massimo un minuto (un utente eliminato è escluso subito).
+- Il token, se impostato, continua a dare accesso completo. Gli endpoint salvati girano con i
+  permessi di chi li ha creati (come una procedura), quindi un endpoint pubblico può leggere una
+  tabella che i visitatori non vedono direttamente.
+
 ## Sicurezza
 
-- Default sicuri: ascolto solo su `127.0.0.1`; in rete serve `--token`.
+- Default sicuri: ascolto solo su `127.0.0.1`; in rete serve `--token` o `--users`.
 - Il token viaggia in chiaro su HTTP: fuori dalla macchina locale metti il server dietro un
   reverse proxy HTTPS (nginx, Caddy) e lascialo in ascolto su `127.0.0.1`.
 - Il token dà accesso completo (anche `DROP`): non metterlo nel codice di una pagina pubblica.

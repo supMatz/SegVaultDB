@@ -42,3 +42,5 @@ test_db_tools
 test_db_tools_asan
 test_png
 test_png_asan
+test_auth
+test_auth_asan

@@ -10,6 +10,7 @@
 #include "schema_view.h"
 #include "schema_model.h"
 #include "db_tools.h"
+#include "users_view.h"
 #include <stdio.h>
 #include <strings.h>
 #include <string.h>
@@ -2126,7 +2127,7 @@ typedef enum {
     // struttura ed explorer
     CTX_NEW_TABLE, CTX_EDIT_STRUCTURE, CTX_TREE_BROWSE, CTX_TREE_USE_DB, CTX_TREE_COPY_NAME, CTX_TREE_SELECT_SQL,
     CTX_TREE_DDL, CTX_TREE_DESIGNER, CTX_PAGE_SQL, CTX_PAGE_DESIGNER,
-    CTX_SEARCH_DB, CTX_DB_OVERVIEW, CTX_TRUNCATE_TABLE, CTX_DROP_TABLE, CTX_DROP_DB,
+    CTX_SEARCH_DB, CTX_DB_OVERVIEW, CTX_TRUNCATE_TABLE, CTX_DROP_TABLE, CTX_DROP_DB, CTX_USERS,
     // Settings / Help
     CTX_SETTINGS, CTX_SETTINGS_RESET, CTX_SHORTCUTS, CTX_SQL_REFERENCE, CTX_DOCS, CTX_ABOUT,
     CTX_ACTION_COUNT
@@ -2227,6 +2228,7 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
     [CTX_TRUNCATE_TABLE] = { "Empty table\xe2\x80\xa6",   NULL },
     [CTX_DROP_TABLE]    = { "Drop table\xe2\x80\xa6",     NULL },
     [CTX_DROP_DB]       = { "Drop database\xe2\x80\xa6",  NULL },
+    [CTX_USERS]         = { "Users & permissions\xe2\x80\xa6", NULL },
     [CTX_PAGE_SQL]      = { "SQL editor",                "Ctrl+Shift+D" },
     [CTX_PAGE_DESIGNER] = { "Schema designer (ER / UML)", "Ctrl+Shift+D" },
     [CTX_SETTINGS]      = { "Settings\xe2\x80\xa6",      "Ctrl+," },
@@ -2261,7 +2263,7 @@ static const int M_IMPORT[] = { CTX_IMPORT_CSV, CTX_SEP, CTX_OPEN, CTX_RUN_FILE 
 static const int M_EXPORT[] = { CTX_EXPORT_CSV, CTX_EXPORT_TSV, CTX_EXPORT_JSON, CTX_EXPORT_MD, CTX_EXPORT_HTML,
                                 CTX_EXPORT_SQL, CTX_SEP, CTX_COPY_ALL, CTX_COPY_JSON, CTX_COPY_MD, CTX_COPY_SQL, CTX_SEP,
                                 CTX_DUMP_DB };
-static const int M_SETTINGS[] = { CTX_SETTINGS, CTX_SEP, CTX_NEXT_THEME, CTX_TOGGLE_SIDEBAR, CTX_TOGGLE_FOOTER,
+static const int M_SETTINGS[] = { CTX_SETTINGS, CTX_USERS, CTX_SEP, CTX_NEXT_THEME, CTX_TOGGLE_SIDEBAR, CTX_TOGGLE_FOOTER,
                                   CTX_TOGGLE_LINENUMS, CTX_TOGGLE_ROWNUMS, CTX_SEP, CTX_SETTINGS_RESET };
 static const int M_HELP[] = { CTX_SHORTCUTS, CTX_SQL_REFERENCE, CTX_DOCS, CTX_SEP, CTX_ABOUT };
 
@@ -2347,6 +2349,7 @@ static bool ctx_enabled(AppWindow* app, int a) {
         case CTX_EDIT_STRUCTURE: { char d[64], t[64]; return idle && design_table(app, d, sizeof(d), t, sizeof(t)); }
         case CTX_TREE_BROWSE: case CTX_TREE_USE_DB: case CTX_TREE_DDL: case CTX_TREE_DESIGNER: return idle;
         case CTX_TRUNCATE_TABLE: case CTX_DROP_TABLE: case CTX_DROP_DB: return idle && !app->in_transaction;
+        case CTX_USERS: return idle;
         case CTX_SEARCH_DB: case CTX_DB_OVERVIEW: { char d[64]; return idle && design_db(app, d, sizeof(d)); }
         case CTX_BEGIN: return idle && !app->in_transaction;
         case CTX_COMMIT: case CTX_ROLLBACK: return idle;
@@ -2664,6 +2667,23 @@ static void schema_action(AppWindow* app, SchemaViewAction a) {
                 schema_view_exec_done(sv, false, full);
                 set_status(app, STATUS_ERROR, full, "");
             }
+            break;
+        }
+        default: break;
+    }
+}
+
+// ── pannello utenti ─────────────────────────────────────────────
+
+static void users_event(AppWindow* app, sEvent* evt) {
+    switch (uv_event(app->uv, evt)) {
+        case UV_CLOSE: uv_close(app->uv); break;
+        case UV_EXEC: {
+            if (busy_guard(app)) break;
+            int total = 0;
+            char err[400];
+            int done = exec_statements(uv_sql(app->uv), &total, err, sizeof(err));   // la GUI è l'amministratore
+            uv_exec_done(app->uv, done == total, done == total ? "Saved" : err);
             break;
         }
         default: break;
@@ -3101,6 +3121,7 @@ static void ctx_run(AppWindow* app, int a) {
             if (d) confirm_drop_db(app, d);
             break;
         }
+        case CTX_USERS: uv_open(app->uv); break;
         case CTX_PAGE_SQL:      set_page(app, PAGE_SQL); break;
         case CTX_PAGE_DESIGNER: set_page(app, PAGE_DESIGNER); break;
         case CTX_TREE_COPY_NAME: {
@@ -4201,6 +4222,7 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
     app->filter_input->on_change = on_filter_change;
     app->filter_input->win = win;
     app->td = td_create(win);
+    app->uv = uv_create(win);
     app->schema = schema_view_create(win);
     app->cell_edit = line_edit_create("");
     if (app->cell_edit) { app->cell_edit->win = win; app->cell_edit->base.visible = false; }
@@ -4313,6 +4335,7 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
     // pannelli modali: designer di tabelle, Settings, informazioni
     if (td_is_open(app->td)) { designer_event(app, evt); return; }
     if (app->conf_open) { confirm_event(app, evt); return; }
+    if (uv_is_open(app->uv)) { users_event(app, evt); return; }
     if (app->settings_open && evt->type != EVT_MOUSE_UP) { settings_handle_event(app, evt); return; }
     if (app->info_page && evt->type != EVT_MOUSE_UP) {
         if (evt->type == EVT_MOUSE_WHEEL) app->info_scroll -= evt->wheel_delta * 3;
@@ -4548,6 +4571,7 @@ bool app_window_tick(AppWindow* app, uint64_t now_ms) {
     c = line_edit_tick(app->filter_input, now_ms) || c;
     if (app->cell_edit && gedit_editing(app)) c = line_edit_tick(app->cell_edit, now_ms) || c;
     c = td_tick(app->td, now_ms) || c;
+    c = uv_tick(app->uv, now_ms) || c;
     if (app->page == PAGE_DESIGNER) c = schema_view_tick(app->schema, now_ms) || c;
     // esecuzione in background: completamento e stato con il tempo trascorso
     if (app->job) {
@@ -4918,6 +4942,7 @@ void app_window_draw(AppWindow* app) {
     draw_cell_view(app);
     draw_settings(app);
     td_draw(app->td, app->win_w, app->win_h);
+    uv_draw(app->uv, app->win_w, app->win_h);
     draw_confirm(app);
     draw_info(app);
     draw_help(app);
@@ -5323,6 +5348,7 @@ void app_window_destroy(AppWindow* app) {
     widget_destroy((Widget*)app->filter_input);
     if (app->cell_edit) widget_destroy((Widget*)app->cell_edit);
     td_destroy(app->td);
+    uv_destroy(app->uv);
     free(app->conf_sql);
     schema_view_destroy(app->schema);
     for (int c = 0; c < 64; c++) free(app->draft_vals[c]);

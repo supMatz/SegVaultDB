@@ -148,6 +148,7 @@ typedef struct {
 
     struct TableDesigner* td;       // designer di tabelle (creazione / struttura)
     struct SchemaView*    schema;   // pagina Designer: diagramma ER / UML
+    struct UsersView*     uv;       // pannello Users & permissions
     int          page;              // PAGE_SQL / PAGE_DESIGNER
     Rect         page_tabs[2];      // selettore di pagina nella toolbar
 

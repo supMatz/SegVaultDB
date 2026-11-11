@@ -100,6 +100,8 @@ static SettingDef DEFS[] = {
       SET_BOOL, S(server_lan), 0, 0, 1, ON_OFF, 2 },
     { "Server", "server_token", "Require a token", "Apps send \"Authorization: Bearer <token>\" (always on with network or CORS)",
       SET_BOOL, S(server_token), 0, 0, 1, ON_OFF, 2 },
+    { "Server", "server_users", "Require a user login", "Apps send a user and password (HTTP Basic); each query runs with that user's privileges",
+      SET_BOOL, S(server_users), 0, 0, 1, ON_OFF, 2 },
     { "Server", "server_cors", "Allow web apps from any origin", "CORS for pages served elsewhere (e.g. a dev server); requires the token",
       SET_BOOL, S(server_cors), 0, 0, 1, ON_OFF, 2 },
     { "Server", "server_timeout", "Request time limit (s)", "A request running longer is stopped (0 = no limit)",

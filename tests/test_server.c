@@ -541,6 +541,60 @@ int main(void) {
     CHECK(r.json && rc && rc->number == 40000, "large result parses: status %d", r.status);
     resp_free(&r);
 
+    // ── utenti (terzo server con --users): login Basic, permessi dell'utente, token = accesso completo ──
+    {
+        QueryResult* q;
+        q = db_execute("CREATE USER anna IDENTIFIED BY 'anna-pass'"); db_result_free(q);
+        q = db_execute("GRANT SELECT ON t.p TO anna"); db_result_free(q);
+        q = db_execute("CREATE USER boss IDENTIFIED BY 'boss-pass'"); db_result_free(q);
+        q = db_execute("GRANT ALL ON *.* TO boss WITH GRANT OPTION"); db_result_free(q);
+        SvServerConfig cfg3 = { .port = 0, .token = "tok3", .default_db = "t", .quiet = true, .require_login = true };
+        SvServer* s3 = sv_server_start(&cfg3, err, sizeof(err));
+        int port3 = s3 ? sv_server_port(s3) : 0;
+        pthread_t th3;
+        if (s3) pthread_create(&th3, NULL, run_server, s3);
+        const char* J = "Content-Type: application/json\r\n";
+        char hdr[256];
+        r = request(port3, "POST", "/api/v1/query", J, "{\"sql\":\"SELECT 1\"}");
+        CHECK(r.status == 401 && strstr(r.body, "Basic"), "login required: %d %s", r.status, r.body);
+        resp_free(&r);
+        snprintf(hdr, sizeof(hdr), "%sAuthorization: Basic YW5uYTp3cm9uZw==\r\n", J);
+        r = request(port3, "POST", "/api/v1/query", hdr, "{\"sql\":\"SELECT 1\"}");
+        CHECK(r.status == 401 && strstr(r.body, "wrong user or password"), "wrong password: %d %s", r.status, r.body);
+        resp_free(&r);
+        snprintf(hdr, sizeof(hdr), "%sAuthorization: Basic YW5uYTphbm5hLXBhc3M=\r\n", J);
+        r = request(port3, "POST", "/api/v1/query", hdr, "{\"sql\":\"SELECT COUNT(*) FROM p\"}");
+        c = cell_at(&r, 0, 0, 0);
+        CHECK(resp_ok(&r) && c && c->number == 3, "anna reads p: %s", r.body);
+        resp_free(&r);
+        r = request(port3, "POST", "/api/v1/query", hdr, "{\"sql\":\"DELETE FROM p\"}");
+        CHECK(!resp_ok(&r) && strstr(err_msg(&r), "Access denied"), "anna cannot delete: %s", r.body);
+        resp_free(&r);
+        r = request(port3, "POST", "/api/v1/query", hdr, "{\"sql\":\"SELECT * FROM conc\"}");
+        CHECK(!resp_ok(&r) && strstr(err_msg(&r), "Access denied"), "anna cannot read conc: %s", r.body);
+        resp_free(&r);
+        // di nuovo (credenziali in cache): stesso esito, e la sessione del motore torna root dopo la richiesta
+        r = request(port3, "POST", "/api/v1/query", hdr, "{\"sql\":\"SELECT COUNT(*) FROM p\"}");
+        CHECK(resp_ok(&r), "cached login: %s", r.body);
+        resp_free(&r);
+        CHECK(!db_session_user()[0], "engine back to root after the request");
+        snprintf(hdr, sizeof(hdr), "%sAuthorization: Basic Ym9zczpib3NzLXBhc3M=\r\n", J);
+        r = request(port3, "POST", "/api/v1/query", hdr, "{\"sql\":\"SELECT COUNT(*) FROM conc\"}");
+        CHECK(resp_ok(&r), "admin reads anything: %s", r.body);
+        resp_free(&r);
+        snprintf(hdr, sizeof(hdr), "%sAuthorization: Bearer tok3\r\n", J);
+        r = request(port3, "POST", "/api/v1/query", hdr, "{\"sql\":\"SELECT COUNT(*) FROM conc\"}");
+        CHECK(resp_ok(&r), "token = full access: %s", r.body);
+        resp_free(&r);
+        // utente eliminato: subito fuori, anche con il login in cache
+        q = db_execute("DROP USER anna"); db_result_free(q);
+        snprintf(hdr, sizeof(hdr), "%sAuthorization: Basic YW5uYTphbm5hLXBhc3M=\r\n", J);
+        r = request(port3, "POST", "/api/v1/query", hdr, "{\"sql\":\"SELECT COUNT(*) FROM p\"}");
+        CHECK(r.status == 401, "dropped user: %d %s", r.status, r.body);
+        resp_free(&r);
+        if (s3) { sv_server_stop(s3); pthread_join(th3, NULL); sv_server_free(s3); }
+    }
+
     sv_server_stop(s);
     sv_server_stop(s2);
     pthread_join(th, NULL);

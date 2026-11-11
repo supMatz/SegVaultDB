@@ -221,6 +221,12 @@ modifiche ne fanno parte (`COMMIT` / `ROLLBACK`). Restano in sola lettura (con i
 di stato) le colonne calcolate e i risultati di `GROUP BY`, `DISTINCT`, `UNION`, viste, e le tabelle
 senza chiave primaria.
 
+**Utenti e permessi** (*Settings › Users & permissions*): gli account del server API con una
+matrice database × permesso (`SELECT` … `ALTER`, *All*, riga *All databases*), amministratore,
+cambio password, permessi sulle singole tabelle; ogni clic è un `GRANT` / `REVOKE` mostrato sotto.
+Gli stessi comandi si scrivono in SQL: `CREATE USER`, `GRANT`, `REVOKE`, `SHOW GRANTS`
+([dettagli](docs/API.md#utenti-e-permessi)).
+
 **Strumenti sul database** (tasto destro su un database nell'explorer, o menu *Query*):
 - *Search in database…* (`Ctrl+Shift+G`): cerca un testo in tutte le colonne di tutte le tabelle, senza
   distinguere maiuscole e minuscole (anche numeri e date; `%` e `_` sono cercati come caratteri); il risultato ha una riga per valore trovato
@@ -328,7 +334,7 @@ delle richieste al posto dei risultati.
 ```
 
 - **Indirizzi** da copiare: locale e, con *Local network*, quello raggiungibile dagli altri computer.
-- **Opzioni:** porta, *This computer* / *Local network*, token (obbligatorio in rete o con CORS; *Copy* e *New*, salvato in `<data>/server.token`), *Same origin* / *Any origin* per le web app, limite di tempo. Una modifica riavvia il server.
+- **Opzioni:** porta, *This computer* / *Local network*, *User login* (utente e password per ogni richiesta, con i permessi definiti in *Settings › Users & permissions*), token (obbligatorio in rete o con CORS; *Copy* e *New*, salvato in `<data>/server.token`), *Same origin* / *Any origin* per le web app, limite di tempo. Una modifica riavvia il server.
 - **Registro** in tempo reale delle ultime 200 richieste, con l'SQL così come è stato inviato (con i `?`: i valori dei parametri, come password o dati personali, non compaiono a schermo).
 - **Web folder:** una cartella con il sito (come la `htdocs` di XAMPP) viene servita su `/` insieme all'API su `/api/v1`, sulla stessa porta e quindi senza CORS; *Open site* lo apre nel browser. Il percorso è salvato in `<data>/server.ini`.
 - **Try it:** il comando `curl` pronto da copiare (a schermo il token è mostrato solo in parte).
@@ -541,6 +547,7 @@ make server                                   # ./segvault-server (make windows:
 | `-p, --port N` | porta TCP (default 8484) |
 | `-b, --bind ADDR` | indirizzo (default `127.0.0.1`: solo questa macchina); in rete serve un token |
 | `-t, --token T` | richiede `Authorization: Bearer T` (anche `SEGVAULT_TOKEN`; `auto` ne genera uno) |
+| `--users` | richiede utente e password (HTTP Basic); ogni query ha i permessi dell'utente (`CREATE USER`, `GRANT`: vedi [docs/API.md](docs/API.md#utenti-e-permessi)) |
 | `-d, --database DB` | database usato se la richiesta non ne indica uno |
 | `--cors ORIGIN` | permette le chiamate dal browser da `ORIGIN` (`*` = tutte) |
 | `--static DIR` | serve i file di `DIR` fuori da `/api` |
@@ -953,6 +960,7 @@ Ogni widget estende `Widget` mettendolo come **primo campo** della propria struc
 | `Panel` / `Splitter` | `panel.*`, `splitter.*` | Contenitore; divisore ridimensionabile |
 | *(finestra)* | `window.h` / `window.c` | Layout dell'editor, menu, impostazioni, esecuzione in background |
 | *(schermate)* | `server_view.h` / `server_view.c` | Scelta iniziale e pannello del server |
+| *(utenti)* | `users_view.*`; `src/bridge/auth.*` | Pannello Users & permissions; utenti, password, `GRANT` e controllo dei permessi nel motore |
 | *(immagini)* | `png_write.h` / `png_write.c` | Encoder PNG senza librerie (deflate con LZ77 e Huffman fisso) |
 | *(strumenti)* | `db_tools.h` / `db_tools.c` | Ricerca in tutto il database e panoramica delle tabelle |
 | *(designer)* | `table_design.*`, `table_designer.*` | Struttura di una tabella e SQL che la realizza (`CREATE` / `ALTER`); il modulo del designer |

@@ -5,6 +5,7 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
        tramite l'API definita in db_api.h.
 */
 #include "db_api.h"
+#include "auth.h"
 #include "../catalog/schema.h"
 #include "../storage/buffer_pool.h"
 #include "../query/lexer.h"
@@ -133,6 +134,7 @@ static bool db_init_impl(const char* data_directory) {
     g_db.exec_ctx.tx_id   = 0;
 
     g_db.initialized = true;
+    auth_init(data_directory);
     return true;
 }
 
@@ -172,6 +174,14 @@ static void maybe_checkpoint(void) {
 
 static int g_num_savepoints;
 
+// utente della sessione ("" = root, tutto permesso: la GUI). Lo imposta il server per ogni richiesta
+static char g_session_user[64];
+
+static const char* cur_db_name(void) {
+    Database* d = catalog_current_db(g_db.catalog);
+    return d ? d->name : "";
+}
+
 // Uno statement con trigger è atomico: se un trigger fallisce dopo che le righe sono state
 // scritte, tutto lo statement viene annullato (transazione implicita, o savepoint se c'è
 // già una transazione aperta). Senza trigger le modifiche sono già validate prima di scrivere.
@@ -197,6 +207,10 @@ static QueryResult* exec_atomic(ASTNode* stmt) {
 // esegue uno statement già analizzato (transazioni e CHECKPOINT gestiti qui)
 static QueryResult* exec_one(ASTNode* stmt) {
     QueryResult* result = NULL;
+    if (g_session_user[0]) {         // permessi dell'utente della sessione
+        char err[300];
+        if (!auth_check(g_session_user, stmt, cur_db_name(), err, sizeof(err))) return result_error(err);
+    }
     if (stmt->type == NODE_BEGIN) {
         result = db_begin() ? result_ok(0) : result_error("Failed to begin transaction");
     } else if (stmt->type == NODE_COMMIT) {
@@ -249,6 +263,13 @@ static QueryResult* db_execute_impl(const char* sql) {
 
     // Pipeline: tokenize → parse → execute
     TokenList*   tokens = lexer_tokenize(sql);
+    void* admin = NULL;               // CREATE USER, GRANT, SHOW GRANTS, ...: gestiti da auth.c
+    if (tokens && auth_statement(tokens, g_session_user, cur_db_name(), &admin)) {
+        lexer_free(tokens);
+        QueryResult* r = admin ? (QueryResult*)admin : result_error("Out of memory");
+        r->exec_time_ms = get_time_ms() - t_start;
+        return r;
+    }
     ParseResult* parsed = parser_parse(tokens);
 
     if (!parsed->success) {
@@ -597,6 +618,8 @@ void db_free_string(char* s) { free(s); }
 
 static void db_shutdown_impl(void) {
     if (!g_db.initialized) return;
+    auth_shutdown();
+    g_session_user[0] = '\0';
     // una transazione lasciata aperta viene annullata (le sue pagine sono già nel buffer)
     if (g_db.exec_ctx.tx_id) db_rollback();
     bp_flush_all(g_db.bp);
@@ -788,6 +811,61 @@ bool db_table_info(const char* db_name, const char* table, TableInfo* out, int* 
     }
     db_unlock();
     return t != NULL;
+}
+
+bool db_set_user(const char* name) {
+    db_lock();
+    bool ok = !name || !name[0] || auth_user_exists(name);
+    if (ok) snprintf(g_session_user, sizeof(g_session_user), "%.63s", name ? name : "");
+    db_unlock();
+    return ok;
+}
+
+const char* db_session_user(void) { return g_session_user; }
+
+bool db_login(const char* name, const char* password) {
+    db_lock();
+    bool ok = name && name[0] && auth_login(name, password);
+    db_unlock();
+    return ok;
+}
+
+bool db_has_users(void) {
+    db_lock();
+    bool r = auth_user_count() > 0;
+    db_unlock();
+    return r;
+}
+
+int db_list_users(DbUserInfo* out, int max) {
+    db_lock();
+    int n = 0;
+    for (int i = 0; i < auth_user_count() && n < max; i++) {
+        const char* u = auth_user_name(i);
+        snprintf(out[n].name, sizeof(out[n].name), "%s", u);
+        out[n].admin = auth_is_admin(u);
+        n++;
+    }
+    db_unlock();
+    return n;
+}
+
+unsigned db_user_grant(const char* user, const char* db, const char* table) {
+    db_lock();
+    unsigned p = auth_grant_on(user, db, table);
+    db_unlock();
+    return p;
+}
+
+int db_user_table_grants(const char* user, char (*db)[64], char (*table)[64], unsigned* privs, int max) {
+    db_lock();
+    int n = 0;
+    for (int i = 0; i < auth_grant_count(user) && n < max; i++) {
+        unsigned p;
+        if (auth_grant_at(user, i, db[n], table[n], &p)) { privs[n] = p; n++; }
+    }
+    db_unlock();
+    return n;
 }
 
 bool db_use(const char* name) {

@@ -8,6 +8,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #include "server.h"
 #include "json.h"
 #include "../bridge/db_api.h"
+#include "../bridge/auth.h"
 #include "../widgets/sql_text.h"
 #include "../../include/common.h"
 
@@ -104,6 +105,7 @@ typedef struct {
     size_t content_length;
     char   content_type[128];
     char   auth[512];
+    char   user[64];                    // utente autenticato (Basic) o "" (root: token o nessun login)
     char   origin[256];
     char   host[256];
     char*  body;                        // NUL-terminato
@@ -464,7 +466,7 @@ static void exec_end(SvServer* s) {
 // esegue lo script (già con i parametri) nel database indicato e scrive la risposta;
 // sql_for_log: il testo originale, con i segnaposto, per il registro. Libera script.
 static void run_script(SvServer* s, Response* rs, char* script, const char* sql_for_log, const char* dbname,
-                       bool want_tx, bool objects) {
+                       bool want_tx, bool objects, const char* user) {
     int len = (int)strlen(script), cap = 64, nst;
     SqlRange* ranges = NULL;
     for (;;) {                                  // quanti statement: si raddoppia finché bastano
@@ -479,6 +481,14 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
     double t0 = now_ms();
     one_line(rs->detail, sizeof(rs->detail), sql_for_log);   // con i '?': i valori dei parametri non finiscono nel registro
     exec_begin(s);
+    // permessi dell'utente della richiesta (vuoto = root), solo per gli statement di questa richiesta
+    if (!db_set_user(user)) {
+        exec_end(s);
+        free(ranges);
+        free(script);
+        json_error(rs, 401, "user '%s' no longer exists", user ? user : "");
+        return;
+    }
     // il database corrente si ripristina alla fine: una richiesta non cambia quello delle successive
     char prev_db[128] = "";
     const char* cur = db_current_database();
@@ -538,6 +548,7 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
         warning = failed ? "the open transaction was rolled back"
                          : "a transaction was left open and has been rolled back (end it with COMMIT)";
     }
+    db_set_user(NULL);
     cur = db_current_database();
     if (prev_db[0] && (!cur || strcmp(cur, prev_db))) {
         char use[160];
@@ -620,7 +631,7 @@ static void handle_query(SvServer* s, Request* rq, Response* rs) {
         char err[512];
         char* script = bind_params(sql, params, err, sizeof(err));
         if (!script) json_error(rs, 400, "%s", err);
-        else run_script(s, rs, script, sql, dbname, want_tx, objects);   // libera script
+        else run_script(s, rs, script, sql, dbname, want_tx, objects, rq->user);   // libera script
     }
     json_free(root);
 }
@@ -725,7 +736,7 @@ static void handle_endpoint(SvServer* s, Request* rq, Response* rs, const char* 
     if (!script) { json_error(rs, 400, "endpoint '%s': %s", name, err); return; }
     char label[200];
     snprintf(label, sizeof(label), "endpoint %.60s: %.120s", name, sql);
-    run_script(s, rs, script, label, db, true, objects);    // sempre atomico: tutto o niente
+    run_script(s, rs, script, label, db, true, objects, NULL);   // sempre atomico; con i permessi di chi l'ha salvato
 }
 
 static void handle_endpoint_list(SvServer* s, Request* rq, Response* rs, const char* db) {
@@ -907,6 +918,75 @@ static const char* origin_problem(SvServer* s, const Request* rq) {
     return "Origin not allowed (start the server with --cors to allow this web app)";
 }
 
+// ── login con utente e password (Authorization: Basic) ─────────
+
+static int b64v(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+}
+
+static size_t b64_decode(const char* in, char* out, size_t cap) {
+    size_t n = 0;
+    unsigned acc = 0;
+    int bits = 0;
+    for (; *in && *in != '='; in++) {
+        int v = b64v(*in);
+        if (v < 0) { if (*in == ' ') continue; return 0; }
+        acc = (acc << 6 | (unsigned)v) & 0xFFFFu;        // bastano gli ultimi 16 bit
+        bits += 6;
+        if (bits >= 8) { bits -= 8; if (n + 1 >= cap) return 0; out[n++] = (char)((acc >> bits) & 0xFF); }
+    }
+    out[n] = '\0';
+    return n;
+}
+
+// le credenziali giuste si ricordano per un minuto (l'hash della password è volutamente lento);
+// chiave = SHA-256 di "utente:password", mai la password. Una password cambiata smette di valere
+// entro un minuto, un utente eliminato subito (la query controlla che esista)
+#define LOGIN_CACHE 16
+#define LOGIN_TTL_MS (60 * 1000)
+static struct { uint8_t key[32]; char user[64]; double until; } g_login_cache[LOGIN_CACHE];
+
+static bool basic_login(SvServer* s, const char* b64, char* user, size_t un) {
+    char dec[400];
+    if (!b64_decode(b64, dec, sizeof(dec))) return false;
+    char* colon = strchr(dec, ':');
+    if (!colon) return false;
+    *colon = '\0';
+    uint8_t key[32];
+    *colon = ':';
+    auth_sha256(dec, strlen(dec), key);
+    *colon = '\0';
+    double now = now_ms();
+    mx_lock(&s->conn_mx);
+    for (int i = 0; i < LOGIN_CACHE; i++)
+        if (g_login_cache[i].until > now && !memcmp(g_login_cache[i].key, key, 32) && !strcmp(g_login_cache[i].user, dec)) {
+            snprintf(user, un, "%s", dec);
+            mx_unlock(&s->conn_mx);
+            return true;
+        }
+    mx_unlock(&s->conn_mx);
+    bool ok = db_login(dec, colon + 1);
+    memset(colon + 1, 0, strlen(colon + 1));
+    if (!ok) {
+        sleep_ms(300);                           // rallenta i tentativi di indovinare la password
+        return false;
+    }
+    snprintf(user, un, "%s", dec);
+    mx_lock(&s->conn_mx);
+    int slot = 0;
+    for (int i = 1; i < LOGIN_CACHE; i++) if (g_login_cache[i].until < g_login_cache[slot].until) slot = i;
+    memcpy(g_login_cache[slot].key, key, 32);
+    snprintf(g_login_cache[slot].user, sizeof(g_login_cache[slot].user), "%s", dec);
+    g_login_cache[slot].until = now + LOGIN_TTL_MS;
+    mx_unlock(&s->conn_mx);
+    return true;
+}
+
 static void route(SvServer* s, Request* rq, Response* rs) {
     bool api = !strncmp(rq->path, API_PREFIX, sizeof(API_PREFIX) - 1) &&
                (rq->path[sizeof(API_PREFIX) - 1] == '\0' || rq->path[sizeof(API_PREFIX) - 1] == '/');
@@ -952,12 +1032,22 @@ static void route(SvServer* s, Request* rq, Response* rs) {
         jb_lit(&rs->body, "{\"ok\":true,\"server\":\"SegVault\",\"version\":\"" SV_VERSION_STR "\"}");
         return;
     }
-    if (api && s->token && !ep_public) {
+    if (api && !ep_public) {
+        // token = accesso completo; utente e password (Basic) = i permessi di quell'utente
         const char* a = rq->auth;
-        bool ok = !strncasecmp(a, "Bearer ", 7) && secret_equal(a + 7, s->token);
-        if (!ok) {
-            rs->extra_headers = "WWW-Authenticate: Bearer\r\n";
-            json_error(rs, 401, "missing or wrong token (send \"Authorization: Bearer <token>\")");
+        bool bearer = s->token && !strncasecmp(a, "Bearer ", 7) && secret_equal(a + 7, s->token);
+        if (!strncasecmp(a, "Basic ", 6)) {
+            if (!basic_login(s, a + 6, rq->user, sizeof(rq->user))) {
+                rs->extra_headers = "WWW-Authenticate: Basic realm=\"SegVault\"\r\n";
+                json_error(rs, 401, "wrong user or password");
+                free(ep_sql);
+                return;
+            }
+        } else if (!bearer && (s->token || s->cfg.require_login)) {
+            rs->extra_headers = s->cfg.require_login ? "WWW-Authenticate: Basic realm=\"SegVault\"\r\n" : "WWW-Authenticate: Bearer\r\n";
+            json_error(rs, 401, s->cfg.require_login ? "log in: send \"Authorization: Basic base64(user:password)\"%s"
+                                                     : "missing or wrong token (send \"Authorization: Bearer <token>\")%s",
+                       s->token && s->cfg.require_login ? " or the token" : "");
             free(ep_sql);
             return;
         }
