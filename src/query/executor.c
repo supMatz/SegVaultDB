@@ -1625,8 +1625,9 @@ static const char* utf8_at(const char* s, int ci) {
 // Testi calcolati più lunghi del buffer di EvalVal (CONCAT, REPLACE, ...): copiati in un'arena
 // che vive quanto lo statement (liberata quando executor_run torna al livello più esterno).
 #define EV_TEXT_MAX (1u << 20)
-static Arena g_text_arena;
-static int   g_run_depth;
+// per-thread: preparazione all'esecuzione in parallelo (ogni thread ha la sua arena e la sua profondità)
+static _Thread_local Arena g_text_arena;
+static _Thread_local int   g_run_depth;
 
 // copia s nell'arena (o nel buffer se ci sta); false se troppo lungo o senza memoria
 static bool ev_text_long(EvalVal* out, const char* s, size_t n) {
@@ -3518,7 +3519,7 @@ static const char* join_step(EvalCtx* ec, Combos* in, Combos* out, int k, JoinTy
 // ── ordinamento ──
 
 typedef struct { SortKey* keys; int nkeys; const bool* desc; } SortSpec;
-static SortSpec g_sort;
+static _Thread_local SortSpec g_sort;
 
 static int unit_cmp(const void* pa, const void* pb) {
     int ia = *(const int*)pa, ib = *(const int*)pb;
@@ -4172,9 +4173,9 @@ static bool set_combine(ORows* a, ORows* b, int op, bool all, ORows* out) {
     return ok;
 }
 
-static const OVal* g_cmp_rows_base;
-static int g_cmp_ncols, g_cmp_nkeys;
-static const int* g_cmp_cols;
+static _Thread_local const OVal* g_cmp_rows_base;
+static _Thread_local int g_cmp_ncols, g_cmp_nkeys;
+static _Thread_local const int* g_cmp_cols;
 static const bool* g_cmp_desc;
 
 static int compound_cmp(const void* pa, const void* pb) {

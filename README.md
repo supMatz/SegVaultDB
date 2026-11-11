@@ -1204,8 +1204,9 @@ SegVault implementa lexer e parser da zero, senza Flex né Bison.
 Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
 
 1. **Concorrenza** — fatto: sessioni del server con database, utente e transazione propri, anche su
-   più richieste, con un solo proprietario delle transazioni. Da fare: esecuzione in parallelo
-   (lock sulle righe o MVCC, letture concorrenti).
+   più richieste, con un solo proprietario delle transazioni; stato dell'executor per thread. Da fare:
+   latch del buffer pool, database corrente e contesto per thread, lock lettori/scrittori per eseguire
+   le letture in parallelo; poi lock sulle righe o MVCC per le scritture concorrenti.
 2. **Righe grandi** — pagine di overflow per testi e `BLOB` oltre i 4080 byte di una riga.
 3. **Compatibilità MySQL** — import dei dump di `mysqldump`, poi il protocollo di rete MySQL (le app
    PHP come WordPress si collegherebbero senza modifiche).
