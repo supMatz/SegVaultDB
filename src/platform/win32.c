@@ -576,6 +576,31 @@ void platform_reset_clip(PlatformWindow* win) {
     SelectClipRgn(win->hdc_mem, NULL);
 }
 
+bool platform_read_pixels(PlatformWindow* win, Rect r, uint32_t* out) {
+    if (!win || !out || r.w <= 0 || r.h <= 0 || r.x < 0 || r.y < 0 || r.x + r.w > win->width || r.y + r.h > win->height) return false;
+    // copia del backbuffer in una DIB a 32 bit (GetDIBits non vuole bitmap selezionate in un DC)
+    BITMAPINFO bmi = {0};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = r.w;
+    bmi.bmiHeader.biHeight      = -r.h;
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = NULL;
+    HDC dc = CreateCompatibleDC(win->hdc_mem);
+    HBITMAP dib = CreateDIBSection(win->hdc_mem, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!dc || !dib || !bits) { if (dib) DeleteObject(dib); if (dc) DeleteDC(dc); return false; }
+    HGDIOBJ old = SelectObject(dc, dib);
+    BitBlt(dc, 0, 0, r.w, r.h, win->hdc_mem, r.x, r.y, SRCCOPY);
+    GdiFlush();
+    const uint32_t* p = (const uint32_t*)bits;      // BGRA in memoria = 0xAARRGGBB
+    for (int i = 0; i < r.w * r.h; i++) out[i] = p[i] & 0x00FFFFFFu;
+    SelectObject(dc, old);
+    DeleteObject(dib);
+    DeleteDC(dc);
+    return true;
+}
+
 void platform_present(PlatformWindow* win) {
     BitBlt(win->hdc, 0, 0, win->width, win->height, win->hdc_mem, 0, 0, SRCCOPY);
 }

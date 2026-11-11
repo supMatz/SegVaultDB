@@ -636,6 +636,30 @@ int platform_measure_text(PlatformWindow* win, const char* text, int size) {
     return platform_measure_text_ex(win, text, -1, size, FONT_UI);
 }
 
+// componente di un pixel secondo la maschera del visual (0..255)
+static uint32_t mask_channel(unsigned long px, unsigned long mask) {
+    if (!mask) return 0;
+    int shift = 0;
+    while (!((mask >> shift) & 1)) shift++;
+    unsigned long v = (px & mask) >> shift, max = mask >> shift;
+    return (uint32_t)(v * 255 / max);
+}
+
+bool platform_read_pixels(PlatformWindow* win, Rect r, uint32_t* out) {
+    if (!win || !out || r.w <= 0 || r.h <= 0 || r.x < 0 || r.y < 0 || r.x + r.w > win->w || r.y + r.h > win->h) return false;
+    XImage* img = XGetImage(win->display, win->backbuf, r.x, r.y, (unsigned)r.w, (unsigned)r.h, AllPlanes, ZPixmap);
+    if (!img) return false;
+    unsigned long rm = img->red_mask, gm = img->green_mask, bm = img->blue_mask;
+    if (!rm) { rm = win->visual->red_mask; gm = win->visual->green_mask; bm = win->visual->blue_mask; }
+    for (int y = 0; y < r.h; y++)
+        for (int x = 0; x < r.w; x++) {
+            unsigned long px = XGetPixel(img, x, y);
+            out[y * r.w + x] = mask_channel(px, rm) << 16 | mask_channel(px, gm) << 8 | mask_channel(px, bm);
+        }
+    XDestroyImage(img);
+    return true;
+}
+
 void platform_present(PlatformWindow *win) {
     // copio il backbuffer sulla finestra principale (equivalente a BitBlt)
     XCopyArea(win->display, win->backbuf, win->window, win->gc,

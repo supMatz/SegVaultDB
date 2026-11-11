@@ -255,6 +255,7 @@ senza scrivere SQL.
 | Relazione obbligatoria / facoltativa | tasto destro sulla linea (`SET` / `DROP NOT NULL` sulle colonne della chiave) |
 | Eliminare | selezione + `Canc`, o tasto destro: tabella (con conferma; le relazioni verso di lei vengono tolte) o relazione (con la casella *Also drop the column* anche le sue colonne, se non servono ad altro) |
 | Dati | tasto destro › *Browse data* apre l'anteprima nella pagina SQL |
+| Immagine | *Export PNG*: tutto il diagramma (non solo la parte visibile) in un file `.png`, a risoluzione normale o doppia, con lo sfondo dell'app o chiaro per documenti e stampa |
 
 Dall'explorer, tasto destro su un database o una tabella › *Show in the designer*.
 
@@ -952,6 +953,7 @@ Ogni widget estende `Widget` mettendolo come **primo campo** della propria struc
 | `Panel` / `Splitter` | `panel.*`, `splitter.*` | Contenitore; divisore ridimensionabile |
 | *(finestra)* | `window.h` / `window.c` | Layout dell'editor, menu, impostazioni, esecuzione in background |
 | *(schermate)* | `server_view.h` / `server_view.c` | Scelta iniziale e pannello del server |
+| *(immagini)* | `png_write.h` / `png_write.c` | Encoder PNG senza librerie (deflate con LZ77 e Huffman fisso) |
 | *(strumenti)* | `db_tools.h` / `db_tools.c` | Ricerca in tutto il database e panoramica delle tabelle |
 | *(designer)* | `table_design.*`, `table_designer.*` | Struttura di una tabella e SQL che la realizza (`CREATE` / `ALTER`); il modulo del designer |
 | *(griglia)* | `grid_edit.h` / `grid_edit.c` | SQL per modificare i dati nella griglia dei risultati |

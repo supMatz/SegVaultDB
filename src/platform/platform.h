@@ -160,6 +160,10 @@ int  platform_text_height(PlatformWindow* win, int size, FontStyle style);
 // disegna un'immagine bitmap (per icone)
 void platform_draw_bitmap(PlatformWindow* win, Rect dest, uint32_t* pixels, int pw, int ph);
 
+// legge i pixel già disegnati (non ancora presentati) del rettangolo r del backbuffer:
+// out = r.w * r.h valori 0x00RRGGBB, riga per riga; false se non riesce
+bool platform_read_pixels(PlatformWindow* win, Rect r, uint32_t* out);
+
 // presenta il frame disegnato (swap backbuffer → schermo)
 void platform_present(PlatformWindow* win);
 

@@ -2,6 +2,7 @@
 #include "schema_model.h"
 #include "theme.h"
 #include "line_edit.h"
+#include "png_write.h"
 #include "../bridge/db_api.h"
 #include "../../include/common.h"
 #include <ctype.h>
@@ -95,6 +96,12 @@ struct SchemaView {
     int  db_hover;
     Rect db_btn, db_menu_rect;
     LineEdit* newdb;
+    LineEdit* exp_path;                // esportazione PNG
+    bool  exp_open;
+    int   exp_scale;
+    bool  exp_light;                   // sfondo chiaro (tema chiaro) per documenti e stampa
+    Rect  exp_rect, exp_ok, exp_s1, exp_s2, exp_l0, exp_l1, b_export;
+    bool  exporting;                   // disegno per l'immagine: niente griglia, selezione, pallini
     bool newdb_open;
     Rect newdb_rect, newdb_ok;
 
@@ -163,6 +170,9 @@ SchemaView* schema_view_create(PlatformWindow* win) {
     v->last_click_target = -9;
     v->newdb = line_edit_create("database_name");
     if (v->newdb) { v->newdb->win = win; v->newdb->base.visible = false; }
+    v->exp_path = line_edit_create("path of the .png file");
+    if (v->exp_path) { v->exp_path->win = win; v->exp_path->base.visible = false; }
+    v->exp_scale = 2;
     return v;
 }
 
@@ -173,6 +183,7 @@ void schema_view_destroy(SchemaView* v) {
     free(v->entw);
     free(v->sql);
     if (v->newdb) widget_destroy((Widget*)v->newdb);
+    if (v->exp_path) widget_destroy((Widget*)v->exp_path);
     free(v);
 }
 
@@ -774,6 +785,10 @@ static void draw_bar(SchemaView* v) {
     if (v->b_table.w) { draw_button(v, v->b_table, "+ Table", true, false); x += v->b_table.w + 8; }
     v->b_newdb = (Rect){ x, y, btn_w(v, "+ Database"), h };
     draw_button(v, v->b_newdb, "+ Database", false, false);
+    x += v->b_newdb.w + 8;
+    v->b_export = (Rect){ x, y, btn_w(v, "Export PNG"), h };
+    v->b_export.w = v->loaded && v->m.nt ? v->b_export.w : 0;
+    if (v->b_export.w) draw_button(v, v->b_export, "Export PNG", false, v->exp_open);
 
     // a destra: notazione, zoom, adatta, disponi
     int rx = bar.x + bar.w - 12;
@@ -785,7 +800,7 @@ static void draw_bar(SchemaView* v) {
     int ew = btn_w(v, "UML");
     v->b_uml = (Rect){ rx - ew, y, ew, h }; rx -= ew;
     v->b_er = (Rect){ rx - ew, y, ew, h };
-    bool room = v->b_er.x > v->b_newdb.x + v->b_newdb.w + 20;
+    bool room = v->b_er.x > SV_MAX(v->b_newdb.x + v->b_newdb.w, v->b_export.x + v->b_export.w) + 20;
     if (!room) { v->b_er.w = v->b_uml.w = v->b_zin.w = v->b_zout.w = v->b_zlabel.w = 0; }
     if (room) {
         draw_button(v, v->b_er, "ER", false, v->notation == NOT_ER);
@@ -904,6 +919,150 @@ static void draw_confirm(SchemaView* v) {
                           TH_ON_ACCENT, TH_FONT_UI, FONT_UI_BOLD);
 }
 
+// relazioni (sotto) e tabelle
+static void draw_diagram(SchemaView* v) {
+    for (int k = 0; k < v->m.nr; k++) if (k != v->sel_rel) draw_rel(v, k);
+    if (v->sel_rel >= 0 && v->sel_rel < v->m.nr) draw_rel(v, v->sel_rel);
+    for (int i = 0; i < v->m.nt; i++) {
+        bool sel = i == v->sel_table, hov = i == v->hover_table && v->drag == DRAG_NONE;
+        bool target = v->drag == DRAG_LINK && i == v->link_target;
+        if (v->notation == NOT_UML) draw_table_uml(v, i, sel, hov, target);
+        else draw_table_er(v, i, sel, hov, target);
+    }
+}
+
+// ── esportazione PNG ────────────────────────────────────────────
+
+// rettangolo del diagramma (coordinate del diagramma): tabelle, linee, rombi ed etichette
+static void diagram_bounds(SchemaView* v, float* x0, float* y0, float* x1, float* y1) {
+    *x0 = *y0 = 1e9f; *x1 = *y1 = -1e9f;
+    for (int i = 0; i < v->m.nt; i++) {
+        const SmTable* t = &v->m.t[i];
+        *x0 = fminf(*x0, (float)t->x); *y0 = fminf(*y0, (float)t->y);
+        *x1 = fmaxf(*x1, (float)(t->x + t->w)); *y1 = fmaxf(*y1, (float)(t->y + t->h));
+    }
+    for (int k = 0; k < v->m.nr; k++) {
+        RelGeo g;
+        rel_geo(v, k, &g);
+        for (int s = 0; s < g.n; s++) {
+            *x0 = fminf(*x0, g.p[s][0]); *y0 = fminf(*y0, g.p[s][1]);
+            *x1 = fmaxf(*x1, g.p[s][0]); *y1 = fmaxf(*y1, g.p[s][1]);
+        }
+        if (v->notation == NOT_ER && !er_link(v, v->m.r[k].child)) {
+            float hw, hh;
+            diamond_half(v, &v->m.r[k], &hw, &hh);
+            *x0 = fminf(*x0, g.mx - hw); *x1 = fmaxf(*x1, g.mx + hw);
+            *y0 = fminf(*y0, g.my - hh); *y1 = fmaxf(*y1, g.my + hh);
+        }
+    }
+    *x0 -= 50; *y0 -= 50; *x1 += 50; *y1 += 50;     // margine (anche per le cardinalità)
+}
+
+// disegna il diagramma a riquadri grandi quanto l'area visibile, legge i pixel e li ricompone
+static bool export_png(SchemaView* v, const char* path, int scale, char* err, size_t errn, int* ow, int* oh) {
+    if (!v->loaded || v->m.nt == 0) { snprintf(err, errn, "The diagram is empty"); return false; }
+    if (v->canvas.w < 50 || v->canvas.h < 50) { snprintf(err, errn, "The window is too small"); return false; }
+    float x0, y0, x1, y1;
+    diagram_bounds(v, &x0, &y0, &x1, &y1);
+    int W = (int)ceilf((x1 - x0) * (float)scale), H = (int)ceilf((y1 - y0) * (float)scale);
+    if (W > 16000 || H > 16000 || (long long)W * H > 60000000LL) {
+        snprintf(err, errn, "The image would be %dx%d pixels: too large%s", W, H, scale > 1 ? ", try 1x" : "");
+        return false;
+    }
+    uint32_t* img = malloc(sizeof(uint32_t) * (size_t)W * (size_t)H);
+    uint32_t* tile = malloc(sizeof(uint32_t) * (size_t)v->canvas.w * (size_t)v->canvas.h);
+    if (!img || !tile) { free(img); free(tile); snprintf(err, errn, "Out of memory"); return false; }
+    // stato della vista: salvato e ripristinato
+    float zoom = v->zoom, px = v->pan_x, py = v->pan_y;
+    int st = v->sel_table, sr = v->sel_rel, ht = v->hover_table, hr = v->hover_rel, dr = v->drag;
+    v->zoom = (float)scale;
+    v->sel_table = v->sel_rel = v->hover_table = v->hover_rel = -1;
+    v->drag = DRAG_NONE;
+    v->exporting = true;
+    int old_theme = theme_current();
+    Color old_bg = v->bg;
+    if (v->exp_light && !theme_get(old_theme)->light)
+        for (int t = 0; t < theme_count(); t++) if (theme_get(t)->light) { theme_apply(t); break; }
+    v->bg = TH_EDITOR_BG;
+    int cw = v->canvas.w, ch = v->canvas.h;
+    bool ok = true;
+    for (int ty = 0; ty * ch < H && ok; ty++)
+        for (int tx = 0; tx * cw < W && ok; tx++) {
+            v->pan_x = x0 + (float)(tx * cw) / v->zoom;
+            v->pan_y = y0 + (float)(ty * ch) / v->zoom;
+            platform_set_clip(v->win, v->canvas);
+            platform_fill_rect(v->win, v->canvas, v->bg);
+            draw_diagram(v);
+            platform_reset_clip(v->win);
+            ok = platform_read_pixels(v->win, v->canvas, tile);
+            int w = SV_MIN(cw, W - tx * cw), h = SV_MIN(ch, H - ty * ch);
+            for (int y = 0; ok && y < h; y++)
+                memcpy(&img[(size_t)(ty * ch + y) * (size_t)W + (size_t)(tx * cw)], &tile[(size_t)y * (size_t)cw], sizeof(uint32_t) * (size_t)w);
+        }
+    v->zoom = zoom; v->pan_x = px; v->pan_y = py;
+    v->sel_table = st; v->sel_rel = sr; v->hover_table = ht; v->hover_rel = hr; v->drag = dr;
+    v->exporting = false;
+    if (theme_current() != old_theme) theme_apply(old_theme);
+    v->bg = old_bg;
+    free(tile);
+    if (!ok) { free(img); snprintf(err, errn, "Cannot read the drawn image"); return false; }
+    ok = png_write_file(path, W, H, img);
+    free(img);
+    if (!ok) { snprintf(err, errn, "Cannot write %.200s", path); return false; }
+    *ow = W; *oh = H;
+    return true;
+}
+
+static void draw_export(SchemaView* v) {
+    if (!v->exp_open) return;
+    PlatformWindow* win = v->win;
+    Rect p = { v->b_export.x, v->b_export.y + v->b_export.h + 6, 520, 166 };
+    p.x = SV_MAX(v->area.x + 8, SV_MIN(p.x, v->area.x + v->area.w - p.w - 8));
+    v->exp_rect = p;
+    platform_fill_rect_rounded(win, (Rect){p.x - 2, p.y + 3, p.w + 4, p.h + 4}, ui_alpha(TH_BG, 170), 10);
+    ui_round_box(win, p, TH_SURFACE_2, TH_BORDER_STRONG, 8);
+    platform_draw_text_ex(win, "EXPORT THE DIAGRAM AS A PNG IMAGE", -1, (Point){p.x + 14, p.y + 12}, TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI_BOLD);
+    v->exp_path->base.bounds = (Rect){ p.x + 14, p.y + 34, p.w - 28, 32 };
+    v->exp_path->base.visible = true;
+    widget_draw((Widget*)v->exp_path, win);
+    int y = p.y + 78;
+    platform_draw_text_ex(win, "Resolution", -1, (Point){p.x + 14, ui_text_y(win, (Rect){0, y, 0, 32}, TH_FONT_UI, FONT_UI)}, TH_TEXT_MUTED, TH_FONT_UI, FONT_UI);
+    v->exp_s1 = (Rect){ p.x + 100, y, 60, 32 };
+    v->exp_s2 = (Rect){ p.x + 164, y, 104, 32 };
+    draw_button(v, v->exp_s1, "1\xc3\x97", false, v->exp_scale == 1);
+    draw_button(v, v->exp_s2, "2\xc3\x97 sharp", false, v->exp_scale == 2);
+    y += 40;
+    platform_draw_text_ex(win, "Background", -1, (Point){p.x + 14, ui_text_y(win, (Rect){0, y, 0, 32}, TH_FONT_UI, FONT_UI)}, TH_TEXT_MUTED, TH_FONT_UI, FONT_UI);
+    v->exp_l0 = (Rect){ p.x + 100, y, 104, 32 };
+    v->exp_l1 = (Rect){ p.x + 208, y, 130, 32 };
+    draw_button(v, v->exp_l0, "Like the app", false, !v->exp_light);
+    draw_button(v, v->exp_l1, "Light (print)", false, v->exp_light);
+    v->exp_ok = (Rect){ p.x + p.w - 14 - 110, y, 110, 32 };
+    draw_button(v, v->exp_ok, "Save PNG", true, false);
+}
+
+static void open_export(SchemaView* v) {
+    char path[700];
+    snprintf(path, sizeof(path), "%.500s/%.63s_%s.png", v->data_dir[0] ? v->data_dir : ".", v->db, v->notation == NOT_ER ? "er" : "uml");
+    line_edit_set_text(v->exp_path, path);
+    line_edit_focus(v->exp_path, true);
+    v->exp_open = true;
+    v->db_menu = false;
+}
+
+static void do_export(SchemaView* v) {
+    char err[300];
+    int w = 0, h = 0;
+    v->exp_open = false;
+    line_edit_focus(v->exp_path, false);
+    if (!v->exp_path->text[0]) { set_msg(v, "Write the path of the .png file", true); return; }
+    if (export_png(v, v->exp_path->text, v->exp_scale, err, sizeof(err), &w, &h)) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "Diagram saved: %.200s (%dx%d)", v->exp_path->text, w, h);
+        set_msg(v, msg, false);
+    } else set_msg(v, err, true);
+}
+
 void schema_view_draw(SchemaView* v, Rect r) {
     if (!v) return;
     PlatformWindow* win = v->win;
@@ -923,14 +1082,7 @@ void schema_view_draw(SchemaView* v, Rect r) {
         draw_empty(v, "No tables yet", "Create the first table, or double-click anywhere on the canvas", "+ New table");
     } else {
         draw_grid(v);
-        for (int k = 0; k < v->m.nr; k++) if (k != v->sel_rel) draw_rel(v, k);
-        if (v->sel_rel >= 0 && v->sel_rel < v->m.nr) draw_rel(v, v->sel_rel);
-        for (int i = 0; i < v->m.nt; i++) {
-            bool sel = i == v->sel_table, hov = i == v->hover_table && v->drag == DRAG_NONE;
-            bool target = v->drag == DRAG_LINK && i == v->link_target;
-            if (v->notation == NOT_UML) draw_table_uml(v, i, sel, hov, target);
-            else draw_table_er(v, i, sel, hov, target);
-        }
+        draw_diagram(v);
         // pallini per trascinare le relazioni (sulla tabella sotto il mouse)
         int ht = v->drag == DRAG_NONE ? v->hover_table : v->drag == DRAG_LINK ? v->link_src : -1;
         if (ht >= 0 && ht < v->m.nt) {
@@ -980,6 +1132,7 @@ void schema_view_draw(SchemaView* v, Rect r) {
     draw_menu(v);
     draw_db_menu(v);
     draw_newdb(v);
+    draw_export(v);
     draw_confirm(v);
 }
 
@@ -1241,6 +1394,25 @@ SchemaViewAction schema_view_event(SchemaView* v, sEvent* evt) {
         return SCV_REDRAW;
     }
 
+    // ── esportazione ──
+    if (v->exp_open) {
+        if (evt->type == EVT_KEY_DOWN && evt->key == KEY_ESCAPE) { v->exp_open = false; line_edit_focus(v->exp_path, false); return SCV_REDRAW; }
+        if (evt->type == EVT_KEY_DOWN && evt->key == KEY_ENTER) { do_export(v); return SCV_REDRAW; }
+        if (evt->type == EVT_MOUSE_DOWN) {
+            if (in_rect(v->exp_ok, v->mx, v->my)) { do_export(v); return SCV_REDRAW; }
+            if (in_rect(v->exp_s1, v->mx, v->my)) { v->exp_scale = 1; return SCV_REDRAW; }
+            if (in_rect(v->exp_s2, v->mx, v->my)) { v->exp_scale = 2; return SCV_REDRAW; }
+            if (in_rect(v->exp_l0, v->mx, v->my)) { v->exp_light = false; return SCV_REDRAW; }
+            if (in_rect(v->exp_l1, v->mx, v->my)) { v->exp_light = true; return SCV_REDRAW; }
+            if (!in_rect(v->exp_rect, v->mx, v->my)) { v->exp_open = false; line_edit_focus(v->exp_path, false); }
+            else widget_handle_event((Widget*)v->exp_path, evt);
+            return SCV_REDRAW;
+        }
+        if (evt->type == EVT_CHAR || evt->type == EVT_KEY_DOWN || evt->type == EVT_MOUSE_MOVE || evt->type == EVT_MOUSE_UP)
+            widget_handle_event((Widget*)v->exp_path, evt);
+        return SCV_REDRAW;
+    }
+
     // ── nuovo database ──
     if (v->newdb_open) {
         if (evt->type == EVT_KEY_DOWN && evt->key == KEY_ESCAPE) { v->newdb_open = false; line_edit_focus(v->newdb, false); return SCV_REDRAW; }
@@ -1393,6 +1565,7 @@ SchemaViewAction schema_view_event(SchemaView* v, sEvent* evt) {
         if (in_rect(v->db_btn, x, y)) { v->db_menu = !v->db_menu; v->db_hover = -1; return SCV_REDRAW; }
         if (in_rect(v->b_table, x, y)) return new_table_default(v);
         if (in_rect(v->b_newdb, x, y)) { open_newdb(v); return SCV_REDRAW; }
+        if (in_rect(v->b_export, x, y)) { open_export(v); return SCV_REDRAW; }
         if (in_rect(v->b_er, x, y) || in_rect(v->b_uml, x, y)) {
             int n = in_rect(v->b_er, x, y) ? NOT_ER : NOT_UML;
             if (n != v->notation) { v->notation = n; v->sizes_dirty = true; save_positions(v); }
@@ -1483,6 +1656,7 @@ bool schema_view_tick(SchemaView* v, uint64_t now_ms) {
     if (!v) return false;
     bool r = false;
     if (v->newdb_open) r = line_edit_tick(v->newdb, now_ms);
+    if (v->exp_open) r = line_edit_tick(v->exp_path, now_ms) || r;
     if (v->msg[0] && now_ms >= v->msg_until) { v->msg[0] = '\0'; r = true; }
     if (v->view_dirty && now_ms - v->view_changed > 800) save_positions(v);
     return r;
