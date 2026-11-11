@@ -440,6 +440,7 @@ static bool next_is(ParserState* ps, int ahead, TokenType tt) {
 
 static ASTExpr* parse_expr(ParserState* ps);
 static ASTExpr* parse_additive(ParserState* ps);
+static ASTExpr* parse_match(ParserState* ps);
 
 
 static bool ident_is(ParserState* ps, const char* word);
@@ -681,6 +682,7 @@ static ASTExpr* parse_primary(ParserState* ps) {
             return e;
         }
         case TOK_IDENTIFIER: case TOK_LEFT: case TOK_RIGHT:   // LEFT(...)/RIGHT(...) sono funzioni
+            if (t.type == TOK_IDENTIFIER && next_is(ps, 1, TOK_LPAREN) && !strcasecmp(t.text, "MATCH")) return parse_match(ps);
             if (next_is(ps, 1, TOK_LPAREN)) return parse_call(ps);
             if (t.type != TOK_IDENTIFIER) break;
             e = new_expr(EXPR_COLUMN);
@@ -710,6 +712,55 @@ static ASTExpr* parse_primary(ParserState* ps) {
     parse_fail(ps, "Expected a value or a column", t);
     if (t.type != TOK_EOF) consume(ps);
     return NULL;
+}
+
+// MATCH(c1, c2, ...) AGAINST('parole' [IN NATURAL LANGUAGE MODE | IN BOOLEAN MODE | WITH QUERY EXPANSION])
+// -> funzione MATCH_AGAINST(c1, ..., testo, modo)  (modo 1 = BOOLEAN)
+static ASTExpr* parse_match(ParserState* ps) {
+    consume(ps);
+    consume(ps);                                          // MATCH (
+    ASTExpr* f = new_expr(EXPR_FUNC);
+    if (!f) return NULL;
+    snprintf(f->func, sizeof(f->func), "MATCH_AGAINST");
+    f->args = calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
+    if (!f->args) { ast_expr_free(f); parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
+    do {
+        if (f->nargs >= 16) { parse_fail(ps, "Too many columns in MATCH (max 16)", peek(ps)); ast_expr_free(f); return NULL; }
+        ASTExpr* c = parse_primary(ps);
+        if (!c) { ast_expr_free(f); return NULL; }
+        f->args[f->nargs++] = c;
+    } while (match(ps, TOK_COMMA));
+    if (!expect(ps, TOK_RPAREN) || !ident_is(ps, "AGAINST")) {
+        if (ps->result->success) parse_fail(ps, "Expected AGAINST after MATCH (...)", peek(ps));
+        ast_expr_free(f);
+        return NULL;
+    }
+    consume(ps);
+    if (!expect(ps, TOK_LPAREN)) { ast_expr_free(f); return NULL; }
+    ASTExpr* q = parse_additive(ps);
+    if (!q) { ast_expr_free(f); return NULL; }
+    f->args[f->nargs++] = q;
+    int mode = 0;
+    if (match(ps, TOK_IN)) {
+        if (peek(ps).text && !strcasecmp(peek(ps).text, "BOOLEAN")) { consume(ps); mode = 1; }
+        else if (ident_is(ps, "NATURAL")) { consume(ps); if (ident_is(ps, "LANGUAGE")) consume(ps); }
+        else { parse_fail(ps, "Expected BOOLEAN MODE or NATURAL LANGUAGE MODE", peek(ps)); ast_expr_free(f); return NULL; }
+        if (!ident_is(ps, "MODE")) { parse_fail(ps, "Expected MODE", peek(ps)); ast_expr_free(f); return NULL; }
+        consume(ps);
+    }
+    if (ident_is(ps, "WITH")) {                           // WITH QUERY EXPANSION: accettato, come la ricerca normale
+        consume(ps);
+        if (!ident_is(ps, "QUERY")) { parse_fail(ps, "Expected QUERY EXPANSION", peek(ps)); ast_expr_free(f); return NULL; }
+        consume(ps);
+        if (ident_is(ps, "EXPANSION")) consume(ps);
+    }
+    if (!expect(ps, TOK_RPAREN)) { ast_expr_free(f); return NULL; }
+    ASTExpr* m = new_expr(EXPR_INT);
+    if (!m) { ast_expr_free(f); return NULL; }
+    m->int_val = mode;
+    f->args[f->nargs++] = m;
+    f->depth = 2;
+    return f;
 }
 
 static ASTExpr* parse_unary(ParserState* ps) {

@@ -286,6 +286,24 @@ int main(void) {
     t("DROP PROCEDURE nome_di", "OK:0");
     t("DROP PROCEDURE bonifico", "OK:0");
     t("DROP TABLE conto", "OK:0");
+    // ricerca full-text: MATCH ... AGAINST (come MySQL, anche BOOLEAN MODE)
+    t("CREATE TABLE art (id INT PRIMARY KEY, titolo VARCHAR(60), testo TEXT)", "OK:0");
+    t("INSERT INTO art VALUES (1, 'Basi di dati', 'Le basi di dati relazionali usano SQL. SQL è standard.'),"
+      " (2, 'Reti', 'Protocolli di rete: TCP e IP.'), (3, 'Database NoSQL', 'Documenti JSON, niente SQL classico.'),"
+      " (4, 'Città', 'Perché la città è bella')", "OK:4");
+    t("SELECT id FROM art WHERE MATCH(titolo, testo) AGAINST('sql') ORDER BY MATCH(titolo, testo) AGAINST('sql') DESC, id", "1;3");
+    t("SELECT id, MATCH(titolo, testo) AGAINST('SQL') FROM art WHERE id IN (1, 2) ORDER BY id", "1|1.6931;2|0");
+    t("SELECT id FROM art WHERE MATCH(testo) AGAINST('tcp json') ORDER BY id", "2;3");
+    t("SELECT id FROM art WHERE MATCH(titolo, testo) AGAINST('+sql -nosql' IN BOOLEAN MODE)", "1");
+    t("SELECT id FROM art WHERE MATCH(titolo, testo) AGAINST('relaz*' IN BOOLEAN MODE)", "1");
+    t("SELECT id FROM art WHERE MATCH(testo) AGAINST('relaz*')", "");                        // senza BOOLEAN MODE niente prefissi
+    t("SELECT id FROM art WHERE MATCH(testo) AGAINST('\"di rete\"' IN BOOLEAN MODE)", "2");
+    t("SELECT id FROM art WHERE MATCH(titolo, testo) AGAINST('+basi +reti' IN BOOLEAN MODE)", "");
+    t("SELECT id FROM art WHERE MATCH(testo) AGAINST('CITTÀ città' IN NATURAL LANGUAGE MODE)", "4");
+    t("SELECT id FROM art WHERE MATCH(testo) AGAINST('sql' WITH QUERY EXPANSION) ORDER BY id", "1;3");
+    t("SELECT id FROM art WHERE MATCH(testo) AGAINST(NULL)", "");
+    t("SELECT id FROM art WHERE MATCH(testo) 'x'", "ERR:Expected AGAINST");
+    t("DROP TABLE art", "OK:0");
     t("SELECT TRUE + TRUE, FALSE FROM n WHERE id = 1", "2|0");
 
     // ── funzioni ──

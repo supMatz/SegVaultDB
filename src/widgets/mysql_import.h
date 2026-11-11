@@ -16,7 +16,7 @@ SCOPO: import dei dump di MySQL / MariaDB (mysqldump, export di phpMyAdmin): tra
 typedef struct {
     int statements;     // statement nel risultato
     int skipped;        // statement saltati (SET, LOCK, ...)
-    int indexes_dropped;// indici su più colonne o FULLTEXT non riportati
+    int indexes_dropped;// indici FULLTEXT / SPATIAL non riportati (MATCH ... AGAINST funziona anche senza)
 } MyImportStats;
 
 bool  mysql_looks_like_dump(const char* sql);                 // intestazione di mysqldump / phpMyAdmin, ENGINE=, ...

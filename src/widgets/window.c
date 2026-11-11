@@ -3601,6 +3601,7 @@ static const char* const SQL_LINES[] = {
     "Operators: + - * / = <> < > <= >= AND OR NOT LIKE [ESCAPE] BETWEEN IN IS [NOT] NULL;  COUNT SUM AVG MIN MAX",
     "Functions: UPPER LOWER LENGTH TRIM CONCAT SUBSTRING REPLACE ABS ROUND FLOOR CEIL MOD COALESCE NULLIF IF NOW YEAR",
     "JSON: JSON_EXTRACT(doc, '$.a[0]')  doc->'$.a'  doc->>'$.a'  JSON_VALID JSON_TYPE JSON_LENGTH JSON_OBJECT JSON_ARRAY;  db.table names",
+    "Full-text: WHERE MATCH(title, body) AGAINST('words')  ... AGAINST('+must -not pre* \"exact phrase\"' IN BOOLEAN MODE)",
     "",
     "#Changing data",
     "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y');  INSERT INTO t SELECT ...;   all rows or none",
@@ -3729,7 +3730,7 @@ static bool run_file(AppWindow* app, const char* path) {
             free(sql);
             sql = tr;
             snprintf(label, sizeof(label), "Import of MySQL dump %.200s (%d skipped%s)", base_name(path), st.skipped,
-                     st.indexes_dropped ? ", multi-column indexes left out" : "");
+                     st.indexes_dropped ? ", FULLTEXT indexes left out (MATCH ... AGAINST works without them)" : "");
             run_text(app, sql, 0, false, label);
             return true;
         }

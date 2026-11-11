@@ -286,7 +286,7 @@ rispettano la tabella resta com'era. La chiave primaria di una tabella esistente
 - tasto destro: copia di cella, riga, colonna o valore come letterale SQL, filtri, ordinamento, export.
 
 **Export** (menu *Export*): CSV, TSV, JSON, Markdown, HTML o `INSERT` SQL, su file o negli appunti (`Ctrl+Shift+C` copia tutto come TSV, da incollare in un foglio di calcolo; `Ctrl+E` esporta in CSV). *Database dump* scrive in un file `.sql` le istruzioni che ricreano il database corrente (tabelle, dati, chiavi esterne, viste, trigger e procedure).
-**Import** (menu *Import*): un file CSV diventa una tabella (tipi delle colonne riconosciuti dai dati); *Run SQL file / MySQL dump* esegue uno script senza aprirlo. Un **dump di MySQL / MariaDB / phpMyAdmin** viene riconosciuto e tradotto prima: `SET`, `LOCK TABLES` e simili saltati, tipi MySQL convertiti (`tinyint`, `mediumtext`, `json`, `timestamp`, `enum`, `set`, ...), attributi e opzioni (`unsigned`, `COLLATE`, `COMMENT`, `ENGINE=`, ...) tolti, `KEY` → `CREATE INDEX`, `UNIQUE KEY` → vincolo `UNIQUE`, chiavi esterne mantenute (gli indici su più colonne e `FULLTEXT` restano fuori).
+**Import** (menu *Import*): un file CSV diventa una tabella (tipi delle colonne riconosciuti dai dati); *Run SQL file / MySQL dump* esegue uno script senza aprirlo. Un **dump di MySQL / MariaDB / phpMyAdmin** viene riconosciuto e tradotto prima: `SET`, `LOCK TABLES` e simili saltati, tipi MySQL convertiti (`tinyint`, `mediumtext`, `json`, `timestamp`, `enum`, `set`, ...), attributi e opzioni (`unsigned`, `COLLATE`, `COMMENT`, `ENGINE=`, ...) tolti, `KEY` → `CREATE INDEX`, `UNIQUE KEY` → vincolo `UNIQUE`, chiavi esterne mantenute (anche gli indici su più colonne; i `FULLTEXT` restano fuori, ma `MATCH ... AGAINST` funziona lo stesso).
 
 ### Menu e impostazioni
 
@@ -449,6 +449,7 @@ LIMIT n [OFFSET m];
 | Funzioni finestra | `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `NTILE(n)`, `LAG(x [, k [, def]])`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `COUNT/SUM/AVG/MIN/MAX(...)` con `OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS \| RANGE BETWEEN ... AND ...])`: frame con `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`, `UNBOUNDED FOLLOWING` |
 | `CASE` | `CASE WHEN voto >= 28 THEN 'alto' ELSE 'basso' END`, `CASE cfu WHEN 6 THEN ... END` |
 | Funzioni | `UPPER`, `LOWER`, `LENGTH`, `CHAR_LENGTH`, `TRIM`, `CONCAT`, `CONCAT_WS`, `SUBSTRING`, `LEFT`, `RIGHT`, `REPLACE`, `REVERSE`, `ABS`, `ROUND`, `FLOOR`, `CEIL`, `MOD`, `POWER`, `SQRT`, `SIGN`, `COALESCE`, `IFNULL`, `NULLIF`, `IF`, `NOW`, `CURDATE`, `YEAR`, `MONTH`, `DAY` |
+| Full-text | `WHERE MATCH(titolo, testo) AGAINST('basi dati')` con punteggio di pertinenza (`ORDER BY MATCH(...) AGAINST(...) DESC`); `IN BOOLEAN MODE`: `+obbligatoria -esclusa prefis* "frase esatta"`. Senza distinzione maiuscole/minuscole, anche con lettere accentate; senza indice (legge ogni riga) |
 | Nomi qualificati | `SELECT * FROM shop.prodotto`, `INSERT INTO shop.prodotto ...`, `DROP TABLE shop.vecchia`, `shop.prodotto.nome`: l'istruzione usa quel database senza cambiare quello corrente (`USE`); per ora un solo database per istruzione |
 | JSON | Su colonne di testo, come MySQL: `JSON_VALID(doc)`, `JSON_EXTRACT(doc, '$.cliente.nome')` (percorsi `$`, `.chiave`, `."con spazi"`, `[n]`; `NULL` se il percorso manca), `doc->'$.tag[0]'` (= `JSON_EXTRACT`), `doc->>'$.nome'` (senza virgolette, = `JSON_UNQUOTE(JSON_EXTRACT(...))`), `JSON_UNQUOTE`, `JSON_TYPE`, `JSON_LENGTH(doc [, percorso])`, `JSON_OBJECT('a', 1, 'b', x)`, `JSON_ARRAY(1, 'z', NULL)`. Esempio: `SELECT id FROM ordine WHERE dati->>'$.stato' = 'pagato'` |
 
@@ -1019,7 +1020,7 @@ make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitize
 |---|---|
 | `test_btree` | B+Tree sotto stress contro un modello di riferimento: inserimenti, aggiornamenti, cancellazioni e scansioni ordinate, con un buffer pool piccolo che costringe a riscrivere e rileggere le pagine |
 | `test_engine` (128) | Motore: pagine, heap, catalogo, WAL e recovery, import CSV |
-| `test_sql` (1104) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, transazioni, crash e recovery, testi lunghi, JSON, 100 transazioni di fila |
+| `test_sql` (1119) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, transazioni, crash e recovery, testi lunghi, JSON, 100 transazioni di fila |
 | `test_examples` (166) | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
 | `test_grid_edit` (22) | Modifica dei dati nella griglia: analisi dei risultati, `UPDATE` / `INSERT` / `DELETE` generati ed eseguiti, chiavi composte, join, apici e backslash, letterali di export e dump |
 | `test_server` (78) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici |
@@ -1242,8 +1243,9 @@ Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
    collegherebbero senza modifiche).
 4. **Limiti del motore** — fatto: `CREATE UNIQUE INDEX`, indici su più colonne (anche dall'import
    MySQL), funzioni JSON e operatori `->` / `->>`, nomi `db.tabella` (un database per istruzione),
-   stored procedure (`CREATE PROCEDURE` / `CALL`, parametri `IN`). Da fare:
-   più tabelle / colonne / indici, ricerca full-text.
+   stored procedure (`CREATE PROCEDURE` / `CALL`, parametri `IN`), ricerca full-text
+   (`MATCH ... AGAINST`, anche `IN BOOLEAN MODE`). Da fare: più tabelle / colonne / indici, indice
+   full-text (ora la ricerca legge ogni riga).
 5. **Sicurezza e gestione** — HTTPS integrato, backup pianificati e ripristino dalla GUI, avvio come
    servizio di sistema, registro di audit, `SHOW DATABASES` filtrato per utente.
 6. **GUI** — costruttore visuale di query, navigazione delle chiavi esterne dalla griglia, grafici dai

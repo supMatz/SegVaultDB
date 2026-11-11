@@ -1433,6 +1433,7 @@ static const FuncDef FUNCS[] = {
     { "YEAR", 1, 1 }, { "MONTH", 1, 1 }, { "DAY", 1, 1 },
     { "JSON_EXTRACT", 2, 2 }, { "JSON_UNQUOTE", 1, 1 }, { "JSON_VALID", 1, 1 }, { "JSON_TYPE", 1, 1 },
     { "JSON_LENGTH", 1, 2 }, { "JSON_OBJECT", 0, 32 }, { "JSON_ARRAY", 0, 32 },
+    { "MATCH_AGAINST", 3, 18 },
 };
 
 static const FuncDef* find_func(const char* name) {
@@ -1709,10 +1710,105 @@ static void now_text(char* buf, size_t n, bool date_only) {
     strftime(buf, n, date_only ? "%Y-%m-%d" : "%Y-%m-%d %H:%M:%S", &tmv);
 }
 
+// ── ricerca full-text (senza indice: si legge ogni riga) ─────────
+// Parole: lettere, cifre, '_' e i caratteri UTF-8 non ASCII; senza distinzione maiuscole/minuscole.
+static bool ft_wordch(unsigned char ch) { return isalnum(ch) || ch == '_' || ch >= 0x80; }
+
+// occorrenze della parola w (wl byte, minuscola) nei testi; prefix: anche come inizio di una parola
+static int ft_count(const char* const* docs, int nd, const char* w, size_t wl, bool prefix) {
+    int n = 0;
+    for (int d = 0; d < nd; d++) {
+        const unsigned char* p = (const unsigned char*)docs[d];
+        while (p && *p) {
+            while (*p && !ft_wordch(*p)) p++;
+            const unsigned char* b = p;
+            while (*p && ft_wordch(*p)) p++;
+            size_t l = (size_t)(p - b);
+            if (l && (l == wl || (prefix && l > wl))) {
+                size_t k = 0;
+                while (k < wl && tolower(b[k]) == (unsigned char)w[k]) k++;
+                if (k == wl) n++;
+            }
+        }
+    }
+    return n;
+}
+
+// la frase (minuscola) compare in uno dei testi?
+static bool ft_phrase(const char* const* docs, int nd, const char* ph, size_t pl) {
+    if (!pl) return false;
+    for (int d = 0; d < nd; d++)
+        for (const char* p = docs[d]; p && *p; p++) {
+            size_t k = 0;
+            while (k < pl && p[k] && tolower((unsigned char)p[k]) == (unsigned char)ph[k]) k++;
+            if (k == pl) return true;
+        }
+    return false;
+}
+
+// punteggio: somma di 1 + ln(occorrenze) per ogni parola trovata. BOOLEAN MODE: +parola obbligatoria,
+// -parola esclusa, parola* prefisso, "frase esatta"; senza + basta una parola trovata
+static double ft_score(const char* const* docs, int nd, char* q, bool boolean) {
+    for (char* p = q; *p; p++) *p = (char)tolower((unsigned char)*p);
+    double score = 0;
+    bool any_req = false, matched = false;
+    char* p = q;
+    while (*p) {
+        while (*p && !ft_wordch((unsigned char)*p) && *p != '"' && !(boolean && (*p == '+' || *p == '-'))) p++;
+        if (!*p) break;
+        char op = 0;
+        if (boolean && (*p == '+' || *p == '-')) { op = *p++; while (*p == '~' || *p == '<' || *p == '>') p++; }
+        int cnt;
+        if (*p == '"') {                                    // frase
+            char* b = ++p;
+            while (*p && *p != '"') p++;
+            cnt = ft_phrase(docs, nd, b, (size_t)(p - b)) ? 1 : 0;
+            if (*p) p++;
+        } else {
+            char* b = p;
+            while (*p && ft_wordch((unsigned char)*p)) p++;
+            size_t wl = (size_t)(p - b);
+            bool prefix = boolean && *p == '*';
+            if (prefix) p++;
+            if (!wl) continue;
+            cnt = ft_count(docs, nd, b, wl, prefix);
+        }
+        if (op == '-') { if (cnt) return 0; continue; }
+        if (op == '+') { any_req = true; if (!cnt) return 0; }
+        if (cnt) { matched = true; score += 1.0 + log((double)cnt); }
+    }
+    if (!matched && !any_req) return 0;
+    return round(score * 10000.0) / 10000.0;
+}
+
 static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     const char* f = e->func;
     EvalVal a[3];
     int na = e->nargs < 3 ? e->nargs : 3;
+
+    // MATCH(colonne) AGAINST('parole'): punteggio di pertinenza (0 = nessuna corrispondenza)
+    if (!strcmp(f, "MATCH_AGAINST")) {
+        int nc = e->nargs - 2;
+        EvalVal q, m;
+        eval_expr(e->args[nc], c, &q);
+        eval_expr(e->args[nc + 1], c, &m);
+        if (q.null) { ev_null(out); return; }
+        char* qs = strdup(ev_s(&q));
+        char** docs = calloc((size_t)nc, sizeof(char*));
+        bool oom = !qs || !docs;
+        for (int i = 0; !oom && i < nc; i++) {
+            EvalVal v;
+            eval_expr(e->args[i], c, &v);
+            if (!v.null && !(docs[i] = strdup(ev_s(&v)))) oom = true;
+        }
+        if (oom) ctx_error(c, "%s", "Out of memory");
+        double sc = oom ? 0 : ft_score((const char* const*)docs, nc, qs, m.is_int && m.inum == 1);
+        for (int i = 0; docs && i < nc; i++) free(docs[i]);
+        free(docs);
+        free(qs);
+        ev_num(out, sc);
+        return;
+    }
 
     // JSON_OBJECT / JSON_ARRAY: tutti gli argomenti (anche oltre 3); numeri così come sono, NULL -> null
     if (!strcmp(f, "JSON_OBJECT") || !strcmp(f, "JSON_ARRAY")) {
