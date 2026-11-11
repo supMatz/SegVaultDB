@@ -55,7 +55,7 @@ typedef enum { STATUS_IDLE, STATUS_OK, STATUS_ERROR, STATUS_INFO } StatusKind;
 
 // barra comandi sovrapposta all'editor
 typedef enum { BAR_NONE, BAR_FIND, BAR_GOTO, BAR_OPEN, BAR_SAVE_AS, BAR_EXPORT,
-               BAR_IMPORT_CSV, BAR_RUN_FILE, BAR_DUMP, BAR_SEARCH_DB } BarMode;
+               BAR_IMPORT_CSV, BAR_RUN_FILE, BAR_DUMP, BAR_SEARCH_DB, BAR_BACKUP, BAR_RESTORE } BarMode;
 
 #define HISTORY_MAX 500
 

@@ -53,3 +53,5 @@ test_mysql_import
 test_mysql_import_asan
 test_overflow
 test_overflow_asan
+test_backup
+test_backup_asan

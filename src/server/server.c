@@ -936,7 +936,8 @@ static void handle_endpoint_list(SvServer* s, Request* rq, Response* rs, const c
 
 // ── catalogo: /api/v1/databases[/db/tables[/t]] ─────────────────
 
-static void handle_catalog(SvServer* s, const char* rest, Response* rs) {
+// con gli utenti (--users) si vede solo ciò su cui si ha qualche permesso; il resto è "not found"
+static void handle_catalog(SvServer* s, const char* user, const char* rest, Response* rs) {
     char parts[3][128] = { "", "", "" };
     int np = 0;
     while (*rest == '/') rest++;
@@ -956,27 +957,40 @@ static void handle_catalog(SvServer* s, const char* rest, Response* rs) {
     if (np == 0) {
         NameList* nl = db_list_databases();
         jb_lit(b, "{\"ok\":true,\"databases\":[");
-        for (int i = 0; nl && i < nl->count; i++) { if (i) jb_lit(b, ","); jb_str(b, nl->names[i]); }
+        for (int i = 0, n = 0; nl && i < nl->count; i++) {
+            if (!db_user_can_see(user, nl->names[i], NULL)) continue;
+            if (n++) jb_lit(b, ",");
+            jb_str(b, nl->names[i]);
+        }
         jb_lit(b, "]}");
         db_namelist_free(nl);
     } else if (np == 2 && !strcmp(parts[1], "tables")) {
-        NameList* tl = db_list_tables(parts[0]);
-        NameList* vl = db_list_views(parts[0]);
+        bool vis = db_user_can_see(user, parts[0], NULL);
+        NameList* tl = vis ? db_list_tables(parts[0]) : NULL;
+        NameList* vl = vis ? db_list_views(parts[0]) : NULL;
         if (!tl) json_error(rs, 404, "database '%s' not found", parts[0]);
         else {
             jb_lit(b, "{\"ok\":true,\"database\":");
             jb_str(b, parts[0]);
             jb_lit(b, ",\"tables\":[");
-            for (int i = 0; i < tl->count; i++) { if (i) jb_lit(b, ","); jb_str(b, tl->names[i]); }
+            for (int i = 0, n = 0; i < tl->count; i++) {
+                if (!db_user_can_see(user, parts[0], tl->names[i])) continue;
+                if (n++) jb_lit(b, ",");
+                jb_str(b, tl->names[i]);
+            }
             jb_lit(b, "],\"views\":[");
-            for (int i = 0; vl && i < vl->count; i++) { if (i) jb_lit(b, ","); jb_str(b, vl->names[i]); }
+            for (int i = 0, n = 0; vl && i < vl->count; i++) {
+                if (!db_user_can_see(user, parts[0], vl->names[i])) continue;
+                if (n++) jb_lit(b, ",");
+                jb_str(b, vl->names[i]);
+            }
             jb_lit(b, "]}");
         }
         db_namelist_free(tl);
         db_namelist_free(vl);
     } else if (np == 3 && !strcmp(parts[1], "tables")) {
         int nc = 0;
-        ColumnInfo* cols = db_list_columns(parts[0], parts[2], &nc);
+        ColumnInfo* cols = db_user_can_see(user, parts[0], parts[2]) ? db_list_columns(parts[0], parts[2], &nc) : NULL;
         if (!cols) json_error(rs, 404, "table '%s.%s' not found", parts[0], parts[2]);
         else {
             jb_lit(b, "{\"ok\":true,\"database\":");
@@ -1247,7 +1261,7 @@ static void route(SvServer* s, Request* rq, Response* rs) {
         }
         if (!strncmp(sub, "/databases", 10) && (sub[10] == '\0' || sub[10] == '/')) {
             if (strcmp(rq->method, "GET") && strcmp(rq->method, "HEAD")) { json_error(rs, 405, "use GET"); return; }
-            handle_catalog(s, sub + 10, rs);
+            handle_catalog(s, rq->user, sub + 10, rs);
             return;
         }
         json_error(rs, 404, "unknown endpoint %s", rq->path);

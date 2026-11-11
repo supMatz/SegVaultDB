@@ -605,6 +605,8 @@ int main(void) {
         QueryResult* q;
         q = db_execute("CREATE USER anna IDENTIFIED BY 'anna-pass'"); db_result_free(q);
         q = db_execute("GRANT SELECT ON t.p TO anna"); db_result_free(q);
+        q = db_execute("CREATE DATABASE t2"); db_result_free(q);
+        q = db_execute("USE t"); db_result_free(q);
         q = db_execute("CREATE USER boss IDENTIFIED BY 'boss-pass'"); db_result_free(q);
         q = db_execute("GRANT ALL ON *.* TO boss WITH GRANT OPTION"); db_result_free(q);
         SvServerConfig cfg3 = { .port = 0, .token = "tok3", .default_db = "t", .quiet = true, .require_login = true };
@@ -631,6 +633,16 @@ int main(void) {
         resp_free(&r);
         r = request(port3, "POST", "/api/v1/query", hdr, "{\"sql\":\"SELECT * FROM conc\"}");
         CHECK(!resp_ok(&r) && strstr(err_msg(&r), "Access denied"), "anna cannot read conc: %s", r.body);
+        resp_free(&r);
+        // catalogo: solo ciò su cui anna ha permessi
+        r = request(port3, "GET", "/api/v1/databases/t/tables", hdr, NULL);
+        CHECK(resp_ok(&r) && strstr(r.body, "\"p\"") && !strstr(r.body, "\"conc\""), "anna sees only p: %s", r.body);
+        resp_free(&r);
+        r = request(port3, "GET", "/api/v1/databases/t/tables/conc", hdr, NULL);
+        CHECK(r.status == 404, "anna cannot describe conc: %d %s", r.status, r.body);
+        resp_free(&r);
+        r = request(port3, "GET", "/api/v1/databases", hdr, NULL);
+        CHECK(resp_ok(&r) && strstr(r.body, "\"t\"") && !strstr(r.body, "\"t2\""), "databases filtered: %s", r.body);
         resp_free(&r);
         // di nuovo (credenziali in cache): stesso esito, e la sessione del motore torna root dopo la richiesta
         r = request(port3, "POST", "/api/v1/query", hdr, "{\"sql\":\"SELECT COUNT(*) FROM p\"}");

@@ -42,6 +42,7 @@ bool     auth_login(const char* user, const char* password);
 bool     auth_user_exists(const char* user);
 bool     auth_is_admin(const char* user);
 unsigned auth_privs(const char* user, const char* db, const char* table);   // permessi effettivi
+bool auth_can_see_db(const char* user, const char* db);              // qualche permesso nel database?
 int      auth_user_count(void);
 const char* auth_user_name(int i);
 // permessi dati esattamente su db.table (senza ereditare da *.* o db.*)

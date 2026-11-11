@@ -237,6 +237,10 @@ char* db_get_create_statement_nofk(const char* db_name, const char* table); // C
 char* db_get_foreign_keys(const char* db_name, const char* table);         // ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY (dump)
 // 0 = CREATE VIEW, 1 = CREATE TRIGGER, 2 = CREATE PROCEDURE di tutto il database (dump); da liberare con db_free_string
 char* db_get_objects_sql(const char* db_name, int what);
+// copia coerente di tutti i dati in dir (cartella nuova o vuota); anche con l'istruzione BACKUP TO 'dir'
+bool db_backup(const char* dir, char* err, size_t errn);
+// sostituisce i dati con quelli di un backup; i dati di prima restano in <dati>/before-restore
+bool db_restore(const char* dir, char* err, size_t errn);
 
 void db_free_string(char* s); // libera una stringa allocata dal DB engine 
 
@@ -305,6 +309,8 @@ typedef struct { char name[64]; bool admin; } DbUserInfo;
 bool        db_set_user(const char* name);        // utente della sessione: NULL / "" = root (tutto permesso)
 const char* db_session_user(void);
 bool        db_login(const char* name, const char* password);   // credenziali giuste?
+// l'utente ha qualche permesso nel database (table NULL) o sulla tabella? "" = root, sempre
+bool        db_user_can_see(const char* user, const char* db, const char* table);
 bool        db_has_users(void);
 int         db_list_users(DbUserInfo* out, int max);
 unsigned    db_user_grant(const char* user, const char* db, const char* table);   // permessi dati proprio lì

@@ -304,6 +304,35 @@ int main(void) {
     t("SELECT id FROM art WHERE MATCH(testo) AGAINST(NULL)", "");
     t("SELECT id FROM art WHERE MATCH(testo) 'x'", "ERR:Expected AGAINST");
     t("DROP TABLE art", "OK:0");
+    // viste: OR REPLACE, ALTER, colonne, opzioni MySQL, SHOW CREATE VIEW / FULL TABLES, DESCRIBE, controlli
+    t("CREATE TABLE vt (id INT PRIMARY KEY, v INT)", "OK:0");
+    t("INSERT INTO vt VALUES (1, 5), (2, 20)", "OK:2");
+    t("CREATE VIEW vg AS SELECT id, v FROM vt WHERE v > 10", "OK:0");
+    t("CREATE VIEW vg AS SELECT id FROM vt", "ERR:already exists");
+    t("CREATE OR REPLACE VIEW vg AS SELECT id FROM vt", "OK:0");
+    t("SELECT * FROM vg ORDER BY id", "1;2");
+    t("ALTER VIEW vg AS SELECT v FROM vt WITH CASCADED CHECK OPTION", "OK:0");
+    t("SELECT * FROM vg ORDER BY v", "5;20");
+    t("ALTER VIEW nessuna AS SELECT 1", "ERR:not found");
+    t("CREATE VIEW vc (a, b) AS SELECT id, v FROM vt", "OK:0");
+    t("SELECT b FROM vc WHERE a = 2", "20");
+    t("CREATE VIEW vbad (a) AS SELECT id, v FROM vt", "ERR:names 1 column");
+    t("CREATE VIEW vself AS SELECT * FROM vself", "ERR:not found");
+    t("CREATE VIEW vbad AS SELECT nessuna FROM vt", "ERR:Unknown column");
+    t("CREATE VIEW vh AS SELECT * FROM vg", "OK:0");
+    t("CREATE OR REPLACE VIEW vg AS SELECT * FROM vh", "ERR:not found");             // niente cicli
+    t("CREATE OR REPLACE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW vm AS select `vt`.`id` AS `id` from `vt`", "OK:0");
+    t("SELECT COUNT(*) FROM vm", "2");
+    t("CREATE OR REPLACE TABLE vx (id INT)", "ERR:only supported for views");
+    t("CREATE VIEW vt AS SELECT 1", "ERR:already exists");
+    t("SHOW CREATE VIEW vc", "vc|CREATE VIEW vc AS WITH vc (a, b) AS (SELECT id, v FROM vt) SELECT * FROM vc");
+    t("DESCRIBE vc", "a|INT|YES|;b|INT|YES|");
+    t("SELECT id FROM vt WITH", "ERR:");
+    t("DROP VIEW vm", "OK:0");
+    t("DROP VIEW vh", "OK:0");
+    t("DROP VIEW vc", "OK:0");
+    t("DROP VIEW vg", "OK:0");
+    t("DROP TABLE vt", "OK:0");
     t("SELECT TRUE + TRUE, FALSE FROM n WHERE id = 1", "2|0");
 
     // ── funzioni ──

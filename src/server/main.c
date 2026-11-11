@@ -10,11 +10,110 @@ SCOPO: segvault-server — il motore SegVault come servizio HTTP/JSON, senza GUI
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #ifdef _WIN32
   #include <direct.h>
+  #include <windows.h>
+#else
+  #include <dirent.h>
+  #include <pthread.h>
+  #include <unistd.h>
 #endif
 
 static SvServer* g_server;
+
+// ── backup pianificati: <dir>/segvault-AAAAMMGG-HHMMSS ogni N minuti, si tengono gli ultimi K ──
+static const char* g_bk_dir;
+static int g_bk_every, g_bk_keep = 7;
+static volatile int g_bk_stop;
+
+static int cmp_str(const void* a, const void* b) { return strcmp(*(char* const*)a, *(char* const*)b); }
+
+static bool is_backup_name(const char* n) {
+    if (strncmp(n, "segvault-", 9) || strlen(n) != 24 || n[17] != '-') return false;
+    for (int i = 9; i < 24; i++) if (i != 17 && (n[i] < '0' || n[i] > '9')) return false;
+    return true;
+}
+
+static void remove_backup(const char* path) {
+    static const char* const F[] = { "segvault.db", "segvault.cat", "segvault.free", "users.dat", "segvault.wal" };
+    char f[800];
+    for (int i = 0; i < 5; i++) { snprintf(f, sizeof(f), "%.700s/%s", path, F[i]); remove(f); }
+#ifdef _WIN32
+    _rmdir(path);
+#else
+    rmdir(path);
+#endif
+}
+
+// tiene solo gli ultimi g_bk_keep backup (i nomi in ordine alfabetico sono in ordine di tempo)
+static void prune_backups(void) {
+    char* names[1024];
+    int n = 0;
+#ifdef _WIN32
+    char pat[700];
+    snprintf(pat, sizeof(pat), "%.600s\\segvault-*", g_bk_dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do { if (n < 1024 && is_backup_name(fd.cFileName)) names[n++] = strdup(fd.cFileName); } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+#else
+    DIR* d = opendir(g_bk_dir);
+    struct dirent* e;
+    while (d && (e = readdir(d))) if (n < 1024 && is_backup_name(e->d_name)) names[n++] = strdup(e->d_name);
+    if (d) closedir(d);
+#endif
+    qsort(names, (size_t)n, sizeof(char*), cmp_str);
+    for (int i = 0; i < n; i++) {
+        if (names[i] && i < n - g_bk_keep) {
+            char p[800];
+            snprintf(p, sizeof(p), "%.600s/%s", g_bk_dir, names[i]);
+            remove_backup(p);
+        }
+        free(names[i]);
+    }
+}
+
+static bool backup_now(void) {
+    time_t t = time(NULL);
+    struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    char path[800], err[600];
+    snprintf(path, sizeof(path), "%.600s/segvault-%04d%02d%02d-%02d%02d%02d", g_bk_dir,
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    if (!db_backup(path, err, sizeof(err))) { fprintf(stderr, "backup failed (retrying in a minute): %s\n", err); return false; }
+    printf("backup written: %s\n", path);
+    fflush(stdout);
+    prune_backups();
+    return true;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI backup_thread(LPVOID arg) {
+#else
+static void* backup_thread(void* arg) {
+#endif
+    (void)arg;
+    int wait = g_bk_every * 60;
+    while (!g_bk_stop) {
+        for (int i = 0; i < wait && !g_bk_stop; i++) {
+#ifdef _WIN32
+            Sleep(1000);
+#else
+            sleep(1);
+#endif
+        }
+        if (g_bk_stop) break;
+        wait = backup_now() ? g_bk_every * 60 : 60;     // una transazione aperta: si riprova presto
+    }
+    return 0;
+}
 
 static void on_signal(int sig) {
     (void)sig;
@@ -36,6 +135,9 @@ static void usage(const char* argv0) {
            "      --max-body MB     largest request body (default 16)\n"
            "      --timeout S       stop a request that runs longer than S seconds (default 30, 0 = never)\n"
            "      --no-auth         allow listening on a non-local address without a token\n"
+           "      --backup-dir DIR  write a backup of all data to DIR/segvault-DATE-TIME (see --backup-every)\n"
+           "      --backup-every M  minutes between backups (default 60 when --backup-dir is given)\n"
+           "      --backup-keep N   keep only the last N backups (default 7)\n"
            "  -q, --quiet           do not log requests\n"
            "  -h, --help            this help\n\n"
            "API: GET /api/v1/health, GET /api/v1/status, POST /api/v1/query,\n"
@@ -65,6 +167,9 @@ int main(int argc, char** argv) {
         else if (ARG("--timeout", "--timeout")) cfg.timeout_ms = atoi(argv[++i]) * 1000;
         else if (!strcmp(a, "--no-auth")) no_auth = true;
         else if (!strcmp(a, "--users")) cfg.require_login = true;
+        else if (ARG("--backup-dir", "--backup-dir")) g_bk_dir = argv[++i];
+        else if (ARG("--backup-every", "--backup-every")) g_bk_every = atoi(argv[++i]);
+        else if (ARG("--backup-keep", "--backup-keep")) g_bk_keep = atoi(argv[++i]);
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) cfg.quiet = true;
         else if (a[0] == '-') { fprintf(stderr, "unknown or incomplete option: %s (see --help)\n", a); return 2; }
         else data_dir = a;
@@ -72,6 +177,9 @@ int main(int argc, char** argv) {
     }
     if (cfg.port < 0 || cfg.port > 65535) { fprintf(stderr, "invalid port\n"); return 2; }
     if (cfg.timeout_ms < 0) cfg.timeout_ms = 0;
+    if (g_bk_dir && g_bk_every <= 0) g_bk_every = 60;
+    if (g_bk_keep < 1) g_bk_keep = 1;
+    if (g_bk_every > 0 && !g_bk_dir) { fprintf(stderr, "--backup-every needs --backup-dir\n"); return 2; }
     if (cfg.token && !strcmp(cfg.token, "auto")) {
         if (!sv_random_token(auto_token, 24)) { fprintf(stderr, "cannot generate a random token\n"); return 1; }
         cfg.token = auto_token;
@@ -115,11 +223,24 @@ int main(int argc, char** argv) {
            cfg.require_login ? ", login required" : cfg.token && cfg.token[0] ? ", token required" : "");
     if (cfg.static_dir) printf("  web site: http://%s:%d/          (files of %s)\n", host, port, cfg.static_dir);
     printf("  API:      http://%s:%d/api/v1\n", host, port);
+    if (g_bk_dir) {
+#ifdef _WIN32
+        _mkdir(g_bk_dir);
+        HANDLE bt = CreateThread(NULL, 0, backup_thread, NULL, 0, NULL);
+        if (bt) CloseHandle(bt);
+#else
+        mkdir(g_bk_dir, 0755);
+        pthread_t bt;
+        if (pthread_create(&bt, NULL, backup_thread, NULL) == 0) pthread_detach(bt);
+#endif
+        printf("  backups:  every %d min in %s (last %d kept)\n", g_bk_every, g_bk_dir, g_bk_keep);
+    }
     fflush(stdout);
 
     sv_server_run(g_server);
 
     printf("shutting down...\n");
+    g_bk_stop = 1;
     sv_server_free(g_server);
     db_shutdown();                      // WAL e catalogo scritti su disco
     return 0;

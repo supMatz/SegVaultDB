@@ -250,6 +250,8 @@ static bool any_in_db(const char* user, const char* db) {
     return false;
 }
 
+bool auth_can_see_db(const char* user, const char* db) { return any_in_db(user, db); }
+
 static const char* const PRIV_NAMES[7] = { "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER" };
 
 const char* auth_priv_name(unsigned bit) {

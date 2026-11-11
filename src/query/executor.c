@@ -6774,6 +6774,19 @@ static QueryResult* exec_show_extra(ExecCtx* ctx, ASTNode* n) {
         }
         return r;
     }
+    if (!strcmp(kind, "CREATE VIEW")) {
+        ViewSchema* vs = catalog_get_view(ctx->catalog, db->name, n->select_stmt.table_alias);
+        if (!vs) { snprintf(a, sizeof(a), "View '%.64s' not found", n->select_stmt.table_alias); return result_error_msg(a); }
+        static const char* const NAMES[] = { "View", "Create View" };
+        QueryResult* r = text_result(2, NAMES);
+        size_t dl = strlen(vs->definition) + 100;
+        char* ddl = malloc(dl);
+        if (ddl) snprintf(ddl, dl, "CREATE VIEW %s AS %s", vs->name, vs->definition);
+        const char* v[2] = { vs->name, ddl ? ddl : "" };
+        if (!r || !text_row(r, &cap, v)) { free(ddl); db_result_free(r); return result_error_msg("Out of memory"); }
+        free(ddl);
+        return r;
+    }
     TableSchema* ts = catalog_get_table(ctx->catalog, db->name, n->select_stmt.table_alias);
     if (!ts) { snprintf(a, sizeof(a), "Table '%.64s' not found", n->select_stmt.table_alias); return result_error_msg(a); }
     if (!strcmp(kind, "CREATE")) {
@@ -6879,6 +6892,20 @@ static QueryResult* exec_show_extra(ExecCtx* ctx, ASTNode* n) {
 }
 
 static QueryResult* exec_show(ExecCtx* ctx, ASTNode* n) {
+    bool full = !strcmp(n->select_stmt.table_name, "FULL TABLES");
+    if (full || !strcmp(n->select_stmt.table_name, "TABLES")) {     // come MySQL: anche le viste
+        Database* db = catalog_current_db(ctx->catalog);
+        if (!db) return result_error_msg("No database selected");
+        static const char* const NAMES[] = { "Tables", "Table_type" };
+        QueryResult* r = text_result(full ? 2 : 1, NAMES);
+        int cap = 0;
+        for (int i = 0; r && i < db->num_tables + db->num_views; i++) {
+            bool view = i >= db->num_tables;
+            const char* v[2] = { view ? db->views[i - db->num_tables].name : db->tables[i].name, view ? "VIEW" : "BASE TABLE" };
+            if (!text_row(r, &cap, v)) { db_result_free(r); r = NULL; }
+        }
+        return r ? r : result_error_msg("Out of memory");
+    }
     if (strcmp(n->select_stmt.table_name, "TABLES") && strcmp(n->select_stmt.table_name, "DATABASES"))
         return exec_show_extra(ctx, n);
     bool tables = strcmp(n->select_stmt.table_name, "TABLES") == 0;
@@ -6920,6 +6947,25 @@ static QueryResult* exec_describe(ExecCtx* ctx, ASTNode* n) {
 
     int num_cols;
     ColumnInfo* cols = db_list_columns(db->name, tname, &num_cols);
+    if (!cols && catalog_get_view(ctx->catalog, db->name, tname)) {   // vista: le colonne del suo risultato
+        char q[200];
+        snprintf(q, sizeof(q), "SELECT * FROM `%.64s` LIMIT 0", tname);
+        TokenList* tk = lexer_tokenize(q);
+        ParseResult* pr = tk ? parser_parse(tk) : NULL;
+        QueryResult* vr = pr && pr->success && pr->count == 1 ? run_select_ex(ctx, pr->statements[0], 0, false, false) : NULL;
+        if (pr) parse_result_free(pr);
+        if (tk) lexer_free(tk);
+        if (!vr || !vr->success) return vr ? vr : result_error_msg("Out of memory");
+        static const char* const NAMES[] = { "Field", "Type", "Null", "Key" };
+        QueryResult* r = text_result(4, NAMES);
+        int cap = 0;
+        for (int i = 0; r && i < vr->num_cols; i++) {
+            const char* v[4] = { vr->col_names[i], vr->col_types && vr->col_types[i] ? vr->col_types[i] : "", "YES", "" };
+            if (!text_row(r, &cap, v)) { db_result_free(r); r = NULL; }
+        }
+        db_result_free(vr);
+        return r ? r : result_error_msg("Out of memory");
+    }
     if (!cols) return result_error_msg("Table not found");
 
     QueryResult* r = calloc(1, sizeof(QueryResult));
@@ -7006,20 +7052,58 @@ static QueryResult* exec_drop_index(ExecCtx* ctx, ASTNode* n) {
     return result_error_msg("Index not found");
 }
 
+// la definizione di una vista funziona? (piano della SELECT, senza eseguirla); NULL o il messaggio
+static const char* view_check(ExecCtx* ctx, const char* def, char* msg, size_t mn) {
+    TokenList* tk = lexer_tokenize(def);
+    ParseResult* pr = tk ? parser_parse(tk) : NULL;
+    const char* fail = NULL;
+    if (!pr || !pr->success || pr->count != 1 || pr->statements[0]->type != NODE_SELECT) {
+        snprintf(msg, mn, "Invalid view: %.250s", pr && !pr->success ? pr->error : "not a single SELECT");
+        fail = msg;
+    } else {
+        QueryResult* r = run_select_ex(ctx, pr->statements[0], 0, true, false);
+        if (!r || !r->success) { snprintf(msg, mn, "Invalid view: %.250s", r ? r->error : "out of memory"); fail = msg; }
+        db_result_free(r);
+    }
+    if (pr) parse_result_free(pr);
+    if (tk) lexer_free(tk);
+    return fail;
+}
+
+// CREATE [OR REPLACE] VIEW / ALTER VIEW. Una vista sostituita resta al suo posto nel catalogo
 static QueryResult* exec_create_view(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
-    ViewSchema vs;
-    memset(&vs, 0, sizeof(vs));
-    snprintf(vs.name, sizeof(vs.name), "%s", n->create_view.view_name);
-    snprintf(vs.definition, sizeof(vs.definition), "%s", n->create_view.definition);
-    if (catalog_get_table(ctx->catalog, db->name, vs.name) || catalog_get_view(ctx->catalog, db->name, vs.name)) {
-        char msg[160];
-        snprintf(msg, sizeof(msg), "Table or view '%.64s' already exists", vs.name);
+    const char* name = n->create_view.view_name;
+    char msg[400];
+    if (catalog_get_table(ctx->catalog, db->name, name)) {
+        snprintf(msg, sizeof(msg), "Table '%.64s' already exists", name);
         return result_error_msg(msg);
     }
-    if (catalog_add_view(ctx->catalog, db->name, &vs) != SV_OK)
-        return result_error_msg("Failed to create view (too many views?)");
+    ViewSchema* old = catalog_get_view(ctx->catalog, db->name, name);
+    if (old && !n->create_view.replace && !n->create_view.alter) {
+        snprintf(msg, sizeof(msg), "View '%.64s' already exists (use CREATE OR REPLACE VIEW)", name);
+        return result_error_msg(msg);
+    }
+    if (!old && n->create_view.alter) { snprintf(msg, sizeof(msg), "View '%.64s' not found", name); return result_error_msg(msg); }
+    // durante il controllo la vista non esiste: una definizione che la usa (anche passando da
+    // un'altra vista) viene rifiutata invece di creare un ciclo
+    char saved[SV_MAX_NAME_LEN];
+    if (old) { memcpy(saved, old->name, sizeof(saved)); old->name[0] = '\0'; }
+    const char* fail = view_check(ctx, n->create_view.definition, msg, sizeof(msg));
+    if (old) memcpy(old->name, saved, sizeof(saved));
+    if (fail) return result_error_msg(fail);
+    if (old) {
+        snprintf(old->definition, sizeof(old->definition), "%s", n->create_view.definition);
+        return result_ok_msg(0);
+    }
+    ViewSchema* vs = calloc(1, sizeof(ViewSchema));
+    if (!vs) return result_error_msg("Out of memory");
+    snprintf(vs->name, sizeof(vs->name), "%s", name);
+    snprintf(vs->definition, sizeof(vs->definition), "%s", n->create_view.definition);
+    int rc = catalog_add_view(ctx->catalog, db->name, vs);
+    free(vs);
+    if (rc != SV_OK) return result_error_msg("Failed to create view (too many views?)");
     return result_ok_msg(0);
 }
 

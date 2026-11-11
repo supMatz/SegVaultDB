@@ -238,16 +238,91 @@ static void create_table(Buf* out, const char* s, int n, MyImportStats* st) {
     if (post.oom || out->oom) out->oom = true;
 }
 
-char* mysql_translate(const char* sql, MyImportStats* st) {
+// Prima della divisione in istruzioni:
+//  - DELIMITER ;; ... ;; (procedure e trigger dei dump): le righe DELIMITER spariscono e il
+//    delimitatore scelto diventa ';' (dentro BEGIN ... END i ';' non separano comunque)
+//  - i commenti versionati di viste, trigger e procedure (/*!50001 CREATE VIEW ... */,
+//    /*!50003 TRIGGER ... */, /*!50013 DEFINER=... */) diventano testo normale: MySQL li esegue.
+//    Gli altri (/*!40101 SET ... */, /*!80016 DEFAULT ENCRYPTION ... */) restano commenti.
+static bool versioned_ok(const char* p) {
+    static const char* const V[] = { "50001", "50003", "50013", "50017", "50020" };
+    for (int i = 0; i < 5; i++) if (!strncmp(p, V[i], 5)) return true;
+    return false;
+}
+
+static char* mysql_prepare(const char* in) {
+    size_t n = strlen(in);
+    Buf out = {0};
+    char delim[16] = ";";
+    size_t dl = 1;
+    bool line_start = true;
+    for (size_t i = 0; i < n; ) {
+        char c = in[i];
+        if (line_start) {                                    // DELIMITER x  (a inizio riga)
+            size_t j = i;
+            while (j < n && (in[j] == ' ' || in[j] == '\t')) j++;
+            if (n - j > 10 && !strncasecmp(in + j, "DELIMITER", 9) && (in[j + 9] == ' ' || in[j + 9] == '\t')) {
+                j += 9;
+                while (j < n && (in[j] == ' ' || in[j] == '\t')) j++;
+                size_t k = 0;
+                while (j < n && !isspace((unsigned char)in[j]) && k < sizeof(delim) - 1) delim[k++] = in[j++];
+                if (k) { delim[k] = '\0'; dl = k; }
+                while (j < n && in[j] != '\n') j++;
+                i = j < n ? j + 1 : j;
+                continue;
+            }
+        }
+        line_start = false;
+        if (c == '\'' || c == '"' || c == '`') {             // stringhe e nomi: copiati così come sono
+            size_t j = i + 1;
+            while (j < n && in[j] != c) { if (in[j] == '\\' && c != '`' && j + 1 < n) j++; j++; }
+            if (j < n) j++;
+            put(&out, in + i, j - i);
+            i = j;
+            continue;
+        }
+        if (c == '-' && i + 1 < n && in[i + 1] == '-') {     // commento di riga
+            size_t j = i;
+            while (j < n && in[j] != '\n') j++;
+            put(&out, in + i, j - i);
+            i = j;
+            continue;
+        }
+        if (c == '/' && i + 2 < n && in[i + 1] == '*') {
+            const char* e = strstr(in + i + 2, "*/");
+            size_t j = e ? (size_t)(e - in) + 2 : n;
+            if (in[i + 2] == '!' && i + 8 <= n && versioned_ok(in + i + 3)) {
+                puts_(&out, " ");
+                put(&out, in + i + 8, (e ? (size_t)(e - in) : n) - (i + 8));
+                puts_(&out, " ");
+            } else put(&out, in + i, j - i);
+            i = j;
+            continue;
+        }
+        if (dl > 1 || delim[0] != ';') {
+            if (!strncmp(in + i, delim, dl)) { puts_(&out, ";"); i += dl; continue; }
+        }
+        if (c == '\n') line_start = true;
+        put(&out, in + i, 1);
+        i++;
+    }
+    if (out.oom) { free(out.p); return NULL; }
+    return out.p ? out.p : strdup("");
+}
+
+char* mysql_translate(const char* sql_in, MyImportStats* st) {
     MyImportStats dummy;
     if (!st) st = &dummy;
     memset(st, 0, sizeof(*st));
+    char* prepared = mysql_prepare(sql_in);
+    if (!prepared) return NULL;
+    const char* sql = prepared;
     int len = (int)strlen(sql), cap = 256, n;
     SqlRange* r = NULL;
     for (;;) {
         free(r);
         r = malloc(sizeof(SqlRange) * (size_t)cap);
-        if (!r) return NULL;
+        if (!r) { free(prepared); return NULL; }
         n = sql_split(sql, len, r, cap);
         if (n < cap) break;
         cap *= 2;
@@ -270,6 +345,7 @@ char* mysql_translate(const char* sql, MyImportStats* st) {
         puts_(&out, ";\n");
     }
     free(r);
+    free(prepared);
     if (out.oom) { free(out.p); return NULL; }
     return out.p;
 }

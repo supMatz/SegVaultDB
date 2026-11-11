@@ -15,6 +15,7 @@ typedef enum {
     NODE_CREATE_TRIGGER, NODE_DROP_TRIGGER,
     NODE_CREATE_PROCEDURE, NODE_DROP_PROCEDURE, NODE_CALL,   // usano create_trigger / drop_trigger / call
     NODE_CHECKPOINT,
+    NODE_BACKUP,       // BACKUP [DATABASE] TO 'cartella'
     NODE_VACUUM,       // recupera le pagine di overflow non più usate
 } StmtType;
 
@@ -258,7 +259,9 @@ typedef struct ASTNode {
         } drop_index;
         struct {
             char       view_name[64];
-            char       definition[2048];
+            char       definition[SV_MAX_SQL_LEN];
+            bool       replace;        // CREATE OR REPLACE VIEW
+            bool       alter;          // ALTER VIEW: la vista deve esistere
         } create_view;
         struct {
             char       view_name[64];
@@ -287,6 +290,9 @@ typedef struct ASTNode {
             ASTExpr*   args[32];
             int        nargs;
         } call;
+        struct {
+            char       path[512];
+        } backup;
         struct {
             void*      stmt;           // ASTNode* della SELECT da spiegare
             bool       analyze;        // EXPLAIN ANALYZE: esegue la query e mostra le righe reali

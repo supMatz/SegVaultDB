@@ -109,6 +109,7 @@ int main(void) {
     CHECK(has_row("SHOW GRANTS", "TO anna"), "own grants visible");
     CHECK(denied("SHOW GRANTS FOR bob"), "others' grants hidden");
     CHECK(denied("USE hr") && denied("CREATE DATABASE altro"), "other database");
+    CHECK(rows("SHOW DATABASES") == 1 && has_row("SHOW DATABASES", "shop"), "SHOW DATABASES lists only allowed databases");
     CHECK(ok("USE shop") && ok("BEGIN") && ok("ROLLBACK"), "use, transactions");
 
     // ── bob: solo SELECT su shop.prodotto: le tabelle nascoste anche in subquery, join, CTE, UNION ──

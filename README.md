@@ -286,7 +286,7 @@ rispettano la tabella resta com'era. La chiave primaria di una tabella esistente
 - tasto destro: copia di cella, riga, colonna o valore come letterale SQL, filtri, ordinamento, export.
 
 **Export** (menu *Export*): CSV, TSV, JSON, Markdown, HTML o `INSERT` SQL, su file o negli appunti (`Ctrl+Shift+C` copia tutto come TSV, da incollare in un foglio di calcolo; `Ctrl+E` esporta in CSV). *Database dump* scrive in un file `.sql` le istruzioni che ricreano il database corrente (tabelle, dati, chiavi esterne, viste, trigger e procedure).
-**Import** (menu *Import*): un file CSV diventa una tabella (tipi delle colonne riconosciuti dai dati); *Run SQL file / MySQL dump* esegue uno script senza aprirlo. Un **dump di MySQL / MariaDB / phpMyAdmin** viene riconosciuto e tradotto prima: `SET`, `LOCK TABLES` e simili saltati, tipi MySQL convertiti (`tinyint`, `mediumtext`, `json`, `timestamp`, `enum`, `set`, ...), attributi e opzioni (`unsigned`, `COLLATE`, `COMMENT`, `ENGINE=`, ...) tolti, `KEY` → `CREATE INDEX`, `UNIQUE KEY` → vincolo `UNIQUE`, chiavi esterne mantenute (anche gli indici su più colonne; i `FULLTEXT` restano fuori, ma `MATCH ... AGAINST` funziona lo stesso).
+**Import** (menu *Import*): un file CSV diventa una tabella (tipi delle colonne riconosciuti dai dati); *Run SQL file / MySQL dump* esegue uno script senza aprirlo. Un **dump di MySQL / MariaDB / phpMyAdmin** viene riconosciuto e tradotto prima: `SET`, `LOCK TABLES` e simili saltati, tipi MySQL convertiti (`tinyint`, `mediumtext`, `json`, `timestamp`, `enum`, `set`, ...), attributi e opzioni (`unsigned`, `COLLATE`, `COMMENT`, `ENGINE=`, ...) tolti, `KEY` → `CREATE INDEX`, `UNIQUE KEY` → vincolo `UNIQUE`, chiavi esterne mantenute, viste, trigger e procedure ricreati (`DELIMITER` e i commenti `/*!50001 ... */` compresi; anche gli indici su più colonne; i `FULLTEXT` restano fuori, ma `MATCH ... AGAINST` funziona lo stesso).
 
 ### Menu e impostazioni
 
@@ -407,8 +407,15 @@ CREATE INDEX idx_esame_corso ON esame (corso);   DROP INDEX idx_esame_corso ON e
 SHOW INDEXES FROM esame;
 
 CREATE VIEW carriera AS SELECT studente, AVG(voto) AS media FROM esame GROUP BY studente;
+CREATE VIEW voti (chi, quanto) AS SELECT studente, voto FROM esame;   -- nomi delle colonne
+CREATE OR REPLACE VIEW carriera AS ...;   ALTER VIEW carriera AS ...;
+SHOW CREATE VIEW carriera;   SHOW FULL TABLES;   DESCRIBE carriera;
 DROP VIEW [IF EXISTS] carriera;
 ```
+
+Una vista viene controllata quando si crea (tabelle e colonne esistenti, nessun ciclo fra viste);
+le opzioni di MySQL (`ALGORITHM`, `DEFINER`, `SQL SECURITY`, `WITH CHECK OPTION`) sono accettate.
+Le viste sono di sola lettura. `SHOW TABLES` elenca anche le viste, come MySQL.
 
 **Vincoli:** `NOT NULL`, `DEFAULT`, `AUTO_INCREMENT`, `PRIMARY KEY` (di colonna o `PRIMARY KEY (a, b)`), `UNIQUE` (più `NULL` ammessi, come in SQL), `CHECK (condizione)` di colonna o di tabella (soddisfatto se vero o sconosciuto), `FOREIGN KEY (a, b) REFERENCES t [(x, y)]` o `REFERENCES t` sulla colonna (senza colonne: la chiave primaria di `t`), con `ON DELETE` / `ON UPDATE` `NO ACTION` (predefinito), `RESTRICT`, `CASCADE`, `SET NULL`, `SET DEFAULT`; anche autoreferenziali. Le colonne riferite devono essere la chiave primaria o una chiave `UNIQUE`. Ogni statement calcola prima tutte le modifiche, comprese quelle a cascata, controlla tutti i vincoli (e la dimensione delle righe) e solo dopo scrive.
 
@@ -465,7 +472,13 @@ SHOW STATUS;                   -- buffer pool (hit ratio, sostituzioni CLOCK), p
 SHOW INDEXES FROM t;           -- chiavi e indici, costruiti o no, numero di chiavi distinte
 CHECKPOINT;                    -- pagine modificate su disco e log svuotato
 VACUUM;                        -- recupera le pagine delle righe grandi non più usate (fuori da una transazione)
+BACKUP TO '/percorso/backup';  -- copia coerente di tutti i dati (database e utenti) in una cartella nuova
 ```
+
+Un backup è una cartella di dati completa: si apre direttamente (`segvault-server /percorso/backup`)
+o si ripristina dall'app (*File → Restore backup*; i dati sostituiti restano in `before-restore`).
+`segvault-server --backup-dir DIR --backup-every 60 --backup-keep 7` ne fa uno ogni ora e tiene gli
+ultimi sette.
 
 ### Transazioni
 
@@ -586,6 +599,8 @@ make server                                   # ./segvault-server (make windows:
 | `--static DIR` | serve i file di `DIR` fuori da `/api` |
 | `--timeout S` | ferma una richiesta che dura più di `S` secondi (default 30) |
 | `--max-body MB` | corpo massimo di una richiesta (default 16) |
+| `--backup-dir DIR` | backup automatici in `DIR/segvault-AAAAMMGG-HHMMSS` |
+| `--backup-every M` / `--backup-keep N` | minuti fra due backup (default 60) / quanti tenerne (default 7) |
 
 Endpoint: `GET /api/v1/health`, `GET /api/v1/status`, `POST /api/v1/query`,
 `GET /api/v1/databases`, `GET /api/v1/databases/{db}/tables`, `GET /api/v1/databases/{db}/tables/{t}`,
@@ -1020,10 +1035,11 @@ make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitize
 |---|---|
 | `test_btree` | B+Tree sotto stress contro un modello di riferimento: inserimenti, aggiornamenti, cancellazioni e scansioni ordinate, con un buffer pool piccolo che costringe a riscrivere e rileggere le pagine |
 | `test_engine` (128) | Motore: pagine, heap, catalogo, WAL e recovery, import CSV |
-| `test_sql` (1119) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, transazioni, crash e recovery, testi lunghi, JSON, 100 transazioni di fila |
+| `test_sql` (1147) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, procedure, viste, transazioni, crash e recovery, testi lunghi, JSON, full-text, 100 transazioni di fila |
 | `test_examples` (166) | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
 | `test_grid_edit` (22) | Modifica dei dati nella griglia: analisi dei risultati, `UPDATE` / `INSERT` / `DELETE` generati ed eseguiti, chiavi composte, join, apici e backslash, letterali di export e dump |
-| `test_server` (78) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici |
+| `test_server` (100) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici, utenti e permessi |
+| `test_backup` (29) | `BACKUP TO`, apertura della copia, ripristino sui dati in uso (con i dati precedenti conservati), righe grandi, viste, procedure e utenti |
 
 La CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) compila su Ubuntu con `-D_FORTIFY_SOURCE=2` e fallisce a qualunque warning, esegue `make test` e `make test-asan`, e compila per Windows con MinGW-w64. Durante lo sviluppo il motore è stato anche verificato con un fuzzer di SQL mutato e uno di richieste HTTP malformate (sotto ASan), con un confronto dei risultati contro SQLite su centinaia di migliaia di query e modifiche casuali, e con arresti forzati (`kill -9`) durante scritture concorrenti senza perdere nessuna scrittura confermata.
 
@@ -1246,8 +1262,9 @@ Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
    stored procedure (`CREATE PROCEDURE` / `CALL`, parametri `IN`), ricerca full-text
    (`MATCH ... AGAINST`, anche `IN BOOLEAN MODE`). Da fare: più tabelle / colonne / indici, indice
    full-text (ora la ricerca legge ogni riga).
-5. **Sicurezza e gestione** — HTTPS integrato, backup pianificati e ripristino dalla GUI, avvio come
-   servizio di sistema, registro di audit, `SHOW DATABASES` filtrato per utente.
+5. **Sicurezza e gestione** — fatto: `BACKUP TO`, backup pianificati del server, ripristino dalla
+   GUI; `SHOW DATABASES` e l'elenco `/api/v1/databases` mostrano a ogni utente solo ciò su cui ha
+   permessi. Da fare: HTTPS integrato, avvio come servizio di sistema, registro di audit.
 6. **GUI** — costruttore visuale di query, navigazione delle chiavi esterne dalla griglia, grafici dai
    risultati, export XLSX/PDF, editor di trigger e viste, manutenzione delle tabelle, query salvate.
 7. **Portata** — interfaccia web, versione macOS, interfaccia in italiano e altre lingue, accessibilità.

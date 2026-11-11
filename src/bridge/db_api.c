@@ -19,6 +19,7 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
 #include "platform_compat.h"
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
 
 // ── mutex del motore e lock della cartella dati ─────────────────
 // Il motore non è rientrante: ogni funzione pubblica che tocca catalogo, pagine o
@@ -284,6 +285,7 @@ static int qual_db_index(const ASTNode* stmt, int cur, char* err, size_t errn) {
 }
 
 static QueryResult* exec_one_in(ASTNode* stmt);
+static bool db_backup_impl(const char* dir, char* err, size_t errn);
 
 // statement con shop.prodotto: gira nel database shop (solo per questo statement e questo thread)
 static QueryResult* exec_one(ASTNode* stmt) {
@@ -320,6 +322,9 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
         result = db_commit() ? result_ok(0) : result_error("Failed to commit");
     } else if (stmt->type == NODE_ROLLBACK && stmt->rollback_to.name[0] == 0) {
         result = db_rollback() ? result_ok(0) : result_error("Failed to rollback");
+    } else if (stmt->type == NODE_BACKUP) {
+        char err[600];
+        result = db_backup_impl(stmt->backup.path, err, sizeof(err)) ? result_ok(0) : result_error(err);
     } else if (stmt->type == NODE_VACUUM) {
         int freed = 0;
         result = g_db.exec_ctx.tx_id || g_tx_owner ? result_error("VACUUM is not allowed while a transaction is open")
@@ -344,6 +349,18 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
         }
     } else {
         result = exec_atomic(stmt);
+    }
+
+    // SHOW DATABASES: un utente vede solo i database in cui ha qualche permesso
+    if (result && result->success && g_session_user[0] && stmt->type == NODE_SHOW &&
+        !strcmp(stmt->select_stmt.table_name, "DATABASES")) {
+        int k = 0;
+        for (int i = 0; i < result->num_rows; i++) {
+            const Cell* c = &result->rows[i].cells[0];
+            if (!c->is_null && auth_can_see_db(g_session_user, c->value)) result->rows[k++] = result->rows[i];
+            else free(result->rows[i].cells);
+        }
+        result->num_rows = k;
     }
 
     // le modifiche allo schema vanno subito su disco: dopo un arresto anomalo le tabelle
@@ -1102,6 +1119,14 @@ bool db_login(const char* name, const char* password) {
     return ok;
 }
 
+bool db_user_can_see(const char* user, const char* db, const char* table) {
+    if (!user || !user[0]) return true;
+    db_lock();
+    bool r = table ? auth_privs(user, db, table) != 0 : auth_can_see_db(user, db);
+    db_unlock();
+    return r;
+}
+
 bool db_has_users(void) {
     db_lock();
     bool r = auth_user_count() > 0;
@@ -1189,6 +1214,18 @@ static void sb_cat(char** p, size_t* n, size_t* cap, const char* a) {
     *n += l;
 }
 
+// il testo SQL contiene la parola name (non dentro un'altra parola; senza distinzione maiuscole/minuscole)?
+static bool sql_mentions(const char* sql, const char* name) {
+    size_t nl = strlen(name);
+    for (const char* p = sql; nl && *p; p++) {
+        if (strncasecmp(p, name, nl)) continue;
+        bool before = p > sql && (isalnum((unsigned char)p[-1]) || p[-1] == '_');
+        bool after = isalnum((unsigned char)p[nl]) || p[nl] == '_';
+        if (!before && !after) return true;
+    }
+    return false;
+}
+
 static char* db_get_objects_sql_impl(const char* db_name, int what) {
     Database* db = g_db.initialized ? catalog_get_db(g_db.catalog, db_name) : NULL;
     if (!db) return NULL;
@@ -1197,12 +1234,27 @@ static char* db_get_objects_sql_impl(const char* db_name, int what) {
     if (!out) return NULL;
     out[0] = '\0';
     char head[400];
-    for (int i = 0; what == 0 && i < db->num_views; i++) {
-        snprintf(head, sizeof(head), "CREATE VIEW %.64s AS ", db->views[i].name);
+    // viste in ordine di dipendenza: una vista va dopo quelle che nomina (ciascuna viene controllata
+    // quando si ricrea); con un ciclo apparente si prosegue nell'ordine del catalogo
+    bool* done = what == 0 ? calloc((size_t)db->num_views + 1, 1) : NULL;
+    for (int left = what == 0 ? db->num_views : 0; left > 0; ) {
+        int pick = -1;
+        for (int i = 0; i < db->num_views && pick < 0; i++) {
+            if (done[i]) continue;
+            bool ready = true;
+            for (int j = 0; j < db->num_views && ready; j++)
+                if (j != i && !done[j] && sql_mentions(db->views[i].definition, db->views[j].name)) ready = false;
+            if (ready) pick = i;
+        }
+        for (int i = 0; i < db->num_views && pick < 0; i++) if (!done[i]) pick = i;
+        done[pick] = true;
+        left--;
+        snprintf(head, sizeof(head), "CREATE VIEW %.64s AS ", db->views[pick].name);
         sb_cat(&out, &n, &cap, head);
-        sb_cat(&out, &n, &cap, db->views[i].definition);
+        sb_cat(&out, &n, &cap, db->views[pick].definition);
         sb_cat(&out, &n, &cap, ";\n");
     }
+    free(done);
     for (int i = 0; what == 1 && i < db->num_triggers; i++) {
         TriggerSchema* t = &db->triggers[i];
         snprintf(head, sizeof(head), "CREATE TRIGGER %.64s %s %.15s ON %.64s ", t->name, t->before ? "BEFORE" : "AFTER", t->event, t->table_name);
@@ -1223,6 +1275,118 @@ static char* db_get_objects_sql_impl(const char* db_name, int what) {
 char* db_get_objects_sql(const char* db_name, int what) {
     db_lock();
     char* r = db_get_objects_sql_impl(db_name, what);
+    db_unlock();
+    return r;
+}
+
+
+// ── BACKUP / ripristino ─────────────────────────────────────────
+// Un backup è una cartella di dati completa (si apre direttamente con segvault o segvault-server):
+// dopo un checkpoint si copiano il file delle pagine, il catalogo, la lista delle pagine libere e
+// gli utenti; il log resta vuoto. Il lock esclusivo del motore ferma tutto durante la copia.
+static const char* const BK_FILES[4] = { "segvault.db", "segvault.cat", "segvault.free", "users.dat" };
+
+static bool bk_copy(const char* from, const char* to, bool must_exist, char* err, size_t errn) {
+    int in = sv_open(from, SV_O_RDONLY, 0);
+    if (in < 0) {
+        if (!must_exist) { remove(to); return true; }
+        snprintf(err, errn, "cannot read %.400s", from);
+        return false;
+    }
+    int out = sv_open(to, SV_O_WRONLY | SV_O_CREAT | SV_O_TRUNC, 0644);
+    if (out < 0) { sv_close(in); snprintf(err, errn, "cannot write %.400s", to); return false; }
+    char* buf = malloc(1 << 20);
+    bool ok = buf != NULL;
+    while (ok) {
+        int n = (int)sv_read(in, buf, 1u << 20);
+        if (n < 0) ok = false;
+        if (n <= 0) break;
+        ok = sv_write_full(out, buf, (size_t)n);
+    }
+    if (ok) ok = sv_fsync(out) == 0;
+    free(buf);
+    sv_close(in);
+    if (sv_close(out) != 0) ok = false;
+    if (!ok) snprintf(err, errn, "copy to %.400s failed", to);
+    return ok;
+}
+
+static bool bk_has_data(const char* dir) {
+    char p[700];
+    snprintf(p, sizeof(p), "%.600s" SV_PATH_SEP "segvault.db", dir);
+    int fd = sv_open(p, SV_O_RDONLY, 0);
+    if (fd < 0) return false;
+    sv_close(fd);
+    return true;
+}
+
+static bool bk_copy_dir(const char* from, const char* to, char* err, size_t errn) {
+    for (int i = 0; i < 4; i++) {
+        char a[700], b[700];
+        snprintf(a, sizeof(a), "%.600s" SV_PATH_SEP "%s", from, BK_FILES[i]);
+        snprintf(b, sizeof(b), "%.600s" SV_PATH_SEP "%s", to, BK_FILES[i]);
+        if (!bk_copy(a, b, i < 2, err, errn)) return false;
+    }
+    char w[700];
+    snprintf(w, sizeof(w), "%.600s" SV_PATH_SEP "segvault.wal", to);
+    remove(w);                                            // log vuoto: niente da rifare
+    return true;
+}
+
+static bool db_backup_impl(const char* dir, char* err, size_t errn) {
+    if (!g_db.initialized) { snprintf(err, errn, "Database not initialized"); return false; }
+    if (!dir || !dir[0]) { snprintf(err, errn, "Missing backup folder"); return false; }
+    if (g_db.exec_ctx.tx_id || g_tx_owner) { snprintf(err, errn, "BACKUP is not allowed while a transaction is open"); return false; }
+    if (!strcmp(dir, g_db.data_dir)) { snprintf(err, errn, "The backup folder must not be the data folder"); return false; }
+    char part[600];                                      // crea anche le cartelle intermedie
+    snprintf(part, sizeof(part), "%s", dir);
+    for (char* q = part + 1; *q; q++)
+        if (*q == '/' || *q == '\\') { char c = *q; *q = '\0'; sv_mkdir(part); *q = c; }
+    sv_mkdir(dir);                                        // può esistere già
+    if (bk_has_data(dir)) { snprintf(err, errn, "%.300s already contains a database: choose an empty folder", dir); return false; }
+    if (!do_checkpoint()) { snprintf(err, errn, "Checkpoint failed"); return false; }
+    free_list_save();
+    sv_fsync(g_db.db_fd);
+    return bk_copy_dir(g_db.data_dir, dir, err, errn);
+}
+
+static bool db_init_impl(const char* data_directory);
+
+static bool db_restore_impl(const char* dir, char* err, size_t errn) {
+    if (!g_db.initialized) { snprintf(err, errn, "Database not initialized"); return false; }
+    if (g_db.exec_ctx.tx_id || g_tx_owner) { snprintf(err, errn, "Restore is not allowed while a transaction is open"); return false; }
+    if (!dir || !bk_has_data(dir)) { snprintf(err, errn, "%.300s is not a SegVault backup (segvault.db missing)", dir ? dir : ""); return false; }
+    if (!strcmp(dir, g_db.data_dir)) { snprintf(err, errn, "That is the data folder itself"); return false; }
+    // i dati attuali restano in <dati>/before-restore: un ripristino sbagliato si può annullare
+    char keep[600];
+    snprintf(keep, sizeof(keep), "%.560s" SV_PATH_SEP "before-restore", g_db.data_dir);
+    sv_mkdir(keep);
+    char dd[512];
+    snprintf(dd, sizeof(dd), "%s", g_db.data_dir);
+    if (!do_checkpoint()) { snprintf(err, errn, "Checkpoint failed"); return false; }
+    free_list_save();
+    sv_fsync(g_db.db_fd);
+    if (!bk_copy_dir(dd, keep, err, errn)) return false;
+    db_shutdown_impl();
+    bool ok = bk_copy_dir(dir, dd, err, errn);
+    if (!ok) {                                            // rimette i dati di prima
+        char e2[300];
+        bk_copy_dir(keep, dd, e2, sizeof(e2));
+    }
+    if (!db_init_impl(dd)) { snprintf(err, errn, "Restored files cannot be opened: %.200s (previous data in %.200s)", g_init_error, keep); return false; }
+    return ok;
+}
+
+bool db_backup(const char* dir, char* err, size_t errn) {
+    db_lock();
+    bool r = db_backup_impl(dir, err, errn);
+    db_unlock();
+    return r;
+}
+
+bool db_restore(const char* dir, char* err, size_t errn) {
+    db_lock();
+    bool r = db_restore_impl(dir, err, errn);
     db_unlock();
     return r;
 }

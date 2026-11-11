@@ -963,7 +963,7 @@ static bool ident_is(ParserState* ps, const char* word) {
 
 // parole che dopo un nome di tabella non possono essere un alias
 static bool alias_forbidden(ParserState* ps) {
-    static const char* const W[] = { "INNER", "CROSS", "OUTER", "OFFSET", "INTERSECT", "EXCEPT", "MINUS", "NATURAL", "FULL", "USING", "WINDOW" };
+    static const char* const W[] = { "INNER", "CROSS", "OUTER", "OFFSET", "INTERSECT", "EXCEPT", "MINUS", "NATURAL", "FULL", "USING", "WINDOW", "WITH" };   // WITH: ... WITH CHECK OPTION delle viste
     for (size_t i = 0; i < sizeof(W) / sizeof(W[0]); i++) if (ident_is(ps, W[i])) return true;
     return false;
 }
@@ -1511,6 +1511,20 @@ TrigProgram* parser_parse_trigger(TokenList* tokens) {
     return p;
 }
 
+// caratteristiche MySQL di una procedura fra i parametri e il corpo (ignorate):
+// COMMENT '...', [NOT] DETERMINISTIC, LANGUAGE SQL, CONTAINS SQL, NO SQL, READS / MODIFIES SQL DATA, SQL SECURITY x
+static void skip_routine_traits(ParserState* ps) {
+    for (int guard = 0; guard < 16; guard++) {
+        if (ident_is(ps, "COMMENT") && next_is(ps, 1, TOK_STRING)) { consume(ps); consume(ps); }
+        else if (ident_is(ps, "DETERMINISTIC")) consume(ps);
+        else if (peek(ps).type == TOK_NOT && next_is(ps, 1, TOK_IDENTIFIER)) { consume(ps); consume(ps); }
+        else if (ident_is(ps, "LANGUAGE") || ident_is(ps, "CONTAINS") || ident_is(ps, "NO")) { consume(ps); consume(ps); }
+        else if (ident_is(ps, "READS") || ident_is(ps, "MODIFIES")) { consume(ps); consume(ps); consume(ps); }
+        else if (ident_is(ps, "SQL") && next_is(ps, 1, TOK_IDENTIFIER)) { consume(ps); consume(ps); consume(ps); }
+        else return;
+    }
+}
+
 TrigProgram* parser_parse_procedure(TokenList* tokens, int start) {
     TrigProgram* p = calloc(1, sizeof(TrigProgram));
     if (!p) return NULL;
@@ -1519,6 +1533,7 @@ TrigProgram* parser_parse_procedure(TokenList* tokens, int start) {
     r.success = true;
     ParserState ps = { tokens, start, &r, 0, "", false };
     p->for_each_row = false;
+    skip_routine_traits(&ps);
     if (match(&ps, TOK_BEGIN)) {
         parse_trig_list(&ps, &p->v, &p->n);
         if (r.success && !match(&ps, TOK_END)) parse_fail(&ps, "Expected END to close the procedure body", peek(&ps));
@@ -1549,6 +1564,7 @@ static ASTNode* parse_create_procedure(ParserState* ps, ASTNode* n) {
     }
     TrigProgram* prog = calloc(1, sizeof(TrigProgram));
     if (!prog) { parse_fail(ps, "Out of memory", peek(ps)); return n; }
+    skip_routine_traits(ps);
     if (match(ps, TOK_BEGIN)) {
         parse_trig_list(ps, &prog->v, &prog->n);
         if (ps->result->success && !match(ps, TOK_END)) parse_fail(ps, "Expected END to close the procedure body", peek(ps));
@@ -1900,11 +1916,75 @@ static void parse_create_table(ParserState* ps, ASTNode* n) {
     expect(ps, TOK_RPAREN);
 }
 
+static bool view_option(Token t) {
+    return t.type == TOK_IDENTIFIER && t.text &&
+           (!strcasecmp(t.text, "ALGORITHM") || !strcasecmp(t.text, "DEFINER") || !strcasecmp(t.text, "SQL"));
+}
+
+// nome [(colonne)] AS SELECT ... [WITH [CASCADED | LOCAL] CHECK OPTION]   (dopo CREATE VIEW / ALTER VIEW)
+// La definizione è ricostruita dai token (le stringhe tornano fra apici); con le colonne diventa
+// WITH nome (colonne) AS (SELECT ...) SELECT * FROM nome
+static void parse_view_def(ParserState* ps, ASTNode* n) {
+    n->type = NODE_CREATE_VIEW;
+    Token vn = consume(ps);
+    if (vn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the view name", vn); return; }
+    copy_text(ps, n->create_view.view_name, sizeof(n->create_view.view_name), vn.text);
+    int cols_from = -1, cols_to = -1;
+    if (peek(ps).type == TOK_LPAREN) {
+        cols_from = ps->pos;
+        consume(ps);
+        do {
+            Token c = consume(ps);
+            if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name in the view column list", c); return; }
+        } while (match(ps, TOK_COMMA));
+        if (!expect(ps, TOK_RPAREN)) return;
+        cols_to = ps->pos;
+    }
+    if (!expect(ps, TOK_AS)) return;
+    if (!query_starts(ps, 0)) { parse_fail(ps, "A view must be defined by a SELECT", peek(ps)); return; }
+    int start = ps->pos;
+    ASTNode* probe = parse_query(ps);                    // la definizione deve essere una SELECT valida
+    free_node(probe);
+    if (!ps->result->success) return;
+    int end = ps->pos;
+    if (ident_is(ps, "WITH")) {                           // WITH [CASCADED | LOCAL] CHECK OPTION: accettato
+        consume(ps);
+        if (ident_is(ps, "CASCADED") || ident_is(ps, "LOCAL")) consume(ps);
+        if (!ident_is(ps, "CHECK")) { parse_fail(ps, "Expected CHECK OPTION", peek(ps)); return; }
+        consume(ps);
+        if (!ident_is(ps, "OPTION")) { parse_fail(ps, "Expected CHECK OPTION", peek(ps)); return; }
+        consume(ps);
+    }
+    if (peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF) { parse_fail(ps, "Unexpected text in the view definition", peek(ps)); return; }
+    char* def = n->create_view.definition;
+    size_t cap = sizeof(n->create_view.definition);
+    bool fits;
+    if (cols_from >= 0) {
+        size_t l = (size_t)snprintf(def, cap, "WITH %s ", n->create_view.view_name);
+        fits = l < cap && tokens_text(ps, cols_from, cols_to, def + l, cap - l);
+        l = strlen(def);
+        if (fits) fits = l + 6 < cap && (strcat(def, " AS ("), tokens_text(ps, start, end, def + l + 5, cap - l - 5));
+        l = strlen(def);
+        if (fits) fits = (size_t)snprintf(def + l, cap - l, ") SELECT * FROM %s", n->create_view.view_name) < cap - l;
+    } else fits = tokens_text(ps, start, end, def, cap);
+    if (!fits) parse_fail(ps, "View definition is too long (max 64 KB)", peek(ps));
+}
+
 static ASTNode* parse_statement(ParserState* ps) {
     ASTNode* n = calloc(1, sizeof(ASTNode));
     if (!n) return NULL;
     Token t = peek(ps);
     if (ident_is(ps, "CALL") && next_is(ps, 1, TOK_IDENTIFIER)) { parse_call_stmt(ps, n); return n; }
+    if (ident_is(ps, "BACKUP")) {                         // BACKUP [DATABASE] TO 'cartella'
+        consume(ps);
+        n->type = NODE_BACKUP;
+        if (peek(ps).type == TOK_DATABASE) consume(ps);
+        if (!expect(ps, TOK_TO)) return n;
+        Token p = consume(ps);
+        if (p.type != TOK_STRING || !p.text[0]) { parse_fail(ps, "Expected the backup folder as a string: BACKUP TO 'folder'", p); return n; }
+        copy_text(ps, n->backup.path, sizeof(n->backup.path), p.text);
+        return n;
+    }
 
     switch (t.type) {
         case TOK_SELECT:
@@ -1931,6 +2011,15 @@ static ASTNode* parse_statement(ParserState* ps) {
         case TOK_CREATE: {
             consume(ps);
             Token sub = consume(ps);
+            bool or_replace = false;                            // CREATE OR REPLACE VIEW
+            if (sub.type == TOK_OR && ident_is(ps, "REPLACE")) { consume(ps); or_replace = true; sub = consume(ps); }
+            // opzioni MySQL delle viste (nei dump): ALGORITHM = x, DEFINER = `u`@`h`, SQL SECURITY x
+            for (int g = 0; g < 4 && view_option(sub); g++) {
+                while (peek(ps).type != TOK_VIEW && peek(ps).type != TOK_TRIGGER && peek(ps).type != TOK_EOF &&
+                       peek(ps).type != TOK_SEMICOLON && !ident_is(ps, "PROCEDURE") && !view_option(peek(ps))) consume(ps);
+                sub = consume(ps);
+            }
+            if (or_replace && sub.type != TOK_VIEW) { parse_fail(ps, "OR REPLACE is only supported for views", sub); break; }
             bool unique_index = false;                          // CREATE UNIQUE INDEX
             if (sub.type == TOK_IDENTIFIER && sub.text && !strcasecmp(sub.text, "UNIQUE") && peek(ps).type == TOK_INDEX) {
                 unique_index = true;
@@ -1990,56 +2079,18 @@ static ASTNode* parse_statement(ParserState* ps) {
                 }
                 // più colonne: l'indice accelera tramite la prima (come il prefisso di un indice composto)
             } else if (sub.type == TOK_VIEW) {
-                n->type = NODE_CREATE_VIEW;
-                Token vn = consume(ps);
-                copy_text(ps, n->create_view.view_name, sizeof(n->create_view.view_name), vn.text);
-                expect(ps, TOK_AS);
-                // la definizione viene ricostruita dai token: le stringhe tornano tra apici (con ''
-                // raddoppiati), altrimenti alla rilettura 'x' diventerebbe la colonna x
-                if (!query_starts(ps, 0)) { parse_fail(ps, "A view must be defined by a SELECT", peek(ps)); break; }
-                int start = ps->pos;
-                char def[sizeof(n->create_view.definition)];
-                size_t di = 0;
-                bool fits = true;
-                while (peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF) {
-                    Token t = consume(ps);
-                    char piece[1100];
-                    if (t.type == TOK_STRING) {
-                        size_t k = 0;
-                        piece[k++] = '\'';
-                        for (const char* q = t.text; *q && k < sizeof(piece) - 3; q++) {
-                            if (*q == '\'' || *q == '\\') piece[k++] = *q;   // '' e \\ come nel testo originale
-                            piece[k++] = *q;
-                        }
-                        piece[k++] = '\'';
-                        piece[k] = '\0';
-                    } else {
-                        snprintf(piece, sizeof(piece), "%s", t.text);
-                    }
-                    size_t pl = strlen(piece);
-                    if (di + pl + 2 >= sizeof(def)) { fits = false; break; }
-                    if (di > 0) def[di++] = ' ';
-                    memcpy(def + di, piece, pl);
-                    di += pl;
-                }
-                def[di] = '\0';
-                if (!fits) { parse_fail(ps, "View definition is too long (max 2047 characters)", peek(ps)); break; }
-                // la definizione deve essere una SELECT valida
-                {
-                    int save = ps->pos;
-                    ps->pos = start;
-                    ASTNode* probe = parse_query(ps);
-                    bool clean = ps->result->success && (peek(ps).type == TOK_SEMICOLON || peek(ps).type == TOK_EOF);
-                    free_node(probe);
-                    if (ps->result->success && !clean) parse_fail(ps, "Unexpected text in the view definition", peek(ps));
-                    ps->pos = save;
-                }
-                copy_text(ps, n->create_view.definition, sizeof(n->create_view.definition), def);
+                n->create_view.replace = or_replace;
+                parse_view_def(ps, n);
             }
             break;
         }
         case TOK_ALTER: {
             consume(ps);
+            if (match(ps, TOK_VIEW)) {                            // ALTER VIEW v [(colonne)] AS SELECT ...
+                n->create_view.alter = true;
+                parse_view_def(ps, n);
+                break;
+            }
             expect(ps, TOK_TABLE);
             n->type = NODE_ALTER_TABLE;
             Token tn = table_tok(ps);
@@ -2187,10 +2238,12 @@ static ASTNode* parse_statement(ParserState* ps) {
             else if (!strcasecmp(what.text, "TABLES")) kind = "TABLES";
             else if (!strcasecmp(what.text, "STATUS")) kind = "STATUS";
             else if (!strcasecmp(what.text, "TRIGGERS")) kind = "TRIGGERS";
+            else if (what.type == TOK_CREATE && match(ps, TOK_VIEW)) { kind = "CREATE VIEW"; needs_table = true; }
             else if (what.type == TOK_CREATE) { expect(ps, TOK_TABLE); kind = "CREATE"; needs_table = true; }
+            else if (!strcasecmp(what.text, "FULL") && ident_is(ps, "TABLES")) { consume(ps); kind = "FULL TABLES"; }
             else if (!strcasecmp(what.text, "CONSTRAINTS")) { kind = "CONSTRAINTS"; needs_table = true; }
             else if (what.type == TOK_INDEX || !strcasecmp(what.text, "INDEXES") || !strcasecmp(what.text, "KEYS")) { kind = "INDEXES"; needs_table = true; }
-            if (!kind) { parse_fail(ps, "Expected DATABASES, TABLES, STATUS, TRIGGERS, CREATE TABLE, CONSTRAINTS or INDEXES after SHOW", what); break; }
+            if (!kind) { parse_fail(ps, "Expected DATABASES, TABLES, FULL TABLES, STATUS, TRIGGERS, CREATE TABLE / VIEW, CONSTRAINTS or INDEXES after SHOW", what); break; }
             if (!strcmp(kind, "TRIGGERS") && (match(ps, TOK_FROM) || match(ps, TOK_IN))) {      // SHOW TRIGGERS [FROM t]
                 Token tn = table_tok(ps);
                 if (tn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name", tn); break; }
@@ -2198,7 +2251,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             }
             snprintf(n->select_stmt.table_name, sizeof(n->select_stmt.table_name), "%s", kind);
             if (needs_table) {
-                if (strcmp(kind, "CREATE") && !match(ps, TOK_FROM) && !match(ps, TOK_IN)) { parse_fail(ps, "Expected FROM table", peek(ps)); break; }
+                if (strncmp(kind, "CREATE", 6) && !match(ps, TOK_FROM) && !match(ps, TOK_IN)) { parse_fail(ps, "Expected FROM table", peek(ps)); break; }
                 Token tn = table_tok(ps);
                 if (tn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name", tn); break; }
                 copy_text(ps, n->select_stmt.table_alias, sizeof(n->select_stmt.table_alias), tn.text);

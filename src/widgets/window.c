@@ -756,6 +756,8 @@ static const char* bar_label(const AppWindow* app) {
         case BAR_IMPORT_CSV: return "Import CSV";
         case BAR_RUN_FILE: return "Run SQL file";
         case BAR_DUMP:    return "Database dump";
+        case BAR_BACKUP:  return "Backup all data";
+        case BAR_RESTORE: return "Restore backup";
         case BAR_SEARCH_DB: return "Search in database";
         default:       return NULL;
     }
@@ -847,6 +849,17 @@ static void bar_open(AppWindow* app, BarMode mode, bool replace) {
         snprintf(ph, sizeof(ph), "Text to find in every table of %.60s (any column, any case)", app->search_db);
         app->bar_input->placeholder = ph;
         textbox_set_search(app->editor, NULL, false, false);
+    } else if (mode == BAR_BACKUP || mode == BAR_RESTORE) {
+        char buf[1100], name[100];
+        time_t t = time(NULL);
+        struct tm* tm = localtime(&t);
+        if (mode == BAR_BACKUP && tm) strftime(name, sizeof(name), "backups/segvault-%Y%m%d-%H%M%S", tm);
+        else snprintf(name, sizeof(name), "backups/");
+        join_path(buf, sizeof(buf), app->data_dir[0] ? app->data_dir : ".", name);
+        line_edit_set_text(app->bar_input, buf);
+        app->bar_input->placeholder = mode == BAR_BACKUP ? "New folder for the backup (all databases, users included)"
+                                    : "Backup folder to restore (the current data is kept in before-restore)";
+        textbox_set_search(app->editor, NULL, false, false);
     } else if (mode == BAR_IMPORT_CSV || mode == BAR_RUN_FILE || mode == BAR_DUMP) {
         char buf[1100];
         const char* db = db_current_database();
@@ -880,7 +893,7 @@ static void bar_open(AppWindow* app, BarMode mode, bool replace) {
     line_edit_focus(app->bar_replace_input, false);
     line_edit_focus(app->bar_input, true);
     if (mode == BAR_OPEN || mode == BAR_SAVE_AS || mode == BAR_EXPORT || mode == BAR_IMPORT_CSV ||
-        mode == BAR_RUN_FILE || mode == BAR_DUMP) app->bar_input->anchor = -1; // cursore in fondo
+        mode == BAR_RUN_FILE || mode == BAR_DUMP || mode == BAR_BACKUP || mode == BAR_RESTORE) app->bar_input->anchor = -1; // cursore in fondo
     else line_edit_select_all(app->bar_input);
 }
 
@@ -990,6 +1003,22 @@ static void bar_submit(AppWindow* app, bool shift, bool ctrl) {
             snprintf(meta, sizeof(meta), "%.1f ms", r->exec_time_ms);
             set_status(app, found ? STATUS_OK : STATUS_INFO, msg, meta);
             in->error = found == 0;
+            break;
+        }
+        case BAR_BACKUP: case BAR_RESTORE: {
+            char path[1024], err[600], msg[1300];
+            expand_path(in->text, path, sizeof(path));
+            size_t pl = strlen(path);
+            while (pl > 1 && (path[pl - 1] == '/' || path[pl - 1] == '\\')) path[--pl] = '\0';
+            if (!pl) { in->error = true; return; }
+            if (busy_guard(app)) return;
+            bool backup = app->bar_mode == BAR_BACKUP;
+            bool ok = backup ? db_backup(path, err, sizeof(err)) : db_restore(path, err, sizeof(err));
+            if (ok) snprintf(msg, sizeof(msg), backup ? "Backup written to %.900s" : "Data restored from %.900s (previous data in before-restore)", path);
+            else snprintf(msg, sizeof(msg), "%s failed: %.600s", backup ? "Backup" : "Restore", err);
+            set_status(app, ok ? STATUS_OK : STATUS_ERROR, msg, "");
+            if (ok && !backup) refresh_tree(app);
+            if (ok) bar_close(app); else in->error = true;
             break;
         }
         case BAR_IMPORT_CSV: case BAR_RUN_FILE: case BAR_DUMP: {
@@ -2124,7 +2153,7 @@ typedef enum {
     // Import / Export
     CTX_IMPORT_CSV, CTX_RUN_FILE,
     CTX_EXPORT_CSV, CTX_EXPORT_TSV, CTX_EXPORT_JSON, CTX_EXPORT_MD, CTX_EXPORT_HTML, CTX_EXPORT_SQL,
-    CTX_COPY_JSON, CTX_COPY_MD, CTX_COPY_SQL, CTX_DUMP_DB,
+    CTX_COPY_JSON, CTX_COPY_MD, CTX_COPY_SQL, CTX_DUMP_DB, CTX_BACKUP, CTX_RESTORE,
     // struttura ed explorer
     CTX_NEW_TABLE, CTX_EDIT_STRUCTURE, CTX_TREE_BROWSE, CTX_TREE_USE_DB, CTX_TREE_COPY_NAME, CTX_TREE_SELECT_SQL,
     CTX_TREE_DDL, CTX_TREE_DESIGNER, CTX_PAGE_SQL, CTX_PAGE_DESIGNER,
@@ -2216,6 +2245,8 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
     [CTX_DISCARD_ROW]   = { "Discard new row",           "Esc" },
     [CTX_DELETE_ROW]    = { "Delete row",                "Del" },
     [CTX_DUMP_DB]       = { "Database dump (.sql)\xe2\x80\xa6", NULL },
+    [CTX_BACKUP]        = { "Backup all data\xe2\x80\xa6", NULL },
+    [CTX_RESTORE]       = { "Restore backup\xe2\x80\xa6", NULL },
     [CTX_NEW_TABLE]     = { "New table\xe2\x80\xa6",     NULL },
     [CTX_EDIT_STRUCTURE] = { "Edit table structure\xe2\x80\xa6", NULL },
     [CTX_TREE_BROWSE]   = { "Browse data",               "Double click" },
@@ -2249,7 +2280,8 @@ enum { CTXK_NONE = 0, CTXK_GRID, CTXK_EDITOR, CTXK_MENU, CTXK_TREE };
 
 // ── barra dei menu ───────────────────────────────────────────────
 
-static const int M_FILE[] = { CTX_NEW, CTX_OPEN, CTX_SAVE, CTX_SAVE_AS, CTX_SEP, CTX_RUN_FILE, CTX_SEP, CTX_SERVER, CTX_SEP, CTX_QUIT };
+static const int M_FILE[] = { CTX_NEW, CTX_OPEN, CTX_SAVE, CTX_SAVE_AS, CTX_SEP, CTX_RUN_FILE, CTX_SEP, CTX_BACKUP, CTX_RESTORE, CTX_SEP,
+                              CTX_SERVER, CTX_SEP, CTX_QUIT };
 static const int M_EDIT[] = { CTX_UNDO, CTX_REDO, CTX_SEP, CTX_CUT, CTX_COPY, CTX_PASTE, CTX_SELECT_ALL, CTX_SEP,
                               CTX_FIND, CTX_REPLACE, CTX_GOTO, CTX_SEP, CTX_DUP_LINE, CTX_DEL_LINE, CTX_COMMENT,
                               CTX_UPPER, CTX_LOWER, CTX_SEP, CTX_FORMAT };
@@ -2350,6 +2382,7 @@ static bool ctx_enabled(AppWindow* app, int a) {
         case CTX_EDIT_STRUCTURE: { char d[64], t[64]; return idle && design_table(app, d, sizeof(d), t, sizeof(t)); }
         case CTX_TREE_BROWSE: case CTX_TREE_USE_DB: case CTX_TREE_DDL: case CTX_TREE_DESIGNER: return idle;
         case CTX_TRUNCATE_TABLE: case CTX_DROP_TABLE: case CTX_DROP_DB: return idle && !app->in_transaction;
+        case CTX_BACKUP: case CTX_RESTORE: return idle && !app->in_transaction;
         case CTX_USERS: return idle;
         case CTX_SEARCH_DB: case CTX_DB_OVERVIEW: { char d[64]; return idle && design_db(app, d, sizeof(d)); }
         case CTX_BEGIN: return idle && !app->in_transaction;
@@ -3053,6 +3086,8 @@ static void ctx_run(AppWindow* app, int a) {
         case CTX_RUN_FILE:   bar_open(app, BAR_RUN_FILE, false); break;
         case CTX_IMPORT_CSV: bar_open(app, BAR_IMPORT_CSV, false); break;
         case CTX_DUMP_DB:    bar_open(app, BAR_DUMP, false); break;
+        case CTX_BACKUP:     bar_open(app, BAR_BACKUP, false); break;
+        case CTX_RESTORE:    bar_open(app, BAR_RESTORE, false); break;
 
         // struttura ed explorer
         case CTX_NEW_TABLE: {

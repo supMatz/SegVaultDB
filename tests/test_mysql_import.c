@@ -55,6 +55,34 @@ static const char* DUMP =
 "LOCK TABLES `ordine` WRITE;\n"
 "INSERT INTO `ordine` VALUES (10,1,'2024-03-01 09:00:00.000','nuovo,pagato'),(11,2,NULL,NULL);\n"
 "UNLOCK TABLES;\n"
+"--\n-- Temporary view structure for view `vista`\n--\n"
+"DROP TABLE IF EXISTS `vista`;\n"
+"/*!50001 DROP VIEW IF EXISTS `vista`*/;\n"
+"SET @saved_cs_client     = @@character_set_client;\n"
+"/*!50503 SET character_set_client = utf8mb4 */;\n"
+"/*!50001 CREATE VIEW `vista` AS SELECT \n 1 AS `id`,\n 1 AS `nome`*/;\n"
+"SET character_set_client = @saved_cs_client;\n"
+"/*!50003 SET @saved_cs_client      = @@character_set_client */ ;\n"
+"DELIMITER ;;\n"
+"/*!50003 CREATE*/ /*!50017 DEFINER=`root`@`localhost`*/ /*!50003 TRIGGER `ordine_check` BEFORE INSERT ON `ordine` FOR EACH ROW BEGIN\n"
+"  IF NEW.id < 0 THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'id negativo'; END IF;\n"
+"END */;;\n"
+"DELIMITER ;\n"
+"DELIMITER ;;\n"
+"CREATE DEFINER=`root`@`localhost` PROCEDURE `clienti_di`(IN t VARCHAR(20))\n"
+"    READS SQL DATA\n"
+"    COMMENT 'clienti per tipo'\n"
+"BEGIN\n"
+"  SELECT COUNT(*) FROM cliente WHERE tipo = t;\n"
+"END ;;\n"
+"DELIMITER ;\n"
+"--\n-- Final view structure for view `vista`\n--\n"
+"/*!50001 DROP VIEW IF EXISTS `vista`*/;\n"
+"/*!50001 SET @saved_cs_client          = @@character_set_client */;\n"
+"/*!50001 CREATE ALGORITHM=UNDEFINED */\n"
+"/*!50013 DEFINER=`root`@`localhost` SQL SECURITY DEFINER */\n"
+"/*!50001 VIEW `vista` AS select `cliente`.`id` AS `id`,`cliente`.`nome` AS `nome` from `cliente` where (`cliente`.`attivo` = 1) */;\n"
+"/*!50001 SET character_set_client      = @saved_cs_client */;\n"
 "/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;\n"
 "-- Dump completed on 2024-03-05\n";
 
@@ -99,6 +127,9 @@ int main(void) {
     CHECK(!strcmp(scalar("SELECT note FROM cliente WHERE id = 1"), "dice \"ciao\"; e poi va"), "semicolon inside a string: %s", scalar("SELECT note FROM cliente WHERE id = 1"));
     CHECK(!strcmp(scalar("SELECT saldo FROM cliente WHERE id = 3"), "-3.25"), "decimal: %s", scalar("SELECT saldo FROM cliente WHERE id = 3"));
     CHECK(!strcmp(scalar("SELECT stato FROM ordine WHERE id = 10"), "nuovo,pagato"), "set value kept");
+    CHECK(!strcmp(scalar("SELECT COUNT(*) FROM vista"), "2"), "view from the dump: %s", scalar("SELECT COUNT(*) FROM vista"));
+    CHECK(!strcmp(scalar("CALL clienti_di('privato')"), "2"), "procedure from the dump: %s", scalar("CALL clienti_di('privato')"));
+    CHECK(strstr(scalar("INSERT INTO ordine (id, cliente_id) VALUES (-1, 1)"), "id negativo"), "trigger from the dump: %s", scalar("INSERT INTO ordine (id, cliente_id) VALUES (-1, 1)"));
     q = db_execute("INSERT INTO cliente (nome, email) VALUES ('X', 'anna@x.it')");
     CHECK(q && !q->success, "unique email enforced");
     db_result_free(q);
