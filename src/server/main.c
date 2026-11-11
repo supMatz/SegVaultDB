@@ -108,9 +108,13 @@ int main(int argc, char** argv) {
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
 #endif
-    printf("SegVault %s server: http://%s:%d" "/api/v1  (data: %s%s%s)\n", SV_VERSION_STR,
-           cfg.bind_addr, sv_server_port(g_server), data_dir,
-           cfg.require_login ? ", login required" : cfg.token && cfg.token[0] ? ", token required" : "", cfg.static_dir ? ", static files" : "");
+    // 0.0.0.0 non si apre nel browser: si mostra l'indirizzo locale
+    const char* host = strcmp(cfg.bind_addr, "0.0.0.0") ? cfg.bind_addr : "127.0.0.1";
+    int port = sv_server_port(g_server);
+    printf("SegVault %s server (data: %s%s)\n", SV_VERSION_STR, data_dir,
+           cfg.require_login ? ", login required" : cfg.token && cfg.token[0] ? ", token required" : "");
+    if (cfg.static_dir) printf("  web site: http://%s:%d/          (files of %s)\n", host, port, cfg.static_dir);
+    printf("  API:      http://%s:%d/api/v1\n", host, port);
     fflush(stdout);
 
     sv_server_run(g_server);
