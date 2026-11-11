@@ -7,6 +7,7 @@
 #include "result_export.h"
 #include "csv_import.h"
 #include "table_designer.h"
+#include "schema_view.h"
 #include <stdio.h>
 #include <strings.h>
 #include <string.h>
@@ -685,6 +686,28 @@ static bool use_database(AppWindow* app, const char* db) {
     return ok;
 }
 
+// anteprima dei dati di una tabella o vista nella griglia (pagina SQL)
+static void preview_table(AppWindow* app, const char* db, const char* table) {
+    if (db) use_database(app, db);
+    char sql[256];
+    snprintf(sql, sizeof(sql), "SELECT * FROM %.120s LIMIT 200;", table);
+    QueryResult* r = db_execute(sql);
+    char msg[256], meta[128];
+    app->page = PAGE_SQL;
+    if (r && r->success) {
+        show_result(app, r);
+        snprintf(msg, sizeof(msg), "Preview of %.120s", table);
+        snprintf(meta, sizeof(meta), "%d rows  \xc2\xb7  %d columns  \xc2\xb7  %.1f ms",
+                 r->num_rows, r->num_cols, r->exec_time_ms);
+        set_status(app, STATUS_OK, msg, meta);
+    } else {
+        snprintf(msg, sizeof(msg), "Error: %.240s", r ? r->error : "no response");
+        table_view_set_message(app->results, TABLE_MSG_ERROR, "Preview failed", r ? r->error : "");
+        set_status(app, STATUS_ERROR, msg, "");
+        if (r) db_result_free(r);
+    }
+}
+
 // doppio click: azione rapida sul nodo
 static void on_tree_activate(TreeNode* node, void* ud) {
     AppWindow* app = (AppWindow*)ud;
@@ -700,27 +723,9 @@ static void on_tree_activate(TreeNode* node, void* ud) {
             break;
         }
         case TREE_NODE_TABLE:
-        case TREE_NODE_VIEW: {
-            const char* db = find_db_name(node);
-            if (db) use_database(app, db);
-            char sql[256];
-            snprintf(sql, sizeof(sql), "SELECT * FROM %s LIMIT 200;", node->label);
-            QueryResult* r = db_execute(sql);
-            char msg[256], meta[128];
-            if (r && r->success) {
-                show_result(app, r);
-                snprintf(msg, sizeof(msg), "Preview of %s", node->label);
-                snprintf(meta, sizeof(meta), "%d rows  \xc2\xb7  %d columns  \xc2\xb7  %.1f ms",
-                         r->num_rows, r->num_cols, r->exec_time_ms);
-                set_status(app, STATUS_OK, msg, meta);
-            } else {
-                snprintf(msg, sizeof(msg), "Error: %.240s", r ? r->error : "no response");
-                table_view_set_message(app->results, TABLE_MSG_ERROR, "Preview failed", r ? r->error : "");
-                set_status(app, STATUS_ERROR, msg, "");
-                if (r) db_result_free(r);
-            }
+        case TREE_NODE_VIEW:
+            preview_table(app, find_db_name(node), node->label);
             break;
-        }
         case TREE_NODE_COLUMN:
             // inserisce il nome della colonna nell'editor
             textbox_insert(app->editor, node->label);
@@ -2088,7 +2093,7 @@ typedef enum {
     CTX_COPY_JSON, CTX_COPY_MD, CTX_COPY_SQL, CTX_DUMP_DB,
     // struttura ed explorer
     CTX_NEW_TABLE, CTX_EDIT_STRUCTURE, CTX_TREE_BROWSE, CTX_TREE_USE_DB, CTX_TREE_COPY_NAME, CTX_TREE_SELECT_SQL,
-    CTX_TREE_DDL,
+    CTX_TREE_DDL, CTX_TREE_DESIGNER, CTX_PAGE_SQL, CTX_PAGE_DESIGNER,
     // Settings / Help
     CTX_SETTINGS, CTX_SETTINGS_RESET, CTX_SHORTCUTS, CTX_SQL_REFERENCE, CTX_DOCS, CTX_ABOUT,
     CTX_ACTION_COUNT
@@ -2183,6 +2188,9 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
     [CTX_TREE_COPY_NAME] = { "Copy name",                NULL },
     [CTX_TREE_SELECT_SQL] = { "Insert SELECT into editor", NULL },
     [CTX_TREE_DDL]      = { "Insert CREATE TABLE into editor", NULL },
+    [CTX_TREE_DESIGNER] = { "Show in the designer",      NULL },
+    [CTX_PAGE_SQL]      = { "SQL editor",                "Ctrl+Shift+D" },
+    [CTX_PAGE_DESIGNER] = { "Schema designer (ER / UML)", "Ctrl+Shift+D" },
     [CTX_SETTINGS]      = { "Settings\xe2\x80\xa6",      "Ctrl+," },
     [CTX_SETTINGS_RESET] = { "Reset all settings",       NULL },
     [CTX_SHORTCUTS]     = { "Keyboard shortcuts",        "F1" },
@@ -2204,7 +2212,7 @@ static const int M_FILE[] = { CTX_NEW, CTX_OPEN, CTX_SAVE, CTX_SAVE_AS, CTX_SEP,
 static const int M_EDIT[] = { CTX_UNDO, CTX_REDO, CTX_SEP, CTX_CUT, CTX_COPY, CTX_PASTE, CTX_SELECT_ALL, CTX_SEP,
                               CTX_FIND, CTX_REPLACE, CTX_GOTO, CTX_SEP, CTX_DUP_LINE, CTX_DEL_LINE, CTX_COMMENT,
                               CTX_UPPER, CTX_LOWER, CTX_SEP, CTX_FORMAT };
-static const int M_VIEW[] = { CTX_TOGGLE_SIDEBAR, CTX_TOGGLE_FOOTER, CTX_TOGGLE_LINENUMS, CTX_TOGGLE_ROWNUMS, CTX_SEP,
+static const int M_VIEW[] = { CTX_PAGE_SQL, CTX_PAGE_DESIGNER, CTX_SEP, CTX_TOGGLE_SIDEBAR, CTX_TOGGLE_FOOTER, CTX_TOGGLE_LINENUMS, CTX_TOGGLE_ROWNUMS, CTX_SEP,
                               CTX_ZOOM_IN, CTX_ZOOM_OUT, CTX_ZOOM_RESET, CTX_SEP, CTX_NEXT_THEME, CTX_SEP,
                               CTX_HISTORY, CTX_REFRESH_TREE };
 static const int M_QUERY[] = { CTX_RUN, CTX_RUN_STMT, CTX_EXPLAIN, CTX_STOP, CTX_SEP, CTX_BEGIN, CTX_COMMIT, CTX_ROLLBACK,
@@ -2298,7 +2306,7 @@ static bool ctx_enabled(AppWindow* app, int a) {
         case CTX_SERVER: return idle && !app->in_transaction;
         case CTX_NEW_TABLE: { char d[64]; return idle && design_db(app, d, sizeof(d)); }
         case CTX_EDIT_STRUCTURE: { char d[64], t[64]; return idle && design_table(app, d, sizeof(d), t, sizeof(t)); }
-        case CTX_TREE_BROWSE: case CTX_TREE_USE_DB: case CTX_TREE_DDL: return idle;
+        case CTX_TREE_BROWSE: case CTX_TREE_USE_DB: case CTX_TREE_DDL: case CTX_TREE_DESIGNER: return idle;
         case CTX_BEGIN: return idle && !app->in_transaction;
         case CTX_COMMIT: case CTX_ROLLBACK: return idle;
         case CTX_DUMP_DB: {   // il motore si interroga solo se libero (il thread di lavoro lo tiene occupato)
@@ -2318,6 +2326,8 @@ static int ctx_checked(AppWindow* app, int a) {
         case CTX_TOGGLE_LINENUMS: return g_settings.line_numbers;
         case CTX_TOGGLE_ROWNUMS:  return g_settings.row_numbers;
         case CTX_HISTORY:         return app->showing_history;
+        case CTX_PAGE_SQL:        return app->page == PAGE_SQL;
+        case CTX_PAGE_DESIGNER:   return app->page == PAGE_DESIGNER;
         default: return -1;
     }
 }
@@ -2368,9 +2378,9 @@ static void ctx_open(AppWindow* app, int kind, int x, int y) {
         CTX_CUT, CTX_COPY, CTX_PASTE, CTX_SELECT_ALL, CTX_SEP,
         CTX_RUN, CTX_RUN_STMT, CTX_EXPLAIN, CTX_SEP, CTX_FORMAT, CTX_COMMENT,
     };
-    static const int TREE_DB[] = { CTX_TREE_USE_DB, CTX_NEW_TABLE, CTX_SEP, CTX_TREE_COPY_NAME, CTX_REFRESH_TREE };
+    static const int TREE_DB[] = { CTX_TREE_DESIGNER, CTX_TREE_USE_DB, CTX_NEW_TABLE, CTX_SEP, CTX_TREE_COPY_NAME, CTX_REFRESH_TREE };
     static const int TREE_TABLE[] = {
-        CTX_TREE_BROWSE, CTX_EDIT_STRUCTURE, CTX_SEP,
+        CTX_TREE_BROWSE, CTX_EDIT_STRUCTURE, CTX_TREE_DESIGNER, CTX_SEP,
         CTX_TREE_SELECT_SQL, CTX_TREE_DDL, CTX_TREE_COPY_NAME, CTX_SEP,
         CTX_NEW_TABLE, CTX_REFRESH_TREE,
     };
@@ -2530,6 +2540,93 @@ static void open_export_bar(AppWindow* app, ExportFormat f) {
     line_edit_set_text(app->bar_input, buf);
 }
 
+// ── pagine: editor SQL / designer dello schema ──────────────────
+
+static void set_page(AppWindow* app, int page) {
+    if (app->page == page) return;
+    app->page = page;
+    app->ctx_kind = CTXK_NONE;
+    app->menu_open = -1;
+    app->tip_visible = false;
+    if (page == PAGE_DESIGNER) {
+        textbox_focus(app->editor, false);
+        app->editor->popup_open = false;
+        if (!schema_view_db(app->schema)[0]) {
+            TreeNode* sel = app->tree->selected;
+            const char* d = sel ? find_db_name(sel) : NULL;
+            if (!d && !app->job) d = db_current_database();
+            schema_view_show_db(app->schema, d, NULL);
+        }
+        schema_view_invalidate(app->schema);
+    } else textbox_focus(app->editor, true);
+    layout_widgets(app);
+}
+
+// esegue statement separati da ";\n" fino al primo errore; ritorna quanti sono riusciti
+static int exec_statements(const char* sql, int* total, char* err, size_t errn) {
+    char* copy = strdup(sql);
+    int done = 0;
+    *total = 1;
+    err[0] = '\0';
+    if (!copy) { snprintf(err, errn, "Out of memory"); return 0; }
+    for (const char* p = copy; (p = strstr(p, ";\n")); p += 2) (*total)++;
+    for (char* p = copy; p; ) {
+        char* e = strstr(p, ";\n");
+        if (e) *e = '\0';
+        QueryResult* r = db_execute(p);
+        bool ok = r && r->success;
+        if (!ok) snprintf(err, errn, "%.380s", r ? r->error : "no response");
+        db_result_free(r);
+        if (!ok) break;
+        done++;
+        p = e ? e + 2 : NULL;
+    }
+    free(copy);
+    return done;
+}
+
+static void schema_action(AppWindow* app, SchemaViewAction a) {
+    SchemaView* sv = app->schema;
+    switch (a) {
+        case SCV_NEW_TABLE:
+            if (busy_guard(app)) break;
+            td_open(app->td, schema_view_db(sv), NULL);
+            break;
+        case SCV_EDIT_TABLE:
+            if (busy_guard(app)) break;
+            if (!td_open(app->td, schema_view_db(sv), schema_view_table(sv)))
+                set_status(app, STATUS_ERROR, "Cannot read the structure of the table", schema_view_table(sv));
+            break;
+        case SCV_BROWSE_TABLE:
+            if (busy_guard(app)) break;
+            preview_table(app, schema_view_db(sv), schema_view_table(sv));
+            layout_widgets(app);
+            break;
+        case SCV_EXEC: {
+            if (busy_guard(app)) { schema_view_exec_done(sv, false, "A query is running: wait for it or stop it"); break; }
+            const char* sql = schema_view_sql(sv);
+            bool create_db = !strncmp(sql, "CREATE DATABASE", 15);
+            if (!create_db && !use_database(app, schema_view_db(sv))) { schema_view_exec_done(sv, false, "Cannot use the database"); break; }
+            int total = 0;
+            char err[400];
+            int done = exec_statements(sql, &total, err, sizeof(err));
+            if (done > 0) { update_session(app); refresh_tree(app); }
+            if (done == total) {
+                schema_view_exec_done(sv, true, NULL);
+                set_status(app, STATUS_OK, "Schema updated", sql);
+            } else {
+                char full[460];
+                if (done > 0) snprintf(full, sizeof(full), "Statement %d of %d failed (the previous ones were applied): %.380s", done + 1, total, err);
+                else snprintf(full, sizeof(full), "%.450s", err);
+                schema_view_exec_done(sv, false, full);
+                set_status(app, STATUS_ERROR, full, "");
+            }
+            break;
+        }
+        default: break;
+    }
+}
+
 // testo in fondo all'editor (su righe nuove), con il cursore alla fine
 static void editor_append(AppWindow* app, const char* text) {
     TextBox* tb = app->editor;
@@ -2577,8 +2674,10 @@ static void designer_apply(AppWindow* app) {
         p = e ? e + 2 : NULL;
     }
     free(sql);
-    if (done > 0) { update_session(app); refresh_tree(app); }
+    if (done > 0) { update_session(app); refresh_tree(app); schema_view_invalidate(app->schema); }
     if (done == total) {
+        if (is_new) schema_view_table_created(app->schema, name);
+        else if (strcmp(orig, name)) schema_view_table_renamed(app->schema, orig, name);
         td_close(app->td);
         char msg[160], meta[64];
         snprintf(msg, sizeof(msg), is_new ? "Table %.60s created" : "Structure of %.60s updated", name);
@@ -2797,6 +2896,15 @@ static void ctx_run(AppWindow* app, int a) {
             }
             break;
         }
+        case CTX_TREE_DESIGNER: {
+            TreeNode* sel = app->tree->selected;
+            TreeNode* t = tree_sel_table(app);
+            const char* d = sel ? find_db_name(sel) : NULL;
+            if (d) { schema_view_show_db(app->schema, d, t ? t->label : NULL); set_page(app, PAGE_DESIGNER); }
+            break;
+        }
+        case CTX_PAGE_SQL:      set_page(app, PAGE_SQL); break;
+        case CTX_PAGE_DESIGNER: set_page(app, PAGE_DESIGNER); break;
         case CTX_TREE_COPY_NAME: {
             TreeNode* sel = app->tree->selected;
             if (sel) copy_and_report(app, sel->label, "the name");
@@ -3470,6 +3578,7 @@ static const Shortcut SC_RUN[] = {
 static const Shortcut SC_FILE[] = {
     { "Ctrl+N", "New script" }, { "Ctrl+O", "Open file" },
     { "Ctrl+S", "Save" }, { "Ctrl+Shift+S", "Save as" },
+    { "Ctrl+Shift+D", "SQL editor / schema designer" }, { "Designer: Enter / Del", "Edit / drop selected table" },
 };
 static const Shortcut SC_FIND[] = {
     { "Ctrl+F", "Find" }, { "Ctrl+H", "Find and replace" }, { "F3 / Shift+F3", "Next / previous match" },
@@ -3596,6 +3705,11 @@ static int toolbar_right_w(AppWindow* app) {
     return w;
 }
 
+static const char* page_label(int page, int level) {
+    if (page == PAGE_SQL) return level >= 2 ? "SQL" : "SQL editor";
+    return level >= 2 ? "Design" : "Designer";
+}
+
 static void layout_toolbar(AppWindow* app) {
     int bh = 32, by = MENUBAR_H + (TOOLBAR_H - bh) / 2;
     Button* b[5];
@@ -3604,7 +3718,19 @@ static void layout_toolbar(AppWindow* app) {
         app->compact = level;
         apply_toolbar_level(app, level);
         int x = SV_MAX(app->side_w, 200) + 14;   // a sinistra c'è il logo
+        // selettore di pagina: SQL / Designer
+        for (int p = 0; p < 2; p++) {
+            const char* lbl = page_label(p, level);
+            int w = platform_measure_text_ex(app->win, lbl, -1, TH_FONT_UI, FONT_UI_BOLD) + (level >= 2 ? 20 : 28);
+            app->page_tabs[p] = (Rect){x, by, w, bh};
+            x += w;
+        }
+        x += 22;
         for (int i = 0; i < 5; i++) {
+            if (app->page == PAGE_DESIGNER && (i == 0 || i == 1 || i == 4)) {   // esecuzione e formattazione: solo nell'editor
+                b[i]->base.bounds = (Rect){x, by, 0, 0};
+                continue;
+            }
             int w = button_preferred_width(b[i], app->win);
             if (level >= 2 && TOOLBAR_TEXT[i].has_icon) w = bh + 2;   // pulsante quadrato con sola icona
             b[i]->base.bounds = (Rect){x, by, w, bh};
@@ -3877,6 +4003,7 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
     app->filter_input->on_change = on_filter_change;
     app->filter_input->win = win;
     app->td = td_create(win);
+    app->schema = schema_view_create(win);
     app->cell_edit = line_edit_create("");
     if (app->cell_edit) { app->cell_edit->win = win; app->cell_edit->base.visible = false; }
     app->edit_src = app->edit_col = app->draft_src = app->del_src = -1;
@@ -3920,6 +4047,32 @@ static void update_cursor_shape(AppWindow* app, int mx, int my) {
         if (rect_has(app->theme_btn, mx, my)) k = CURSOR_HAND;
     }
     platform_set_cursor(app->win, k);
+}
+
+// pagina Designer: il diagramma riceve mouse e tastiera della parte centrale; sidebar, toolbar e
+// scorciatoie generali restano attive. true = evento consumato.
+static bool designer_page_event(AppWindow* app, sEvent* evt) {
+    Rect center = { app->side_w + 4, TOP_H, app->win_w - app->side_w - 4, app->win_h - TOP_H - app->footer_h };
+    bool mouse = evt->type == EVT_MOUSE_MOVE || evt->type == EVT_MOUSE_DOWN || evt->type == EVT_MOUSE_WHEEL;
+    if (evt->type == EVT_MOUSE_UP) { schema_action(app, schema_view_event(app->schema, evt)); return false; }
+    if (mouse && !app->sidebar_drag && rect_has(center, evt->mouse_x, evt->mouse_y)) {
+        if (evt->type == EVT_MOUSE_MOVE) { app->mouse_x = evt->mouse_x; app->mouse_y = evt->mouse_y; app->sidebar_hover = false; }
+        if (evt->type == EVT_MOUSE_DOWN && app->job && evt->mouse_button != SV_MOUSE_MIDDLE) { busy_guard(app); return true; }
+        schema_action(app, schema_view_event(app->schema, evt));
+        return true;
+    }
+    if (evt->type == EVT_KEY_DOWN || evt->type == EVT_CHAR) {
+        if (evt->type == EVT_KEY_DOWN) {
+            bool ctrl = evt->modifiers & SV_MOD_CTRL, shift = evt->modifiers & SV_MOD_SHIFT;
+            if (evt->key == KEY_F1) return false;
+            if (evt->key == KEY_LETTER && ctrl && (evt->character == ',' || evt->character == 'b' ||
+                                                   (shift && evt->character == 't') || evt->character == 'o' || evt->character == 'n'))
+                return false;
+        }
+        schema_action(app, schema_view_event(app->schema, evt));
+        return true;
+    }
+    return false;
 }
 
 void app_window_handle_event(AppWindow* app, sEvent* evt) {
@@ -3994,6 +4147,17 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
                                           rect_has(app->theme_btn, evt->mouse_x, evt->mouse_y) ? CURSOR_HAND : CURSOR_ARROW);
         return;
     }
+
+    // selettore di pagina nella toolbar e Ctrl+Shift+D
+    if (evt->type == EVT_MOUSE_DOWN && evt->mouse_button == SV_MOUSE_LEFT)
+        for (int i = 0; i < 2; i++)
+            if (rect_has(app->page_tabs[i], evt->mouse_x, evt->mouse_y)) { set_page(app, i); return; }
+    if (evt->type == EVT_KEY_DOWN && evt->key == KEY_LETTER && (evt->modifiers & SV_MOD_CTRL) &&
+        (evt->modifiers & SV_MOD_SHIFT) && evt->character == 'd') {
+        set_page(app, app->page == PAGE_SQL ? PAGE_DESIGNER : PAGE_SQL);
+        return;
+    }
+    if (app->page == PAGE_DESIGNER && designer_page_event(app, evt)) return;
 
     // schede dei risultati
     if (evt->type == EVT_MOUSE_DOWN && evt->mouse_button == SV_MOUSE_LEFT) {
@@ -4121,7 +4285,7 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         app->mouse_x = evt->mouse_x;
         app->mouse_y = evt->mouse_y;
         int sy = app->splitter_y;
-        app->splitter_hover = evt->mouse_x >= center_x &&
+        app->splitter_hover = app->page == PAGE_SQL && evt->mouse_x >= center_x &&
                               evt->mouse_y >= sy - 2 && evt->mouse_y <= sy + SPLITTER_H + 2;
     }
     if (evt->type == EVT_MOUSE_DOWN && evt->mouse_button == SV_MOUSE_LEFT && app->splitter_hover) {
@@ -4153,6 +4317,12 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
         (Widget*)app->tree, (Widget*)app->editor, (Widget*)app->results,
     };
     int count = (int)(sizeof(order) / sizeof(order[0]));
+    if (app->page == PAGE_DESIGNER) {     // senza editor, risultati e pulsanti di esecuzione
+        Widget* side[] = { (Widget*)app->btn_commit, (Widget*)app->btn_rollback, (Widget*)app->btn_refresh,
+                           (Widget*)app->tree_scroll, (Widget*)app->tree };
+        count = (int)(sizeof(side) / sizeof(side[0]));
+        for (int i = 0; i < count; i++) order[i] = side[i];
+    }
 
     if (evt->type == EVT_MOUSE_UP) {
         // il rilascio va a tutti: termina qualsiasi trascinamento in corso
@@ -4177,6 +4347,7 @@ bool app_window_tick(AppWindow* app, uint64_t now_ms) {
     c = line_edit_tick(app->filter_input, now_ms) || c;
     if (app->cell_edit && gedit_editing(app)) c = line_edit_tick(app->cell_edit, now_ms) || c;
     c = td_tick(app->td, now_ms) || c;
+    if (app->page == PAGE_DESIGNER) c = schema_view_tick(app->schema, now_ms) || c;
     // esecuzione in background: completamento e stato con il tempo trascorso
     if (app->job) {
         if (atomic_load(&app->job->done)) {
@@ -4225,15 +4396,35 @@ static void draw_toolbar(AppWindow* app) {
     platform_draw_text_ex(win, ver, -1, (Point){vr.x + 6, ui_text_y(win, vr, TH_FONT_SMALL, FONT_MONO)},
                           TH_TEXT_DIM, TH_FONT_SMALL, FONT_MONO);
 
-    // separatore tra gruppo "esecuzione" e "transazione"
-    Rect rc = app->btn_run_current->base.bounds;
-    platform_fill_rect(win, (Rect){rc.x + rc.w + 11, MENUBAR_H + 14, 1, TOOLBAR_H - 28}, TH_BORDER_STRONG);
+    // selettore di pagina (segmenti)
+    {
+        Rect a = app->page_tabs[0], b = app->page_tabs[1];
+        Rect all = { a.x, a.y, b.x + b.w - a.x, a.h };
+        ui_round_box(win, all, TH_ELEVATED, TH_BORDER_STRONG, 8);
+        for (int p = 0; p < 2; p++) {
+            Rect r = app->page_tabs[p];
+            bool on = app->page == p, hov = rect_has(r, app->mouse_x, app->mouse_y);
+            Rect in = { r.x + 3, r.y + 3, r.w - 6, r.h - 6 };
+            if (on) platform_fill_rect_rounded(win, in, TH_ACCENT_SOFT, 6);
+            else if (hov) platform_fill_rect_rounded(win, in, TH_HOVER, 6);
+            const char* lbl = page_label(p, app->compact);
+            int w = platform_measure_text_ex(win, lbl, -1, TH_FONT_UI, FONT_UI_BOLD);
+            platform_draw_text_ex(win, lbl, -1, (Point){r.x + (r.w - w) / 2, ui_text_y(win, r, TH_FONT_UI, FONT_UI_BOLD)},
+                                  on ? TH_ACCENT_TEXT : TH_TEXT_MUTED, TH_FONT_UI, FONT_UI_BOLD);
+        }
+        Rect pb = app->page_tabs[1];
+        platform_fill_rect(win, (Rect){pb.x + pb.w + 11, MENUBAR_H + 14, 1, TOOLBAR_H - 28}, TH_BORDER_STRONG);
+    }
     Rect rb = app->btn_rollback->base.bounds;
-    platform_fill_rect(win, (Rect){rb.x + rb.w + 11, MENUBAR_H + 14, 1, TOOLBAR_H - 28}, TH_BORDER_STRONG);
-    widget_draw((Widget*)app->btn_format, win);
-
-    widget_draw((Widget*)app->btn_run, win);
-    widget_draw((Widget*)app->btn_run_current, win);
+    if (app->page == PAGE_SQL) {
+        // separatore tra gruppo "esecuzione" e "transazione"
+        Rect rc = app->btn_run_current->base.bounds;
+        platform_fill_rect(win, (Rect){rc.x + rc.w + 11, MENUBAR_H + 14, 1, TOOLBAR_H - 28}, TH_BORDER_STRONG);
+        platform_fill_rect(win, (Rect){rb.x + rb.w + 11, MENUBAR_H + 14, 1, TOOLBAR_H - 28}, TH_BORDER_STRONG);
+        widget_draw((Widget*)app->btn_format, win);
+        widget_draw((Widget*)app->btn_run, win);
+        widget_draw((Widget*)app->btn_run_current, win);
+    }
     widget_draw((Widget*)app->btn_commit, win);
     widget_draw((Widget*)app->btn_rollback, win);
 
@@ -4497,6 +4688,10 @@ void app_window_draw(AppWindow* app) {
     // sfondo generale
     platform_clear(win, TH_BG);
 
+    if (app->page == PAGE_DESIGNER) {
+        if (!app->job) schema_view_sync(app->schema);
+        schema_view_draw(app->schema, (Rect){app->side_w, TOP_H, app->win_w - app->side_w, app->win_h - TOP_H - app->footer_h});
+    } else {
     widget_draw((Widget*)app->editor,           win);
     widget_draw((Widget*)app->editor_scroll,    win);
     widget_draw((Widget*)app->results,          win);
@@ -4510,11 +4705,12 @@ void app_window_draw(AppWindow* app) {
 
     draw_splitter_and_status(app);
     draw_result_tabs(app);
+    }
     draw_sidebar(app);
     draw_toolbar(app);
     draw_menubar(app);
     draw_footer(app);
-    textbox_draw_overlay(app->editor, win, (Rect){0, 0, app->win_w, app->win_h});
+    if (app->page == PAGE_SQL) textbox_draw_overlay(app->editor, win, (Rect){0, 0, app->win_w, app->win_h});
     draw_theme_menu(app);
     draw_ctx_menu(app);
     draw_tooltip(app);
@@ -4789,6 +4985,7 @@ static void finish_run(AppWindow* app) {
     app->job_thread = NULL;
     app->job = NULL;
     style_run_button(app);
+    schema_view_invalidate(app->schema);
 
     TextBox* tb = app->editor;
     for (int i = 0; i < j->log_n; i++) history_add(app, j->log[i].sql, j->log[i].ok, j->log[i].rows, j->log[i].ms);
@@ -4924,6 +5121,7 @@ void app_window_destroy(AppWindow* app) {
     widget_destroy((Widget*)app->filter_input);
     if (app->cell_edit) widget_destroy((Widget*)app->cell_edit);
     td_destroy(app->td);
+    schema_view_destroy(app->schema);
     for (int c = 0; c < 64; c++) free(app->draft_vals[c]);
     free(app);
 }
@@ -4940,6 +5138,7 @@ void app_window_set_data_dir(AppWindow* app, const char* dir) {
     bool have_settings = settings_load(app->settings_path);
     apply_settings(app);
     server_panel_set_paths(app->server, dir, app->settings_path);
+    schema_view_set_data_dir(app->schema, dir);
     history_load(app);
     if (!g_settings.restore_session) {
         if (!have_settings) settings_store(app);

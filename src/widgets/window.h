@@ -49,6 +49,7 @@ typedef enum { RUN_SCRIPT, RUN_CURRENT } RunMode;
 
 // cosa mostra la finestra: l'editor SQL, la scelta iniziale o il pannello del server API
 typedef enum { APP_MODE_EDITOR = 0, APP_MODE_START, APP_MODE_SERVER } AppMode;
+enum { PAGE_SQL = 0, PAGE_DESIGNER = 1 };   // pagine dell'editor
 
 typedef enum { STATUS_IDLE, STATUS_OK, STATUS_ERROR, STATUS_INFO } StatusKind;
 
@@ -146,6 +147,9 @@ typedef struct {
     int          menu_hover;        // titolo sotto il mouse (-1 = nessuno)
 
     struct TableDesigner* td;       // designer di tabelle (creazione / struttura)
+    struct SchemaView*    schema;   // pagina Designer: diagramma ER / UML
+    int          page;              // PAGE_SQL / PAGE_DESIGNER
+    Rect         page_tabs[2];      // selettore di pagina nella toolbar
 
     // -- pannello Settings (Ctrl+,) --
     bool         settings_open;

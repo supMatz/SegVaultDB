@@ -727,6 +727,48 @@ ColumnInfo* db_list_columns(const char* db_name, const char* table, int* out_cou
     return r;
 }
 
+static const char* fk_action_name(int a) {
+    switch (a) {
+        case FK_RESTRICT: return "RESTRICT";
+        case FK_CASCADE: return "CASCADE";
+        case FK_SET_NULL: return "SET NULL";
+        case FK_SET_DEFAULT: return "SET DEFAULT";
+        default: return "NO ACTION";
+    }
+}
+
+ForeignKeyInfo* db_list_foreign_keys(const char* db_name, int* out_count) {
+    *out_count = 0;
+    db_lock();
+    Database* db = db_name ? catalog_get_db(g_db.catalog, db_name) : NULL;
+    int n = 0;
+    for (int t = 0; db && t < db->num_tables; t++)
+        for (int k = 0; k < db->tables[t].num_constraints; k++) n += db->tables[t].constraints[k].kind == CONS_FOREIGN;
+    ForeignKeyInfo* out = n ? calloc((size_t)n, sizeof(ForeignKeyInfo)) : NULL;
+    for (int t = 0; out && t < db->num_tables; t++) {
+        const TableSchema* ts = &db->tables[t];
+        for (int k = 0; k < ts->num_constraints; k++) {
+            const Constraint* c = &ts->constraints[k];
+            if (c->kind != CONS_FOREIGN) continue;
+            ForeignKeyInfo* f = &out[(*out_count)++];
+            snprintf(f->name, sizeof(f->name), "%.63s", c->name);
+            snprintf(f->table, sizeof(f->table), "%.63s", ts->name);
+            snprintf(f->ref_table, sizeof(f->ref_table), "%.63s", c->ref_table);
+            f->ncols = c->ncols > 8 ? 8 : c->ncols;
+            for (int i = 0; i < f->ncols; i++) {
+                if (c->cols[i] < ts->num_columns) snprintf(f->cols[i], 64, "%.63s", ts->columns[c->cols[i]].name);
+                snprintf(f->ref_cols[i], 64, "%.63s", c->ref_cols[i]);
+            }
+            snprintf(f->on_delete, sizeof(f->on_delete), "%s", fk_action_name(c->on_delete));
+            snprintf(f->on_update, sizeof(f->on_update), "%s", fk_action_name(c->on_update));
+        }
+    }
+    db_unlock();
+    return out;
+}
+
+void db_foreign_keys_free(ForeignKeyInfo* fks) { free(fks); }
+
 bool db_use(const char* name) {
     db_lock();
     bool r = db_use_impl(name);

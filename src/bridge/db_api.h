@@ -130,6 +130,18 @@ typedef struct {
     char unique_name[64];   // nome del vincolo UNIQUE ("" se è un attributo della colonna senza nome)
 } ColumnInfo;
 
+// chiave esterna (per il diagramma dello schema)
+typedef struct {
+    char name[64];
+    char table[64];            // tabella con la chiave esterna (figlia)
+    char ref_table[64];        // tabella riferita (genitore)
+    int  ncols;
+    char cols[8][64];          // colonne della figlia
+    char ref_cols[8][64];      // colonne riferite ("" = la chiave primaria del genitore)
+    char on_delete[16];        // "NO ACTION", "CASCADE", ...
+    char on_update[16];
+} ForeignKeyInfo;
+
 // informazioni su una tabella
 typedef struct {
     char     name[64];
@@ -237,5 +249,9 @@ NameList* db_list_views(const char* db_name);
 ColumnInfo* db_list_columns(const char* db_name, const char* table, int* out_count);
 
 void db_columns_free(ColumnInfo* cols, int count);
+
+// tutte le chiavi esterne delle tabelle di un database (NULL se il database non esiste o è vuoto)
+ForeignKeyInfo* db_list_foreign_keys(const char* db_name, int* out_count);
+void db_foreign_keys_free(ForeignKeyInfo* fks);
 
 #endif

@@ -228,6 +228,25 @@ senza chiave primaria.
 *Copy name*. Le stesse voci per tabelle sono nel menu *Query* (sulla tabella selezionata
 nell'explorer o su quella del risultato modificabile).
 
+**Pagina Designer** (selettore *SQL editor | Designer* nella toolbar, `Ctrl+Shift+D`, o *View ›
+Schema designer*): il diagramma dello schema del database scelto in alto, per progettare un database
+senza scrivere SQL.
+
+| Azione | Come |
+|---|---|
+| Notazione | *ER* (entità, attributi a lecca-lecca — pieno = identificatore —, relazioni a rombo con le cardinalità `(1,1)` / `(0,N)`) o *UML* (classi con attributi e tipi, molteplicità `1` / `0..1` / `*`, freccia verso la tabella riferita) |
+| Spostare una tabella | trascinarla (posizioni salvate per database in `diagram_<db>.txt` nella cartella dei dati); frecce = sposta la selezionata |
+| Navigare | trascinare lo sfondo o rotella (`Shift` = orizzontale), `Ctrl` + rotella o *− / +* = zoom, *Fit* adatta, *Arrange* ridispone (genitori a sinistra, senza linee sopra le tabelle) |
+| Nuovo database | *+ Database* (o il menu del database) |
+| Nuova tabella | *+ Table*, doppio click su un punto vuoto o tasto destro › *New table here*: si apre il modulo della struttura e la tabella va in quel punto |
+| Modificare una tabella | doppio click, `Invio` o tasto destro › *Edit structure* |
+| Relazione (chiave esterna) | trascinare dal **+** sul bordo di una tabella alla tabella a cui si riferisce (crea la colonna `<tabella>_id` del tipo giusto); in UML anche dal pallino di una colonna: diventa lei la chiave esterna. Oppure tasto destro › *Add relationship…* e click sulla destinazione |
+| Relazione obbligatoria / facoltativa | tasto destro sulla linea (`SET` / `DROP NOT NULL` sulle colonne della chiave) |
+| Eliminare | selezione + `Canc`, o tasto destro: tabella (con conferma; le relazioni verso di lei vengono tolte) o relazione (la colonna resta) |
+| Dati | tasto destro › *Browse data* apre l'anteprima nella pagina SQL |
+
+Dall'explorer, tasto destro su un database o una tabella › *Show in the designer*.
+
 **Designer di tabelle** (come la scheda *Struttura* di phpMyAdmin): un modulo con una riga per
 colonna — nome, tipo (menu), lunghezza per `VARCHAR` / `CHAR`, `DEFAULT`, *Primary*, *Not null*,
 *Unique*, *Auto inc* — e l'aggiunta o l'eliminazione di colonne. Sotto, l'SQL che verrà eseguito si

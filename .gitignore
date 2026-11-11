@@ -36,3 +36,5 @@ test_grid_edit
 test_grid_edit_asan
 test_table_design
 test_table_design_asan
+test_schema_model
+test_schema_model_asan
