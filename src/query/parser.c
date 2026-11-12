@@ -1978,6 +1978,14 @@ static ASTNode* parse_statement(ParserState* ps) {
     if (!n) return NULL;
     Token t = peek(ps);
     if (ident_is(ps, "CALL") && next_is(ps, 1, TOK_IDENTIFIER)) { parse_call_stmt(ps, n); return n; }
+    // START TRANSACTION [READ WRITE | READ ONLY | WITH CONSISTENT SNAPSHOT] = BEGIN (MySQL)
+    if (ident_is(ps, "START") && next_is(ps, 1, TOK_TRANSACTION)) {
+        consume(ps);
+        consume(ps);
+        n->type = NODE_BEGIN;
+        while (peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF) consume(ps);
+        return n;
+    }
     // CHECK | ANALYZE | OPTIMIZE | REPAIR  TABLE t [, t2 ...]   (manutenzione, come MySQL)
     if ((ident_is(ps, "ANALYZE") || ident_is(ps, "OPTIMIZE") || ident_is(ps, "REPAIR") || ident_is(ps, "CHECK")) &&
         next_is(ps, 1, TOK_TABLE)) {
@@ -2303,17 +2311,20 @@ static ASTNode* parse_statement(ParserState* ps) {
         case TOK_BEGIN: {
             consume(ps);
             n->type = NODE_BEGIN;
-            match(ps, TOK_TRANSACTION);
+            if (!match(ps, TOK_TRANSACTION) && ident_is(ps, "WORK")) consume(ps);
             break;
         }
         case TOK_COMMIT: {
             consume(ps);
             n->type = NODE_COMMIT;
+            if (ident_is(ps, "WORK")) consume(ps);
             break;
         }
         case TOK_ROLLBACK: {
             consume(ps);
+            if (ident_is(ps, "WORK")) consume(ps);
             if (match(ps, TOK_TO)) {
+                match(ps, TOK_SAVEPOINT);
                 n->type = NODE_ROLLBACK_TO;
                 Token sn = consume(ps);
                 copy_text(ps, n->rollback_to.name, sizeof(n->rollback_to.name), sn.text);

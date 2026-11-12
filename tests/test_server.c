@@ -149,6 +149,97 @@ static void my_query(My* m, const char* sql, char* out, size_t on) {
     }
 }
 
+// prepared statement: PREPARE -> id (0 = errore, messaggio in out), numero di parametri e colonne
+static uint32_t my_prepare(My* m, const char* sql, int* np, int* nc, char* out, size_t on) {
+    uint8_t q[4096];
+    q[0] = 0x16;
+    size_t sl = strlen(sql);
+    memcpy(q + 1, sql, sl);
+    m->seq = 0;
+    out[0] = '\0';
+    uint8_t* p; size_t n;
+    if (!my_wr(m, q, sl + 1) || !my_rd(m, &p, &n)) { snprintf(out, on, "io"); return 0; }
+    if (p[0] == 0xff) { snprintf(out, on, "ERR:%u %s", (unsigned)(p[1] | p[2] << 8), (char*)p + 9); free(p); return 0; }
+    uint32_t id = (uint32_t)p[1] | (uint32_t)p[2] << 8 | (uint32_t)p[3] << 16 | (uint32_t)p[4] << 24;
+    *nc = p[5] | p[6] << 8;
+    *np = p[7] | p[8] << 8;
+    free(p);
+    int skip = (*np ? *np + 1 : 0) + (*nc ? *nc + 1 : 0);   // definizioni + EOF
+    for (int i = 0; i < skip; i++) { if (!my_rd(m, &p, &n)) return 0; free(p); }
+    return id;
+}
+
+// EXECUTE con parametri di testo (NULL = valore NULL) o un intero (vals[i] che inizia con '#');
+// risultato come my_query, le colonne di tipo BIGINT lette in binario
+static void my_execute(My* m, uint32_t id, int np, const char* const* vals, char* out, size_t on) {
+    uint8_t q[4096];
+    size_t k = 0;
+    q[k++] = 0x17;
+    for (int i = 0; i < 4; i++) q[k++] = (uint8_t)(id >> (8 * i));
+    q[k++] = 0;
+    q[k++] = 1; q[k++] = 0; q[k++] = 0; q[k++] = 0;
+    if (np) {
+        size_t nb = ((size_t)np + 7) / 8;
+        memset(q + k, 0, nb);
+        for (int i = 0; i < np; i++) if (!vals[i]) q[k + (size_t)i / 8] |= (uint8_t)(1u << (i % 8));
+        k += nb;
+        q[k++] = 1;
+        for (int i = 0; i < np; i++) { q[k++] = vals[i] && vals[i][0] == '#' ? 8 : 0xfd; q[k++] = 0; }
+        for (int i = 0; i < np; i++) {
+            if (!vals[i]) continue;
+            if (vals[i][0] == '#') { long long v = atoll(vals[i] + 1); for (int b = 0; b < 8; b++) q[k++] = (uint8_t)((unsigned long long)v >> (8 * b)); }
+            else { size_t l = strlen(vals[i]); q[k++] = (uint8_t)l; memcpy(q + k, vals[i], l); k += l; }
+        }
+    }
+    m->seq = 0;
+    out[0] = '\0';
+    uint8_t* p; size_t n;
+    if (!my_wr(m, q, k) || !my_rd(m, &p, &n)) { snprintf(out, on, "io"); return; }
+    if (p[0] == 0) { size_t pos = 1; snprintf(out, on, "OK:%llu", (unsigned long long)my_lenenc(p, &pos)); free(p); return; }
+    if (p[0] == 0xff) { snprintf(out, on, "ERR:%u %s", (unsigned)(p[1] | p[2] << 8), (char*)p + 9); free(p); return; }
+    size_t pos = 0;
+    int ncols = (int)my_lenenc(p, &pos);
+    free(p);
+    uint8_t types[32];
+    for (int i = 0; i < ncols; i++) {                      // tipo: dopo catalogo, schema, tabelle, nomi, 0x0c, charset, len
+        if (!my_rd(m, &p, &n)) return;
+        pos = 0;
+        for (int f = 0; f < 6; f++) { uint64_t l = my_lenenc(p, &pos); pos += (size_t)l; }
+        types[i < 32 ? i : 31] = p[pos + 1 + 2 + 4];
+        free(p);
+    }
+    if (!my_rd(m, &p, &n)) return;
+    free(p);
+    size_t ol = 0;
+    for (bool first = true;; first = false) {
+        if (!my_rd(m, &p, &n)) return;
+        if (p[0] == 0xfe && n < 9) { free(p); break; }
+        if (!first) ol += (size_t)snprintf(out + ol, on - ol, ";");
+        size_t nb = ((size_t)ncols + 9) / 8;
+        pos = 1 + nb;
+        for (int c = 0; c < ncols; c++) {
+            if (c) ol += (size_t)snprintf(out + ol, on - ol, "|");
+            if (p[1 + (c + 2) / 8] & (1u << ((c + 2) % 8))) { ol += (size_t)snprintf(out + ol, on - ol, "NULL"); continue; }
+            if (types[c] == 8) {
+                long long v = 0;
+                for (int b = 0; b < 8; b++) v |= (long long)p[pos + b] << (8 * b);
+                pos += 8;
+                ol += (size_t)snprintf(out + ol, on - ol, "%lld", v);
+            } else if (types[c] == 5) {
+                double d; memcpy(&d, p + pos, 8); pos += 8;
+                ol += (size_t)snprintf(out + ol, on - ol, "%g", d);
+            } else if (types[c] == 1) {
+                ol += (size_t)snprintf(out + ol, on - ol, "%d", p[pos++]);
+            } else {
+                uint64_t l = my_lenenc(p, &pos);
+                ol += (size_t)snprintf(out + ol, on - ol, "%.*s", (int)l, (char*)p + pos);
+                pos += (size_t)l;
+            }
+        }
+        free(p);
+    }
+}
+
 static void send_str(int fd, const char* s, size_t n) {
     while (n > 0) { ssize_t w = send(fd, s, n, MSG_NOSIGNAL); if (w <= 0) return; s += w; n -= (size_t)w; }
 }
@@ -832,6 +923,48 @@ int main(void) {
         CHECK(!strcmp(out, "OK:0 / OK:1 / 2 / OK:0"), "transaction: %s", out);
         my_query(&m, "SELECT COUNT(*) FROM p", out, sizeof(out));
         CHECK(!strcmp(out, "3"), "rolled back: %s", out);
+
+        // prepared statement lato server (mysqli->prepare, JDBC, mysql-connector prepared=True)
+        int np = -1, nc = -1;
+        uint32_t sid = my_prepare(&m, "SELECT id, nome FROM p WHERE id >= ? AND nome <> ? ORDER BY id", &np, &nc, out, sizeof(out));
+        CHECK(sid && np == 2 && nc == 2, "prepare select: id %u params %d cols %d %s", sid, np, nc, out);
+        const char* v1[] = { "#1", "x' OR '1'='1" };
+        my_execute(&m, sid, 2, v1, out, sizeof(out));
+        CHECK(!strncmp(out, "1|", 2) && strchr(out, ';'), "execute select (binary rows, quoted text): %s", out);
+        const char* v2[] = { "#3", "zzz" };
+        my_execute(&m, sid, 2, v2, out, sizeof(out));
+        CHECK(!strncmp(out, "3|", 2) && !strchr(out, ';'), "same statement, other values: %s", out);
+        uint32_t ins = my_prepare(&m, "INSERT INTO p (id, nome, prezzo) VALUES (?, ?, ?)", &np, &nc, out, sizeof(out));
+        CHECK(ins && np == 3 && nc == 0, "prepare insert: %u %d %d %s", ins, np, nc, out);
+        const char* v3[] = { "#40", "it's \\ ok -- not a comment", NULL };
+        my_execute(&m, ins, 3, v3, out, sizeof(out));
+        CHECK(!strcmp(out, "OK:1"), "execute insert: %s", out);
+        my_query(&m, "SELECT nome, prezzo FROM p WHERE id = 40", out, sizeof(out));
+        CHECK(!strcmp(out, "it's \\ ok -- not a comment|NULL"), "inserted values kept as data: %s", out);
+        my_execute(&m, ins, 3, v3, out, sizeof(out));
+        CHECK(strstr(out, "ERR:1062"), "duplicate through a prepared insert: %s", out);
+        uint32_t lit = my_prepare(&m, "SELECT '?' AS q, ? AS v -- ?", &np, &nc, out, sizeof(out));
+        CHECK(lit && np == 1, "'?' inside strings and comments is not a parameter: %d", np);
+        CHECK(!my_prepare(&m, "SELECT * FROM nessuna WHERE id = ?", &np, &nc, out, sizeof(out)) && strstr(out, "ERR:1146"),
+              "prepare reports a missing table: %s", out);
+        uint8_t cl[5] = { 0x19, (uint8_t)sid, (uint8_t)(sid >> 8), (uint8_t)(sid >> 16), (uint8_t)(sid >> 24) };
+        m.seq = 0;
+        my_wr(&m, cl, 5);                                  // COM_STMT_CLOSE: nessuna risposta
+        my_execute(&m, sid, 2, v1, out, sizeof(out));
+        CHECK(strstr(out, "ERR:1243"), "closed statement: %s", out);
+        my_query(&m, "DELETE FROM p WHERE id = 40", out, sizeof(out));
+
+        // autocommit = 0: le modifiche restano in sospeso fino a COMMIT / ROLLBACK
+        my_query(&m, "COMMIT", out, sizeof(out));
+        CHECK(!strcmp(out, "OK:0"), "COMMIT with nothing to commit: %s", out);
+        my_query(&m, "SET autocommit = 0; DELETE FROM p WHERE id = 1; ROLLBACK", out, sizeof(out));
+        CHECK(!strcmp(out, "OK:0 / OK:1 / OK:0"), "autocommit off: %s", out);
+        my_query(&m, "SELECT COUNT(*) FROM p", out, sizeof(out));
+        CHECK(!strcmp(out, "3"), "implicit transaction rolled back: %s", out);
+        my_query(&m, "UPDATE p SET nome = 'ac' WHERE id = 1; SET @@session.autocommit = 1; ROLLBACK; SELECT nome FROM p WHERE id = 1", out, sizeof(out));
+        CHECK(strstr(out, " / ac"), "SET autocommit = 1 commits: %s", out);
+        my_query(&m, "START TRANSACTION; DELETE FROM p WHERE id = 1; ROLLBACK WORK; SELECT COUNT(*) FROM p", out, sizeof(out));
+        CHECK(!strcmp(out, "OK:0 / OK:1 / OK:0 / 3"), "START TRANSACTION / ROLLBACK WORK: %s", out);
         close(m.fd);
         if (s4) { sv_server_stop(s4); pthread_join(th4, NULL); sv_server_free(s4); }
     }

@@ -1615,8 +1615,16 @@ static void my_leave(SvServer* s, DbSession* ds) {
     exec_end(s);
 }
 
+static unsigned my_status(bool autocommit) {
+    return (in_transaction() ? MW_STATUS_IN_TRANS : 0) | (autocommit ? MW_STATUS_AUTOCOMMIT : 0);
+}
+
 // COM_QUERY: le istruzioni una dopo l'altra; ogni risultato è un resultset o un OK
-static void my_query(SvServer* s, Conn* c, MwOut* o, char* sql, const char* user) {
+// (binary: risposta a COM_STMT_EXECUTE, righe in formato binario).
+// *autocommit è quello della connessione: con SET autocommit = 0 la prima istruzione che
+// modifica i dati apre una transazione, che resta aperta fino a COMMIT / ROLLBACK (come MySQL;
+// le sole letture non la aprono, così una connessione che legge non blocca chi scrive)
+static void my_query(SvServer* s, Conn* c, MwOut* o, char* sql, const char* user, bool binary, bool* autocommit) {
     int len = (int)strlen(sql), cap = 32, nst;
     SqlRange* ranges = NULL;
     for (;;) {
@@ -1629,7 +1637,7 @@ static void my_query(SvServer* s, Conn* c, MwOut* o, char* sql, const char* user
     }
     int last = -1;
     for (int k = 0; k < nst; k++) if (ranges[k].has_code) last = k;
-    if (last < 0) { mw_ok(o, 0, 0, MW_STATUS_AUTOCOMMIT, NULL); free(ranges); return; }
+    if (last < 0) { mw_ok(o, 0, 0, my_status(*autocommit), NULL); free(ranges); return; }
     Response rs = {0};
     snprintf(rs.client, sizeof(rs.client), "%s", c->client);
     for (int k = 0; k <= last; k++) {
@@ -1638,10 +1646,29 @@ static void my_query(SvServer* s, Conn* c, MwOut* o, char* sql, const char* user
         char saved = sql[e];
         sql[e] = '\0';
         unsigned more = k < last ? MW_STATUS_MORE_RESULTS : 0;
-        unsigned st = (in_transaction() ? MW_STATUS_IN_TRANS : MW_STATUS_AUTOCOMMIT) | more;
-        if (mw_client_noise(o, sql + a, st)) { sql[e] = saved; continue; }
-        QueryResult* r = db_execute(sql + a);
-        audit_stmt(s, &rs, user, sql + a, r);
+        const char* one = sql + a;
+        int ac = mw_set_autocommit(one);
+        if (ac >= 0) {                                     // SET autocommit = 1 conferma la transazione aperta
+            sql[e] = saved;
+            if (ac == 1 && in_transaction() && !db_commit()) { my_error(o, "Failed to commit"); break; }
+            *autocommit = ac == 1;
+            mw_ok(o, 0, 0, my_status(*autocommit) | more, NULL);
+            continue;
+        }
+        int kind = mw_stmt_kind(one);
+        if ((kind == MW_KIND_COMMIT || kind == MW_KIND_ROLLBACK) && !in_transaction()) {
+            sql[e] = saved;                                // niente da confermare: in MySQL non è un errore
+            mw_ok(o, 0, 0, my_status(*autocommit) | more, NULL);
+            continue;
+        }
+        if (mw_client_noise(o, one, my_status(*autocommit) | more)) { sql[e] = saved; continue; }
+        if (kind == MW_KIND_DML && !*autocommit && !in_transaction() && !db_begin()) {
+            sql[e] = saved;
+            my_error(o, "Failed to begin transaction");
+            break;
+        }
+        QueryResult* r = db_execute(one);
+        audit_stmt(s, &rs, user, one, r);
         sql[e] = saved;
         bool timeout = exec_timed_out(s);
         if (!r || !r->success || timeout) {
@@ -1649,14 +1676,149 @@ static void my_query(SvServer* s, Conn* c, MwOut* o, char* sql, const char* user
             db_result_free(r);
             break;
         }
-        st = (in_transaction() ? MW_STATUS_IN_TRANS : MW_STATUS_AUTOCOMMIT) | more;
+        unsigned st = my_status(*autocommit) | more;
         const char* cur = db_current_database();
-        if (r->num_cols > 0) mw_resultset(o, r, cur ? cur : "", st);
+        if (r->num_cols > 0) { if (binary) mw_resultset_binary(o, r, cur ? cur : "", st); else mw_resultset(o, r, cur ? cur : "", st); }
         else mw_ok(o, (uint64_t)(r->rows_affected > 0 ? r->rows_affected : 0),
                    (uint64_t)(r->last_insert_id > 0 ? r->last_insert_id : 0), st, NULL);
         db_result_free(r);
     }
     free(ranges);
+}
+
+// prepared statement di una connessione
+typedef struct {
+    uint32_t    id;
+    char*       sql;
+    int         nparams;
+    uint8_t*    types;          // 2 byte per parametro, dall'ultimo EXECUTE che li ha mandati
+    bool        types_set;
+    MwLongData* ld;             // valori mandati con COM_STMT_SEND_LONG_DATA
+} MyStmt;
+
+typedef struct { MyStmt* v; int n, cap; uint32_t next_id; bool autocommit; } MyStmts;   // + autocommit della connessione
+
+#define MAX_STMTS 4096           // come max_prepared_stmt_count, ma per connessione
+
+static void stmt_clear_ld(MyStmt* st) {
+    for (int i = 0; st->ld && i < st->nparams; i++) { free(st->ld[i].p); st->ld[i] = (MwLongData){0}; }
+}
+
+static void stmt_free(MyStmt* st) {
+    stmt_clear_ld(st);
+    free(st->ld);
+    free(st->types);
+    free(st->sql);
+}
+
+static MyStmt* stmt_find(MyStmts* ss, uint32_t id) {
+    for (int i = 0; i < ss->n; i++) if (ss->v[i].id == id) return &ss->v[i];
+    return NULL;
+}
+
+static void stmt_close(MyStmts* ss, uint32_t id) {
+    MyStmt* st = stmt_find(ss, id);
+    if (!st) return;
+    stmt_free(st);
+    *st = ss->v[--ss->n];
+}
+
+static void stmts_free(MyStmts* ss) {
+    for (int i = 0; i < ss->n; i++) stmt_free(&ss->v[i]);
+    free(ss->v);
+    *ss = (MyStmts){0};
+}
+
+static bool has_word(const char* s, const char* w) {
+    size_t l = strlen(w);
+    for (const char* p = s; *p; p++)
+        if (!strncasecmp(p, w, l) && (p == s || (!isalnum((unsigned char)p[-1]) && p[-1] != '_')) &&
+            !isalnum((unsigned char)p[l]) && p[l] != '_') return true;
+    return false;
+}
+
+// istruzione che legge soltanto: per conoscere le colonne la si può eseguire già al PREPARE
+static bool stmt_reads_only(const char* sql) {
+    while (isspace((unsigned char)*sql) || *sql == '(') sql++;
+    static const char* const W[] = { "SELECT", "WITH", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "VALUES", "TABLE" };
+    for (size_t i = 0; i < sizeof(W) / sizeof(W[0]); i++) {
+        size_t l = strlen(W[i]);
+        if (!strncasecmp(sql, W[i], l) && !isalnum((unsigned char)sql[l]) && sql[l] != '_') {
+            if (i == 1) return !has_word(sql, "INSERT") && !has_word(sql, "UPDATE") && !has_word(sql, "DELETE");
+            return true;
+        }
+    }
+    return false;
+}
+
+// COM_STMT_PREPARE: si contano i '?'; per una lettura si esegue l'istruzione con i parametri a NULL
+// così il client conosce subito le colonne (mysqli_stmt_result_metadata, JDBC getMetaData)
+static void my_prepare(MyStmts* ss, MwOut* o, const char* sql) {
+    if (ss->n >= MAX_STMTS) { mw_err(o, 1461, "42000", "Too many prepared statements on this connection (max 4096): close the ones you do not need"); return; }
+    const char* q = sql;
+    while (isspace((unsigned char)*q)) q++;
+    if (!*q) { mw_err(o, 1065, "42000", "Query was empty"); return; }
+    int np = mw_count_params(sql);
+    if (np > 65535) { mw_err(o, 1390, "HY000", "Prepared statement contains too many placeholders"); return; }
+    if (ss->n == ss->cap) {
+        int nc = ss->cap ? ss->cap * 2 : 8;
+        MyStmt* nv = realloc(ss->v, sizeof(MyStmt) * (size_t)nc);
+        if (!nv) { mw_err(o, 1105, "HY000", "out of memory"); return; }
+        ss->v = nv;
+        ss->cap = nc;
+    }
+    MyStmt st = { .id = ++ss->next_id, .sql = strdup(sql), .nparams = np };
+    st.types = calloc((size_t)(np ? np : 1), 2);
+    st.ld = calloc((size_t)(np ? np : 1), sizeof(MwLongData));
+    if (!st.sql || !st.types || !st.ld) { stmt_free(&st); mw_err(o, 1105, "HY000", "out of memory"); return; }
+    QueryResult* meta = NULL;
+    if (stmt_reads_only(sql)) {
+        // i '?' come NULL: stessa forma del risultato, quasi sempre senza righe da leggere
+        char* text = mw_with_nulls(sql);
+        if (text && !mw_client_noise(&(MwOut){0}, text, 0)) meta = db_execute(text);
+        free(text);
+        if (meta && !meta->success) {                      // errore vero (tabella o colonna sbagliata): come MySQL
+            my_error(o, meta->error);
+            db_result_free(meta);
+            stmt_free(&st);
+            return;
+        }
+    }
+    ss->v[ss->n++] = st;
+    const char* cur = db_current_database();
+    mw_prepare_ok(o, st.id, np, meta, cur ? cur : "", my_status(ss->autocommit));
+    db_result_free(meta);
+}
+
+static void my_execute(SvServer* s, Conn* c, MyStmts* ss, MwOut* o, const uint8_t* p, size_t n, const char* user) {
+    if (n < 5) { mw_err(o, 1835, "HY000", "Malformed COM_STMT_EXECUTE packet"); return; }
+    uint32_t id = (uint32_t)p[1] | (uint32_t)p[2] << 8 | (uint32_t)p[3] << 16 | (uint32_t)p[4] << 24;
+    MyStmt* st = stmt_find(ss, id);
+    if (!st) { mw_err(o, 1243, "HY000", "Unknown prepared statement handler given to mysqld_stmt_execute"); return; }
+    char err[160];
+    char* sql = mw_bind_execute(st->sql, p + 5, n - 5, st->nparams, st->types, &st->types_set, st->ld, err, sizeof(err));
+    stmt_clear_ld(st);                                     // i dati lunghi valgono per un solo EXECUTE
+    if (!sql) { mw_err(o, 1210, "HY000", err); return; }
+    my_query(s, c, o, sql, user, true, &ss->autocommit);
+    free(sql);
+}
+
+// COM_STMT_SEND_LONG_DATA: stmt id, numero del parametro, un pezzo del valore (nessuna risposta)
+static void my_long_data(MyStmts* ss, const uint8_t* p, size_t n) {
+    if (n < 7) return;
+    uint32_t id = (uint32_t)p[1] | (uint32_t)p[2] << 8 | (uint32_t)p[3] << 16 | (uint32_t)p[4] << 24;
+    unsigned k = (unsigned)p[5] | (unsigned)p[6] << 8;
+    MyStmt* st = stmt_find(ss, id);
+    if (!st || (int)k >= st->nparams) return;
+    MwLongData* d = &st->ld[k];
+    size_t add = n - 7;
+    char* q = realloc(d->p, d->n + add + 1);
+    if (!q) return;
+    memcpy(q + d->n, p + 7, add);
+    d->p = q;
+    d->n += add;
+    d->p[d->n] = '\0';
+    d->set = true;
 }
 
 static void serve_mysql(Conn* c) {
@@ -1724,6 +1886,7 @@ static void serve_mysql(Conn* c) {
             my_leave(s, ds);
         }
     }
+    MyStmts stmts = { .autocommit = true };
     if (ok) mw_ok(&o, 0, 0, MW_STATUS_AUTOCOMMIT, NULL);
     else if (!o.n) mw_err(&o, 1205, "HY000", "Lock wait timeout exceeded");
     if (!my_send(c, &o) || !ok) goto done;
@@ -1736,16 +1899,27 @@ static void serve_mysql(Conn* c) {
         if (cmd == MW_COM_QUIT) { free(pk.p); break; }
         if (cmd == MW_COM_PING) mw_ok(&o, 0, 0, MW_STATUS_AUTOCOMMIT, NULL);
         else if (cmd == MW_COM_FIELD_LIST) mw_eof(&o, MW_STATUS_AUTOCOMMIT);
-        else if (cmd == MW_COM_STMT_PREPARE)
-            mw_err(&o, 1295, "HY000", "Server-side prepared statements are not supported: use client-side (emulated) prepares, e.g. PDO::ATTR_EMULATE_PREPARES");
-        else if (cmd == MW_COM_QUERY || cmd == MW_COM_INIT_DB || cmd == MW_COM_RESET_CONNECTION) {
+        else if (cmd == MW_COM_STMT_CLOSE) {               // nessuna risposta
+            if (pk.n >= 5) stmt_close(&stmts, (uint32_t)pk.p[1] | (uint32_t)pk.p[2] << 8 | (uint32_t)pk.p[3] << 16 | (uint32_t)pk.p[4] << 24);
+        } else if (cmd == MW_COM_STMT_SEND_LONG_DATA) my_long_data(&stmts, pk.p, pk.n);   // nessuna risposta
+        else if (cmd == MW_COM_STMT_RESET) {
+            MyStmt* st = pk.n >= 5 ? stmt_find(&stmts, (uint32_t)pk.p[1] | (uint32_t)pk.p[2] << 8 | (uint32_t)pk.p[3] << 16 | (uint32_t)pk.p[4] << 24) : NULL;
+            if (!st) mw_err(&o, 1243, "HY000", "Unknown prepared statement handler given to mysqld_stmt_reset");
+            else { stmt_clear_ld(st); mw_ok(&o, 0, 0, my_status(stmts.autocommit), NULL); }
+        } else if (cmd == MW_COM_QUERY || cmd == MW_COM_INIT_DB || cmd == MW_COM_RESET_CONNECTION ||
+                   cmd == MW_COM_STMT_PREPARE || cmd == MW_COM_STMT_EXECUTE) {
             if (!my_enter(s, ds)) mw_err(&o, 1205, "HY000", "Lock wait timeout exceeded: another session has an open transaction");
             else {
                 if (!db_set_user(user)) mw_err(&o, 1045, "28000", "The user no longer exists");
                 else if (cmd == MW_COM_QUERY) {
                     char* sql = (char*)pk.p + 1;
                     pk.p[pk.n] = 0;
-                    my_query(s, c, &o, sql, user);
+                    my_query(s, c, &o, sql, user, false, &stmts.autocommit);
+                } else if (cmd == MW_COM_STMT_PREPARE) {
+                    pk.p[pk.n] = 0;
+                    my_prepare(&stmts, &o, (char*)pk.p + 1);
+                } else if (cmd == MW_COM_STMT_EXECUTE) {
+                    my_execute(s, c, &stmts, &o, pk.p, pk.n, user);
                 } else if (cmd == MW_COM_INIT_DB) {
                     char use[160];
                     snprintf(use, sizeof(use), "USE `%.100s`", (char*)pk.p + 1);
@@ -1755,6 +1929,8 @@ static void serve_mysql(Conn* c) {
                     db_result_free(r);
                 } else {                                   // COM_RESET_CONNECTION: transazione annullata
                     if (in_transaction()) db_rollback();
+                    stmts_free(&stmts);
+                    stmts.autocommit = true;
                     mw_ok(&o, 0, 0, MW_STATUS_AUTOCOMMIT, NULL);
                 }
                 db_set_user(NULL);
@@ -1762,9 +1938,10 @@ static void serve_mysql(Conn* c) {
             }
         } else mw_err(&o, 1047, "08S01", "Unknown command");
         free(pk.p);
-        if (!my_send(c, &o)) break;
+        if (o.n && !my_send(c, &o)) break;
     }
 done:
+    stmts_free(&stmts);
     mx_lock(&s->exec_mx);
     db_session_end(ds);                                    // una transazione lasciata aperta viene annullata
     mx_unlock(&s->exec_mx);

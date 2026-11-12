@@ -52,7 +52,7 @@ database per piccoli siti web e app desktop.
 | **Storage** | Heap file a pagine da 4 KB con slot directory e free-space map; indici in memoria (anche su più colonne): tabella hash per le uguaglianze, chiavi ordinate per gli intervalli |
 | **Buffer pool** | 1024 frame, tabella hash per la ricerca, sostituzione **CLOCK**; statistiche con `SHOW STATUS` |
 | **Ottimizzatore** | Pushdown delle selezioni, hash join (anche per `FROM a, b WHERE a.x = b.y`), accesso con indice per uguaglianza o per intervallo (scelto solo se conviene), subquery decorrelate per chiave; `EXPLAIN` con stime alla System R e `EXPLAIN ANALYZE` con le righe reali |
-| **Transazioni** | Write-Ahead Log con undo/redo, `BEGIN` / `COMMIT` / `ROLLBACK`, `SAVEPOINT`, recovery dopo un crash, `CHECKPOINT` (anche automatico) |
+| **Transazioni** | Write-Ahead Log con undo/redo, `BEGIN` (o `START TRANSACTION`) / `COMMIT` / `ROLLBACK`, `SAVEPOINT` (`ROLLBACK TO [SAVEPOINT]`), recovery dopo un crash, `CHECKPOINT` (anche automatico) |
 | **Basi di dati attive** | Trigger `BEFORE` / `AFTER`, `FOR EACH ROW` / `FOR EACH STATEMENT`, `NEW` / `OLD`, `WHEN`, `SET NEW.col`, `SIGNAL`, `IF`; stored procedure (`CREATE PROCEDURE`, `CALL`) |
 | **Testi e righe grandi** | Testi fino a 16 MB, righe fino a 64 MB: una riga oltre 2 KB va in pagine di overflow (anche dopo `ROLLBACK`, riavvio e crash) |
 | **Strumenti visuali** | Designer dello schema ER (notazione di Chen) / UML a trascinamento, export PNG; modulo della struttura con SQL live; modifica dei dati nella griglia; ricerca in tutto il database; panoramica; utenti e permessi; monitor del server |
@@ -645,13 +645,21 @@ Node.js, il client `mysql` e gli strumenti grafici. Ogni connessione è una sess
 database e la sua transazione; il login usa gli utenti di SegVault (`CREATE USER`, con i loro
 permessi), oppure `root` con il token come password; un server locale senza token né `--users`
 accetta qualunque nome. Le istruzioni di avvio dei driver (`SET NAMES`, `SELECT @@version`,
-`SHOW VARIABLES`, ...) hanno una risposta. Limiti: niente TLS e niente prepared statement lato
-server (PDO li emula già da sé; con `mysqli` si usa `query()` o `real_escape_string`); gli utenti
-creati prima di questa versione devono reimpostare la password (`ALTER USER u IDENTIFIED BY '...'`).
+`SHOW VARIABLES`, ...) hanno una risposta. **Prepared statement lato server** (`mysqli->prepare`,
+JDBC `PreparedStatement`, `mysql-connector` con `prepared=True`, PDO senza emulazione): righe in
+formato binario con i tipi giusti (interi, decimali, date, `NULL`), anche `send_long_data`; i valori
+non diventano mai codice SQL. **Transazioni come in MySQL:** `START TRANSACTION`, `COMMIT` /
+`ROLLBACK` (anche `WORK`), e `SET autocommit = 0` (il default di Python e JDBC con
+`setAutoCommit(false)`): la prima modifica apre la transazione, che resta aperta fino a `COMMIT` o
+`ROLLBACK`; un `COMMIT` senza niente da confermare non è un errore. Limiti: niente TLS; gli utenti
+creati prima della 1.0.3 devono reimpostare la password (`ALTER USER u IDENTIFIED BY '...'`).
 
 ```php
-$db = new PDO('mysql:host=127.0.0.1;port=3306;dbname=shop', 'anna', 'segreta1');
-foreach ($db->query('SELECT nome, prezzo FROM prodotto') as $r) echo $r['nome'], "\n";
+$db = new mysqli('127.0.0.1', 'anna', 'segreta1', 'shop', 3306);
+$st = $db->prepare('SELECT nome, prezzo FROM prodotto WHERE prezzo < ?');
+$st->bind_param('d', $max);
+$st->execute();
+foreach ($st->get_result() as $r) echo $r['nome'], "\n";
 ```
 
 Ogni istruzione che modifica dati o schema può essere registrata con `--audit FILE` (una riga con
@@ -1323,8 +1331,8 @@ Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
    rende riusabili le pagine delle righe grandi aggiornate o eliminate.
 3. **Compatibilità MySQL** — fatto: import dei dump di `mysqldump` / phpMyAdmin (anche date con i
    decimali dei secondi), con viste, trigger e procedure; **protocollo di rete MySQL**
-   (`--mysql-port`: PHP, Python, Java e il client `mysql` si collegano senza modifiche). Da fare:
-   prepared statement lato server e TLS; le funzioni e le variabili di MySQL che mancano ancora
+   (`--mysql-port`: PHP, Python, Java e il client `mysql` si collegano senza modifiche), prepared
+   statement lato server, `autocommit` e `START TRANSACTION`. Da fare: TLS; le funzioni e le variabili di MySQL che mancano ancora
    (un'app complessa come WordPress va provata).
 4. **Limiti del motore** — fatto: `CREATE UNIQUE INDEX`, indici su più colonne (anche dall'import
    MySQL), funzioni JSON e operatori `->` / `->>`, nomi `db.tabella` (un database per istruzione),

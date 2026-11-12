@@ -142,10 +142,13 @@ static void map_type(const char* t, unsigned* type, unsigned* flags, unsigned* c
     }
 }
 
-static void column_def(MwOut* o, const char* db, const char* table, const char* name, const char* type) {
+// bin: risultati in formato binario (prepared statement): INT diventa BIGINT, perché un intero di
+// SegVault può non stare in 32 bit e nel formato binario la larghezza è quella del tipo
+static void column_def_ex(MwOut* o, const char* db, const char* table, const char* name, const char* type, bool bin) {
     unsigned ty, fl, cs, dec;
     uint32_t len;
     map_type(type, &ty, &fl, &cs, &len, &dec);
+    if (bin && ty == MT_LONG) { ty = MT_LONGLONG; len = 20; }
     mw_begin(o);
     mw_lenz(o, "def");
     mw_lenz(o, db);
@@ -161,6 +164,10 @@ static void column_def(MwOut* o, const char* db, const char* table, const char* 
     mw_u8(o, dec);
     mw_u16(o, 0);
     mw_end(o);
+}
+
+static void column_def(MwOut* o, const char* db, const char* table, const char* name, const char* type) {
+    column_def_ex(o, db, table, name, type, false);
 }
 
 void mw_resultset(MwOut* o, const QueryResult* r, const char* db, unsigned status) {
@@ -395,4 +402,385 @@ bool mw_client_noise(MwOut* o, const char* sql, unsigned status) {
     text_row(o, n, cv);
     mw_eof(o, status);
     return true;
+}
+
+// ── prepared statement (COM_STMT_PREPARE / EXECUTE) ──────────────
+// Il server non compila il piano: conserva il testo, e a ogni EXECUTE sostituisce i '?' con i
+// valori arrivati in formato binario, scritti come letterali SQL (stringhe con gli apici
+// raddoppiati e i backslash protetti: nessuna SQL injection possibile dai valori).
+
+// scorre l'SQL saltando stringhe, identificatori tra backtick e commenti; per ogni '?' di codice
+// chiama fn (se c'è) e restituisce quanti sono
+static int scan_params(const char* sql, void (*fn)(void* ctx, size_t at), void* ctx) {
+    int count = 0;
+    size_t n = strlen(sql), i = 0;
+    while (i < n) {
+        char c = sql[i];
+        if (c == '\'' || c == '"' || c == '`') {
+            i++;
+            while (i < n) {
+                if (sql[i] == '\\' && c != '`' && i + 1 < n) { i += 2; continue; }
+                if (sql[i] == c) { if (i + 1 < n && sql[i + 1] == c) { i += 2; continue; } i++; break; }
+                i++;
+            }
+        } else if (c == '-' && i + 1 < n && sql[i + 1] == '-') {
+            while (i < n && sql[i] != '\n') i++;
+        } else if (c == '/' && i + 1 < n && sql[i + 1] == '*') {
+            const char* e = strstr(sql + i + 2, "*/");
+            i = e ? (size_t)(e - sql) + 2 : n;
+        } else {
+            if (c == '?') { if (fn) fn(ctx, i); count++; }
+            i++;
+        }
+    }
+    return count;
+}
+
+int mw_count_params(const char* sql) { return scan_params(sql, NULL, NULL); }
+
+void mw_prepare_ok(MwOut* o, uint32_t id, int nparams, const QueryResult* meta, const char* db, unsigned status) {
+    int ncols = meta && meta->success ? meta->num_cols : 0;
+    mw_begin(o);
+    mw_u8(o, 0);
+    mw_u32(o, id);
+    mw_u16(o, (unsigned)ncols);
+    mw_u16(o, (unsigned)nparams);
+    mw_u8(o, 0);
+    mw_u16(o, 0);
+    mw_end(o);
+    if (nparams > 0) {
+        for (int i = 0; i < nparams; i++) column_def_ex(o, "", "", "?", NULL, true);
+        mw_eof(o, status);
+    }
+    if (ncols > 0) {
+        for (int c = 0; c < ncols; c++)
+            column_def_ex(o, db, meta->col_tables && meta->col_tables[c] ? meta->col_tables[c] : "",
+                          meta->col_names[c], meta->col_types ? meta->col_types[c] : NULL, true);
+        mw_eof(o, status);
+    }
+}
+
+static void put_le(MwOut* o, uint64_t v, int bytes) {
+    uint8_t b[8];
+    for (int i = 0; i < bytes; i++) b[i] = (uint8_t)(v >> (8 * i));
+    mw_bytes(o, b, (size_t)bytes);
+}
+
+static long long cell_int(const char* v) {
+    if (!strcasecmp(v, "true") || !strcasecmp(v, "t")) return 1;
+    if (!strcasecmp(v, "false") || !strcasecmp(v, "f")) return 0;
+    char* e;
+    long long x = strtoll(v, &e, 10);
+    if (*e == '.' || *e == 'e' || *e == 'E') x = (long long)strtod(v, NULL);
+    return x;
+}
+
+// "AAAA-MM-GG[ HH:MM:SS[.ffffff]]" -> formato binario di DATE / DATETIME
+static void put_datetime(MwOut* o, const char* v) {
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0, k = 0;
+    long us = 0;
+    int got = sscanf(v, "%d-%d-%d%n", &y, &mo, &d, &k);
+    if (got < 3) { mw_u8(o, 0); return; }                 // non è una data: 0000-00-00
+    const char* t = v + k;
+    if (*t == ' ' || *t == 'T') {
+        int k2 = 0;
+        if (sscanf(t + 1, "%d:%d:%d%n", &h, &mi, &se, &k2) == 3 && t[1 + k2] == '.') {
+            const char* f = t + 2 + k2;
+            int digits = 0;
+            while (isdigit((unsigned char)*f) && digits < 6) { us = us * 10 + (*f++ - '0'); digits++; }
+            while (digits++ < 6) us *= 10;
+        }
+    }
+    int len = us ? 11 : (h || mi || se) ? 7 : 4;
+    mw_u8(o, (unsigned)len);
+    mw_u16(o, (unsigned)y);
+    mw_u8(o, (unsigned)mo);
+    mw_u8(o, (unsigned)d);
+    if (len >= 7) { mw_u8(o, (unsigned)h); mw_u8(o, (unsigned)mi); mw_u8(o, (unsigned)se); }
+    if (len == 11) mw_u32(o, (uint32_t)us);
+}
+
+void mw_resultset_binary(MwOut* o, const QueryResult* r, const char* db, unsigned status) {
+    mw_begin(o);
+    mw_lenenc(o, (uint64_t)r->num_cols);
+    mw_end(o);
+    unsigned* types = calloc((size_t)(r->num_cols ? r->num_cols : 1), sizeof(unsigned));
+    if (!types) { o->oom = true; return; }
+    for (int c = 0; c < r->num_cols; c++) {
+        const char* t = r->col_types ? r->col_types[c] : NULL;
+        column_def_ex(o, db, r->col_tables && r->col_tables[c] ? r->col_tables[c] : "", r->col_names[c], t, true);
+        unsigned fl, cs, dec;
+        uint32_t len;
+        map_type(t, &types[c], &fl, &cs, &len, &dec);
+        if (types[c] == MT_LONG) types[c] = MT_LONGLONG;
+    }
+    mw_eof(o, status & ~MW_STATUS_MORE_RESULTS);
+    size_t nb = ((size_t)r->num_cols + 7 + 2) / 8;
+    uint8_t* bitmap = calloc(nb, 1);
+    if (!bitmap) { free(types); o->oom = true; return; }
+    for (int i = 0; i < r->num_rows && !o->oom; i++) {
+        mw_begin(o);
+        mw_u8(o, 0);
+        memset(bitmap, 0, nb);
+        for (int c = 0; c < r->num_cols; c++)
+            if (r->rows[i].cells[c].is_null) bitmap[(c + 2) / 8] |= (uint8_t)(1u << ((c + 2) % 8));
+        mw_bytes(o, bitmap, nb);
+        for (int c = 0; c < r->num_cols; c++) {
+            const Cell* cell = &r->rows[i].cells[c];
+            if (cell->is_null) continue;
+            const char* v = cell->value ? cell->value : "";
+            switch (types[c]) {
+                case MT_TINY:     mw_u8(o, (unsigned)(cell_int(v) & 0xff)); break;
+                case MT_LONGLONG: put_le(o, (uint64_t)cell_int(v), 8); break;
+                case MT_DOUBLE: { double d = strtod(v, NULL); uint64_t b; memcpy(&b, &d, 8); put_le(o, b, 8); break; }
+                case MT_DATE: case MT_DATETIME: put_datetime(o, v); break;
+                default:          mw_lenz(o, v); break;
+            }
+        }
+        mw_end(o);
+    }
+    free(bitmap);
+    free(types);
+    mw_eof(o, status);
+}
+
+// ── valori dei parametri ─────────────────────────────────────────
+
+typedef struct { char* p; size_t n, cap; bool oom; } Sb;
+static void sb_add(Sb* b, const char* s, size_t n) {
+    if (b->oom) return;
+    if (b->n + n + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap * 2 : 256;
+        while (nc < b->n + n + 1) nc *= 2;
+        char* q = realloc(b->p, nc);
+        if (!q) { b->oom = true; return; }
+        b->p = q; b->cap = nc;
+    }
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = '\0';
+}
+static void sb_str(Sb* b, const char* s) { sb_add(b, s, strlen(s)); }
+
+static bool sb_quoted(Sb* b, const uint8_t* s, size_t n) {
+    if (memchr(s, 0, n)) return false;
+    sb_add(b, "'", 1);
+    size_t st = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] != '\'' && s[i] != '\\') continue;
+        sb_add(b, (const char*)s + st, i - st);
+        sb_add(b, s[i] == '\'' ? "''" : "\\\\", 2);
+        st = i + 1;
+    }
+    sb_add(b, (const char*)s + st, n - st);
+    sb_add(b, "'", 1);
+    return true;
+}
+
+static uint64_t rd_le(const uint8_t* p, int bytes) {
+    uint64_t v = 0;
+    for (int i = 0; i < bytes; i++) v |= (uint64_t)p[i] << (8 * i);
+    return v;
+}
+
+// un valore in formato binario -> letterale SQL in lit; false se il pacchetto è troncato
+static bool param_literal(Sb* lit, unsigned type, bool is_unsigned, const uint8_t* p, size_t n, size_t* pos, char* err, size_t en) {
+    char tmp[96];
+    int w = 0;
+    switch (type) {
+        case 0x06: sb_str(lit, "NULL"); return true;                  // MYSQL_TYPE_NULL
+        case 0x01: w = 1; break;                                       // TINY
+        case 0x02: case 0x0d: w = 2; break;                            // SHORT, YEAR
+        case 0x03: case 0x09: w = 4; break;                            // LONG, INT24
+        case 0x08: w = 8; break;                                       // LONGLONG
+        case 0x04: {                                                   // FLOAT
+            if (*pos + 4 > n) goto trunc;
+            uint32_t b = (uint32_t)rd_le(p + *pos, 4); float f; memcpy(&f, &b, 4); *pos += 4;
+            snprintf(tmp, sizeof(tmp), "%.9g", (double)f);
+            goto number;
+        }
+        case 0x05: {                                                   // DOUBLE
+            if (*pos + 8 > n) goto trunc;
+            uint64_t b = rd_le(p + *pos, 8); double d; memcpy(&d, &b, 8); *pos += 8;
+            snprintf(tmp, sizeof(tmp), "%.17g", d);
+            goto number;
+        }
+        case 0x07: case 0x0a: case 0x0c: {                             // TIMESTAMP, DATE, DATETIME
+            if (*pos >= n) goto trunc;
+            unsigned l = p[(*pos)++];
+            if (*pos + l > n) goto trunc;
+            const uint8_t* d = p + *pos;
+            unsigned y = l >= 4 ? (unsigned)rd_le(d, 2) : 0, mo = l >= 4 ? d[2] : 0, dd = l >= 4 ? d[3] : 0;
+            unsigned h = l >= 7 ? d[4] : 0, mi = l >= 7 ? d[5] : 0, s = l >= 7 ? d[6] : 0;
+            unsigned long us = l >= 11 ? (unsigned long)rd_le(d + 7, 4) : 0;
+            *pos += l;
+            if (type == 0x0a) snprintf(tmp, sizeof(tmp), "'%04u-%02u-%02u'", y, mo, dd);
+            else if (us) snprintf(tmp, sizeof(tmp), "'%04u-%02u-%02u %02u:%02u:%02u.%06lu'", y, mo, dd, h, mi, s, us);
+            else snprintf(tmp, sizeof(tmp), "'%04u-%02u-%02u %02u:%02u:%02u'", y, mo, dd, h, mi, s);
+            sb_str(lit, tmp);
+            return true;
+        }
+        case 0x0b: {                                                   // TIME
+            if (*pos >= n) goto trunc;
+            unsigned l = p[(*pos)++];
+            if (*pos + l > n) goto trunc;
+            const uint8_t* d = p + *pos;
+            bool neg = l >= 8 && d[0];
+            unsigned long days = l >= 8 ? (unsigned long)rd_le(d + 1, 4) : 0;
+            unsigned h = l >= 8 ? d[5] : 0, mi = l >= 8 ? d[6] : 0, s = l >= 8 ? d[7] : 0;
+            *pos += l;
+            snprintf(tmp, sizeof(tmp), "'%s%02lu:%02u:%02u'", neg ? "-" : "", days * 24 + h, mi, s);
+            sb_str(lit, tmp);
+            return true;
+        }
+        default: {                                                     // stringhe, BLOB, DECIMAL, JSON, ...
+            uint64_t l;
+            if (!rd_lenenc(p, n, pos, &l) || *pos + l > n) goto trunc;
+            const uint8_t* s = p + *pos;
+            *pos += (size_t)l;
+            if (type == 0xf6 || type == 0x00) {                        // DECIMAL: numero, se lo è davvero
+                bool num = l > 0 && l < sizeof(tmp);
+                for (uint64_t i = 0; num && i < l; i++)
+                    if (!isdigit(s[i]) && s[i] != '.' && s[i] != '-' && s[i] != '+' && s[i] != 'e' && s[i] != 'E') num = false;
+                if (num) { memcpy(tmp, s, (size_t)l); tmp[l] = '\0'; goto number; }
+            }
+            if (!sb_quoted(lit, s, (size_t)l)) { snprintf(err, en, "parameter values cannot contain NUL bytes"); return false; }
+            return true;
+        }
+    }
+    if (*pos + (size_t)w > n) goto trunc;
+    {
+        uint64_t u = rd_le(p + *pos, w);
+        *pos += (size_t)w;
+        if (is_unsigned) snprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)u);
+        else {
+            long long v = w == 1 ? (int8_t)u : w == 2 ? (int16_t)u : w == 4 ? (int32_t)u : (long long)u;
+            snprintf(tmp, sizeof(tmp), "%lld", v);
+        }
+    }
+number:
+    if (!strcmp(tmp, "inf") || !strcmp(tmp, "-inf") || !strcmp(tmp, "nan") || !strcmp(tmp, "-nan")) { sb_str(lit, "NULL"); return true; }
+    if (tmp[0] == '-') { sb_str(lit, "("); sb_str(lit, tmp); sb_str(lit, ")"); }   // "x-?" con -5 non diventa un commento
+    else sb_str(lit, tmp);
+    return true;
+trunc:
+    snprintf(err, en, "malformed COM_STMT_EXECUTE packet");
+    return false;
+}
+
+typedef struct { const char* sql; Sb* out; size_t last; char** lits; int k; } Subst;
+static void subst_at(void* ctx, size_t at) {
+    Subst* s = ctx;
+    sb_add(s->out, s->sql + s->last, at - s->last);
+    sb_str(s->out, s->lits[s->k++]);
+    s->last = at + 1;
+}
+
+char* mw_bind_execute(const char* sql, const uint8_t* p, size_t n, int nparams, uint8_t* types,
+                      bool* types_set, MwLongData* ld, char* err, size_t en) {
+    // p: dopo il comando e l'id (flag u8, iteration_count u32, poi i parametri)
+    size_t pos = 5;
+    if (n < pos) { snprintf(err, en, "malformed COM_STMT_EXECUTE packet"); return NULL; }
+    char** lits = calloc((size_t)(nparams > 0 ? nparams : 1), sizeof(char*));
+    if (!lits) { snprintf(err, en, "out of memory"); return NULL; }
+    char* res = NULL;
+    if (nparams > 0) {
+        size_t nb = ((size_t)nparams + 7) / 8;
+        if (pos + nb + 1 > n) { snprintf(err, en, "malformed COM_STMT_EXECUTE packet"); goto out; }
+        const uint8_t* nulls = p + pos;
+        pos += nb;
+        if (p[pos++]) {                                    // new_params_bound_flag: tipi nuovi
+            if (pos + 2 * (size_t)nparams > n) { snprintf(err, en, "malformed COM_STMT_EXECUTE packet"); goto out; }
+            memcpy(types, p + pos, 2 * (size_t)nparams);
+            pos += 2 * (size_t)nparams;
+            *types_set = true;
+        }
+        if (!*types_set) { snprintf(err, en, "no parameter types were sent for the prepared statement"); goto out; }
+        for (int i = 0; i < nparams; i++) {
+            Sb lit = {0};
+            if (ld && ld[i].set) {                         // valore mandato con COM_STMT_SEND_LONG_DATA
+                if (!sb_quoted(&lit, (const uint8_t*)(ld[i].p ? ld[i].p : ""), ld[i].n)) {
+                    snprintf(err, en, "parameter values cannot contain NUL bytes"); free(lit.p); goto out;
+                }
+            } else if (nulls[i / 8] & (1u << (i % 8))) sb_str(&lit, "NULL");
+            else if (!param_literal(&lit, types[2 * i], (types[2 * i + 1] & 0x80) != 0, p, n, &pos, err, en)) { free(lit.p); goto out; }
+            if (lit.oom || !lit.p) { free(lit.p); snprintf(err, en, "out of memory"); goto out; }
+            lits[i] = lit.p;
+        }
+    }
+    {
+        Sb o = {0};
+        Subst st = { sql, &o, 0, lits, 0 };
+        int found = scan_params(sql, subst_at, &st);
+        sb_add(&o, sql + st.last, strlen(sql + st.last));
+        if (found != nparams) { free(o.p); snprintf(err, en, "the statement changed: %d placeholders, %d expected", found, nparams); goto out; }
+        if (o.oom) { free(o.p); snprintf(err, en, "out of memory"); goto out; }
+        res = o.p ? o.p : strdup("");
+    }
+out:
+    for (int i = 0; i < nparams; i++) free(lits[i]);
+    free(lits);
+    return res;
+}
+
+typedef struct { const char* sql; Sb* out; size_t last; } Nulls;
+static void null_at(void* ctx, size_t at) {
+    Nulls* s = ctx;
+    sb_add(s->out, s->sql + s->last, at - s->last);
+    sb_str(s->out, "NULL");
+    s->last = at + 1;
+}
+
+char* mw_with_nulls(const char* sql) {
+    Sb o = {0};
+    Nulls st = { sql, &o, 0 };
+    scan_params(sql, null_at, &st);
+    sb_add(&o, sql + st.last, strlen(sql + st.last));
+    if (o.oom) { free(o.p); return NULL; }
+    return o.p ? o.p : strdup("");
+}
+
+// ── autocommit ───────────────────────────────────────────────────
+
+int mw_set_autocommit(const char* sql) {
+    const char* p = sql;
+    if (!word(&p, "SET")) return -1;
+    if (!word(&p, "SESSION")) word(&p, "LOCAL");
+    p = skip_ws(p);
+    if (p[0] == '@' && p[1] == '@') {
+        p += 2;
+        if (!strncasecmp(p, "session.", 8)) p += 8;
+        else if (!strncasecmp(p, "local.", 6)) p += 6;
+    }
+    if (!word(&p, "autocommit")) return -1;
+    p = skip_ws(p);
+    if (*p == '=') p++;
+    else if (p[0] == ':' && p[1] == '=') p += 2;
+    else return -1;
+    int v = -1;
+    const char* q = p;
+    if (word(&q, "1") || word(&q, "ON") || word(&q, "TRUE")) v = 1;
+    else if (q = p, word(&q, "0") || word(&q, "OFF") || word(&q, "FALSE")) v = 0;
+    else {
+        q = skip_ws(p);
+        if (*q == '\'') {
+            if (!strncasecmp(q, "'ON'", 4) || !strncmp(q, "'1'", 3)) v = 1;
+            else if (!strncasecmp(q, "'OFF'", 5) || !strncmp(q, "'0'", 3)) v = 0;
+            if (v >= 0) q = strchr(q + 1, '\'') + 1;
+        }
+    }
+    if (v < 0) return -1;
+    q = skip_ws(q);
+    if (*q == ';') q = skip_ws(q + 1);
+    return *q ? -1 : v;                                    // SET autocommit = 0, x = 1: non qui
+}
+
+int mw_stmt_kind(const char* sql) {
+    const char* p = sql;
+    if (word(&p, "COMMIT")) return MW_KIND_COMMIT;
+    p = sql;
+    if (word(&p, "ROLLBACK")) { word(&p, "WORK"); return word(&p, "TO") ? MW_KIND_OTHER : MW_KIND_ROLLBACK; }
+    static const char* const DML[] = { "INSERT", "UPDATE", "DELETE", "REPLACE", "CALL" };
+    for (size_t i = 0; i < sizeof(DML) / sizeof(DML[0]); i++) { p = sql; if (word(&p, DML[i])) return MW_KIND_DML; }
+    return MW_KIND_OTHER;
 }

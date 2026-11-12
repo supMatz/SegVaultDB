@@ -47,6 +47,10 @@ SCOPO: protocollo di rete di MySQL (client/server protocol 4.1) per segvault-ser
 #define MW_COM_FIELD_LIST  0x04
 #define MW_COM_PING        0x0e
 #define MW_COM_STMT_PREPARE 0x16
+#define MW_COM_STMT_EXECUTE 0x17
+#define MW_COM_STMT_SEND_LONG_DATA 0x18
+#define MW_COM_STMT_CLOSE  0x19
+#define MW_COM_STMT_RESET  0x1a
 #define MW_COM_RESET_CONNECTION 0x1f
 
 // pacchetti in uscita: header (3 byte di lunghezza + numero di sequenza) e contenuto
@@ -89,5 +93,25 @@ bool mw_parse_login(const uint8_t* p, size_t n, MwLogin* out);
 // istruzioni che i driver mandano all'avvio e che SegVault non ha (SET NAMES, SELECT @@version,
 // SHOW VARIABLES, SHOW WARNINGS, ...): se la riconosce scrive la risposta e restituisce true
 bool mw_client_noise(MwOut* o, const char* sql, unsigned status);
+
+// prepared statement: il testo resta com'è, a ogni EXECUTE i '?' diventano letterali SQL
+int  mw_count_params(const char* sql);                    // '?' fuori da stringhe e commenti
+char* mw_with_nulls(const char* sql);                     // i '?' sostituiti da NULL (da liberare)
+// COM_STMT_PREPARE_OK: meta (se c'è) dà le colonne del risultato
+void mw_prepare_ok(MwOut* o, uint32_t id, int nparams, const QueryResult* meta, const char* db, unsigned status);
+// risultato in formato binario (risposta a COM_STMT_EXECUTE)
+void mw_resultset_binary(MwOut* o, const QueryResult* r, const char* db, unsigned status);
+// valore di un parametro arrivato a pezzi con COM_STMT_SEND_LONG_DATA
+typedef struct { char* p; size_t n; bool set; } MwLongData;
+// p, n: il pacchetto COM_STMT_EXECUTE dopo comando e id; types (2 byte per parametro) e
+// types_set restano fra un EXECUTE e l'altro; ld: NULL o un valore per parametro.
+// Restituisce l'SQL con i valori (da liberare) o NULL con il motivo in err
+char* mw_bind_execute(const char* sql, const uint8_t* p, size_t n, int nparams, uint8_t* types,
+                      bool* types_set, MwLongData* ld, char* err, size_t en);
+
+// SET [SESSION] autocommit = 0 | 1 (anche @@session.autocommit, ON / OFF): 0 o 1, -1 se non è questo
+int mw_set_autocommit(const char* sql);
+enum { MW_KIND_OTHER, MW_KIND_COMMIT, MW_KIND_ROLLBACK, MW_KIND_DML };
+int mw_stmt_kind(const char* sql);                        // COMMIT, ROLLBACK (non TO), INSERT/UPDATE/DELETE/...
 
 #endif

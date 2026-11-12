@@ -503,6 +503,15 @@ int main(void) {
     t("SELECT COUNT(*) FROM u WHERE id = 100", "0");
     t("INSERT INTO u VALUES (100, 1, 1, 'r')", "OK:1");
     t("SELECT label FROM u WHERE id = 100", "r");
+    // sintassi di MySQL: START TRANSACTION, WORK, ROLLBACK TO SAVEPOINT
+    t("START TRANSACTION READ WRITE", "OK:0");
+    t("INSERT INTO u VALUES (101, 1, 1, 's')", "OK:1");
+    t("SAVEPOINT a", "OK:0");
+    t("INSERT INTO u VALUES (102, 1, 1, 's')", "OK:1");
+    t("ROLLBACK WORK TO SAVEPOINT a", "OK:0");
+    t("COMMIT WORK", "OK:0");
+    t("SELECT COUNT(*) FROM u WHERE id IN (101, 102)", "1");
+    t("DELETE FROM u WHERE id = 101", "OK:1");
 
     // ── EXPLAIN ──
     t("EXPLAIN SELECT * FROM u WHERE id = 4",
