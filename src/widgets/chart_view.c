@@ -175,8 +175,9 @@ void chart_draw(PlatformWindow* win, Rect area, const QueryResult* r, const int*
     if (hover >= 0) platform_fill_rect(win, (Rect){plot.x + (int)(hover * slot), plot.y, (int)ceil(slot), plot.h}, ui_alpha(TH_HOVER, 160));
     if (!m->line) {
         // barre raggruppate: sottili, 2 px fra le barre, estremità arrotondate
-        double group = slot * 0.72;
-        double bw = group / m->nseries;
+        double bw = slot * 0.72 / m->nseries;
+        if (bw > 36) bw = 36;                              // barre sottili anche con pochi valori
+        double group = bw * m->nseries;
         for (int i = 0; i < nrows; i++)
             for (int s = 0; s < m->nseries; s++) {
                 bool ok;
@@ -189,7 +190,7 @@ void chart_draw(PlatformWindow* win, Rect area, const QueryResult* r, const int*
                 Rect b = v >= 0 ? (Rect){x0, y, w, zero - y} : (Rect){x0, zero, w, y - zero};
                 if (b.h < 1) b.h = 1;
                 Color c = series_color(s, dark);
-                if (hover >= 0 && hover != i) c = ui_alpha(c, 150);
+                if (hover >= 0 && hover != i) c = ui_mix(c, TH_SURFACE, 0.45f);   // colore pieno: niente sovrapposizioni visibili
                 if (b.h > 6 && w > 6) {
                     platform_fill_rect_rounded(win, b, c, 3);
                     // estremità dalla parte dello zero: squadrata

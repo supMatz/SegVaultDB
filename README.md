@@ -285,6 +285,15 @@ rispettano la tabella resta com'era. La chiave primaria di una tabella esistente
 - `Ctrl+F` sulla griglia, o il campo nell'intestazione, filtra le righe;
 - tasto destro: copia di cella, riga, colonna o valore come letterale SQL, filtri, ordinamento, export.
 
+**Query salvate:** *Query › Save query…* salva con un nome lo statement sotto il cursore (o la
+selezione); *Query › Saved queries* le elenca: doppio clic o Invio le inserisce nell'editor, Canc le
+toglie. Stanno in `<dati>/saved_queries.sql`, un normale script SQL.
+
+**Grafici:** il pulsante *Chart* sopra i risultati disegna le colonne numeriche (fino a quattro
+serie) rispetto alla prima colonna di testo: barre per pochi valori, linee per molti (*Bars* /
+*Lines* per cambiare), valore sotto il mouse, colori leggibili anche da chi non distingue i colori.
+Segue il filtro e l'ordinamento della griglia.
+
 **Chiavi esterne dalla griglia:** Ctrl+clic su un valore di chiave esterna (o tasto destro → *Open
 referenced row*) apre la riga riferita; su una chiave primaria, *Show rows that reference this*
 mostra le righe che la riferiscono.
@@ -330,6 +339,8 @@ delle richieste al posto dei risultati.
 │ PORT [−][8484][+]│ 21:51:51  127.0.0.1  POST   /api/v1/query  400   0.1  Table … not found│
 │ REACHABLE FROM │                                                     │
 │ TOKEN          │                                                     │
+│ USER LOGIN     │                                                     │
+│ MYSQL PROTOCOL │                                                     │
 │ WEB APPS (CORS)│                                                     │
 │ TIME LIMIT     │                                                     │
 │ WEB FOLDER     │                                                     │
@@ -342,6 +353,7 @@ delle richieste al posto dei risultati.
 - **Indirizzi** da copiare: locale e, con *Local network*, quello raggiungibile dagli altri computer.
 - **Opzioni:** porta, *This computer* / *Local network*, *User login* (utente e password per ogni richiesta, con i permessi definiti in *Settings › Users & permissions*), token (obbligatorio in rete o con CORS; *Copy* e *New*, salvato in `<data>/server.token`), *Same origin* / *Any origin* per le web app, limite di tempo. Una modifica riavvia il server.
 - **Registro** in tempo reale delle ultime 200 richieste, con l'SQL così come è stato inviato (con i `?`: i valori dei parametri, come password o dati personali, non compaiono a schermo).
+- **MySQL protocol** (*Port 3306*): le app PHP, Python e Java e il client `mysql` si collegano come a MySQL (`127.0.0.1:3306`); l'indirizzo `mysql://` compare fra quelli da copiare. Se la porta è occupata (MySQL o XAMPP già avviati) il pannello lo dice.
 - **Web folder:** una cartella con il sito (come la `htdocs` di XAMPP) viene servita su `/` insieme all'API su `/api/v1`, sulla stessa porta e quindi senza CORS; *Open site* lo apre nel browser. Il percorso è salvato in `<data>/server.ini`.
 - **Monitor** (scheda accanto a *Requests*): richieste al secondo, tempo medio e p95, percentuale di
   errori, righe inviate, connessioni aperte e percentuale di pagine trovate in cache; due grafici degli
@@ -1304,8 +1316,7 @@ Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
    permessi; registro di audit (`--audit`); servizio systemd e avvio automatico su Windows; HTTPS tramite
    reverse proxy (documentato). Da fare: HTTPS integrato senza proxy.
 6. **GUI** — fatto: navigazione delle chiavi esterne dalla griglia (Ctrl+clic), backup e ripristino
-   dal menu File, export XLSX e PDF. Da fare: costruttore visuale di query, grafici dai
-   risultati, editor di trigger e viste, manutenzione delle tabelle, query salvate.
+   dal menu File, export XLSX e PDF, grafici dai risultati, query salvate, protocollo MySQL dal pannello del server. Da fare: costruttore visuale di query, editor di trigger e viste, manutenzione delle tabelle.
 7. **Portata** — interfaccia web, versione macOS, interfaccia in italiano e altre lingue, accessibilità.
 
 ## Licenza

@@ -56,7 +56,7 @@ typedef enum { STATUS_IDLE, STATUS_OK, STATUS_ERROR, STATUS_INFO } StatusKind;
 
 // barra comandi sovrapposta all'editor
 typedef enum { BAR_NONE, BAR_FIND, BAR_GOTO, BAR_OPEN, BAR_SAVE_AS, BAR_EXPORT,
-               BAR_IMPORT_CSV, BAR_RUN_FILE, BAR_DUMP, BAR_SEARCH_DB, BAR_BACKUP, BAR_RESTORE } BarMode;
+               BAR_IMPORT_CSV, BAR_RUN_FILE, BAR_DUMP, BAR_SEARCH_DB, BAR_BACKUP, BAR_RESTORE, BAR_SAVE_QUERY } BarMode;
 
 #define HISTORY_MAX 500
 
@@ -68,6 +68,10 @@ typedef struct {
     int    rows;            // righe restituite o modificate
     double ms;
 } HistoryEntry;
+
+// query salvata con un nome (<dati>/saved_queries.sql)
+#define SAVED_MAX 200
+typedef struct { char name[80]; char* sql; } SavedQuery;
 
 typedef enum {
     BAR_BTN_TOGGLE_REPLACE, BAR_BTN_CASE, BAR_BTN_WORD, BAR_BTN_PREV, BAR_BTN_NEXT, BAR_BTN_CLOSE,
@@ -219,6 +223,9 @@ typedef struct {
     Rect         eb_add, eb_save, eb_discard;   // pulsanti nell'intestazione dei risultati
     Rect         eb_chart, eb_chart_kind;       // Chart / Table e Bars / Lines
     bool         chart_on;                      // risultati come grafico
+    SavedQuery   saved[SAVED_MAX];
+    int          saved_count;
+    bool         list_saved;                    // la lista mostrata (showing_history) è quella delle query salvate
     ChartModel   chart;
 
     // -- stato --

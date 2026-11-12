@@ -23,6 +23,7 @@
 
 static void refresh_tree(AppWindow* app);
 static Cell* grid_cell(AppWindow* app);
+static bool grid_ready(const AppWindow* app);
 static void update_session(AppWindow* app);
 static bool busy_guard(AppWindow* app);
 static void finish_run(AppWindow* app);
@@ -153,6 +154,7 @@ static void set_result_tabs(AppWindow* app, QueryResult** rs, int n, int select)
     app->cur_tab  = n ? SV_CLAMP(select, 0, n - 1) : 0;
     app->last_result = n ? app->tabs[app->cur_tab] : NULL;
     app->showing_history = false;
+    app->list_saved = false;
     app->cell_open = false;
     app->ctx_kind  = 0;
     if (app->filter_input && app->filter_input->text[0]) line_edit_set_text(app->filter_input, "");
@@ -386,6 +388,130 @@ static void history_load(AppWindow* app) {
     free(buf);
 }
 
+// ── query salvate ────────────────────────────────────────────────
+
+#define SAVED_FILE "saved_queries.sql"
+#define SAVED_MARK "-- @saved "
+
+static void saved_write(AppWindow* app) {
+    if (!app->data_dir[0]) return;
+    char path[1100], tmp[1110];
+    join_path(path, sizeof(path), app->data_dir, SAVED_FILE);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE* f = fopen(tmp, "wb");
+    if (!f) return;
+    fprintf(f, "-- SegVault saved queries (Query > Saved queries)\n");
+    for (int i = 0; i < app->saved_count; i++) fprintf(f, SAVED_MARK "%s\n%s\n", app->saved[i].name, app->saved[i].sql);
+    bool ok = fclose(f) == 0;
+    remove(path);
+    if (ok) rename(tmp, path);
+}
+
+static void saved_load(AppWindow* app) {
+    char path[1100];
+    join_path(path, sizeof(path), app->data_dir, SAVED_FILE);
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* buf = size > 0 && size < (16 << 20) ? malloc((size_t)size + 1) : NULL;
+    size_t n = buf ? fread(buf, 1, (size_t)size, f) : 0;
+    fclose(f);
+    if (!buf) return;
+    buf[n] = '\0';
+    size_t ml = strlen(SAVED_MARK);
+    char* p = strstr(buf, SAVED_MARK);
+    while (p && app->saved_count < SAVED_MAX) {
+        char* name = p + ml;
+        char* body = strchr(name, '\n');
+        if (!body) break;
+        *body++ = '\0';
+        char* next = strstr(body, "\n" SAVED_MARK);
+        char* end = next ? next : body + strlen(body);
+        while (end > body && isspace((unsigned char)end[-1])) end--;
+        SavedQuery* q = &app->saved[app->saved_count];
+        snprintf(q->name, sizeof(q->name), "%.79s", name);
+        q->sql = malloc((size_t)(end - body) + 1);
+        if (q->sql) { memcpy(q->sql, body, (size_t)(end - body)); q->sql[end - body] = '\0'; app->saved_count++; }
+        p = next ? next + 1 : NULL;
+    }
+    free(buf);
+}
+
+static QueryResult* make_grid(const char* const* cols, const char* const* types, int ncols, int nrows);
+
+static void saved_show(AppWindow* app) {
+    static const char* const cols[]  = { "name", "statement" };
+    static const char* const types[] = { "", "" };
+    QueryResult* r = make_grid(cols, types, 2, app->saved_count);
+    if (!r) return;
+    for (int i = 0; i < app->saved_count; i++) {
+        char stmt[512];
+        int k = 0;
+        bool sp = false;
+        for (const char* s = app->saved[i].sql; *s && k < (int)sizeof(stmt) - 4; s++) {
+            if (isspace((unsigned char)*s)) { if (!sp && k) stmt[k++] = ' '; sp = true; }
+            else { stmt[k++] = *s; sp = false; }
+        }
+        stmt[k] = '\0';
+        const char* vals[2] = { app->saved[i].name, stmt };
+        if (!db_row_set(&r->rows[i], 2, vals, NULL)) break;
+        r->num_rows++;
+    }
+    show_result(app, r);
+    app->showing_history = true;
+    app->list_saved = true;
+    char meta[64];
+    snprintf(meta, sizeof(meta), "%d quer%s", app->saved_count, app->saved_count == 1 ? "y" : "ies");
+    set_status(app, STATUS_INFO, app->saved_count ? "Saved queries \xc2\xb7 double-click or Enter inserts it into the editor, Del removes it"
+                                                  : "No saved queries yet: Query \xe2\x80\xba Save query\xe2\x80\xa6 stores the statement under the cursor", meta);
+}
+
+// salva lo statement sotto il cursore (o la selezione) con un nome; un nome uguale lo sostituisce
+static bool saved_add(AppWindow* app, const char* name_in) {
+    char name[80];
+    while (*name_in == ' ') name_in++;
+    snprintf(name, sizeof(name), "%.79s", name_in);
+    size_t nl = strlen(name);
+    while (nl && name[nl - 1] == ' ') name[--nl] = '\0';
+    for (char* c = name; *c; c++) if (*c == '\n' || *c == '\r') *c = ' ';
+    if (!nl) return false;
+    char* text = NULL;
+    if (textbox_get_run_text(app->editor, &text) < 0 || !text) {
+        set_status(app, STATUS_INFO, "Nothing to save: put the cursor on a statement (or select it)", "");
+        free(text);
+        return false;
+    }
+    int idx = -1;
+    for (int i = 0; i < app->saved_count; i++) if (!strcasecmp(app->saved[i].name, name)) idx = i;
+    if (idx < 0) {
+        if (app->saved_count >= SAVED_MAX) { free(text); set_status(app, STATUS_ERROR, "Too many saved queries", ""); return false; }
+        idx = app->saved_count++;
+        snprintf(app->saved[idx].name, sizeof(app->saved[idx].name), "%s", name);
+    } else free(app->saved[idx].sql);
+    app->saved[idx].sql = text;
+    saved_write(app);
+    char msg[160];
+    snprintf(msg, sizeof(msg), "Saved as '%.80s' (Query \xe2\x80\xba Saved queries)", name);
+    set_status(app, STATUS_OK, msg, "");
+    return true;
+}
+
+static void saved_delete(AppWindow* app, int row) {
+    if (row < 0 || row >= app->saved_count) return;
+    char msg[160];
+    snprintf(msg, sizeof(msg), "Removed '%.80s'", app->saved[row].name);
+    free(app->saved[row].sql);
+    memmove(&app->saved[row], &app->saved[row + 1], sizeof(SavedQuery) * (size_t)(app->saved_count - row - 1));
+    app->saved_count--;
+    saved_write(app);
+    int sel = app->results->selected_row;
+    saved_show(app);
+    if (app->saved_count) app->results->selected_row = SV_MIN(sel, app->saved_count - 1);
+    set_status(app, STATUS_OK, msg, "");
+}
+
 // risultato sintetico (stesse regole di allocazione di db_result_free)
 static QueryResult* make_grid(const char* const* cols, const char* const* types, int ncols, int nrows) {
     QueryResult* r = calloc(1, sizeof(QueryResult));
@@ -430,6 +556,7 @@ static void history_show(AppWindow* app) {
     }
     show_result(app, r);
     app->showing_history = true;
+    app->list_saved = false;
     char meta[64];
     snprintf(meta, sizeof(meta), "%d entr%s", n, n == 1 ? "y" : "ies");
     set_status(app, STATUS_INFO, n ? "Query history \xc2\xb7 double-click or Enter inserts the statement into the editor"
@@ -458,8 +585,15 @@ static void on_results_activate(int row, void* ud) {
         return;
     }
     row = table_view_source_row(app->results, row);              // griglia filtrata / ordinata
-    if (row < 0 || row >= app->history_count) return;
-    const HistoryEntry* e = &app->history[app->history_count - 1 - row];
+    const char* src_sql;
+    if (app->list_saved) {
+        if (row < 0 || row >= app->saved_count) return;
+        src_sql = app->saved[row].sql;
+    } else {
+        if (row < 0 || row >= app->history_count) return;
+        src_sql = app->history[app->history_count - 1 - row].sql;
+    }
+    struct { const char* sql; } e0 = { src_sql }, *e = &e0;
     size_t n = strlen(e->sql);
     char* text = malloc(n + 3);
     if (!text) return;
@@ -877,6 +1011,7 @@ static const char* bar_label(const AppWindow* app) {
         case BAR_BACKUP:  return "Backup all data";
         case BAR_RESTORE: return "Restore backup";
         case BAR_SEARCH_DB: return "Search in database";
+        case BAR_SAVE_QUERY: return "Save query as";
         default:       return NULL;
     }
 }
@@ -958,6 +1093,10 @@ static void bar_open(AppWindow* app, BarMode mode, bool replace) {
         join_path(buf, sizeof(buf), app->data_dir[0] ? app->data_dir : ".", "result.csv");
         line_edit_set_text(app->bar_input, buf);
         app->bar_input->placeholder = "File path: .csv .tsv .json .md .html .sql .xlsx .pdf choose the format";
+        textbox_set_search(app->editor, NULL, false, false);
+    } else if (mode == BAR_SAVE_QUERY) {
+        line_edit_set_text(app->bar_input, "");
+        app->bar_input->placeholder = "Name for the statement under the cursor (or the selection)";
         textbox_set_search(app->editor, NULL, false, false);
     } else if (mode == BAR_SEARCH_DB) {
         char* w = textbox_word_or_selection(app->editor);
@@ -1106,6 +1245,9 @@ static void bar_submit(AppWindow* app, bool shift, bool ctrl) {
             }
             break;
         }
+        case BAR_SAVE_QUERY:
+            if (saved_add(app, in->text)) bar_close(app); else in->error = true;
+            break;
         case BAR_SEARCH_DB: {
             if (!in->text[0]) { in->error = true; return; }
             if (busy_guard(app)) return;
@@ -1948,6 +2090,12 @@ static bool gedit_handle_event(AppWindow* app, sEvent* evt) {
                 return false;
         }
     }
+    // lista delle query salvate: Canc ne toglie una
+    if (tv->base.state == WIDGET_STATE_FOCUSED && app->showing_history && app->list_saved && evt->type == EVT_KEY_DOWN &&
+        evt->key == KEY_DELETE && !(evt->modifiers & (SV_MOD_CTRL | SV_MOD_ALT)) && grid_has_row(app)) {
+        saved_delete(app, table_view_source_row(tv, tv->selected_row));
+        return true;
+    }
     // griglia con il focus: F2 / un carattere modificano, Canc elimina, Ctrl+Invio salva la riga nuova
     if (tv->base.state != WIDGET_STATE_FOCUSED || !grid_ready(app) || app->showing_history) return false;
     if (evt->type == EVT_KEY_DOWN) {
@@ -2263,7 +2411,7 @@ typedef enum {
     CTX_SORT_ASC, CTX_SORT_DESC, CTX_SORT_CLEAR, CTX_FIT_COL, CTX_COPY_ALL, CTX_EXPORT,
     CTX_FILTER_VALUE, CTX_FILTER_ROWS, CTX_FILTER_CLEAR,
     CTX_EDIT_CELL, CTX_SET_NULL, CTX_ADD_ROW, CTX_SAVE_ROW, CTX_DISCARD_ROW, CTX_DELETE_ROW,
-    CTX_FK_PARENT, CTX_FK_CHILDREN,
+    CTX_FK_PARENT, CTX_FK_CHILDREN, CTX_SAVE_QUERY, CTX_SAVED_LIST,
     // editor
     CTX_CUT, CTX_COPY, CTX_PASTE, CTX_SELECT_ALL, CTX_RUN, CTX_RUN_STMT, CTX_FORMAT, CTX_COMMENT,
     // File
@@ -2368,6 +2516,8 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
     [CTX_COPY_SQL]      = { "Copy results as SQL INSERTs", NULL },
     [CTX_EDIT_CELL]     = { "Edit cell",                 "F2" },
     [CTX_FK_PARENT]     = { "Open referenced row",       "Ctrl+Click" },
+    [CTX_SAVE_QUERY]    = { "Save query\xe2\x80\xa6",       NULL },
+    [CTX_SAVED_LIST]    = { "Saved queries",             NULL },
     [CTX_FK_CHILDREN]   = { "Show rows that reference this", NULL },
     [CTX_SET_NULL]      = { "Set to NULL",               NULL },
     [CTX_ADD_ROW]       = { "Add row",                   NULL },
@@ -2421,7 +2571,7 @@ static const int M_VIEW[] = { CTX_PAGE_SQL, CTX_PAGE_DESIGNER, CTX_SEP, CTX_TOGG
 static const int M_QUERY[] = { CTX_RUN, CTX_RUN_STMT, CTX_EXPLAIN, CTX_STOP, CTX_SEP, CTX_BEGIN, CTX_COMMIT, CTX_ROLLBACK,
                                CTX_SEP, CTX_SNIP_SELECT, CTX_SNIP_JOIN, CTX_SNIP_GROUP, CTX_SNIP_INSERT, CTX_SNIP_UPDATE,
                                CTX_SNIP_DELETE, CTX_SNIP_CREATE, CTX_SEP, CTX_NEW_TABLE, CTX_EDIT_STRUCTURE, CTX_SEP,
-                               CTX_SEARCH_DB, CTX_DB_OVERVIEW };
+                               CTX_SEARCH_DB, CTX_DB_OVERVIEW, CTX_SEP, CTX_SAVE_QUERY, CTX_SAVED_LIST };
 static const int M_IMPORT[] = { CTX_IMPORT_CSV, CTX_SEP, CTX_OPEN, CTX_RUN_FILE };
 static const int M_EXPORT[] = { CTX_EXPORT_XLSX, CTX_EXPORT_PDF, CTX_EXPORT_CSV, CTX_EXPORT_TSV, CTX_EXPORT_JSON, CTX_EXPORT_MD,
                                 CTX_EXPORT_HTML, CTX_EXPORT_SQL, CTX_SEP, CTX_COPY_ALL, CTX_COPY_JSON, CTX_COPY_MD, CTX_COPY_SQL, CTX_SEP,
@@ -3126,6 +3276,8 @@ static void ctx_run(AppWindow* app, int a) {
         case CTX_COPY_ALL:   copy_results_as(app, EXPORT_TSV); break;
         case CTX_EXPORT:     bar_open(app, BAR_EXPORT, false); break;
         case CTX_FK_PARENT: case CTX_FK_CHILDREN: fk_follow(app, a == CTX_FK_PARENT, true); break;
+        case CTX_SAVE_QUERY: bar_open(app, BAR_SAVE_QUERY, false); break;
+        case CTX_SAVED_LIST: saved_show(app); break;
         case CTX_FILTER_VALUE: {
             Cell* c = grid_cell(app);
             const char* name = tv->result->col_names[tv->selected_col];
@@ -5554,6 +5706,7 @@ void app_window_destroy(AppWindow* app) {
     widget_destroy((Widget*)app->btn_format);
     widget_destroy((Widget*)app->btn_history);
     for (int i = 0; i < app->history_count; i++) free(app->history[i].sql);
+    for (int i = 0; i < app->saved_count; i++) free(app->saved[i].sql);
     widget_destroy((Widget*)app->lbl_db_name);
     widget_destroy((Widget*)app->tree);
     widget_destroy((Widget*)app->tree_scroll);
@@ -5589,6 +5742,7 @@ void app_window_set_data_dir(AppWindow* app, const char* dir) {
     server_panel_set_paths(app->server, dir, app->settings_path);
     schema_view_set_data_dir(app->schema, dir);
     history_load(app);
+    saved_load(app);
     if (!g_settings.restore_session) {
         if (!have_settings) settings_store(app);
         return;

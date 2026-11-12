@@ -153,7 +153,7 @@ ViewAction start_screen_event(StartScreen* s, const sEvent* evt) {
 enum {
     HIT_COPY_URL, HIT_COPY_LAN, HIT_PORT_MINUS, HIT_PORT_PLUS, HIT_ACCESS_LOCAL, HIT_ACCESS_LAN,
     HIT_TOKEN_OFF, HIT_TOKEN_ON, HIT_COPY_TOKEN, HIT_NEW_TOKEN, HIT_CORS_OFF, HIT_CORS_ON, HIT_TIME_MINUS,
-    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_TAB_REQ, HIT_TAB_MON, HIT_COUNT
+    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_TAB_REQ, HIT_TAB_MON, HIT_MYSQL_OFF, HIT_MYSQL_ON, HIT_COPY_MYSQL, HIT_COUNT
 };
 
 enum { ACT_NONE, ACT_TOGGLE, ACT_EDITOR, ACT_COPY };
@@ -168,7 +168,7 @@ struct ServerPanel {
     PlatformThread* thread;
     char            token[65];
     char            error[300];
-    char            url[96], lan_url[96];
+    char            url[96], lan_url[96], mysql_addr[96];
     SvStats         stats;
     SvLogEntry      log[SV_LOG_MAX];
     int             nlog;
@@ -325,9 +325,13 @@ bool server_panel_start(ServerPanel* p) {
         .timeout_ms  = g_settings.server_timeout * 1000,
         .quiet       = true,
         .require_login = g_settings.server_users != 0,
+        .mysql       = g_settings.server_mysql != 0,
+        .mysql_port  = 3306,
     };
     char err[256];
     p->srv = sv_server_start(&cfg, err, sizeof(err));
+    if (!p->srv && cfg.mysql && strstr(err, "MySQL"))
+        snprintf(err + strlen(err), sizeof(err) - strlen(err), " - is MySQL / XAMPP already running? Stop it or turn the MySQL protocol off");
     if (!p->srv) { snprintf(p->error, sizeof(p->error), "%s", err); return false; }
     p->thread = platform_thread_start(run_server_thread, p->srv);
     if (!p->thread) {
@@ -338,6 +342,8 @@ bool server_panel_start(ServerPanel* p) {
     }
     snprintf(p->url, sizeof(p->url), "http://127.0.0.1:%d/api/v1", sv_server_port(p->srv));
     snprintf(p->site_url, sizeof(p->site_url), "http://127.0.0.1:%d/", sv_server_port(p->srv));
+    p->mysql_addr[0] = '\0';
+    if (sv_server_mysql_port(p->srv)) snprintf(p->mysql_addr, sizeof(p->mysql_addr), "mysql://127.0.0.1:%d", sv_server_mysql_port(p->srv));
     char ip[64];
     p->lan_url[0] = '\0';
     if (g_settings.server_lan && sv_local_ip(ip, sizeof(ip)))
@@ -566,6 +572,11 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
             link_btn(p, HIT_COPY_LAN, (Rect){x + w - cw, y, cw, 24}, "Copy", true);
             y += 26;
         }
+        if (p->mysql_addr[0]) {
+            ui_text_clipped(win, p->mysql_addr, x, y + 4, w - cw - 4, TH_TEXT, TH_FONT_SMALL + 1, FONT_MONO);
+            link_btn(p, HIT_COPY_MYSQL, (Rect){x + w - cw, y, cw, 24}, "Copy", true);
+            y += 26;
+        }
     } else {
         y += text_wrap(win, p->error[0] ? p->error : "Not running. Press F5 or Start server.", x, y + 4, w,
                        p->error[0] ? TH_ERROR_TEXT : TH_TEXT_FAINT, TH_FONT_SMALL + 1) + 2;
@@ -608,6 +619,15 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
                                           : "No users yet: create them in Settings \xe2\x80\xba Users & permissions.",
                        x, y + 2, w, running || nu ? TH_TEXT_FAINT : TH_WARNING, TH_FONT_SMALL) + 2;
     }
+    y += 12;
+
+    y = section_label(win, "MYSQL PROTOCOL", x, y);
+    segmented(p, HIT_MYSQL_OFF, (Rect){x, y, w, 28}, "Off", "Port 3306", g_settings.server_mysql ? 1 : 0, true);
+    y += 28 + 4;
+    if (g_settings.server_mysql)
+        y += text_wrap(win, "PHP, Python, Java and the mysql client connect as to MySQL: host 127.0.0.1, port 3306, "
+                            "a user from Users & permissions (or root with the token as password).",
+                       x, y + 2, w, TH_TEXT_FAINT, TH_FONT_SMALL) + 2;
     y += 12;
 
     y = section_label(win, "WEB APPS (CORS)", x, y);
@@ -1183,6 +1203,10 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
         case HIT_USERS_OFF: case HIT_USERS_ON:
             if (g_settings.server_users != (hit == HIT_USERS_ON)) { g_settings.server_users = hit == HIT_USERS_ON; config_changed(p); }
             break;
+        case HIT_MYSQL_OFF: case HIT_MYSQL_ON:
+            if (g_settings.server_mysql != (hit == HIT_MYSQL_ON)) { g_settings.server_mysql = hit == HIT_MYSQL_ON; config_changed(p); }
+            break;
+        case HIT_COPY_MYSQL: copy_text(p, hit, p->mysql_addr); break;
         case HIT_COPY_TOKEN: copy_text(p, hit, p->token); break;
         case HIT_NEW_TOKEN:
             token_load(p, true);                        // le app con il token vecchio ricevono 401
