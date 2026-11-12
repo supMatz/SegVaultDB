@@ -1,4 +1,4 @@
-# 🗄️ SegVault — DBMS relazionale in C puro
+# 🗄️ SegVault - DBMS relazionale in C puro
 
 > Un DBMS relazionale scritto a mano in C, senza dipendenze: parser SQL, executor con ottimizzatore,
 > storage a pagine, Write-Ahead Log e recovery, con un'app desktop nativa per **Windows** (Win32) e
@@ -9,6 +9,7 @@
 ## 📋 Indice
 
 - [Panoramica](#panoramica)
+- [Download](#download)
 - [Avvio rapido](#avvio-rapido)
 - [Per i corsi di Basi di Dati 1 e 2](#per-i-corsi-di-basi-di-dati-1-e-2)
 - [L'app desktop](#lapp-desktop)
@@ -42,7 +43,7 @@ database per piccoli siti web e app desktop.
 | Caratteristica | Dettagli |
 |---|---|
 | **Linguaggio** | C11, zero dipendenze per il motore e per il server |
-| **Versione** | 1.2.0 |
+| **Versione** | 1.0.3 |
 | **App desktop** | Win32 / GDI (Windows) · Xlib/X11 + Xft (Linux); all'avvio si sceglie **editor SQL** o **server API** |
 | **Server API** | `segvault-server` (o il pannello dell'app): HTTP/JSON, parametri `?` contro la SQL injection, sessioni con transazioni su più richieste, utenti e permessi (`GRANT`), token, CORS, limite di tempo, registro e monitor delle richieste, audit, backup pianificati; anche il **protocollo di rete MySQL** (PHP, Python, Java senza modifiche) |
 | **Client** | TypeScript/JavaScript e Python pronti in [`clients/`](clients/); esempi per C# e Java; `libsegvault.a` per incorporare il motore in C/C++ |
@@ -59,6 +60,18 @@ database per piccoli siti web e app desktop.
 
 ---
 
+## Download
+
+Basta **un solo file**, senza installazione (i font sono dentro l'eseguibile):
+
+| Sistema | App desktop (editor SQL + server) | Solo server |
+|---|---|---|
+| Windows 10 / 11 | [segvault.exe](https://github.com/supMatz/SegVaultDB/raw/main/bin/windows-x86_64/segvault.exe) | [segvault-server.exe](https://github.com/supMatz/SegVaultDB/raw/main/bin/windows-x86_64/segvault-server.exe) |
+| Linux x86-64 | [segvault](https://github.com/supMatz/SegVaultDB/raw/main/bin/linux-x86_64/segvault) | [segvault-server](https://github.com/supMatz/SegVaultDB/raw/main/bin/linux-x86_64/segvault-server) |
+
+Gli stessi file sono allegati a ogni [release](https://github.com/supMatz/SegVaultDB/releases) e
+nella cartella [`bin/`](bin/README.md) (requisiti e dettagli). Per compilare dai sorgenti: sotto.
+
 ## Avvio rapido
 
 ```bash
@@ -69,8 +82,8 @@ make                        # ./segvault (app desktop) e ./segvault-server
 ./segvault-server           # il server senza finestra (servizi, container)
 ```
 
-Su Windows: `segvault.exe` e `segvault-server.exe`, da tenere accanto alla cartella `assets/`
-(i font). La cartella dati viene creata se manca e contiene:
+Su Windows: `segvault.exe` e `segvault-server.exe` (i font sono inclusi; `make dist` aggiorna gli
+eseguibili in `bin/`). La cartella dati viene creata se manca e contiene:
 
 | File | Contenuto |
 |---|---|
@@ -138,7 +151,7 @@ lo ferma e torna all'editor.
 ┌──────────────────────────────────────────────────────────────────────┐
 │ File  Edit  View  Query  Import  Export  Settings  Help   untitled.sql│
 ├──────────────────────────────────────────────────────────────────────┤
-│ ◆ SegVault v1.2.0 [▶ Run F5] [Run statement] │ [Commit] [Rollback] │ [Format]   ● Sky  ▤ db │
+│ ◆ SegVault v1.0.3 [▶ Run F5] [Run statement] │ [Commit] [Rollback] │ [Format]   ● Sky  ▤ db │
 ├────────────┬─────────────────────────────────────────────────────────┤
 │ EXPLORER ⟳ │  editor SQL (numeri di riga, highlighting, completamento)│
 │  ▸ uni     │                                                         │
@@ -146,7 +159,7 @@ lo ferma e torna all'editor.
 │            │  RESULTS ● Query OK            filtro    12 rows  History│
 │            │  griglia dei risultati (schede se più SELECT)           │
 ├────────────┴─────────────────────────────────────────────────────────┤
-│ ● SegVault engine 1.2.0  ▤ uni  script.sql         Ln 3, Col 7  F1 Shortcuts│
+│ ● SegVault engine 1.0.3  ▤ uni  script.sql         Ln 3, Col 7  F1 Shortcuts│
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -331,7 +344,7 @@ delle richieste al posto dei risultati.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ ◆ SegVault v1.2.0 [■ Stop server F5] [Copy address]  ● Running · port 8484 [Open SQL editor]│
+│ ◆ SegVault v1.0.3 [■ Stop server F5] [Copy address]  ● Running · port 8484 [Open SQL editor]│
 ├────────────────┬─────────────────────────────────────────────────────┤
 │ SERVER         │ REQUESTS ● 4 requests · 1 error · 3 rows sent · up 1m │
 │ ADDRESS        │ time      client     method path          status ms   sql │
@@ -346,7 +359,7 @@ delle richieste al posto dei risultati.
 │ WEB FOLDER     │                                                     │
 │ TRY IT  curl … │                                                     │
 ├────────────────┴─────────────────────────────────────────────────────┤
-│ ● SegVault engine 1.2.0  API server running  this computer only    F5 Start / Stop│
+│ ● SegVault engine 1.0.3  API server running  this computer only    F5 Start / Stop│
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -489,7 +502,13 @@ SHOW INDEXES FROM t;           -- chiavi e indici, costruiti o no, numero di chi
 CHECKPOINT;                    -- pagine modificate su disco e log svuotato
 VACUUM;                        -- recupera le pagine delle righe grandi non più usate (fuori da una transazione)
 BACKUP TO '/percorso/backup';  -- copia coerente di tutti i dati (database e utenti) in una cartella nuova
+CHECK TABLE t1, t2;            -- legge ogni riga e controlla chiavi primarie, UNIQUE, NOT NULL e chiavi esterne
+ANALYZE TABLE t;               -- conta le righe (statistiche dell'ottimizzatore)
+OPTIMIZE TABLE t;              -- statistiche, indici ricostruiti e VACUUM;  REPAIR TABLE t: statistiche e indici
 ```
+
+Le stesse operazioni sono nel menu della tabella nell'albero (*Check / Analyze / Optimize table*);
+il risultato ha le colonne di MySQL (`Table`, `Op`, `Msg_type`, `Msg_text`).
 
 Un backup è una cartella di dati completa: si apre direttamente (`segvault-server /percorso/backup`)
 o si ripristina dall'app (*File → Restore backup*; i dati sostituiti restano in `before-restore`).
@@ -1081,7 +1100,7 @@ make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitize
 |---|---|
 | `test_btree` | B+Tree sotto stress contro un modello di riferimento: inserimenti, aggiornamenti, cancellazioni e scansioni ordinate, con un buffer pool piccolo che costringe a riscrivere e rileggere le pagine |
 | `test_engine` (128) | Motore: pagine, heap, catalogo, WAL e recovery, import CSV |
-| `test_sql` (1152) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, procedure, viste, transazioni, crash e recovery, testi lunghi, JSON, full-text, 100 transazioni di fila |
+| `test_sql` (1164) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, procedure, viste, transazioni, crash e recovery, testi lunghi, JSON, full-text, 100 transazioni di fila |
 | `test_examples` (166) | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
 | `test_grid_edit` (22) | Modifica dei dati nella griglia: analisi dei risultati, `UPDATE` / `INSERT` / `DELETE` generati ed eseguiti, chiavi composte, join, apici e backslash, letterali di export e dump |
 | `test_server` (115) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici, utenti e permessi, audit, protocollo MySQL (login, permessi, errori, più istruzioni, transazioni) |
@@ -1161,7 +1180,8 @@ SegVaultDB/
 ├── tests/                     # test_sql, test_examples, test_server, test_btree
 ├── test_engine.c              # Test del motore
 ├── bench/bench.c              # Benchmark
-├── assets/fonts/              # JetBrains Mono e Fira Sans (licenza OFL)
+├── assets/fonts/              # JetBrains Mono e Fira Sans (licenza OFL), inclusi negli eseguibili
+├── bin/                       # Eseguibili pronti per Windows e Linux (make dist)
 ├── .github/workflows/ci.yml   # CI
 └── Makefile
 ```
@@ -1170,7 +1190,7 @@ SegVaultDB/
 
 | Costante | Valore | Significato |
 |---|---|---|
-| `SV_VERSION_STR` | `"1.2.0"` | Versione |
+| `SV_VERSION_STR` | `"1.0.3"` | Versione |
 | `SV_PAGE_SIZE` | `4096` | Dimensione di una pagina su disco |
 | `SV_BUFFER_POOL_CAP` | `1024` | Pagine nel buffer pool |
 | `SV_MAX_DATABASES` | `64` | Database |
@@ -1196,7 +1216,7 @@ make bench         # benchmark su 100.000 righe
 make clean
 ```
 
-**Linux:** servono `gcc`, `make`, `pkg-config` e le librerie di sviluppo di X11 e Xft (`sudo apt install build-essential pkg-config libx11-dev libxft-dev libxrender-dev libfontconfig1-dev` su Debian/Ubuntu, `sudo pacman -S base-devel libx11 libxft` su Arch). Il server e la libreria non hanno bisogno di X11. I font JetBrains Mono e Fira Sans sono in `assets/fonts/`; se mancano, fontconfig sceglie il miglior font monospace / sans-serif disponibile.
+**Linux:** servono `gcc`, `make`, `pkg-config` e le librerie di sviluppo di X11 e Xft (`sudo apt install build-essential pkg-config libx11-dev libxft-dev libxrender-dev libfontconfig1-dev` su Debian/Ubuntu, `sudo pacman -S base-devel libx11 libxft` su Arch). Il server e la libreria non hanno bisogno di X11. I font JetBrains Mono e Fira Sans sono in `assets/fonts/` e vengono inclusi negli eseguibili (`src/platform/fonts_embed.c`): su Linux, se l'eseguibile è da solo, vengono copiati una volta in `~/.cache/segvault/fonts`.
 
 **Windows (da Linux):** `sudo apt install mingw-w64` (o `pacman -S mingw-w64-gcc`), poi `make windows`. Gli eseguibili sono statici: basta copiarli insieme alla cartella `assets/`. `segvault.exe` è l'app desktop (scelta iniziale, editor e server), `segvault-server.exe` il server da console. La CI pubblica entrambi come artifact a ogni push.
 
@@ -1316,7 +1336,7 @@ Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
    permessi; registro di audit (`--audit`); servizio systemd e avvio automatico su Windows; HTTPS tramite
    reverse proxy (documentato). Da fare: HTTPS integrato senza proxy.
 6. **GUI** — fatto: navigazione delle chiavi esterne dalla griglia (Ctrl+clic), backup e ripristino
-   dal menu File, export XLSX e PDF, grafici dai risultati, query salvate, protocollo MySQL dal pannello del server. Da fare: costruttore visuale di query, editor di trigger e viste, manutenzione delle tabelle.
+   dal menu File, export XLSX e PDF, grafici dai risultati, query salvate, protocollo MySQL dal pannello del server, manutenzione delle tabelle (`CHECK` / `ANALYZE` / `OPTIMIZE` / `REPAIR TABLE`). Da fare: costruttore visuale di query, editor di trigger e viste.
 7. **Portata** — interfaccia web, versione macOS, interfaccia in italiano e altre lingue, accessibilità.
 
 ## Licenza

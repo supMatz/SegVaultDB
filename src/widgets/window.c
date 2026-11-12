@@ -2411,7 +2411,7 @@ typedef enum {
     CTX_SORT_ASC, CTX_SORT_DESC, CTX_SORT_CLEAR, CTX_FIT_COL, CTX_COPY_ALL, CTX_EXPORT,
     CTX_FILTER_VALUE, CTX_FILTER_ROWS, CTX_FILTER_CLEAR,
     CTX_EDIT_CELL, CTX_SET_NULL, CTX_ADD_ROW, CTX_SAVE_ROW, CTX_DISCARD_ROW, CTX_DELETE_ROW,
-    CTX_FK_PARENT, CTX_FK_CHILDREN, CTX_SAVE_QUERY, CTX_SAVED_LIST,
+    CTX_FK_PARENT, CTX_FK_CHILDREN, CTX_SAVE_QUERY, CTX_SAVED_LIST, CTX_TBL_CHECK, CTX_TBL_ANALYZE, CTX_TBL_OPTIMIZE,
     // editor
     CTX_CUT, CTX_COPY, CTX_PASTE, CTX_SELECT_ALL, CTX_RUN, CTX_RUN_STMT, CTX_FORMAT, CTX_COMMENT,
     // File
@@ -2517,6 +2517,9 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
     [CTX_EDIT_CELL]     = { "Edit cell",                 "F2" },
     [CTX_FK_PARENT]     = { "Open referenced row",       "Ctrl+Click" },
     [CTX_SAVE_QUERY]    = { "Save query\xe2\x80\xa6",       NULL },
+    [CTX_TBL_CHECK]     = { "Check table",               NULL },
+    [CTX_TBL_ANALYZE]   = { "Analyze table",             NULL },
+    [CTX_TBL_OPTIMIZE]  = { "Optimize table",            NULL },
     [CTX_SAVED_LIST]    = { "Saved queries",             NULL },
     [CTX_FK_CHILDREN]   = { "Show rows that reference this", NULL },
     [CTX_SET_NULL]      = { "Set to NULL",               NULL },
@@ -2663,6 +2666,8 @@ static bool ctx_enabled(AppWindow* app, int a) {
         case CTX_EDIT_STRUCTURE: { char d[64], t[64]; return idle && design_table(app, d, sizeof(d), t, sizeof(t)); }
         case CTX_TREE_BROWSE: case CTX_TREE_USE_DB: case CTX_TREE_DDL: case CTX_TREE_DESIGNER: return idle;
         case CTX_TRUNCATE_TABLE: case CTX_DROP_TABLE: case CTX_DROP_DB: return idle && !app->in_transaction;
+        case CTX_TBL_CHECK: case CTX_TBL_ANALYZE: return idle;
+        case CTX_TBL_OPTIMIZE: return idle && !app->in_transaction;
         case CTX_BACKUP: case CTX_RESTORE: return idle && !app->in_transaction;
         case CTX_USERS: return idle;
         case CTX_SEARCH_DB: case CTX_DB_OVERVIEW: { char d[64]; return idle && design_db(app, d, sizeof(d)); }
@@ -2744,6 +2749,7 @@ static void ctx_open(AppWindow* app, int kind, int x, int y) {
         CTX_TREE_BROWSE, CTX_EDIT_STRUCTURE, CTX_TREE_DESIGNER, CTX_SEP,
         CTX_TREE_SELECT_SQL, CTX_TREE_DDL, CTX_TREE_COPY_NAME, CTX_SEP,
         CTX_NEW_TABLE, CTX_REFRESH_TREE, CTX_SEP,
+        CTX_TBL_CHECK, CTX_TBL_ANALYZE, CTX_TBL_OPTIMIZE, CTX_SEP,
         CTX_TRUNCATE_TABLE, CTX_DROP_TABLE,
     };
     static const int TREE_VIEW[] = { CTX_TREE_BROWSE, CTX_SEP, CTX_TREE_SELECT_SQL, CTX_TREE_COPY_NAME, CTX_SEP, CTX_REFRESH_TREE };
@@ -3277,6 +3283,17 @@ static void ctx_run(AppWindow* app, int a) {
         case CTX_EXPORT:     bar_open(app, BAR_EXPORT, false); break;
         case CTX_FK_PARENT: case CTX_FK_CHILDREN: fk_follow(app, a == CTX_FK_PARENT, true); break;
         case CTX_SAVE_QUERY: bar_open(app, BAR_SAVE_QUERY, false); break;
+        case CTX_TBL_CHECK: case CTX_TBL_ANALYZE: case CTX_TBL_OPTIMIZE: {
+            TreeNode* sel = app->tree->selected;
+            TreeNode* t = tree_sel_table(app);
+            const char* d = sel ? find_db_name(sel) : NULL;
+            if (!t || !d) break;
+            char sql[200];
+            snprintf(sql, sizeof(sql), "%s TABLE `%.63s`.`%.63s`;", a == CTX_TBL_CHECK ? "CHECK" : a == CTX_TBL_ANALYZE ? "ANALYZE" : "OPTIMIZE", d, t->label);
+            char* text = strdup(sql);
+            if (text) run_text(app, text, 0, false, a == CTX_TBL_CHECK ? "Checking the table\xe2\x80\xa6" : "Table maintenance\xe2\x80\xa6");
+            break;
+        }
         case CTX_SAVED_LIST: saved_show(app); break;
         case CTX_FILTER_VALUE: {
             Cell* c = grid_cell(app);

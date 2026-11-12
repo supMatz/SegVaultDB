@@ -339,6 +339,19 @@ int main(void) {
     t("INSERT INTO li (x) VALUES (1), (2)", "OK:2");
     t("SELECT LAST_INSERT_ID()", "2");
     t("DROP TABLE li", "OK:0");
+    // manutenzione delle tabelle (come MySQL / phpMyAdmin)
+    t("CREATE TABLE mp (id INT PRIMARY KEY, nome VARCHAR(10) NOT NULL)", "OK:0");
+    t("CREATE TABLE mc (id INT PRIMARY KEY, p INT REFERENCES mp(id))", "OK:0");
+    t("INSERT INTO mp VALUES (1, 'a'), (2, 'b')", "OK:2");
+    t("INSERT INTO mc VALUES (10, 1), (11, 2), (12, NULL)", "OK:3");
+    t("CHECK TABLE mp, mc", "mp|check|status|OK (2 rows);mc|check|status|OK (3 rows)");
+    t("ANALYZE TABLE mc", "mc|analyze|status|OK (3 rows)");
+    t("REPAIR TABLE mp", "mp|repair|status|OK (2 rows)");
+    t("OPTIMIZE TABLE mp", "#1");
+    t("CHECK TABLE nessuna", "nessuna|check|Error|Table doesn't exist");
+    t("CHECK TABLE mc EXTENDED", "mc|check|status|OK (3 rows)");
+    t("DROP TABLE mc", "OK:0");
+    t("DROP TABLE mp", "OK:0");
     t("SELECT TRUE + TRUE, FALSE FROM n WHERE id = 1", "2|0");
 
     // ── funzioni ──

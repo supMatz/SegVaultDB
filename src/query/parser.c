@@ -1978,6 +1978,24 @@ static ASTNode* parse_statement(ParserState* ps) {
     if (!n) return NULL;
     Token t = peek(ps);
     if (ident_is(ps, "CALL") && next_is(ps, 1, TOK_IDENTIFIER)) { parse_call_stmt(ps, n); return n; }
+    // CHECK | ANALYZE | OPTIMIZE | REPAIR  TABLE t [, t2 ...]   (manutenzione, come MySQL)
+    if ((ident_is(ps, "ANALYZE") || ident_is(ps, "OPTIMIZE") || ident_is(ps, "REPAIR") || ident_is(ps, "CHECK")) &&
+        next_is(ps, 1, TOK_TABLE)) {
+        Token op = consume(ps);
+        consume(ps);
+        n->type = NODE_TABLE_MAINT;
+        snprintf(n->maint.op, sizeof(n->maint.op), "%s", op.text);
+        for (char* c = n->maint.op; *c; c++) *c = (char)toupper((unsigned char)*c);
+        do {
+            if (n->maint.ntables >= 16) { parse_fail(ps, "Too many tables (max 16)", peek(ps)); return n; }
+            Token tn = table_tok(ps);
+            if (tn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name", tn); return n; }
+            copy_text(ps, n->maint.tables[n->maint.ntables++], 64, tn.text);
+        } while (match(ps, TOK_COMMA));
+        while (ident_is(ps, "QUICK") || ident_is(ps, "FAST") || ident_is(ps, "MEDIUM") || ident_is(ps, "EXTENDED") ||
+               ident_is(ps, "CHANGED") || ident_is(ps, "FOR") || ident_is(ps, "UPGRADE")) consume(ps);   // opzioni di MySQL
+        return n;
+    }
     if (ident_is(ps, "BACKUP")) {                         // BACKUP [DATABASE] TO 'cartella'
         consume(ps);
         n->type = NODE_BACKUP;

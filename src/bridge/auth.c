@@ -715,6 +715,10 @@ bool auth_check(const char* user, const ASTNode* stmt, const char* cur_db, char*
         case NODE_CREATE_TRIGGER: need(&k, AUTH_ALTER, stmt->create_trigger.table_name); break;
         case NODE_DROP_TRIGGER: need(&k, AUTH_ALTER, "*"); break;
         case NODE_CREATE_PROCEDURE: need(&k, AUTH_CREATE, "*"); break;
+        case NODE_TABLE_MAINT:
+            for (int i = 0; i < stmt->maint.ntables; i++)
+                need(&k, strcmp(stmt->maint.op, "CHECK") && strcmp(stmt->maint.op, "ANALYZE") ? AUTH_ALTER : AUTH_SELECT, stmt->maint.tables[i]);
+            break;
         case NODE_DROP_PROCEDURE: need(&k, AUTH_DROP, "*"); break;
         case NODE_CALL:          // le istruzioni della procedura si controllano una per una (auth_hook)
             if (!cur_db || !cur_db[0] || !any_in_db(user, cur_db)) {

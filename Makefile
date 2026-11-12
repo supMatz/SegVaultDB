@@ -1,12 +1,12 @@
 ifeq ($(OS), Windows_NT)
-    PLATFORM_SRC = src/platform/win32.c
+    PLATFORM_SRC = src/platform/win32.c src/platform/fonts_embed.c
     LIBS         = -lgdi32 -luser32 -lkernel32 -lws2_32 -lshell32
     OUT          = segvault.exe
     MKDIR        = mkdir
     RM           = del /Q /F
     SEP          = \\
 else
-    PLATFORM_SRC = src/platform/xlib.c
+    PLATFORM_SRC = src/platform/xlib.c src/platform/fonts_embed.c
     XFT_CFLAGS  := $(shell pkg-config --cflags xft 2>/dev/null || echo -I/usr/include/freetype2)
     XFT_LIBS    := $(shell pkg-config --libs xft xrender fontconfig 2>/dev/null || echo -lXft -lXrender -lfontconfig)
     LIBS         = -lX11 $(XFT_LIBS) -lm -pthread
@@ -81,7 +81,7 @@ ENGINE_SRCS = \
 FULL_SRCS = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) $(NET_SRCS) $(ENGINE_SRCS)
 FULL_OBJS = $(FULL_SRCS:.c=.o)
 
-.PHONY: all full clean test test-asan test-tsan windows bench server lib
+.PHONY: all full clean test test-asan test-tsan windows bench server lib dist
 
 all: full server
 
@@ -290,7 +290,7 @@ test_engine: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
 # ── Cross-compilazione Windows da Linux (MinGW-w64) ──
 #   make windows  ->  segvault.exe (statico: basta copiarlo con la cartella assets/)
 WIN_CC   ?= x86_64-w64-mingw32-gcc
-WIN_SRCS  = src/main.c src/platform/win32.c $(WIDGET_SRCS) $(NET_SRCS) $(ENGINE_SRCS)
+WIN_SRCS  = src/main.c src/platform/win32.c src/platform/fonts_embed.c $(WIDGET_SRCS) $(NET_SRCS) $(ENGINE_SRCS)
 WIN_OBJS  = $(patsubst %.c,build-win/%.o,$(WIN_SRCS))
 
 WIN_SERVER_OBJS = $(patsubst %.c,build-win/%.o,$(SERVER_SRCS))
@@ -317,3 +317,19 @@ bench_sql: bench/bench.c $(ENGINE_SRCS)
 
 bench: bench_sql
 	./bench_sql 100000
+
+# i font sono dentro l'eseguibile (.incbin): si ricompila se cambiano
+src/platform/fonts_embed.o build-win/src/platform/fonts_embed.o: $(wildcard assets/fonts/*.ttf)
+
+# ── eseguibili pronti da scaricare, nel repository (bin/): make dist ──
+# Linux: l'app desktop usa le librerie X11 del sistema (glibc 2.38+), il server è statico (ogni Linux x86-64).
+# Windows 10 / 11: nessuna DLL da installare. I font sono dentro gli eseguibili.
+WIN_STRIP ?= x86_64-w64-mingw32-strip
+dist: all windows
+	@mkdir -p bin/linux-x86_64 bin/windows-x86_64
+	strip -o bin/linux-x86_64/segvault segvault
+	$(CC) -O2 -static -o bin/linux-x86_64/segvault-server $(SERVER_OBJS) -lm -pthread
+	strip bin/linux-x86_64/segvault-server
+	$(WIN_STRIP) -o bin/windows-x86_64/segvault.exe segvault.exe
+	$(WIN_STRIP) -o bin/windows-x86_64/segvault-server.exe segvault-server.exe
+	@echo "=== bin/: eseguibili pronti ==="

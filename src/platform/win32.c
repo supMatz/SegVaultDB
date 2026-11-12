@@ -7,6 +7,7 @@ SCOPO: Implementa platform.h usando le API native Windows.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include "fonts_embed.h"
 #include <windows.h>   // API Win32 completa
 #include <windowsx.h>  // GET_X_LPARAM, GET_Y_LPARAM
 #include <shellapi.h>  // ShellExecuteA (platform_open_url)
@@ -267,6 +268,14 @@ static int load_fonts_from(const WCHAR* dir) {
 }
 
 static void load_bundled_fonts(void) {
+    // i font sono dentro l'eseguibile: niente file accanto (basta scaricare l'exe)
+    int loaded = 0;
+    for (int i = 0; i < sv_embedded_font_count(); i++) {
+        EmbeddedFont f = sv_embedded_font(i);
+        DWORD n = 0;
+        if (f.size && AddFontMemResourceEx((void*)f.data, (DWORD)f.size, NULL, &n)) loaded++;
+    }
+    if (loaded == sv_embedded_font_count()) return;
     WCHAR exe[MAX_PATH];
     DWORD len = GetModuleFileNameW(NULL, exe, MAX_PATH);
     if (len > 0 && len < MAX_PATH) {

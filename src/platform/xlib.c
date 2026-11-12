@@ -8,6 +8,7 @@ SCOPO: Stessa interfaccia di win32.c ma usa Xlib (Linux/X11).
        Appunti: selezione CLIPBOARD (ICCCM).
 */
 
+#include "fonts_embed.h"
 #include <X11/X.h>
 #include <X11/Xlib.h>     // API Xlib
 #include <X11/Xutil.h>    // XLookupString, XSizeHints
@@ -18,6 +19,7 @@ SCOPO: Stessa interfaccia di win32.c ma usa Xlib (Linux/X11).
 #include <X11/extensions/Xrender.h>
 #include <sys/select.h>
 #include <unistd.h>      // readlink
+#include <sys/stat.h>
 #include <sys/wait.h>    // waitpid (platform_open_url)
 #include <pthread.h>
 #include <stdlib.h>
@@ -130,6 +132,40 @@ static void apply_clip(PlatformWindow* win) {
 
 // rende disponibili a fontconfig i font inclusi nel progetto (assets/fonts accanto
 // all'eseguibile o nella cartella corrente)
+static bool is_dir(const char* p) { struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode); }
+
+// i font inclusi nell'eseguibile, copiati una volta in ~/.cache/segvault/fonts (fontconfig vuole dei file)
+static bool load_embedded_fonts(void) {
+    const char* base = getenv("XDG_CACHE_HOME");
+    const char* home = getenv("HOME");
+    char dir[4200];
+    if (base && base[0]) snprintf(dir, sizeof(dir), "%s/segvault", base);
+    else if (home && home[0]) snprintf(dir, sizeof(dir), "%s/.cache/segvault", home);
+    else return false;
+    char parent[4200];
+    snprintf(parent, sizeof(parent), "%s", dir);
+    char* sl = strrchr(parent, '/');
+    if (sl) { *sl = '\0'; mkdir(parent, 0755); }
+    mkdir(dir, 0755);
+    snprintf(dir + strlen(dir), sizeof(dir) - strlen(dir), "/fonts");
+    mkdir(dir, 0755);
+    for (int i = 0; i < sv_embedded_font_count(); i++) {
+        EmbeddedFont f = sv_embedded_font(i);
+        char path[4400];
+        snprintf(path, sizeof(path), "%s/%s", dir, f.name);
+        struct stat st;
+        if (stat(path, &st) == 0 && (size_t)st.st_size == f.size) continue;   // già copiato
+        char tmp[4500];
+        snprintf(tmp, sizeof(tmp), "%s.%d.tmp", path, (int)getpid());
+        FILE* o = fopen(tmp, "wb");
+        if (!o) return false;
+        bool ok = fwrite(f.data, 1, f.size, o) == f.size;
+        if (fclose(o) != 0) ok = false;
+        if (!ok || rename(tmp, path) != 0) { remove(tmp); return false; }
+    }
+    return FcConfigAppFontAddDir(NULL, (const FcChar8*)dir);
+}
+
 static void load_bundled_fonts(void) {
     char exe[4096];
     ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
@@ -139,11 +175,12 @@ static void load_bundled_fonts(void) {
         if (slash) *slash = '\0';
         char dir[4200];
         snprintf(dir, sizeof(dir), "%s/assets/fonts", exe);
-        if (FcConfigAppFontAddDir(NULL, (const FcChar8*)dir)) return;
+        if (is_dir(dir) && FcConfigAppFontAddDir(NULL, (const FcChar8*)dir)) return;
         snprintf(dir, sizeof(dir), "%s/fonts", exe);
-        if (FcConfigAppFontAddDir(NULL, (const FcChar8*)dir)) return;
+        if (is_dir(dir) && FcConfigAppFontAddDir(NULL, (const FcChar8*)dir)) return;
     }
-    FcConfigAppFontAddDir(NULL, (const FcChar8*)"assets/fonts");
+    if (is_dir("assets/fonts") && FcConfigAppFontAddDir(NULL, (const FcChar8*)"assets/fonts")) return;
+    load_embedded_fonts();                      // eseguibile scaricato da solo
 }
 
 bool platform_init(void) {

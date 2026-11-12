@@ -303,6 +303,156 @@ static QueryResult* exec_one(ASTNode* stmt) {
     return r;
 }
 
+
+// ── manutenzione delle tabelle (CHECK / ANALYZE / OPTIMIZE / REPAIR TABLE) ──
+// Risultato come MySQL: Table | Op | Msg_type | Msg_text, una riga per messaggio.
+
+typedef struct { QueryResult* r; int cap; } MaintOut;
+
+static void maint_row(MaintOut* m, const char* table, const char* op, const char* type, const char* text) {
+    if (!m->r) return;
+    if (m->r->num_rows >= m->cap) {
+        int nc = m->cap ? m->cap * 2 : 8;
+        Row* nr = realloc(m->r->rows, sizeof(Row) * (size_t)nc);
+        if (!nr) return;
+        m->r->rows = nr;
+        m->cap = nc;
+    }
+    const char* v[4] = { table, op, type, text };
+    if (db_row_set(&m->r->rows[m->r->num_rows], 4, v, NULL)) m->r->num_rows++;
+}
+
+// una query interna con un solo numero come risultato (-1 = errore, messaggio in err)
+static long long maint_count(const char* sql, char* err, size_t en) {
+    TokenList* tk = lexer_tokenize(sql);
+    ParseResult* pr = tk ? parser_parse(tk) : NULL;
+    long long v = -1;
+    if (pr && pr->success && pr->count == 1) {
+        QueryResult* r = executor_run(&g_db.exec_ctx, pr->statements[0]);
+        if (r && r->success && r->num_rows > 0 && r->num_cols > 0 && !r->rows[0].cells[0].is_null) v = atoll(r->rows[0].cells[0].value);
+        else if (r && r->success) v = 0;
+        else snprintf(err, en, "%.250s", r ? r->error : "out of memory");
+        db_result_free(r);
+    } else snprintf(err, en, "%.250s", pr ? pr->error : "out of memory");
+    if (pr) parse_result_free(pr);
+    if (tk) lexer_free(tk);
+    return v;
+}
+
+// CHECK TABLE: si leggono tutte le righe e si controllano chiave primaria, NOT NULL, UNIQUE e chiavi esterne
+static void maint_check(MaintOut* m, const char* db, TableSchema* ts) {
+    char q[1200], err[300], msg[400];
+    int errors = 0;
+    snprintf(q, sizeof(q), "SELECT COUNT(*) FROM `%s`", ts->name);
+    long long rows = maint_count(q, err, sizeof(err));
+    if (rows < 0) { snprintf(msg, sizeof(msg), "Rows cannot be read: %s", err); maint_row(m, ts->name, "check", "error", msg); return; }
+    for (int c = 0; c < ts->num_columns; c++) {
+        if (ts->columns[c].nullable && !ts->columns[c].primary_key) continue;
+        snprintf(q, sizeof(q), "SELECT COUNT(*) FROM `%s` WHERE `%s` IS NULL", ts->name, ts->columns[c].name);
+        long long n = maint_count(q, err, sizeof(err));
+        if (n > 0) { snprintf(msg, sizeof(msg), "%lld rows have NULL in NOT NULL column %s", n, ts->columns[c].name); maint_row(m, ts->name, "check", "error", msg); errors++; }
+    }
+    for (int k = 0; k < ts->num_constraints; k++) {
+        const Constraint* c = &ts->constraints[k];
+        if (c->kind != CONS_PRIMARY && c->kind != CONS_UNIQUE && c->kind != CONS_FOREIGN) continue;
+        char cols[600] = "", where[700] = "";
+        size_t cl = 0, wl = 0;
+        for (int j = 0; j < c->ncols; j++) {
+            const char* cn = ts->columns[c->cols[j]].name;
+            cl += (size_t)snprintf(cols + cl, sizeof(cols) - cl, "%s`%s`", j ? ", " : "", cn);
+            wl += (size_t)snprintf(where + wl, sizeof(where) - wl, "%s`%s` IS NOT NULL", j ? " AND " : "", cn);
+        }
+        if (c->kind != CONS_FOREIGN) {
+            snprintf(q, sizeof(q), "SELECT COUNT(*) FROM (SELECT %s FROM `%s` WHERE %s GROUP BY %s HAVING COUNT(*) > 1) AS d",
+                     cols, ts->name, where, cols);
+            long long n = maint_count(q, err, sizeof(err));
+            if (n > 0) {
+                snprintf(msg, sizeof(msg), "%lld duplicated values of the %s key (%s)", n, c->kind == CONS_PRIMARY ? "primary" : "unique", cols);
+                maint_row(m, ts->name, "check", "error", msg);
+                errors++;
+            }
+        } else {
+            TableSchema* ps = catalog_get_table(g_db.catalog, db, c->ref_table);
+            if (!ps) { snprintf(msg, sizeof(msg), "Foreign key %s: table %s does not exist", c->name, c->ref_table); maint_row(m, ts->name, "check", "error", msg); errors++; continue; }
+            char on[900] = "";
+            size_t ol = 0;
+            for (int j = 0; j < c->ncols; j++) {
+                const char* rn = c->ref_cols[j];
+                if (!rn[0]) {                                  // la chiave primaria del genitore, j-esima colonna
+                    int seen = 0;
+                    for (int k2 = 0; k2 < ps->num_constraints && !rn[0]; k2++)
+                        if (ps->constraints[k2].kind == CONS_PRIMARY && j < ps->constraints[k2].ncols) rn = ps->columns[ps->constraints[k2].cols[j]].name;
+                    for (int k2 = 0; k2 < ps->num_columns && !rn[0]; k2++)
+                        if (ps->columns[k2].primary_key && seen++ == j) rn = ps->columns[k2].name;
+                }
+                ol += (size_t)snprintf(on + ol, sizeof(on) - ol, "%sp.`%s` = c.`%s`", j ? " AND " : "", rn, ts->columns[c->cols[j]].name);
+            }
+            char cw[700] = "";
+            size_t cwl = 0;
+            for (int j = 0; j < c->ncols; j++)
+                cwl += (size_t)snprintf(cw + cwl, sizeof(cw) - cwl, "%sc.`%s` IS NOT NULL", j ? " AND " : "", ts->columns[c->cols[j]].name);
+            snprintf(q, sizeof(q), "SELECT COUNT(*) FROM `%s` c WHERE %s AND NOT EXISTS (SELECT 1 FROM `%s` p WHERE %s)",
+                     ts->name, cw, ps->name, on);
+            long long n = maint_count(q, err, sizeof(err));
+            if (n > 0) {
+                snprintf(msg, sizeof(msg), "%lld rows reference a missing row of %s (foreign key %s)", n, ps->name, c->name[0] ? c->name : cols);
+                maint_row(m, ts->name, "check", "error", msg);
+                errors++;
+            } else if (n < 0) { snprintf(msg, sizeof(msg), "Foreign key %s not checked: %s", c->name, err); maint_row(m, ts->name, "check", "warning", msg); }
+        }
+    }
+    if (errors) snprintf(msg, sizeof(msg), "Inconsistent: %d problem%s found", errors, errors == 1 ? "" : "s");
+    else snprintf(msg, sizeof(msg), "OK (%lld rows)", rows);
+    maint_row(m, ts->name, "check", errors ? "error" : "status", msg);
+}
+
+static QueryResult* exec_table_maint(ASTNode* stmt) {
+    Database* d = catalog_current_db(g_db.catalog);
+    if (!d) return result_error("No database selected");
+    char dbname[64];
+    snprintf(dbname, sizeof(dbname), "%s", d->name);
+    const char* op = stmt->maint.op;
+    char opl[12];
+    snprintf(opl, sizeof(opl), "%s", op);
+    for (char* c = opl; *c; c++) *c = (char)tolower((unsigned char)*c);
+    bool optimize = !strcmp(op, "OPTIMIZE");
+    if ((optimize) && (g_db.exec_ctx.tx_id || g_tx_owner)) return result_error("OPTIMIZE TABLE is not allowed while a transaction is open");
+    MaintOut m = { calloc(1, sizeof(QueryResult)), 0 };
+    if (!m.r) return result_error("Out of memory");
+    static const char* const NAMES[4] = { "Table", "Op", "Msg_type", "Msg_text" };
+    m.r->success = true;
+    m.r->num_cols = 4;
+    m.r->col_names = calloc(4, sizeof(char*));
+    m.r->col_types = calloc(4, sizeof(char*));
+    for (int i = 0; m.r->col_names && m.r->col_types && i < 4; i++) { m.r->col_names[i] = strdup(NAMES[i]); m.r->col_types[i] = strdup("VARCHAR"); }
+    bool vacuumed = false;
+    for (int i = 0; i < stmt->maint.ntables; i++) {
+        const char* tn = stmt->maint.tables[i];
+        TableSchema* ts = catalog_get_table(g_db.catalog, dbname, tn);
+        if (!ts) { maint_row(&m, tn, opl, "Error", "Table doesn't exist"); continue; }
+        char msg[200], err[300], q[200];
+        if (!strcmp(op, "CHECK")) { maint_check(&m, dbname, ts); continue; }
+        // ANALYZE / REPAIR / OPTIMIZE: conteggio esatto delle righe (statistiche dell'ottimizzatore) e indici ricostruiti
+        snprintf(q, sizeof(q), "SELECT COUNT(*) FROM `%s`", ts->name);
+        long long rows = maint_count(q, err, sizeof(err));
+        if (rows < 0) { snprintf(msg, sizeof(msg), "%.180s", err); maint_row(&m, tn, opl, "error", msg); continue; }
+        ts = catalog_get_table(g_db.catalog, dbname, tn);
+        if (ts) ts->num_rows = (uint64_t)rows;
+        if (strcmp(op, "ANALYZE")) executor_invalidate_indexes();          // ricostruiti al primo uso
+        if (optimize && !vacuumed) {
+            int freed = 0;
+            vacuumed = do_vacuum(&freed);
+            snprintf(msg, sizeof(msg), vacuumed ? "OK (%lld rows; %d unused pages reclaimed)" : "VACUUM failed", rows, freed);
+            maint_row(&m, tn, opl, vacuumed ? "status" : "error", msg);
+            continue;
+        }
+        snprintf(msg, sizeof(msg), "OK (%lld rows)", rows);
+        maint_row(&m, tn, opl, "status", msg);
+    }
+    catalog_save(g_db.catalog, g_db.cat_path);                             // statistiche aggiornate
+    return m.r;
+}
+
 // istruzioni dentro una procedura: con i permessi dell'utente che la chiama
 static bool proc_auth(const ASTNode* st, char* err, size_t errn) {
     return auth_check(g_session_user, st, cur_db_name(), err, errn);
@@ -322,6 +472,8 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
         result = db_commit() ? result_ok(0) : result_error("Failed to commit");
     } else if (stmt->type == NODE_ROLLBACK && stmt->rollback_to.name[0] == 0) {
         result = db_rollback() ? result_ok(0) : result_error("Failed to rollback");
+    } else if (stmt->type == NODE_TABLE_MAINT) {
+        result = exec_table_maint(stmt);
     } else if (stmt->type == NODE_BACKUP) {
         char err[600];
         result = db_backup_impl(stmt->backup.path, err, sizeof(err)) ? result_ok(0) : result_error(err);
