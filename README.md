@@ -661,7 +661,7 @@ basta lo zip di [windows.php.net](https://windows.php.net/download/) (contiene `
   (i client accettano lo stesso prefisso: `new SegVault(url, {prefix: "/_segvault"})`,
   `SegVault(url, prefix="/_segvault")`), oppure `--api-prefix none` se il sito usa solo mysqli / PDO.
 - Tutte le variabili CGI (`$_SERVER`), le intestazioni `HTTP_*` (non `Proxy`: falla *httpoxy*),
-  ogni metodo (`POST`, `PUT`, `DELETE`, ...) e corpo (form, upload fino a `--max-body`); dalla
+  ogni metodo (`POST`, `PUT`, `DELETE`, ...) e corpo (form, upload fino a `--max-body`, anche *chunked*); dalla
   risposta `Status:`, `Location:` (redirect), più `Set-Cookie`. Gli avvisi di PHP finiscono nel
   registro delle richieste.
 - Senza `--php` un file `.php` non viene **mai** mandato come testo (403): il sorgente contiene le
@@ -1148,7 +1148,7 @@ make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitize
 | `test_sql` (1164) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, procedure, viste, transazioni, crash e recovery, testi lunghi, JSON, full-text, 100 transazioni di fila |
 | `test_examples` (166) | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
 | `test_grid_edit` (22) | Modifica dei dati nella griglia: analisi dei risultati, `UPDATE` / `INSERT` / `DELETE` generati ed eseguiti, chiavi composte, join, apici e backslash, letterali di export e dump |
-| `test_php` (50) | PHP via FastCGI con un php-cgi finto (e quello vero se installato): variabili CGI, `PATH_INFO`, `index.php`, URL belli, redirect e cookie, sorgente mai mostrato, processi riavviati dopo un crash o un timeout, richieste in parallelo, php-fpm esterno, prefisso dell'API spostato o spento |
+| `test_php` (58) | PHP via FastCGI con un php-cgi finto (e quello vero se installato): variabili CGI, `PATH_INFO`, `index.php`, URL belli, redirect e cookie, sorgente mai mostrato, processi riavviati dopo un crash o un timeout, richieste in parallelo, php-fpm esterno, prefisso dell'API spostato o spento, corpi *chunked* (anche malformati) |
 | `test_server` (115) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici, utenti e permessi, audit, protocollo MySQL (login, permessi, errori, più istruzioni, transazioni) |
 | `test_export` (9) | Export XLSX (zip con CRC giusti, parti XML complete, numeri, testo con caratteri speciali, NULL) e PDF (xref, pagine, testo WinAnsi) |
 | `test_backup` (29) | `BACKUP TO`, apertura della copia, ripristino sui dati in uso (con i dati precedenti conservati), righe grandi, viste, procedure e utenti |

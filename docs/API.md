@@ -126,7 +126,8 @@ tutto il resto (`VARCHAR`, `TEXT`, `DATE`, ...) → stringa. Le date sono string
 | 403 | richiesta da una pagina web di un'altra origine non ammessa, o `Host` non locale senza token (vedi Sicurezza) |
 | 404 | endpoint, database o tabella inesistente |
 | 405 | metodo sbagliato (es. `GET /query`) |
-| 411 | manca `Content-Length` (i corpi *chunked* non sono supportati) |
+| 411 | un `POST` senza `Content-Length` né corpo `Transfer-Encoding: chunked` |
+| 501 | `Transfer-Encoding` diverso da `chunked` (es. `gzip`) |
 | 413 | corpo oltre `--max-body` |
 | 415 | `Content-Type` diverso da `application/json` / `text/plain` |
 | 503 | troppe connessioni contemporanee (64) |

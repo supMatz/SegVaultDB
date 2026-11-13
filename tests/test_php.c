@@ -168,6 +168,25 @@ static Resp req(int port, const char* method, const char* path, const char* head
     r.body[r.blen] = 0;
     return r;
 }
+// richiesta scritta a mano (corpi chunked, richieste malformate)
+static Resp raw(int port, const char* text, size_t n) {
+    Resp r = {0};
+    int fd = connect_to(port);
+    if (fd < 0) return r;
+    wr(fd, text, n);
+    Str in = {0};
+    char buf[65536];
+    for (;;) { ssize_t g = recv(fd, buf, sizeof(buf), 0); if (g <= 0) break; sadd(&in, buf, (size_t)g); }
+    close(fd);
+    if (!in.buf) return r;
+    sscanf(in.buf, "HTTP/1.1 %d", &r.status);
+    char* he = strstr(in.buf, "\r\n\r\n");
+    if (he) { *he = 0; r.body = strdup(he + 4); }
+    r.head = in.buf;
+    return r;
+}
+#define RAW(port, lit) raw(port, lit, sizeof(lit) - 1)
+
 static void rfree(Resp* r) { free(r->head); free(r->body); memset(r, 0, sizeof(*r)); }
 static bool has(const Resp* r, const char* s) { return r->body && strstr(r->body, s); }
 static bool hdr(const Resp* r, const char* s) { return r->head && strcasestr(r->head, s); }
@@ -285,6 +304,34 @@ int main(int argc, char** argv) {
         rfree(&r);
         r = req(port, "DELETE", "/echo.php?id=4", NULL, NULL);
         CHECK(r.status == 200 && has(&r, "REQUEST_METHOD=DELETE\n"), "DELETE goes to PHP: %d", r.status);
+        rfree(&r);
+
+        // corpi chunked: a PHP arrivano decodificati, con CONTENT_LENGTH
+        r = RAW(port, "POST /echo.php HTTP/1.1\r\nHost: x\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n"
+                      "Content-Type: text/plain\r\n\r\n5;ext=1\r\nciao \r\nB\r\nmondo\0zero!\r\n0\r\nX-Trailer: 1\r\n\r\n");
+        CHECK(r.status == 200 && r.body && strstr(r.body, "CONTENT_LENGTH=16\n") && strstr(r.body, "BODY=ciao mondo") &&
+              !strstr(r.body, "HTTP_TRANSFER_ENCODING"), "chunked body to PHP: %d %s", r.status, r.body);
+        rfree(&r);
+        r = RAW(port, "POST /api/v1/query HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n"
+                      "8\r\n{\"sql\":\"\r\n10\r\nSELECT 6 * 7 AS \r\n4\r\nr\"}\n\r\n0\r\n\r\n"
+                      "GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        CHECK(r.status == 200 && r.body && strstr(r.body, "42"), "chunked JSON to the API: %d %s", r.status, r.body);
+        CHECK(r.body && strstr(r.body, "HTTP/1.1 200") && strstr(r.body, "\"server\":\"SegVault\""), "pipelined request after a chunked one: %s", r.body);
+        rfree(&r);
+        r = RAW(port, "POST /echo.php HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+        CHECK(r.status == 400, "Content-Length + chunked rejected (smuggling): %d", r.status);
+        rfree(&r);
+        r = RAW(port, "POST /echo.php HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n");
+        CHECK(r.status == 501, "other transfer codings: %d", r.status);
+        rfree(&r);
+        r = RAW(port, "POST /echo.php HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n");
+        CHECK(r.status == 400, "bad chunk size: %d", r.status);
+        rfree(&r);
+        r = RAW(port, "POST /echo.php HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX0\r\n\r\n");
+        CHECK(r.status == 400, "chunk without CRLF: %d", r.status);
+        rfree(&r);
+        r = RAW(port, "POST /echo.php HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFFFF\r\n");
+        CHECK(r.status == 413, "huge chunk size: %d", r.status);
         rfree(&r);
 
         r = req(port, "GET", "/echo.php/utenti/7", NULL, NULL);

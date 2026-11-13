@@ -1238,7 +1238,8 @@ static void run_php(SvServer* s, Request* rq, Response* rs, const char* script, 
             size_t nl = (size_t)(c - line);
             // Content-Type / Length hanno già le loro variabili; Proxy aprirebbe la falla "httpoxy"
             bool skip = (nl == 12 && !strncasecmp(line, "Content-Type", 12)) || (nl == 14 && !strncasecmp(line, "Content-Length", 14)) ||
-                        (nl == 5 && !strncasecmp(line, "Proxy", 5));
+                        (nl == 5 && !strncasecmp(line, "Proxy", 5)) ||
+                        (nl == 17 && !strncasecmp(line, "Transfer-Encoding", 17));   // il corpo arriva già decodificato
             if (!skip && used + nl + 6 + l + 2 < hlen * 2 + 16) {
                 char* nm = names + used;
                 memcpy(nm, "HTTP_", 5);
@@ -1629,7 +1630,11 @@ static int parse_head(SvServer* s, char* head, Request* rq) {
                 rq->has_length = true;
                 rq->content_length = (size_t)cl;
                 if (cl > s->cfg.max_body) return 413;
-            } else if (!strcasecmp(p, "Transfer-Encoding")) rq->chunked = true;
+            } else if (!strcasecmp(p, "Transfer-Encoding")) {
+                if (strcasecmp(val, "chunked")) return 501;      // gzip, deflate, ...: non supportati
+                if (rq->chunked) return 400;
+                rq->chunked = true;
+            }
             else if (!strcasecmp(p, "Connection")) {
                 if (!strcasecmp(val, "close")) rq->keep_alive = false;
                 else if (!strcasecmp(val, "keep-alive")) rq->keep_alive = true;
@@ -1642,8 +1647,9 @@ static int parse_head(SvServer* s, char* head, Request* rq) {
         }
         p = e + 2;
     }
-    if (rq->chunked) return 411;                 // corpo chunked non supportato: serve Content-Length
-    if (!strcmp(rq->method, "POST") && !rq->has_length) return 411;
+    // Content-Length e chunked insieme: due lunghezze possibili, la via del "request smuggling"
+    if (rq->chunked && rq->has_length) return 400;
+    if (!strcmp(rq->method, "POST") && !rq->has_length && !rq->chunked) return 411;
     return 0;
 }
 
@@ -1712,6 +1718,52 @@ static void log_request(SvServer* s, const char* client, const Request* rq, cons
     mx_unlock(&s->conn_mx);
 }
 
+// posizione di "\r\n" in in->data a partire da pos (i dati possono contenere byte zero)
+static size_t find_crlf(const InBuf* in, size_t pos) {
+    for (size_t i = pos; i + 1 < in->len; i++) if (in->data[i] == '\r' && in->data[i + 1] == '\n') return i;
+    return (size_t)-1;
+}
+
+// corpo "Transfer-Encoding: chunked" che inizia a in->data[pos]: decodificato in out,
+// *end = primo byte dopo il corpo. 0 = ok, -1 = connessione chiusa, altrimenti codice HTTP
+static int read_chunked(SvServer* s, Conn* c, InBuf* in, size_t pos, JsonBuf* out, size_t* end) {
+    for (;;) {
+        size_t le;
+        while ((le = find_crlf(in, pos)) == (size_t)-1) {
+            if (in->len - pos > 1024) return 400;               // riga della dimensione troppo lunga
+            if (!fill(c->fd, in, in->len + 1, &s->stop)) return -1;
+        }
+        char* q = in->data + pos;
+        size_t size = 0;
+        int digits = 0;
+        for (; q < in->data + le && isxdigit((unsigned char)*q); q++, digits++) {
+            if (digits >= 15) return 413;
+            size = size * 16 + (size_t)(isdigit((unsigned char)*q) ? *q - '0' : (tolower((unsigned char)*q) - 'a' + 10));
+        }
+        if (!digits || (q < in->data + le && *q != ';' && *q != ' ' && *q != '\t')) return 400;   // ";estensione" ignorata
+        pos = le + 2;
+        if (size == 0) {                                        // ultimo pezzo: eventuali trailer, poi riga vuota
+            for (;;) {
+                while ((le = find_crlf(in, pos)) == (size_t)-1) {
+                    if (in->len - pos > MAX_HEADER) return 431;
+                    if (!fill(c->fd, in, in->len + 1, &s->stop)) return -1;
+                }
+                bool empty = le == pos;
+                pos = le + 2;
+                if (empty) break;
+            }
+            *end = pos;
+            return 0;
+        }
+        if (out->len + size > s->cfg.max_body) return 413;
+        if (!fill(c->fd, in, pos + size + 2, &s->stop)) return -1;
+        if (in->data[pos + size] != '\r' || in->data[pos + size + 1] != '\n') return 400;
+        jb_raw(out, in->data + pos, size);
+        if (out->oom) return 413;
+        pos += size + 2;
+    }
+}
+
 // risponde a una richiesta della connessione; false = connessione da chiudere
 static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
     // intestazione: fino a \r\n\r\n
@@ -1745,21 +1797,48 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
     if (perr) {
         rs.close = true;
         json_error(&rs, perr, "%s", perr == 413 ? "request body too large" :
-                                    perr == 411 ? "a Content-Length header is required (no chunked bodies)" : "malformed request");
+                                    perr == 411 ? "a Content-Length header (or a chunked body) is required" :
+                                    perr == 501 ? "unsupported Transfer-Encoding (only chunked)" : "malformed request");
         send_response(s, c->fd, &rq, &rs);
         free(rs.body.data);
         free(rq.headers);
         return false;
     }
-    if (!fill(c->fd, in, head_len + rq.content_length, &s->stop)) { free(rq.headers); return false; }
-    char after = in->data[head_len + rq.content_length];
-    in->data[head_len + rq.content_length] = '\0';
-    rq.body = in->data + head_len;
-    rq.body_len = rq.content_length;
+    size_t used;                                 // byte della richiesta in in->data (intestazione + corpo)
+    JsonBuf chunked = {0};
+    char after = 0;
+    if (rq.chunked) {
+        int cerr = read_chunked(s, c, in, head_len, &chunked, &used);
+        if (cerr) {
+            free(chunked.data);
+            if (cerr > 0) {
+                rs.close = true;
+                json_error(&rs, cerr, "%s", cerr == 413 ? "request body too large" : "malformed chunked body");
+                send_response(s, c->fd, &rq, &rs);
+                free(rs.body.data);
+            }
+            free(rq.headers);
+            return false;
+        }
+        jb_raw(&chunked, "", 1);                 // terminatore (il corpo resta di chunked.len - 1 byte)
+        if (chunked.oom) { free(chunked.data); free(rq.headers); return false; }
+        rq.body = chunked.data;
+        rq.body_len = rq.content_length = chunked.len - 1;
+        rq.has_length = true;
+    } else {
+        if (!fill(c->fd, in, head_len + rq.content_length, &s->stop)) { free(rq.headers); return false; }
+        used = head_len + rq.content_length;
+        after = in->data[used];
+        in->data[used] = '\0';
+        rq.body = in->data + head_len;
+        rq.body_len = rq.content_length;
+    }
 
     route(s, &rq, &rs);
     rs.close = !rq.keep_alive || s->stop;
-    in->data[head_len + rq.content_length] = after;
+    if (!rq.chunked) in->data[used] = after;
+    free(chunked.data);
+    rq.body = NULL;
     bool sent = send_response(s, c->fd, &rq, &rs);
     double ms = now_ms() - t0;
     if (!s->cfg.quiet)
@@ -1771,7 +1850,6 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
     free(rq.headers);
     if (!sent || rs.close) return false;
     // richieste in coda (pipelining): si sposta il resto all'inizio
-    size_t used = head_len + rq.content_length;
     memmove(in->data, in->data + used, in->len - used);
     in->len -= used;
     in->data[in->len] = '\0';
