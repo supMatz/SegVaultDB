@@ -45,7 +45,7 @@ SegVault copre già database e phpMyAdmin; qui c'è quello che manca, in ordine 
 - [x] Modalità MySQL per le connessioni del protocollo MySQL (regole permissive di MySQL: `DISTINCT ... ORDER BY` su colonne non selezionate); nomi di colonna senza alias (`t.*, tt.*`)
 - [x] Bug del motore trovati con WordPress: `WHERE id = '1'` sulla chiave primaria restituiva 0 righe (ora la chiave viene convertita), buffer non inizializzati in `SHOW`
 - [x] Prova completa con **WordPress 7.1.4**: installazione, login, tutta l'amministrazione, articoli con `meta_query` / `tax_query`, paginazione, ricerca, commenti, utenti, transient, cestino, menu, feed, API REST: nessun errore di database (`test_mysql`: 112 controlli)
-- [ ] Confronti senza distinzione di maiuscole come le collation `_ci` di MySQL (`WHERE user_login = 'Admin'`)
+- [x] Confronti senza distinzione di maiuscole per le tabelle con collation `_ci` (come MySQL: `=`, `IN`, indici, `UNIQUE`, `GROUP BY`, `DISTINCT`, `ORDER BY`, join); le tabelle native di SegVault restano case-sensitive
 
 ## 4. Concorrenza
 - [ ] Scritture concorrenti (lock sulle righe o MVCC); più transazioni aperte insieme

@@ -862,23 +862,52 @@ typedef struct {
     int64_t     inum;      // valore intero esatto (se is_int)
     double      num;
     const char* str;       // testo (stringhe e numeri formattati); punta a buf o a memoria della tupla
+    bool        ci;        // testo di una colonna con collation _ci: confronti senza maiuscole (MySQL)
     char        buf[EV_STR_MAX + 1];
 } EvalVal;
 
 // valore tipizzato conservato (risultati, chiavi di ordinamento, funzioni finestra)
-typedef struct SortKey { bool null, is_num, is_int; int64_t inum; double num; char* str; } SortKey;
+typedef struct SortKey { bool null, is_num, is_int, ci; int64_t inum; double num; char* str; } SortKey;
 
-static void ev_null(EvalVal* v) { v->null = true; v->is_num = v->is_int = false; v->str = ""; }
+// colonna di testo di una tabella con collation *_ci (creata da un'applicazione MySQL): i confronti,
+// gli indici, GROUP BY e ORDER BY ignorano maiuscole e minuscole, come in MySQL
+static bool col_is_ci(const TableSchema* ts, int c) {
+    if (!ts || c < 0 || c >= ts->num_columns) return false;
+    DataType t = ts->columns[c].type;
+    if (t != SV_TYPE_VARCHAR && t != SV_TYPE_CHAR && t != SV_TYPE_TEXT) return false;
+    size_t l = strlen(ts->collation);
+    return l > 3 && !strcmp(ts->collation + l - 3, "_ci");
+}
+
+// confronto di testi senza maiuscole (ASCII; i caratteri UTF-8 multi-byte restano come sono)
+static int ci_cmp(const char* a, const char* b) {
+    for (;; a++, b++) {
+        int x = tolower((unsigned char)*a), y = tolower((unsigned char)*b);
+        if (x != y) return x < y ? -1 : 1;
+        if (!x) return 0;
+    }
+}
+
+// copia in minuscolo (malloc); NULL se manca memoria
+static char* ci_fold(const char* s) {
+    size_t l = strlen(s);
+    char* o = malloc(l + 1);
+    if (!o) return NULL;
+    for (size_t i = 0; i <= l; i++) o[i] = (char)tolower((unsigned char)s[i]);
+    return o;
+}
+
+static void ev_null(EvalVal* v) { v->null = true; v->is_num = v->is_int = false; v->str = ""; v->ci = false; }
 
 // i numeri vengono convertiti in testo solo quando serve (ev_s): confronti, aritmetica e
 // filtri lavorano sui valori binari, senza snprintf per ogni riga
 static void ev_int(EvalVal* v, int64_t x) {
-    v->null = false; v->is_num = v->is_int = true; v->inum = x; v->num = (double)x; v->str = NULL;
+    v->null = false; v->is_num = v->is_int = true; v->inum = x; v->num = (double)x; v->str = NULL; v->ci = false;
 }
 
 static void ev_num(EvalVal* v, double x) {
     if (x != x || x - x != 0) { ev_null(v); return; }        // NaN / infinito: NULL
-    v->null = false; v->is_num = true; v->is_int = false; v->num = x; v->str = NULL;
+    v->null = false; v->is_num = true; v->is_int = false; v->num = x; v->str = NULL; v->ci = false;
 }
 
 // testo del valore ("" per NULL); per i numeri viene formattato alla prima richiesta
@@ -942,7 +971,7 @@ static int ev_cmp(const EvalVal* a, const EvalVal* b) {
             return x < y ? -1 : x > y;
         }
     }
-    int c = strcmp(ev_s(a), ev_s(b));
+    int c = (a->ci || b->ci) ? ci_cmp(ev_s(a), ev_s(b)) : strcmp(ev_s(a), ev_s(b));
     return c < 0 ? -1 : c > 0;
 }
 
@@ -954,6 +983,7 @@ static int ev_truth(const EvalVal* v) {
 
 // valore di una colonna della tupla
 static void ev_from_value(EvalVal* out, const Value* v, DataType type) {
+    out->ci = false;
     if (v->is_null) { ev_null(out); return; }
     switch (type) {
         case SV_TYPE_INT:    ev_int(out, v->int_val); return;
@@ -1142,10 +1172,13 @@ static void mi_invalidate_table(const char* db, const char* table) {
 }
 
 // chiave canonica di un valore (NULL non viene indicizzato)
-static void mi_key(const Value* v, DataType t, char* buf, size_t n) {
-    if (t != SV_TYPE_INT && t != SV_TYPE_BIGINT && t != SV_TYPE_FLOAT && t != SV_TYPE_BOOL)   // testo
-        key_text(buf, n, v->str_val ? v->str_val : "");
-    else value_to_string((Value*)v, t, buf, n);
+static void mi_key(const Value* v, DataType t, char* buf, size_t n, bool ci) {
+    if (t != SV_TYPE_INT && t != SV_TYPE_BIGINT && t != SV_TYPE_FLOAT && t != SV_TYPE_BOOL) {   // testo
+        const char* s = v->str_val ? v->str_val : "";
+        char* f = ci ? ci_fold(s) : NULL;
+        key_text(buf, n, f ? f : s);
+        free(f);
+    } else value_to_string((Value*)v, t, buf, n);
 }
 
 // chiave della tupla sulle colonne indicate; false se una colonna è NULL (non indicizzata:
@@ -1157,7 +1190,7 @@ static bool tuple_key(const TableSchema* ts, const Tuple* t, const int* cols, in
         int ci = cols[k];
         if (ci < 0 || ci >= t->num_values || t->values[ci].is_null) return false;
         if (k) { if (len + KEY_INLINE_MAX + 2 >= n) return false; buf[len++] = '\x1f'; buf[len] = '\0'; }
-        mi_key(&t->values[ci], ts->columns[ci].type, buf + len, n - len);
+        mi_key(&t->values[ci], ts->columns[ci].type, buf + len, n - len, col_is_ci(ts, ci));
         len += strlen(buf + len);
     }
     return true;
@@ -3361,6 +3394,7 @@ static void eval_aggregate(ASTExpr* e, EvalCtx* c, EvalVal* out) {
 }
 
 static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out) {
+    out->ci = false;                       // lo imposta solo la lettura di una colonna _ci (e chi la copia)
     if (!e) { ev_null(out); return; }
     switch (e->type) {
         case EXPR_NULL:   ev_null(out); return;
@@ -3381,6 +3415,7 @@ static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             Tuple* t = (cc && cc->cur && s < cc->nsrc) ? cc->cur[s] : NULL;
             if (!t || col >= t->num_values) { ev_null(out); return; }
             ev_from_value(out, &t->values[col], cc->src[s].ts->columns[col].type);
+            out->ci = col_is_ci(cc->src[s].ts, col);
             return;
         }
         case EXPR_SUBQUERY: eval_subquery(e, c, out); return;
@@ -3531,12 +3566,16 @@ static bool is_num_storage(DataType t) { return t == SV_TYPE_INT || t == SV_TYPE
 static Tuple* tuple_clone(const Tuple* t, const TableSchema* ts);
 
 // chiave per l'hash join: interi -> numero, testo -> testo; false per NULL
-static bool join_key(const Tuple* t, int col, DataType type, char* buf, size_t n) {
+static bool join_key(const Tuple* t, int col, DataType type, char* buf, size_t n, bool ci) {
     if (!t || col >= t->num_values || t->values[col].is_null) return false;
     const Value* v = &t->values[col];
     if (type == SV_TYPE_INT)         snprintf(buf, n, "%d", v->int_val);
     else if (type == SV_TYPE_BIGINT) snprintf(buf, n, "%lld", (long long)v->bigint_val);
-    else                             key_text(buf, n, v->str_val ? v->str_val : "");
+    else {
+        char* f = ci ? ci_fold(v->str_val ? v->str_val : "") : NULL;
+        key_text(buf, n, f ? f : (v->str_val ? v->str_val : ""));
+        free(f);
+    }
     return true;
 }
 
@@ -3560,7 +3599,9 @@ static bool find_index_eq(ASTExpr* w, TableSchema* ts, int* out_ci, char* key, s
                    d == floor(d) && fabs(d) <= 2147483647.0) {                // WHERE id = '5'
             snprintf(key, keyn, "%lld", (long long)d);
         } else if (is_text_type(t) && val->type == EXPR_STRING) {
-            key_text(key, keyn, val->str_val ? val->str_val : "");
+            char* f = col_is_ci(ts, ci) ? ci_fold(val->str_val ? val->str_val : "") : NULL;
+            key_text(key, keyn, f ? f : (val->str_val ? val->str_val : ""));
+            free(f);
         } else {
             continue;
         }
@@ -3610,7 +3651,7 @@ typedef SortKey OVal;
 
 // copia di un valore calcolato (il testo viene duplicato; i numeri senza testo restano binari)
 static void key_set(SortKey* k, const EvalVal* v) {
-    k->null = v->null; k->is_num = v->is_num; k->is_int = v->is_int; k->inum = v->inum; k->num = v->num;
+    k->null = v->null; k->is_num = v->is_num; k->is_int = v->is_int; k->inum = v->inum; k->num = v->num; k->ci = v->ci && !v->is_num;
     k->str = (v->null || (v->is_num && !v->str)) ? NULL : strdup(ev_s(v));
 }
 
@@ -3618,13 +3659,17 @@ static void ev_from_oval(EvalVal* v, const OVal* o) {
     if (o->null) { ev_null(v); return; }
     v->null = false; v->is_num = o->is_num; v->is_int = o->is_int; v->inum = o->inum; v->num = o->num;
     v->str = o->str ? o->str : (o->is_num ? NULL : "");
+    v->ci = o->ci;
 }
 
 static int key_cmp(const SortKey* a, const SortKey* b) {
     if (a->null || b->null) return a->null == b->null ? 0 : a->null ? -1 : 1;   // NULL per primi
     if (a->is_int && b->is_int) return a->inum < b->inum ? -1 : a->inum > b->inum;
     if (a->is_num && b->is_num) return a->num < b->num ? -1 : a->num > b->num;
-    if (!a->is_num && !b->is_num) { int c = strcmp(a->str ? a->str : "", b->str ? b->str : ""); return c < 0 ? -1 : c > 0; }
+    if (!a->is_num && !b->is_num) {
+        int c = (a->ci || b->ci) ? ci_cmp(a->str ? a->str : "", b->str ? b->str : "") : strcmp(a->str ? a->str : "", b->str ? b->str : "");
+        return c < 0 ? -1 : c > 0;
+    }
     EvalVal x, y;
     ev_from_oval(&x, a);
     ev_from_oval(&y, b);
@@ -3655,7 +3700,11 @@ static uint64_t ev_hash(const EvalVal* v) {
         memcpy(&b, &d, 8);
         return mix64(b ^ 0x5bd1e995ULL);
     }
-    return str_hash(ev_s(v)) ^ 0x27d4eb2f165667c5ULL;
+    // sempre senza maiuscole: 'Anna' e 'anna' finiscono nello stesso secchio, poi decide l'uguaglianza
+    // (con o senza collation _ci): così i due lati di un confronto hanno sempre lo stesso hash
+    uint64_t h = 1469598103934665603ULL;
+    for (const char* p = ev_s(v); *p; p++) { h ^= (unsigned char)tolower((unsigned char)*p); h *= 1099511628211ULL; }
+    return h ^ 0x27d4eb2f165667c5ULL;
 }
 
 // stessa chiave di raggruppamento? (NULL con NULL sì, numeri per valore, testi per contenuto)
@@ -3663,6 +3712,7 @@ static bool ev_eq_key(const EvalVal* a, const SortKey* b) {
     if (a->null || b->null) return a->null && b->null;
     if (a->is_num != b->is_num) return false;
     if (a->is_num) return (a->is_int && b->is_int) ? a->inum == b->inum : a->num == b->num;
+    if (a->ci || b->ci) return ci_cmp(ev_s(a), b->str ? b->str : "") == 0;
     return strcmp(ev_s(a), b->str ? b->str : "") == 0;
 }
 
@@ -3695,12 +3745,17 @@ static bool hmap_put(HMap* m, uint64_t h, int val) {
 }
 
 // hash del valore di una colonna (interi come numero, testi come testo); false per NULL
-static bool col_hash(const Tuple* t, int col, DataType type, uint64_t* h) {
+static bool col_hash(const Tuple* t, int col, DataType type, uint64_t* h, bool ci) {
     if (!t || col >= t->num_values || t->values[col].is_null) return false;
     const Value* v = &t->values[col];
     if (type == SV_TYPE_INT) *h = mix64((uint64_t)(int64_t)v->int_val);
     else if (type == SV_TYPE_BIGINT) *h = mix64((uint64_t)v->bigint_val);
-    else *h = str_hash(v->str_val ? v->str_val : "");
+    else {                                                     // senza maiuscole: vedi ev_hash
+        (void)ci;
+        uint64_t x = 1469598103934665603ULL;
+        for (const char* p = v->str_val ? v->str_val : ""; *p; p++) { x ^= (unsigned char)tolower((unsigned char)*p); x *= 1099511628211ULL; }
+        *h = x;
+    }
     return true;
 }
 
@@ -3714,7 +3769,9 @@ static size_t oval_key(const OVal* o, char* buf, size_t cap) {
     else {
         if (cap < KEY_INLINE_MAX + 3) { buf[0] = '\0'; return 0; }
         buf[0] = 's';
-        key_text(buf + 1, cap - 2, o->str ? o->str : "");
+        char* f = o->ci ? ci_fold(o->str ? o->str : "") : NULL;
+        key_text(buf + 1, cap - 2, f ? f : (o->str ? o->str : ""));
+        free(f);
         n = (int)strlen(buf);
         buf[n++] = '\x1f';
         buf[n] = '\0';
@@ -3866,6 +3923,7 @@ struct SelectPlan {
     StrMap    inset;                    // IN (SELECT ...): valori del risultato
     int       inset_class;              // 1 numeri, 2 testi, 3 misto
     bool      inset_null;
+    bool      inset_ci;                // i valori della subquery vengono da una colonna _ci
     bool      inset_built;
     long      execs;                    // esecuzioni (EXPLAIN delle subquery)
     // NATURAL / USING: copia di destra di una colonna unita -> colonna di sinistra (s*1024+c+1)
@@ -4751,6 +4809,7 @@ static bool range_rids(SelectPlan* p, int s, EvalCtx* ec, RID** rids, int* n) {
             const char* bt = ev_s(bv[k]);
             if (key_is_long(bt, strlen(bt))) return false;               // chiave in forma lunga: niente intervallo
             snprintf(keep[k], sizeof(keep[k]), "%s", bt);
+            if (col_is_ci(S->ts, ci)) for (char* q = keep[k]; *q; q++) *q = (char)tolower((unsigned char)*q);   // indice in minuscolo
             bv[k]->str = keep[k];
         }
     }
@@ -4765,7 +4824,9 @@ static bool range_worth(const Source* S, int n) {
 }
 
 // chiave di ricerca dal valore calcolato; false se il tipo non è confrontabile esattamente
-static bool probe_text(const EvalVal* v, DataType col, char* buf, size_t n) {
+static bool probe_text_ci(const EvalVal* v, DataType col, char* buf, size_t n, bool ci);
+static bool probe_text(const EvalVal* v, DataType col, char* buf, size_t n) { return probe_text_ci(v, col, buf, n, false); }
+static bool probe_text_ci(const EvalVal* v, DataType col, char* buf, size_t n, bool ci) {
     if (v->null) return false;
     if (is_int_type(col)) {
         // colonna intera: anche 1.0 e '1' (MySQL: WHERE ID = '1') trovano la chiave 1
@@ -4779,7 +4840,12 @@ static bool probe_text(const EvalVal* v, DataType col, char* buf, size_t n) {
         snprintf(buf, n, "%lld", x);
         return true;
     }
-    if (is_text_type(col) && !v->is_num) { key_text(buf, n, ev_s(v)); return true; }
+    if (is_text_type(col) && !v->is_num) {
+        char* f = ci ? ci_fold(ev_s(v)) : NULL;
+        key_text(buf, n, f ? f : ev_s(v));
+        free(f);
+        return true;
+    }
     return false;
 }
 
@@ -5137,7 +5203,7 @@ static bool plan_load(SelectPlan* p) {
                 EvalVal kv;
                 eval_expr(p->probe_key[s], &ec, &kv);
                 char key[KEY_BUF];
-                bool keyed = probe_text(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key));
+                bool keyed = probe_text_ci(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key), col_is_ci(S->ts, p->probe_col[s]));
                 // un valore che non diventa una chiave della colonna (testo contro numero, ...): si legge tutto
                 MemIndex* ix = keyed || kv.null ? mi_get(p->x, db->name, S->ts, p->probe_col[s]) : NULL;
                 if (ix) {
@@ -5247,7 +5313,7 @@ static bool plan_load(SelectPlan* p) {
             for (int r = S->n - 1; r >= 0; r--) {
                 char key[KEY_BUF];
                 p->pnext[s][r] = -1;
-                if (!join_key(S->rows[r], col, kt, key, sizeof(key))) continue;
+                if (!join_key(S->rows[r], col, kt, key, sizeof(key), col_is_ci(S->ts, col))) continue;
                 SMSlot* sl = sm_slot(&p->pmap[s], key, true);
                 if (!sl) { snprintf(p->err, sizeof(p->err), "Out of memory"); return false; }
                 p->pnext[s][r] = sl->val;
@@ -5315,15 +5381,17 @@ static const char* join_step(EvalCtx* ec, Combos* in, Combos* out, int k, JoinTy
     int kc, os, oc;
     HMap map = {0};
     int* next = NULL;
+    bool hci = false;
     bool hashed = find_hash_cond(conds, k, ec->src, &kc, &os, &oc);
     if (hashed) {
         next = malloc(sizeof(int) * (size_t)(nrows ? nrows : 1));
         if (!next) { free(right_hit); return "Out of memory"; }
         DataType kt = ec->src[k].ts->columns[kc].type;
+        hci = col_is_ci(ec->src[k].ts, kc) || col_is_ci(ec->src[os].ts, oc);
         for (int r = nrows - 1; r >= 0; r--) {          // in ordine: la catena parte dalla prima riga
             uint64_t h;
             next[r] = -1;
-            if (!col_hash(rows[r], kc, kt, &h)) continue;
+            if (!col_hash(rows[r], kc, kt, &h, hci)) continue;
             size_t j = map.cap ? h & (map.cap - 1) : 0;
             while (map.cap && map.v[j] >= 0 && map.h[j] != h) j = (j + 1) & (map.cap - 1);
             if (map.cap && map.v[j] >= 0) { next[r] = map.v[j]; map.v[j] = r; continue; }
@@ -5341,7 +5409,7 @@ static const char* join_step(EvalCtx* ec, Combos* in, Combos* out, int k, JoinTy
         if (hashed) {
             uint64_t h;
             r = -1;
-            if (col_hash(base[os], oc, ot, &h) && map.cap) {
+            if (col_hash(base[os], oc, ot, &h, hci) && map.cap) {
                 size_t j = h & (map.cap - 1);
                 while (map.v[j] >= 0 && map.h[j] != h) j = (j + 1) & (map.cap - 1);
                 r = map.v[j];
@@ -5712,8 +5780,9 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
             EvalVal kv;
             eval_expr(p->probe_key[s], &ec, &kv);
             char key[KEY_BUF];
-            SMSlot* sl = probe_text(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key)) ? sm_slot(&p->pmap[s], key, false) : NULL;
-            if (!probe_text(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key)) && !kv.null) {
+            bool pci = col_is_ci(S->ts, p->probe_col[s]);
+            SMSlot* sl = probe_text_ci(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key), pci) ? sm_slot(&p->pmap[s], key, false) : NULL;
+            if (!probe_text_ci(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key), pci) && !kv.null) {
                 // tipo non confrontabile per chiave: si provano tutte le righe
                 for (int r = 0; r < S->n; r++) { cur[s] = S->rows[r]; if (xv_all_true(&p->pre_dyn[s], &ec)) st.frows[s][st.fn[s]++] = S->rows[r]; }
             } else {
@@ -6185,9 +6254,11 @@ static void eval_subquery(ASTExpr* e, EvalCtx* c, EvalVal* out) {
                     p->inset_built = true;
                     p->inset_class = 0;
                     p->inset_null = false;
+                    p->inset_ci = false;
                     for (int i = 0; i < rows->nrows; i++) {
                         const OVal* o = orow(rows, i);
                         if (o->null) { p->inset_null = true; continue; }
+                        if (o->ci) p->inset_ci = true;
                         int cl = o->is_num ? 1 : 2;
                         p->inset_class = p->inset_class == 0 ? cl : p->inset_class == cl ? cl : 3;
                         char key[KEY_BUF];
@@ -6195,9 +6266,11 @@ static void eval_subquery(ASTExpr* e, EvalCtx* c, EvalVal* out) {
                         if (!sm_slot(&p->inset, key, true)) { p->inset_class = 3; break; }
                     }
                 }
-                if (p->inset_class == val_class(&a) || p->inset_class == 0) {
+                // collation diverse fra il valore e la subquery: confronto riga per riga (sotto)
+                if ((p->inset_class == val_class(&a) || p->inset_class == 0) && (a.ci && !a.is_num) == p->inset_ci) {
                     OVal o;
-                    o.null = false; o.is_num = a.is_num; o.is_int = a.is_int; o.inum = a.inum; o.num = a.num;
+                    memset(&o, 0, sizeof(o));
+                    o.null = false; o.is_num = a.is_num; o.is_int = a.is_int; o.inum = a.inum; o.num = a.num; o.ci = a.ci && !a.is_num;
                     o.str = (char*)(a.is_num ? NULL : ev_s(&a));
                     char key[KEY_BUF];
                     oval_key(&o, key, sizeof(key));
@@ -7873,8 +7946,8 @@ static const char* fire_cascaded(ExecCtx* ctx, Database* db, ChangeSet* cs, bool
             const Value* y = &ch->nt->values[c];
             bool diff = x->is_null != y->is_null;
             if (!diff && !x->is_null) {
-                mi_key(x, ch->ts->columns[c].type, a, sizeof(a));
-                mi_key(y, ch->ts->columns[c].type, b, sizeof(b));
+                mi_key(x, ch->ts->columns[c].type, a, sizeof(a), col_is_ci(ch->ts, c));
+                mi_key(y, ch->ts->columns[c].type, b, sizeof(b), col_is_ci(ch->ts, c));
                 diff = strcmp(a, b) != 0;
             }
             if (diff) changed[nch++] = c;
@@ -8121,7 +8194,7 @@ static const char* select_matches(ExecCtx* ctx, Database* db, Source* s, ASTExpr
             EvalVal kv;
             eval_expr(key, ec, &kv);
             char kt[KEY_BUF];
-            if (!probe_text(&kv, s->ts->columns[ci].type, kt, sizeof(kt)) && !kv.null) continue;
+            if (!probe_text_ci(&kv, s->ts->columns[ci].type, kt, sizeof(kt), col_is_ci(s->ts, ci)) && !kv.null) continue;
             MemIndex* ix = mi_get(ctx, db->name, s->ts, ci);
             if (!ix) continue;
             s->loaded = true;

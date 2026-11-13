@@ -197,6 +197,29 @@ int main(void) {
     t("SELECT GROUP_CONCAT(v, n ORDER BY n DESC SEPARATOR ';') FROM g WHERE k = 1", "a3;b2;a1");
     t("SELECT GROUP_CONCAT(v) FROM g WHERE k = 99", "NULL");
 
+    // ── collation _ci: confronti senza maiuscole (solo per le tabelle create con una collation _ci) ──
+    t("CREATE TABLE u (login VARCHAR(60) NOT NULL, nome VARCHAR(30), PRIMARY KEY (login), UNIQUE KEY em (nome)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_520_ci", "OK:0");
+    t("INSERT INTO u VALUES ('Admin', 'Anna'), ('bob', 'Bruno')", "OK:2");
+    t("SELECT login FROM u WHERE login = 'admin'", "Admin");                 // chiave primaria (indice)
+    t("SELECT login FROM u WHERE nome = 'ANNA'", "Admin");                   // indice UNIQUE
+    t("SELECT login FROM u WHERE UPPER(login) = 'BOB' AND login = 'BOB'", "bob");
+    t("INSERT INTO u VALUES ('ADMIN', 'x')", "ERR:Duplicate");               // come MySQL: stessa chiave
+    t("INSERT INTO u VALUES ('carla', 'bruno')", "ERR:Duplicate");
+    t("INSERT INTO u VALUES ('carla', 'Carla'), ('Dario', 'dario')", "OK:2");
+    t("SELECT login FROM u ORDER BY login", "Admin;bob;carla;Dario");        // ordine senza maiuscole
+    t("SELECT login FROM u WHERE login IN ('ADMIN', 'DARIO') ORDER BY login", "Admin;Dario");
+    t("SELECT login FROM u WHERE login IN (SELECT UPPER(login) FROM u WHERE login < 'c') ORDER BY login", "Admin;bob");
+    t("CREATE TABLE ux (k VARCHAR(10)) COLLATE utf8mb4_general_ci", "OK:0");
+    t("INSERT INTO ux VALUES ('a'), ('A'), ('b'), ('B'), ('b')", "OK:5");
+    t("SELECT COUNT(*) FROM (SELECT DISTINCT k FROM ux) AS d", "2");
+    t("SELECT LOWER(k), COUNT(*) FROM ux GROUP BY k ORDER BY k", "a|2;b|3");
+    t("SELECT COUNT(*) FROM ux JOIN u ON u.login = ux.k", "0");
+    t("SELECT MIN(k) = 'a', MAX(k) = 'B' FROM ux", "1|1");
+    t("CREATE TABLE cs (k VARCHAR(10) PRIMARY KEY)", "OK:0");                // SegVault: distingue le maiuscole
+    t("INSERT INTO cs VALUES ('a'), ('A')", "OK:2");
+    t("SELECT k FROM cs WHERE k = 'a'", "a");
+    t("SELECT COUNT(DISTINCT k) FROM cs", "2");
+
     // ── LIKE: \ protegge % e _ come in MySQL e PostgreSQL ──
     t("SELECT 'a_b' LIKE 'a\\_b', 'axb' LIKE 'a\\_b', '50%' LIKE '50\\%', 'a\\\\b' LIKE 'a\\\\\\\\b'", "1|0|1|1");
 
