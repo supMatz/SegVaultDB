@@ -87,7 +87,7 @@ FULL_OBJS = $(FULL_SRCS:.c=.o)
 all: full server
 
 # ── server HTTP/JSON (nessuna GUI, nessuna libreria X11): segvault-server ──
-SERVER_SRCS = src/server/main.c $(NET_SRCS) src/widgets/sql_text.c $(ENGINE_SRCS)
+SERVER_SRCS = src/server/main.c src/server/service.c $(NET_SRCS) src/widgets/sql_text.c $(ENGINE_SRCS)
 SERVER_OBJS = $(patsubst %.c,build-server/%.o,$(SERVER_SRCS))
 
 server: segvault-server

@@ -6,6 +6,12 @@
 #include "../server/server.h"
 #include "../server/fastcgi.h"
 #include "../server/tls.h"
+#ifndef _WIN32
+#include <unistd.h>
+#include <limits.h>
+#else
+#include <windows.h>
+#endif
 #include "../bridge/db_api.h"
 #include "../../include/common.h"
 #include <stdio.h>
@@ -155,7 +161,7 @@ ViewAction start_screen_event(StartScreen* s, const sEvent* evt) {
 enum {
     HIT_COPY_URL, HIT_COPY_LAN, HIT_PORT_MINUS, HIT_PORT_PLUS, HIT_ACCESS_LOCAL, HIT_ACCESS_LAN,
     HIT_TOKEN_OFF, HIT_TOKEN_ON, HIT_COPY_TOKEN, HIT_NEW_TOKEN, HIT_CORS_OFF, HIT_CORS_ON, HIT_TIME_MINUS,
-    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_TAB_REQ, HIT_TAB_MON, HIT_MYSQL_OFF, HIT_MYSQL_ON, HIT_COPY_MYSQL, HIT_PHP_OFF, HIT_PHP_ON, HIT_MAIL_OFF, HIT_MAIL_ON, HIT_OPEN_MAIL, HIT_OPEN_DASH, HIT_HTTPS_OFF, HIT_HTTPS_ON, HIT_TRUST_CA, HIT_OPEN_HTTPS, HIT_EDIT_PHPINI, HIT_LF0, HIT_LF1, HIT_LF2, HIT_LF3, HIT_LF4, HIT_LF5, HIT_COUNT
+    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_TAB_REQ, HIT_TAB_MON, HIT_MYSQL_OFF, HIT_MYSQL_ON, HIT_COPY_MYSQL, HIT_PHP_OFF, HIT_PHP_ON, HIT_MAIL_OFF, HIT_MAIL_ON, HIT_OPEN_MAIL, HIT_OPEN_DASH, HIT_HTTPS_OFF, HIT_HTTPS_ON, HIT_TRUST_CA, HIT_OPEN_HTTPS, HIT_EDIT_PHPINI, HIT_LF0, HIT_LF1, HIT_LF2, HIT_LF3, HIT_LF4, HIT_LF5, HIT_AUTO_OFF, HIT_AUTO_ON, HIT_COUNT
 };
 
 enum { ACT_NONE, ACT_TOGGLE, ACT_EDITOR, ACT_COPY };
@@ -250,6 +256,8 @@ void server_panel_set_paths(ServerPanel* p, const char* data_dir, const char* se
 }
 
 bool server_panel_running(const ServerPanel* p) { return p && p->srv; }
+
+const char* server_panel_dashboard_url(const ServerPanel* p) { return p && p->srv ? p->dash_url : ""; }
 
 static bool token_required(void) { return g_settings.server_token || g_settings.server_lan || g_settings.server_cors; }
 
@@ -846,6 +854,16 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
                  "Nothing leaves this computer.", g_settings.server_mail_port);
         y += text_wrap(win, lb, x, y + 2, w, TH_TEXT_FAINT, TH_FONT_SMALL) + 2;
     }
+    y += 12;
+
+    // avvio con il computer: l'app parte nell'area di notifica con il server acceso
+    y = section_label(win, "START WITH THE COMPUTER", x, y);
+    bool auto_on = platform_autostart_get();
+    segmented(p, HIT_AUTO_OFF, (Rect){x, y, w, 28}, "Off", "In the tray", auto_on ? 1 : 0, true);
+    y += 28 + 4;
+    y += text_wrap(win, auto_on ? "At login SegVault starts hidden in the notification area with the server on (same data folder)."
+                                : "Start SegVault at login, hidden in the notification area, with the server on.",
+                   x, y + 2, w, TH_TEXT_FAINT, TH_FONT_SMALL) + 2;
     y += 12;
 
     // prova rapida
@@ -1487,6 +1505,24 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
                 break;
             }
             snprintf(p->flash, sizeof(p->flash), "Restart the server after saving");
+            break;
+        }
+        case HIT_AUTO_OFF: case HIT_AUTO_ON: {
+            // riga di comando: questo eseguibile, --server --tray, la cartella dati in forma assoluta
+            char exe[1024] = "", data[1024] = "", cmd[2300];
+#ifdef _WIN32
+            DWORD n = GetModuleFileNameA(NULL, exe, sizeof(exe));
+            if (n == 0 || n >= sizeof(exe)) exe[0] = '\0';
+            if (!_fullpath(data, p->data_dir[0] ? p->data_dir : ".", sizeof(data))) data[0] = '\0';
+#else
+            ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+            exe[n > 0 ? n : 0] = '\0';
+            if (!realpath(p->data_dir[0] ? p->data_dir : ".", data)) data[0] = '\0';
+#endif
+            snprintf(cmd, sizeof(cmd), "\"%s\" --server --tray \"%s\"", exe, data);
+            bool on = hit == HIT_AUTO_ON;
+            if (!exe[0] || !data[0] || !platform_autostart_set(on, cmd))
+                snprintf(p->error, sizeof(p->error), "Cannot change the start at login setting");
             break;
         }
         case HIT_HTTPS_OFF: case HIT_HTTPS_ON:

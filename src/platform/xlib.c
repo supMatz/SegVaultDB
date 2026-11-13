@@ -71,6 +71,12 @@ struct PlatformWindow {
     // clipping corrente
     bool has_clip;
     Rect clip;
+
+    // icona nel system tray (XEmbed)
+    Window tray;            // 0 = nessuna
+    int    tray_w, tray_h;
+    bool   tray_active;
+    bool   visible;
 };
 
 // -- utilità --
@@ -294,6 +300,118 @@ PlatformWindow* platform_window_create(const char* title, int w, int h) {
 void platform_window_show(PlatformWindow* win) {
     XMapWindow(win->display, win->window); // rende visibile la finestra
     XFlush(win->display); // invia i comandi al server X
+    win->visible = true;
+}
+
+void platform_window_set_visible(PlatformWindow* win, bool visible) {
+    if (visible) XMapRaised(win->display, win->window);
+    else XUnmapWindow(win->display, win->window);
+    XFlush(win->display);
+    win->visible = visible;
+}
+
+bool platform_window_visible(PlatformWindow* win) { return win->visible; }
+
+// ── system tray (protocollo XEmbed di freedesktop.org) ──
+
+static void tray_draw(PlatformWindow* win) {
+    if (!win->tray) return;
+    Display* d = win->display;
+    int w = win->tray_w > 0 ? win->tray_w : 22, h = win->tray_h > 0 ? win->tray_h : 22;
+    int sz = (w < h ? w : h) - 4;
+    if (sz < 8) sz = 8;
+    int x = (w - sz) / 2, y = (h - sz) / 2;
+    GC gc = XCreateGC(d, win->tray, 0, NULL);
+    XClearWindow(d, win->tray);
+    // pila di dischi (un database): verde se il server gira, grigia altrimenti
+    unsigned long col = win->tray_active ? 0x22a35a : 0x8a919c;
+    XSetForeground(d, gc, col);
+    int dh = sz / 3;
+    for (int i = 0; i < 3; i++) {
+        XFillArc(d, win->tray, gc, x, y + i * (sz - dh) / 2, sz, dh, 0, 360 * 64);
+    }
+    XFillRectangle(d, win->tray, gc, x, y + dh / 2, sz, sz - dh);
+    XSetForeground(d, gc, 0xffffff);
+    for (int i = 1; i < 3; i++) XDrawArc(d, win->tray, gc, x, y + i * (sz - dh) / 2 - 1, sz - 1, dh, 180 * 64, 180 * 64);
+    XFreeGC(d, gc);
+    XFlush(d);
+}
+
+bool platform_tray_enable(PlatformWindow* win, const char* tooltip) {
+    if (win->tray) return true;
+    Display* d = win->display;
+    char name[48];
+    snprintf(name, sizeof(name), "_NET_SYSTEM_TRAY_S%d", win->screen);
+    Window owner = XGetSelectionOwner(d, XInternAtom(d, name, False));
+    if (owner == None) return false;                          // nessuna area di notifica (es. GNOME senza estensione)
+    XSetWindowAttributes a;
+    memset(&a, 0, sizeof(a));
+    a.background_pixmap = ParentRelative;
+    a.event_mask = ExposureMask | ButtonPressMask | StructureNotifyMask;
+    win->tray = XCreateWindow(d, RootWindow(d, win->screen), 0, 0, 22, 22, 0, CopyFromParent, InputOutput, CopyFromParent,
+                              CWBackPixmap | CWEventMask, &a);
+    win->tray_w = win->tray_h = 22;
+    XSizeHints* sh = XAllocSizeHints();
+    if (sh) { sh->flags = PMinSize; sh->min_width = sh->min_height = 16; XSetWMNormalHints(d, win->tray, sh); XFree(sh); }
+    XStoreName(d, win->tray, tooltip ? tooltip : "SegVault");
+    Atom xi = XInternAtom(d, "_XEMBED_INFO", False);
+    long info[2] = { 0, 1 };                                  // versione 0, XEMBED_MAPPED
+    XChangeProperty(d, win->tray, xi, xi, 32, PropModeReplace, (unsigned char*)info, 2);
+    XEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.xclient.type = ClientMessage;
+    ev.xclient.window = owner;
+    ev.xclient.message_type = XInternAtom(d, "_NET_SYSTEM_TRAY_OPCODE", False);
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = CurrentTime;
+    ev.xclient.data.l[1] = 0;                                 // SYSTEM_TRAY_REQUEST_DOCK
+    ev.xclient.data.l[2] = (long)win->tray;
+    XSendEvent(d, owner, False, NoEventMask, &ev);
+    XFlush(d);
+    return true;
+}
+
+void platform_tray_update(PlatformWindow* win, const char* tooltip, bool active) {
+    if (!win->tray) return;
+    if (tooltip) XStoreName(win->display, win->tray, tooltip);
+    if (active != win->tray_active) { win->tray_active = active; tray_draw(win); }
+}
+
+void platform_tray_disable(PlatformWindow* win) {
+    if (!win->tray) return;
+    XDestroyWindow(win->display, win->tray);
+    win->tray = 0;
+    XFlush(win->display);
+}
+
+// ── avvio con il computer: ~/.config/autostart (specifica XDG) ──
+
+static void autostart_path(char* out, size_t n) {
+    const char* cfg = getenv("XDG_CONFIG_HOME");
+    const char* home = getenv("HOME");
+    if (cfg && cfg[0]) snprintf(out, n, "%s/autostart/segvault.desktop", cfg);
+    else snprintf(out, n, "%s/.config/autostart/segvault.desktop", home ? home : ".");
+}
+
+bool platform_autostart_set(bool on, const char* command) {
+    char p[1100];
+    autostart_path(p, sizeof(p));
+    if (!on) return remove(p) == 0 || access(p, F_OK) != 0;
+    char dir[1100];
+    snprintf(dir, sizeof(dir), "%s", p);
+    char* sl = strrchr(dir, '/');
+    if (sl) { *sl = '\0'; char* sl2 = strrchr(dir, '/'); if (sl2) { *sl2 = '\0'; mkdir(dir, 0755); *sl2 = '/'; } mkdir(dir, 0755); }
+    FILE* f = fopen(p, "w");
+    if (!f) return false;
+    fprintf(f, "[Desktop Entry]\nType=Application\nName=SegVault\nComment=Local development server and database\n"
+               "Exec=%s\nTerminal=false\nX-GNOME-Autostart-enabled=true\n", command);
+    return fclose(f) == 0;
+}
+
+bool platform_autostart_get(void) {
+    char p[1100];
+    autostart_path(p, sizeof(p));
+    return access(p, F_OK) == 0;
 }
 
 // -- appunti: risposta alle richieste di altri programmi --
@@ -360,6 +478,13 @@ bool platform_poll_event(PlatformWindow *win, sEvent *evt) {
         memset(evt, 0, sizeof(*evt));
         evt->type = EVT_NONE;
 
+        if (win->tray && xe.xany.window == win->tray) {          // eventi dell'icona nel tray
+            if (xe.type == Expose && xe.xexpose.count == 0) tray_draw(win);
+            else if (xe.type == ConfigureNotify) { win->tray_w = xe.xconfigure.width; win->tray_h = xe.xconfigure.height; tray_draw(win); }
+            else if (xe.type == DestroyNotify) win->tray = 0;
+            else if (xe.type == ButtonPress) { evt->type = EVT_TRAY_OPEN; return true; }
+            continue;
+        }
         switch (xe.type) {
             case ClientMessage:
                 if ((Atom)xe.xclient.data.l[0] == win->wm_delete)
@@ -816,6 +941,7 @@ char* platform_get_clipboard(PlatformWindow* win) {
 
 void platform_window_destroy(PlatformWindow* win) {
     if (!win) return;
+    platform_tray_disable(win);
     for (int i = 0; i < win->num_fonts; i++)
         XftFontClose(win->display, win->fonts[i].font);
     for (int i = 0; i < CURSOR_COUNT; i++)

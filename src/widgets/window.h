@@ -268,6 +268,9 @@ void app_window_set_data_dir(AppWindow* app, const char* dir);
 
 // true dopo File > Exit: il main loop chiude l'applicazione
 bool app_window_quit_requested(AppWindow* app);
+bool app_window_server_running(AppWindow* app);
+void app_window_toggle_server(AppWindow* app);         // icona nell'area di notifica
+const char* app_window_dashboard_url(AppWindow* app);  // "" se il server è fermo
 
 // all'avvio: apre l'editor, il server o la scelta iniziale secondo Settings > Server
 // (forced = START_EDITOR / START_SERVER dalla riga di comando, -1 = usa l'impostazione)

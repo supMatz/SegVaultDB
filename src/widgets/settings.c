@@ -114,6 +114,8 @@ static SettingDef DEFS[] = {
       SET_BOOL, S(server_cors), 0, 0, 1, ON_OFF, 2 },
     { "Server", "server_timeout", "Request time limit (s)", "A request running longer is stopped (0 = no limit)",
       SET_INT, S(server_timeout), 30, 0, 600, NULL, 0 },
+    { "Server", "tray", "Keep running in the tray", "With the server on, closing the window leaves SegVault in the notification area",
+      SET_BOOL, S(tray), 1, 0, 1, ON_OFF, 2 },
     { "Server", "server_mysql_port", "MySQL protocol port", "Where PHP, Node, Python and the mysql client connect (MySQL's own is 3306)",
       SET_INT, S(server_mysql_port), 3306, 1, 65535, NULL, 0 },
     { "Server", "server_mail_port", "Mail catcher port (SMTP)", "Where apps send mail (Mailpit and MailHog use 1025 too)",

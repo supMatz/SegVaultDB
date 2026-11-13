@@ -53,7 +53,15 @@ struct PlatformWindow {
     CursorKind cur_cursor;
 
     WCHAR high_surrogate;
+
+    // icona nell'area di notifica
+    bool            tray_on, tray_active;
+    NOTIFYICONDATAA nid;
+    HICON           tray_icons[2];          // spento / acceso
+    bool            visible;
 };
+
+#define WM_SV_TRAY (WM_APP + 7)
 
 // puntatore globale alla finestra corrente (necessario per passare eventi dal WndProc alla poll_event)
 static PlatformWindow* g_win = NULL;
@@ -155,6 +163,30 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             e.character = cp;
             e.modifiers = win_modifiers();
             push_event(win, &e);
+            return 0;
+        }
+
+        case WM_SV_TRAY: {                          // clic sull'icona nell'area di notifica
+            PlatformWindow* tw = win;
+            if (!tw) return 0;
+            UINT m = (UINT)lp;
+            sEvent e = {0};
+            if (m == WM_LBUTTONUP || m == WM_LBUTTONDBLCLK) { e.type = EVT_TRAY_OPEN; push_event(tw, &e); }
+            else if (m == WM_RBUTTONUP || m == WM_CONTEXTMENU) {
+                HMENU menu = CreatePopupMenu();
+                AppendMenuA(menu, MF_STRING, 1, "Open SegVault");
+                AppendMenuA(menu, MF_STRING, 2, "Sites and services (browser)");
+                AppendMenuA(menu, MF_STRING, 3, tw->tray_active ? "Stop the server" : "Start the server");
+                AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+                AppendMenuA(menu, MF_STRING, 4, "Quit");
+                POINT pt;
+                GetCursorPos(&pt);
+                SetForegroundWindow(hwnd);              // il menu si chiude cliccando altrove
+                int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
+                DestroyMenu(menu);
+                e.type = cmd == 1 ? EVT_TRAY_OPEN : cmd == 2 ? EVT_TRAY_DASHBOARD : cmd == 3 ? EVT_TRAY_TOGGLE : cmd == 4 ? EVT_TRAY_QUIT : EVT_NONE;
+                if (e.type != EVT_NONE) push_event(tw, &e);
+            }
             return 0;
         }
 
@@ -361,6 +393,7 @@ PlatformWindow* platform_window_create(const char* title, int w, int h) {
 void platform_window_show(PlatformWindow* win) {
     ShowWindow(win->hwnd, SW_SHOW);
     UpdateWindow(win->hwnd);
+    win->visible = true;
 }
 
 bool platform_poll_event(PlatformWindow* win, sEvent* evt) {
@@ -654,6 +687,114 @@ bool platform_open_file(const char* path) {
     return (INT_PTR)ShellExecuteA(NULL, "open", "notepad.exe", q, NULL, SW_SHOWNORMAL) > 32;
 }
 
+// ── area di notifica ──
+
+// icona 32x32 disegnata in memoria: una pila di dischi (database), verde se attivo, grigia se no
+static HICON make_tray_icon(bool active) {
+    const int N = 32;
+    BITMAPV5HEADER bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = N;
+    bi.bV5Height = -N;
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000; bi.bV5GreenMask = 0x0000FF00; bi.bV5BlueMask = 0x000000FF; bi.bV5AlphaMask = 0xFF000000;
+    HDC dc = GetDC(NULL);
+    void* bits = NULL;
+    HBITMAP color = CreateDIBSection(dc, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    ReleaseDC(NULL, dc);
+    if (!color || !bits) return LoadIcon(NULL, IDI_APPLICATION);
+    uint32_t* px = bits;
+    uint32_t c = active ? 0xFF22A35A : 0xFF8A919C;
+    for (int y = 0; y < N; y++)
+        for (int x = 0; x < N; x++) {
+            // cilindro: corpo rettangolare con ellissi sopra e sotto, due linee bianche a 1/3 e 2/3
+            double cx = (x - 15.5) / 13.0;
+            bool in_body = x >= 3 && x <= 28 && y >= 7 && y <= 25;
+            double ty = (y - 7) / 4.0, by = (y - 25) / 4.0;
+            bool in_top = cx * cx + ty * ty <= 1.0, in_bot = cx * cx + by * by <= 1.0;
+            uint32_t v = 0;
+            if (in_body || in_top || in_bot) v = c;
+            for (int k = 1; k <= 2; k++) {
+                double ly = (y - (7 + k * 6)) / 4.0;
+                double r = cx * cx + ly * ly;
+                if (in_body && ly > 0 && r > 0.75 && r < 1.05) v = 0xFFFFFFFF;
+            }
+            px[y * N + x] = v;
+        }
+    HBITMAP mask = CreateBitmap(N, N, 1, 1, NULL);
+    ICONINFO ii = { TRUE, 0, 0, mask, color };
+    HICON h = CreateIconIndirect(&ii);
+    DeleteObject(mask);
+    DeleteObject(color);
+    return h ? h : LoadIcon(NULL, IDI_APPLICATION);
+}
+
+bool platform_tray_enable(PlatformWindow* win, const char* tooltip) {
+    if (win->tray_on) return true;
+    if (!win->tray_icons[0]) { win->tray_icons[0] = make_tray_icon(false); win->tray_icons[1] = make_tray_icon(true); }
+    memset(&win->nid, 0, sizeof(win->nid));
+    win->nid.cbSize = sizeof(win->nid);
+    win->nid.hWnd = win->hwnd;
+    win->nid.uID = 1;
+    win->nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    win->nid.uCallbackMessage = WM_SV_TRAY;
+    win->nid.hIcon = win->tray_icons[win->tray_active ? 1 : 0];
+    snprintf(win->nid.szTip, sizeof(win->nid.szTip), "%s", tooltip ? tooltip : "SegVault");
+    win->tray_on = Shell_NotifyIconA(NIM_ADD, &win->nid) != 0;
+    return win->tray_on;
+}
+
+void platform_tray_update(PlatformWindow* win, const char* tooltip, bool active) {
+    if (!win->tray_on) { win->tray_active = active; return; }
+    bool changed = active != win->tray_active;
+    win->tray_active = active;
+    if (tooltip && strcmp(tooltip, win->nid.szTip)) { snprintf(win->nid.szTip, sizeof(win->nid.szTip), "%s", tooltip); changed = true; }
+    if (!changed) return;
+    win->nid.hIcon = win->tray_icons[active ? 1 : 0];
+    win->nid.uFlags = NIF_ICON | NIF_TIP;
+    Shell_NotifyIconA(NIM_MODIFY, &win->nid);
+}
+
+void platform_tray_disable(PlatformWindow* win) {
+    if (!win->tray_on) return;
+    Shell_NotifyIconA(NIM_DELETE, &win->nid);
+    win->tray_on = false;
+}
+
+void platform_window_set_visible(PlatformWindow* win, bool visible) {
+    if (visible) {
+        ShowWindow(win->hwnd, IsIconic(win->hwnd) ? SW_RESTORE : SW_SHOW);
+        SetForegroundWindow(win->hwnd);
+    } else ShowWindow(win->hwnd, SW_HIDE);
+    win->visible = visible;
+}
+
+bool platform_window_visible(PlatformWindow* win) { return win->visible; }
+
+// ── avvio con il computer: HKCU\Software\Microsoft\Windows\CurrentVersion\Run ──
+
+#define RUN_KEY "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+
+bool platform_autostart_set(bool on, const char* command) {
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return false;
+    LONG r = on ? RegSetValueExA(k, "SegVault", 0, REG_SZ, (const BYTE*)command, (DWORD)strlen(command) + 1)
+                : RegDeleteValueA(k, "SegVault");
+    RegCloseKey(k);
+    return r == ERROR_SUCCESS || (!on && r == ERROR_FILE_NOT_FOUND);
+}
+
+bool platform_autostart_get(void) {
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS) return false;
+    LONG r = RegQueryValueExA(k, "SegVault", NULL, NULL, NULL, NULL);
+    RegCloseKey(k);
+    return r == ERROR_SUCCESS;
+}
+
 void platform_set_clipboard(PlatformWindow* win, const char* text) {
     if (!text || !OpenClipboard(win->hwnd)) return;
     EmptyClipboard();
@@ -708,6 +849,7 @@ char* platform_get_clipboard(PlatformWindow* win) {
 
 void platform_window_destroy(PlatformWindow* win) {
     if (!win) return;
+    platform_tray_disable(win);
     for (int i = 0; i < win->num_fonts; i++) DeleteObject(win->fonts[i].font);
     if (win->hbm_px) DeleteObject(win->hbm_px);
     if (win->hdc_px) DeleteDC(win->hdc_px);

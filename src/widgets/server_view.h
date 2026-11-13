@@ -35,6 +35,7 @@ void         server_panel_set_paths(ServerPanel* p, const char* data_dir, const 
 bool         server_panel_start(ServerPanel* p);        // false: il motivo è mostrato nel pannello
 void         server_panel_stop(ServerPanel* p);
 bool         server_panel_running(const ServerPanel* p);
+const char*  server_panel_dashboard_url(const ServerPanel* p);   // "" se il server è fermo
 void         server_panel_draw(ServerPanel* p, int w, int h);
 ViewAction   server_panel_event(ServerPanel* p, sEvent* evt);
 bool         server_panel_tick(ServerPanel* p, uint64_t now_ms);   // true se serve ridisegnare

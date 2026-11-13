@@ -6,6 +6,7 @@ SCOPO: segvault-server — il motore SegVault come servizio HTTP/JSON, senza GUI
 #include "fastcgi.h"
 #include "mail.h"
 #include "tls.h"
+#include "service.h"
 #include "../bridge/db_api.h"
 #include "../../include/common.h"
 #include <signal.h>
@@ -166,6 +167,9 @@ static void usage(const char* argv0) {
            "      --trust-ca        add the local authority to the trusted ones (browsers, and the system if root), then exit\n"
            "      --cert-dir DIR    where the local authority is kept (default DATA/certs)\n"
            "      --no-http2        HTTPS with HTTP/1.1 only\n"
+           "      --install-service start this server (with the same options) when you log in: systemd user\n"
+           "                        service on Linux, LaunchAgent on macOS, Run key on Windows; no admin rights\n"
+           "      --uninstall-service  remove it\n"
            "      --no-dir-listing  404 instead of a file list for folders without an index\n"
            "      --no-htaccess     ignore .htaccess files (by default their mod_rewrite rules, Require all denied\n"
            "                        and Options -Indexes apply, as in Apache)\n"
@@ -186,7 +190,21 @@ int main(int argc, char** argv) {
     const char* data_dir = "./data";
     bool no_auth = false;
     const char* php_arg = NULL;
-    bool trust_ca = false;
+    bool trust_ca = false, background = false;
+    // servizio dell'utente: stessa riga di comando, senza questa opzione
+    for (int i = 1; i < argc; i++) {
+        char out[8000];
+        if (!strcmp(argv[i], "--install-service")) {
+            int r = sv_service_install(argc - 1, argv + 1, out, sizeof(out));
+            fputs(out, r ? stderr : stdout);
+            return r;
+        }
+        if (!strcmp(argv[i], "--uninstall-service")) {
+            int r = sv_service_uninstall(out, sizeof(out));
+            fputs(out, stdout);
+            return r;
+        }
+    }
     char php_path[1024];
     cfg.token = getenv("SEGVAULT_TOKEN");
 
@@ -236,6 +254,7 @@ int main(int argc, char** argv) {
         else if (ARG("--cert-dir", "--cert-dir")) cfg.cert_dir = argv[++i];
         else if (!strcmp(a, "--no-http2")) cfg.http2 = false;
         else if (!strcmp(a, "--trust-ca")) trust_ca = true;
+        else if (!strcmp(a, "--background")) background = true;
         else if (!strcmp(a, "--no-dir-listing")) cfg.dir_listing = false;
         else if (!strcmp(a, "--no-htaccess")) cfg.no_htaccess = true;
         else if (a[0] == '-') { fprintf(stderr, "unknown or incomplete option: %s (see --help)\n", a); return 2; }
@@ -300,6 +319,11 @@ int main(int argc, char** argv) {
         int r = tls_trust_ca(cfg.cert_dir, out, sizeof(out));
         fputs(out, r ? stderr : stdout);
         return r;
+    }
+    if (background) {                   // avviato all'accesso (servizio su Windows): niente console, registro in un file
+        static char logp[1200];
+        snprintf(logp, sizeof(logp), "%s/segvault-server.log", data_dir);
+        sv_service_background(logp);
     }
     static char mail_dir_buf[1200];
     if (cfg.mail && !cfg.mail_dir) {

@@ -52,6 +52,10 @@ typedef enum {
     EVT_RESIZE,        // ridimensionamento finestra
     EVT_PAINT,         // stampa a schermo della finestra
     EVT_MOUSE_WHEEL,   // rotella: evt->wheel_delta > 0 su, < 0 giù
+    EVT_TRAY_OPEN,     // icona nell'area di notifica: mostra la finestra
+    EVT_TRAY_DASHBOARD,// menu dell'icona: apri il cruscotto nel browser
+    EVT_TRAY_TOGGLE,   // menu dell'icona: avvia / ferma il server
+    EVT_TRAY_QUIT,     // menu dell'icona: esci davvero
 } sEventType;
 
 // codici tasti speciali generalizzati
@@ -178,6 +182,20 @@ char* platform_get_clipboard(PlatformWindow* win);   // stringa malloc'd (free()
 bool  platform_open_url(const char* url);
 // apre un file di testo esistente (es. php.ini) nell'editor del sistema; false se non c'è o non si può
 bool  platform_open_file(const char* path);
+
+// icona nell'area di notifica (Windows; X11 con un system tray XEmbed: KDE, XFCE, Cinnamon, MATE, ...).
+// false se non c'è un'area di notifica. Clic: EVT_TRAY_OPEN; menu (Windows): gli altri EVT_TRAY_*
+bool  platform_tray_enable(PlatformWindow* win, const char* tooltip);
+void  platform_tray_update(PlatformWindow* win, const char* tooltip, bool active);   // verde = attivo
+void  platform_tray_disable(PlatformWindow* win);
+// finestra nascosta (resta solo l'icona) o di nuovo visibile e in primo piano
+void  platform_window_set_visible(PlatformWindow* win, bool visible);
+bool  platform_window_visible(PlatformWindow* win);
+
+// avvio con il computer (all'accesso dell'utente): command è la riga di comando completa
+// (Windows: chiave Run dell'utente; Linux: ~/.config/autostart/segvault.desktop). on=false lo toglie
+bool  platform_autostart_set(bool on, const char* command);
+bool  platform_autostart_get(void);
 
 // thread di lavoro (usato per eseguire le query senza bloccare l'interfaccia)
 typedef struct PlatformThread PlatformThread;

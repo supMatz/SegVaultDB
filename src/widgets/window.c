@@ -4457,6 +4457,18 @@ static void layout_widgets(AppWindow* app) {
 
 bool app_window_quit_requested(AppWindow* app) { return app && app->quit_requested; }
 
+bool app_window_server_running(AppWindow* app) { return app && server_panel_running(app->server); }
+
+// dall'icona nell'area di notifica: server acceso / spento (la pagina del server mostra l'esito)
+void app_window_toggle_server(AppWindow* app) {
+    if (!app) return;
+    if (server_panel_running(app->server)) { server_panel_stop(app->server); return; }
+    if (app->mode != APP_MODE_SERVER) app_window_set_mode(app, APP_MODE_SERVER);
+    else server_panel_start(app->server);
+}
+
+const char* app_window_dashboard_url(AppWindow* app) { return app ? server_panel_dashboard_url(app->server) : ""; }
+
 AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
     settings_init();
     AppWindow* app = SV_ALLOC(AppWindow);
