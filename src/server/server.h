@@ -58,6 +58,11 @@ typedef struct {
     bool        mail;
     int         mail_port;    // porta SMTP (0 = libera scelta dal sistema; vedi sv_server_mail_port)
     const char* mail_dir;     // cartella dei messaggi (.eml)
+    // HTTPS (vedi tls.h): OpenSSL caricato all'avvio, CA locale in cert_dir, un certificato per sito
+    bool        https;
+    int         https_port;   // 0 = libera scelta dal sistema (vedi sv_server_https_port)
+    const char* cert_dir;     // cartella della CA (default "certs")
+    bool        http2;        // HTTP/2 sulle connessioni HTTPS (ALPN "h2")
     const char* self_exe;     // eseguibile di SegVault (sendmail_path di PHP: "EXE --sendmail PORTA");
                               // NULL = cercato da solo
 } SvServerConfig;
@@ -103,6 +108,8 @@ int       sv_server_port(const SvServer* s);
 int       sv_server_mysql_port(const SvServer* s);   // 0 se il protocollo MySQL è spento
 int       sv_server_mail_port(const SvServer* s);    // 0 se la cattura delle email è spenta
 int       sv_server_mail_count(SvServer* s);         // messaggi catturati
+int       sv_server_https_port(const SvServer* s);   // 0 se HTTPS è spento
+const char* sv_server_tls_info(const SvServer* s);   // libreria TLS e CA ("" se spento)
 const char* sv_server_php(const SvServer* s);
 const char* sv_server_api_prefix(const SvServer* s);  // "/api/v1", "" se l'API HTTP è spenta         // descrizione del backend PHP ("" se spento)
 void      sv_server_run(SvServer* s);     // accetta connessioni finché non viene chiamato sv_server_stop

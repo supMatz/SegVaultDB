@@ -5,6 +5,7 @@ SCOPO: segvault-server — il motore SegVault come servizio HTTP/JSON, senza GUI
 #include "server.h"
 #include "fastcgi.h"
 #include "mail.h"
+#include "tls.h"
 #include "../bridge/db_api.h"
 #include "../../include/common.h"
 #include <signal.h>
@@ -160,6 +161,11 @@ static void usage(const char* argv0) {
            "                        instead of delivering it; read them at http://localhost:PORT/.segvault/mail/\n"
            "                        (PHP mail() is routed there automatically)\n"
            "      --mail-dir DIR    where caught messages are kept (default DATA/mail)\n"
+           "      --https-port P    HTTPS too (e.g. 8443), with certificates from a local authority (DATA/certs/ca.crt)\n"
+           "                        made for each site name: https://NAME.localhost:P\n"
+           "      --trust-ca        add the local authority to the trusted ones (browsers, and the system if root), then exit\n"
+           "      --cert-dir DIR    where the local authority is kept (default DATA/certs)\n"
+           "      --no-http2        HTTPS with HTTP/1.1 only\n"
            "      --no-dir-listing  404 instead of a file list for folders without an index\n"
            "      --no-htaccess     ignore .htaccess files (by default their mod_rewrite rules, Require all denied\n"
            "                        and Options -Indexes apply, as in Apache)\n"
@@ -173,13 +179,14 @@ static void usage(const char* argv0) {
 int main(int argc, char** argv) {
     // "segvault-server --sendmail PORTA [-f mittente] [-t] [-i]": il sendmail_path di PHP (vedi mail.h)
     if (argc >= 3 && !strcmp(argv[1], "--sendmail")) return mail_sendmail_main(atoi(argv[2]), argc - 3, argv + 3);
-    SvServerConfig cfg = { .bind_addr = "127.0.0.1", .port = 8484, .timeout_ms = 30000, .dir_listing = true };
+    SvServerConfig cfg = { .bind_addr = "127.0.0.1", .port = 8484, .timeout_ms = 30000, .dir_listing = true, .http2 = true };
     static SvSite sites[64];
     static char site_buf[64][1200];
     char auto_token[65];
     const char* data_dir = "./data";
     bool no_auth = false;
     const char* php_arg = NULL;
+    bool trust_ca = false;
     char php_path[1024];
     cfg.token = getenv("SEGVAULT_TOKEN");
 
@@ -225,6 +232,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--no-auto-sites")) cfg.no_auto_sites = true;
         else if (ARG("--mail-port", "--mail-port")) { cfg.mail = true; cfg.mail_port = atoi(argv[++i]); }
         else if (ARG("--mail-dir", "--mail-dir")) cfg.mail_dir = argv[++i];
+        else if (ARG("--https-port", "--https-port")) { cfg.https = true; cfg.https_port = atoi(argv[++i]); }
+        else if (ARG("--cert-dir", "--cert-dir")) cfg.cert_dir = argv[++i];
+        else if (!strcmp(a, "--no-http2")) cfg.http2 = false;
+        else if (!strcmp(a, "--trust-ca")) trust_ca = true;
         else if (!strcmp(a, "--no-dir-listing")) cfg.dir_listing = false;
         else if (!strcmp(a, "--no-htaccess")) cfg.no_htaccess = true;
         else if (a[0] == '-') { fprintf(stderr, "unknown or incomplete option: %s (see --help)\n", a); return 2; }
@@ -279,6 +290,17 @@ int main(int argc, char** argv) {
             }
         }
     }
+    static char cert_dir_buf[1200];
+    if (!cfg.cert_dir) {
+        snprintf(cert_dir_buf, sizeof(cert_dir_buf), "%s/certs", data_dir);
+        cfg.cert_dir = cert_dir_buf;
+    }
+    if (trust_ca) {                     // installa la CA locale tra quelle fidate ed esce
+        char out[4000];
+        int r = tls_trust_ca(cfg.cert_dir, out, sizeof(out));
+        fputs(out, r ? stderr : stdout);
+        return r;
+    }
     static char mail_dir_buf[1200];
     if (cfg.mail && !cfg.mail_dir) {
         snprintf(mail_dir_buf, sizeof(mail_dir_buf), "%s/mail", data_dir);
@@ -323,6 +345,8 @@ int main(int argc, char** argv) {
         printf("  PHP:      %s\n", sv_server_php(g_server));
         if (!cfg.mysql) printf("            (scripts reach the database with mysqli / PDO if you add --mysql-port 3306)\n");
     }
+    if (sv_server_https_port(g_server))
+        printf("  https:    https://localhost:%d/  (%s; trust it once with --trust-ca)\n", sv_server_https_port(g_server), sv_server_tls_info(g_server));
     if (sv_server_mail_port(g_server))
         printf("  mail:     smtp://127.0.0.1:%d  -> http://localhost:%d/.segvault/mail/  (%d messages)\n",
                sv_server_mail_port(g_server), port, sv_server_mail_count(g_server));

@@ -39,18 +39,21 @@ static void wr(int fd, const char* p) {
 
 // una risposta SMTP (anche su più righe): il codice dell'ultima
 static int smtp_reply(int fd, char* last, size_t n) {
-    char buf[4096];
-    size_t have = 0;
+    // un byte alla volta: con il pipelining le risposte successive restano nel socket
+    char line[1024];
     for (;;) {
-        ssize_t g = recv(fd, buf + have, sizeof(buf) - 1 - have, 0);
-        if (g <= 0) return -1;
-        have += (size_t)g;
-        buf[have] = 0;
-        for (char* line = buf; ; ) {
-            char* e = strstr(line, "\r\n");
-            if (!e) break;
-            if (line[3] == ' ') { if (last) snprintf(last, n, "%.*s", (int)(e - line), line); return atoi(line); }
-            line = e + 2;
+        size_t k = 0;
+        for (;;) {
+            char ch;
+            if (recv(fd, &ch, 1, 0) != 1) return -1;
+            if (k + 1 < sizeof(line)) line[k++] = ch;
+            if (ch == '\n') break;
+        }
+        line[k] = 0;
+        if (k >= 4 && line[3] == ' ') {
+            line[strcspn(line, "\r\n")] = 0;
+            if (last) snprintf(last, n, "%s", line);
+            return atoi(line);
         }
     }
 }

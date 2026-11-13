@@ -319,8 +319,8 @@ static void var_value(const Ctx* c, const char* name, size_t nl, char* out, size
     else if (!strcasecmp(nm, "HTTP_HOST")) snprintf(out, n, "%s", rq->host ? rq->host : "");
     else if (!strcasecmp(nm, "SERVER_NAME")) { snprintf(out, n, "%s", rq->host ? rq->host : ""); char* col = strchr(out, ':'); if (col) *col = '\0'; }
     else if (!strcasecmp(nm, "REQUEST_METHOD")) snprintf(out, n, "%s", rq->method ? rq->method : "GET");
-    else if (!strcasecmp(nm, "HTTPS")) snprintf(out, n, "off");
-    else if (!strcasecmp(nm, "REQUEST_SCHEME")) snprintf(out, n, "http");
+    else if (!strcasecmp(nm, "HTTPS")) snprintf(out, n, "%s", rq->https ? "on" : "off");
+    else if (!strcasecmp(nm, "REQUEST_SCHEME")) snprintf(out, n, "%s", rq->https ? "https" : "http");
     else if (!strcasecmp(nm, "SERVER_PORT")) snprintf(out, n, "%d", rq->port);
     else if (!strcasecmp(nm, "REMOTE_ADDR")) snprintf(out, n, "%s", rq->client ? rq->client : "");
     else if (!strcasecmp(nm, "DOCUMENT_ROOT")) snprintf(out, n, "%s", rq->root);

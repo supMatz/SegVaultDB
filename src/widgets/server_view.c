@@ -5,6 +5,7 @@
 #include "button.h"
 #include "../server/server.h"
 #include "../server/fastcgi.h"
+#include "../server/tls.h"
 #include "../bridge/db_api.h"
 #include "../../include/common.h"
 #include <stdio.h>
@@ -154,7 +155,7 @@ ViewAction start_screen_event(StartScreen* s, const sEvent* evt) {
 enum {
     HIT_COPY_URL, HIT_COPY_LAN, HIT_PORT_MINUS, HIT_PORT_PLUS, HIT_ACCESS_LOCAL, HIT_ACCESS_LAN,
     HIT_TOKEN_OFF, HIT_TOKEN_ON, HIT_COPY_TOKEN, HIT_NEW_TOKEN, HIT_CORS_OFF, HIT_CORS_ON, HIT_TIME_MINUS,
-    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_TAB_REQ, HIT_TAB_MON, HIT_MYSQL_OFF, HIT_MYSQL_ON, HIT_COPY_MYSQL, HIT_PHP_OFF, HIT_PHP_ON, HIT_MAIL_OFF, HIT_MAIL_ON, HIT_OPEN_MAIL, HIT_OPEN_DASH, HIT_COUNT
+    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_TAB_REQ, HIT_TAB_MON, HIT_MYSQL_OFF, HIT_MYSQL_ON, HIT_COPY_MYSQL, HIT_PHP_OFF, HIT_PHP_ON, HIT_MAIL_OFF, HIT_MAIL_ON, HIT_OPEN_MAIL, HIT_OPEN_DASH, HIT_HTTPS_OFF, HIT_HTTPS_ON, HIT_TRUST_CA, HIT_OPEN_HTTPS, HIT_COUNT
 };
 
 enum { ACT_NONE, ACT_TOGGLE, ACT_EDITOR, ACT_COPY };
@@ -195,7 +196,8 @@ struct ServerPanel {
     char            php_cgi[1024];   // percorso di php-cgi scelto a mano (server.ini "php_cgi="); "" = cercato
     char            php_desc[600];   // processi PHP del server avviato
     char            site_url[96];
-    char            mail_url[128], dash_url[128];
+    char            mail_url[128], dash_url[128], https_url[128];
+    char            trust_msg[400];  // esito di "Trust certificate"
     int             mail_count;
     // siti con nome da server.ini ("site.blog=/percorso" o "site.app=http://127.0.0.1:5173")
     char            site_name[32][64];
@@ -355,7 +357,8 @@ bool server_panel_start(ServerPanel* p) {
     }
     SvSite sites[32];
     for (int i = 0; i < p->n_sites; i++) { sites[i].name = p->site_name[i]; sites[i].target = p->site_target[i]; }
-    char mail_dir[600];
+    char mail_dir[600], cert_dir[600];
+    snprintf(cert_dir, sizeof(cert_dir), "%s%scerts", p->data_dir, p->data_dir[0] ? "/" : "");
     snprintf(mail_dir, sizeof(mail_dir), "%s%smail", p->data_dir, p->data_dir[0] ? "/" : "");
     SvServerConfig cfg = {
         .sites       = sites,
@@ -364,6 +367,10 @@ bool server_panel_start(ServerPanel* p) {
         .mail        = g_settings.server_mail != 0,
         .mail_port   = 1025,
         .mail_dir    = mail_dir,
+        .https       = g_settings.server_https != 0,
+        .https_port  = 8443,
+        .cert_dir    = cert_dir,
+        .http2       = true,
         .php_cgi     = php[0] ? php : NULL,
         .static_dir  = web[0] ? web : NULL,
         .bind_addr   = g_settings.server_lan ? "0.0.0.0" : "127.0.0.1",
@@ -380,6 +387,8 @@ bool server_panel_start(ServerPanel* p) {
     p->srv = sv_server_start(&cfg, err, sizeof(err));
     if (!p->srv && cfg.mysql && strstr(err, "MySQL"))
         snprintf(err + strlen(err), sizeof(err) - strlen(err), " - is MySQL / XAMPP already running? Stop it or turn the MySQL protocol off");
+    if (!p->srv && cfg.https && strstr(err, "HTTPS") && strstr(err, "port"))
+        snprintf(err + strlen(err), sizeof(err) - strlen(err), " - is another web server using 8443? Stop it or turn HTTPS off");
     if (!p->srv && cfg.mail && strstr(err, "SMTP"))
         snprintf(err + strlen(err), sizeof(err) - strlen(err), " - is Mailpit / MailHog already running? Stop it or turn the mail catcher off");
     if (!p->srv) { snprintf(p->error, sizeof(p->error), "%s", err); return false; }
@@ -396,6 +405,8 @@ bool server_panel_start(ServerPanel* p) {
     snprintf(p->mail_url, sizeof(p->mail_url), "http://localhost:%d/.segvault/mail/", sv_server_port(p->srv));
     snprintf(p->dash_url, sizeof(p->dash_url), "http://localhost:%d/.segvault/", sv_server_port(p->srv));
     p->mail_count = sv_server_mail_count(p->srv);
+    p->https_url[0] = '\0';
+    if (sv_server_https_port(p->srv)) snprintf(p->https_url, sizeof(p->https_url), "https://localhost:%d/", sv_server_https_port(p->srv));
     p->mysql_addr[0] = '\0';
     if (sv_server_mysql_port(p->srv)) snprintf(p->mysql_addr, sizeof(p->mysql_addr), "mysql://127.0.0.1:%d", sv_server_mysql_port(p->srv));
     char ip[64];
@@ -759,6 +770,26 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
         }
         y += 12;
     }
+
+    // HTTPS con la CA locale (come Laragon / mkcert)
+    y = section_label(win, "HTTPS", x, y);
+    segmented(p, HIT_HTTPS_OFF, (Rect){x, y, w, 28}, "Off", "Port 8443 + HTTP/2", g_settings.server_https ? 1 : 0, true);
+    y += 28 + 4;
+    if (g_settings.server_https) {
+        int tw = link_w(p, "Trust certificate");
+        if (running && p->https_url[0]) {
+            int ow = link_w(p, "Open");
+            link_btn(p, HIT_OPEN_HTTPS, (Rect){x - 8, y, ow, 24}, "Open", true);
+            ui_text_clipped(win, p->https_url, x + ow - 4, y + 5, w - ow - tw - 4, TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_MONO);
+        }
+        link_btn(p, HIT_TRUST_CA, (Rect){x + w - tw, y, tw, 24}, "Trust certificate", true);
+        y += 26;
+        y += text_wrap(win, p->trust_msg[0] ? p->trust_msg :
+                       "Every site also answers on https://NAME.localhost:8443 with a certificate from a local authority "
+                       "(DATA/certs/ca.crt). Trust it once and browsers open the sites without warnings.",
+                       x, y + 2, w, TH_TEXT_FAINT, TH_FONT_SMALL) + 2;
+    }
+    y += 12;
 
     // cattura delle email (come Mailpit)
     y = section_label(win, "MAIL CATCHER", x, y);
@@ -1371,6 +1402,23 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
         case HIT_OPEN_DASH:
             if (!platform_open_url(p->dash_url)) copy_text(p, hit, p->dash_url);
             break;
+        case HIT_HTTPS_OFF: case HIT_HTTPS_ON:
+            if (g_settings.server_https != (hit == HIT_HTTPS_ON)) { g_settings.server_https = hit == HIT_HTTPS_ON; config_changed(p); }
+            break;
+        case HIT_OPEN_HTTPS:
+            if (!platform_open_url(p->https_url)) copy_text(p, hit, p->https_url);
+            break;
+        case HIT_TRUST_CA: {
+            char cd[600], out[4000];
+            snprintf(cd, sizeof(cd), "%s%scerts", p->data_dir, p->data_dir[0] ? "/" : "");
+            int r = tls_trust_ca(cd, out, sizeof(out));
+            // in una riga: le righe dopo la prima dicono dove è stata aggiunta
+            char* nl = strchr(out, '\n');
+            const char* rest = nl ? nl + 1 : out;
+            snprintf(p->trust_msg, sizeof(p->trust_msg), "%s%.380s", r == 0 ? "Trusted. " : "", rest);
+            for (char* q = p->trust_msg; *q; q++) if (*q == '\n') *q = ' ';
+            break;
+        }
         case HIT_MAIL_OFF: case HIT_MAIL_ON:
             if (g_settings.server_mail != (hit == HIT_MAIL_ON)) { g_settings.server_mail = hit == HIT_MAIL_ON; config_changed(p); }
             break;

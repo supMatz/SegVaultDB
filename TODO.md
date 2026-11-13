@@ -31,8 +31,9 @@ SegVault copre già database e phpMyAdmin; qui c'è quello che manca, in ordine 
 - [x] Reverse proxy per i dev server (`--site app=http://127.0.0.1:5173`: Vite, Next.js, Express, Django, Rails, ...): streaming, chunked, keep-alive, WebSocket (ricarica a caldo), `X-Forwarded-*`, pagina 502 che spiega come avviare il dev server
 - [x] Cruscotto su `http://localhost:PORTA/` (se la cartella non ha un index) e `/.segvault/`: servizi attivi e siti con il tipo di progetto riconosciuto (Laravel, WordPress, Symfony, Node, ...)
 - [x] `.htaccess` come Apache: `mod_rewrite` (RewriteCond / RewriteRule con i flag usati da WordPress, Laravel, Symfony, ...), `Require all denied` / `Deny from all` (anche in `<Files>` / `<FilesMatch>`), `Options -Indexes`; `--no-htaccess` per spegnerli. Il motore regex ora ha i gruppi di cattura
-- [ ] HTTPS integrato (certificato self-signed generato al primo avvio, come XAMPP), anche per il protocollo MySQL
-- [ ] HTTP/2 su HTTPS (negoziato con ALPN): i browser usano HTTP/2 e HTTP/3 solo con TLS; con HTTP/2 cade il limite di 6 connessioni per host (Vite in sviluppo carica centinaia di moduli). HTTP/3 (QUIC) non porta vantaggi in locale
+- [x] HTTPS integrato (`--https-port 8443`, interruttore nel pannello): OpenSSL 3/4 caricato all'avvio (nessuna dipendenza di compilazione; su Windows le DLL di PHP), CA locale in `DATA/certs` come mkcert, un certificato per ogni nome (SNI) firmato al volo, `--trust-ca` / "Trust certificate" la rende fidata (Chrome, Firefox, Edge, sistema); PHP vede `HTTPS=on`, `%{HTTPS}` nei `.htaccess`, `X-Forwarded-Proto: https` al proxy
+- [x] HTTP/2 su HTTPS (ALPN `h2`, HPACK con Huffman, controllo di flusso, fino a 64 stream per connessione): 200 file in parallelo su una connessione in ~30 ms; streaming, SSE, Range, 304 anche in HTTP/2. HTTP/3 (QUIC) non porta vantaggi in locale
+- [ ] TLS anche per il protocollo MySQL
 
 ## 3. Compatibilità MySQL per le app vere
 - [x] `CREATE TABLE` nel dialetto di MySQL: `bigint(20) unsigned`, `longtext`, `enum(...)` (diventa un `CHECK`), `KEY` / `INDEX` / `FULLTEXT` / `UNIQUE KEY nome`, prefissi `col(191)`, `ENGINE=`, `CHARSET`, `COLLATE`, `AUTO_INCREMENT=n`, `COMMENT`, `ON UPDATE CURRENT_TIMESTAMP`, `DEFAULT CURRENT_TIMESTAMP`, `DEFAULT ''`

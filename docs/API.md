@@ -45,6 +45,10 @@ SEGVAULT_TOKEN=segreto ./segvault-server -b 0.0.0.0   # raggiungibile in rete: i
 | `--no-auto-sites` | le sottocartelle di `--static` non diventano siti |
 | `--no-dir-listing` | 404 invece dell'elenco dei file per le cartelle senza index |
 | `--no-htaccess` | ignora i file `.htaccess` (di default valgono come in Apache, vedi sotto) |
+| `--https-port P` | anche HTTPS (es. 8443), con HTTP/2: certificati di una CA locale (`DATA/certs/ca.crt`) fatti per ogni nome di sito |
+| `--trust-ca` | rende fidata la CA locale (browser; anche il sistema se si è root) ed esce |
+| `--cert-dir DIR` | dove tenere la CA (default `DATA/certs`) |
+| `--no-http2` | HTTPS solo con HTTP/1.1 |
 | `--mail-port P` | cattura delle email: un server SMTP sulla porta `P` (es. 1025) tiene ogni messaggio invece di consegnarlo; si leggono su `http://localhost:PORTA/.segvault/mail/` |
 | `--mail-dir DIR` | dove tenere i messaggi catturati (default `DATA/mail`) |
 | `--api-prefix P` | prefisso dell'API (default `/api/v1`; `none` = spenta). Con PHP, i percorsi sotto il prefisso che non sono dell'API vanno al sito |
@@ -304,6 +308,24 @@ in `.localhost`.
   servizi attivi e siti, con il tipo di progetto riconosciuto. Solo per i client di questa macchina.
 - Una cartella senza index mostra l'elenco dei suoi file (senza quelli nascosti); `--no-dir-listing`
   lo spegne.
+
+## HTTPS e HTTP/2
+
+Con `--https-port 8443` ogni sito risponde anche su `https://NOME.localhost:8443`.
+
+- Al primo avvio SegVault crea un'autorità di certificazione locale (`DATA/certs/ca.crt`, chiave
+  leggibile solo dall'utente) e firma al volo un certificato per ogni nome richiesto (SNI):
+  `localhost`, `127.0.0.1`, `blog.localhost`, `shop.test`, ...
+- `segvault-server --trust-ca` (o "Trust certificate" nel pannello) la aggiunge a quelle fidate:
+  Windows (archivio Root dell'utente: Chrome, Edge), macOS (portachiavi), Linux (Chrome / Chromium
+  e i profili di Firefox con `certutil`; anche il sistema, per curl / PHP / Node, se lanciato da root).
+- OpenSSL 3 o successivo viene caricato all'avvio: su Linux e macOS c'è già, su Windows bastano
+  `libssl-3-x64.dll` e `libcrypto-3-x64.dll`, che PHP per Windows ha nella sua cartella.
+- HTTP/2 viene negoziato con ALPN (`--no-http2` per spegnerlo): una sola connessione per tutte le
+  richieste del browser, senza il limite di 6 connessioni per sito di HTTP/1.1 (utile con Vite e
+  con le pagine che caricano molti file). I browser usano HTTP/2 solo su HTTPS.
+- PHP riceve `HTTPS=on`, `REQUEST_SCHEME=https` e la porta HTTPS; nei `.htaccess` `%{HTTPS}` vale
+  `on`; i dev server dietro al proxy ricevono `X-Forwarded-Proto: https`.
 
 ## .htaccess
 

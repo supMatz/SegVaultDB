@@ -12,6 +12,8 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #include "proxy.h"
 #include "mail.h"
 #include "rewrite.h"
+#include "tls.h"
+#include "h2.h"
 #include "../widgets/png_write.h"
 #include "../bridge/db_api.h"
 #include "../bridge/auth.h"
@@ -109,6 +111,11 @@ struct SvServer {
     sock_t         mail_fd;             // SMTP della cattura delle email (BAD_SOCK = spenta)
     int            mail_port;
     MailStore*     mail;
+    TlsCtx*        tls;                 // HTTPS (NULL = spento)
+    sock_t         https_fd;
+    int            https_port;
+    char           tls_secret[65];      // prima riga delle connessioni del ponte TLS (vedi tls.h)
+    char           tls_info[300];
     int            mysql_port;
     uint32_t       mysql_ids;           // id delle connessioni MySQL
     atomic_int     stop;                // chiesto da un altro thread o da un gestore di segnale
@@ -135,6 +142,8 @@ typedef struct {
     int       client_port;
     bool      mysql;                   // connessione col protocollo MySQL
     bool      smtp;                    // connessione SMTP (cattura delle email)
+    bool      tls;                     // connessione HTTPS da decifrare (porta https)
+    bool      https;                   // richieste arrivate dal ponte TLS
 } Conn;
 
 // ── richiesta / risposta ────────────────────────────────────────
@@ -172,6 +181,8 @@ typedef struct {
     char   site[128];                   // nome del sito ("" = quello predefinito)
     bool   upgrade;                     // Upgrade: websocket
     sock_t fd;                          // socket del client (risposte di PHP in streaming)
+    bool   https;                       // arrivata su HTTPS
+    int    https_port;
     bool   rw_done;                     // .htaccess già applicato
     bool   no_listing;                  // Options -Indexes in un .htaccess
 } Request;
@@ -1494,7 +1505,10 @@ static void run_php(SvServer* s, Request* rq, Response* rs, const char* script, 
     P("SERVER_PROTOCOL", rq->http10 ? "HTTP/1.0" : "HTTP/1.1");
     P("SERVER_NAME", server_name);
     P("SERVER_ADDR", s->cfg.bind_addr);
+    if (rq->https) snprintf(port, sizeof(port), "%d", rq->https_port);
     P("SERVER_PORT", port);
+    P("REQUEST_SCHEME", rq->https ? "https" : "http");
+    if (rq->https) P("HTTPS", "on");
     P("REQUEST_METHOD", rq->method);
     P("REQUEST_URI", rq->uri);
     P("QUERY_STRING", rq->query);
@@ -1876,6 +1890,11 @@ static void dashboard(SvServer* s, Response* rs) {
         jb_printf(b, "<div class=\"card\"><b><i class=\"dot on\"></i>MySQL protocol</b><span>127.0.0.1:%d</span></div>", s->mysql_port);
     else
         jb_lit(b, "<div class=\"card\"><b><i class=\"dot\"></i>MySQL protocol</b><span>off (--mysql-port 3306)</span></div>");
+    if (s->tls)
+        jb_printf(b, "<div class=\"card\"><b><i class=\"dot on\"></i>HTTPS%s</b><span>https://localhost:%d</span></div>",
+                  h2_enabled() ? " + HTTP/2" : "", s->https_port);
+    else
+        jb_lit(b, "<div class=\"card\"><b><i class=\"dot\"></i>HTTPS</b><span>off (--https-port 8443)</span></div>");
     if (s->mail)
         jb_printf(b, "<div class=\"card\"><b><i class=\"dot on\"></i>Mail catcher</b><span>SMTP 127.0.0.1:%d &middot; "
                      "<a href=\"/.segvault/mail/\">%d message%s</a></span></div>", s->mail_port, mail_count(s->mail), mail_count(s->mail) == 1 ? "" : "s");
@@ -1940,7 +1959,8 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
     // .htaccess del sito (mod_rewrite, Require all denied, Options -Indexes), come Apache
     if (!rq->rw_done && !s->cfg.no_htaccess) {
         rq->rw_done = true;
-        RwRequest rr = { rq->root, rq->path, rq->query, rq->method, rq->host, rq->headers, rq->client, NULL, s->port };
+        RwRequest rr = { rq->root, rq->path, rq->query, rq->method, rq->host, rq->headers, rq->client, NULL,
+                         rq->https ? rq->https_port : s->port, rq->https };
         char the_request[4200];
         snprintf(the_request, sizeof(the_request), "%s %s HTTP/1.%d", rq->method, rq->uri, rq->http10 ? 0 : 1);
         rr.the_request = the_request;
@@ -2075,6 +2095,7 @@ static const char* origin_problem(SvServer* s, const Request* rq) {
     // stessa origine: la pagina è servita da questo server (--static)
     const char* o = rq->origin;
     if (!strncmp(o, "http://", 7) && rq->host[0] && !strcasecmp(o + 7, rq->host)) return NULL;
+    if (!strncmp(o, "https://", 8) && rq->host[0] && !strcasecmp(o + 8, rq->host)) return NULL;
     return "Origin not allowed (start the server with --cors to allow this web app)";
 }
 
@@ -2269,7 +2290,8 @@ static void route(SvServer* s, Request* rq, Response* rs) {
         if (!s->mail) { json_error(rs, 404, "the mail catcher is off (start the server with --mail-port 1025)"); return; }
         // da un'altra pagina aperta nel browser non si cancella niente
         if (strcmp(rq->method, "GET") && strcmp(rq->method, "HEAD") && rq->origin[0] &&
-            !(!strncmp(rq->origin, "http://", 7) && !strcasecmp(rq->origin + 7, rq->host))) { json_error(rs, 403, "Origin not allowed"); return; }
+            !(!strncmp(rq->origin, "http://", 7) && !strcasecmp(rq->origin + 7, rq->host)) &&
+            !(!strncmp(rq->origin, "https://", 8) && !strcasecmp(rq->origin + 8, rq->host))) { json_error(rs, 403, "Origin not allowed"); return; }
         const char* ct = NULL;
         const char* xh = NULL;
         int st = mail_web(s->mail, rq->method, rq->path + 15, rq->query, &rs->body, &ct, &xh);
@@ -2552,9 +2574,10 @@ static bool proxy_request(SvServer* s, Conn* c, InBuf* in, Request* rq, size_t u
         }
         line = e ? e + 2 : NULL;
     }
-    jb_printf(&h, "X-Forwarded-For: %s%s\r\nX-Forwarded-Proto: http\r\nX-Real-IP: %s\r\n", xff, c->client, c->client);
+    jb_printf(&h, "X-Forwarded-For: %s%s\r\nX-Forwarded-Proto: %s\r\nX-Real-IP: %s\r\n", xff, c->client,
+              rq->https ? "https" : "http", c->client);
     if (rq->host[0]) jb_printf(&h, "X-Forwarded-Host: %s\r\n", rq->host);
-    jb_printf(&h, "X-Forwarded-Port: %d\r\n", s->port);
+    jb_printf(&h, "X-Forwarded-Port: %d\r\n", rq->https ? rq->https_port : s->port);
     if (rq->body_len || rq->has_length) jb_printf(&h, "Content-Length: %llu\r\n", (unsigned long long)rq->body_len);
     bool up = rq->upgrade && upgrade[0];
     if (up) jb_printf(&h, "Connection: Upgrade\r\nUpgrade: %s\r\n\r\n", upgrade);
@@ -2623,6 +2646,8 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
     rq.client = c->client;
     rq.client_port = c->client_port;
     rq.fd = c->fd;
+    rq.https = c->https;
+    rq.https_port = s->https_port;
     {                                            // tutte le intestazioni servono a PHP (HTTP_*) e al proxy
         const char* first = strstr(in->data, "\r\n");
         rq.headers = first ? strdup(first + 2) : NULL;
@@ -2709,6 +2734,27 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
 static void serve_connection(Conn* c) {
     InBuf in = {0};
     set_timeout(c->fd, IDLE_TIMEOUT_MS);
+    // connessione dal ponte TLS: "SVTLS <segreto> <ip> <porta>\r\n" prima della richiesta
+    SvServer* s = c->s;
+    if (s->tls && !strncmp(c->client, "127.", 4)) {
+        if (!fill(c->fd, &in, 6, &s->stop)) { free(in.data); return; }
+        if (!memcmp(in.data, "SVTLS ", 6)) {
+            size_t e;
+            while ((e = find_crlf(&in, 0)) == (size_t)-1) {
+                if (in.len > 300 || !fill(c->fd, &in, in.len + 1, &s->stop)) { free(in.data); return; }
+            }
+            char sec[80] = "", ip[64] = "";
+            int port = 0;
+            in.data[e] = '\0';
+            if (sscanf(in.data + 6, "%79s %63s %d", sec, ip, &port) != 3 || !secret_equal(sec, s->tls_secret)) { free(in.data); return; }
+            c->https = true;
+            snprintf(c->client, sizeof(c->client), "%s", ip);
+            c->client_port = port;
+            memmove(in.data, in.data + e + 2, in.len - e - 2);
+            in.len -= e + 2;
+            in.data[in.len] = '\0';
+        }
+    }
     while (serve_one(c->s, c, &in)) {}          // keep-alive: una richiesta dopo l'altra
     free(in.data);
 }
@@ -3160,7 +3206,7 @@ static void conn_finish(Conn* c) {
 }
 
 #ifdef _WIN32
-static DWORD WINAPI conn_thread(LPVOID arg) { Conn* c = (Conn*)arg; if (c->smtp) mail_smtp_serve(c->s->mail, c->fd, c->client, &c->s->stop); else if (c->mysql) serve_mysql(c); else serve_connection(c); conn_finish(c); return 0; }
+static DWORD WINAPI conn_thread(LPVOID arg) { Conn* c = (Conn*)arg; if (c->tls) tls_serve(c->s->tls, c->fd, c->client, c->client_port, c->s->port, c->s->tls_secret, &c->s->stop); else if (c->smtp) mail_smtp_serve(c->s->mail, c->fd, c->client, &c->s->stop); else if (c->mysql) serve_mysql(c); else serve_connection(c); conn_finish(c); return 0; }
 static bool spawn(Conn* c) {
     HANDLE h = CreateThread(NULL, 0, conn_thread, c, 0, NULL);
     if (!h) return false;
@@ -3168,7 +3214,7 @@ static bool spawn(Conn* c) {
     return true;
 }
 #else
-static void* conn_thread(void* arg) { Conn* c = (Conn*)arg; if (c->smtp) mail_smtp_serve(c->s->mail, c->fd, c->client, &c->s->stop); else if (c->mysql) serve_mysql(c); else serve_connection(c); conn_finish(c); return NULL; }
+static void* conn_thread(void* arg) { Conn* c = (Conn*)arg; if (c->tls) tls_serve(c->s->tls, c->fd, c->client, c->client_port, c->s->port, c->s->tls_secret, &c->s->stop); else if (c->smtp) mail_smtp_serve(c->s->mail, c->fd, c->client, &c->s->stop); else if (c->mysql) serve_mysql(c); else serve_connection(c); conn_finish(c); return NULL; }
 static bool spawn(Conn* c) {
     pthread_t t;
     pthread_attr_t a;
@@ -3225,10 +3271,11 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
     s->listen_fd = BAD_SOCK;
     s->mysql_fd = BAD_SOCK;
     s->mail_fd = BAD_SOCK;
+    s->https_fd = BAD_SOCK;
     s->cfg = *cfg;
     if (!s->cfg.bind_addr) s->cfg.bind_addr = "127.0.0.1";
     if (!s->cfg.max_body) s->cfg.max_body = 16u << 20;
-    if (s->cfg.max_clients <= 0) s->cfg.max_clients = 64;
+    if (s->cfg.max_clients <= 0) s->cfg.max_clients = cfg->https ? 256 : 64;   // HTTPS: ogni connessione ne usa almeno due
     s->token      = cfg->token && cfg->token[0] ? strdup(cfg->token) : NULL;
     s->cors       = cfg->cors_origin && cfg->cors_origin[0] ? strdup(cfg->cors_origin) : NULL;
     s->default_db = cfg->default_db && cfg->default_db[0] ? strdup(cfg->default_db) : NULL;
@@ -3291,7 +3338,22 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
             return NULL;
         }
     }
-    s->cfg.mail_dir = s->cfg.self_exe = NULL;
+    s->https_fd = BAD_SOCK;
+    if (cfg->https) {
+        char terr[300];
+        s->tls = tls_create(cfg->cert_dir && cfg->cert_dir[0] ? cfg->cert_dir : "certs", terr, sizeof(terr));
+        if (!s->tls) { snprintf(err, errsz, "HTTPS: %s", terr); sv_server_free(s); return NULL; }
+        if (!sv_random_token(s->tls_secret, 24)) { snprintf(err, errsz, "HTTPS: no random source"); sv_server_free(s); return NULL; }
+        s->https_fd = listen_tcp(s->cfg.bind_addr, cfg->https_port, &s->https_port);
+        if (s->https_fd == BAD_SOCK) {
+            snprintf(err, errsz, "cannot listen on %s:%d for HTTPS (port in use?)", s->cfg.bind_addr, cfg->https_port);
+            sv_server_free(s);
+            return NULL;
+        }
+        h2_set_enabled(cfg->http2);
+        snprintf(s->tls_info, sizeof(s->tls_info), "%s, CA %s", tls_library(s->tls), tls_ca_path(s->tls));
+    }
+    s->cfg.mail_dir = s->cfg.self_exe = s->cfg.cert_dir = NULL;
     if ((cfg->php_cgi && cfg->php_cgi[0]) || (cfg->php_fcgi && cfg->php_fcgi[0])) {
         bool any_dir = s->static_dir != NULL;
         for (int i = 0; i < s->n_sites; i++) if (s->sites[i].dir) any_dir = true;
@@ -3407,6 +3469,10 @@ int sv_server_mail_port(const SvServer* s) { return s->mail_fd != BAD_SOCK ? s->
 
 int sv_server_mail_count(SvServer* s) { return s->mail ? mail_count(s->mail) : 0; }
 
+int sv_server_https_port(const SvServer* s) { return s->https_fd != BAD_SOCK ? s->https_port : 0; }
+
+const char* sv_server_tls_info(const SvServer* s) { return s->tls ? s->tls_info : ""; }
+
 const char* sv_server_php(const SvServer* s) { return s->php ? fcgi_pool_describe(s->php) : ""; }
 
 const char* sv_server_api_prefix(const SvServer* s) { return s->api; }
@@ -3423,6 +3489,7 @@ void sv_server_run(SvServer* s) {
         sock_t top = s->listen_fd;
         if (s->mysql_fd != BAD_SOCK) { FD_SET(s->mysql_fd, &rd); if (s->mysql_fd > top) top = s->mysql_fd; }
         if (s->mail_fd != BAD_SOCK) { FD_SET(s->mail_fd, &rd); if (s->mail_fd > top) top = s->mail_fd; }
+        if (s->https_fd != BAD_SOCK) { FD_SET(s->https_fd, &rd); if (s->https_fd > top) top = s->https_fd; }
         struct timeval tv = { 0, 200000 };           // si ricontrolla stop 5 volte al secondo
         int r = select((int)top + 1, &rd, NULL, NULL, &tv);
         // watchdog: una richiesta oltre timeout_ms viene interrotta (le SELECT si fermano subito,
@@ -3438,7 +3505,8 @@ void sv_server_run(SvServer* s) {
         socklen_t pl = sizeof(peer);
         bool is_mysql = s->mysql_fd != BAD_SOCK && FD_ISSET(s->mysql_fd, &rd);
         bool is_smtp = !is_mysql && s->mail_fd != BAD_SOCK && FD_ISSET(s->mail_fd, &rd);
-        sock_t fd = accept(is_mysql ? s->mysql_fd : is_smtp ? s->mail_fd : s->listen_fd, (struct sockaddr*)&peer, &pl);
+        bool is_tls = !is_mysql && !is_smtp && s->https_fd != BAD_SOCK && FD_ISSET(s->https_fd, &rd);
+        sock_t fd = accept(is_mysql ? s->mysql_fd : is_smtp ? s->mail_fd : is_tls ? s->https_fd : s->listen_fd, (struct sockaddr*)&peer, &pl);
         if (fd == BAD_SOCK) continue;
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
@@ -3447,6 +3515,7 @@ void sv_server_run(SvServer* s) {
         for (int i = 0; i < s->cfg.max_clients && slot < 0; i++) if (s->conns[i] == BAD_SOCK) slot = i;
         if (slot >= 0) { s->conns[slot] = fd; s->active++; }
         mx_unlock(&s->conn_mx);
+        if (slot < 0 && is_tls) { sock_close(fd); continue; }
         if (slot < 0 && is_smtp) {
             send_all(fd, "421 4.3.2 Too many connections\r\n", 33);
             sock_close(fd);
@@ -3471,7 +3540,7 @@ void sv_server_run(SvServer* s) {
         }
         Conn* c = malloc(sizeof(Conn));
         if (c) {
-            c->s = s; c->fd = fd; c->slot = slot; c->mysql = is_mysql; c->smtp = is_smtp;
+            c->s = s; c->fd = fd; c->slot = slot; c->mysql = is_mysql; c->smtp = is_smtp; c->tls = is_tls; c->https = false;
             const unsigned char* ip = (const unsigned char*)&peer.sin_addr.s_addr;
             snprintf(c->client, sizeof(c->client), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
             c->client_port = ntohs(peer.sin_port);
@@ -3493,6 +3562,7 @@ void sv_server_free(SvServer* s) {
     if (s->listen_fd != BAD_SOCK) sock_close(s->listen_fd);
     if (s->mysql_fd != BAD_SOCK) sock_close(s->mysql_fd);
     if (s->mail_fd != BAD_SOCK) sock_close(s->mail_fd);
+    if (s->https_fd != BAD_SOCK) sock_close(s->https_fd);
     // le connessioni aperte vengono interrotte; si aspetta che i thread finiscano
     for (int tries = 0; s->conns; tries++) {
         mx_lock(&s->conn_mx);
@@ -3519,6 +3589,7 @@ void sv_server_free(SvServer* s) {
     free(s->sites);
     fcgi_pool_free(s->php);
     mail_store_free(s->mail);
+    tls_free(s->tls);
     if (s->audit) fclose(s->audit);
     free(s);
 #ifdef _WIN32

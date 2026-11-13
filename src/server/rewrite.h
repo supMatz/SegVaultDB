@@ -25,6 +25,7 @@ typedef struct {
     const char* client;         // REMOTE_ADDR
     const char* the_request;    // "GET /x?y HTTP/1.1"
     int         port;
+    bool        https;
 } RwRequest;
 
 typedef enum { RW_NONE, RW_REWRITE, RW_REDIRECT, RW_FORBIDDEN, RW_GONE } RwAction;
