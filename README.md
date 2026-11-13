@@ -1,8 +1,10 @@
 # 🗄️ SegVault - DBMS relazionale in C puro
 
-> Un DBMS relazionale scritto a mano in C, senza dipendenze: parser SQL, executor con ottimizzatore,
-> storage a pagine, Write-Ahead Log e recovery, con un'app desktop nativa per **Windows** (Win32) e
-> **Linux** (X11) e un **server HTTP/JSON** per siti web e app in qualsiasi linguaggio.
+> Un **ambiente di sviluppo locale completo** e un DBMS relazionale scritti a mano in C, senza
+> dipendenze: server web con PHP, siti `progetto.localhost`, HTTPS + HTTP/2, reverse proxy per
+> Vite / Next.js / Django, cattura delle email, protocollo MySQL con transazioni concorrenti e MVCC,
+> editor SQL e strumenti visuali, in un pacchetto da **1,8 MB** per **Windows** e **Linux**.
+> L'alternativa a XAMPP, UniServerZ e Laragon, più veloce e senza niente da installare.
 
 ---
 
@@ -11,6 +13,7 @@
 - [Panoramica](#panoramica)
 - [Download](#download)
 - [Avvio rapido](#avvio-rapido)
+- [Ambiente di sviluppo locale (meglio di XAMPP e Laragon)](#ambiente-di-sviluppo-locale-meglio-di-xampp-e-laragon)
 - [Per i corsi di Basi di Dati 1 e 2](#per-i-corsi-di-basi-di-dati-1-e-2)
 - [L'app desktop](#lapp-desktop)
   - [Scelta iniziale: editor o server](#scelta-iniziale-editor-o-server)
@@ -34,16 +37,20 @@
 
 ## Panoramica
 
-**SegVault** è un DBMS relazionale didattico ma completo, scritto interamente in C: nessuna libreria
-esterna, nessun framework. È pensato per i corsi di **Basi di Dati 1 e 2** di ingegneria informatica
-(lo stesso programma fa da ambiente per gli esercizi di SQL e da laboratorio sugli interni di un DBMS:
-piani di esecuzione, indici, buffer pool, log, transazioni, trigger) e, con il server API, come
-database per piccoli siti web e app desktop.
+**SegVault** è un ambiente di sviluppo locale completo per sviluppatori full-stack e backend, con il
+suo DBMS relazionale, scritto interamente in C: nessuna libreria esterna, nessun framework, un solo
+eseguibile. Fa quello che fanno XAMPP, UniServerZ e Laragon (server web, PHP, database compatibile
+MySQL, gestione del database) e in più siti per cartella su `*.localhost`, HTTPS con HTTP/2,
+reverse proxy per i dev server JavaScript e Python, cattura delle email, `.htaccess`, CGI, servizi
+avviabili uno per uno e un database con transazioni concorrenti e letture MVCC. Resta anche un
+laboratorio per i corsi di **Basi di Dati 1 e 2** (piani di esecuzione, indici, buffer pool, log,
+transazioni, trigger).
 
 | Caratteristica | Dettagli |
 |---|---|
 | **Linguaggio** | C11, zero dipendenze per il motore e per il server |
-| **Versione** | 1.0.4 |
+| **Versione** | 1.1.0 |
+| **Server di sviluppo** | Web + **PHP** (FastCGI, senza configurazione), un sito per cartella su `NOME.localhost`, **HTTPS + HTTP/2** con una CA locale, **reverse proxy** con WebSocket (Vite, Next.js, Django, Rails), `.htaccess` (`mod_rewrite`), **CGI** (Perl, Python, Ruby), **cattura delle email** (SMTP + pagina web + API), cruscotto, servizi accesi e spenti uno per uno, icona nell'area di notifica, servizio all'avvio |
 | **App desktop** | Win32 / GDI (Windows) · Xlib/X11 + Xft (Linux); all'avvio si sceglie **editor SQL** o **server API** |
 | **Server API** | `segvault-server` (o il pannello dell'app): HTTP/JSON, parametri `?` contro la SQL injection, sessioni con transazioni su più richieste, utenti e permessi (`GRANT`), token, CORS, limite di tempo, registro e monitor delle richieste, audit, backup pianificati; anche il **protocollo di rete MySQL** (PHP, Python, Java senza modifiche) |
 | **Client** | TypeScript/JavaScript e Python pronti in [`clients/`](clients/); esempi per C# e Java; `libsegvault.a` per incorporare il motore in C/C++ |
@@ -52,7 +59,8 @@ database per piccoli siti web e app desktop.
 | **Storage** | Heap file a pagine da 4 KB con slot directory e free-space map; indici in memoria (anche su più colonne): tabella hash per le uguaglianze, chiavi ordinate per gli intervalli |
 | **Buffer pool** | 1024 frame, tabella hash per la ricerca, sostituzione **CLOCK**; statistiche con `SHOW STATUS` |
 | **Ottimizzatore** | Pushdown delle selezioni, hash join (anche per `FROM a, b WHERE a.x = b.y`), accesso con indice per uguaglianza o per intervallo (scelto solo se conviene), subquery decorrelate per chiave; `EXPLAIN` con stime alla System R e `EXPLAIN ANALYZE` con le righe reali |
-| **Transazioni** | Write-Ahead Log con undo/redo, `BEGIN` (o `START TRANSACTION`) / `COMMIT` / `ROLLBACK`, `SAVEPOINT` (`ROLLBACK TO [SAVEPOINT]`), recovery dopo un crash, `CHECKPOINT` (anche automatico) |
+| **Transazioni** | Write-Ahead Log con undo/redo, `BEGIN` (o `START TRANSACTION`) / `COMMIT` / `ROLLBACK`, `SAVEPOINT` (`ROLLBACK TO [SAVEPOINT]`), recovery dopo un crash (anche con più transazioni aperte), `CHECKPOINT` (anche automatico) |
+| **Concorrenza** | Più transazioni aperte insieme (sessioni HTTP, connessioni MySQL, editor): lock di tabella S / X a due fasi, deadlock riconosciuti (errore MySQL 1213), timeout (1205); **le letture non aspettano mai le scritture** (MVCC: versione confermata) |
 | **Basi di dati attive** | Trigger `BEFORE` / `AFTER`, `FOR EACH ROW` / `FOR EACH STATEMENT`, `NEW` / `OLD`, `WHEN`, `SET NEW.col`, `SIGNAL`, `IF`; stored procedure (`CREATE PROCEDURE`, `CALL`) |
 | **Testi e righe grandi** | Testi fino a 16 MB, righe fino a 64 MB: una riga oltre 2 KB va in pagine di overflow (anche dopo `ROLLBACK`, riavvio e crash) |
 | **Strumenti visuali** | Designer dello schema ER (notazione di Chen) / UML a trascinamento, export PNG; modulo della struttura con SQL live; modifica dei dati nella griglia; ricerca in tutto il database; panoramica; utenti e permessi; monitor del server |
@@ -62,7 +70,10 @@ database per piccoli siti web e app desktop.
 
 ## Download
 
-Basta **un solo file**, senza installazione (i font sono dentro l'eseguibile):
+**Pacchetto completo** (eseguibili, script di avvio, sito d'esempio, README; su Windows `get-php.cmd`
+scarica PHP): `SegVault-1.1.0-windows-x86_64.zip` e `SegVault-1.1.0-linux-x86_64.tar.gz` nelle
+[release](https://github.com/supMatz/SegVaultDB/releases). Oppure **un solo file**, senza
+installazione (i font sono dentro l'eseguibile):
 
 | Sistema | App desktop (editor SQL + server) | Solo server |
 |---|---|---|
@@ -94,10 +105,69 @@ eseguibili in `bin/`). La cartella dati viene creata se manca e contiene:
 | `session.sql`, `session.ini` | Script aperto nell'editor, cursore, file, zoom, tema |
 | `history.sql` | Cronologia degli statement eseguiti |
 | `server.token` | Token del server API (creato quando serve) |
-| `server.ini` | Cartella del sito servito dal pannello del server |
+| `server.ini` | Cartella del sito servito dal pannello del server, `php_cgi=`, siti con nome `site.NOME=DEST` |
+| `certs/` | Autorità di certificazione locale (`ca.crt`, `ca.key`) e chiave dei siti per HTTPS |
+| `mail/` | Email catturate (`.eml`) |
 
 Una cartella dati è usata da un solo processo alla volta: una seconda istanza sulla stessa cartella
 viene rifiutata, perché la corromperebbe.
+
+---
+
+## Ambiente di sviluppo locale (meglio di XAMPP e Laragon)
+
+Un solo programma da 1,8 MB al posto di Apache + PHP + MySQL + phpMyAdmin + Mailpit + mkcert:
+
+```bash
+segvault-server --static www --php auto --mysql-port 3306 --mail-port 1025 --https-port 8443 data
+#   http://localhost:8484/.segvault/      cruscotto: servizi e siti
+#   www/blog          ->  http://blog.localhost:8484  e  https://blog.localhost:8443  (HTTP/2)
+#   www/shop (Laravel)->  http://shop.localhost:8484  (radice: shop/public)
+#   127.0.0.1:3306        protocollo MySQL (PHP, Node, Python, Java, client mysql), anche con TLS
+#   127.0.0.1:1025        posta catturata: http://localhost:8484/.segvault/mail/
+segvault-server --trust-ca data                                # una volta: HTTPS senza avvisi nei browser
+segvault-server --site app=5173 --static www data              # http://app.localhost:8484 -> Vite / Next.js
+```
+
+Nell'app desktop gli stessi servizi si accendono dal pannello del server; l'editor SQL resta usabile
+mentre il server gira.
+
+| | **SegVault** | XAMPP | UniServerZ | Laragon |
+|---|---|---|---|---|
+| Dimensione | **1,8 MB** (PHP a parte) | ~150 MB | ~100 MB | ~150 MB |
+| Installazione | nessuna (un eseguibile) | installer | zip | installer |
+| Sistemi | Windows, Linux | Windows, Linux, macOS | Windows | Windows |
+| Siti per cartella su `*.localhost` (senza file hosts) | ✅ | ❌ | ❌ | ✅ (`.test`, modifica hosts) |
+| HTTPS con certificati fidati per ogni sito | ✅ CA locale, `--trust-ca` | ⚠️ autofirmato | ⚠️ | ✅ |
+| HTTP/2 | ✅ | ❌ | ❌ | ⚠️ |
+| Reverse proxy per Vite / Next.js / Django (WebSocket) | ✅ `--site app=5173` | ❌ manuale | ❌ | ⚠️ |
+| Cattura delle email con pagina e API per i test E2E | ✅ integrata | ❌ | ❌ | ✅ (Mailpit) |
+| `.htaccess` / `mod_rewrite` | ✅ | ✅ | ✅ | ✅ |
+| PHP pronto senza configurare `php.ini` | ✅ | ✅ | ✅ | ✅ |
+| CGI (Perl, Python, Ruby) | ✅ | ✅ | ✅ | ✅ |
+| Database compatibile MySQL (WordPress, Laravel) | ✅ | ✅ MariaDB | ✅ | ✅ |
+| Letture che non aspettano le scritture (MVCC) | ✅ | ✅ | ✅ | ✅ |
+| Editor SQL, designer dello schema, grafici integrati | ✅ nativi | phpMyAdmin (web) | phpMyAdmin | HeidiSQL |
+| Registro delle query dell'app e monitor in tempo reale | ✅ | ❌ | ❌ | ❌ |
+| Porta occupata: chi la usa | ✅ `mysqld (pid 812)`, tutte insieme | ✅ | ✅ | ⚠️ |
+| Servizi accesi e spenti uno per uno, icona di notifica, avvio con il computer | ✅ | ✅ | ✅ | ✅ |
+
+**Per tutto il ciclo di vita del software:**
+
+- **Sviluppo** — PHP (WordPress, Laravel, Symfony, CodeIgniter, Drupal girano senza modifiche), dev
+  server di Node / Python / Ruby / Go dietro `NOME.localhost` con la ricarica a caldo, HTTPS come in
+  produzione (cookie `Secure`, service worker, OAuth), `.htaccess`, CGI.
+- **Database** — protocollo MySQL (anche TLS), transazioni concorrenti con MVCC, editor SQL con
+  autocompletamento, `EXPLAIN ANALYZE`, designer ER, import dei dump di phpMyAdmin / `mysqldump`,
+  export CSV / XLSX / PDF / SQL.
+- **Debug** — registro in tempo reale di ogni richiesta e di ogni query mandata dall'app (con il
+  servizio: web, PHP, API, MySQL, posta), avvisi di PHP, monitor con tempi e percentili.
+- **Test** — email catturate interrogabili via API (`/.segvault/mail/api/messages?to=...`), API HTTP
+  del database per preparare e verificare i dati, backup e ripristino in un comando.
+- **Rilascio** — `BACKUP TO`, backup pianificati, dump compatibile MySQL, server headless installabile
+  come servizio (`segvault-server --install-service`).
+
+Tutti i dettagli: [docs/API.md](docs/API.md) (siti, proxy, `.htaccess`, HTTPS, posta, servizi).
 
 ---
 
@@ -151,7 +221,7 @@ lo ferma e torna all'editor.
 ┌──────────────────────────────────────────────────────────────────────┐
 │ File  Edit  View  Query  Import  Export  Settings  Help   untitled.sql│
 ├──────────────────────────────────────────────────────────────────────┤
-│ ◆ SegVault v1.0.4 [▶ Run F5] [Run statement] │ [Commit] [Rollback] │ [Format]   ● Sky  ▤ db │
+│ ◆ SegVault v1.1.0 [▶ Run F5] [Run statement] │ [Commit] [Rollback] │ [Format]   ● Sky  ▤ db │
 ├────────────┬─────────────────────────────────────────────────────────┤
 │ EXPLORER ⟳ │  editor SQL (numeri di riga, highlighting, completamento)│
 │  ▸ uni     │                                                         │
@@ -159,7 +229,7 @@ lo ferma e torna all'editor.
 │            │  RESULTS ● Query OK            filtro    12 rows  History│
 │            │  griglia dei risultati (schede se più SELECT)           │
 ├────────────┴─────────────────────────────────────────────────────────┤
-│ ● SegVault engine 1.0.4  ▤ uni  script.sql         Ln 3, Col 7  F1 Shortcuts│
+│ ● SegVault engine 1.1.0  ▤ uni  script.sql         Ln 3, Col 7  F1 Shortcuts│
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -344,22 +414,26 @@ delle richieste al posto dei risultati.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ ◆ SegVault v1.0.4 [■ Stop server F5] [Copy address]  ● Running · port 8484 [Open SQL editor]│
+│ ◆ SegVault v1.1.0 [■ Stop server F5] [Copy address]  ● Running · port 8484 [Open SQL editor]│
 ├────────────────┬─────────────────────────────────────────────────────┤
-│ SERVER         │ REQUESTS ● 4 requests · 1 error · 3 rows sent · up 1m │
-│ ADDRESS        │ time      client     method path          status ms   sql │
-│ http://127.0…  │ 21:51:51  127.0.0.1  POST   /api/v1/query  200   0.2  SELECT * FROM p │
-│ PORT [−][8484][+]│ 21:51:51  127.0.0.1  POST   /api/v1/query  400   0.1  Table … not found│
-│ REACHABLE FROM │                                                     │
+│ SERVER         │ REQUESTS ● 4 requests · up 1m   All Web PHP API MySQL Mail │
+│ ADDRESS        │ time     service client    method path / query     status ms │
+│ http://127.0…  │ 21:51:51 php     127.0.0.1 GET    /index.php         200   3.1 │
+│ PORT [−][8484][+]│ 21:51:51 mysql   127.0.0.1 SQL    SELECT * FROM wp_… 200   0.2 │
+│ REACHABLE FROM │ 21:51:52 mail    127.0.0.1 MAIL   eve@example.com    200   0.0 │
 │ TOKEN          │                                                     │
 │ USER LOGIN     │                                                     │
 │ MYSQL PROTOCOL │                                                     │
 │ WEB APPS (CORS)│                                                     │
 │ TIME LIMIT     │                                                     │
 │ WEB FOLDER     │                                                     │
+│ PHP            │                                                     │
+│ HTTPS          │                                                     │
+│ MAIL CATCHER   │                                                     │
+│ START WITH THE COMPUTER                                              │
 │ TRY IT  curl … │                                                     │
 ├────────────────┴─────────────────────────────────────────────────────┤
-│ ● SegVault engine 1.0.4  API server running  this computer only    F5 Start / Stop│
+│ ● SegVault engine 1.1.0  API server running  this computer only    F5 Start / Stop│
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -380,6 +454,20 @@ delle richieste al posto dei risultati.
   stato del motore (file dei dati, cache delle pagine, letture dal disco, WAL, checkpoint). Il registro
   delle richieste mostra `utente@indirizzo` quando c'è il login.
 - **Try it:** il comando `curl` pronto da copiare (a schermo il token è mostrato solo in parte).
+- **Servizi uno per uno:** PHP, MySQL, posta e HTTPS si accendono e si spengono con il server in
+  funzione, senza interrompere gli altri; una porta occupata viene segnalata con il programma che la
+  usa. Le porte si cambiano in *Settings › Server*.
+- **Siti:** ogni cartella della Web folder è `http://NOME.localhost:8484` (*All sites* apre il
+  cruscotto); i dev server si aggiungono in `server.ini` (`site.app=http://127.0.0.1:5173`).
+- **HTTPS** (*Port 8443 + HTTP/2*) con *Trust certificate* per rendere fidata la CA locale;
+  **Mail catcher** (*SMTP port 1025*) con *Open inbox (N)*; **Edit php.ini** apre il `php.ini` in uso.
+- **Registro per servizio:** colonna *service* e filtri *All / Web / PHP / API / MySQL / Mail*; le
+  query che l'app manda con il protocollo MySQL compaiono una per riga.
+- **Area di notifica:** con il server acceso, chiudere la finestra lascia SegVault nell'area di
+  notifica (icona verde; su Windows con il menu Apri / Siti e servizi / Avvia-Ferma / Esci);
+  *Start with the computer* lo avvia all'accesso, nascosto, con il server acceso.
+- **Editor e server insieme:** *Open SQL editor* non ferma il server; l'indicatore *● Server :8484*
+  nella barra dei menu riporta al pannello.
 
 ### Temi
 
@@ -1209,9 +1297,21 @@ SegVaultDB/
 │   │   ├── result_export.*    # Export CSV / TSV / JSON / Markdown / HTML / SQL
 │   │   └── csv_import.*       # Import CSV
 │   ├── bridge/
-│   │   └── db_api.h / .c      # Unico punto di contatto con il motore (app, server, libsegvault.a)
-│   ├── server/                # Server HTTP/JSON
-│   │   ├── server.h / .c      # Socket, HTTP/1.1, endpoint, parametri ?, sicurezza, registro
+│   │   ├── db_api.h / .c      # Unico punto di contatto con il motore (app, server, libsegvault.a);
+│   │   │                      # sessioni, lock per statement, letture MVCC
+│   │   ├── locks.h / .c       # Lock delle tabelle (S / X), attese, rilevamento dei deadlock
+│   │   └── auth.h / .c        # Utenti, password, GRANT
+│   ├── server/                # Server di sviluppo
+│   │   ├── server.h / .c      # Socket, HTTP/1.1, API, siti, cruscotto, servizi, registro
+│   │   ├── fastcgi.h / .c     # PHP (php-cgi / php-fpm), PHP senza configurazione
+│   │   ├── proxy.h / .c       # Reverse proxy per i dev server (streaming, WebSocket)
+│   │   ├── rewrite.h / .c     # .htaccess: mod_rewrite, Require, Options
+│   │   ├── cgi.h / .c         # Programmi CGI (Perl, Python, Ruby)
+│   │   ├── mail.h / .c        # Cattura delle email: SMTP, MIME, pagina e API, sendmail
+│   │   ├── tls.h / .c         # HTTPS con OpenSSL caricato all'avvio, CA locale, certificati SNI
+│   │   ├── h2.h / .c          # HTTP/2 (HPACK, controllo di flusso)
+│   │   ├── mysql_wire.h / .c  # Protocollo di rete MySQL
+│   │   ├── service.h / .c     # --install-service (systemd, launchd, Windows)
 │   │   ├── json.h / .c        # Lettura e scrittura JSON
 │   │   └── main.c             # segvault-server: opzioni da riga di comando
 │   ├── query/                 # SQL: lexer → parser → executor
@@ -1241,7 +1341,7 @@ SegVaultDB/
 
 | Costante | Valore | Significato |
 |---|---|---|
-| `SV_VERSION_STR` | `"1.0.4"` | Versione |
+| `SV_VERSION_STR` | `"1.1.0"` | Versione |
 | `SV_PAGE_SIZE` | `4096` | Dimensione di una pagina su disco |
 | `SV_BUFFER_POOL_CAP` | `1024` | Pagine nel buffer pool |
 | `SV_MAX_DATABASES` | `64` | Database |
@@ -1363,32 +1463,18 @@ SegVault implementa lexer e parser da zero, senza Flex né Bison.
 
 ## Roadmap
 
-Cosa manca per superare phpMyAdmin + XAMPP, in ordine di importanza:
+Fatto nella 1.1 (dettagli in [TODO.md](TODO.md)): server di sviluppo completo (PHP, siti per cartella,
+proxy, HTTPS + HTTP/2, posta, `.htaccess`, CGI), transazioni concorrenti con MVCC, compatibilità MySQL
+provata con WordPress, servizi indipendenti, area di notifica, pacchetti portabili.
 
-1. **Concorrenza** — fatto: sessioni del server con database, utente e transazione propri, anche su
-   più richieste, con un solo proprietario delle transazioni; **letture in parallelo** (lock
-   lettori/scrittori con precedenza alle scritture, latch del buffer pool, database corrente e
-   annullamento per thread; verificato con ThreadSanitizer: `make test-tsan`). Da fare: scritture
-   concorrenti (lock sulle righe o MVCC).
-2. **Righe grandi** — fatto: pagine di overflow (righe fino a 64 MB, testi fino a 16 MB); `VACUUM`
-   rende riusabili le pagine delle righe grandi aggiornate o eliminate.
-3. **Compatibilità MySQL** — fatto: import dei dump di `mysqldump` / phpMyAdmin (anche date con i
-   decimali dei secondi), con viste, trigger e procedure; **protocollo di rete MySQL**
-   (`--mysql-port`: PHP, Python, Java e il client `mysql` si collegano senza modifiche), prepared
-   statement lato server, `autocommit` e `START TRANSACTION`. Da fare: TLS; le funzioni e le variabili di MySQL che mancano ancora
-   (un'app complessa come WordPress va provata).
-4. **Limiti del motore** — fatto: `CREATE UNIQUE INDEX`, indici su più colonne (anche dall'import
-   MySQL), funzioni JSON e operatori `->` / `->>`, nomi `db.tabella` (un database per istruzione),
-   stored procedure (`CREATE PROCEDURE` / `CALL`, parametri `IN`), ricerca full-text
-   (`MATCH ... AGAINST`, anche `IN BOOLEAN MODE`). Da fare: più tabelle / colonne / indici, indice
-   full-text (ora la ricerca legge ogni riga).
-5. **Sicurezza e gestione** — fatto: `BACKUP TO`, backup pianificati del server, ripristino dalla
-   GUI; `SHOW DATABASES` e l'elenco `/api/v1/databases` mostrano a ogni utente solo ciò su cui ha
-   permessi; registro di audit (`--audit`); servizio systemd e avvio automatico su Windows; HTTPS tramite
-   reverse proxy (documentato). Da fare: HTTPS integrato senza proxy.
-6. **GUI** — fatto: navigazione delle chiavi esterne dalla griglia (Ctrl+clic), backup e ripristino
-   dal menu File, export XLSX e PDF, grafici dai risultati, query salvate, protocollo MySQL dal pannello del server, manutenzione delle tabelle (`CHECK` / `ANALYZE` / `OPTIMIZE` / `REPAIR TABLE`). Da fare: costruttore visuale di query, editor di trigger e viste.
-7. **Portata** — interfaccia web, versione macOS, interfaccia in italiano e altre lingue, accessibilità.
+Prossimi passi:
+
+1. **Motore** — lock sulle righe per le scritture concorrenti sulla stessa tabella; indice full-text;
+   più tabelle, colonne e indici per database.
+2. **Sviluppo** — supporto a più versioni di PHP in parallelo (una per sito), Node.js e Python gestiti
+   dal pannello, terminale integrato, Redis compatibile.
+3. **GUI** — costruttore visuale di query, editor di trigger e viste, interfaccia in italiano.
+4. **Portata** — versione macOS nativa, interfaccia web, firma degli eseguibili Windows.
 
 ## Licenza
 
