@@ -12,6 +12,7 @@ SCOPO: Entry point di SegVault.
 #include "widgets/window.h"
 #include "bridge/db_api.h"
 #include "widgets/settings.h"
+#include "server/mail.h"
 #include <string.h>
 #include <stdio.h>
 #include <signal.h>
@@ -36,6 +37,8 @@ static void on_quit_signal(int sig) { (void)sig; g_quit_requested = 1; }
 #define INITIAL_H  800
 
 int main(int argc, char** argv) {
+    // sendmail_path di PHP quando il server della GUI cattura le email (vedi src/server/mail.h)
+    if (argc >= 3 && !strcmp(argv[1], "--sendmail")) return mail_sendmail_main(atoi(argv[2]), argc - 3, argv + 3);
 
     // -- argomenti: [--server | --editor] [cartella-dati] --
     const char* data_dir = "./data";

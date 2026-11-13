@@ -4,6 +4,7 @@ SCOPO: segvault-server — il motore SegVault come servizio HTTP/JSON, senza GUI
 */
 #include "server.h"
 #include "fastcgi.h"
+#include "mail.h"
 #include "../bridge/db_api.h"
 #include "../../include/common.h"
 #include <signal.h>
@@ -155,6 +156,10 @@ static void usage(const char* argv0) {
            "                        Every folder inside --static is a site too (www/blog -> blog.localhost,\n"
            "                        www/blog/public as the root when the folder has no index: Laravel, Symfony)\n"
            "      --no-auto-sites   do not turn the folders of --static into sites\n"
+           "      --mail-port P     catch outgoing email: an SMTP server on port P (e.g. 1025) keeps every message\n"
+           "                        instead of delivering it; read them at http://localhost:PORT/.segvault/mail/\n"
+           "                        (PHP mail() is routed there automatically)\n"
+           "      --mail-dir DIR    where caught messages are kept (default DATA/mail)\n"
            "      --no-dir-listing  404 instead of a file list for folders without an index\n"
            "  -q, --quiet           do not log requests\n"
            "  -h, --help            this help\n\n"
@@ -164,6 +169,8 @@ static void usage(const char* argv0) {
 }
 
 int main(int argc, char** argv) {
+    // "segvault-server --sendmail PORTA [-f mittente] [-t] [-i]": il sendmail_path di PHP (vedi mail.h)
+    if (argc >= 3 && !strcmp(argv[1], "--sendmail")) return mail_sendmail_main(atoi(argv[2]), argc - 3, argv + 3);
     SvServerConfig cfg = { .bind_addr = "127.0.0.1", .port = 8484, .timeout_ms = 30000, .dir_listing = true };
     static SvSite sites[64];
     static char site_buf[64][1200];
@@ -214,6 +221,8 @@ int main(int argc, char** argv) {
             cfg.sites = sites;
         }
         else if (!strcmp(a, "--no-auto-sites")) cfg.no_auto_sites = true;
+        else if (ARG("--mail-port", "--mail-port")) { cfg.mail = true; cfg.mail_port = atoi(argv[++i]); }
+        else if (ARG("--mail-dir", "--mail-dir")) cfg.mail_dir = argv[++i];
         else if (!strcmp(a, "--no-dir-listing")) cfg.dir_listing = false;
         else if (a[0] == '-') { fprintf(stderr, "unknown or incomplete option: %s (see --help)\n", a); return 2; }
         else data_dir = a;
@@ -267,6 +276,11 @@ int main(int argc, char** argv) {
             }
         }
     }
+    static char mail_dir_buf[1200];
+    if (cfg.mail && !cfg.mail_dir) {
+        snprintf(mail_dir_buf, sizeof(mail_dir_buf), "%s/mail", data_dir);
+        cfg.mail_dir = mail_dir_buf;
+    }
     if (!db_init(data_dir)) {
         fprintf(stderr, "cannot open the data directory '%s': %s\n", data_dir, db_init_error());
         return 1;
@@ -306,6 +320,9 @@ int main(int argc, char** argv) {
         printf("  PHP:      %s\n", sv_server_php(g_server));
         if (!cfg.mysql) printf("            (scripts reach the database with mysqli / PDO if you add --mysql-port 3306)\n");
     }
+    if (sv_server_mail_port(g_server))
+        printf("  mail:     smtp://127.0.0.1:%d  -> http://localhost:%d/.segvault/mail/  (%d messages)\n",
+               sv_server_mail_port(g_server), port, sv_server_mail_count(g_server));
     if (sv_server_api_prefix(g_server)[0]) printf("  API:      http://%s:%d%s\n", host, port, sv_server_api_prefix(g_server));
     else printf("  API:      off (--api-prefix none)\n");
     if (cfg.mysql) printf("  MySQL:    %s:%d   (e.g. mysql -h %s -P %d -u root)\n", host, sv_server_mysql_port(g_server), host, sv_server_mysql_port(g_server));

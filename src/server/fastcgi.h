@@ -22,7 +22,8 @@ typedef struct {
 } FcgiParam;
 
 // avvia `workers` processi php-cgi (0 = 4); NULL + messaggio in err se l'eseguibile non parte
-FcgiPool* fcgi_pool_spawn(const char* php_cgi, int workers, char* err, size_t errsz);
+// ini: impostazioni "chiave=valore" passate a ogni processo con -d (n_ini voci, anche 0)
+FcgiPool* fcgi_pool_spawn(const char* php_cgi, int workers, const char* const* ini, int n_ini, char* err, size_t errsz);
 // backend esterno: "host:porta" (TCP) o "unix:/run/php/php-fpm.sock" (solo Linux)
 FcgiPool* fcgi_pool_external(const char* addr, char* err, size_t errsz);
 void      fcgi_pool_free(FcgiPool* p);     // ferma i processi avviati

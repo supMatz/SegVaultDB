@@ -44,6 +44,8 @@ SEGVAULT_TOKEN=segreto ./segvault-server -b 0.0.0.0   # raggiungibile in rete: i
 | `--site NOME=DEST` | un sito su `http://NOME.localhost:PORTA` (e `NOME.test`): `DEST` è una cartella oppure un dev server da raggiungere col reverse proxy (`http://127.0.0.1:5173`, anche solo `5173`; WebSocket compresi). Ripetibile |
 | `--no-auto-sites` | le sottocartelle di `--static` non diventano siti |
 | `--no-dir-listing` | 404 invece dell'elenco dei file per le cartelle senza index |
+| `--mail-port P` | cattura delle email: un server SMTP sulla porta `P` (es. 1025) tiene ogni messaggio invece di consegnarlo; si leggono su `http://localhost:PORTA/.segvault/mail/` |
+| `--mail-dir DIR` | dove tenere i messaggi catturati (default `DATA/mail`) |
 | `--api-prefix P` | prefisso dell'API (default `/api/v1`; `none` = spenta). Con PHP, i percorsi sotto il prefisso che non sono dell'API vanno al sito |
 | `--max-body MB` | corpo massimo di una richiesta (default 16) |
 | `--timeout S` | ferma una richiesta che dura più di S secondi (default 30, `0` = mai) |
@@ -301,6 +303,29 @@ in `.localhost`.
   servizi attivi e siti, con il tipo di progetto riconosciuto. Solo per i client di questa macchina.
 - Una cartella senza index mostra l'elenco dei suoi file (senza quelli nascosti); `--no-dir-listing`
   lo spegne.
+
+## Email di sviluppo (cattura)
+
+Con `--mail-port 1025` nessuna email esce dalla macchina: il server SMTP di SegVault accetta ogni
+messaggio (qualsiasi utente e password, niente TLS) e lo salva in `DATA/mail/ID.eml`.
+
+- Configurazione delle app: host `127.0.0.1`, porta `1025`, senza cifratura. Laravel
+  `MAIL_MAILER=smtp MAIL_HOST=127.0.0.1 MAIL_PORT=1025`; Symfony `MAILER_DSN=smtp://127.0.0.1:1025`;
+  Nodemailer `{ host: '127.0.0.1', port: 1025, secure: false }`; Django `EMAIL_HOST='127.0.0.1'`,
+  `EMAIL_PORT=1025`; WordPress e `mail()` di PHP: niente da fare (SegVault imposta `sendmail_path`
+  o `SMTP` / `smtp_port` dei processi `php-cgi` che avvia).
+- `http://localhost:PORTA/.segvault/mail/`: elenco aggiornato da solo, ricerca, HTML (in un iframe
+  `sandbox`, senza script), testo, sorgente `.eml`, allegati, cancellazione.
+- API per i test automatici (Playwright, Cypress, PHPUnit, pytest):
+
+| Richiesta | Risposta |
+|---|---|
+| `GET /.segvault/mail/api/messages` | `{"total":N,"messages":[{"id","time","size","from","to","subject"}]}`, dal più recente; filtri `?to=` `?from=` `?subject=` `?q=` (sottostringhe, senza distinzione di maiuscole) e `?limit=` |
+| `GET /.segvault/mail/api/messages/ID` (o `/latest`) | il messaggio: `cc`, `date`, `message_id`, `headers`, `text`, `html` (o `null`), `attachments` |
+| `GET /.segvault/mail/ID.eml` · `/ID.html` · `/ID/att/N` | sorgente, parte HTML, allegato N |
+| `DELETE /.segvault/mail/api/messages[/ID]` | cancella tutti i messaggi (o uno) |
+
+Le pagine della posta rispondono solo ai client di questa macchina.
 
 ## Sicurezza
 

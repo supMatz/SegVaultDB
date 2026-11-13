@@ -52,6 +52,13 @@ typedef struct {
     int         n_sites;
     bool        no_auto_sites;// niente siti automatici dalle sottocartelle
     bool        dir_listing;  // elenco dei file di una cartella senza index (come Apache "Indexes")
+    // cattura delle email (vedi mail.h): un server SMTP che tiene i messaggi invece di consegnarli,
+    // visibili su http://localhost:PORTA/.segvault/mail. Con PHP, mail() arriva qui da solo
+    bool        mail;
+    int         mail_port;    // porta SMTP (0 = libera scelta dal sistema; vedi sv_server_mail_port)
+    const char* mail_dir;     // cartella dei messaggi (.eml)
+    const char* self_exe;     // eseguibile di SegVault (sendmail_path di PHP: "EXE --sendmail PORTA");
+                              // NULL = cercato da solo
 } SvServerConfig;
 
 typedef struct SvServer SvServer;
@@ -93,6 +100,8 @@ typedef struct {
 SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz);
 int       sv_server_port(const SvServer* s);
 int       sv_server_mysql_port(const SvServer* s);   // 0 se il protocollo MySQL è spento
+int       sv_server_mail_port(const SvServer* s);    // 0 se la cattura delle email è spenta
+int       sv_server_mail_count(SvServer* s);         // messaggi catturati
 const char* sv_server_php(const SvServer* s);
 const char* sv_server_api_prefix(const SvServer* s);  // "/api/v1", "" se l'API HTTP è spenta         // descrizione del backend PHP ("" se spento)
 void      sv_server_run(SvServer* s);     // accetta connessioni finché non viene chiamato sv_server_stop

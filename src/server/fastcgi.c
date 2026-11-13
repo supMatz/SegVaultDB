@@ -85,6 +85,9 @@ struct FcgiPool {
     int         port;
     // processi avviati da qui
     char*       exe;
+    char**      args;            // argv dei processi: exe, -d k=v ..., -b, (porta), NULL
+    int         n_args;
+    char*       cmd_ini;         // Windows: le stesse impostazioni nella riga di comando
     int         n;
     FcgiWorker* w;
     int         next;            // giro dei processi (round robin)
@@ -242,8 +245,8 @@ static bool worker_start(FcgiPool* p, FcgiWorker* w, char* err, size_t errsz) {
     char bind_arg[32];
     snprintf(bind_arg, sizeof(bind_arg), "127.0.0.1:%d", w->port);
 #ifdef _WIN32
-    char cmd[1400];
-    snprintf(cmd, sizeof(cmd), "\"%s\" -b %s", p->exe, bind_arg);
+    char cmd[4400];
+    snprintf(cmd, sizeof(cmd), "\"%s\"%s -b %s", p->exe, p->cmd_ini ? p->cmd_ini : "", bind_arg);
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof(si));
@@ -257,7 +260,12 @@ static bool worker_start(FcgiPool* p, FcgiWorker* w, char* err, size_t errsz) {
     CloseHandle(pi.hThread);
     w->proc = pi.hProcess;
 #else
-    char* argv[] = { p->exe, "-b", bind_arg, NULL };
+    char* argv[80];
+    int na = 0;
+    for (int i = 0; i < p->n_args && na < 76; i++) argv[na++] = p->args[i];
+    argv[na++] = "-b";
+    argv[na++] = bind_arg;
+    argv[na] = NULL;
     int max_fd = p->max_fd;
     pid_t pid = fork();
     if (pid < 0) { snprintf(err, errsz, "fork failed: %s", strerror(errno)); return false; }
@@ -406,12 +414,26 @@ static int fcgi_talk(sock_t fd, const FcgiParam* params, int nparams, const char
 
 // ── API ─────────────────────────────────────────────────────────
 
-FcgiPool* fcgi_pool_spawn(const char* php_cgi, int workers, char* err, size_t errsz) {
+FcgiPool* fcgi_pool_spawn(const char* php_cgi, int workers, const char* const* ini, int n_ini, char* err, size_t errsz) {
     if (workers <= 0) workers = 4;
     if (workers > 64) workers = 64;
     FcgiPool* p = calloc(1, sizeof(FcgiPool));
     if (!p) { snprintf(err, errsz, "out of memory"); return NULL; }
     p->exe = strdup(php_cgi);
+    if (n_ini > 36) n_ini = 36;
+    p->args = calloc((size_t)(1 + 2 * n_ini + 1), sizeof(char*));
+    if (p->args) {
+        p->args[p->n_args++] = p->exe;
+        JsonBuf cmd = {0};
+        for (int i = 0; i < n_ini; i++) {
+            p->args[p->n_args++] = strdup("-d");
+            p->args[p->n_args++] = strdup(ini[i]);
+            jb_lit(&cmd, " -d \"");
+            jb_raw(&cmd, ini[i], strlen(ini[i]));
+            jb_lit(&cmd, "\"");
+        }
+        p->cmd_ini = cmd.data;
+    }
     p->n = workers;
     p->w = calloc((size_t)workers, sizeof(FcgiWorker));
     mx_init(&p->mx);
@@ -532,6 +554,9 @@ void fcgi_pool_free(FcgiPool* p) {
 #endif
     mx_destroy(&p->mx);
     free(p->w);
+    for (int i = 1; p->args && i < p->n_args; i++) free(p->args[i]);   // args[0] è exe
+    free(p->args);
+    free(p->cmd_ini);
     free(p->exe);
     free(p);
 }

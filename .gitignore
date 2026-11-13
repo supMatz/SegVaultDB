@@ -33,6 +33,8 @@ test_server
 test_server_asan
 test_web
 test_web_asan
+test_mail
+test_mail_asan
 test_php
 test_php_asan
 __pycache__/

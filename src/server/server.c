@@ -10,6 +10,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #include "mysql_wire.h"
 #include "fastcgi.h"
 #include "proxy.h"
+#include "mail.h"
 #include "../widgets/png_write.h"
 #include "../bridge/db_api.h"
 #include "../bridge/auth.h"
@@ -104,6 +105,9 @@ struct SvServer {
     sock_t         listen_fd;
     int            port;
     sock_t         mysql_fd;            // protocollo MySQL (BAD_SOCK = spento)
+    sock_t         mail_fd;             // SMTP della cattura delle email (BAD_SOCK = spenta)
+    int            mail_port;
+    MailStore*     mail;
     int            mysql_port;
     uint32_t       mysql_ids;           // id delle connessioni MySQL
     atomic_int     stop;                // chiesto da un altro thread o da un gestore di segnale
@@ -129,6 +133,7 @@ typedef struct {
     char      client[48];
     int       client_port;
     bool      mysql;                   // connessione col protocollo MySQL
+    bool      smtp;                    // connessione SMTP (cattura delle email)
 } Conn;
 
 // ── richiesta / risposta ────────────────────────────────────────
@@ -1868,6 +1873,11 @@ static void dashboard(SvServer* s, Response* rs) {
         jb_printf(b, "<div class=\"card\"><b><i class=\"dot on\"></i>MySQL protocol</b><span>127.0.0.1:%d</span></div>", s->mysql_port);
     else
         jb_lit(b, "<div class=\"card\"><b><i class=\"dot\"></i>MySQL protocol</b><span>off (--mysql-port 3306)</span></div>");
+    if (s->mail)
+        jb_printf(b, "<div class=\"card\"><b><i class=\"dot on\"></i>Mail catcher</b><span>SMTP 127.0.0.1:%d &middot; "
+                     "<a href=\"/.segvault/mail/\">%d message%s</a></span></div>", s->mail_port, mail_count(s->mail), mail_count(s->mail) == 1 ? "" : "s");
+    else
+        jb_lit(b, "<div class=\"card\"><b><i class=\"dot\"></i>Mail catcher</b><span>off (--mail-port 1025)</span></div>");
     if (s->api[0]) {
         jb_lit(b, "<div class=\"card\"><b><i class=\"dot on\"></i>HTTP API</b><span>");
         html_esc(b, s->api);
@@ -2204,6 +2214,20 @@ static void route(SvServer* s, Request* rq, Response* rs) {
             return;
         }
         json_error(rs, 404, "unknown endpoint %s", rq->path);
+        return;
+    }
+    if ((!strcmp(rq->path, "/.segvault/mail") || !strncmp(rq->path, "/.segvault/mail/", 16)) && client_is_local(rq)) {
+        if (!s->mail) { json_error(rs, 404, "the mail catcher is off (start the server with --mail-port 1025)"); return; }
+        // da un'altra pagina aperta nel browser non si cancella niente
+        if (strcmp(rq->method, "GET") && strcmp(rq->method, "HEAD") && rq->origin[0] &&
+            !(!strncmp(rq->origin, "http://", 7) && !strcasecmp(rq->origin + 7, rq->host))) { json_error(rs, 403, "Origin not allowed"); return; }
+        const char* ct = NULL;
+        const char* xh = NULL;
+        int st = mail_web(s->mail, rq->method, rq->path + 15, rq->query, &rs->body, &ct, &xh);
+        if (st == 0 || st == 405) { free(rs->body.data); memset(&rs->body, 0, sizeof(rs->body)); json_error(rs, st ? 405 : 404, st ? "method not allowed" : "not found"); return; }
+        rs->status = st;
+        rs->content_type = ct;
+        rs->extra_headers = xh;
         return;
     }
     if ((!strcmp(rq->path, "/.segvault") || !strncmp(rq->path, "/.segvault/", 11)) && client_is_local(rq)) { dashboard(s, rs); return; }
@@ -3087,7 +3111,7 @@ static void conn_finish(Conn* c) {
 }
 
 #ifdef _WIN32
-static DWORD WINAPI conn_thread(LPVOID arg) { Conn* c = (Conn*)arg; if (c->mysql) serve_mysql(c); else serve_connection(c); conn_finish(c); return 0; }
+static DWORD WINAPI conn_thread(LPVOID arg) { Conn* c = (Conn*)arg; if (c->smtp) mail_smtp_serve(c->s->mail, c->fd, c->client, &c->s->stop); else if (c->mysql) serve_mysql(c); else serve_connection(c); conn_finish(c); return 0; }
 static bool spawn(Conn* c) {
     HANDLE h = CreateThread(NULL, 0, conn_thread, c, 0, NULL);
     if (!h) return false;
@@ -3095,7 +3119,7 @@ static bool spawn(Conn* c) {
     return true;
 }
 #else
-static void* conn_thread(void* arg) { Conn* c = (Conn*)arg; if (c->mysql) serve_mysql(c); else serve_connection(c); conn_finish(c); return NULL; }
+static void* conn_thread(void* arg) { Conn* c = (Conn*)arg; if (c->smtp) mail_smtp_serve(c->s->mail, c->fd, c->client, &c->s->stop); else if (c->mysql) serve_mysql(c); else serve_connection(c); conn_finish(c); return NULL; }
 static bool spawn(Conn* c) {
     pthread_t t;
     pthread_attr_t a;
@@ -3107,6 +3131,41 @@ static bool spawn(Conn* c) {
 }
 #endif
 
+// socket in ascolto su addr:port (port 0 = scelta dal sistema, *actual = quella vera)
+static sock_t listen_tcp(const char* addr_s, int port, int* actual) {
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port);
+    addr.sin_addr.s_addr = inet_addr(addr_s);
+    sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == BAD_SOCK) return BAD_SOCK;
+    int one = 1;
+#ifndef _WIN32
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#else
+    setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&one, sizeof(one));
+#endif
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(fd, 64) != 0) { sock_close(fd); return BAD_SOCK; }
+    socklen_t al = sizeof(addr);
+    getsockname(fd, (struct sockaddr*)&addr, &al);
+    *actual = ntohs(addr.sin_port);
+    return fd;
+}
+
+// percorso di questo eseguibile (per sendmail_path di PHP)
+static bool self_exe(char* out, size_t n) {
+#ifdef _WIN32
+    DWORD k = GetModuleFileNameA(NULL, out, (DWORD)n);
+    return k > 0 && k < n;
+#else
+    ssize_t k = readlink("/proc/self/exe", out, n - 1);
+    if (k <= 0) return false;
+    out[k] = '\0';
+    return true;
+#endif
+}
+
 SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
 #ifdef _WIN32
     WSADATA wsa;
@@ -3116,6 +3175,7 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
     if (!s) { snprintf(err, errsz, "out of memory"); return NULL; }
     s->listen_fd = BAD_SOCK;
     s->mysql_fd = BAD_SOCK;
+    s->mail_fd = BAD_SOCK;
     s->cfg = *cfg;
     if (!s->cfg.bind_addr) s->cfg.bind_addr = "127.0.0.1";
     if (!s->cfg.max_body) s->cfg.max_body = 16u << 20;
@@ -3171,6 +3231,18 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
         }
     }
     s->cfg.sites = NULL;
+    if (cfg->mail) {
+        char merr[300];
+        s->mail = mail_store_open(cfg->mail_dir && cfg->mail_dir[0] ? cfg->mail_dir : "mail", merr, sizeof(merr));
+        if (!s->mail) { snprintf(err, errsz, "mail: %s", merr); sv_server_free(s); return NULL; }
+        s->mail_fd = listen_tcp(s->cfg.bind_addr, cfg->mail_port, &s->mail_port);
+        if (s->mail_fd == BAD_SOCK) {
+            snprintf(err, errsz, "cannot listen on %s:%d for SMTP (port in use?)", s->cfg.bind_addr, cfg->mail_port);
+            sv_server_free(s);
+            return NULL;
+        }
+    }
+    s->cfg.mail_dir = s->cfg.self_exe = NULL;
     if ((cfg->php_cgi && cfg->php_cgi[0]) || (cfg->php_fcgi && cfg->php_fcgi[0])) {
         bool any_dir = s->static_dir != NULL;
         for (int i = 0; i < s->n_sites; i++) if (s->sites[i].dir) any_dir = true;
@@ -3189,8 +3261,28 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
         s->doc_root = strdup(abs);
         }
         char perr[300];
+        // mail() di PHP verso la cattura delle email
+        char ini_buf[2][1400];
+        const char* ini[2];
+        int n_ini = 0;
+        if (s->mail) {
+#ifdef _WIN32
+            snprintf(ini_buf[0], sizeof(ini_buf[0]), "SMTP=127.0.0.1");
+            snprintf(ini_buf[1], sizeof(ini_buf[1]), "smtp_port=%d", s->mail_port);
+            ini[n_ini++] = ini_buf[0];
+            ini[n_ini++] = ini_buf[1];
+#else
+            char exe[1024];
+            if (cfg->self_exe && cfg->self_exe[0]) snprintf(exe, sizeof(exe), "%s", cfg->self_exe);
+            else if (!self_exe(exe, sizeof(exe))) exe[0] = '\0';
+            if (exe[0] && !strchr(exe, '\'')) {
+                snprintf(ini_buf[0], sizeof(ini_buf[0]), "sendmail_path='%s' --sendmail %d", exe, s->mail_port);
+                ini[n_ini++] = ini_buf[0];
+            }
+#endif
+        }
         s->php = cfg->php_fcgi && cfg->php_fcgi[0] ? fcgi_pool_external(cfg->php_fcgi, perr, sizeof(perr))
-                                                    : fcgi_pool_spawn(cfg->php_cgi, cfg->php_workers, perr, sizeof(perr));
+                                                    : fcgi_pool_spawn(cfg->php_cgi, cfg->php_workers, ini, n_ini, perr, sizeof(perr));
         if (!s->php) { snprintf(err, errsz, "PHP: %s", perr); sv_server_free(s); return NULL; }
     }
     s->cfg.php_cgi = s->cfg.php_fcgi = NULL;
@@ -3262,6 +3354,10 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
 
 int sv_server_mysql_port(const SvServer* s) { return s->mysql_fd != BAD_SOCK ? s->mysql_port : 0; }
 
+int sv_server_mail_port(const SvServer* s) { return s->mail_fd != BAD_SOCK ? s->mail_port : 0; }
+
+int sv_server_mail_count(SvServer* s) { return s->mail ? mail_count(s->mail) : 0; }
+
 const char* sv_server_php(const SvServer* s) { return s->php ? fcgi_pool_describe(s->php) : ""; }
 
 const char* sv_server_api_prefix(const SvServer* s) { return s->api; }
@@ -3277,6 +3373,7 @@ void sv_server_run(SvServer* s) {
         FD_SET(s->listen_fd, &rd);
         sock_t top = s->listen_fd;
         if (s->mysql_fd != BAD_SOCK) { FD_SET(s->mysql_fd, &rd); if (s->mysql_fd > top) top = s->mysql_fd; }
+        if (s->mail_fd != BAD_SOCK) { FD_SET(s->mail_fd, &rd); if (s->mail_fd > top) top = s->mail_fd; }
         struct timeval tv = { 0, 200000 };           // si ricontrolla stop 5 volte al secondo
         int r = select((int)top + 1, &rd, NULL, NULL, &tv);
         // watchdog: una richiesta oltre timeout_ms viene interrotta (le SELECT si fermano subito,
@@ -3291,7 +3388,8 @@ void sv_server_run(SvServer* s) {
         struct sockaddr_in peer;
         socklen_t pl = sizeof(peer);
         bool is_mysql = s->mysql_fd != BAD_SOCK && FD_ISSET(s->mysql_fd, &rd);
-        sock_t fd = accept(is_mysql ? s->mysql_fd : s->listen_fd, (struct sockaddr*)&peer, &pl);
+        bool is_smtp = !is_mysql && s->mail_fd != BAD_SOCK && FD_ISSET(s->mail_fd, &rd);
+        sock_t fd = accept(is_mysql ? s->mysql_fd : is_smtp ? s->mail_fd : s->listen_fd, (struct sockaddr*)&peer, &pl);
         if (fd == BAD_SOCK) continue;
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
@@ -3300,6 +3398,11 @@ void sv_server_run(SvServer* s) {
         for (int i = 0; i < s->cfg.max_clients && slot < 0; i++) if (s->conns[i] == BAD_SOCK) slot = i;
         if (slot >= 0) { s->conns[slot] = fd; s->active++; }
         mx_unlock(&s->conn_mx);
+        if (slot < 0 && is_smtp) {
+            send_all(fd, "421 4.3.2 Too many connections\r\n", 33);
+            sock_close(fd);
+            continue;
+        }
         if (slot < 0 && is_mysql) {
             MwOut o = {0};
             mw_err(&o, 1040, "08004", "Too many connections");
@@ -3319,7 +3422,7 @@ void sv_server_run(SvServer* s) {
         }
         Conn* c = malloc(sizeof(Conn));
         if (c) {
-            c->s = s; c->fd = fd; c->slot = slot; c->mysql = is_mysql;
+            c->s = s; c->fd = fd; c->slot = slot; c->mysql = is_mysql; c->smtp = is_smtp;
             const unsigned char* ip = (const unsigned char*)&peer.sin_addr.s_addr;
             snprintf(c->client, sizeof(c->client), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
             c->client_port = ntohs(peer.sin_port);
@@ -3340,6 +3443,7 @@ void sv_server_free(SvServer* s) {
     s->stop = 1;
     if (s->listen_fd != BAD_SOCK) sock_close(s->listen_fd);
     if (s->mysql_fd != BAD_SOCK) sock_close(s->mysql_fd);
+    if (s->mail_fd != BAD_SOCK) sock_close(s->mail_fd);
     // le connessioni aperte vengono interrotte; si aspetta che i thread finiscano
     for (int tries = 0; s->conns; tries++) {
         mx_lock(&s->conn_mx);
@@ -3365,6 +3469,7 @@ void sv_server_free(SvServer* s) {
     for (int i = 0; i < s->n_sites; i++) free(s->sites[i].dir);
     free(s->sites);
     fcgi_pool_free(s->php);
+    mail_store_free(s->mail);
     if (s->audit) fclose(s->audit);
     free(s);
 #ifdef _WIN32
