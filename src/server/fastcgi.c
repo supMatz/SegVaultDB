@@ -95,6 +95,15 @@ struct FcgiPool {
 #else
     char**      envp;            // ambiente dei figli (preparato prima di fork)
     int         max_fd;
+    // PR_SET_PDEATHSIG vale per il *thread* che fa fork: un php-cgi avviato dal thread di una connessione
+    // morirebbe con quella. Tutti i processi nascono quindi da un thread che vive quanto il gruppo.
+    pthread_t       spawner;
+    bool            spawner_on, spawner_stop;
+    pthread_mutex_t sp_mx, sp_req_mx;   // sp_req_mx: una richiesta di avvio alla volta
+    pthread_cond_t  sp_cv;
+    FcgiWorker*     sp_w;               // processo da avviare (NULL = niente da fare)
+    bool            sp_done, sp_ok;
+    char            sp_err[256];
 #endif
 };
 
@@ -270,6 +279,48 @@ static bool worker_start(FcgiPool* p, FcgiWorker* w, char* err, size_t errsz) {
     return true;
 }
 
+#ifndef _WIN32
+static void* spawner_main(void* arg) {
+    FcgiPool* p = arg;
+    pthread_mutex_lock(&p->sp_mx);
+    while (!p->spawner_stop) {
+        if (p->sp_w && !p->sp_done) {
+            FcgiWorker* w = p->sp_w;
+            pthread_mutex_unlock(&p->sp_mx);
+            char err[256] = "";
+            bool ok = worker_start(p, w, err, sizeof(err));
+            pthread_mutex_lock(&p->sp_mx);
+            p->sp_ok = ok;
+            snprintf(p->sp_err, sizeof(p->sp_err), "%s", err);
+            p->sp_done = true;
+            pthread_cond_broadcast(&p->sp_cv);
+        } else pthread_cond_wait(&p->sp_cv, &p->sp_mx);
+    }
+    pthread_mutex_unlock(&p->sp_mx);
+    return NULL;
+}
+#endif
+
+// avvia (o riavvia) un processo; su Linux lo fa il thread spawner
+static bool worker_launch(FcgiPool* p, FcgiWorker* w, char* err, size_t errsz) {
+#ifdef _WIN32
+    return worker_start(p, w, err, errsz);
+#else
+    pthread_mutex_lock(&p->sp_req_mx);
+    pthread_mutex_lock(&p->sp_mx);
+    p->sp_w = w;
+    p->sp_done = false;
+    pthread_cond_broadcast(&p->sp_cv);
+    while (!p->sp_done) pthread_cond_wait(&p->sp_cv, &p->sp_mx);
+    bool ok = p->sp_ok;
+    snprintf(err, errsz, "%s", p->sp_err);
+    p->sp_w = NULL;
+    pthread_mutex_unlock(&p->sp_mx);
+    pthread_mutex_unlock(&p->sp_req_mx);
+    return ok;
+#endif
+}
+
 // ── record FastCGI ──────────────────────────────────────────────
 
 static void rec_head(uint8_t h[8], int type, size_t len) {
@@ -393,9 +444,21 @@ FcgiPool* fcgi_pool_spawn(const char* php_cgi, int workers, char* err, size_t er
     p->envp[k++] = "PHP_FCGI_MAX_REQUESTS=0";
     long mf = sysconf(_SC_OPEN_MAX);
     p->max_fd = mf > 0 && mf < 65536 ? (int)mf : 65536;
+    pthread_mutex_init(&p->sp_mx, NULL);
+    pthread_mutex_init(&p->sp_req_mx, NULL);
+    pthread_cond_init(&p->sp_cv, NULL);
+    if (pthread_create(&p->spawner, NULL, spawner_main, p) != 0) {
+        snprintf(err, errsz, "cannot start the PHP supervisor thread");
+        pthread_mutex_destroy(&p->sp_mx);
+        pthread_mutex_destroy(&p->sp_req_mx);
+        pthread_cond_destroy(&p->sp_cv);
+        fcgi_pool_free(p);
+        return NULL;
+    }
+    p->spawner_on = true;
 #endif
     for (int i = 0; i < workers; i++)
-        if (!worker_start(p, &p->w[i], err, errsz)) { fcgi_pool_free(p); return NULL; }
+        if (!worker_launch(p, &p->w[i], err, errsz)) { fcgi_pool_free(p); return NULL; }
     // il primo processo deve accettare connessioni: altrimenti php-cgi non è un php-cgi (o manca una libreria)
     double t0 = now_ms();
     for (;;) {
@@ -451,6 +514,16 @@ void fcgi_pool_free(FcgiPool* p) {
 #ifdef _WIN32
     if (p->job) CloseHandle(p->job);
 #else
+    if (p->spawner_on) {
+        pthread_mutex_lock(&p->sp_mx);
+        p->spawner_stop = true;
+        pthread_cond_broadcast(&p->sp_cv);
+        pthread_mutex_unlock(&p->sp_mx);
+        pthread_join(p->spawner, NULL);
+        pthread_mutex_destroy(&p->sp_mx);
+        pthread_mutex_destroy(&p->sp_req_mx);
+        pthread_cond_destroy(&p->sp_cv);
+    }
     free(p->envp);
 #endif
     mx_destroy(&p->mx);
@@ -500,7 +573,7 @@ int fcgi_request(FcgiPool* p, const FcgiParam* params, int nparams, const char* 
     for (;;) {                                         // connessione, riavviando il processo se è uscito
         if (!worker_alive(w)) {
             if (restarted && now_ms() - c0 > START_WAIT_MS) break;
-            if (!worker_start(p, w, err, errsz)) break;
+            if (!worker_launch(p, w, err, errsz)) break;
             restarted = true;
             c0 = now_ms();
         }

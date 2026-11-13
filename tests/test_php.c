@@ -199,6 +199,40 @@ static void put(const char* dir, const char* name, const char* content) {
     fclose(f);
 }
 
+
+// valore di un'intestazione della risposta ("" se manca)
+static void hval(const Resp* r, const char* name, char* out, size_t n) {
+    out[0] = 0;
+    char key[80];
+    snprintf(key, sizeof(key), "\r\n%s:", name);
+    const char* p = r->head ? strcasestr(r->head, key) : NULL;
+    if (!p) return;
+    p += strlen(key);
+    while (*p == ' ') p++;
+    size_t l = strcspn(p, "\r\n");
+    if (l >= n) l = n - 1;
+    memcpy(out, p, l);
+    out[l] = 0;
+}
+
+// decomprime un corpo gzip con il gzip di sistema; NULL se non è gzip valido
+static char* gunzip(const char* dir, const char* data, size_t n, size_t* out_n) {
+    char in[1200], cmd[2600];
+    snprintf(in, sizeof(in), "%s/body.gz", dir);
+    FILE* f = fopen(in, "wb"); fwrite(data, 1, n, f); fclose(f);
+    snprintf(cmd, sizeof(cmd), "gzip -dc '%s' 2>/dev/null", in);
+    FILE* pp = popen(cmd, "r");
+    if (!pp) return NULL;
+    Str o = {0};
+    char buf[65536];
+    size_t g;
+    while ((g = fread(buf, 1, sizeof(buf), pp)) > 0) sadd(&o, buf, g);
+    int st = pclose(pp);
+    if (st != 0) { free(o.buf); return NULL; }
+    *out_n = o.len;
+    return o.buf ? o.buf : calloc(1, 1);
+}
+
 static void* run_server(void* s) { sv_server_run((SvServer*)s); return NULL; }
 
 typedef struct { int port; int ok; } Par;
@@ -206,6 +240,7 @@ static void* parallel_req(void* a) {
     Par* p = a;
     Resp r = req(p->port, "GET", "/echo.php?par=1", NULL, NULL);
     p->ok = r.status == 200 && has(&r, "QUERY_STRING=par=1");
+    if (!p->ok) printf("parallel request: %d %s\n", r.status, r.body ? r.body : "(no body)");
     rfree(&r);
     return NULL;
 }
@@ -447,6 +482,21 @@ int main(int argc, char** argv) {
         CHECK(!sv_server_start(&bad, err, sizeof(err)) && strstr(err, "invalid API prefix"), "bad prefix: %s", err);
     }
 
+    // ── un processo riavviato dal thread di una connessione sopravvive alla connessione ──
+    // (PR_SET_PDEATHSIG è legato al thread che fa fork: i processi nascono da un thread apposito)
+    {
+        SvServerConfig cfg = { .port = 0, .static_dir = www, .quiet = true, .php_cgi = self, .php_workers = 1 };
+        SvServer* s = start(&cfg, &th);
+        int port = sv_server_port(s);
+        r = req(port, "GET", "/crash.php", NULL, NULL);
+        CHECK(r.status == 502, "single worker crash: %d", r.status);
+        rfree(&r);
+        int ok = 0;
+        for (int i = 0; i < 5; i++) { r = req(port, "GET", "/echo.php", NULL, NULL); ok += r.status == 200; rfree(&r); usleep(50000); }
+        CHECK(ok == 5, "restarted worker survives the connection that restarted it: %d/5", ok);
+        stop(s, th);
+    }
+
     // ── backend esterno (php-fpm): host:porta ──
     {
         int lfd = fake_listen(0);
@@ -483,6 +533,149 @@ int main(int argc, char** argv) {
         CHECK(!sv_server_start(&c3, err, sizeof(err)) && strstr(err, "exited"), "not a php-cgi: %s", err);
         SvServerConfig c4 = { .port = 0, .static_dir = www, .quiet = true, .php_fcgi = "senza-porta" };
         CHECK(!sv_server_start(&c4, err, sizeof(err)) && strstr(err, "host:port"), "bad FastCGI address: %s", err);
+    }
+
+    // ── sito web: file statici ──
+    {
+        char wk[1300], git[1300], big[1300];
+        snprintf(wk, sizeof(wk), "%s/.well-known", www); mkdir(wk, 0755);
+        snprintf(wk, sizeof(wk), "%s/.well-known/acme", www); mkdir(wk, 0755);
+        put(wk, "tok", "acme-ok");
+        snprintf(git, sizeof(git), "%s/.git", www); mkdir(git, 0755);
+        put(git, "config", "[secret]");
+        // testo grande (comprimibile) e "video" binario
+        Str js = {0};
+        for (int i = 0; i < 4000; i++) { char l[64]; snprintf(l, sizeof(l), "console.log('riga %d');\n", i); sputs(&js, l); }
+        put(www, "app.js", js.buf);
+        snprintf(big, sizeof(big), "%s/clip.mp4", www);
+        FILE* f = fopen(big, "wb");
+        for (int i = 0; i < 300000; i++) fputc((i * 7 + i / 256) & 0xff, f);
+        fclose(f);
+        f = fopen(big, "rb");
+        char* vid = malloc(300000);
+        if (fread(vid, 1, 300000, f) != 300000) return 1;
+        fclose(f);
+
+        SvServerConfig cfg = { .port = 0, .static_dir = www, .quiet = true };
+        SvServer* s = start(&cfg, &th);
+        int port = sv_server_port(s);
+        char v[200], etag[200], lm[200];
+
+        r = req(port, "GET", "/app.js", NULL, NULL);
+        hval(&r, "Content-Encoding", v, sizeof(v));
+        CHECK(r.status == 200 && !v[0] && r.blen == js.len && !memcmp(r.body, js.buf, js.len) && hdr(&r, "text/javascript"),
+              "text without Accept-Encoding: %d %zu %s", r.status, r.blen, v);
+        hval(&r, "ETag", etag, sizeof(etag));
+        hval(&r, "Last-Modified", lm, sizeof(lm));
+        CHECK(etag[0] == '"' && strstr(lm, " GMT") && hdr(&r, "Accept-Ranges: bytes") && hdr(&r, "Cache-Control: no-cache"), "validators: %s / %s", etag, lm);
+        rfree(&r);
+
+        r = req(port, "GET", "/app.js", "Accept-Encoding: gzip, deflate, br\r\n", NULL);
+        hval(&r, "Content-Encoding", v, sizeof(v));
+        size_t un = 0;
+        char* plain = r.body ? gunzip(dir, r.body, r.blen, &un) : NULL;
+        CHECK(r.status == 200 && !strcmp(v, "gzip") && r.blen < js.len / 3 && plain && un == js.len && !memcmp(plain, js.buf, js.len),
+              "gzip: %d %s %zu -> %zu", r.status, v, js.len, r.blen);
+        free(plain);
+        char gz_etag[200];
+        hval(&r, "ETag", gz_etag, sizeof(gz_etag));
+        CHECK(strcmp(gz_etag, etag) && hdr(&r, "Vary: Accept-Encoding"), "gzip variant has its own ETag: %s %s", gz_etag, etag);
+        rfree(&r);
+        r = req(port, "GET", "/app.js", "Accept-Encoding: gzip;q=0, identity\r\n", NULL);
+        CHECK(r.status == 200 && !hdr(&r, "Content-Encoding"), "gzip;q=0 refuses gzip: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/style.css", "Accept-Encoding: gzip\r\n", NULL);
+        CHECK(r.status == 200 && !hdr(&r, "Content-Encoding") && !strcmp(r.body, "body{}"), "tiny file not compressed");
+        rfree(&r);
+
+        // cache del browser
+        char h2[400];
+        snprintf(h2, sizeof(h2), "If-None-Match: %s\r\n", etag);
+        r = req(port, "GET", "/app.js", h2, NULL);
+        CHECK(r.status == 304 && r.blen == 0 && hdr(&r, "ETag"), "If-None-Match -> 304: %d %zu", r.status, r.blen);
+        rfree(&r);
+        snprintf(h2, sizeof(h2), "If-None-Match: \"altro\", W/%s\r\n", etag);
+        r = req(port, "GET", "/app.js", h2, NULL);
+        CHECK(r.status == 304, "weak tag in a list -> 304: %d", r.status);
+        rfree(&r);
+        snprintf(h2, sizeof(h2), "If-Modified-Since: %s\r\n", lm);
+        r = req(port, "GET", "/app.js", h2, NULL);
+        CHECK(r.status == 304, "If-Modified-Since -> 304: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/app.js", "If-None-Match: \"vecchio\"\r\n", NULL);
+        CHECK(r.status == 200 && r.blen == js.len, "changed file -> 200: %d", r.status);
+        rfree(&r);
+
+        // file binario a pezzi e intervalli
+        r = req(port, "GET", "/clip.mp4", "Accept-Encoding: gzip\r\n", NULL);
+        CHECK(r.status == 200 && r.blen == 300000 && !memcmp(r.body, vid, 300000) && hdr(&r, "video/mp4") && !hdr(&r, "Content-Encoding"),
+              "streamed binary file: %d %zu", r.status, r.blen);
+        rfree(&r);
+        r = req(port, "HEAD", "/clip.mp4", NULL, NULL);
+        hval(&r, "Content-Length", v, sizeof(v));
+        CHECK(r.status == 200 && r.blen == 0 && !strcmp(v, "300000"), "HEAD of a big file: %d %s %zu", r.status, v, r.blen);
+        rfree(&r);
+        r = req(port, "GET", "/clip.mp4", "Range: bytes=100-199\r\n", NULL);
+        hval(&r, "Content-Range", v, sizeof(v));
+        CHECK(r.status == 206 && r.blen == 100 && !memcmp(r.body, vid + 100, 100) && !strcmp(v, "bytes 100-199/300000"), "range: %d %s %zu", r.status, v, r.blen);
+        rfree(&r);
+        r = req(port, "GET", "/clip.mp4", "Range: bytes=-10\r\n", NULL);
+        CHECK(r.status == 206 && r.blen == 10 && !memcmp(r.body, vid + 299990, 10), "suffix range: %d %zu", r.status, r.blen);
+        rfree(&r);
+        r = req(port, "GET", "/clip.mp4", "Range: bytes=299000-\r\n", NULL);
+        hval(&r, "Content-Range", v, sizeof(v));
+        CHECK(r.status == 206 && r.blen == 1000 && !memcmp(r.body, vid + 299000, 1000) && !strcmp(v, "bytes 299000-299999/300000"), "open range: %d %s", r.status, v);
+        rfree(&r);
+        r = req(port, "GET", "/clip.mp4", "Range: bytes=299990-999999\r\n", NULL);
+        CHECK(r.status == 206 && r.blen == 10, "range past the end is clipped: %d %zu", r.status, r.blen);
+        rfree(&r);
+        r = req(port, "GET", "/clip.mp4", "Range: bytes=400000-\r\n", NULL);
+        hval(&r, "Content-Range", v, sizeof(v));
+        CHECK(r.status == 416 && !strcmp(v, "bytes */300000"), "unsatisfiable range: %d %s", r.status, v);
+        rfree(&r);
+        r = req(port, "GET", "/clip.mp4", "Range: bytes=0-1,5-6\r\n", NULL);
+        CHECK(r.status == 200 && r.blen == 300000, "several ranges -> whole file: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/clip.mp4", "Range: pezzi=1-2\r\n", NULL);
+        CHECK(r.status == 200 && r.blen == 300000, "unknown range unit ignored: %d", r.status);
+        rfree(&r);
+
+        // percorsi
+        r = req(port, "GET", "/.well-known/acme/tok", NULL, NULL);
+        CHECK(r.status == 200 && !strcmp(r.body, "acme-ok"), "/.well-known served: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/.git/config", NULL, NULL);
+        CHECK(r.status == 404 && !has(&r, "secret"), "hidden folders stay hidden: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/.well-known/../.git/config", NULL, NULL);
+        CHECK(r.status == 404 && !has(&r, "secret"), "no escape through /.well-known: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/manca.html", NULL, NULL);
+        CHECK(r.status == 404 && hdr(&r, "application/json"), "default 404: %d", r.status);
+        rfree(&r);
+        put(www, "404.html", "<h1>Pagina non trovata</h1>");
+        r = req(port, "GET", "/manca.html", NULL, NULL);
+        CHECK(r.status == 404 && hdr(&r, "text/html") && has(&r, "Pagina non trovata"), "custom 404.html: %d %s", r.status, r.body);
+        rfree(&r);
+        r = req(port, "GET", "/api/v1/nessuno", NULL, NULL);
+        CHECK(r.status == 404 && hdr(&r, "application/json"), "API 404 stays JSON: %d", r.status);
+        rfree(&r);
+
+        // l'API comprime i risultati grandi
+        r = req(port, "POST", "/api/v1/query", "Content-Type: application/json\r\nAccept-Encoding: gzip\r\n",
+                "{\"sql\":\"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 900) SELECT i, 'testo ripetuto' AS t FROM n\"}");
+        hval(&r, "Content-Encoding", v, sizeof(v));
+        plain = r.body ? gunzip(dir, r.body, r.blen, &un) : NULL;
+        CHECK(r.status == 200 && !strcmp(v, "gzip") && plain && strstr(plain, "\"ok\":true") && strstr(plain, "900"), "gzip JSON: %d %s %zu %.200s", r.status, v, r.blen, r.body);
+        free(plain);
+        rfree(&r);
+        stop(s, th);
+        unlink(big);
+        free(vid);
+        free(js.buf);
+        char p404[1300];
+        snprintf(p404, sizeof(p404), "%s/404.html", www);
+        unlink(p404);
     }
 
     // ── php-cgi vero, se c'è ──

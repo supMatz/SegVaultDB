@@ -370,6 +370,9 @@ delle richieste al posto dei risultati.
 - **Web folder:** una cartella con il sito (come la `htdocs` di XAMPP) viene servita su `/` insieme all'API su `/api/v1`, sulla stessa porta e quindi senza CORS; *Open site* lo apre nel browser. Il percorso è salvato in `<data>/server.ini`.
 - **PHP** (*Run .php files*): i file `.php` della Web folder vengono eseguiti con `php-cgi`, come in XAMPP (vedi [PHP](#api-usare-segvault-da-siti-web-e-app-desktop) sotto). `php-cgi` viene cercato nella cartella `php/` accanto a SegVault, nel `PATH`, in `C:\xampp\php`, ...; un percorso diverso va in `server.ini` come `php_cgi=...`. Gli avvisi e gli errori di PHP compaiono nel registro delle richieste; con PHP conviene accendere anche *MySQL protocol*.
 - Le opzioni scorrono con la rotella quando la finestra è bassa.
+- Come un server web vero: video e download grandi inviati a pezzi con `Range`, cache del browser
+  (`ETag`, `304`), compressione gzip dei testi, `404.html` personalizzata, `/.well-known/` (vedi
+  [docs/API.md](docs/API.md)).
 - **Monitor** (scheda accanto a *Requests*): richieste al secondo, tempo medio e p95, percentuale di
   errori, righe inviate, connessioni aperte e percentuale di pagine trovate in cache; due grafici degli
   ultimi 2 minuti (richieste al secondo con gli errori in rosso, tempo di risposta medio e massimo, con
@@ -1150,7 +1153,7 @@ make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitize
 | `test_sql` (1164) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, procedure, viste, transazioni, crash e recovery, testi lunghi, JSON, full-text, 100 transazioni di fila |
 | `test_examples` (166) | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
 | `test_grid_edit` (22) | Modifica dei dati nella griglia: analisi dei risultati, `UPDATE` / `INSERT` / `DELETE` generati ed eseguiti, chiavi composte, join, apici e backslash, letterali di export e dump |
-| `test_php` (58) | PHP via FastCGI con un php-cgi finto (e quello vero se installato): variabili CGI, `PATH_INFO`, `index.php`, URL belli, redirect e cookie, sorgente mai mostrato, processi riavviati dopo un crash o un timeout, richieste in parallelo, php-fpm esterno, prefisso dell'API spostato o spento, corpi *chunked* (anche malformati) |
+| `test_php` (86) | PHP via FastCGI con un php-cgi finto (e quello vero se installato): variabili CGI, `PATH_INFO`, `index.php`, URL belli, redirect e cookie, sorgente mai mostrato, processi riavviati dopo un crash o un timeout, richieste in parallelo, php-fpm esterno, prefisso dell'API spostato o spento, corpi *chunked* (anche malformati), sito statico (gzip verificato con `gzip`, `Range`, `304`, `/.well-known`, `404.html`, tipi MIME) |
 | `test_server` (115) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici, utenti e permessi, audit, protocollo MySQL (login, permessi, errori, più istruzioni, transazioni) |
 | `test_export` (9) | Export XLSX (zip con CRC giusti, parti XML complete, numeri, testo con caratteri speciali, NULL) e PDF (xref, pagine, testo WinAnsi) |
 | `test_backup` (29) | `BACKUP TO`, apertura della copia, ripristino sui dati in uso (con i dati precedenti conservati), righe grandi, viste, procedure e utenti |

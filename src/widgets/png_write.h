@@ -21,4 +21,7 @@ uint8_t* png_zlib_compress(const uint8_t* data, size_t n, size_t* out_len);
 
 uint32_t png_crc32(const uint8_t* p, size_t n);
 
+// file gzip (RFC 1952) di data, per Content-Encoding: gzip del server; thread-safe
+uint8_t* gzip_compress(const uint8_t* data, size_t n, size_t* out_len);
+
 #endif

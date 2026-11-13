@@ -285,7 +285,12 @@ DROP USER anna;
   reverse proxy HTTPS (nginx, Caddy) e lascialo in ascolto su `127.0.0.1`.
 - Il token dà accesso completo (anche `DROP`): non metterlo nel codice di una pagina pubblica.
   Per un sito pubblico il browser parla con il tuo backend, che parla con SegVault.
-- `--static` non serve file nascosti (`/.qualcosa`) né percorsi con `..`.
+- `--static` non serve file nascosti (`/.qualcosa`, tranne `/.well-known/`) né percorsi con `..`.
+- File statici: inviati a pezzi (anche più grandi della memoria), `Range` (video, download ripresi:
+  `206` / `416`), `ETag` e `Last-Modified` con `Cache-Control: no-cache` (il browser chiede ogni volta
+  e riceve `304` se il file non è cambiato), testi fra 1 KB e 8 MB compressi con gzip quando il client
+  lo accetta (anche le risposte JSON dell'API e le pagine PHP). Una `404.html` nella cartella diventa
+  la pagina degli errori 404 del sito.
 - **Siti aperti nel browser.** Una pagina qualsiasi può inviare un `POST` a `localhost` (con
   `text/plain` il browser non chiede il permesso CORS prima). Per questo una richiesta con un header
   `Origin` viene eseguita solo se l'origine è la pagina servita dal server stesso o quella ammessa

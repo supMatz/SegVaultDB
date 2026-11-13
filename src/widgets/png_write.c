@@ -92,13 +92,12 @@ static void put_match(Bits* b, int len, int dist) {
 #define HSIZE    (1 << HBITS)
 #define MAXCHAIN 24
 
-uint8_t* png_zlib_compress(const uint8_t* data, size_t n, size_t* out_len) {
-    Bits b = {0};
-    put_byte(&b, 0x78);
-    put_byte(&b, 0x01);
+// un blocco deflate (LZ77 + codici fissi) di data in coda a b; false se manca memoria
+static bool deflate_block(Bits* bp, const uint8_t* data, size_t n) {
+    #define b (*bp)
     int32_t* head = malloc(sizeof(int32_t) * HSIZE);
     int32_t* prev = malloc(sizeof(int32_t) * WIN);
-    if (!head || !prev) { free(head); free(prev); free(b.p); return NULL; }
+    if (!head || !prev) { free(head); free(prev); return false; }
     for (int i = 0; i < HSIZE; i++) head[i] = -1;
     put_bits(&b, 1, 1);         // ultimo blocco
     put_bits(&b, 1, 2);         // codici fissi
@@ -137,11 +136,42 @@ uint8_t* png_zlib_compress(const uint8_t* data, size_t n, size_t* out_len) {
     }
     put_litlen(&b, 256);                       // fine del blocco
     if (b.nbits) put_bits(&b, 0, 8 - b.nbits);
+    free(head);
+    free(prev);
+    return !b.oom;
+    #undef b
+}
+
+uint8_t* png_zlib_compress(const uint8_t* data, size_t n, size_t* out_len) {
+    Bits b = {0};
+    put_byte(&b, 0x78);
+    put_byte(&b, 0x01);
+    if (!deflate_block(&b, data, n)) { free(b.p); return NULL; }
     uint32_t ad = adler32(data, n);
     put_byte(&b, (uint8_t)(ad >> 24)); put_byte(&b, (uint8_t)(ad >> 16));
     put_byte(&b, (uint8_t)(ad >> 8));  put_byte(&b, (uint8_t)ad);
-    free(head);
-    free(prev);
+    if (b.oom) { free(b.p); return NULL; }
+    *out_len = b.n;
+    return b.p;
+}
+
+uint8_t* gzip_compress(const uint8_t* data, size_t n, size_t* out_len) {
+    // CRC-32 con la tabella sullo stack: chiamabile da più thread (il server)
+    uint32_t table[256];
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+        table[i] = c;
+    }
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    crc ^= 0xFFFFFFFFu;
+    Bits b = {0};
+    static const uint8_t H[10] = { 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff };   // deflate, niente nome né data
+    for (int i = 0; i < 10; i++) put_byte(&b, H[i]);
+    if (!deflate_block(&b, data, n)) { free(b.p); return NULL; }
+    for (int i = 0; i < 4; i++) put_byte(&b, (uint8_t)(crc >> (8 * i)));
+    for (int i = 0; i < 4; i++) put_byte(&b, (uint8_t)((uint32_t)n >> (8 * i)));
     if (b.oom) { free(b.p); return NULL; }
     *out_len = b.n;
     return b.p;

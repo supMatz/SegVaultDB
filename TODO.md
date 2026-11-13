@@ -15,16 +15,18 @@ SegVault copre già database e phpMyAdmin; qui c'è quello che manca, in ordine 
 - [x] Prova con un php-cgi vero (PHP 8.5: PDO con prepared statement, `lastInsertId`, mysqli, redirect, cookie, URL belli)
 - [x] Prefisso dell'API configurabile (`--api-prefix`, anche `none`); con PHP i percorsi sotto `/api/v1` che non sono dell'API vanno al sito (Laravel)
 - [x] Corpi `Transfer-Encoding: chunked` in ingresso (API e PHP; `Content-Length` + chunked rifiutati contro il request smuggling)
+- [x] I `php-cgi` riavviati da una connessione non muoiono con lei (nati da un thread apposito: `PR_SET_PDEATHSIG` è per thread)
 - [x] Pannello del server: interruttore PHP, `php-cgi` cercato da solo (o `php_cgi=` in `server.ini`), errori PHP nel registro; colonna delle opzioni che scorre
 - [ ] Risposte grandi in streaming (ora la risposta di PHP è tenuta in memoria)
 
 ## 2. Server web completo
-- [ ] Tipi MIME mancanti (`.pdf`, `.mp4`, `.webm`, `.mp3`, `.wasm`, `.xml`, `.zip`, `.map`, `.avif`, ...)
-- [ ] File statici in streaming (ora vengono letti tutti in memoria) e richieste `Range` (video, download ripresi)
-- [ ] Cache: `ETag` / `Last-Modified`, `304 Not Modified`
-- [ ] Compressione gzip per testi (HTML, CSS, JS, JSON)
-- [ ] Pagine d'errore personalizzate (`404.html`) ed elenco dei file di una cartella (opzionale)
-- [ ] `/.well-known/` ammesso (ora ogni percorso con `/.` è rifiutato)
+- [x] Tipi MIME mancanti (`.pdf`, `.mp4`, `.webm`, `.mp3`, `.wasm`, `.xml`, `.zip`, `.map`, `.avif`, ...)
+- [x] File statici in streaming e richieste `Range` (video, download ripresi)
+- [x] Cache: `ETag` / `Last-Modified`, `304 Not Modified`
+- [x] Compressione gzip per testi (HTML, CSS, JS, JSON; anche API e PHP), con il deflate già usato per i PNG
+- [x] Pagina d'errore personalizzata (`404.html`)
+- [ ] Elenco dei file di una cartella senza index (opzionale, spento di default)
+- [x] `/.well-known/` ammesso
 - [ ] Virtual host: più siti per nome (`progetto1.test`, `progetto2.test`)
 - [ ] Regole di rewrite minime (alternativa a `.htaccess`)
 - [ ] HTTPS integrato (certificato self-signed generato al primo avvio, come XAMPP), anche per il protocollo MySQL

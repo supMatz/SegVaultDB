@@ -9,6 +9,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #include "json.h"
 #include "mysql_wire.h"
 #include "fastcgi.h"
+#include "../widgets/png_write.h"
 #include "../bridge/db_api.h"
 #include "../bridge/auth.h"
 #include "../widgets/sql_text.h"
@@ -18,6 +19,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #include <errno.h>
 #include <math.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -92,7 +94,7 @@ struct SvServer {
     sock_t         mysql_fd;            // protocollo MySQL (BAD_SOCK = spento)
     int            mysql_port;
     uint32_t       mysql_ids;           // id delle connessioni MySQL
-    volatile int   stop;
+    atomic_int     stop;                // chiesto da un altro thread o da un gestore di segnale
     sv_mutex       conn_mx;             // conns[] e active
     sock_t*        conns;               // socket aperti (per chiuderli allo stop)
     int            active;
@@ -138,6 +140,10 @@ typedef struct {
     char*  body;                        // NUL-terminato
     size_t body_len;
     char*  headers;                     // copia delle righe d'intestazione (solo con PHP: diventano HTTP_*)
+    char   range[128];                  // Range: bytes=...
+    char   if_none_match[256];
+    char   if_modified_since[64];
+    bool   accept_gzip;                 // Accept-Encoding comprende gzip
     const char* client;                 // indirizzo e porta del client (REMOTE_ADDR / REMOTE_PORT)
     int    client_port;
 } Request;
@@ -149,6 +155,8 @@ typedef struct {
     const char* extra_headers;          // righe "Nome: valore\r\n" già formattate
     char*       own_headers;            // intestazioni allocate (risposte di PHP), liberate dopo l'invio
     char        ctype[160];             // Content-Type scelto da PHP
+    FILE*       file;                   // file statico inviato a pezzi (corpo vuoto), chiuso dopo l'invio
+    long long   file_off, file_len;     // parte del file da inviare (Range)
     bool        close;
     char        detail[120];            // per il registro: SQL eseguito o errore
     long long   rows;                   // righe restituite
@@ -186,6 +194,7 @@ static const char* status_text(int st) {
         case 411: return "Length Required";
         case 413: return "Payload Too Large";
         case 415: return "Unsupported Media Type";
+        case 416: return "Range Not Satisfiable";
         case 422: return "Unprocessable Content";
         case 429: return "Too Many Requests";
         case 431: return "Request Header Fields Too Large";
@@ -214,9 +223,29 @@ static bool send_all(sock_t fd, const char* p, size_t n) {
     return true;
 }
 
+// tipi che vale la pena comprimere (testo); le immagini e i video sono già compressi
+static bool compressible(const char* ctype) {
+    if (!ctype) return true;                               // JSON dell'API
+    return !strncmp(ctype, "text/", 5) || strstr(ctype, "json") || strstr(ctype, "javascript") ||
+           strstr(ctype, "xml") || strstr(ctype, "svg") || strstr(ctype, "wasm") || strstr(ctype, "font/ttf");
+}
+
+#define GZIP_MIN   1024                // corpi più piccoli: la compressione non conviene
+#define GZIP_MAX   (8u << 20)          // corpi più grandi: troppa CPU per richiesta
+
 static bool send_response(SvServer* s, sock_t fd, const Request* rq, Response* rs) {
     JsonBuf h = {0};
+    const char* body = rs->body.oom ? NULL : rs->body.data;
     size_t blen = rs->body.oom ? 0 : rs->body.len;
+    uint8_t* gz = NULL;
+    bool gzipped = false;
+    if (rq && rq->accept_gzip && !rs->file && blen >= GZIP_MIN && blen <= GZIP_MAX && (rs->status == 200 || rs->status == 404) &&
+        compressible(rs->content_type) && !(rs->extra_headers && ci_strstr(rs->extra_headers, "Content-Encoding"))) {
+        size_t gl;
+        gz = gzip_compress((const uint8_t*)body, blen, &gl);
+        if (gz && gl < blen) { body = (const char*)gz; blen = gl; gzipped = true; }
+    }
+    unsigned long long clen = rs->file ? (unsigned long long)rs->file_len : (unsigned long long)blen;
     jb_printf(&h,
         "HTTP/1.1 %d %s\r\n"
         "Server: SegVault/" SV_VERSION_STR "\r\n"
@@ -226,7 +255,10 @@ static bool send_response(SvServer* s, sock_t fd, const Request* rq, Response* r
         "X-Content-Type-Options: nosniff\r\n",
         rs->status, status_text(rs->status),
         rs->content_type ? rs->content_type : "application/json; charset=utf-8",
-        (unsigned long long)blen, rs->close ? "close" : "keep-alive");
+        clen, rs->close ? "close" : "keep-alive");
+    if (gzipped) jb_lit(&h, "Content-Encoding: gzip\r\n");
+    if (gzipped || (rs->content_type && !rs->file && compressible(rs->content_type) && rs->status == 200))
+        jb_lit(&h, "Vary: Accept-Encoding\r\n");
     bool own_acao = rs->extra_headers && ci_strstr(rs->extra_headers, "Access-Control-Allow-Origin");
     if (s->cors && !own_acao) {
         // origine ammessa: "*" oppure quella configurata, ripetuta solo se coincide con la richiesta
@@ -235,13 +267,29 @@ static bool send_response(SvServer* s, sock_t fd, const Request* rq, Response* r
     }
     if (rs->extra_headers) jb_raw(&h, rs->extra_headers, strlen(rs->extra_headers));
     jb_lit(&h, "\r\n");
-    bool head_only = rq && !strcmp(rq->method, "HEAD");
+    bool head_only = (rq && !strcmp(rq->method, "HEAD")) || rs->status == 304;
     // intestazione e corpo piccolo in un solo invio
-    if (!h.oom && !head_only && blen > 0 && blen <= 16384) { jb_raw(&h, rs->body.data, blen); blen = 0; head_only = true; }
+    if (!h.oom && !head_only && !rs->file && blen > 0 && blen <= 16384) { jb_raw(&h, body, blen); blen = 0; head_only = true; }
     bool ok = !h.oom && send_all(fd, h.data, h.len);
     free(h.data);
-    if (!ok) return false;
-    return head_only || blen == 0 || send_all(fd, rs->body.data, blen);
+    if (ok && !head_only && rs->file) {                     // file statico a pezzi: niente copia intera in memoria
+#ifdef _WIN32
+        ok = _fseeki64(rs->file, rs->file_off, SEEK_SET) == 0;
+#else
+        ok = fseeko(rs->file, (off_t)rs->file_off, SEEK_SET) == 0;
+#endif
+        char chunk[65536];
+        long long left = rs->file_len;
+        while (ok && left > 0) {
+            size_t want = left < (long long)sizeof(chunk) ? (size_t)left : sizeof(chunk);
+            size_t got = fread(chunk, 1, want, rs->file);
+            if (got == 0) { ok = false; break; }              // file accorciato nel frattempo
+            ok = send_all(fd, chunk, got);
+            left -= (long long)got;
+        }
+    } else if (ok && !head_only && blen > 0) ok = send_all(fd, body, blen);
+    free(gz);
+    return ok;
 }
 
 // testo su una riga, accorciato (per il registro)
@@ -1102,11 +1150,22 @@ static const char* mime_of(const char* path) {
     static const char* const map[][2] = {
         { ".html", "text/html; charset=utf-8" }, { ".htm", "text/html; charset=utf-8" },
         { ".js", "text/javascript; charset=utf-8" }, { ".mjs", "text/javascript; charset=utf-8" },
-        { ".css", "text/css; charset=utf-8" }, { ".json", "application/json" },
-        { ".svg", "image/svg+xml" }, { ".png", "image/png" }, { ".jpg", "image/jpeg" },
-        { ".jpeg", "image/jpeg" }, { ".gif", "image/gif" }, { ".ico", "image/x-icon" },
-        { ".webp", "image/webp" }, { ".woff2", "font/woff2" }, { ".woff", "font/woff" },
-        { ".ttf", "font/ttf" }, { ".txt", "text/plain; charset=utf-8" }, { ".sql", "text/plain; charset=utf-8" },
+        { ".css", "text/css; charset=utf-8" }, { ".json", "application/json" }, { ".map", "application/json" },
+        { ".webmanifest", "application/manifest+json" }, { ".xml", "application/xml" }, { ".rss", "application/rss+xml" },
+        { ".atom", "application/atom+xml" }, { ".csv", "text/csv; charset=utf-8" }, { ".md", "text/markdown; charset=utf-8" },
+        { ".txt", "text/plain; charset=utf-8" }, { ".sql", "text/plain; charset=utf-8" }, { ".ics", "text/calendar" },
+        { ".svg", "image/svg+xml" }, { ".png", "image/png" }, { ".jpg", "image/jpeg" }, { ".jpeg", "image/jpeg" },
+        { ".gif", "image/gif" }, { ".ico", "image/x-icon" }, { ".webp", "image/webp" }, { ".avif", "image/avif" },
+        { ".bmp", "image/bmp" }, { ".tif", "image/tiff" }, { ".tiff", "image/tiff" },
+        { ".woff2", "font/woff2" }, { ".woff", "font/woff" }, { ".ttf", "font/ttf" }, { ".otf", "font/otf" },
+        { ".mp4", "video/mp4" }, { ".m4v", "video/mp4" }, { ".webm", "video/webm" }, { ".ogv", "video/ogg" }, { ".mov", "video/quicktime" },
+        { ".mp3", "audio/mpeg" }, { ".m4a", "audio/mp4" }, { ".ogg", "audio/ogg" }, { ".oga", "audio/ogg" }, { ".wav", "audio/wav" },
+        { ".flac", "audio/flac" }, { ".opus", "audio/opus" }, { ".vtt", "text/vtt; charset=utf-8" },
+        { ".pdf", "application/pdf" }, { ".zip", "application/zip" }, { ".gz", "application/gzip" }, { ".tar", "application/x-tar" },
+        { ".7z", "application/x-7z-compressed" }, { ".wasm", "application/wasm" },
+        { ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+        { ".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document" },
+        { ".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation" },
     };
     for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++)
         if (!strcasecmp(dot, map[i][0])) return map[i][1];
@@ -1118,16 +1177,138 @@ static bool path_is(const char* path, int kind) {     // kind: S_IFREG o S_IFDIR
     return stat(path, &st) == 0 && (int)(st.st_mode & S_IFMT) == kind;
 }
 
-static void serve_file(Response* rs, const char* full) {
-    FILE* f = fopen(full, "rb");
+// dimensione e ora di modifica (anche file oltre 2 GB su Windows)
+static bool file_info(const char* path, long long* size, long long* mtime) {
+#ifdef _WIN32
+    struct __stat64 st;
+    if (_stat64(path, &st) != 0 || (st.st_mode & S_IFMT) != S_IFREG) return false;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0 || (st.st_mode & S_IFMT) != S_IFREG) return false;
+#endif
+    *size = (long long)st.st_size;
+    *mtime = (long long)st.st_mtime;
+    return true;
+}
+
+// data HTTP (RFC 9110): "Sun, 06 Nov 1994 08:49:37 GMT", indipendente dalla lingua del sistema
+static void http_date(long long t, char* out, size_t n) {
+    static const char* const D[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    static const char* const M[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    time_t tt = (time_t)t;
+    struct tm g;
+#ifdef _WIN32
+    gmtime_s(&g, &tt);
+#else
+    gmtime_r(&tt, &g);
+#endif
+    snprintf(out, n, "%s, %02d %s %04d %02d:%02d:%02d GMT", D[g.tm_wday % 7], g.tm_mday, M[g.tm_mon % 12],
+             g.tm_year + 1900, g.tm_hour, g.tm_min, g.tm_sec);
+}
+
+// "bytes=a-b" | "bytes=a-" | "bytes=-n" (un solo intervallo). 1 = ok, 0 = da ignorare (file intero), -1 = 416
+static int parse_range(const char* r, long long size, long long* from, long long* len) {
+    if (strncmp(r, "bytes=", 6) || strchr(r, ',')) return 0;    // più intervalli: si manda tutto (consentito)
+    const char* p = r + 6;
+    char* e;
+    if (*p == '-') {
+        long long n = strtoll(p + 1, &e, 10);
+        if (e == p + 1 || *e || n <= 0) return n == 0 && e != p + 1 && !*e ? -1 : 0;
+        if (n > size) n = size;
+        if (size == 0) return -1;
+        *from = size - n; *len = n;
+        return 1;
+    }
+    long long a = strtoll(p, &e, 10);
+    if (e == p || *e != '-' || a < 0) return 0;
+    const char* q = e + 1;
+    long long b = size - 1;
+    if (*q) { b = strtoll(q, &e, 10); if (e == q || *e || b < a) return 0; }
+    if (a >= size) return -1;
+    if (b >= size) b = size - 1;
+    *from = a; *len = b - a + 1;
+    return 1;
+}
+
+// una delle etichette di If-None-Match ("*", "x", W/"x", separate da virgole)
+static bool etag_matches(const char* list, const char* etag) {
+    if (!list[0]) return false;
+    if (!strcmp(list, "*")) return true;
+    const char* bare = etag + (etag[0] == 'W' ? 2 : 0);
+    for (const char* p = list; (p = strstr(p, bare)); p += strlen(bare)) {
+        char after = p[strlen(bare)];
+        if (after == '\0' || after == ',' || after == ' ') return true;
+    }
+    return false;
+}
+
+static void set_own_headers(Response* rs, const char* text) {
+    free(rs->own_headers);
+    rs->own_headers = strdup(text);
+    rs->extra_headers = rs->own_headers;
+}
+
+// 404 del sito: la pagina 404.html della cartella, se c'è
+static void web_not_found(SvServer* s, Response* rs) {
+    char p[4096];
+    snprintf(p, sizeof(p), "%s/404.html", s->static_dir);
+    FILE* f = fopen(p, "rb");
     if (!f) { json_error(rs, 404, "not found"); return; }
     char chunk[65536];
     size_t got;
-    while ((got = fread(chunk, 1, sizeof(chunk), f)) > 0) jb_raw(&rs->body, chunk, got);
+    while ((got = fread(chunk, 1, sizeof(chunk), f)) > 0 && rs->body.len < (1u << 20)) jb_raw(&rs->body, chunk, got);
     fclose(f);
-    if (rs->body.oom) { json_error(rs, 500, "file too large"); return; }
-    rs->status = 200;
-    rs->content_type = mime_of(full);
+    rs->status = 404;
+    rs->content_type = "text/html; charset=utf-8";
+}
+
+// file statico: 304 se il browser l'ha già, 206 per un intervallo (video, download ripresi), altrimenti
+// tutto; i testi piccoli vengono compressi da send_response, gli altri inviati a pezzi
+static void serve_file(SvServer* s, const Request* rq, Response* rs, const char* full) {
+    long long size, mtime;
+    if (!file_info(full, &size, &mtime)) { web_not_found(s, rs); return; }
+    const char* ctype = mime_of(full);
+    bool range = rq->range[0] && !strcmp(rq->method, "GET");
+    bool gz = rq->accept_gzip && !range && compressible(ctype) && size >= GZIP_MIN && size <= (long long)GZIP_MAX;
+    char etag[64], lm[40], hdr[400];
+    snprintf(etag, sizeof(etag), "\"%llx-%llx%s\"", (unsigned long long)size, (unsigned long long)mtime, gz ? "-gz" : "");
+    http_date(mtime, lm, sizeof(lm));
+    int hl = snprintf(hdr, sizeof(hdr), "ETag: %s\r\nLast-Modified: %s\r\nCache-Control: no-cache\r\nAccept-Ranges: bytes\r\n", etag, lm);
+
+    // già nella cache del browser (no-cache: chiede ogni volta, ma riceve il file solo se è cambiato)
+    if (etag_matches(rq->if_none_match, etag) || (!rq->if_none_match[0] && rq->if_modified_since[0] && !strcmp(rq->if_modified_since, lm))) {
+        rs->status = 304;
+        rs->content_type = ctype;
+        set_own_headers(rs, hdr);
+        return;
+    }
+    long long from = 0, len = size;
+    int r = range ? parse_range(rq->range, size, &from, &len) : 0;
+    if (r < 0) {
+        snprintf(hdr + hl, sizeof(hdr) - (size_t)hl, "Content-Range: bytes */%lld\r\n", size);
+        set_own_headers(rs, hdr);
+        rs->status = 416;
+        rs->content_type = "text/plain; charset=utf-8";
+        jb_lit(&rs->body, "range not satisfiable\n");
+        return;
+    }
+    FILE* f = fopen(full, "rb");
+    if (!f) { web_not_found(s, rs); return; }
+    if (r > 0) snprintf(hdr + hl, sizeof(hdr) - (size_t)hl, "Content-Range: bytes %lld-%lld/%lld\r\n", from, from + len - 1, size);
+    set_own_headers(rs, hdr);
+    rs->status = r > 0 ? 206 : 200;
+    rs->content_type = ctype;
+    if (gz) {                                              // in memoria: send_response lo comprime
+        char chunk[65536];
+        size_t got;
+        while ((got = fread(chunk, 1, sizeof(chunk), f)) > 0) jb_raw(&rs->body, chunk, got);
+        fclose(f);
+        if (rs->body.oom) json_error(rs, 500, "out of memory");
+        return;
+    }
+    rs->file = f;
+    rs->file_off = from;
+    rs->file_len = len;
 }
 
 // ── PHP (FastCGI) ───────────────────────────────────────────────
@@ -1292,8 +1473,9 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
     const char* p = rq->path;
     // niente "..", backslash o percorsi nascosti: si resta dentro static_dir
     for (const char* q = p; *q; q++) {
-        if (*q == '\\' || *q == ':') { json_error(rs, 404, "not found"); return; }
-        if (*q == '/' && q[1] == '.') { json_error(rs, 404, "not found"); return; }
+        if (*q == '\\' || *q == ':') { web_not_found(s, rs); return; }
+        // file nascosti e ".." no; /.well-known/ sì (certificati ACME, security.txt, ...)
+        if (*q == '/' && q[1] == '.' && !(q == p && !strncmp(q, "/.well-known/", 13))) { web_not_found(s, rs); return; }
     }
     bool get = !strcmp(rq->method, "GET") || !strcmp(rq->method, "HEAD");
     char script[2048] = "", info[2048] = "", full[4096];
@@ -1307,7 +1489,7 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
         }
     if (!script[0]) {
         int n = snprintf(full, sizeof(full), "%s%s", s->static_dir, p);
-        if (n < 0 || (size_t)n >= sizeof(full) - 16) { json_error(rs, 404, "not found"); return; }
+        if (n < 0 || (size_t)n >= sizeof(full) - 16) { web_not_found(s, rs); return; }
         if (path_is(full, S_IFDIR)) {
             size_t pl = strlen(p);
             if (pl == 0 || p[pl - 1] != '/') {             // /cartella -> /cartella/ (i link relativi funzionano)
@@ -1327,13 +1509,13 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
             if (path_is(idx, S_IFREG)) snprintf(script, sizeof(script), "%sindex.php", p);
             else {
                 strcat(full, "index.html");
-                if (!path_is(full, S_IFREG)) { json_error(rs, 404, "not found"); return; }
+                if (!path_is(full, S_IFREG)) { web_not_found(s, rs); return; }
             }
         } else if (!path_is(full, S_IFREG)) {
             char idx[4096];
             snprintf(idx, sizeof(idx), "%s/index.php", s->static_dir);
             if (s->php && path_is(idx, S_IFREG)) snprintf(script, sizeof(script), "/index.php");
-            else { json_error(rs, 404, "not found"); return; }
+            else { web_not_found(s, rs); return; }
         }
     }
     if (script[0]) {
@@ -1342,7 +1524,7 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
             return;
         }
         snprintf(full, sizeof(full), "%s%s", s->static_dir, script);
-        if (!path_is(full, S_IFREG)) { json_error(rs, 404, "not found"); return; }
+        if (!path_is(full, S_IFREG)) { web_not_found(s, rs); return; }
         run_php(s, rq, rs, script, info);
         return;
     }
@@ -1351,7 +1533,7 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
         json_error(rs, 405, "use GET");
         return;
     }
-    serve_file(rs, full);
+    serve_file(s, rq, rs, full);
 }
 
 // ── instradamento ───────────────────────────────────────────────
@@ -1596,6 +1778,23 @@ static void header_value(const char* line, char* out, size_t outsz) {
     out[l] = '\0';
 }
 
+// Accept-Encoding: "gzip, deflate, br" / "gzip;q=0.5" / "*;q=0.1" / "gzip;q=0" (= rifiutato)
+static bool accepts_gzip(const char* v) {
+    while (*v) {
+        while (*v == ' ' || *v == ',') v++;
+        const char* tok = v;
+        while (*v && *v != ',' && *v != ';' && *v != ' ') v++;
+        size_t tl = (size_t)(v - tok);
+        double q = 1.0;
+        while (*v && *v != ',') {
+            if ((*v == 'q' || *v == 'Q') && v[1] == '=') q = atof(v + 2);
+            v++;
+        }
+        if (((tl == 4 && !strncasecmp(tok, "gzip", 4)) || (tl == 1 && *tok == '*')) && q > 0) return true;
+    }
+    return false;
+}
+
 // 0 = ok, -1 = connessione chiusa / errore, altrimenti codice HTTP d'errore
 static int parse_head(SvServer* s, char* head, Request* rq) {
     char* line_end = strstr(head, "\r\n");
@@ -1644,6 +1843,10 @@ static int parse_head(SvServer* s, char* head, Request* rq) {
             else if (!strcasecmp(p, "X-SegVault-Session")) header_value(v, rq->session, sizeof(rq->session));
             else if (!strcasecmp(p, "Origin"))        header_value(v, rq->origin, sizeof(rq->origin));
             else if (!strcasecmp(p, "Host"))          header_value(v, rq->host, sizeof(rq->host));
+            else if (!strcasecmp(p, "Range"))         header_value(v, rq->range, sizeof(rq->range));
+            else if (!strcasecmp(p, "If-None-Match")) header_value(v, rq->if_none_match, sizeof(rq->if_none_match));
+            else if (!strcasecmp(p, "If-Modified-Since")) header_value(v, rq->if_modified_since, sizeof(rq->if_modified_since));
+            else if (!strcasecmp(p, "Accept-Encoding")) rq->accept_gzip = accepts_gzip(val);
         }
         p = e + 2;
     }
@@ -1659,7 +1862,7 @@ typedef struct {
 } InBuf;
 
 // legge finché in buf c'è almeno need byte; false su chiusura/timeout
-static bool fill(sock_t fd, InBuf* in, size_t need, volatile int* stop) {
+static bool fill(sock_t fd, InBuf* in, size_t need, atomic_int* stop) {
     while (in->len < need) {
         if (*stop) return false;
         if (in->cap < need + 1) {
@@ -1847,6 +2050,7 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
     if (strcmp(rq.method, "OPTIONS")) log_request(s, c->client, &rq, &rs, ms);
     free(rs.body.data);
     free(rs.own_headers);
+    if (rs.file) fclose(rs.file);
     free(rq.headers);
     if (!sent || rs.close) return false;
     // richieste in coda (pipelining): si sposta il resto all'inizio

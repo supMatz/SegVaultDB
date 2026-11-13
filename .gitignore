@@ -63,3 +63,4 @@ test_export_asan
 # eseguibili pronti da scaricare (make dist): nel repository
 !/bin/
 !/bin/**
+test_php_tsan
