@@ -619,6 +619,7 @@ make server                                   # ./segvault-server (make windows:
 ./segvault-server                             # http://127.0.0.1:8484/api/v1, dati in ./data
 ./segvault-server -p 9000 -d shop dati/       # porta, database predefinito, cartella dati
 ./segvault-server --static examples/web       # serve anche una web app: http://127.0.0.1:8484/
+./segvault-server --static www --php auto --mysql-port 3306   # come XAMPP: sito PHP + database
 ./segvault-server --cors http://localhost:5173 # una web app su un'altra origine (es. Vite in sviluppo)
 ./segvault-server -b 0.0.0.0 --token auto     # in rete locale, con un token casuale (stampato all'avvio)
 ```
@@ -632,12 +633,42 @@ make server                                   # ./segvault-server (make windows:
 | `-d, --database DB` | database usato se la richiesta non ne indica uno |
 | `--cors ORIGIN` | permette le chiamate dal browser da `ORIGIN` (`*` = tutte) |
 | `--static DIR` | serve i file di `DIR` fuori da `/api` |
+| `--php PATH\|auto` | esegue i file `.php` di `--static DIR` con `php-cgi` (vedi sotto); `auto` lo cerca |
+| `--php-fcgi ADDR` | li esegue con un server FastCGI già avviato (php-fpm): `host:porta` o `unix:/run/php/php-fpm.sock` |
+| `--php-workers N` | processi `php-cgi`, cioè richieste PHP eseguite insieme (default 4) |
 | `--timeout S` | ferma una richiesta che dura più di `S` secondi (default 30) |
 | `--max-body MB` | corpo massimo di una richiesta (default 16) |
 | `--backup-dir DIR` | backup automatici in `DIR/segvault-AAAAMMGG-HHMMSS` |
 | `--backup-every M` / `--backup-keep N` | minuti fra due backup (default 60) / quanti tenerne (default 7) |
 | `--audit FILE` | registro delle modifiche (chi, quando, da dove, cosa) |
 | `--mysql-port N` | parla anche il protocollo di rete di MySQL sulla porta `N` (vedi sotto) |
+
+**PHP.** Con `--php` la cartella `--static` diventa un sito PHP come la `htdocs` di XAMPP: SegVault
+avvia e sorveglia alcuni processi `php-cgi` (FastCGI, uno per richiesta contemporanea; uno che esce
+o resta bloccato oltre `--timeout` viene riavviato) e si ferma insieme a loro. `--php auto` cerca
+`php-cgi` nella cartella `php/` accanto a `segvault-server` (pacchetto portabile), poi nel `PATH`,
+poi in `C:\php`, `C:\xampp\php` o `/usr/bin` (anche la variabile `SEGVAULT_PHP_CGI`). Su Linux va
+installato `php-cgi` (Arch: `pacman -S php-cgi`, Debian/Ubuntu: `apt install php-cgi`); su Windows
+basta lo zip di [windows.php.net](https://windows.php.net/download/) (contiene `php-cgi.exe`).
+- `/pagina.php` viene eseguito, anche con `PATH_INFO` (`/api.php/utenti/7`); una cartella apre
+  `index.php`, altrimenti `index.html`; `/cartella` senza `/` finale viene reindirizzata.
+- **URL "belli"** (WordPress, Laravel, Slim, ...): un percorso che non è un file va a `/index.php`
+  con `REQUEST_URI` originale, come `try_files $uri $uri/ /index.php` di nginx. `/api/v1` resta
+  l'API di SegVault.
+- Tutte le variabili CGI (`$_SERVER`), le intestazioni `HTTP_*` (non `Proxy`: falla *httpoxy*),
+  ogni metodo (`POST`, `PUT`, `DELETE`, ...) e corpo (form, upload fino a `--max-body`); dalla
+  risposta `Status:`, `Location:` (redirect), più `Set-Cookie`. Gli avvisi di PHP finiscono nel
+  registro delle richieste.
+- Senza `--php` un file `.php` non viene **mai** mandato come testo (403): il sorgente contiene le
+  password del database.
+- Gli script usano il database con `mysqli` / `PDO` sul protocollo MySQL (`--mysql-port 3306`,
+  sotto).
+
+```php
+<?php // www/index.php
+$db = new PDO('mysql:host=127.0.0.1;port=3306;dbname=shop', 'root', '');
+foreach ($db->query('SELECT nome, prezzo FROM prodotto') as $r) echo htmlspecialchars($r['nome']), "<br>";
+```
 
 **Protocollo MySQL.** Con `--mysql-port 3306` il server accetta anche i driver MySQL, senza
 cambiare il codice dell'app: PHP (`mysqli`, `PDO`), Python (`PyMySQL`, `mysql-connector`), Java (JDBC),
@@ -1029,6 +1060,7 @@ Esempio in [`docs/API.md`](docs/API.md#incorporare-il-motore-in-unapp-cc-senza-s
 | Provare o sviluppare sul proprio computer | `segvault` → *API server* (pannello con il registro delle richieste) |
 | Sito pubblico che legge dati, senza backend | endpoint salvati `public` |
 | Sito statico + database, come con XAMPP | `segvault` → *API server* → *Web folder* (o `segvault-server --static cartella/`) |
+| Sito PHP + database, come con XAMPP | `segvault-server --static www/ --php auto --mysql-port 3306` |
 | Sito / web app che gira sulla stessa macchina | `segvault-server --static app/` (stessa origine) |
 | Frontend su un'altra origine (sviluppo) | `segvault-server --cors http://localhost:5173` |
 | Sito pubblico | browser → tuo backend → `segvault-server` su `127.0.0.1` |
@@ -1111,6 +1143,7 @@ make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitize
 | `test_sql` (1164) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, procedure, viste, transazioni, crash e recovery, testi lunghi, JSON, full-text, 100 transazioni di fila |
 | `test_examples` (166) | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
 | `test_grid_edit` (22) | Modifica dei dati nella griglia: analisi dei risultati, `UPDATE` / `INSERT` / `DELETE` generati ed eseguiti, chiavi composte, join, apici e backslash, letterali di export e dump |
+| `test_php` (40) | PHP via FastCGI con un php-cgi finto (e quello vero se installato): variabili CGI, `PATH_INFO`, `index.php`, URL belli, redirect e cookie, sorgente mai mostrato, processi riavviati dopo un crash o un timeout, richieste in parallelo, php-fpm esterno |
 | `test_server` (115) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici, utenti e permessi, audit, protocollo MySQL (login, permessi, errori, più istruzioni, transazioni) |
 | `test_export` (9) | Export XLSX (zip con CRC giusti, parti XML complete, numeri, testo con caratteri speciali, NULL) e PDF (xref, pagine, testo WinAnsi) |
 | `test_backup` (29) | `BACKUP TO`, apertura della copia, ripristino sui dati in uso (con i dati precedenti conservati), righe grandi, viste, procedure e utenti |

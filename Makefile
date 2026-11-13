@@ -54,7 +54,7 @@ WIDGET_SRCS = \
 	src/widgets/window.c
 
 # ── server HTTP/JSON (usato anche dalla GUI, modalità "API server") ──
-NET_SRCS = src/server/server.c src/server/json.c src/server/mysql_wire.c
+NET_SRCS = src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c
 
 # ── DB engine source files ──
 ENGINE_SRCS = \
@@ -119,12 +119,13 @@ SQL_TEST_SRCS = tests/test_sql.c $(ENGINE_SRCS)
 
 EXAMPLES_TEST_SRCS = tests/test_examples.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
-test: test_engine test_btree test_sql test_examples test_server test_grid_edit test_table_design test_schema_model test_db_tools test_png test_auth test_sessions test_parallel test_mysql_import test_overflow test_backup test_export
+test: test_engine test_btree test_sql test_examples test_server test_php test_grid_edit test_table_design test_schema_model test_db_tools test_png test_auth test_sessions test_parallel test_mysql_import test_overflow test_backup test_export
 	./test_btree
 	./test_engine
 	./test_sql
 	./test_examples
 	./test_server
+	./test_php
 	./test_grid_edit
 	./test_table_design
 	./test_schema_model
@@ -210,11 +211,17 @@ TEST_GRID_SRCS = tests/test_grid_edit.c src/widgets/grid_edit.c $(ENGINE_SRCS)
 test_grid_edit: $(TEST_GRID_SRCS) src/widgets/grid_edit.h
 	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_grid_edit $(TEST_GRID_SRCS) -lm -pthread
 
-TEST_SERVER_SRCS = tests/test_server.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/widgets/sql_text.c $(ENGINE_SRCS)
+TEST_SERVER_SRCS = tests/test_server.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
 # il server HTTP: richieste reali su un socket locale
 test_server: $(TEST_SERVER_SRCS) src/server/server.h src/server/json.h
 	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_server $(TEST_SERVER_SRCS) -lm -pthread
+
+TEST_PHP_SRCS = tests/test_php.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/widgets/sql_text.c $(ENGINE_SRCS)
+
+# PHP via FastCGI: il test fa anche da php-cgi finto (e prova quello vero se è installato)
+test_php: $(TEST_PHP_SRCS) src/server/server.h src/server/fastcgi.h src/server/json.h
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_php $(TEST_PHP_SRCS) -lm -pthread
 
 # gli script di examples/ eseguiti come nell'editor
 test_examples: $(EXAMPLES_TEST_SRCS) $(wildcard examples/*.sql)
@@ -244,6 +251,9 @@ test-asan: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
 	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
 		-I. $(BASE_INCLUDES) -o test_server_asan $(TEST_SERVER_SRCS) -lm -pthread
 	ASAN_OPTIONS=detect_leaks=1 ./test_server_asan
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
+		-I. $(BASE_INCLUDES) -o test_php_asan $(TEST_PHP_SRCS) -lm -pthread
+	ASAN_OPTIONS=detect_leaks=1 ./test_php_asan
 	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
 		-I. $(BASE_INCLUDES) -o test_grid_edit_asan $(TEST_GRID_SRCS) -lm -pthread
 	ASAN_OPTIONS=detect_leaks=1 ./test_grid_edit_asan
@@ -306,7 +316,7 @@ build-win/%.o: %.c
 
 clean:
 	$(RM) $(FULL_OBJS) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql test_examples test_examples_asan
-	$(RM) segvault-server segvault-server.exe libsegvault.a test_server test_server_asan test_grid_edit test_grid_edit_asan test_table_design test_table_design_asan test_schema_model test_schema_model_asan test_db_tools test_db_tools_asan test_png test_png_asan test_auth test_auth_asan test_sessions test_sessions_asan test_parallel test_parallel_asan test_parallel_tsan test_mysql_import test_mysql_import_asan test_overflow test_overflow_asan test_backup test_backup_asan test_export test_export_asan
+	$(RM) segvault-server segvault-server.exe libsegvault.a test_server test_server_asan test_php test_php_asan test_grid_edit test_grid_edit_asan test_table_design test_table_design_asan test_schema_model test_schema_model_asan test_db_tools test_db_tools_asan test_png test_png_asan test_auth test_auth_asan test_sessions test_sessions_asan test_parallel test_parallel_asan test_parallel_tsan test_mysql_import test_mysql_import_asan test_overflow test_overflow_asan test_backup test_backup_asan test_export test_export_asan
 	$(RM) -r obj build-win build-server
 
 -include $(FULL_OBJS:.o=.d) $(WIN_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(WIN_SERVER_OBJS:.o=.d)

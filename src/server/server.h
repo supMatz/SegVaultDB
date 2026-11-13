@@ -31,6 +31,10 @@ typedef struct {
     int         mysql_port;   // porta MySQL (0 = libera scelta dal sistema; vedi sv_server_mysql_port)
     const char* audit_file;   // se non NULL: ogni istruzione che non è una lettura viene aggiunta a questo
                               // file (ora, client, utente, database, esito, testo)
+    // PHP nella cartella del sito (static_dir), via FastCGI (vedi fastcgi.h); senza, un .php non viene servito
+    const char* php_cgi;      // percorso di php-cgi: SegVault avvia e sorveglia php_workers processi
+    const char* php_fcgi;     // oppure un backend già avviato: "host:porta" o "unix:/percorso.sock" (php-fpm)
+    int         php_workers;  // processi php-cgi (0 = 4): richieste PHP eseguite insieme
 } SvServerConfig;
 
 typedef struct SvServer SvServer;
@@ -72,6 +76,7 @@ typedef struct {
 SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz);
 int       sv_server_port(const SvServer* s);
 int       sv_server_mysql_port(const SvServer* s);   // 0 se il protocollo MySQL è spento
+const char* sv_server_php(const SvServer* s);         // descrizione del backend PHP ("" se spento)
 void      sv_server_run(SvServer* s);     // accetta connessioni finché non viene chiamato sv_server_stop
 void      sv_server_stop(SvServer* s);    // chiamabile da un altro thread o da un gestore di segnale
 void      sv_server_free(SvServer* s);    // chiude le connessioni rimaste e libera tutto

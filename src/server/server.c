@@ -8,6 +8,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #include "server.h"
 #include "json.h"
 #include "mysql_wire.h"
+#include "fastcgi.h"
 #include "../bridge/db_api.h"
 #include "../bridge/auth.h"
 #include "../widgets/sql_text.h"
@@ -83,6 +84,8 @@ struct SvServer {
     char*          cors;
     char*          default_db;
     char*          static_dir;
+    char*          doc_root;            // percorso assoluto di static_dir (SCRIPT_FILENAME per PHP)
+    FcgiPool*      php;                 // NULL = PHP spento
     sock_t         listen_fd;
     int            port;
     sock_t         mysql_fd;            // protocollo MySQL (BAD_SOCK = spento)
@@ -109,6 +112,7 @@ typedef struct {
     sock_t    fd;
     int       slot;
     char      client[48];
+    int       client_port;
     bool      mysql;                   // connessione col protocollo MySQL
 } Conn;
 
@@ -116,6 +120,7 @@ typedef struct {
 
 typedef struct {
     char   method[16];
+    char   uri[4096];                   // destinazione grezza, come arrivata (REQUEST_URI)
     char   path[2048];                  // decodificato (%xx)
     char   query[2048];                 // grezzo, dopo '?'
     bool   http10;
@@ -131,6 +136,9 @@ typedef struct {
     char   host[256];
     char*  body;                        // NUL-terminato
     size_t body_len;
+    char*  headers;                     // copia delle righe d'intestazione (solo con PHP: diventano HTTP_*)
+    const char* client;                 // indirizzo e porta del client (REMOTE_ADDR / REMOTE_PORT)
+    int    client_port;
 } Request;
 
 typedef struct {
@@ -138,30 +146,54 @@ typedef struct {
     const char* content_type;
     JsonBuf     body;
     const char* extra_headers;          // righe "Nome: valore\r\n" già formattate
+    char*       own_headers;            // intestazioni allocate (risposte di PHP), liberate dopo l'invio
+    char        ctype[160];             // Content-Type scelto da PHP
     bool        close;
     char        detail[120];            // per il registro: SQL eseguito o errore
     long long   rows;                   // righe restituite
     char        client[48];             // indirizzo del client (registro di audit)
 } Response;
 
+// sottostringa senza distinzione tra maiuscole e minuscole (strcasestr non c'è su Windows)
+static const char* ci_strstr(const char* h, const char* n) {
+    size_t nl = strlen(n);
+    for (; *h; h++) if (!strncasecmp(h, n, nl)) return h;
+    return nl ? NULL : h;
+}
+
 static const char* status_text(int st) {
     switch (st) {
         case 200: return "OK";
+        case 201: return "Created";
+        case 202: return "Accepted";
         case 204: return "No Content";
+        case 206: return "Partial Content";
+        case 301: return "Moved Permanently";
+        case 302: return "Found";
+        case 303: return "See Other";
+        case 304: return "Not Modified";
+        case 307: return "Temporary Redirect";
+        case 308: return "Permanent Redirect";
         case 400: return "Bad Request";
         case 401: return "Unauthorized";
         case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 408: return "Request Timeout";
+        case 409: return "Conflict";
+        case 410: return "Gone";
         case 411: return "Length Required";
         case 413: return "Payload Too Large";
         case 415: return "Unsupported Media Type";
+        case 422: return "Unprocessable Content";
+        case 429: return "Too Many Requests";
         case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
+        case 502: return "Bad Gateway";
         case 503: return "Service Unavailable";
-        default:  return "Unknown";
+        case 504: return "Gateway Timeout";
+        default:  return st < 300 ? "OK" : st < 400 ? "Redirect" : st < 500 ? "Client Error" : "Server Error";
     }
 }
 
@@ -182,9 +214,9 @@ static bool send_all(sock_t fd, const char* p, size_t n) {
 }
 
 static bool send_response(SvServer* s, sock_t fd, const Request* rq, Response* rs) {
-    char head[1024];
+    JsonBuf h = {0};
     size_t blen = rs->body.oom ? 0 : rs->body.len;
-    int n = snprintf(head, sizeof(head),
+    jb_printf(&h,
         "HTTP/1.1 %d %s\r\n"
         "Server: SegVault/" SV_VERSION_STR "\r\n"
         "Content-Type: %s\r\n"
@@ -194,20 +226,20 @@ static bool send_response(SvServer* s, sock_t fd, const Request* rq, Response* r
         rs->status, status_text(rs->status),
         rs->content_type ? rs->content_type : "application/json; charset=utf-8",
         (unsigned long long)blen, rs->close ? "close" : "keep-alive");
-    bool own_acao = rs->extra_headers && strstr(rs->extra_headers, "Access-Control-Allow-Origin");
-    if (s->cors && !own_acao && n > 0 && (size_t)n < sizeof(head)) {
+    bool own_acao = rs->extra_headers && ci_strstr(rs->extra_headers, "Access-Control-Allow-Origin");
+    if (s->cors && !own_acao) {
         // origine ammessa: "*" oppure quella configurata, ripetuta solo se coincide con la richiesta
         const char* allow = !strcmp(s->cors, "*") ? "*" : (rq && !strcmp(rq->origin, s->cors) ? s->cors : NULL);
-        if (allow)
-            n += snprintf(head + n, sizeof(head) - (size_t)n,
-                          "Access-Control-Allow-Origin: %s\r\nVary: Origin\r\n", allow);
+        if (allow) jb_printf(&h, "Access-Control-Allow-Origin: %s\r\nVary: Origin\r\n", allow);
     }
-    if (rs->extra_headers && n > 0 && (size_t)n < sizeof(head))
-        n += snprintf(head + n, sizeof(head) - (size_t)n, "%s", rs->extra_headers);
-    if (n > 0 && (size_t)n < sizeof(head)) n += snprintf(head + n, sizeof(head) - (size_t)n, "\r\n");
-    if (n <= 0 || (size_t)n >= sizeof(head)) return false;
-    if (!send_all(fd, head, (size_t)n)) return false;
+    if (rs->extra_headers) jb_raw(&h, rs->extra_headers, strlen(rs->extra_headers));
+    jb_lit(&h, "\r\n");
     bool head_only = rq && !strcmp(rq->method, "HEAD");
+    // intestazione e corpo piccolo in un solo invio
+    if (!h.oom && !head_only && blen > 0 && blen <= 16384) { jb_raw(&h, rs->body.data, blen); blen = 0; head_only = true; }
+    bool ok = !h.oom && send_all(fd, h.data, h.len);
+    free(h.data);
+    if (!ok) return false;
     return head_only || blen == 0 || send_all(fd, rs->body.data, blen);
 }
 
@@ -1080,22 +1112,12 @@ static const char* mime_of(const char* path) {
     return "application/octet-stream";
 }
 
-static void handle_static(SvServer* s, const Request* rq, Response* rs) {
-    const char* p = rq->path;
-    // niente "..", backslash o percorsi nascosti: si resta dentro static_dir
-    for (const char* q = p; *q; q++) {
-        if (*q == '\\' || *q == ':') { json_error(rs, 404, "not found"); return; }
-        if (*q == '/' && q[1] == '.') { json_error(rs, 404, "not found"); return; }
-    }
-    char full[4096];
-    size_t pl = strlen(p);
-    int n = snprintf(full, sizeof(full), "%s%s%s", s->static_dir, p, (pl == 0 || p[pl - 1] == '/') ? "index.html" : "");
-    if (n < 0 || (size_t)n >= sizeof(full)) { json_error(rs, 404, "not found"); return; }
+static bool path_is(const char* path, int kind) {     // kind: S_IFREG o S_IFDIR
     struct stat st;
-    if (stat(full, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR) {
-        if ((size_t)n + 12 >= sizeof(full)) { json_error(rs, 404, "not found"); return; }
-        strcat(full, "/index.html");
-    }
+    return stat(path, &st) == 0 && (int)(st.st_mode & S_IFMT) == kind;
+}
+
+static void serve_file(Response* rs, const char* full) {
     FILE* f = fopen(full, "rb");
     if (!f) { json_error(rs, 404, "not found"); return; }
     char chunk[65536];
@@ -1105,6 +1127,229 @@ static void handle_static(SvServer* s, const Request* rq, Response* rs) {
     if (rs->body.oom) { json_error(rs, 500, "file too large"); return; }
     rs->status = 200;
     rs->content_type = mime_of(full);
+}
+
+// ── PHP (FastCGI) ───────────────────────────────────────────────
+
+#define MAX_CGI_PARAMS 160
+
+// risposta CGI di PHP (intestazioni, riga vuota, corpo) -> Response
+static void cgi_response(Response* rs, JsonBuf* out) {
+    size_t hl = 0, skip = 0;
+    for (size_t i = 0; i < out->len; i++) {
+        if (out->data[i] != '\n') continue;
+        if (i + 1 < out->len && out->data[i + 1] == '\n') { hl = i + 1; skip = 1; break; }
+        if (i + 2 < out->len && out->data[i + 1] == '\r' && out->data[i + 2] == '\n') { hl = i + 1; skip = 2; break; }
+    }
+    if (!hl) {
+        free(out->data);
+        json_error(rs, 502, "PHP sent no headers");
+        return;
+    }
+    JsonBuf hb = {0};
+    int status = 0;
+    bool location = false;
+    rs->ctype[0] = '\0';
+    char* p = out->data;
+    char* end = out->data + hl;
+    while (p < end) {
+        char* e = memchr(p, '\n', (size_t)(end - p));
+        if (!e) e = end;
+        size_t l = (size_t)(e - p);
+        if (l > 0 && p[l - 1] == '\r') l--;
+        char* colon = memchr(p, ':', l);
+        if (colon && colon > p) {
+            size_t nl = (size_t)(colon - p);
+            char* v = colon + 1;
+            while (v < p + l && (*v == ' ' || *v == '\t')) v++;
+            size_t vl = (size_t)(p + l - v);
+            #define IS(name) (nl == sizeof(name) - 1 && !strncasecmp(p, name, nl))
+            if (IS("Status")) status = atoi(v);
+            else if (IS("Content-Type")) snprintf(rs->ctype, sizeof(rs->ctype), "%.*s", (int)vl, v);
+            else if (IS("Content-Length") || IS("Connection") || IS("Transfer-Encoding") || IS("Keep-Alive")) {}
+            else {
+                if (IS("Location")) location = true;
+                jb_raw(&hb, p, nl);
+                jb_lit(&hb, ": ");
+                jb_raw(&hb, v, vl);
+                jb_lit(&hb, "\r\n");
+            }
+            #undef IS
+        }
+        p = e + 1;
+    }
+    if (status < 100 || status > 999) status = location ? 302 : 200;
+    size_t body_at = hl + skip;
+    memmove(out->data, out->data + body_at, out->len - body_at);
+    out->len -= body_at;
+    free(rs->body.data);
+    rs->body = *out;
+    rs->status = status;
+    rs->content_type = rs->ctype[0] ? rs->ctype : "text/html; charset=UTF-8";
+    if (hb.oom) { free(hb.data); hb.data = NULL; }
+    rs->own_headers = hb.data;                 // NUL-terminato da jb_raw
+    rs->extra_headers = rs->own_headers;
+}
+
+// script: percorso nel sito ("/blog/index.php"); info: PATH_INFO ("" se manca)
+static void run_php(SvServer* s, Request* rq, Response* rs, const char* script, const char* info) {
+    char filename[4096], translated[4096] = "", port[16], rport[16], clen[24], server_name[256];
+    snprintf(filename, sizeof(filename), "%s%s", s->doc_root, script);
+    if (info[0]) snprintf(translated, sizeof(translated), "%s%s", s->doc_root, info);
+    snprintf(port, sizeof(port), "%d", s->port);
+    snprintf(rport, sizeof(rport), "%d", rq->client_port);
+    snprintf(clen, sizeof(clen), "%zu", rq->body_len);
+    snprintf(server_name, sizeof(server_name), "%s", rq->host[0] ? rq->host : s->cfg.bind_addr);
+    char* colon = server_name[0] == '[' ? strchr(server_name, ']') : server_name;   // senza la porta
+    if (colon && (colon = strchr(colon, ':'))) *colon = '\0';
+
+    FcgiParam pr[MAX_CGI_PARAMS];
+    int n = 0;
+    #define P(k, v) do { if (n < MAX_CGI_PARAMS) { pr[n].name = (k); pr[n].value = (v); n++; } } while (0)
+    P("GATEWAY_INTERFACE", "CGI/1.1");
+    P("SERVER_SOFTWARE", "SegVault/" SV_VERSION_STR);
+    P("SERVER_PROTOCOL", rq->http10 ? "HTTP/1.0" : "HTTP/1.1");
+    P("SERVER_NAME", server_name);
+    P("SERVER_ADDR", s->cfg.bind_addr);
+    P("SERVER_PORT", port);
+    P("REQUEST_METHOD", rq->method);
+    P("REQUEST_URI", rq->uri);
+    P("QUERY_STRING", rq->query);
+    P("DOCUMENT_ROOT", s->doc_root);
+    P("SCRIPT_NAME", script);
+    P("SCRIPT_FILENAME", filename);
+    if (info[0]) { P("PATH_INFO", info); P("PATH_TRANSLATED", translated); }
+    P("REMOTE_ADDR", rq->client ? rq->client : "");
+    P("REMOTE_PORT", rport);
+    P("REDIRECT_STATUS", "200");                 // php-cgi con cgi.force_redirect lo richiede
+    if (rq->has_length || rq->body_len) P("CONTENT_LENGTH", clen);
+    if (rq->content_type[0]) P("CONTENT_TYPE", rq->content_type);
+
+    // intestazioni della richiesta -> HTTP_NOME (in un solo blocco liberato alla fine)
+    size_t hlen = rq->headers ? strlen(rq->headers) : 0;
+    char* names = hlen ? malloc(hlen * 2 + 16) : NULL;
+    size_t used = 0;
+    for (char* line = names ? rq->headers : NULL; line && *line; ) {
+        char* e = strstr(line, "\r\n");
+        size_t l = e ? (size_t)(e - line) : strlen(line);
+        char* c = memchr(line, ':', l);
+        if (c && c > line) {
+            size_t nl = (size_t)(c - line);
+            // Content-Type / Length hanno già le loro variabili; Proxy aprirebbe la falla "httpoxy"
+            bool skip = (nl == 12 && !strncasecmp(line, "Content-Type", 12)) || (nl == 14 && !strncasecmp(line, "Content-Length", 14)) ||
+                        (nl == 5 && !strncasecmp(line, "Proxy", 5));
+            if (!skip && used + nl + 6 + l + 2 < hlen * 2 + 16) {
+                char* nm = names + used;
+                memcpy(nm, "HTTP_", 5);
+                for (size_t i = 0; i < nl; i++) {
+                    char ch = line[i];
+                    nm[5 + i] = ch == '-' ? '_' : (char)toupper((unsigned char)ch);
+                }
+                nm[5 + nl] = '\0';
+                used += 5 + nl + 1;
+                const char* v = c + 1;
+                while (*v == ' ' || *v == '\t') v++;
+                size_t vl = (size_t)(line + l - v);
+                while (vl > 0 && (v[vl - 1] == ' ' || v[vl - 1] == '\t')) vl--;
+                char* vv = names + used;
+                memcpy(vv, v, vl);
+                vv[vl] = '\0';
+                used += vl + 1;
+                bool dup = false;
+                for (int i = 0; i < n; i++) if (!strcmp(pr[i].name, nm)) dup = true;   // primo valore vince
+                if (!dup) P(nm, vv);
+            }
+        }
+        line = e ? e + 2 : NULL;
+    }
+    #undef P
+
+    JsonBuf out = {0}, errout = {0};
+    char err[256];
+    int r = fcgi_request(s->php, pr, n, rq->body, rq->body_len, s->cfg.timeout_ms, 0, &out, &errout, err, sizeof(err));
+    free(names);
+    if (errout.len && !errout.oom) {
+        jb_raw(&errout, "", 1);
+        if (!s->cfg.quiet) fprintf(stderr, "[php] %s: %s%s", script, errout.data, errout.data[errout.len - 2] == '\n' ? "" : "\n");
+    }
+    if (r) {
+        free(out.data);
+        json_error(rs, r, "PHP: %s", err);
+        free(errout.data);
+        return;
+    }
+    cgi_response(rs, &out);
+    if (errout.len && !errout.oom) one_line(rs->detail, sizeof(rs->detail), errout.data);
+    else snprintf(rs->detail, sizeof(rs->detail), "php %s", script);
+    free(errout.data);
+}
+
+// sito web (static_dir): file statici, script .php, cartelle con index.php / index.html,
+// e il "front controller" (un percorso che non esiste va a /index.php: URL di WordPress e Laravel)
+static void handle_web(SvServer* s, Request* rq, Response* rs) {
+    const char* p = rq->path;
+    // niente "..", backslash o percorsi nascosti: si resta dentro static_dir
+    for (const char* q = p; *q; q++) {
+        if (*q == '\\' || *q == ':') { json_error(rs, 404, "not found"); return; }
+        if (*q == '/' && q[1] == '.') { json_error(rs, 404, "not found"); return; }
+    }
+    bool get = !strcmp(rq->method, "GET") || !strcmp(rq->method, "HEAD");
+    char script[2048] = "", info[2048] = "", full[4096];
+
+    // /a/b.php o /a/b.php/resto (PATH_INFO)
+    for (const char* q = p; (q = ci_strstr(q, ".php")); q += 4)
+        if (q[4] == '\0' || q[4] == '/') {
+            snprintf(script, sizeof(script), "%.*s", (int)(q + 4 - p), p);
+            snprintf(info, sizeof(info), "%s", q + 4);
+            break;
+        }
+    if (!script[0]) {
+        int n = snprintf(full, sizeof(full), "%s%s", s->static_dir, p);
+        if (n < 0 || (size_t)n >= sizeof(full) - 16) { json_error(rs, 404, "not found"); return; }
+        if (path_is(full, S_IFDIR)) {
+            size_t pl = strlen(p);
+            if (pl == 0 || p[pl - 1] != '/') {             // /cartella -> /cartella/ (i link relativi funzionano)
+                const char* qm = strchr(rq->uri, '?');
+                size_t ul = qm ? (size_t)(qm - rq->uri) : strlen(rq->uri);
+                rs->own_headers = malloc(ul + strlen(rq->uri) + 32);
+                if (!rs->own_headers) { json_error(rs, 500, "out of memory"); return; }
+                sprintf(rs->own_headers, "Location: %.*s/%s\r\n", (int)ul, rq->uri, qm ? qm : "");
+                rs->extra_headers = rs->own_headers;
+                rs->status = 301;
+                rs->content_type = "text/plain; charset=utf-8";
+                jb_lit(&rs->body, "moved\n");
+                return;
+            }
+            char idx[4096 + 16];
+            snprintf(idx, sizeof(idx), "%sindex.php", full);
+            if (path_is(idx, S_IFREG)) snprintf(script, sizeof(script), "%sindex.php", p);
+            else {
+                strcat(full, "index.html");
+                if (!path_is(full, S_IFREG)) { json_error(rs, 404, "not found"); return; }
+            }
+        } else if (!path_is(full, S_IFREG)) {
+            char idx[4096];
+            snprintf(idx, sizeof(idx), "%s/index.php", s->static_dir);
+            if (s->php && path_is(idx, S_IFREG)) snprintf(script, sizeof(script), "/index.php");
+            else { json_error(rs, 404, "not found"); return; }
+        }
+    }
+    if (script[0]) {
+        if (!s->php) {                    // il codice sorgente (con le password del database) non si mostra mai
+            json_error(rs, 403, "PHP is not enabled on this server (start it with --php)");
+            return;
+        }
+        snprintf(full, sizeof(full), "%s%s", s->static_dir, script);
+        if (!path_is(full, S_IFREG)) { json_error(rs, 404, "not found"); return; }
+        run_php(s, rq, rs, script, info);
+        return;
+    }
+    if (!get) {
+        rs->extra_headers = "Allow: GET, HEAD\r\n";
+        json_error(rs, 405, "use GET");
+        return;
+    }
+    serve_file(rs, full);
 }
 
 // ── instradamento ───────────────────────────────────────────────
@@ -1230,7 +1475,7 @@ static void route(SvServer* s, Request* rq, Response* rs) {
     const char* bad_origin = api && !ep_public ? origin_problem(s, rq) : NULL;
     if (bad_origin) { free(ep_sql); json_error(rs, 403, "%s", bad_origin); return; }
 
-    if (!strcmp(rq->method, "OPTIONS")) {        // preflight CORS
+    if (!strcmp(rq->method, "OPTIONS") && (api || !s->php)) {   // preflight CORS (con PHP lo gestisce lo script)
         rs->status = 204;
         free(ep_sql);
         rs->extra_headers = ep_public ?
@@ -1309,7 +1554,7 @@ static void route(SvServer* s, Request* rq, Response* rs) {
         json_error(rs, 404, "unknown endpoint %s", rq->path);
         return;
     }
-    if (s->static_dir && (!strcmp(rq->method, "GET") || !strcmp(rq->method, "HEAD"))) { handle_static(s, rq, rs); return; }
+    if (s->static_dir) { handle_web(s, rq, rs); return; }
     json_error(rs, 404, "not found (the API is under " API_PREFIX ")");
 }
 
@@ -1346,6 +1591,7 @@ static int parse_head(SvServer* s, char* head, Request* rq) {
     if (strncmp(version, "HTTP/1.", 7)) return 400;
     rq->http10 = !strcmp(version, "HTTP/1.0");
     rq->keep_alive = !rq->http10;
+    snprintf(rq->uri, sizeof(rq->uri), "%s", target);
     char* qm = strchr(target, '?');
     if (qm) { *qm = '\0'; snprintf(rq->query, sizeof(rq->query), "%s", qm + 1); }
     if (target[0] != '/' || url_decode(target, strlen(target), rq->path, sizeof(rq->path), false) < 0) return 400;
@@ -1472,6 +1718,12 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
     memset(&rq, 0, sizeof(rq));
     char saved = in->data[head_len - 2];
     in->data[head_len - 2] = '\0';              // la testata termina con l'ultimo \r\n
+    rq.client = c->client;
+    rq.client_port = c->client_port;
+    if (s->php) {                                // tutte le intestazioni servono a PHP (HTTP_*)
+        const char* first = strstr(in->data, "\r\n");
+        rq.headers = first ? strdup(first + 2) : NULL;
+    }
     int perr = parse_head(s, in->data, &rq);
     in->data[head_len - 2] = saved;
     Response rs = {0};
@@ -1482,9 +1734,10 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
                                     perr == 411 ? "a Content-Length header is required (no chunked bodies)" : "malformed request");
         send_response(s, c->fd, &rq, &rs);
         free(rs.body.data);
+        free(rq.headers);
         return false;
     }
-    if (!fill(c->fd, in, head_len + rq.content_length, &s->stop)) return false;
+    if (!fill(c->fd, in, head_len + rq.content_length, &s->stop)) { free(rq.headers); return false; }
     char after = in->data[head_len + rq.content_length];
     in->data[head_len + rq.content_length] = '\0';
     rq.body = in->data + head_len;
@@ -1500,6 +1753,8 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
                 c->client, rq.method, rq.path, rs.status, (unsigned long long)rs.body.len, ms);
     if (strcmp(rq.method, "OPTIONS")) log_request(s, c->client, &rq, &rs, ms);
     free(rs.body.data);
+    free(rs.own_headers);
+    free(rq.headers);
     if (!sent || rs.close) return false;
     // richieste in coda (pipelining): si sposta il resto all'inizio
     size_t used = head_len + rq.content_length;
@@ -2017,6 +2272,25 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
         if (!s->audit) { snprintf(err, errsz, "cannot open the audit log %.200s: %s", cfg->audit_file, strerror(errno)); sv_server_free(s); return NULL; }
     }
     s->cfg.audit_file = NULL;                              // il file è già aperto: la stringa non serve più
+    if ((cfg->php_cgi && cfg->php_cgi[0]) || (cfg->php_fcgi && cfg->php_fcgi[0])) {
+        if (!s->static_dir) { snprintf(err, errsz, "PHP needs a web folder (--static DIR)"); sv_server_free(s); return NULL; }
+        char abs[4096];
+#ifdef _WIN32
+        if (!_fullpath(abs, s->static_dir, sizeof(abs))) abs[0] = '\0';
+        for (char* q = abs; *q; q++) if (*q == '\\') *q = '/';
+#else
+        if (!realpath(s->static_dir, abs)) abs[0] = '\0';
+#endif
+        if (!abs[0]) { snprintf(err, errsz, "web folder not found: %.200s", s->static_dir); sv_server_free(s); return NULL; }
+        size_t al = strlen(abs);
+        while (al > 1 && abs[al - 1] == '/') abs[--al] = '\0';
+        s->doc_root = strdup(abs);
+        char perr[300];
+        s->php = cfg->php_fcgi && cfg->php_fcgi[0] ? fcgi_pool_external(cfg->php_fcgi, perr, sizeof(perr))
+                                                    : fcgi_pool_spawn(cfg->php_cgi, cfg->php_workers, perr, sizeof(perr));
+        if (!s->php) { snprintf(err, errsz, "PHP: %s", perr); sv_server_free(s); return NULL; }
+    }
+    s->cfg.php_cgi = s->cfg.php_fcgi = NULL;
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -2068,6 +2342,8 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
 }
 
 int sv_server_mysql_port(const SvServer* s) { return s->mysql_fd != BAD_SOCK ? s->mysql_port : 0; }
+
+const char* sv_server_php(const SvServer* s) { return s->php ? fcgi_pool_describe(s->php) : ""; }
 
 int sv_server_port(const SvServer* s) { return s->port; }
 
@@ -2125,6 +2401,7 @@ void sv_server_run(SvServer* s) {
             c->s = s; c->fd = fd; c->slot = slot; c->mysql = is_mysql;
             const unsigned char* ip = (const unsigned char*)&peer.sin_addr.s_addr;
             snprintf(c->client, sizeof(c->client), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+            c->client_port = ntohs(peer.sin_port);
         }
         if (!c || !spawn(c)) {
             mx_lock(&s->conn_mx);
@@ -2163,6 +2440,8 @@ void sv_server_free(SvServer* s) {
     free(s->cors);
     free(s->default_db);
     free(s->static_dir);
+    free(s->doc_root);
+    fcgi_pool_free(s->php);
     if (s->audit) fclose(s->audit);
     free(s);
 #ifdef _WIN32

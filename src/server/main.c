@@ -3,6 +3,7 @@ SCOPO: segvault-server — il motore SegVault come servizio HTTP/JSON, senza GUI
        Uso: segvault-server [opzioni] [cartella-dati]      (vedi --help e docs/API.md)
 */
 #include "server.h"
+#include "fastcgi.h"
 #include "../bridge/db_api.h"
 #include "../../include/common.h"
 #include <signal.h>
@@ -131,7 +132,12 @@ static void usage(const char* argv0) {
            "      --cors ORIGIN     allow browser calls from ORIGIN (e.g. http://localhost:5173, or *)\n"
            "      --users           require a user and password (Authorization: Basic); each query\n"
            "                        runs with that user's privileges (CREATE USER / GRANT in SQL)\n"
-           "      --static DIR      also serve the files in DIR (a web app) outside /api\n"
+           "      --static DIR      also serve the files in DIR (a web site, like XAMPP's htdocs) outside /api\n"
+           "      --php PATH|auto   run the .php files of --static DIR with php-cgi (auto: php/ next to\n"
+           "                        segvault-server, the PATH, the usual folders)\n"
+           "      --php-fcgi ADDR   run them with a PHP FastCGI server already started (php-fpm):\n"
+           "                        host:port or unix:/run/php/php-fpm.sock\n"
+           "      --php-workers N   php-cgi processes, i.e. PHP requests at the same time (default 4)\n"
            "      --max-body MB     largest request body (default 16)\n"
            "      --timeout S       stop a request that runs longer than S seconds (default 30, 0 = never)\n"
            "      --no-auth         allow listening on a non-local address without a token\n"
@@ -154,6 +160,8 @@ int main(int argc, char** argv) {
     char auto_token[65];
     const char* data_dir = "./data";
     bool no_auth = false;
+    const char* php_arg = NULL;
+    char php_path[1024];
     cfg.token = getenv("SEGVAULT_TOKEN");
 
     for (int i = 1; i < argc; i++) {
@@ -167,6 +175,9 @@ int main(int argc, char** argv) {
         else if (ARG("-d", "--database")) cfg.default_db = argv[++i];
         else if (ARG("--cors", "--cors")) cfg.cors_origin = argv[++i];
         else if (ARG("--static", "--static")) cfg.static_dir = argv[++i];
+        else if (ARG("--php", "--php")) php_arg = argv[++i];
+        else if (ARG("--php-fcgi", "--php-fcgi")) cfg.php_fcgi = argv[++i];
+        else if (ARG("--php-workers", "--php-workers")) cfg.php_workers = atoi(argv[++i]);
         else if (ARG("--max-body", "--max-body")) cfg.max_body = (size_t)atoi(argv[++i]) << 20;
         else if (ARG("--timeout", "--timeout")) cfg.timeout_ms = atoi(argv[++i]) * 1000;
         else if (!strcmp(a, "--no-auth")) no_auth = true;
@@ -182,6 +193,18 @@ int main(int argc, char** argv) {
         #undef ARG
     }
     if (cfg.port < 0 || cfg.port > 65535) { fprintf(stderr, "invalid port\n"); return 2; }
+    if (php_arg && cfg.php_fcgi) { fprintf(stderr, "use either --php or --php-fcgi\n"); return 2; }
+    if ((php_arg || cfg.php_fcgi) && !cfg.static_dir) { fprintf(stderr, "PHP runs the files of the web folder: add --static DIR\n"); return 2; }
+    if (php_arg) {
+        if (!strcmp(php_arg, "auto")) {
+            if (!fcgi_find_php_cgi(php_path, sizeof(php_path))) {
+                fprintf(stderr, "php-cgi not found: put PHP in a php/ folder next to segvault-server, add it to the PATH,\n"
+                                "or give its path with --php /path/to/php-cgi\n");
+                return 2;
+            }
+            cfg.php_cgi = php_path;
+        } else cfg.php_cgi = php_arg;
+    }
     if (cfg.timeout_ms < 0) cfg.timeout_ms = 0;
     if (g_bk_dir && g_bk_every <= 0) g_bk_every = 60;
     if (g_bk_keep < 1) g_bk_keep = 1;
@@ -248,6 +271,10 @@ int main(int argc, char** argv) {
     printf("SegVault %s server (data: %s%s)\n", SV_VERSION_STR, data_dir,
            cfg.require_login ? ", login required" : cfg.token && cfg.token[0] ? ", token required" : "");
     if (cfg.static_dir) printf("  web site: http://%s:%d/          (files of %s)\n", host, port, cfg.static_dir);
+    if (sv_server_php(g_server)[0]) {
+        printf("  PHP:      %s\n", sv_server_php(g_server));
+        if (!cfg.mysql) printf("            (scripts reach the database with mysqli / PDO if you add --mysql-port 3306)\n");
+    }
     printf("  API:      http://%s:%d/api/v1\n", host, port);
     if (cfg.mysql) printf("  MySQL:    %s:%d   (e.g. mysql -h %s -P %d -u root)\n", host, sv_server_mysql_port(g_server), host, sv_server_mysql_port(g_server));
     if (g_bk_dir) {
