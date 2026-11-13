@@ -69,6 +69,7 @@ typedef struct {
     int server_mail;        // cattura delle email: server SMTP sulla porta 1025 (vedi src/server/mail.h)
     int server_cors;        // le web app di qualsiasi origine possono chiamarlo (richiede il token)
     int server_timeout;     // secondi (0 = nessun limite)
+    int server_cgi;         // esegue i programmi CGI della cartella web (.cgi .pl .py .rb)
     int tray;               // con il server acceso, chiudere la finestra lascia SegVault nell'area di notifica
     int server_mysql_port;  // porte dei servizi (default 3306, 1025, 8443)
     int server_mail_port;

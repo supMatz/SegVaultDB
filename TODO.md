@@ -69,4 +69,4 @@ SegVault copre già database e phpMyAdmin; qui c'è quello che manca, in ordine 
 
 ## 6. Facoltativi (XAMPP li ha, servono a pochi)
 - [x] Cattura delle email (come Mailpit, integrata): server SMTP `--mail-port 1025` (AUTH con qualsiasi credenziale, pipelining, Bcc dalla busta), messaggi salvati in `DATA/mail/*.eml` (restano dopo un riavvio), pagina `/.segvault/mail/` con HTML in un iframe sandbox, testo, sorgente, allegati; API JSON con filtri (`?to=`, `?subject=`, `/latest`) per i test E2E; `mail()` di PHP instradato da solo (`sendmail_path` su Linux, `SMTP`/`smtp_port` su Windows)
-- [ ] Perl / altri interpreti CGI
+- [x] Perl / altri interpreti CGI (`--cgi`, Settings > Server): `.cgi`, `.pl`, `.py`, `.rb` eseguiti come mod_cgi (interprete dalla riga `#!` anche su Windows, o dall'estensione), stesse variabili di PHP, corpo su stdin, `Status:`, `PATH_INFO`, limite di tempo, stderr nel registro; con CGI spento il sorgente non viene mostrato

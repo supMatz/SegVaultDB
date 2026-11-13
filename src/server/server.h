@@ -54,6 +54,7 @@ typedef struct {
     bool        no_auto_sites;// niente siti automatici dalle sottocartelle
     bool        dir_listing;  // elenco dei file di una cartella senza index (come Apache "Indexes")
     bool        no_htaccess;  // ignora i file .htaccess (di default si applicano come in Apache, vedi rewrite.h)
+    bool        cgi;          // esegue i programmi CGI del sito: .cgi, .pl, .py, .rb (vedi cgi.h)
     // cattura delle email (vedi mail.h): un server SMTP che tiene i messaggi invece di consegnarli,
     // visibili su http://localhost:PORTA/.segvault/mail. Con PHP, mail() arriva qui da solo
     bool        mail;

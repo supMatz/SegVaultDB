@@ -445,6 +445,83 @@ int main(void) {
         sv_server_free(busy);
     }
 
+    // ── programmi CGI (--cgi): sh, Perl, Python ──
+    {
+        char cg[400], f[500];
+        snprintf(cg, sizeof(cg), "%s/cgi", tmp);
+        mkdir(cg, 0755);
+        snprintf(f, sizeof(f), "%s/cgi-bin", cg); mkdir(f, 0755);
+        snprintf(f, sizeof(f), "%s/cgi-bin/env.cgi", cg);
+        put(f, "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\nX-Cgi: yes\\r\\n\\r\\n'\n"
+               "echo \"method=$REQUEST_METHOD query=$QUERY_STRING info=$PATH_INFO script=$SCRIPT_NAME gw=$GATEWAY_INTERFACE\"\n"
+               "echo \"body=$(cat)\"\necho \"cwd=$(basename \"$(pwd)\")\"\necho oops >&2\n");
+        chmod(f, 0755);
+        snprintf(f, sizeof(f), "%s/cgi-bin/status.cgi", cg);
+        put(f, "#!/bin/sh\nprintf 'Status: 404 Not Found\\nContent-Type: text/html\\n\\n<p>custom 404</p>'\n");
+        chmod(f, 0755);
+        snprintf(f, sizeof(f), "%s/cgi-bin/slow.cgi", cg);
+        put(f, "#!/bin/sh\nsleep 5\necho\n");
+        chmod(f, 0755);
+        snprintf(f, sizeof(f), "%s/cgi-bin/noperl.pl", cg);
+        put(f, "#!/nonexistent/bin/notaninterpreter\nprint 1;\n");
+        snprintf(f, sizeof(f), "%s/hello.pl", cg);
+        put(f, "#!/usr/bin/perl\nprint \"Content-Type: text/plain\\n\\n\";\nprint \"perl $ENV{QUERY_STRING}\";\n");
+        snprintf(f, sizeof(f), "%s/hello.py", cg);
+        put(f, "#!/usr/bin/env python3\nimport os, sys\nprint('Content-Type: text/plain')\nprint()\n"
+               "print('python', os.environ.get('REQUEST_METHOD'), sys.stdin.read())\n");
+        SvServerConfig cc = { .port = 0, .static_dir = cg, .quiet = true, .cgi = true, .timeout_ms = 1500 };
+        SvServer* sc = sv_server_start(&cc, err, sizeof(err));
+        pthread_t tc;
+        pthread_create(&tc, NULL, run_server, sc);
+        int cp = sv_server_port(sc);
+        r = get(cp, "localhost", "/cgi-bin/env.cgi/extra/path?a=1&b=2");
+        CHECK(r.status == 200 && strcasestr(r.head, "X-Cgi: yes") && has(&r, "method=GET query=a=1&b=2 info=/extra/path script=/cgi-bin/env.cgi gw=CGI/1.1") &&
+              has(&r, "cwd=cgi-bin"), "sh CGI: %d %s", r.status, r.body);
+        free(r.body);
+        {
+            int fd = connect_to(cp);
+            const char* q = "POST /cgi-bin/env.cgi HTTP/1.1\r\nHost: localhost\r\nContent-Length: 9\r\nConnection: close\r\n\r\nname=anna";
+            wr(fd, q, strlen(q));
+            CHECK(read_resp(fd, &r, false) && r.status == 200 && strstr(r.body, "method=POST") && strstr(r.body, "body=name=anna"),
+                  "POST body on stdin: %d %s", r.status, r.body);
+            free(r.body);
+            close(fd);
+        }
+        SvLogEntry le;
+        CHECK(sv_server_recent(sc, &le, 1) == 1 && !strcmp(le.svc, "cgi") && strstr(le.detail, "oops"), "stderr in the log: %s %s", le.svc, le.detail);
+        r = get(cp, "localhost", "/cgi-bin/status.cgi");
+        CHECK(r.status == 404 && has(&r, "custom 404"), "Status: header: %d %s", r.status, r.body);
+        free(r.body);
+        r = get(cp, "localhost", "/cgi-bin/slow.cgi");
+        CHECK(r.status == 504, "time limit: %d", r.status);
+        free(r.body);
+        r = get(cp, "localhost", "/cgi-bin/noperl.pl");
+        CHECK(r.status == 502 && has(&r, "interpreter not found"), "missing interpreter: %d %s", r.status, r.body);
+        free(r.body);
+        if (system("command -v perl >/dev/null 2>&1") == 0) {
+            r = get(cp, "localhost", "/hello.pl?x=7");
+            CHECK(r.status == 200 && !strcmp(r.body, "perl x=7"), "Perl: %d [%s]", r.status, r.body);
+            free(r.body);
+        }
+        if (system("command -v python3 >/dev/null 2>&1") == 0) {
+            int fd = connect_to(cp);
+            const char* q = "PUT /hello.py HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nciao!";
+            wr(fd, q, strlen(q));
+            CHECK(read_resp(fd, &r, false) && r.status == 200 && strstr(r.body, "python PUT ciao!"), "Python: %d [%s]", r.status, r.body);
+            free(r.body);
+            close(fd);
+        }
+        sv_server_stop(sc); pthread_join(tc, NULL); sv_server_free(sc);
+        // senza --cgi non si esegue niente
+        SvServerConfig cn = { .port = 0, .static_dir = cg, .quiet = true };
+        sc = sv_server_start(&cn, err, sizeof(err));
+        pthread_create(&tc, NULL, run_server, sc);
+        r = get(sv_server_port(sc), "localhost", "/cgi-bin/env.cgi");
+        CHECK(r.status == 403 && !has(&r, "REQUEST_METHOD") && has(&r, "--cgi"), "cgi off: neither run nor shown: %d %s", r.status, r.body);
+        free(r.body);
+        sv_server_stop(sc); pthread_join(tc, NULL); sv_server_free(sc);
+    }
+
     // configurazioni sbagliate
     SvSite bad1[] = { { "../x", www } };
     SvServerConfig c3 = { .port = 0, .quiet = true, .sites = bad1, .n_sites = 1 };

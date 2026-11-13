@@ -410,6 +410,7 @@ bool server_panel_start(ServerPanel* p) {
         .sites       = sites,
         .n_sites     = p->n_sites,
         .dir_listing = true,
+        .cgi         = g_settings.server_cgi != 0,
         .mail        = g_settings.server_mail != 0,
         .mail_port   = g_settings.server_mail_port,
         .mail_dir    = mail_dir,

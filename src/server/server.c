@@ -14,6 +14,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #include "rewrite.h"
 #include "tls.h"
 #include "h2.h"
+#include "cgi.h"
 #include "../widgets/png_write.h"
 #include "../bridge/db_api.h"
 #include "../bridge/auth.h"
@@ -1543,18 +1544,28 @@ static FcgiPool* php_acquire(SvServer* s);
 static void php_release(SvServer* s, FcgiPool* p);
 
 // script: percorso nel sito ("/blog/index.php"); info: PATH_INFO ("" se manca)
-static void run_php(SvServer* s, Request* rq, Response* rs, const char* script, const char* info) {
-    char filename[4096], translated[4096] = "", port[16], rport[16], clen[24], server_name[256];
-    snprintf(filename, sizeof(filename), "%s%s", rq->root_abs, script);
-    if (info[0]) snprintf(translated, sizeof(translated), "%s%s", rq->root_abs, info);
-    snprintf(port, sizeof(port), "%d", s->port);
-    snprintf(rport, sizeof(rport), "%d", rq->client_port);
-    snprintf(clen, sizeof(clen), "%zu", rq->body_len);
-    snprintf(server_name, sizeof(server_name), "%s", rq->host[0] ? rq->host : s->cfg.bind_addr);
+// variabili CGI di una richiesta (le stesse per PHP via FastCGI e per i programmi CGI)
+typedef struct {
+    FcgiParam pr[MAX_CGI_PARAMS];
+    int       n;
+    char      filename[4096], translated[4096], port[16], rport[16], clen[24], server_name[256];
+    char*     names;                      // testi delle intestazioni HTTP_* (liberare con free)
+} CgiVars;
+
+static void cgi_vars(SvServer* s, Request* rq, const char* script, const char* info, CgiVars* v) {
+    char* filename = v->filename; char* translated = v->translated; char* port = v->port; char* rport = v->rport;
+    char* clen = v->clen; char* server_name = v->server_name;
+    translated[0] = '\0';
+    snprintf(filename, sizeof(v->filename), "%s%s", rq->root_abs, script);
+    if (info[0]) snprintf(translated, sizeof(v->translated), "%s%s", rq->root_abs, info);
+    snprintf(port, sizeof(v->port), "%d", s->port);
+    snprintf(rport, sizeof(v->rport), "%d", rq->client_port);
+    snprintf(clen, sizeof(v->clen), "%zu", rq->body_len);
+    snprintf(server_name, sizeof(v->server_name), "%s", rq->host[0] ? rq->host : s->cfg.bind_addr);
     char* colon = server_name[0] == '[' ? strchr(server_name, ']') : server_name;   // senza la porta
     if (colon && (colon = strchr(colon, ':'))) *colon = '\0';
 
-    FcgiParam pr[MAX_CGI_PARAMS];
+    FcgiParam* pr = v->pr;
     int n = 0;
     #define P(k, v) do { if (n < MAX_CGI_PARAMS) { pr[n].name = (k); pr[n].value = (v); n++; } } while (0)
     P("GATEWAY_INTERFACE", "CGI/1.1");
@@ -1562,7 +1573,7 @@ static void run_php(SvServer* s, Request* rq, Response* rs, const char* script, 
     P("SERVER_PROTOCOL", rq->http10 ? "HTTP/1.0" : "HTTP/1.1");
     P("SERVER_NAME", server_name);
     P("SERVER_ADDR", s->cfg.bind_addr);
-    if (rq->https) snprintf(port, sizeof(port), "%d", rq->https_port);
+    if (rq->https) snprintf(port, sizeof(v->port), "%d", rq->https_port);
     P("SERVER_PORT", port);
     P("REQUEST_SCHEME", rq->https ? "https" : "http");
     if (rq->https) P("HTTPS", "on");
@@ -1618,6 +1629,17 @@ static void run_php(SvServer* s, Request* rq, Response* rs, const char* script, 
         line = e ? e + 2 : NULL;
     }
     #undef P
+    v->n = n;
+    v->names = names;
+}
+
+static void run_php(SvServer* s, Request* rq, Response* rs, const char* script, const char* info) {
+    CgiVars* cv = malloc(sizeof(CgiVars));
+    if (!cv) { json_error(rs, 500, "out of memory"); return; }
+    cgi_vars(s, rq, script, info, cv);
+    FcgiParam* pr = cv->pr;
+    int n = cv->n;
+    char* names = cv->names;
 
     JsonBuf out = {0}, errout = {0};
     char err[256];
@@ -1630,6 +1652,7 @@ static void run_php(SvServer* s, Request* rq, Response* rs, const char* script, 
                  : (snprintf(err, sizeof(err), "PHP was turned off"), 503);
     if (pool) php_release(s, pool);
     free(names);
+    free(cv);
     if (ps.started) {                         // risposta già partita: si chiude il flusso (o la connessione)
         free(out.data);
         if (r == 0 && !rq->http10) { if (!send_all(rq->fd, "0\r\n\r\n", 5)) rs->close = true; }
@@ -1659,6 +1682,50 @@ static void run_php(SvServer* s, Request* rq, Response* rs, const char* script, 
     free(errout.data);
 }
 
+
+// programma CGI (Perl, Python, Ruby, .cgi): stesse variabili di PHP, una esecuzione per richiesta
+static void run_cgi(SvServer* s, Request* rq, Response* rs, const char* script, const char* info) {
+    rs->svc = "cgi";
+    CgiVars* cv = malloc(sizeof(CgiVars));
+    if (!cv) { json_error(rs, 500, "out of memory"); return; }
+    cgi_vars(s, rq, script, info, cv);
+    // "NOME=valore" per l'ambiente del processo
+    JsonBuf eb = {0};
+    size_t* offs = malloc(sizeof(size_t) * (size_t)(cv->n + 1));
+    for (int i = 0; offs && i < cv->n; i++) {
+        offs[i] = eb.len;
+        jb_printf(&eb, "%s=%s", cv->pr[i].name, cv->pr[i].value ? cv->pr[i].value : "");
+        jb_raw(&eb, "", 1);
+    }
+    const char** env = calloc((size_t)cv->n + 1, sizeof(char*));
+    if (!offs || !env || eb.oom) {
+        free(offs); free(env); free(eb.data); free(cv->names); free(cv);
+        json_error(rs, 500, "out of memory");
+        return;
+    }
+    for (int i = 0; i < cv->n; i++) env[i] = eb.data + offs[i];
+    char path[4200];
+    snprintf(path, sizeof(path), "%s%s", rq->root_abs, script);
+    JsonBuf out = {0}, errout = {0};
+    char err[300] = "";
+    int r = cgi_exec(path, env, rq->body, rq->body_len, s->cfg.timeout_ms, (size_t)256 << 20, &out, &errout, err, sizeof(err));
+    free(offs); free(env); free(eb.data); free(cv->names); free(cv);
+    if (errout.len && !errout.oom) {
+        jb_raw(&errout, "", 1);
+        if (!s->cfg.quiet) fprintf(stderr, "[cgi] %s: %s%s", script, errout.data, errout.data[errout.len - 2] == '\n' ? "" : "\n");
+    }
+    if (r) {
+        free(out.data);
+        json_error(rs, r, "CGI: %s", err);
+        free(errout.data);
+        return;
+    }
+    if (!out.len) { free(out.data); free(errout.data); json_error(rs, 502, "CGI: the program wrote nothing"); return; }
+    cgi_response(rs, &out);
+    if (errout.len && !errout.oom) one_line(rs->detail, sizeof(rs->detail), errout.data);
+    else snprintf(rs->detail, sizeof(rs->detail), "cgi %s", script);
+    free(errout.data);
+}
 
 // ── siti (virtual host) ─────────────────────────────────────────
 
@@ -2074,6 +2141,20 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
             snprintf(info, sizeof(info), "%s", q + 4);
             break;
         }
+    // programmi CGI (--cgi): /cgi-bin/a.pl, /x.py/resto (PATH_INFO); solo file che esistono
+    bool cgi = false;
+    if (!script[0] && s->cfg.cgi) {
+        size_t pl = strlen(p);
+        for (size_t i = 1; i <= pl && !cgi; i++) {
+            if (i < pl && p[i] != '/') continue;
+            if (!cgi_is_script(p, i)) continue;
+            int n = snprintf(full, sizeof(full), "%s%.*s", rq->root, (int)i, p);
+            if (n < 0 || (size_t)n >= sizeof(full) || !path_is(full, S_IFREG)) continue;
+            snprintf(script, sizeof(script), "%.*s", (int)i, p);
+            snprintf(info, sizeof(info), "%s", p + i);
+            cgi = true;
+        }
+    }
     if (!script[0]) {
         int n = snprintf(full, sizeof(full), "%s%s", rq->root, p);
         if (n < 0 || (size_t)n >= sizeof(full) - 16) { web_not_found(rq, rs); return; }
@@ -2110,6 +2191,17 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
             snprintf(idx, sizeof(idx), "%s/index.php", rq->root);
             if (s->php && path_is(idx, S_IFREG)) snprintf(script, sizeof(script), "/index.php");
             else { web_not_found(rq, rs); return; }
+        }
+    }
+    if (cgi) { run_cgi(s, rq, rs, script, info); return; }
+    // senza --cgi il sorgente di un programma CGI non si mostra (come per PHP): .cgi e .pl ovunque, .py e .rb in /cgi-bin/
+    if (!s->cfg.cgi) {
+        size_t pl = strlen(p);
+        bool in_bin = !strncmp(p, "/cgi-bin/", 9);
+        if (pl > 4 && (!strcasecmp(p + pl - 4, ".cgi") || !strcasecmp(p + pl - 3, ".pl") ||
+                       (in_bin && (!strcasecmp(p + pl - 3, ".py") || !strcasecmp(p + pl - 3, ".rb"))))) {
+            json_error(rs, 403, "CGI programs are not enabled on this server (start it with --cgi)");
+            return;
         }
     }
     if (script[0]) {

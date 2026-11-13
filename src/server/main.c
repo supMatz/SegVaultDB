@@ -171,6 +171,7 @@ static void usage(const char* argv0) {
            "                        service on Linux, LaunchAgent on macOS, Run key on Windows; no admin rights\n"
            "      --uninstall-service  remove it\n"
            "      --no-dir-listing  404 instead of a file list for folders without an index\n"
+           "      --cgi             run CGI programs of the site (.cgi, .pl, .py, .rb: Perl, Python, Ruby), as mod_cgi\n"
            "      --no-htaccess     ignore .htaccess files (by default their mod_rewrite rules, Require all denied\n"
            "                        and Options -Indexes apply, as in Apache)\n"
            "  -q, --quiet           do not log requests\n"
@@ -257,6 +258,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--background")) background = true;
         else if (!strcmp(a, "--no-dir-listing")) cfg.dir_listing = false;
         else if (!strcmp(a, "--no-htaccess")) cfg.no_htaccess = true;
+        else if (!strcmp(a, "--cgi")) cfg.cgi = true;
         else if (a[0] == '-') { fprintf(stderr, "unknown or incomplete option: %s (see --help)\n", a); return 2; }
         else data_dir = a;
         #undef ARG
