@@ -33,7 +33,23 @@ typedef struct {
     Page* page;            // pagina corrente, pinnata finché la scansione è su di essa
     bool done;
     uint8_t* ovbuf;        // riga grande ricomposta dalle pagine di overflow (fino alla riga seguente)
+    const struct HeapSnapshot* snap;   // versione confermata da leggere (MVCC), NULL = le righe come sono
+    int extra_i;           // righe cancellate dalla transazione già restituite in fondo alla scansione
 } HeapScan;
+
+// Versione confermata di una tabella per chi legge mentre un'altra transazione la sta modificando
+// (letture che non aspettano le scritture): le righe nuove non confermate si nascondono, quelle
+// modificate tornano alla versione di prima, quelle cancellate si aggiungono in fondo. I dati sono righe
+// serializzate (tuple_serialize). Attiva solo per il thread che la imposta.
+typedef struct HeapSnapshot {
+    uint32_t  root;               // la tabella (prima pagina)
+    RID*      hide;  int nhide;   // righe da nascondere (ordinate)
+    RID*      repl_rid;           // righe da sostituire (ordinate) con repl[i] / repl_len[i]
+    uint8_t** repl;  size_t* repl_len; int nrepl;
+    uint8_t** extra; size_t* extra_len; int nextra;
+} HeapSnapshot;
+void heap_snapshot_set(const HeapSnapshot* snaps, int n);   // NULL, 0 = nessuna
+bool heap_snapshot_active(uint32_t root);
 
 HeapScan* heap_scan_open(HeapFile* hf, TableSchema* schema);
 Tuple* heap_scan_next(HeapScan* scan, RID* out_rid);

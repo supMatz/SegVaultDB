@@ -47,4 +47,11 @@ bool executor_mysql_mode(void);
 char* executor_create_statement(Catalog* cat, const char* db, const char* table, bool with_fk);
 char* executor_fk_statements(Catalog* cat, const char* db, const char* table);
 
+// ogni modifica di una riga dentro una transazione (tx_id != 0): per le letture della versione confermata
+// (vedi heap_snapshot). type: LOG_INSERT / LOG_DELETE / LOG_UPDATE / LOG_UPDATE_MOVE; old: la riga di prima
+// serializzata (NULL per INSERT); new_rid: la nuova posizione (UPDATE_MOVE)
+typedef void (*ExecChangeHook)(uint64_t tx_id, const char* db, const char* table, uint8_t type, RID rid, RID new_rid,
+                               const uint8_t* old, size_t old_len);
+void executor_set_change_hook(ExecChangeHook hook);
+
 #endif

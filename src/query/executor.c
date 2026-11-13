@@ -1370,6 +1370,8 @@ static MemIndex* mi_get_cols_locked(ExecCtx* ctx, const char* db, TableSchema* t
 static SvRwLock g_mi_lock = SV_RWLOCK_INIT;
 
 static MemIndex* mi_get_cols(ExecCtx* ctx, const char* db, TableSchema* ts, const int* cols, int ncols) {
+    // versione confermata (MVCC): gli indici descrivono le righe attuali, si legge la tabella
+    if (heap_snapshot_active(ts->root_page_id)) return NULL;
     sv_rw_wr(&g_mi_lock);
     MemIndex* ix = mi_get_cols_locked(ctx, db, ts, cols, ncols);
     sv_rw_wrunlock(&g_mi_lock);
@@ -6732,11 +6734,21 @@ static int pk_column(const TableSchema* ts) {
 
 static void rid_key(RID r, char* buf, size_t n) { snprintf(buf, n, "%u:%u", r.page_id, (unsigned)r.slot_id); }
 
+static ExecChangeHook g_change_hook;
+void executor_set_change_hook(ExecChangeHook hook) { g_change_hook = hook; }
+
+static void change_notify(ExecCtx* ctx, uint8_t type, RID rid, RID nrid, const uint8_t* old, size_t ol, TableSchema* ts) {
+    if (!g_change_hook || !ctx->tx_id) return;
+    Database* db = catalog_current_db(ctx->catalog);
+    g_change_hook(ctx->tx_id, db ? db->name : "", ts->name, type, rid, nrid, old, ol);
+}
+
 static void wal_log(ExecCtx* ctx, uint8_t type, RID rid, const Tuple* newt, const Tuple* oldt, TableSchema* ts) {
     if (!ctx->wal) return;
     size_t nl = 0, ol = 0;
     uint8_t* ns = newt ? tuple_serialize((Tuple*)newt, ts, &nl) : NULL;
     uint8_t* os = oldt ? tuple_serialize((Tuple*)oldt, ts, &ol) : NULL;
+    change_notify(ctx, type, rid, rid, os, ol, ts);
     wal_write(ctx->wal, type, ctx->tx_id, rid.page_id, (SVRID){rid.page_id, rid.slot_id},
               ns, (uint32_t)nl, os, (uint32_t)ol);
     free(ns);
@@ -6748,6 +6760,7 @@ static void wal_log_move(ExecCtx* ctx, RID old_rid, RID new_rid, const Tuple* ne
     size_t nl = 0, ol = 0;
     uint8_t* ns = tuple_serialize((Tuple*)newt, ts, &nl);
     uint8_t* os = tuple_serialize((Tuple*)oldt, ts, &ol);
+    change_notify(ctx, LOG_UPDATE_MOVE, old_rid, new_rid, os, ol, ts);
     uint8_t* data = ns ? malloc(nl + 6) : NULL;
     if (data) {
         memcpy(data, &new_rid.page_id, 4);

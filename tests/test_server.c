@@ -783,18 +783,19 @@ int main(void) {
         c = cell_at(&r, 0, 0, 0);
         CHECK(resp_ok(&r) && c && c->number == 1, "own uncommitted row visible in the session: %s", r.body);
         resp_free(&r);
-        // una richiesta senza sessione aspetta il COMMIT, poi vede la riga
+        // una richiesta senza sessione non aspetta: legge la versione confermata (MVCC), senza la riga
         g_port = port2;
         pthread_t waiter;
         pthread_create(&waiter, NULL, count_after_commit, NULL);
-        struct timespec ts = { 0, 300 * 1000000L };
-        nanosleep(&ts, NULL);
-        CHECK(!g_waiter_done, "other request waits while the session holds a transaction");
+        pthread_join(waiter, NULL);
+        CHECK(g_waiter_done && g_waiter_count == 0, "other request reads the committed version at once: %d", g_waiter_count);
         r = request(port2, "POST", "/api/v1/query", hdr, "{\"sql\":\"COMMIT\"}");
         CHECK(resp_ok(&r) && strstr(r.body, "\"in_transaction\":false"), "commit in a later request: %s", r.body);
         resp_free(&r);
+        g_waiter_done = false;
+        pthread_create(&waiter, NULL, count_after_commit, NULL);
         pthread_join(waiter, NULL);
-        CHECK(g_waiter_count == 1, "the waiting request ran after the commit and saw the row: %d", g_waiter_count);
+        CHECK(g_waiter_count == 1, "after the commit the row is visible: %d", g_waiter_count);
         // il database resta impostato nella sessione; chiusa con una transazione aperta = rollback
         r = request(port2, "POST", "/api/v1/query", hdr, "{\"sql\":\"BEGIN; DELETE FROM conc\"}");
         resp_free(&r);

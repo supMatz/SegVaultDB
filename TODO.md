@@ -53,7 +53,7 @@ SegVault copre già database e phpMyAdmin; qui c'è quello che manca, in ordine 
 
 ## 4. Concorrenza
 - [x] Più transazioni aperte insieme (sessioni HTTP, connessioni MySQL, GUI): lock di tabella S / X per statement (anche trigger, chiavi esterne, viste, procedure) tenuti fino a COMMIT / ROLLBACK, attesa che lascia lavorare gli altri, deadlock riconosciuti (errore 1213, la vittima viene annullata), `Lock wait timeout` (1205) dopo 30 s; letture parallele solo su tabelle non in scrittura (niente letture sporche); recupero dopo un crash con più transazioni interlacciate; ROLLBACK TO senza troncare il log
-- [ ] Lock sulle righe o MVCC (letture che non aspettano mai le scritture)
+- [x] MVCC per le letture: una SELECT su una tabella in scrittura in un'altra transazione legge subito la versione confermata (registro in memoria delle righe di prima di ogni transazione aperta, overlay sulle scansioni e sulle letture per RID, indici scavalcati), `FOR UPDATE` / `LOCK IN SHARE MODE` aspettano; prova con PHP: lettura coerente durante un trasferimento non confermato in 0,1 ms
 
 ## 5. Pannello di controllo stile XAMPP
 - [x] Pannello del server: interruttore della cattura delle email (porta 1025, "Open inbox (N)" aggiornato da solo), link al cruscotto "All sites", siti `site.NOME=DEST` letti da `server.ini`, messaggi chiari se la porta 1025 è già presa (Mailpit / MailHog)

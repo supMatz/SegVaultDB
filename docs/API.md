@@ -223,7 +223,11 @@ curl -X DELETE http://127.0.0.1:8484/api/v1/sessions/3f9a...   # chiusa: una tra
   per scrivere: anche le tabelle toccate da trigger, chiavi esterne con `CASCADE`, viste e procedure)
   e lo tiene fino a `COMMIT` / `ROLLBACK` (locking a due fasi stretto: isolamento serializzabile,
   nessuna lettura di dati non confermati). Transazioni su tabelle diverse, o che leggono soltanto,
-  vanno avanti insieme; chi vuole una tabella in scrittura altrui aspetta il `COMMIT`, fino a 30 s
+  vanno avanti insieme. **Le letture non aspettano mai le scritture (MVCC):** una `SELECT` su una
+  tabella che un'altra transazione sta modificando vede subito la versione confermata (le righe nuove
+  non ci sono, quelle modificate o cancellate sono come prima), come il *read committed* di MySQL e
+  PostgreSQL; `SELECT ... FOR UPDATE` / `LOCK IN SHARE MODE` invece aspetta. Chi vuole scrivere una
+  tabella in scrittura altrui aspetta il `COMMIT`, fino a 30 s
   (`Lock wait timeout exceeded`, errore MySQL 1205). Un ciclo di attese viene riconosciuto subito:
   una delle transazioni riceve `Deadlock found when trying to get lock; try restarting transaction`
   (1213, come MySQL: Laravel, Doctrine e gli altri ORM la ripetono da soli) e viene annullata.

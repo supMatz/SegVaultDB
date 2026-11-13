@@ -290,8 +290,47 @@ int heap_insert(HeapFile* hf, Tuple* t, TableSchema* schema, RID* out_rid) {
     return SV_OK;
 }
 
+// ── versione confermata (MVCC) ──
+
+static _Thread_local const HeapSnapshot* t_snaps;
+static _Thread_local int t_nsnaps;
+
+void heap_snapshot_set(const HeapSnapshot* snaps, int n) { t_snaps = snaps; t_nsnaps = snaps ? n : 0; }
+
+static const HeapSnapshot* snap_of(uint32_t root) {
+    for (int i = 0; i < t_nsnaps; i++) if (t_snaps[i].root == root && root) return &t_snaps[i];
+    return NULL;
+}
+
+bool heap_snapshot_active(uint32_t root) { return snap_of(root) != NULL; }
+
+static int rid_cmp(RID a, RID b) {
+    if (a.page_id != b.page_id) return a.page_id < b.page_id ? -1 : 1;
+    return a.slot_id < b.slot_id ? -1 : a.slot_id > b.slot_id;
+}
+
+static int rid_find(const RID* v, int n, RID r) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int m = (lo + hi) / 2, c = rid_cmp(v[m], r);
+        if (!c) return m;
+        if (c < 0) lo = m + 1; else hi = m - 1;
+    }
+    return -1;
+}
+
 Tuple* heap_get(HeapFile* hf, RID rid, TableSchema* schema) {
     if (!hf || !schema) return NULL;
+    const HeapSnapshot* sn = snap_of(hf->root_page_id);
+    if (sn) {
+        if (rid_find(sn->hide, sn->nhide, rid) >= 0) return NULL;
+        int k = rid_find(sn->repl_rid, sn->nrepl, rid);
+        if (k >= 0) {
+            Tuple* t = tuple_deserialize(sn->repl[k], sn->repl_len[k], schema);
+            if (t) t->rid = rid;
+            return t;
+        }
+    }
 
     Page* p = bp_fetch(hf->bp, rid.page_id);
     if (!p) return NULL;
@@ -356,6 +395,7 @@ HeapScan* heap_scan_open(HeapFile* hf, TableSchema* schema) {
     scan->current_page = hf->root_page_id;
     scan->current_slot = 0;
     scan->done         = false;
+    scan->snap         = snap_of(hf->root_page_id);
     return scan;
 }
 
@@ -393,6 +433,16 @@ const uint8_t* heap_scan_next_raw(HeapScan* scan, RID* out_rid, size_t* out_len)
             uint16_t len;
             const void* data = page_get_slot(p, scan->current_slot, &len);
             uint16_t slot = scan->current_slot++;
+            if (data && scan->snap) {                       // versione confermata
+                RID r = { scan->current_page, slot };
+                if (rid_find(scan->snap->hide, scan->snap->nhide, r) >= 0) continue;
+                int k = rid_find(scan->snap->repl_rid, scan->snap->nrepl, r);
+                if (k >= 0) {
+                    if (out_rid) *out_rid = r;
+                    if (out_len) *out_len = scan->snap->repl_len[k];
+                    return scan->snap->repl[k];
+                }
+            }
             if (data) {
                 if (out_rid) *out_rid = (RID){scan->current_page, slot};
                 if (ov_is_stub(data, len, NULL, NULL)) {        // riga grande: ricomposta
@@ -413,6 +463,13 @@ const uint8_t* heap_scan_next_raw(HeapScan* scan, RID* out_rid, size_t* out_len)
         scan->current_slot = 0;
     }
     scan_release(scan);
+    // in fondo, le righe confermate che la transazione ha cancellato
+    if (scan->snap && scan->extra_i < scan->snap->nextra) {
+        int k = scan->extra_i++;
+        if (out_rid) *out_rid = (RID){ 0xFFFFFFFFu, (uint16_t)k };
+        if (out_len) *out_len = scan->snap->extra_len[k];
+        return scan->snap->extra[k];
+    }
     scan->done = true;
     return NULL;
 }

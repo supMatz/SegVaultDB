@@ -34,5 +34,7 @@ void lk_release_all(const void* owner);
 int  lk_count(const void* owner);         // lock tenuti (diagnostica, test)
 // proprietario che tiene un lock in conflitto con req (per i messaggi), NULL se nessuno
 const void* lk_blocker(const void* owner, const LkReq* req, int n);
+// chi (diverso da except) tiene la tabella in modo esclusivo, NULL se nessuno
+const void* lk_x_holder(int db, const char* table, const void* except);
 
 #endif

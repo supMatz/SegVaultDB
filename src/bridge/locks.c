@@ -220,3 +220,13 @@ const void* lk_blocker(const void* owner, const LkReq* req, int n) {
     sv_rw_wrunlock(&g_mx);
     return nb ? b[0] : NULL;
 }
+
+const void* lk_x_holder(int db, const char* table, const void* except) {
+    sv_rw_wr(&g_mx);
+    const void* o = NULL;
+    LkEntry* e = find(db, table, false);
+    for (int j = 0; e && j < e->nh && !o; j++)
+        if (e->h[j].owner != except && e->h[j].mode == LK_X) o = e->h[j].owner;
+    sv_rw_wrunlock(&g_mx);
+    return o;
+}

@@ -62,7 +62,11 @@ int main(void) {
           "s1 writes another table meanwhile");
     {
         QueryResult* r = db_execute("SELECT COUNT(*) FROM a.t");
-        CHECK(r && !r->success && strstr(r->error, "Lock wait timeout"), "a table written by s2 waits (no dirty read): %s", r ? r->error : "");
+        CHECK(r && r->success && !strcmp(r->rows[0].cells[0].value, "1"), "a table written by s2: committed version, no wait (MVCC): %s",
+              r && r->success ? r->rows[0].cells[0].value : r ? r->error : "");
+        db_result_free(r);
+        r = db_execute("SELECT COUNT(*) FROM a.t FOR UPDATE");
+        CHECK(r && !r->success && strstr(r->error, "Lock wait timeout"), "SELECT ... FOR UPDATE waits: %s", r ? r->error : "");
         db_result_free(r);
     }
     db_session_leave(s1);
@@ -73,6 +77,50 @@ int main(void) {
     CHECK(ok("DELETE FROM b.t") && num("SELECT COUNT(*) FROM b.t") == 0, "s1 cleans b");
     db_session_leave(s1);
     CHECK(num("SELECT COUNT(*) FROM t") == 2, "committed row visible to the default session");
+
+    // MVCC: chi legge vede la versione confermata mentre un'altra transazione scrive, senza aspettare
+    {
+        ok("USE a");
+        ok("CREATE TABLE m (id INT PRIMARY KEY, name TEXT, n INT)");
+        ok("INSERT INTO m VALUES (1, 'uno', 10), (2, 'due', 20), (3, 'tre', 30), (4, 'quattro', 40)");
+        DbSession* w = db_session_new();
+        DbSession* rd = db_session_new();
+        CHECK(db_session_enter(w) && ok("USE a") && ok("BEGIN") && ok("UPDATE m SET n = n + 1 WHERE id = 1") &&
+              ok("UPDATE m SET name = 'due due due due due due due due due due due due due' WHERE id = 2") &&
+              ok("DELETE FROM m WHERE id = 3") && ok("INSERT INTO m VALUES (5, 'cinque', 50)") &&
+              ok("UPDATE m SET n = 99 WHERE id = 5") && ok("UPDATE m SET n = n * 100 WHERE id = 1") &&
+              ok("SAVEPOINT x") && ok("DELETE FROM m WHERE id = 4") && ok("ROLLBACK TO x"), "writer changes rows");
+        CHECK(num("SELECT COUNT(*) FROM m") == 4 && num("SELECT SUM(n) FROM m") == 1100 + 20 + 40 + 99, "the writer sees its own changes: %lld", num("SELECT SUM(n) FROM m"));
+        db_session_leave(w);
+        CHECK(db_session_enter(rd) && ok("USE a"), "reader enters");
+        CHECK(num("SELECT COUNT(*) FROM m") == 4, "reader: committed row count: %lld", num("SELECT COUNT(*) FROM m"));
+        CHECK(num("SELECT SUM(n) FROM m") == 100, "reader: committed values: %lld", num("SELECT SUM(n) FROM m"));
+        CHECK(num("SELECT n FROM m WHERE id = 1") == 10, "reader: primary key lookup sees the committed version: %lld", num("SELECT n FROM m WHERE id = 1"));
+        CHECK(num("SELECT COUNT(*) FROM m WHERE id = 3") == 1 && num("SELECT COUNT(*) FROM m WHERE id = 5") == 0, "reader: deleted row back, new row hidden");
+        {
+            QueryResult* r = db_execute("SELECT name FROM m WHERE id = 2");
+            CHECK(r && r->success && r->num_rows == 1 && !strcmp(r->rows[0].cells[0].value, "due"), "reader: moved row in its old version: %s",
+                  r && r->success && r->num_rows ? r->rows[0].cells[0].value : "?");
+            db_result_free(r);
+        }
+        db_session_leave(rd);
+        CHECK(db_session_enter(w) && ok("COMMIT"), "writer commits");
+        db_session_leave(w);
+        CHECK(db_session_enter(rd) && num("SELECT SUM(n) FROM m") == 1100 + 20 + 40 + 99 && num("SELECT COUNT(*) FROM m WHERE id = 3") == 0,
+              "after COMMIT the reader sees the new version: %lld", num("SELECT SUM(n) FROM m"));
+        db_session_leave(rd);
+        // una transazione annullata non lascia tracce nella versione confermata
+        CHECK(db_session_enter(w) && ok("BEGIN") && ok("DELETE FROM m") && num("SELECT COUNT(*) FROM m") == 0, "writer empties the table");
+        db_session_leave(w);
+        CHECK(db_session_enter(rd) && num("SELECT COUNT(*) FROM m") == 4, "reader still sees 4 rows: %lld", num("SELECT COUNT(*) FROM m"));
+        db_session_leave(rd);
+        CHECK(db_session_enter(w) && ok("ROLLBACK"), "writer rolls back");
+        db_session_leave(w);
+        CHECK(num("SELECT COUNT(*) FROM m") == 4, "all rows back");
+        ok("DROP TABLE m");
+        db_session_end(w);
+        db_session_end(rd);
+    }
 
     // ROLLBACK di una sessione sospesa (fine sessione = client sparito)
     CHECK(db_session_enter(s1) && ok("USE a") && ok("BEGIN") && ok("DELETE FROM t"), "s1 deletes in a transaction");

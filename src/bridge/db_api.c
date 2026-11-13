@@ -52,7 +52,8 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
 #include "locks.h"
 static SvRwLock g_db_rw;
 static _Thread_local int g_lock_depth;
-static void db_mutex_init(void) { sv_rw_init(&g_db_rw); lk_init(); }
+static void chg_hook(uint64_t tx, const char* db, const char* table, uint8_t type, RID rid, RID nrid, const uint8_t* old, size_t ol);
+static void db_mutex_init(void) { sv_rw_init(&g_db_rw); lk_init(); executor_set_change_hook(chg_hook); }
 static void db_lock(void)       { if (g_lock_depth++ == 0) sv_rw_wr(&g_db_rw); }
 static void db_unlock(void)     { if (--g_lock_depth == 0) sv_rw_wrunlock(&g_db_rw); }
 
@@ -562,7 +563,7 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
 }
 
 
-typedef struct { char name[64]; off_t offset; } SavepointRec;
+typedef struct { char name[64]; off_t offset; uint64_t chg_seq; } SavepointRec;
 
 struct DbSession {
     int          cur_db;            // indice nel catalogo (-1 = nessuno)
@@ -571,6 +572,165 @@ struct DbSession {
     int          nsp;
     char         user[64];
 };
+
+
+// ── letture della versione confermata (MVCC) ────────────────────
+// Ogni modifica di una transazione aperta resta qui (riga di prima, posizione) finché la transazione
+// finisce. Una SELECT che troverebbe una tabella in scrittura altrui non aspetta: legge la versione
+// confermata (heap_snapshot), ricostruita da queste voci. Le scritture restano serializzate dai lock.
+
+typedef struct {
+    uint64_t tx, seq;
+    char     db[64], table[64];
+    uint8_t  type;                 // LOG_INSERT / LOG_DELETE / LOG_UPDATE / LOG_UPDATE_MOVE; 0 = non registrata (memoria)
+    RID      rid, nrid;
+    uint8_t* old;
+    size_t   ol;
+} TxChange;
+
+static TxChange* g_chg;
+static int       g_nchg, g_capchg;
+static uint64_t  g_chg_seq;
+
+static void chg_hook(uint64_t tx, const char* db, const char* table, uint8_t type, RID rid, RID nrid, const uint8_t* old, size_t ol) {
+    if (g_nchg == g_capchg) {
+        int nc = g_capchg ? g_capchg * 2 : 256;
+        TxChange* nv = realloc(g_chg, sizeof(TxChange) * (size_t)nc);
+        if (!nv) { if (g_nchg) g_chg[g_nchg - 1].type = 0; return; }     // la transazione non si potrà leggere confermata
+        g_chg = nv;
+        g_capchg = nc;
+    }
+    TxChange* c = &g_chg[g_nchg];
+    memset(c, 0, sizeof(*c));
+    c->tx = tx;
+    c->seq = ++g_chg_seq;
+    snprintf(c->db, sizeof(c->db), "%s", db);
+    snprintf(c->table, sizeof(c->table), "%s", table);
+    c->type = type;
+    c->rid = rid;
+    c->nrid = nrid;
+    if (old && ol) {
+        c->old = malloc(ol);
+        if (c->old) { memcpy(c->old, old, ol); c->ol = ol; }
+        else c->type = 0;
+    }
+    g_nchg++;
+}
+
+// via le voci della transazione tx dopo il numero after (0 = tutte): COMMIT, ROLLBACK, ROLLBACK TO
+static void chg_drop(uint64_t tx, uint64_t after) {
+    int k = 0;
+    for (int i = 0; i < g_nchg; i++) {
+        if (g_chg[i].tx == tx && g_chg[i].seq > after) { free(g_chg[i].old); continue; }
+        g_chg[k++] = g_chg[i];
+    }
+    g_nchg = k;
+}
+
+typedef struct { RID rid; const uint8_t* old; size_t ol; bool fresh; } SnapRow;
+
+static int snaprow_cmp(const void* a, const void* b) {
+    const SnapRow* x = a; const SnapRow* y = b;
+    if (x->rid.page_id != y->rid.page_id) return x->rid.page_id < y->rid.page_id ? -1 : 1;
+    return x->rid.slot_id < y->rid.slot_id ? -1 : x->rid.slot_id > y->rid.slot_id;
+}
+
+static HeapSnapshot g_snaps[16];
+static int g_nsnaps;
+
+static void snapshot_clear(void) {
+    heap_snapshot_set(NULL, 0);
+    for (int i = 0; i < g_nsnaps; i++) {
+        free(g_snaps[i].hide); free(g_snaps[i].repl_rid); free(g_snaps[i].repl); free(g_snaps[i].repl_len);
+        free(g_snaps[i].extra); free(g_snaps[i].extra_len);
+    }
+    memset(g_snaps, 0, sizeof(g_snaps));
+    g_nsnaps = 0;
+}
+
+// versione confermata della tabella (db, table) rispetto alla transazione tx
+static bool snapshot_build(uint64_t tx, int dbi, const char* table, HeapSnapshot* out) {
+    if (dbi < 0 || dbi >= g_db.catalog->num_databases || g_nsnaps >= 16) return false;
+    Database* d = &g_db.catalog->databases[dbi];
+    TableSchema* ts = catalog_get_table(g_db.catalog, d->name, table);
+    if (!ts) return false;
+    memset(out, 0, sizeof(*out));
+    out->root = ts->root_page_id;
+    int cap = 0, n = 0, ecap = 0;
+    SnapRow* m = NULL;              // posizione attuale -> origine (riga confermata o nuova)
+    for (int i = 0; i < g_nchg; i++) {
+        const TxChange* c = &g_chg[i];
+        if (c->tx != tx || strcasecmp(c->db, d->name) || strcasecmp(c->table, table)) continue;
+        if (!c->type) { free(m); return false; }
+        if (n + 1 > cap) {
+            cap = cap ? cap * 2 : 64;
+            SnapRow* nm = realloc(m, sizeof(SnapRow) * (size_t)cap);
+            if (!nm) { free(m); return false; }
+            m = nm;
+        }
+        int at = -1;
+        RID key = c->rid;
+        for (int k = 0; k < n; k++) if (m[k].rid.page_id == key.page_id && m[k].rid.slot_id == key.slot_id) { at = k; break; }
+        SnapRow origin = { key, c->old, c->ol, false };
+        if (at >= 0) origin = m[at];
+        switch (c->type) {
+        case LOG_INSERT:
+            if (at >= 0) m[at] = (SnapRow){ key, NULL, 0, true };
+            else m[n++] = (SnapRow){ key, NULL, 0, true };
+            break;
+        case LOG_UPDATE:
+            if (at < 0) m[n++] = origin;                         // prima modifica: la versione confermata è la vecchia
+            break;
+        case LOG_UPDATE_MOVE:
+            if (at >= 0) m[at] = m[--n];                         // la vecchia posizione non c'è più
+            origin.rid = c->nrid;
+            m[n++] = origin;
+            break;
+        case LOG_DELETE:
+            if (at >= 0) m[at] = m[--n];
+            if (!origin.fresh && origin.old) {                   // riga confermata cancellata: torna in fondo
+                if (out->nextra + 1 > ecap) {
+                    ecap = ecap ? ecap * 2 : 16;
+                    uint8_t** ne = realloc(out->extra, sizeof(uint8_t*) * (size_t)ecap);
+                    size_t* nl = realloc(out->extra_len, sizeof(size_t) * (size_t)ecap);
+                    if (ne) out->extra = ne;
+                    if (nl) out->extra_len = nl;
+                    if (!ne || !nl) { free(m); return false; }
+                }
+                out->extra[out->nextra] = (uint8_t*)origin.old;
+                out->extra_len[out->nextra++] = origin.ol;
+            }
+            break;
+        }
+    }
+    if (n) qsort(m, (size_t)n, sizeof(SnapRow), snaprow_cmp);
+    out->hide = malloc(sizeof(RID) * (size_t)(n + 1));
+    out->repl_rid = malloc(sizeof(RID) * (size_t)(n + 1));
+    out->repl = malloc(sizeof(uint8_t*) * (size_t)(n + 1));
+    out->repl_len = malloc(sizeof(size_t) * (size_t)(n + 1));
+    if (!out->hide || !out->repl_rid || !out->repl || !out->repl_len) { free(m); return false; }
+    for (int k = 0; k < n; k++) {
+        if (m[k].fresh) out->hide[out->nhide++] = m[k].rid;
+        else if (m[k].old) {
+            out->repl_rid[out->nrepl] = m[k].rid;
+            out->repl[out->nrepl] = (uint8_t*)m[k].old;
+            out->repl_len[out->nrepl++] = m[k].ol;
+        }
+    }
+    free(m);
+    return true;
+}
+
+// SELECT ... FOR UPDATE / FOR SHARE / LOCK IN SHARE MODE: aspetta come in MySQL (niente versione confermata)
+static bool locking_read(const TokenList* tl) {
+    for (int i = 0; tl && i + 1 < tl->count; i++) {
+        const Token* t = &tl->tokens[i];
+        if (t->type == TOK_FOR && (tl->tokens[i + 1].type == TOK_UPDATE ||
+                                   (tl->tokens[i + 1].text && !strcasecmp(tl->tokens[i + 1].text, "SHARE")))) return true;
+        if (t->text && !strcasecmp(t->text, "LOCK") && tl->tokens[i + 1].type == TOK_IN) return true;
+    }
+    return false;
+}
 
 // ── lock delle tabelle per statement (transazioni concorrenti, vedi locks.h) ──
 
@@ -700,7 +860,35 @@ static DbSession* g_active;
 
 // prende i lock; 0 = presi, 1 = deadlock, 2 = tempo scaduto. Mentre aspetta lascia il motore
 // (la sessione esce, il lock del motore si libera, l'hook del thread lascia passare gli altri)
-static int acquire_locks(const LockSet* ls) {
+static uint64_t owner_tx(const void* owner) {
+    if (owner == (const void*)&g_default_session) return g_active ? g_default_session.tx_id : g_db.exec_ctx.tx_id;
+    if (owner == (const void*)g_active) return g_db.exec_ctx.tx_id;
+    return ((const DbSession*)owner)->tx_id;
+}
+
+// lettura senza attesa: le tabelle in scrittura altrui si leggono nella versione confermata, le altre
+// con il lock S solito. true = fatto (heap_snapshot impostato per questo thread)
+static bool try_snapshot(const LockSet* ls) {
+    const void* owner = lock_owner();
+    LkReq rest[MAX_STMT_LOCKS];
+    int nr = 0;
+    snapshot_clear();
+    for (int i = 0; i < ls->n; i++) {
+        const LkReq* q = &ls->r[i];
+        const void* xo = q->mode == LK_S && q->db >= 0 ? lk_x_holder(q->db, q->table, owner) : NULL;
+        if (xo) {
+            uint64_t tx = owner_tx(xo);
+            if (!tx || !snapshot_build(tx, q->db, q->table, &g_snaps[g_nsnaps])) { snapshot_clear(); return false; }
+            g_nsnaps++;
+        } else rest[nr++] = *q;
+    }
+    if (!g_nsnaps) return false;
+    if (lk_acquire(owner, rest, nr) != LK_GRANTED) { lk_cancel_wait(owner); snapshot_clear(); return false; }
+    heap_snapshot_set(g_snaps, g_nsnaps);
+    return true;
+}
+
+static int acquire_locks(const LockSet* ls, bool allow_snapshot) {
     if (!ls->n) return 0;
     double t0 = get_time_ms();
     for (;;) {
@@ -708,6 +896,7 @@ static int acquire_locks(const LockSet* ls) {
         int r = lk_acquire(owner, ls->r, ls->n);
         if (r == LK_GRANTED) return 0;
         if (r == LK_DEADLOCK) return 1;
+        if (allow_snapshot && try_snapshot(ls)) return 3;     // SELECT: la versione confermata, subito
         if (get_time_ms() - t0 > g_lock_wait_ms || g_lock_depth != 1) { lk_cancel_wait(owner); return 2; }
         DbSession* s = g_active;
         if (s) { session_save(s); session_load(&g_default_session); g_active = NULL; }
@@ -794,8 +983,10 @@ static QueryResult* db_execute_impl(const char* sql) {
         if (!ls) result = result_error("Out of memory");
         else {
             stmt_locks(parsed->statements[0], tokens, ls, g_db.catalog->current_db);
-            int why = acquire_locks(ls);
-            result = why ? lock_error(why) : exec_one(parsed->statements[0]);
+            bool snap = stmt_lock_kind(parsed->statements[0]) == 1 && !locking_read(tokens);
+            int why = acquire_locks(ls, snap);
+            result = why == 1 || why == 2 ? lock_error(why) : exec_one(parsed->statements[0]);
+            if (why == 3) snapshot_clear();
             release_if_autocommit();
             free(ls);
         }
@@ -829,8 +1020,12 @@ static QueryResult** db_execute_multi_impl(const char* sql, int* out_count) {
     for (int i = 0; i < parsed->count; i++) {
         // i lock di ogni statement dal testo intero (sovrastima: più tabelle, mai meno)
         int why = 0;
-        if (ls) { stmt_locks(parsed->statements[i], tokens, ls, g_db.catalog->current_db); why = acquire_locks(ls); }
-        results[i] = !ls ? result_error("Out of memory") : why ? lock_error(why) : exec_one(parsed->statements[i]);
+        if (ls) {
+            stmt_locks(parsed->statements[i], tokens, ls, g_db.catalog->current_db);
+            why = acquire_locks(ls, stmt_lock_kind(parsed->statements[i]) == 1 && !locking_read(tokens));
+        }
+        results[i] = !ls ? result_error("Out of memory") : why == 1 || why == 2 ? lock_error(why) : exec_one(parsed->statements[i]);
+        if (why == 3) snapshot_clear();
         release_if_autocommit();
         if (results[i])
             results[i]->exec_time_ms = get_time_ms() - t_start;
@@ -891,6 +1086,7 @@ static bool db_commit_impl(void) {
               (SVRID){0,0}, NULL, 0, NULL, 0);
     wal_flush(g_db.wal); // DEVE essere su disco prima del commit
     txm_commit(g_db.txm, g_db.exec_ctx.tx_id);
+    chg_drop(g_db.exec_ctx.tx_id, 0);
     g_db.exec_ctx.tx_id = 0;
     g_num_savepoints = 0;
     if (g_open_tx > 0) g_open_tx--;
@@ -911,6 +1107,7 @@ static bool db_rollback_impl(void) {
     // Invalida tutte le pagine in cache per forzare la rilettura dal disco
     bp_remove_all(g_db.bp);
     txm_abort(g_db.txm, g_db.exec_ctx.tx_id);
+    chg_drop(g_db.exec_ctx.tx_id, 0);
     g_db.exec_ctx.tx_id = 0;
     g_num_savepoints = 0;
     if (g_open_tx > 0) g_open_tx--;
@@ -920,7 +1117,7 @@ static bool db_rollback_impl(void) {
 }
 
 // Simple savepoint tracking: store name and file offset
-static struct { char name[64]; off_t offset; } g_savepoints[64];
+static SavepointRec g_savepoints[64];
 static int g_num_savepoints = 0;   // (dichiarato prima di exec_atomic)
 
 static bool db_savepoint_impl(const char* name) {
@@ -945,6 +1142,7 @@ static bool db_savepoint_impl(const char* name) {
     // Record offset
     snprintf(g_savepoints[g_num_savepoints].name, sizeof(g_savepoints[g_num_savepoints].name), "%s", name);
     g_savepoints[g_num_savepoints].offset = sv_lseek(g_db.wal->fd, 0, SEEK_CUR);
+    g_savepoints[g_num_savepoints].chg_seq = g_chg_seq;
     g_num_savepoints++;
     return true;
 }
@@ -962,6 +1160,7 @@ static bool db_rollback_to_impl(const char* name) {
 
     // annulla le voci della transazione scritte dopo il savepoint (stesso undo del ROLLBACK)
     off_t sp_off = g_savepoints[sp_idx].offset;
+    chg_drop(g_db.exec_ctx.tx_id, g_savepoints[sp_idx].chg_seq);
     wal_undo_tx_from(g_db.log_path, g_db.db_path, g_db.exec_ctx.tx_id, (long)sp_off);
 
     // il log non si accorcia (dopo il savepoint ci sono anche le voci delle altre transazioni): una
