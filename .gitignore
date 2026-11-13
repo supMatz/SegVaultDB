@@ -74,4 +74,3 @@ test_mysql
 build-dist/
 bin/SegVault-*.zip
 bin/SegVault-*.tar.gz
-bin/linux-x86_64/segvault-server-static
