@@ -14,6 +14,14 @@ SCOPO: server HTTP/JSON di SegVault: espone il motore (db_api.h) a siti web,
 #include <stdbool.h>
 #include <stddef.h>
 
+// un sito con un nome: "blog" risponde a http://blog.localhost e http://blog.test (anche ai
+// sottodomini: api.blog.localhost), un nome con un punto ("shop.example.com") solo a sé stesso
+typedef struct {
+    const char* name;
+    const char* target;       // cartella del sito, oppure "http://host:porta" / "porta" (reverse proxy verso
+                              // un dev server: Vite, Next.js, Express, Django, ...; WebSocket compresi)
+} SvSite;
+
 typedef struct {
     const char* bind_addr;    // indirizzo IPv4 (default 127.0.0.1)
     int         port;         // 0 = porta libera scelta dal sistema (vedi sv_server_port)
@@ -37,6 +45,13 @@ typedef struct {
     int         php_workers;  // processi php-cgi (0 = 4): richieste PHP eseguite insieme
     const char* api_prefix;   // dove sta l'API HTTP (NULL = "/api/v1"; "none" = spenta, resta il protocollo MySQL).
                               // Con PHP le richieste sotto il prefisso che non sono dell'API vanno al sito
+    // siti (virtual host). Ogni sottocartella di static_dir è anche un sito automatico:
+    // www/blog -> http://blog.localhost:PORTA (i browser risolvono *.localhost da soli), con
+    // www/blog/public come radice se la cartella non ha un index (Laravel, Symfony)
+    const SvSite* sites;
+    int         n_sites;
+    bool        no_auto_sites;// niente siti automatici dalle sottocartelle
+    bool        dir_listing;  // elenco dei file di una cartella senza index (come Apache "Indexes")
 } SvServerConfig;
 
 typedef struct SvServer SvServer;

@@ -41,6 +41,9 @@ SEGVAULT_TOKEN=segreto ./segvault-server -b 0.0.0.0   # raggiungibile in rete: i
 | `--php PATH\|auto` | esegue i `.php` di `--static DIR` con `php-cgi` (FastCGI; `auto` lo cerca in `php/`, nel `PATH`, ...) |
 | `--php-fcgi ADDR` | li esegue con php-fpm già avviato: `host:porta` o `unix:/percorso.sock` |
 | `--php-workers N` | processi `php-cgi` (default 4) |
+| `--site NOME=DEST` | un sito su `http://NOME.localhost:PORTA` (e `NOME.test`): `DEST` è una cartella oppure un dev server da raggiungere col reverse proxy (`http://127.0.0.1:5173`, anche solo `5173`; WebSocket compresi). Ripetibile |
+| `--no-auto-sites` | le sottocartelle di `--static` non diventano siti |
+| `--no-dir-listing` | 404 invece dell'elenco dei file per le cartelle senza index |
 | `--api-prefix P` | prefisso dell'API (default `/api/v1`; `none` = spenta). Con PHP, i percorsi sotto il prefisso che non sono dell'API vanno al sito |
 | `--max-body MB` | corpo massimo di una richiesta (default 16) |
 | `--timeout S` | ferma una richiesta che dura più di S secondi (default 30, `0` = mai) |
@@ -278,6 +281,27 @@ DROP USER anna;
   permessi di chi li ha creati (come una procedura), quindi un endpoint pubblico può leggere una
   tabella che i visitatori non vedono direttamente.
 
+## Siti di sviluppo (virtual host)
+
+Come Laragon, ma senza modificare il file `hosts`: i browser risolvono da soli ogni nome che finisce
+in `.localhost`.
+
+- Ogni sottocartella di `--static` è un sito: `www/blog` → `http://blog.localhost:8484/`
+  (anche `blog.test`, se il nome punta a questa macchina, e i sottodomini `api.blog.localhost`).
+  Se la cartella non ha un `index.php` / `index.html` ma ha una `public/`, la radice è `public/`
+  (Laravel, Symfony): `.env` e il codice restano fuori dal sito.
+- `--site NOME=CARTELLA` aggiunge un sito che sta altrove; un `NOME` con un punto
+  (`shop.example.com`) risponde solo a quel nome esatto.
+- `--site app=http://127.0.0.1:5173` (o `--site app=5173`) inoltra tutto `app.localhost` a un dev
+  server: Vite, Next.js, Nuxt, Express, Django, Flask, Rails, Go, `php artisan serve`. Le risposte
+  passano in streaming (Server-Sent Events, download), le connessioni WebSocket della ricarica a
+  caldo vengono collegate, il backend riceve `Host` originale e `X-Forwarded-For / Proto / Host / Port`.
+  Se il dev server è spento, il browser mostra una pagina 502 che spiega cosa avviare.
+- `http://localhost:PORTA/` senza un index (e `/.segvault/` da qualsiasi sito) mostra il cruscotto:
+  servizi attivi e siti, con il tipo di progetto riconosciuto. Solo per i client di questa macchina.
+- Una cartella senza index mostra l'elenco dei suoi file (senza quelli nascosti); `--no-dir-listing`
+  lo spegne.
+
 ## Sicurezza
 
 - Default sicuri: ascolto solo su `127.0.0.1`; in rete serve `--token` o `--users`.
@@ -295,5 +319,6 @@ DROP USER anna;
   `text/plain` il browser non chiede il permesso CORS prima). Per questo una richiesta con un header
   `Origin` viene eseguita solo se l'origine è la pagina servita dal server stesso o quella ammessa
   con `--cors`; le altre ricevono 403 senza eseguire nulla. Senza token, inoltre, il server in
-  ascolto su `127.0.0.1` risponde solo se `Host` è `localhost` / `127.x.x.x` (difesa dal *DNS rebinding*).
+  ascolto su `127.0.0.1` risponde solo se `Host` è `localhost` / `*.localhost` / `127.x.x.x` (difesa dal
+  *DNS rebinding*: i nomi `.localhost` puntano sempre a questa macchina, RFC 6761).
   Client che non sono browser (curl, Python, C#, Java, Node) non inviano `Origin` e non ne sono toccati.

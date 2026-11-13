@@ -9,6 +9,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #include "json.h"
 #include "mysql_wire.h"
 #include "fastcgi.h"
+#include "proxy.h"
 #include "../widgets/png_write.h"
 #include "../bridge/db_api.h"
 #include "../bridge/auth.h"
@@ -16,6 +17,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #include "../../include/common.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <math.h>
 #include <stdarg.h>
@@ -73,6 +75,14 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #define SESSION_IDLE_MS   (5 * 60 * 1000)   // una sessione inattiva si chiude
 #define TX_IDLE_MS        (30 * 1000)       // una transazione ferma si annulla (non blocca gli altri)
 #define SESSION_WAIT_MS   10000             // attesa massima di una richiesta per una transazione altrui
+// un sito con nome (vedi SvSite): cartella oppure backend del reverse proxy
+typedef struct {
+    char  name[128];          // in minuscolo
+    char* dir;                // NULL = proxy
+    char  phost[256];         // backend del proxy
+    int   pport;
+} Site;
+
 typedef struct {
     char       id[33];
     DbSession* db;
@@ -89,6 +99,8 @@ struct SvServer {
     char           api[128];            // prefisso dell'API ("" = spenta)
     char*          doc_root;            // percorso assoluto di static_dir (SCRIPT_FILENAME per PHP)
     FcgiPool*      php;                 // NULL = PHP spento
+    Site*          sites;               // siti con nome (--site); quelli automatici si cercano a ogni richiesta
+    int            n_sites;
     sock_t         listen_fd;
     int            port;
     sock_t         mysql_fd;            // protocollo MySQL (BAD_SOCK = spento)
@@ -146,6 +158,13 @@ typedef struct {
     bool   accept_gzip;                 // Accept-Encoding comprende gzip
     const char* client;                 // indirizzo e porta del client (REMOTE_ADDR / REMOTE_PORT)
     int    client_port;
+    // sito scelto dall'Host (vedi resolve_site)
+    const char* root;                   // cartella del sito (NULL = nessuna)
+    char   root_buf[4096];
+    char   root_abs[4096];              // percorso assoluto (DOCUMENT_ROOT di PHP)
+    const Site* proxy;                  // sito servito da un altro server (reverse proxy)
+    char   site[128];                   // nome del sito ("" = quello predefinito)
+    bool   upgrade;                     // Upgrade: websocket
 } Request;
 
 typedef struct {
@@ -1249,9 +1268,9 @@ static void set_own_headers(Response* rs, const char* text) {
 }
 
 // 404 del sito: la pagina 404.html della cartella, se c'è
-static void web_not_found(SvServer* s, Response* rs) {
-    char p[4096];
-    snprintf(p, sizeof(p), "%s/404.html", s->static_dir);
+static void web_not_found(const Request* rq, Response* rs) {
+    char p[4300];
+    snprintf(p, sizeof(p), "%s/404.html", rq->root ? rq->root : ".");
     FILE* f = fopen(p, "rb");
     if (!f) { json_error(rs, 404, "not found"); return; }
     char chunk[65536];
@@ -1266,7 +1285,7 @@ static void web_not_found(SvServer* s, Response* rs) {
 // tutto; i testi piccoli vengono compressi da send_response, gli altri inviati a pezzi
 static void serve_file(SvServer* s, const Request* rq, Response* rs, const char* full) {
     long long size, mtime;
-    if (!file_info(full, &size, &mtime)) { web_not_found(s, rs); return; }
+    if (!file_info(full, &size, &mtime)) { web_not_found(rq, rs); return; }
     const char* ctype = mime_of(full);
     bool range = rq->range[0] && !strcmp(rq->method, "GET");
     bool gz = rq->accept_gzip && !range && compressible(ctype) && size >= GZIP_MIN && size <= (long long)GZIP_MAX;
@@ -1293,7 +1312,7 @@ static void serve_file(SvServer* s, const Request* rq, Response* rs, const char*
         return;
     }
     FILE* f = fopen(full, "rb");
-    if (!f) { web_not_found(s, rs); return; }
+    if (!f) { web_not_found(rq, rs); return; }
     if (r > 0) snprintf(hdr + hl, sizeof(hdr) - (size_t)hl, "Content-Range: bytes %lld-%lld/%lld\r\n", from, from + len - 1, size);
     set_own_headers(rs, hdr);
     rs->status = r > 0 ? 206 : 200;
@@ -1376,8 +1395,8 @@ static void cgi_response(Response* rs, JsonBuf* out) {
 // script: percorso nel sito ("/blog/index.php"); info: PATH_INFO ("" se manca)
 static void run_php(SvServer* s, Request* rq, Response* rs, const char* script, const char* info) {
     char filename[4096], translated[4096] = "", port[16], rport[16], clen[24], server_name[256];
-    snprintf(filename, sizeof(filename), "%s%s", s->doc_root, script);
-    if (info[0]) snprintf(translated, sizeof(translated), "%s%s", s->doc_root, info);
+    snprintf(filename, sizeof(filename), "%s%s", rq->root_abs, script);
+    if (info[0]) snprintf(translated, sizeof(translated), "%s%s", rq->root_abs, info);
     snprintf(port, sizeof(port), "%d", s->port);
     snprintf(rport, sizeof(rport), "%d", rq->client_port);
     snprintf(clen, sizeof(clen), "%zu", rq->body_len);
@@ -1397,7 +1416,7 @@ static void run_php(SvServer* s, Request* rq, Response* rs, const char* script, 
     P("REQUEST_METHOD", rq->method);
     P("REQUEST_URI", rq->uri);
     P("QUERY_STRING", rq->query);
-    P("DOCUMENT_ROOT", s->doc_root);
+    P("DOCUMENT_ROOT", rq->root_abs);
     P("SCRIPT_NAME", script);
     P("SCRIPT_FILENAME", filename);
     if (info[0]) { P("PATH_INFO", info); P("PATH_TRANSLATED", translated); }
@@ -1467,15 +1486,353 @@ static void run_php(SvServer* s, Request* rq, Response* rs, const char* script, 
     free(errout.data);
 }
 
+
+// ── siti (virtual host) ─────────────────────────────────────────
+
+// percorso assoluto con "/" come separatore (false se non esiste)
+static bool abs_path(const char* in, char* out, size_t n) {
+#ifdef _WIN32
+    char tmp[4096];
+    if (!_fullpath(tmp, in, sizeof(tmp))) return false;
+    for (char* q = tmp; *q; q++) if (*q == '\\') *q = '/';
+    if (!path_is(tmp, S_IFDIR)) return false;
+#else
+    char* tmp = realpath(in, NULL);
+    if (!tmp) return false;
+#endif
+    size_t l = strlen(tmp);
+    while (l > 1 && tmp[l - 1] == '/') tmp[--l] = '\0';
+    bool ok = l < n;
+    if (ok) memcpy(out, tmp, l + 1);
+#ifndef _WIN32
+    free(tmp);
+#endif
+    return ok;
+}
+
+// nome di una cartella usabile come sito: lettere, cifre, '-' e '_' (niente punti: niente "..")
+static bool site_label(const char* s, size_t n) {
+    if (n == 0 || n > 63) return false;
+    for (size_t i = 0; i < n; i++)
+        if (!isalnum((unsigned char)s[i]) && s[i] != '-' && s[i] != '_') return false;
+    return true;
+}
+
+static bool has_index(const char* dir) {
+    char p[4200];
+    snprintf(p, sizeof(p), "%s/index.php", dir);
+    if (path_is(p, S_IFREG)) return true;
+    snprintf(p, sizeof(p), "%s/index.html", dir);
+    return path_is(p, S_IFREG);
+}
+
+// radice di un sito automatico: la cartella, o la sua public/ se lei non ha un index (Laravel, Symfony)
+static void auto_root(const char* dir, char* out, size_t n) {
+    snprintf(out, n, "%s", dir);
+    if (has_index(dir)) return;
+    char pub[4200];
+    snprintf(pub, sizeof(pub), "%s/public", dir);
+    if (path_is(pub, S_IFDIR)) snprintf(out, n, "%s", pub);
+}
+
+static const Site* find_site(SvServer* s, const char* name, size_t n) {
+    for (int i = 0; i < s->n_sites; i++)
+        if (strlen(s->sites[i].name) == n && !strncmp(s->sites[i].name, name, n)) return &s->sites[i];
+    return NULL;
+}
+
+static bool use_site(SvServer* s, Request* rq, const char* name, size_t n) {
+    const Site* st = find_site(s, name, n);
+    char dir[4200];
+    if (st && !st->dir) {
+        rq->proxy = st;
+    } else if (st) {
+        snprintf(rq->root_buf, sizeof(rq->root_buf), "%s", st->dir);
+    } else if (s->static_dir && !s->cfg.no_auto_sites && site_label(name, n)) {
+        snprintf(dir, sizeof(dir), "%s/%.*s", s->static_dir, (int)n, name);
+        if (!path_is(dir, S_IFDIR)) return false;
+        auto_root(dir, rq->root_buf, sizeof(rq->root_buf));
+    } else return false;
+    snprintf(rq->site, sizeof(rq->site), "%.*s", (int)n, name);
+    if (!rq->proxy) {
+        rq->root = rq->root_buf;
+        if (!abs_path(rq->root, rq->root_abs, sizeof(rq->root_abs))) snprintf(rq->root_abs, sizeof(rq->root_abs), "%s", rq->root);
+    }
+    return true;
+}
+
+// sito della richiesta dall'Host: "blog.localhost" / "blog.test" / "api.blog.localhost" -> sito "blog",
+// un nome completo configurato ("shop.example.com") -> quel sito; altrimenti la cartella del server
+static void resolve_site(SvServer* s, Request* rq) {
+    rq->root = s->static_dir;
+    rq->proxy = NULL;
+    rq->site[0] = '\0';
+    if (s->doc_root) snprintf(rq->root_abs, sizeof(rq->root_abs), "%s", s->doc_root);
+    else if (!s->static_dir || !abs_path(s->static_dir, rq->root_abs, sizeof(rq->root_abs)))
+        snprintf(rq->root_abs, sizeof(rq->root_abs), "%s", s->static_dir ? s->static_dir : "");
+    char h[256];
+    snprintf(h, sizeof(h), "%s", rq->host);
+    if (h[0] == '[') return;                                 // indirizzo IPv6
+    char* colon = strchr(h, ':');
+    if (colon) *colon = '\0';
+    size_t l = strlen(h);
+    while (l > 0 && h[l - 1] == '.') h[--l] = '\0';          // "blog.localhost."
+    for (size_t i = 0; i < l; i++) h[i] = (char)tolower((unsigned char)h[i]);
+    if (!l) return;
+    if (find_site(s, h, l)) { use_site(s, rq, h, l); return; }
+    static const char* const SUF[] = { ".localhost", ".test" };
+    for (int k = 0; k < 2; k++) {
+        size_t sl = strlen(SUF[k]);
+        if (l <= sl || strcmp(h + l - sl, SUF[k])) continue;
+        size_t bl = l - sl;
+        if (use_site(s, rq, h, bl)) return;                  // "api.blog" (un sito con quel nome)
+        const char* dot = NULL;                              // sottodominio: si guarda l'ultima etichetta
+        for (size_t i = 0; i < bl; i++) if (h[i] == '.') dot = h + i;
+        if (dot) use_site(s, rq, dot + 1, (size_t)(h + bl - dot - 1));
+        return;
+    }
+}
+
+static bool client_is_local(const Request* rq) {
+    return rq->client && (!strncmp(rq->client, "127.", 4) || !strcmp(rq->client, "::1"));
+}
+
+static void html_esc(JsonBuf* b, const char* t) {
+    for (; *t; t++) {
+        switch (*t) {
+        case '<': jb_lit(b, "&lt;"); break;
+        case '>': jb_lit(b, "&gt;"); break;
+        case '&': jb_lit(b, "&amp;"); break;
+        case '"': jb_lit(b, "&quot;"); break;
+        case '\'': jb_lit(b, "&#39;"); break;
+        default: jb_raw(b, t, 1);
+        }
+    }
+}
+
+// percorso in un URL (%xx per gli spazi e i caratteri speciali, "/" resta)
+static void url_esc(JsonBuf* b, const char* t) {
+    for (; *t; t++) {
+        unsigned char c = (unsigned char)*t;
+        if (isalnum(c) || strchr("/-_.~", c)) jb_raw(b, t, 1);
+        else jb_printf(b, "%%%02X", c);
+    }
+}
+
+static const char* const PAGE_CSS =
+    ":root{--bg:#f6f7f9;--fg:#1d2330;--mut:#667085;--card:#fff;--line:#e4e7ec;--acc:#2563eb;--ok:#16a34a;--off:#9aa1ad}"
+    "@media(prefers-color-scheme:dark){:root{--bg:#111318;--fg:#e6e8ec;--mut:#98a2b3;--card:#1a1d24;--line:#2a2f3a;--acc:#60a5fa;--ok:#4ade80;--off:#6b7280}}"
+    "*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}"
+    "main{max-width:1000px;margin:0 auto;padding:28px 16px}h1{font-size:22px;margin:0 0 4px}h2{font-size:15px;margin:28px 0 10px;color:var(--mut);"
+    "text-transform:uppercase;letter-spacing:.06em}a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}"
+    ".sub{color:var(--mut);margin:0 0 20px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}"
+    ".card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}.card b{display:block;font-size:13px;color:var(--mut);font-weight:500}"
+    ".card span{font-size:16px;word-break:break-all}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--off)}"
+    ".dot.on{background:var(--ok)}table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}"
+    "th,td{text-align:left;padding:9px 14px;border-bottom:1px solid var(--line);vertical-align:top}th{font-size:13px;color:var(--mut);font-weight:500}"
+    "tr:last-child td{border-bottom:0}td.n{text-align:right;white-space:nowrap;color:var(--mut)}.tag{font-size:12px;border:1px solid var(--line);border-radius:99px;padding:1px 8px;color:var(--mut);white-space:nowrap}"
+    ".path{color:var(--mut);font-size:13px;word-break:break-all}.wrap{overflow-x:auto}code{font:13px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}";
+
+static void page_start(JsonBuf* b, const char* title) {
+    jb_lit(b, "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
+    html_esc(b, title);
+    jb_lit(b, "</title><style>");
+    jb_raw(b, PAGE_CSS, strlen(PAGE_CSS));
+    jb_lit(b, "</style></head><body><main>");
+}
+
+// che cosa c'è in una cartella di progetto (per il cruscotto)
+static const char* project_kind(const char* dir) {
+    static const struct { const char* file; const char* kind; } K[] = {
+        { "artisan", "Laravel" }, { "wp-load.php", "WordPress" }, { "wp-config.php", "WordPress" }, { "bin/console", "Symfony" },
+        { "craft", "Craft CMS" }, { "spark", "CodeIgniter" }, { "core/lib/Drupal.php", "Drupal" }, { "web/core/lib/Drupal.php", "Drupal" },
+        { "configuration.php", "Joomla" }, { "composer.json", "PHP" }, { "index.php", "PHP" }, { "public/index.php", "PHP" },
+        { "package.json", "Node" }, { "index.html", "Static" },
+    };
+    char p[4300];
+    for (size_t i = 0; i < sizeof(K) / sizeof(K[0]); i++) {
+        snprintf(p, sizeof(p), "%s/%s", dir, K[i].file);
+        if (path_is(p, S_IFREG)) return K[i].kind;
+    }
+    return "Folder";
+}
+
+typedef struct { char name[256]; bool dir; long long size, mtime; } DirEnt;
+
+static int dirent_cmp(const void* a, const void* b) {
+    const DirEnt* x = a; const DirEnt* y = b;
+    if (x->dir != y->dir) return x->dir ? -1 : 1;
+    return strcasecmp(x->name, y->name);
+}
+
+// voci di una cartella senza i file nascosti, cartelle prima (NULL se non si apre)
+static DirEnt* list_dir(const char* dir, int* count) {
+    *count = 0;
+    DIR* d = opendir(dir);
+    if (!d) return NULL;
+    int cap = 64, n = 0;
+    DirEnt* v = malloc(sizeof(DirEnt) * (size_t)cap);
+    struct dirent* e;
+    while (v && (e = readdir(d))) {
+        if (e->d_name[0] == '.' || strlen(e->d_name) >= sizeof(v[0].name)) continue;
+        if (n == cap) {
+            if (cap >= 100000) break;
+            DirEnt* nv = realloc(v, sizeof(DirEnt) * (size_t)cap * 2);
+            if (!nv) break;
+            v = nv; cap *= 2;
+        }
+        char p[4400];
+        snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
+        DirEnt* de = &v[n];
+        snprintf(de->name, sizeof(de->name), "%s", e->d_name);
+        de->dir = path_is(p, S_IFDIR);
+        de->size = de->mtime = 0;
+        if (!de->dir && !file_info(p, &de->size, &de->mtime)) continue;
+        n++;
+    }
+    closedir(d);
+    if (v) qsort(v, (size_t)n, sizeof(DirEnt), dirent_cmp);
+    *count = n;
+    return v;
+}
+
+static void human_size(long long n, char* out, size_t sz) {
+    if (n < 1024) snprintf(out, sz, "%lld B", n);
+    else if (n < 1024 * 1024) snprintf(out, sz, "%.1f KB", n / 1024.0);
+    else if (n < 1024LL * 1024 * 1024) snprintf(out, sz, "%.1f MB", n / 1048576.0);
+    else snprintf(out, sz, "%.1f GB", n / 1073741824.0);
+}
+
+// elenco dei file di una cartella senza index (--dir-listing)
+static void dir_listing(const Request* rq, Response* rs, const char* full) {
+    int n;
+    DirEnt* v = list_dir(full, &n);
+    if (!v) { web_not_found(rq, rs); return; }
+    JsonBuf* b = &rs->body;
+    char title[2200];
+    snprintf(title, sizeof(title), "Index of %s", rq->path);
+    page_start(b, title);
+    jb_lit(b, "<h1>Index of ");
+    html_esc(b, rq->path);
+    jb_lit(b, "</h1><p class=\"sub\">");
+    html_esc(b, rq->site[0] ? rq->site : "localhost");
+    jb_lit(b, "</p><div class=\"wrap\"><table><tr><th>Name</th><th>Size</th><th>Modified</th></tr>");
+    if (strcmp(rq->path, "/")) jb_lit(b, "<tr><td><a href=\"../\">../</a></td><td></td><td></td></tr>");
+    for (int i = 0; i < n; i++) {
+        jb_lit(b, "<tr><td><a href=\"");
+        url_esc(b, v[i].name);
+        if (v[i].dir) jb_lit(b, "/");
+        jb_lit(b, "\">");
+        html_esc(b, v[i].name);
+        if (v[i].dir) jb_lit(b, "/");
+        jb_lit(b, "</a></td><td class=\"n\">");
+        if (!v[i].dir) {
+            char hs[32], when[32];
+            human_size(v[i].size, hs, sizeof(hs));
+            time_t t = (time_t)v[i].mtime;
+            struct tm tmv;
+#ifdef _WIN32
+            localtime_s(&tmv, &t);
+#else
+            localtime_r(&t, &tmv);
+#endif
+            strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &tmv);
+            jb_printf(b, "%s</td><td class=\"n\">%s", hs, when);
+        } else jb_lit(b, "</td><td class=\"n\">");
+        jb_lit(b, "</td></tr>");
+    }
+    jb_lit(b, "</table></div></main></body></html>");
+    free(v);
+    rs->status = 200;
+    rs->content_type = "text/html; charset=utf-8";
+    rs->extra_headers = "Cache-Control: no-store\r\n";
+}
+
+static void dash_site_row(SvServer* s, JsonBuf* b, const char* name, const char* kind, const char* where, bool link) {
+    jb_lit(b, "<tr><td>");
+    if (link) {
+        jb_lit(b, "<a href=\"http://");
+        html_esc(b, name);
+        jb_printf(b, ".localhost:%d/\">", s->port);
+        html_esc(b, name);
+        jb_printf(b, ".localhost:%d</a>", s->port);
+    } else html_esc(b, name);
+    jb_lit(b, "</td><td><span class=\"tag\">");
+    html_esc(b, kind);
+    jb_lit(b, "</span></td><td class=\"path\">");
+    html_esc(b, where);
+    jb_lit(b, "</td></tr>");
+}
+
+// cruscotto di SegVault (http://localhost:PORTA/ senza index, o /.segvault/): servizi e siti
+static void dashboard(SvServer* s, Response* rs) {
+    JsonBuf* b = &rs->body;
+    page_start(b, "SegVault");
+    jb_lit(b, "<h1>SegVault</h1><p class=\"sub\">Local development server &middot; version " SV_VERSION_STR "</p><h2>Services</h2><div class=\"grid\">");
+    jb_printf(b, "<div class=\"card\"><b><i class=\"dot on\"></i>Web</b><span>http://localhost:%d</span></div>", s->port);
+    jb_lit(b, "<div class=\"card\"><b>");
+    jb_printf(b, "<i class=\"dot%s\"></i>PHP</b><span>", s->php ? " on" : "");
+    html_esc(b, s->php ? fcgi_pool_describe(s->php) : "off (start with --php auto)");
+    jb_lit(b, "</span></div>");
+    if (s->mysql_fd != BAD_SOCK)
+        jb_printf(b, "<div class=\"card\"><b><i class=\"dot on\"></i>MySQL protocol</b><span>127.0.0.1:%d</span></div>", s->mysql_port);
+    else
+        jb_lit(b, "<div class=\"card\"><b><i class=\"dot\"></i>MySQL protocol</b><span>off (--mysql-port 3306)</span></div>");
+    if (s->api[0]) {
+        jb_lit(b, "<div class=\"card\"><b><i class=\"dot on\"></i>HTTP API</b><span>");
+        html_esc(b, s->api);
+        jb_lit(b, "</span></div>");
+    }
+    jb_lit(b, "</div><h2>Sites</h2>");
+    int shown = 0;
+    JsonBuf rows = {0};
+    for (int i = 0; i < s->n_sites; i++) {
+        const Site* st = &s->sites[i];
+        char where[600];
+        if (st->dir) snprintf(where, sizeof(where), "%s", st->dir);
+        else snprintf(where, sizeof(where), "proxy \xe2\x86\x92 http://%s:%d", st->phost, st->pport);
+        bool full = strchr(st->name, '.') != NULL;
+        dash_site_row(s, &rows, st->name, st->dir ? project_kind(st->dir) : "Proxy", where, !full);
+        shown++;
+    }
+    if (s->static_dir && !s->cfg.no_auto_sites) {
+        int n;
+        DirEnt* v = list_dir(s->static_dir, &n);
+        for (int i = 0; v && i < n; i++) {
+            if (!v[i].dir || !site_label(v[i].name, strlen(v[i].name)) || find_site(s, v[i].name, strlen(v[i].name))) continue;
+            char dir[4400], root[4400];
+            snprintf(dir, sizeof(dir), "%s/%s", s->static_dir, v[i].name);
+            auto_root(dir, root, sizeof(root));
+            dash_site_row(s, &rows, v[i].name, project_kind(dir), root, true);
+            shown++;
+        }
+        free(v);
+    }
+    if (shown) {
+        jb_lit(b, "<div class=\"wrap\"><table><tr><th>URL</th><th>Type</th><th>Root</th></tr>");
+        if (rows.data) jb_raw(b, rows.data, rows.len);
+        jb_lit(b, "</table></div>");
+    } else {
+        jb_lit(b, "<p class=\"sub\">No sites yet. Every folder in the web folder");
+        if (s->static_dir) { jb_lit(b, " (<code>"); html_esc(b, s->static_dir); jb_lit(b, "</code>)"); }
+        jb_lit(b, " becomes <code>http://NAME.localhost</code>; a dev server becomes a site with <code>--site NAME=http://127.0.0.1:5173</code>.</p>");
+    }
+    free(rows.data);
+    jb_lit(b, "</main></body></html>");
+    rs->status = 200;
+    rs->content_type = "text/html; charset=utf-8";
+    rs->extra_headers = "Cache-Control: no-store\r\n";
+}
+
 // sito web (static_dir): file statici, script .php, cartelle con index.php / index.html,
 // e il "front controller" (un percorso che non esiste va a /index.php: URL di WordPress e Laravel)
 static void handle_web(SvServer* s, Request* rq, Response* rs) {
     const char* p = rq->path;
     // niente "..", backslash o percorsi nascosti: si resta dentro static_dir
     for (const char* q = p; *q; q++) {
-        if (*q == '\\' || *q == ':') { web_not_found(s, rs); return; }
+        if (*q == '\\' || *q == ':') { web_not_found(rq, rs); return; }
         // file nascosti e ".." no; /.well-known/ sì (certificati ACME, security.txt, ...)
-        if (*q == '/' && q[1] == '.' && !(q == p && !strncmp(q, "/.well-known/", 13))) { web_not_found(s, rs); return; }
+        if (*q == '/' && q[1] == '.' && !(q == p && !strncmp(q, "/.well-known/", 13))) { web_not_found(rq, rs); return; }
     }
     bool get = !strcmp(rq->method, "GET") || !strcmp(rq->method, "HEAD");
     char script[2048] = "", info[2048] = "", full[4096];
@@ -1488,8 +1845,8 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
             break;
         }
     if (!script[0]) {
-        int n = snprintf(full, sizeof(full), "%s%s", s->static_dir, p);
-        if (n < 0 || (size_t)n >= sizeof(full) - 16) { web_not_found(s, rs); return; }
+        int n = snprintf(full, sizeof(full), "%s%s", rq->root, p);
+        if (n < 0 || (size_t)n >= sizeof(full) - 16) { web_not_found(rq, rs); return; }
         if (path_is(full, S_IFDIR)) {
             size_t pl = strlen(p);
             if (pl == 0 || p[pl - 1] != '/') {             // /cartella -> /cartella/ (i link relativi funzionano)
@@ -1508,14 +1865,21 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
             snprintf(idx, sizeof(idx), "%sindex.php", full);
             if (path_is(idx, S_IFREG)) snprintf(script, sizeof(script), "%sindex.php", p);
             else {
+                snprintf(idx, sizeof(idx), "%sindex.html", full);
+                if (!path_is(idx, S_IFREG)) {
+                    if (!get) { web_not_found(rq, rs); return; }
+                    if (!strcmp(p, "/") && !rq->site[0] && client_is_local(rq)) dashboard(s, rs);
+                    else if (s->cfg.dir_listing) dir_listing(rq, rs, full);
+                    else web_not_found(rq, rs);
+                    return;
+                }
                 strcat(full, "index.html");
-                if (!path_is(full, S_IFREG)) { web_not_found(s, rs); return; }
             }
         } else if (!path_is(full, S_IFREG)) {
             char idx[4096];
-            snprintf(idx, sizeof(idx), "%s/index.php", s->static_dir);
+            snprintf(idx, sizeof(idx), "%s/index.php", rq->root);
             if (s->php && path_is(idx, S_IFREG)) snprintf(script, sizeof(script), "/index.php");
-            else { web_not_found(s, rs); return; }
+            else { web_not_found(rq, rs); return; }
         }
     }
     if (script[0]) {
@@ -1523,8 +1887,8 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
             json_error(rs, 403, "PHP is not enabled on this server (start it with --php)");
             return;
         }
-        snprintf(full, sizeof(full), "%s%s", s->static_dir, script);
-        if (!path_is(full, S_IFREG)) { web_not_found(s, rs); return; }
+        snprintf(full, sizeof(full), "%s%s", rq->root, script);
+        if (!path_is(full, S_IFREG)) { web_not_found(rq, rs); return; }
         run_php(s, rq, rs, script, info);
         return;
     }
@@ -1545,6 +1909,8 @@ static bool is_loopback_host(const char* h) {
     char* colon = name[0] == '[' ? strchr(name, ']') : strrchr(name, ':');
     if (colon && name[0] == '[') colon[1] = '\0';
     else if (colon) *colon = '\0';
+    size_t nl = strlen(name);
+    if (nl > 10 && !strcasecmp(name + nl - 10, ".localhost")) return true;    // RFC 6761: sempre questa macchina
     return !strcasecmp(name, "localhost") || !strncmp(name, "127.", 4) || !strcmp(name, "[::1]");
 }
 
@@ -1750,7 +2116,9 @@ static void route(SvServer* s, Request* rq, Response* rs) {
         json_error(rs, 404, "unknown endpoint %s", rq->path);
         return;
     }
-    if (s->static_dir) { handle_web(s, rq, rs); return; }
+    if ((!strcmp(rq->path, "/.segvault") || !strncmp(rq->path, "/.segvault/", 11)) && client_is_local(rq)) { dashboard(s, rs); return; }
+    if (rq->root) { handle_web(s, rq, rs); return; }
+    if (!strcmp(rq->path, "/") && client_is_local(rq)) { dashboard(s, rs); return; }
     if (apl) json_error(rs, 404, "not found (the API is under %s)", s->api);
     else json_error(rs, 404, "not found");
 }
@@ -1835,8 +2203,15 @@ static int parse_head(SvServer* s, char* head, Request* rq) {
                 rq->chunked = true;
             }
             else if (!strcasecmp(p, "Connection")) {
-                if (!strcasecmp(val, "close")) rq->keep_alive = false;
-                else if (!strcasecmp(val, "keep-alive")) rq->keep_alive = true;
+                // "close", "keep-alive", "Upgrade", "keep-alive, Upgrade" (Firefox)
+                for (const char* t = val; *t; ) {
+                    while (*t == ' ' || *t == ',') t++;
+                    size_t tl = strcspn(t, ", ");
+                    if (tl == 5 && !strncasecmp(t, "close", 5)) rq->keep_alive = false;
+                    else if (tl == 10 && !strncasecmp(t, "keep-alive", 10)) rq->keep_alive = true;
+                    else if (tl == 7 && !strncasecmp(t, "upgrade", 7)) rq->upgrade = true;
+                    t += tl;
+                }
             }
             else if (!strcasecmp(p, "Content-Type"))  header_value(v, rq->content_type, sizeof(rq->content_type));
             else if (!strcasecmp(p, "Authorization")) header_value(v, rq->auth, sizeof(rq->auth));
@@ -1967,6 +2342,101 @@ static int read_chunked(SvServer* s, Conn* c, InBuf* in, size_t pos, JsonBuf* ou
     }
 }
 
+
+// ── reverse proxy (siti --site nome=http://host:porta) ─────────
+
+static bool hop_header(const char* line, size_t nl) {
+    static const char* const H[] = { "Connection", "Keep-Alive", "Proxy-Connection", "Transfer-Encoding", "Content-Length",
+                                     "TE", "Trailer", "Upgrade", "Proxy", "X-Forwarded-For", "X-Forwarded-Proto",
+                                     "X-Forwarded-Host", "X-Forwarded-Port", "X-Real-IP" };
+    for (size_t i = 0; i < sizeof(H) / sizeof(H[0]); i++)
+        if (strlen(H[i]) == nl && !strncasecmp(line, H[i], nl)) return true;
+    return false;
+}
+
+static void proxy_log(SvServer* s, Conn* c, Request* rq, int status, double t0, const char* detail) {
+    Response lr = { .status = status };
+    snprintf(lr.detail, sizeof(lr.detail), "%s", detail);
+    double ms = now_ms() - t0;
+    if (!s->cfg.quiet)
+        fprintf(stderr, "[segvault-server] %s %s %s%s -> %d (proxy, %.1f ms)\n", c->client, rq->method, rq->host, rq->uri, status, ms);
+    log_request(s, c->client, rq, &lr, ms);
+}
+
+// true = la connessione del client resta aperta per la prossima richiesta
+static bool proxy_request(SvServer* s, Conn* c, InBuf* in, Request* rq, size_t used, double t0) {
+    const Site* st = rq->proxy;
+    JsonBuf h = {0};
+    jb_printf(&h, "%s %s HTTP/1.1\r\n", rq->method, rq->uri);
+    char upgrade[128] = "", xff[512] = "";
+    for (char* line = rq->headers; line && *line; ) {
+        char* e = strstr(line, "\r\n");
+        size_t l = e ? (size_t)(e - line) : strlen(line);
+        char* colon = memchr(line, ':', l);
+        if (colon && colon > line) {
+            size_t nl = (size_t)(colon - line);
+            if (nl == 7 && !strncasecmp(line, "Upgrade", 7)) {
+                const char* v = colon + 1;
+                while (*v == ' ') v++;
+                snprintf(upgrade, sizeof(upgrade), "%.*s", (int)(line + l - v), v);
+            }
+            if (nl == 15 && !strncasecmp(line, "X-Forwarded-For", 15)) {
+                const char* v = colon + 1;
+                while (*v == ' ') v++;
+                snprintf(xff, sizeof(xff), "%.*s, ", (int)(line + l - v) > 400 ? 400 : (int)(line + l - v), v);
+            }
+            if (!hop_header(line, nl)) { jb_raw(&h, line, l); jb_lit(&h, "\r\n"); }
+        }
+        line = e ? e + 2 : NULL;
+    }
+    jb_printf(&h, "X-Forwarded-For: %s%s\r\nX-Forwarded-Proto: http\r\nX-Real-IP: %s\r\n", xff, c->client, c->client);
+    if (rq->host[0]) jb_printf(&h, "X-Forwarded-Host: %s\r\n", rq->host);
+    jb_printf(&h, "X-Forwarded-Port: %d\r\n", s->port);
+    if (rq->body_len || rq->has_length) jb_printf(&h, "Content-Length: %llu\r\n", (unsigned long long)rq->body_len);
+    bool up = rq->upgrade && upgrade[0];
+    if (up) jb_printf(&h, "Connection: Upgrade\r\nUpgrade: %s\r\n\r\n", upgrade);
+    else jb_lit(&h, "Connection: close\r\n\r\n");
+    if (h.oom) { free(h.data); return false; }
+
+    // con un Upgrade il client può aver già mandato i primi messaggi: vanno al backend
+    const char* early = up && in->len > used ? in->data + used : NULL;
+    size_t early_len = early ? in->len - used : 0;
+    PxResult pr;
+    char err[256] = "";
+    // la risposta del backend non ha limiti di tempo per il client (eventi, download lenti)
+    set_timeout(c->fd, 0);
+    int r = px_forward(c->fd, st->phost, st->pport, h.data, h.len, rq->body, rq->body_len, early, early_len,
+                       !strcmp(rq->method, "HEAD"), rq->keep_alive && !s->stop, &s->stop, &pr, err, sizeof(err));
+    set_timeout(c->fd, IDLE_TIMEOUT_MS);
+    free(h.data);
+    char detail[300];
+    if (r < 0) {
+        Response rs = {0};
+        rs.close = !rq->keep_alive || s->stop;
+        JsonBuf* b = &rs.body;
+        page_start(b, "502 Bad Gateway");
+        jb_lit(b, "<h1>The dev server is not answering</h1><p class=\"sub\">");
+        html_esc(b, rq->site);
+        jb_printf(b, " is served by <code>http://%s:%d</code>: ", st->phost, st->pport);
+        html_esc(b, err);
+        jb_lit(b, ".</p><p>Start it (for example <code>npm run dev</code>, <code>php artisan serve</code>, "
+                  "<code>python manage.py runserver</code>) and reload this page.</p></main></body></html>");
+        rs.status = 502;
+        rs.content_type = "text/html; charset=utf-8";
+        rs.extra_headers = "Cache-Control: no-store\r\nRetry-After: 1\r\n";
+        bool sent = send_response(s, c->fd, rq, &rs);
+        free(rs.body.data);
+        snprintf(detail, sizeof(detail), "proxy %s:%d: %s", st->phost, st->pport, err);
+        proxy_log(s, c, rq, 502, t0, detail);
+        if (up) in->len = used;                 // i byte in anticipo non servono più
+        return sent && !rs.close && !up;
+    }
+    snprintf(detail, sizeof(detail), "proxy %s:%d%s", st->phost, st->pport, pr.status == 101 ? " (websocket)" : "");
+    proxy_log(s, c, rq, pr.status, t0, detail);
+    if (pr.status == 101) in->len = used;
+    return pr.keep_alive && !s->stop;
+}
+
 // risponde a una richiesta della connessione; false = connessione da chiudere
 static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
     // intestazione: fino a \r\n\r\n
@@ -1989,7 +2459,7 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
     in->data[head_len - 2] = '\0';              // la testata termina con l'ultimo \r\n
     rq.client = c->client;
     rq.client_port = c->client_port;
-    if (s->php) {                                // tutte le intestazioni servono a PHP (HTTP_*)
+    {                                            // tutte le intestazioni servono a PHP (HTTP_*) e al proxy
         const char* first = strstr(in->data, "\r\n");
         rq.headers = first ? strdup(first + 2) : NULL;
     }
@@ -2037,6 +2507,18 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
         rq.body_len = rq.content_length;
     }
 
+    resolve_site(s, &rq);
+    if (rq.proxy) {                              // sito servito da un dev server: la richiesta passa a lui
+        if (!rq.chunked) in->data[used] = after; // il corpo ha la sua lunghezza; i byte dopo vanno inoltrati intatti
+        bool keep = proxy_request(s, c, in, &rq, used, t0);
+        free(chunked.data);
+        free(rq.headers);
+        if (!keep) return false;
+        memmove(in->data, in->data + used, in->len - used);
+        in->len -= used;
+        in->data[in->len] = '\0';
+        return true;
+    }
     route(s, &rq, &rs);
     rs.close = !rq.keep_alive || s->stop;
     if (!rq.chunked) in->data[used] = after;
@@ -2569,9 +3051,41 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
         if (!s->audit) { snprintf(err, errsz, "cannot open the audit log %.200s: %s", cfg->audit_file, strerror(errno)); sv_server_free(s); return NULL; }
     }
     s->cfg.audit_file = NULL;                              // il file è già aperto: la stringa non serve più
+    if (cfg->n_sites > 0) {
+        s->sites = calloc((size_t)cfg->n_sites, sizeof(Site));
+        if (!s->sites) { snprintf(err, errsz, "out of memory"); sv_server_free(s); return NULL; }
+        for (int i = 0; i < cfg->n_sites; i++) {
+            const char* nm = cfg->sites[i].name ? cfg->sites[i].name : "";
+            const char* tg = cfg->sites[i].target ? cfg->sites[i].target : "";
+            Site* st = &s->sites[s->n_sites];
+            size_t nl = strlen(nm);
+            bool ok = nl > 0 && nl < sizeof(st->name) && nm[0] != '.' && nm[nl - 1] != '.' && !strstr(nm, "..");
+            for (size_t k = 0; k < nl && ok; k++) ok = isalnum((unsigned char)nm[k]) || nm[k] == '-' || nm[k] == '_' || nm[k] == '.';
+            if (!ok) { snprintf(err, errsz, "invalid site name '%.100s' (letters, digits, '-', '_' and dots)", nm); sv_server_free(s); return NULL; }
+            for (size_t k = 0; k <= nl; k++) st->name[k] = (char)tolower((unsigned char)nm[k]);
+            if (find_site(s, st->name, nl)) { snprintf(err, errsz, "site '%.100s' given twice", nm); sv_server_free(s); return NULL; }
+            if (!strncasecmp(tg, "http", 4) || strspn(tg, "0123456789") == strlen(tg) || (strchr(tg, ':') && !path_is(tg, S_IFDIR))) {
+                if (!px_parse_target(tg, st->phost, sizeof(st->phost), &st->pport)) {
+                    snprintf(err, errsz, "site %.100s: invalid address '%.200s' (e.g. http://127.0.0.1:5173)", nm, tg);
+                    sv_server_free(s); return NULL;
+                }
+            } else {
+                if (!path_is(tg, S_IFDIR)) { snprintf(err, errsz, "site %.100s: folder not found: %.200s", nm, tg); sv_server_free(s); return NULL; }
+                st->dir = strdup(tg);
+                if (!st->dir) { snprintf(err, errsz, "out of memory"); sv_server_free(s); return NULL; }
+                size_t dl = strlen(st->dir);
+                while (dl > 1 && (st->dir[dl - 1] == '/' || st->dir[dl - 1] == '\\')) st->dir[--dl] = '\0';
+            }
+            s->n_sites++;
+        }
+    }
+    s->cfg.sites = NULL;
     if ((cfg->php_cgi && cfg->php_cgi[0]) || (cfg->php_fcgi && cfg->php_fcgi[0])) {
-        if (!s->static_dir) { snprintf(err, errsz, "PHP needs a web folder (--static DIR)"); sv_server_free(s); return NULL; }
-        char abs[4096];
+        bool any_dir = s->static_dir != NULL;
+        for (int i = 0; i < s->n_sites; i++) if (s->sites[i].dir) any_dir = true;
+        if (!any_dir) { snprintf(err, errsz, "PHP needs a web folder (--static DIR or --site NAME=DIR)"); sv_server_free(s); return NULL; }
+        char abs[4096] = "";
+        if (s->static_dir) {
 #ifdef _WIN32
         if (!_fullpath(abs, s->static_dir, sizeof(abs))) abs[0] = '\0';
         for (char* q = abs; *q; q++) if (*q == '\\') *q = '/';
@@ -2582,6 +3096,7 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
         size_t al = strlen(abs);
         while (al > 1 && abs[al - 1] == '/') abs[--al] = '\0';
         s->doc_root = strdup(abs);
+        }
         char perr[300];
         s->php = cfg->php_fcgi && cfg->php_fcgi[0] ? fcgi_pool_external(cfg->php_fcgi, perr, sizeof(perr))
                                                     : fcgi_pool_spawn(cfg->php_cgi, cfg->php_workers, perr, sizeof(perr));
@@ -2756,6 +3271,8 @@ void sv_server_free(SvServer* s) {
     free(s->default_db);
     free(s->static_dir);
     free(s->doc_root);
+    for (int i = 0; i < s->n_sites; i++) free(s->sites[i].dir);
+    free(s->sites);
     fcgi_pool_free(s->php);
     if (s->audit) fclose(s->audit);
     free(s);

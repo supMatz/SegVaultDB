@@ -150,6 +150,12 @@ static void usage(const char* argv0) {
            "      --backup-dir DIR  write a backup of all data to DIR/segvault-DATE-TIME (see --backup-every)\n"
            "      --backup-every M  minutes between backups (default 60 when --backup-dir is given)\n"
            "      --backup-keep N   keep only the last N backups (default 7)\n"
+           "      --site NAME=TARGET  a site at http://NAME.localhost:PORT (and NAME.test): TARGET is a folder\n"
+           "                        or a dev server to proxy to (http://127.0.0.1:5173, WebSockets included).\n"
+           "                        Every folder inside --static is a site too (www/blog -> blog.localhost,\n"
+           "                        www/blog/public as the root when the folder has no index: Laravel, Symfony)\n"
+           "      --no-auto-sites   do not turn the folders of --static into sites\n"
+           "      --no-dir-listing  404 instead of a file list for folders without an index\n"
            "  -q, --quiet           do not log requests\n"
            "  -h, --help            this help\n\n"
            "API: GET /api/v1/health, GET /api/v1/status, POST /api/v1/query,\n"
@@ -158,7 +164,9 @@ static void usage(const char* argv0) {
 }
 
 int main(int argc, char** argv) {
-    SvServerConfig cfg = { .bind_addr = "127.0.0.1", .port = 8484, .timeout_ms = 30000 };
+    SvServerConfig cfg = { .bind_addr = "127.0.0.1", .port = 8484, .timeout_ms = 30000, .dir_listing = true };
+    static SvSite sites[64];
+    static char site_buf[64][1200];
     char auto_token[65];
     const char* data_dir = "./data";
     bool no_auth = false;
@@ -191,13 +199,29 @@ int main(int argc, char** argv) {
         else if (ARG("--backup-every", "--backup-every")) g_bk_every = atoi(argv[++i]);
         else if (ARG("--backup-keep", "--backup-keep")) g_bk_keep = atoi(argv[++i]);
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) cfg.quiet = true;
+        else if (ARG("--site", "--site")) {
+            const char* v = argv[++i];
+            const char* eq = strchr(v, '=');
+            if (!eq || eq == v || !eq[1] || cfg.n_sites >= 64 || strlen(v) >= sizeof(site_buf[0])) {
+                fprintf(stderr, "--site NAME=FOLDER or --site NAME=http://127.0.0.1:PORT\n");
+                return 2;
+            }
+            snprintf(site_buf[cfg.n_sites], sizeof(site_buf[0]), "%s", v);
+            site_buf[cfg.n_sites][eq - v] = '\0';
+            sites[cfg.n_sites].name = site_buf[cfg.n_sites];
+            sites[cfg.n_sites].target = site_buf[cfg.n_sites] + (eq - v) + 1;
+            cfg.n_sites++;
+            cfg.sites = sites;
+        }
+        else if (!strcmp(a, "--no-auto-sites")) cfg.no_auto_sites = true;
+        else if (!strcmp(a, "--no-dir-listing")) cfg.dir_listing = false;
         else if (a[0] == '-') { fprintf(stderr, "unknown or incomplete option: %s (see --help)\n", a); return 2; }
         else data_dir = a;
         #undef ARG
     }
     if (cfg.port < 0 || cfg.port > 65535) { fprintf(stderr, "invalid port\n"); return 2; }
     if (php_arg && cfg.php_fcgi) { fprintf(stderr, "use either --php or --php-fcgi\n"); return 2; }
-    if ((php_arg || cfg.php_fcgi) && !cfg.static_dir) { fprintf(stderr, "PHP runs the files of the web folder: add --static DIR\n"); return 2; }
+    if ((php_arg || cfg.php_fcgi) && !cfg.static_dir && !cfg.n_sites) { fprintf(stderr, "PHP runs the files of the web folder: add --static DIR\n"); return 2; }
     if (php_arg) {
         if (!strcmp(php_arg, "auto")) {
             if (!fcgi_find_php_cgi(php_path, sizeof(php_path))) {
@@ -274,6 +298,10 @@ int main(int argc, char** argv) {
     printf("SegVault %s server (data: %s%s)\n", SV_VERSION_STR, data_dir,
            cfg.require_login ? ", login required" : cfg.token && cfg.token[0] ? ", token required" : "");
     if (cfg.static_dir) printf("  web site: http://%s:%d/          (files of %s)\n", host, port, cfg.static_dir);
+    if (cfg.static_dir && !cfg.no_auto_sites)
+        printf("  sites:    http://FOLDER.localhost:%d/  (every folder of the web site; list: http://localhost:%d/.segvault/)\n", port, port);
+    for (int i = 0; i < cfg.n_sites; i++)
+        printf("  site:     http://%s%s:%d/  -> %s\n", cfg.sites[i].name, strchr(cfg.sites[i].name, '.') ? "" : ".localhost", port, cfg.sites[i].target);
     if (sv_server_php(g_server)[0]) {
         printf("  PHP:      %s\n", sv_server_php(g_server));
         if (!cfg.mysql) printf("            (scripts reach the database with mysqli / PDO if you add --mysql-port 3306)\n");

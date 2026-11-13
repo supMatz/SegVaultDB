@@ -25,11 +25,14 @@ SegVault copre già database e phpMyAdmin; qui c'è quello che manca, in ordine 
 - [x] Cache: `ETag` / `Last-Modified`, `304 Not Modified`
 - [x] Compressione gzip per testi (HTML, CSS, JS, JSON; anche API e PHP), con il deflate già usato per i PNG
 - [x] Pagina d'errore personalizzata (`404.html`)
-- [ ] Elenco dei file di una cartella senza index (opzionale, spento di default)
+- [x] Elenco dei file di una cartella senza index (acceso di default nel server di sviluppo, `--no-dir-listing` per spegnerlo)
 - [x] `/.well-known/` ammesso
-- [ ] Virtual host: più siti per nome (`progetto1.test`, `progetto2.test`)
+- [x] Virtual host automatici come Laragon, senza toccare il file hosts: ogni cartella `www/NOME` è `http://NOME.localhost:PORTA` (anche `NOME.test` e i sottodomini `api.NOME.localhost`); `public/` come radice se la cartella non ha un index (Laravel, Symfony); siti espliciti `--site NOME=CARTELLA`, anche con un nome completo (`shop.example.com`)
+- [x] Reverse proxy per i dev server (`--site app=http://127.0.0.1:5173`: Vite, Next.js, Express, Django, Rails, ...): streaming, chunked, keep-alive, WebSocket (ricarica a caldo), `X-Forwarded-*`, pagina 502 che spiega come avviare il dev server
+- [x] Cruscotto su `http://localhost:PORTA/` (se la cartella non ha un index) e `/.segvault/`: servizi attivi e siti con il tipo di progetto riconosciuto (Laravel, WordPress, Symfony, Node, ...)
 - [ ] Regole di rewrite minime (alternativa a `.htaccess`)
 - [ ] HTTPS integrato (certificato self-signed generato al primo avvio, come XAMPP), anche per il protocollo MySQL
+- [ ] HTTP/2 su HTTPS (negoziato con ALPN): i browser usano HTTP/2 e HTTP/3 solo con TLS; con HTTP/2 cade il limite di 6 connessioni per host (Vite in sviluppo carica centinaia di moduli). HTTP/3 (QUIC) non porta vantaggi in locale
 
 ## 3. Compatibilità MySQL per le app vere
 - [x] `CREATE TABLE` nel dialetto di MySQL: `bigint(20) unsigned`, `longtext`, `enum(...)` (diventa un `CHECK`), `KEY` / `INDEX` / `FULLTEXT` / `UNIQUE KEY nome`, prefissi `col(191)`, `ENGINE=`, `CHARSET`, `COLLATE`, `AUTO_INCREMENT=n`, `COMMENT`, `ON UPDATE CURRENT_TIMESTAMP`, `DEFAULT CURRENT_TIMESTAMP`, `DEFAULT ''`
