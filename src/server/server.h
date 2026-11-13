@@ -122,6 +122,12 @@ int       sv_server_recent(SvServer* s, SvLogEntry* out, int max);
 // gli ultimi n secondi fino ad adesso, dal più vecchio (i secondi senza richieste valgono zero)
 int       sv_server_series(SvServer* s, SvBucket* out, int n);
 
+// porte della configurazione già occupate (web, MySQL, posta, HTTPS), tutte insieme, con il programma che
+// le usa quando si riesce a saperlo: "port 3306 (MySQL) is used by mysqld (pid 812)". 0 = tutte libere
+int       sv_ports_check(const SvServerConfig* cfg, char* msg, size_t msgsz);
+// chi è in ascolto su una porta TCP ("mysqld (pid 812)"); false se non si sa
+bool      sv_port_owner(int port, char* out, size_t outsz);
+
 // token casuale (hex, 2*bytes caratteri + NUL) dalla sorgente casuale del sistema
 bool      sv_random_token(char* out, int bytes);
 

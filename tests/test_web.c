@@ -430,6 +430,21 @@ int main(void) {
     pthread_join(th, NULL);
     sv_server_free(s);
 
+    // porte occupate: tutte in un messaggio, con il programma che le usa
+    {
+        SvServerConfig c4 = { .port = 0, .quiet = true };
+        SvServer* busy = sv_server_start(&c4, err, sizeof(err));
+        int bp = sv_server_port(busy);
+        SvServerConfig c5 = { .port = bp, .quiet = true, .mail = true, .mail_port = bp, .mail_dir = tmp };
+        SvServer* x = sv_server_start(&c5, err, sizeof(err));
+        char want[64];
+        snprintf(want, sizeof(want), "port %d (web) is in use by test_web", bp);
+        CHECK(!x && strstr(err, want) && strstr(err, "(mail catcher) is in use"), "busy ports reported with their owner: %s", err);
+        char who[160];
+        CHECK(sv_port_owner(bp, who, sizeof(who)) && strstr(who, "test_web (pid "), "port owner: %s", who);
+        sv_server_free(busy);
+    }
+
     // configurazioni sbagliate
     SvSite bad1[] = { { "../x", www } };
     SvServerConfig c3 = { .port = 0, .quiet = true, .sites = bad1, .n_sites = 1 };

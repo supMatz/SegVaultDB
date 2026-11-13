@@ -169,7 +169,7 @@ struct ServerPanel {
     SvServer*       srv;
     PlatformThread* thread;
     char            token[65];
-    char            error[300];
+    char            error[700];
     char            url[96], lan_url[96], mysql_addr[96];
     SvStats         stats;
     SvLogEntry      log[SV_LOG_MAX];
@@ -365,10 +365,10 @@ bool server_panel_start(ServerPanel* p) {
         .n_sites     = p->n_sites,
         .dir_listing = true,
         .mail        = g_settings.server_mail != 0,
-        .mail_port   = 1025,
+        .mail_port   = g_settings.server_mail_port,
         .mail_dir    = mail_dir,
         .https       = g_settings.server_https != 0,
-        .https_port  = 8443,
+        .https_port  = g_settings.server_https_port,
         .cert_dir    = cert_dir,
         .http2       = true,
         .php_cgi     = php[0] ? php : NULL,
@@ -381,16 +381,13 @@ bool server_panel_start(ServerPanel* p) {
         .quiet       = true,
         .require_login = g_settings.server_users != 0,
         .mysql       = g_settings.server_mysql != 0,
-        .mysql_port  = 3306,
+        .mysql_port  = g_settings.server_mysql_port,
     };
-    char err[256];
+    char err[600];
     p->srv = sv_server_start(&cfg, err, sizeof(err));
-    if (!p->srv && cfg.mysql && strstr(err, "MySQL"))
-        snprintf(err + strlen(err), sizeof(err) - strlen(err), " - is MySQL / XAMPP already running? Stop it or turn the MySQL protocol off");
-    if (!p->srv && cfg.https && strstr(err, "HTTPS") && strstr(err, "port"))
-        snprintf(err + strlen(err), sizeof(err) - strlen(err), " - is another web server using 8443? Stop it or turn HTTPS off");
-    if (!p->srv && cfg.mail && strstr(err, "SMTP"))
-        snprintf(err + strlen(err), sizeof(err) - strlen(err), " - is Mailpit / MailHog already running? Stop it or turn the mail catcher off");
+    // porte occupate: chi le usa, e come uscirne (fermare l'altro programma o cambiare porta)
+    if (!p->srv && strstr(err, "is in use"))
+        snprintf(err + strlen(err), sizeof(err) - strlen(err), ". Stop that program, turn the service off, or change its port in Settings > Server");
     if (!p->srv) { snprintf(p->error, sizeof(p->error), "%s", err); return false; }
     snprintf(p->php_desc, sizeof(p->php_desc), "%s", sv_server_php(p->srv));
     p->thread = platform_thread_start(run_server_thread, p->srv);
@@ -701,12 +698,15 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
     y += 12;
 
     y = section_label(win, "MYSQL PROTOCOL", x, y);
-    segmented(p, HIT_MYSQL_OFF, (Rect){x, y, w, 28}, "Off", "Port 3306", g_settings.server_mysql ? 1 : 0, true);
+    char lb[200];
+    snprintf(lb, sizeof(lb), "Port %d", g_settings.server_mysql_port);
+    segmented(p, HIT_MYSQL_OFF, (Rect){x, y, w, 28}, "Off", lb, g_settings.server_mysql ? 1 : 0, true);
     y += 28 + 4;
-    if (g_settings.server_mysql)
-        y += text_wrap(win, "PHP, Python, Java and the mysql client connect as to MySQL: host 127.0.0.1, port 3306, "
-                            "a user from Users & permissions (or root with the token as password).",
-                       x, y + 2, w, TH_TEXT_FAINT, TH_FONT_SMALL) + 2;
+    if (g_settings.server_mysql) {
+        snprintf(lb, sizeof(lb), "PHP, Python, Java and the mysql client connect as to MySQL: host 127.0.0.1, port %d, "
+                 "a user from Users & permissions (or root with the token as password).", g_settings.server_mysql_port);
+        y += text_wrap(win, lb, x, y + 2, w, TH_TEXT_FAINT, TH_FONT_SMALL) + 2;
+    }
     y += 12;
 
     y = section_label(win, "WEB APPS (CORS)", x, y);
@@ -776,7 +776,8 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
 
     // HTTPS con la CA locale (come Laragon / mkcert)
     y = section_label(win, "HTTPS", x, y);
-    segmented(p, HIT_HTTPS_OFF, (Rect){x, y, w, 28}, "Off", "Port 8443 + HTTP/2", g_settings.server_https ? 1 : 0, true);
+    snprintf(lb, sizeof(lb), "Port %d + HTTP/2", g_settings.server_https_port);
+    segmented(p, HIT_HTTPS_OFF, (Rect){x, y, w, 28}, "Off", lb, g_settings.server_https ? 1 : 0, true);
     y += 28 + 4;
     if (g_settings.server_https) {
         int tw = link_w(p, "Trust certificate");
@@ -787,16 +788,16 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
         }
         link_btn(p, HIT_TRUST_CA, (Rect){x + w - tw, y, tw, 24}, "Trust certificate", true);
         y += 26;
-        y += text_wrap(win, p->trust_msg[0] ? p->trust_msg :
-                       "Every site also answers on https://NAME.localhost:8443 with a certificate from a local authority "
-                       "(DATA/certs/ca.crt). Trust it once and browsers open the sites without warnings.",
-                       x, y + 2, w, TH_TEXT_FAINT, TH_FONT_SMALL) + 2;
+        snprintf(lb, sizeof(lb), "Every site also answers on https://NAME.localhost:%d with a certificate from a local authority "
+                 "(DATA/certs/ca.crt). Trust it once and browsers open the sites without warnings.", g_settings.server_https_port);
+        y += text_wrap(win, p->trust_msg[0] ? p->trust_msg : lb, x, y + 2, w, TH_TEXT_FAINT, TH_FONT_SMALL) + 2;
     }
     y += 12;
 
     // cattura delle email (come Mailpit)
     y = section_label(win, "MAIL CATCHER", x, y);
-    segmented(p, HIT_MAIL_OFF, (Rect){x, y, w, 28}, "Off", "SMTP port 1025", g_settings.server_mail ? 1 : 0, true);
+    snprintf(lb, sizeof(lb), "SMTP port %d", g_settings.server_mail_port);
+    segmented(p, HIT_MAIL_OFF, (Rect){x, y, w, 28}, "Off", lb, g_settings.server_mail ? 1 : 0, true);
     y += 28 + 4;
     if (g_settings.server_mail) {
         if (running && p->mail_url[0]) {
@@ -806,8 +807,9 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
             link_btn(p, HIT_OPEN_MAIL, (Rect){x - 8, y, mw, 24}, lbl, true);
             y += 26;
         }
-        y += text_wrap(win, "Apps send mail to 127.0.0.1:1025 (any user and password, no TLS); PHP mail() goes there by itself. "
-                            "Nothing leaves this computer.", x, y + 2, w, TH_TEXT_FAINT, TH_FONT_SMALL) + 2;
+        snprintf(lb, sizeof(lb), "Apps send mail to 127.0.0.1:%d (any user and password, no TLS); PHP mail() goes there by itself. "
+                 "Nothing leaves this computer.", g_settings.server_mail_port);
+        y += text_wrap(win, lb, x, y + 2, w, TH_TEXT_FAINT, TH_FONT_SMALL) + 2;
     }
     y += 12;
 

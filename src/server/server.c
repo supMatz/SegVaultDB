@@ -36,6 +36,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #include <windows.h>
+  #include <iphlpapi.h>
   typedef SOCKET sock_t;
   #define BAD_SOCK INVALID_SOCKET
   #define sock_close closesocket
@@ -3293,6 +3294,121 @@ static sock_t listen_tcp(const char* addr_s, int port, int* actual) {
     return fd;
 }
 
+// ── porte occupate ──────────────────────────────────────────────
+
+bool sv_port_owner(int port, char* out, size_t outsz) {
+    out[0] = '\0';
+#ifdef _WIN32
+    ULONG sz = 0;
+    GetExtendedTcpTable(NULL, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0);
+    MIB_TCPTABLE_OWNER_PID* t = sz ? malloc(sz) : NULL;
+    bool found = false;
+    if (t && GetExtendedTcpTable(t, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) == NO_ERROR) {
+        for (DWORD i = 0; i < t->dwNumEntries && !found; i++) {
+            if (ntohs((u_short)t->table[i].dwLocalPort) != port) continue;
+            DWORD pid = t->table[i].dwOwningPid;
+            char name[MAX_PATH] = "";
+            HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (h) {
+                DWORD nl = sizeof(name);
+                if (!QueryFullProcessImageNameA(h, 0, name, &nl)) name[0] = '\0';
+                CloseHandle(h);
+            }
+            const char* b = strrchr(name, '\\');
+            snprintf(out, outsz, "%s (pid %lu)", name[0] ? (b ? b + 1 : name) : "another program", (unsigned long)pid);
+            found = true;
+        }
+    }
+    free(t);
+    return found;
+#else
+    // /proc/net/tcp[6]: la riga in ascolto (stato 0A) sulla porta -> inode del socket -> processo con quel socket
+    unsigned long inode = 0;
+    unsigned uid = 0;
+    static const char* const F[] = { "/proc/net/tcp", "/proc/net/tcp6" };
+    for (int k = 0; k < 2 && !inode; k++) {
+        FILE* f = fopen(F[k], "r");
+        if (!f) continue;
+        char line[512];
+        if (!fgets(line, sizeof(line), f)) { fclose(f); continue; }
+        while (fgets(line, sizeof(line), f)) {
+            char local[64], rem[64];
+            unsigned st, u;
+            unsigned long ino;
+            if (sscanf(line, "%*d: %63s %63s %x %*s %*s %*s %u %*d %lu", local, rem, &st, &u, &ino) != 5) continue;
+            char* colon = strrchr(local, ':');
+            if (st != 0x0A || !colon || (int)strtol(colon + 1, NULL, 16) != port) continue;
+            inode = ino;
+            uid = u;
+            break;
+        }
+        fclose(f);
+    }
+    if (!inode) return false;
+    char want[64];
+    snprintf(want, sizeof(want), "socket:[%lu]", inode);
+    DIR* d = opendir("/proc");
+    struct dirent* e;
+    while (d && (e = readdir(d)) && !out[0]) {
+        if (!isdigit((unsigned char)e->d_name[0])) continue;
+        char fdp[300];
+        snprintf(fdp, sizeof(fdp), "/proc/%s/fd", e->d_name);
+        DIR* fd = opendir(fdp);
+        struct dirent* x;
+        while (fd && (x = readdir(fd))) {
+            char lp[600], tgt[128];
+            snprintf(lp, sizeof(lp), "%s/%s", fdp, x->d_name);
+            ssize_t n = readlink(lp, tgt, sizeof(tgt) - 1);
+            if (n <= 0) continue;
+            tgt[n] = '\0';
+            if (strcmp(tgt, want)) continue;
+            char cp[300], comm[64] = "";
+            snprintf(cp, sizeof(cp), "/proc/%s/comm", e->d_name);
+            FILE* c = fopen(cp, "r");
+            if (c) { if (fgets(comm, sizeof(comm), c)) comm[strcspn(comm, "\n")] = '\0'; fclose(c); }
+            snprintf(out, outsz, "%s (pid %s)", comm[0] ? comm : "a program", e->d_name);
+            break;
+        }
+        if (fd) closedir(fd);
+    }
+    if (d) closedir(d);
+    // processo di un altro utente (es. il servizio mysqld del sistema): almeno il suo utente
+    if (!out[0]) snprintf(out, outsz, "a program of user %u%s", uid, uid == 0 ? " (root: a system service)" : "");
+    return true;
+#endif
+}
+
+static bool port_free(const char* addr_s, int port) {
+    int actual;
+    sock_t fd = listen_tcp(addr_s, port, &actual);
+    if (fd == BAD_SOCK) return false;
+    sock_close(fd);
+    return true;
+}
+
+int sv_ports_check(const SvServerConfig* cfg, char* msg, size_t msgsz) {
+    const char* addr = cfg->bind_addr ? cfg->bind_addr : "127.0.0.1";
+    struct { bool on; int port; const char* what; const char* hint; } P[] = {
+        { true, cfg->port, "web", "another web server (Apache, nginx, XAMPP)?" },
+        { cfg->mysql, cfg->mysql_port, "MySQL", "MySQL / MariaDB / XAMPP already running?" },
+        { cfg->mail, cfg->mail_port, "mail catcher", "Mailpit / MailHog already running?" },
+        { cfg->https, cfg->https_port, "HTTPS", "another web server?" },
+    };
+    int busy = 0;
+    size_t k = 0;
+    msg[0] = '\0';
+    for (size_t i = 0; i < sizeof(P) / sizeof(P[0]); i++) {
+        if (!P[i].on || P[i].port <= 0 || port_free(addr, P[i].port)) continue;
+        char who[160];
+        bool known = sv_port_owner(P[i].port, who, sizeof(who));
+        if (k < msgsz)
+            k += (size_t)snprintf(msg + k, msgsz - k, "%sport %d (%s) is in use%s%s%s", busy ? "; " : "", P[i].port, P[i].what,
+                                  known ? " by " : " - ", known ? who : P[i].hint, "");
+        busy++;
+    }
+    return busy;
+}
+
 // percorso di questo eseguibile (per sendmail_path di PHP)
 static bool self_exe(char* out, size_t n) {
 #ifdef _WIN32
@@ -3311,6 +3427,13 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { snprintf(err, errsz, "WSAStartup failed"); return NULL; }
 #endif
+    // tutte le porte occupate in un messaggio solo (con chi le usa), prima di avviare qualcosa
+    if (sv_ports_check(cfg, err, errsz)) {
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return NULL;
+    }
     SvServer* s = calloc(1, sizeof(SvServer));
     if (!s) { snprintf(err, errsz, "out of memory"); return NULL; }
     s->listen_fd = BAD_SOCK;
