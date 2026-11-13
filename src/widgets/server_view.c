@@ -154,7 +154,7 @@ ViewAction start_screen_event(StartScreen* s, const sEvent* evt) {
 enum {
     HIT_COPY_URL, HIT_COPY_LAN, HIT_PORT_MINUS, HIT_PORT_PLUS, HIT_ACCESS_LOCAL, HIT_ACCESS_LAN,
     HIT_TOKEN_OFF, HIT_TOKEN_ON, HIT_COPY_TOKEN, HIT_NEW_TOKEN, HIT_CORS_OFF, HIT_CORS_ON, HIT_TIME_MINUS,
-    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_TAB_REQ, HIT_TAB_MON, HIT_MYSQL_OFF, HIT_MYSQL_ON, HIT_COPY_MYSQL, HIT_PHP_OFF, HIT_PHP_ON, HIT_COUNT
+    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_TAB_REQ, HIT_TAB_MON, HIT_MYSQL_OFF, HIT_MYSQL_ON, HIT_COPY_MYSQL, HIT_PHP_OFF, HIT_PHP_ON, HIT_MAIL_OFF, HIT_MAIL_ON, HIT_OPEN_MAIL, HIT_OPEN_DASH, HIT_COUNT
 };
 
 enum { ACT_NONE, ACT_TOGGLE, ACT_EDITOR, ACT_COPY };
@@ -195,6 +195,12 @@ struct ServerPanel {
     char            php_cgi[1024];   // percorso di php-cgi scelto a mano (server.ini "php_cgi="); "" = cercato
     char            php_desc[600];   // processi PHP del server avviato
     char            site_url[96];
+    char            mail_url[128], dash_url[128];
+    int             mail_count;
+    // siti con nome da server.ini ("site.blog=/percorso" o "site.app=http://127.0.0.1:5173")
+    char            site_name[32][64];
+    char            site_target[32][1024];
+    int             n_sites;
     int             flash_hit;
     uint64_t        flash_until;
     // pagina Monitor
@@ -277,6 +283,7 @@ static void web_load(ServerPanel* p) {
     char path[600], line[1200];
     p->web_dir[0] = '\0';
     p->php_cgi[0] = '\0';
+    p->n_sites = 0;
     web_path(p, path, sizeof(path));
     FILE* f = fopen(path, "rb");
     if (!f) return;
@@ -284,6 +291,12 @@ static void web_load(ServerPanel* p) {
         line[strcspn(line, "\r\n")] = '\0';
         if (!strncmp(line, "web_folder=", 11)) snprintf(p->web_dir, sizeof(p->web_dir), "%.1000s", line + 11);
         if (!strncmp(line, "php_cgi=", 8)) snprintf(p->php_cgi, sizeof(p->php_cgi), "%.1000s", line + 8);
+        char* eq = strchr(line, '=');
+        if (!strncmp(line, "site.", 5) && eq && eq - line > 5 && eq - line < 5 + 63 && p->n_sites < 32) {
+            snprintf(p->site_name[p->n_sites], sizeof(p->site_name[0]), "%.*s", (int)(eq - line - 5), line + 5);
+            snprintf(p->site_target[p->n_sites], sizeof(p->site_target[0]), "%.1000s", eq + 1);
+            p->n_sites++;
+        }
     }
     fclose(f);
 }
@@ -295,6 +308,7 @@ static void web_save(ServerPanel* p) {
     if (!f) return;
     fprintf(f, "web_folder=%s\n", p->web_dir);
     if (p->php_cgi[0]) fprintf(f, "php_cgi=%s\n", p->php_cgi);
+    for (int i = 0; i < p->n_sites; i++) fprintf(f, "site.%s=%s\n", p->site_name[i], p->site_target[i]);
     fclose(f);
 }
 
@@ -339,7 +353,17 @@ bool server_panel_start(ServerPanel* p) {
             return false;
         }
     }
+    SvSite sites[32];
+    for (int i = 0; i < p->n_sites; i++) { sites[i].name = p->site_name[i]; sites[i].target = p->site_target[i]; }
+    char mail_dir[600];
+    snprintf(mail_dir, sizeof(mail_dir), "%s%smail", p->data_dir, p->data_dir[0] ? "/" : "");
     SvServerConfig cfg = {
+        .sites       = sites,
+        .n_sites     = p->n_sites,
+        .dir_listing = true,
+        .mail        = g_settings.server_mail != 0,
+        .mail_port   = 1025,
+        .mail_dir    = mail_dir,
         .php_cgi     = php[0] ? php : NULL,
         .static_dir  = web[0] ? web : NULL,
         .bind_addr   = g_settings.server_lan ? "0.0.0.0" : "127.0.0.1",
@@ -356,6 +380,8 @@ bool server_panel_start(ServerPanel* p) {
     p->srv = sv_server_start(&cfg, err, sizeof(err));
     if (!p->srv && cfg.mysql && strstr(err, "MySQL"))
         snprintf(err + strlen(err), sizeof(err) - strlen(err), " - is MySQL / XAMPP already running? Stop it or turn the MySQL protocol off");
+    if (!p->srv && cfg.mail && strstr(err, "SMTP"))
+        snprintf(err + strlen(err), sizeof(err) - strlen(err), " - is Mailpit / MailHog already running? Stop it or turn the mail catcher off");
     if (!p->srv) { snprintf(p->error, sizeof(p->error), "%s", err); return false; }
     snprintf(p->php_desc, sizeof(p->php_desc), "%s", sv_server_php(p->srv));
     p->thread = platform_thread_start(run_server_thread, p->srv);
@@ -367,6 +393,9 @@ bool server_panel_start(ServerPanel* p) {
     }
     snprintf(p->url, sizeof(p->url), "http://127.0.0.1:%d%s", sv_server_port(p->srv), sv_server_api_prefix(p->srv));
     snprintf(p->site_url, sizeof(p->site_url), "http://127.0.0.1:%d/", sv_server_port(p->srv));
+    snprintf(p->mail_url, sizeof(p->mail_url), "http://localhost:%d/.segvault/mail/", sv_server_port(p->srv));
+    snprintf(p->dash_url, sizeof(p->dash_url), "http://localhost:%d/.segvault/", sv_server_port(p->srv));
+    p->mail_count = sv_server_mail_count(p->srv);
     p->mysql_addr[0] = '\0';
     if (sv_server_mysql_port(p->srv)) snprintf(p->mysql_addr, sizeof(p->mysql_addr), "mysql://127.0.0.1:%d", sv_server_mysql_port(p->srv));
     char ip[64];
@@ -430,6 +459,8 @@ bool server_panel_tick(ServerPanel* p, uint64_t now_ms) {
         p->log_seq = st.requests;
         redraw = true;
     }
+    int mc = sv_server_mail_count(p->srv);
+    if (mc != p->mail_count) { p->mail_count = mc; redraw = true; }
     if ((int)st.uptime_s != p->last_uptime || st.connections != p->stats.connections || st.busy != p->stats.busy) redraw = true;
     p->last_uptime = (int)st.uptime_s;
     p->stats = st;
@@ -712,6 +743,37 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
             snprintf(msg, sizeof(msg), "php-cgi is looked for in a php folder next to SegVault, the PATH, C:\\xampp\\php "
                      "(or set php_cgi=PATH in server.ini).%s", g_settings.server_mysql ? "" : " Scripts reach the database through the MySQL protocol.");
         y += text_wrap(win, msg, x, y + 2, w, !g_settings.server_mysql && running ? TH_WARNING : TH_TEXT_FAINT, TH_FONT_SMALL) + 2;
+    }
+    y += 12;
+
+    // siti per cartella (www/blog -> blog.localhost) e cruscotto
+    if (p->web_dir[0] || p->n_sites) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "Every folder of the web folder is a site: http://NAME.localhost:%d (Laravel: its public/). "
+                 "Dev servers: site.NAME=http://127.0.0.1:5173 in server.ini.", g_settings.server_port);
+        y += text_wrap(win, msg, x, y + 2, w, TH_TEXT_FAINT, TH_FONT_SMALL) + 2;
+        if (running) {
+            int dw = link_w(p, "All sites");
+            link_btn(p, HIT_OPEN_DASH, (Rect){x - 8, y, dw, 24}, "All sites", true);
+            y += 26;
+        }
+        y += 12;
+    }
+
+    // cattura delle email (come Mailpit)
+    y = section_label(win, "MAIL CATCHER", x, y);
+    segmented(p, HIT_MAIL_OFF, (Rect){x, y, w, 28}, "Off", "SMTP port 1025", g_settings.server_mail ? 1 : 0, true);
+    y += 28 + 4;
+    if (g_settings.server_mail) {
+        if (running && p->mail_url[0]) {
+            char lbl[48];
+            snprintf(lbl, sizeof(lbl), "Open inbox (%d)", p->mail_count);
+            int mw = link_w(p, lbl);
+            link_btn(p, HIT_OPEN_MAIL, (Rect){x - 8, y, mw, 24}, lbl, true);
+            y += 26;
+        }
+        y += text_wrap(win, "Apps send mail to 127.0.0.1:1025 (any user and password, no TLS); PHP mail() goes there by itself. "
+                            "Nothing leaves this computer.", x, y + 2, w, TH_TEXT_FAINT, TH_FONT_SMALL) + 2;
     }
     y += 12;
 
@@ -1302,6 +1364,15 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
         case HIT_CLEAR_LOG: p->log_cleared = p->nlog ? p->log[0].seq : 0; p->log_scroll = 0; break;
         case HIT_OPEN_SITE:
             if (!platform_open_url(p->site_url)) copy_text(p, hit, p->site_url);
+            break;
+        case HIT_OPEN_MAIL:
+            if (!platform_open_url(p->mail_url)) copy_text(p, hit, p->mail_url);
+            break;
+        case HIT_OPEN_DASH:
+            if (!platform_open_url(p->dash_url)) copy_text(p, hit, p->dash_url);
+            break;
+        case HIT_MAIL_OFF: case HIT_MAIL_ON:
+            if (g_settings.server_mail != (hit == HIT_MAIL_ON)) { g_settings.server_mail = hit == HIT_MAIL_ON; config_changed(p); }
             break;
         case HIT_CLEAR_WEB:
             if (we) line_edit_set_text(we, "");

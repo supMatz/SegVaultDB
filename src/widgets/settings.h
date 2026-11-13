@@ -65,6 +65,7 @@ typedef struct {
     int server_users;       // richiede utente e password (permessi per utente, vedi auth.h)
     int server_mysql;       // anche il protocollo di rete MySQL (porta 3306)
     int server_php;         // esegue i .php della cartella web con php-cgi (FastCGI)
+    int server_mail;        // cattura delle email: server SMTP sulla porta 1025 (vedi src/server/mail.h)
     int server_cors;        // le web app di qualsiasi origine possono chiamarlo (richiede il token)
     int server_timeout;     // secondi (0 = nessun limite)
 } Settings;
