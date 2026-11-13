@@ -352,7 +352,9 @@ static void put_len(JsonBuf* b, size_t n) {
 
 // conversazione su una connessione aperta
 static int fcgi_talk(sock_t fd, const FcgiParam* params, int nparams, const char* body, size_t body_len,
-                     size_t max_out, JsonBuf* out, JsonBuf* errout, char* err, size_t errsz) {
+                     size_t max_out, JsonBuf* out, JsonBuf* errout, char* err, size_t errsz,
+                     FcgiOnOutput on_output, void* ctx) {
+    size_t total = 0;
     uint8_t begin[16];
     rec_head(begin, FCGI_BEGIN_REQUEST, 8);
     memset(begin + 8, 0, 8);
@@ -384,8 +386,10 @@ static int fcgi_talk(sock_t fd, const FcgiParam* params, int nparams, const char
         r = recv_all(fd, content, len + pad);
         if (r <= 0) { snprintf(err, errsz, r < 0 ? "PHP did not answer in time" : "PHP closed the connection"); return r < 0 ? 504 : 502; }
         if (h[1] == FCGI_STDOUT) {
-            if (out->len + len > max_out) { snprintf(err, errsz, "PHP response larger than %zu MB", max_out >> 20); return 502; }
+            total += len;
+            if ((on_output ? out->len + len : total) > max_out) { snprintf(err, errsz, "PHP response larger than %zu MB", max_out >> 20); return 502; }
             jb_raw(out, content, len);
+            if (on_output && len && !out->oom && !on_output(ctx, out)) { snprintf(err, errsz, "the client went away"); return 499; }
         } else if (h[1] == FCGI_STDERR) {
             if (errout->len < (1u << 20)) jb_raw(errout, content, len);
         } else if (h[1] == FCGI_END_REQUEST) {
@@ -535,7 +539,8 @@ void fcgi_pool_free(FcgiPool* p) {
 const char* fcgi_pool_describe(const FcgiPool* p) { return p ? p->desc : ""; }
 
 int fcgi_request(FcgiPool* p, const FcgiParam* params, int nparams, const char* body, size_t body_len,
-                 int timeout_ms, size_t max_out, JsonBuf* out, JsonBuf* errout, char* err, size_t errsz) {
+                 int timeout_ms, size_t max_out, JsonBuf* out, JsonBuf* errout, char* err, size_t errsz,
+                 FcgiOnOutput on_output, void* ctx) {
     err[0] = '\0';
     if (!max_out) max_out = (size_t)256 << 20;
     if (p->external) {
@@ -546,7 +551,7 @@ int fcgi_request(FcgiPool* p, const FcgiParam* params, int nparams, const char* 
         fd = connect_tcp(p->host, p->port);
         if (fd == BAD_SOCK) { snprintf(err, errsz, "cannot connect to PHP at %s", p->desc + 8); return 502; }
         if (timeout_ms > 0) set_timeouts(fd, timeout_ms);
-        int r = fcgi_talk(fd, params, nparams, body, body_len, max_out, out, errout, err, errsz);
+        int r = fcgi_talk(fd, params, nparams, body, body_len, max_out, out, errout, err, errsz, on_output, ctx);
         sock_close(fd);
         return r;
     }
@@ -586,10 +591,10 @@ int fcgi_request(FcgiPool* p, const FcgiParam* params, int nparams, const char* 
         result = 502;
     } else {
         if (timeout_ms > 0) set_timeouts(fd, timeout_ms);
-        result = fcgi_talk(fd, params, nparams, body, body_len, max_out, out, errout, err, errsz);
+        result = fcgi_talk(fd, params, nparams, body, body_len, max_out, out, errout, err, errsz, on_output, ctx);
         sock_close(fd);
         // tempo scaduto: il processo sta ancora eseguendo lo script, si riavvia
-        if (result == 504) worker_kill(w);
+        if (result == 504 || result == 499) worker_kill(w);
     }
     mx_lock(&p->mx);
     w->busy = false;

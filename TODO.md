@@ -17,7 +17,7 @@ SegVault copre già database e phpMyAdmin; qui c'è quello che manca, in ordine 
 - [x] Corpi `Transfer-Encoding: chunked` in ingresso (API e PHP; `Content-Length` + chunked rifiutati contro il request smuggling)
 - [x] I `php-cgi` riavviati da una connessione non muoiono con lei (nati da un thread apposito: `PR_SET_PDEATHSIG` è per thread)
 - [x] Pannello del server: interruttore PHP, `php-cgi` cercato da solo (o `php_cgi=` in `server.ini`), errori PHP nel registro; colonna delle opzioni che scorre
-- [ ] Risposte grandi in streaming (ora la risposta di PHP è tenuta in memoria)
+- [x] Risposte di PHP in streaming: oltre 256 KB, o con `text/event-stream` / `X-Accel-Buffering: no`, partono subito a pezzi (download ed export grandi, `flush()`, Server-Sent Events); quelle piccole restano compresse con gzip
 
 ## 2. Server web completo
 - [x] Tipi MIME mancanti (`.pdf`, `.mp4`, `.webm`, `.mp3`, `.wasm`, `.xml`, `.zip`, `.map`, `.avif`, ...)

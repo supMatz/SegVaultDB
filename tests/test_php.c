@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 
 static int g_fail = 0, g_count = 0;
 #define CHECK(cond, ...) do { g_count++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -166,6 +167,25 @@ static Resp req(int port, const char* method, const char* path, const char* head
     r.body = malloc(r.blen + 1);
     memcpy(r.body, he + 4, r.blen);
     r.body[r.blen] = 0;
+    if (strcasestr(r.head, "Transfer-Encoding: chunked")) {     // risposta in streaming: si decodifica
+        char* src = r.body;
+        char* dst = malloc(r.blen + 1);
+        size_t dl = 0;
+        char* p = src;
+        for (;;) {
+            size_t n = strtoul(p, &p, 16);
+            char* nl = strstr(p, "\r\n");
+            if (!nl || !n) break;
+            p = nl + 2;
+            memcpy(dst + dl, p, n);
+            dl += n;
+            p += n + 2;
+        }
+        dst[dl] = 0;
+        free(src);
+        r.body = dst;
+        r.blen = dl;
+    }
     return r;
 }
 // richiesta scritta a mano (corpi chunked, richieste malformate)
@@ -426,6 +446,7 @@ int main(int argc, char** argv) {
         bool big_ok = r.status == 200 && r.blen == 1000000;
         for (size_t i = 0; big_ok && i < r.blen; i++) big_ok = r.body[i] == (char)('0' + i % 10);
         CHECK(big_ok, "1 MB response over many records: %d %zu", r.status, r.blen);
+        CHECK(hdr(&r, "Transfer-Encoding: chunked") && !hdr(&r, "Content-Length"), "large PHP response streamed: %s", r.head);
         rfree(&r);
 
         // un processo che muore viene riavviato
@@ -687,6 +708,33 @@ int main(int argc, char** argv) {
         r = req(sv_server_port(s), "POST", "/real.php?q=7", "Content-Type: application/x-www-form-urlencoded\r\n", "p=ok");
         CHECK(r.status == 200 && hdr(&r, "X-Real: 1") && has(&r, "sum=5 m=POST q=7 p=ok"), "real php-cgi (%s): %d %s", php, r.status, r.body);
         rfree(&r);
+        // Server-Sent Events: il primo evento arriva subito, prima che lo script finisca
+        put(www, "sse.php", "<?php header('Content-Type: text/event-stream'); header('Cache-Control: no-cache');"
+                            "while (ob_get_level()) ob_end_flush(); echo \"data: uno\\n\\n\"; flush(); usleep(800000); echo \"data: due\\n\\n\";");
+        {
+            int fd = connect_to(sv_server_port(s));
+            const char* q = "GET /sse.php HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            wr(fd, q, strlen(q));
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            char buf[4096];
+            size_t have = 0;
+            while (have < sizeof(buf) - 1) {
+                ssize_t g = recv(fd, buf + have, sizeof(buf) - 1 - have, 0);
+                if (g <= 0) break;
+                have += (size_t)g;
+                buf[have] = 0;
+                if (strstr(buf, "data: uno")) break;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+            CHECK(strstr(buf, "data: uno") && !strstr(buf, "data: due") && ms < 600 && strcasestr(buf, "Transfer-Encoding: chunked") &&
+                  strcasestr(buf, "text/event-stream"), "SSE first event streamed (%.0f ms): %s", ms, buf);
+            for (;;) { ssize_t g = recv(fd, buf + have, sizeof(buf) - 1 - have, 0); if (g <= 0) break; have += (size_t)g; }
+            buf[have] = 0;
+            CHECK(strstr(buf, "data: due") && strstr(buf, "\r\n0\r\n\r\n"), "SSE second event and end: %s", buf);
+            close(fd);
+        }
         stop(s, th);
         printf("(real php-cgi tested: %s)\n", php);
     } else printf("(php-cgi not installed: real PHP test skipped)\n");

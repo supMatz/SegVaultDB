@@ -165,6 +165,7 @@ typedef struct {
     const Site* proxy;                  // sito servito da un altro server (reverse proxy)
     char   site[128];                   // nome del sito ("" = quello predefinito)
     bool   upgrade;                     // Upgrade: websocket
+    sock_t fd;                          // socket del client (risposte di PHP in streaming)
 } Request;
 
 typedef struct {
@@ -180,6 +181,8 @@ typedef struct {
     char        detail[120];            // per il registro: SQL eseguito o errore
     long long   rows;                   // righe restituite
     char        client[48];             // indirizzo del client (registro di audit)
+    bool        streamed;               // già inviata a pezzi (PHP in streaming): serve_one non la rimanda
+    long long   streamed_bytes;
 } Response;
 
 // sottostringa senza distinzione tra maiuscole e minuscole (strcasestr non c'è su Windows)
@@ -1335,13 +1338,19 @@ static void serve_file(SvServer* s, const Request* rq, Response* rs, const char*
 #define MAX_CGI_PARAMS 160
 
 // risposta CGI di PHP (intestazioni, riga vuota, corpo) -> Response
-static void cgi_response(Response* rs, JsonBuf* out) {
-    size_t hl = 0, skip = 0;
+// fine delle intestazioni CGI: *hl = byte delle intestazioni, *skip = la riga vuota; false se non ancora arrivate
+static bool cgi_head_end(const JsonBuf* out, size_t* hl, size_t* skip) {
     for (size_t i = 0; i < out->len; i++) {
         if (out->data[i] != '\n') continue;
-        if (i + 1 < out->len && out->data[i + 1] == '\n') { hl = i + 1; skip = 1; break; }
-        if (i + 2 < out->len && out->data[i + 1] == '\r' && out->data[i + 2] == '\n') { hl = i + 1; skip = 2; break; }
+        if (i + 1 < out->len && out->data[i + 1] == '\n') { *hl = i + 1; *skip = 1; return true; }
+        if (i + 2 < out->len && out->data[i + 1] == '\r' && out->data[i + 2] == '\n') { *hl = i + 1; *skip = 2; return true; }
     }
+    return false;
+}
+
+static void cgi_response(Response* rs, JsonBuf* out) {
+    size_t hl = 0, skip = 0;
+    cgi_head_end(out, &hl, &skip);
     if (!hl) {
         free(out->data);
         json_error(rs, 502, "PHP sent no headers");
@@ -1390,6 +1399,71 @@ static void cgi_response(Response* rs, JsonBuf* out) {
     if (hb.oom) { free(hb.data); hb.data = NULL; }
     rs->own_headers = hb.data;                 // NUL-terminato da jb_raw
     rs->extra_headers = rs->own_headers;
+}
+
+
+// ── risposte di PHP in streaming ──
+// Una risposta piccola resta in memoria (Content-Length, gzip). Quando supera PHP_STREAM_AT, o è un
+// flusso di eventi (text/event-stream, "X-Accel-Buffering: no"), parte subito a pezzi (chunked):
+// download ed export grandi senza tenerli in memoria, flush() e Server-Sent Events da PHP.
+#define PHP_STREAM_AT (256 * 1024)
+
+typedef struct {
+    SvServer*      s;
+    const Request* rq;
+    Response*      rs;
+    bool           started, failed;
+} PhpStream;
+
+static bool send_chunk(sock_t fd, bool chunked, const char* p, size_t n) {
+    if (!n) return true;
+    if (!chunked) return send_all(fd, p, n);
+    char h[24];
+    int hl = snprintf(h, sizeof(h), "%llx\r\n", (unsigned long long)n);
+    return send_all(fd, h, (size_t)hl) && send_all(fd, p, n) && send_all(fd, "\r\n", 2);
+}
+
+static bool php_on_output(void* ctx, JsonBuf* out) {
+    PhpStream* ps = ctx;
+    if (ps->failed) return false;
+    bool chunked = !ps->rq->http10;
+    if (ps->started) {
+        bool ok = send_chunk(ps->rq->fd, chunked, out->data, out->len);
+        ps->rs->streamed_bytes += (long long)out->len;
+        out->len = 0;
+        if (!ok) ps->failed = true;
+        return ok;
+    }
+    size_t hl, skip;
+    if (!cgi_head_end(out, &hl, &skip)) return true;           // intestazioni non ancora complete
+    char head[8192];
+    size_t n = hl < sizeof(head) - 1 ? hl : sizeof(head) - 1;
+    for (size_t i = 0; i < n; i++) head[i] = (char)tolower((unsigned char)out->data[i]);
+    head[n] = '\0';
+    bool events = strstr(head, "text/event-stream") || strstr(head, "x-accel-buffering: no");
+    if (!events && out->len < PHP_STREAM_AT) return true;
+    JsonBuf all = *out;                                         // cgi_response prende il buffer
+    memset(out, 0, sizeof(*out));
+    Response* rs = ps->rs;
+    cgi_response(rs, &all);
+    if (rs->status == 204 || rs->status == 304 || rs->status < 200) return true;   // niente corpo: via normale
+    JsonBuf h = {0};
+    jb_printf(&h, "HTTP/1.1 %d %s\r\nServer: SegVault/" SV_VERSION_STR "\r\nContent-Type: %s\r\n%s"
+                  "X-Content-Type-Options: nosniff\r\n",
+              rs->status, status_text(rs->status), rs->content_type,
+              chunked ? "Transfer-Encoding: chunked\r\n" : "Connection: close\r\n");
+    if (chunked) jb_printf(&h, "Connection: %s\r\n", ps->rq->keep_alive && !ps->s->stop ? "keep-alive" : "close");
+    if (events) jb_lit(&h, "X-Accel-Buffering: no\r\n");
+    if (rs->extra_headers) jb_raw(&h, rs->extra_headers, strlen(rs->extra_headers));
+    jb_lit(&h, "\r\n");
+    bool ok = !h.oom && send_all(ps->rq->fd, h.data, h.len) && send_chunk(ps->rq->fd, chunked, rs->body.data, rs->body.len);
+    free(h.data);
+    ps->started = true;
+    rs->streamed = true;
+    rs->streamed_bytes = (long long)rs->body.len;
+    rs->body.len = 0;
+    if (!ok) ps->failed = true;
+    return ok;
 }
 
 // script: percorso nel sito ("/blog/index.php"); info: PATH_INFO ("" se manca)
@@ -1468,8 +1542,24 @@ static void run_php(SvServer* s, Request* rq, Response* rs, const char* script, 
 
     JsonBuf out = {0}, errout = {0};
     char err[256];
-    int r = fcgi_request(s->php, pr, n, rq->body, rq->body_len, s->cfg.timeout_ms, 0, &out, &errout, err, sizeof(err));
+    PhpStream ps = { s, rq, rs, false, false };
+    bool head = !strcmp(rq->method, "HEAD");
+    int r = fcgi_request(s->php, pr, n, rq->body, rq->body_len, s->cfg.timeout_ms, 0, &out, &errout, err, sizeof(err),
+                         head ? NULL : php_on_output, &ps);
     free(names);
+    if (ps.started) {                         // risposta già partita: si chiude il flusso (o la connessione)
+        free(out.data);
+        if (r == 0 && !rq->http10) { if (!send_all(rq->fd, "0\r\n\r\n", 5)) rs->close = true; }
+        else rs->close = true;
+        if (r) fprintf(stderr, "[php] %s: %s (response cut)\n", script, err);
+        if (errout.len && !errout.oom) {
+            jb_raw(&errout, "", 1);
+            if (!s->cfg.quiet) fprintf(stderr, "[php] %s: %s%s", script, errout.data, errout.data[errout.len - 2] == '\n' ? "" : "\n");
+            one_line(rs->detail, sizeof(rs->detail), errout.data);
+        } else snprintf(rs->detail, sizeof(rs->detail), "php %s (streamed)", script);
+        free(errout.data);
+        return;
+    }
     if (errout.len && !errout.oom) {
         jb_raw(&errout, "", 1);
         if (!s->cfg.quiet) fprintf(stderr, "[php] %s: %s%s", script, errout.data, errout.data[errout.len - 2] == '\n' ? "" : "\n");
@@ -2459,6 +2549,7 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
     in->data[head_len - 2] = '\0';              // la testata termina con l'ultimo \r\n
     rq.client = c->client;
     rq.client_port = c->client_port;
+    rq.fd = c->fd;
     {                                            // tutte le intestazioni servono a PHP (HTTP_*) e al proxy
         const char* first = strstr(in->data, "\r\n");
         rq.headers = first ? strdup(first + 2) : NULL;
@@ -2520,11 +2611,11 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
         return true;
     }
     route(s, &rq, &rs);
-    rs.close = !rq.keep_alive || s->stop;
+    rs.close = rs.close || !rq.keep_alive || s->stop || (rs.streamed && rq.http10);
     if (!rq.chunked) in->data[used] = after;
     free(chunked.data);
     rq.body = NULL;
-    bool sent = send_response(s, c->fd, &rq, &rs);
+    bool sent = rs.streamed ? true : send_response(s, c->fd, &rq, &rs);
     double ms = now_ms() - t0;
     if (!s->cfg.quiet)
         fprintf(stderr, "[segvault-server] %s %s %s -> %d (%llu bytes, %.1f ms)\n",

@@ -32,8 +32,13 @@ const char* fcgi_pool_describe(const FcgiPool* p);   // "php-cgi ×4 (/usr/bin/p
 // `errout` quello che PHP scrive su stderr (avvisi, errori). timeout_ms = 0: nessun limite.
 // Ritorna 0 se riuscita, altrimenti un codice HTTP: 502 (PHP non risponde), 503 (tutti occupati),
 // 504 (tempo scaduto); err spiega il motivo.
+// on_output (facoltativo): chiamata dopo ogni pezzo d'uscita con tutto quello che è in `out`; può
+// consumarlo (inviarlo al client e svuotare out->len) per le risposte in streaming. false = il client
+// non c'è più: la richiesta si interrompe (ritorna 499)
+typedef bool (*FcgiOnOutput)(void* ctx, JsonBuf* out);
 int fcgi_request(FcgiPool* p, const FcgiParam* params, int nparams, const char* body, size_t body_len,
-                 int timeout_ms, size_t max_out, JsonBuf* out, JsonBuf* errout, char* err, size_t errsz);
+                 int timeout_ms, size_t max_out, JsonBuf* out, JsonBuf* errout, char* err, size_t errsz,
+                 FcgiOnOutput on_output, void* ctx);
 
 // cerca php-cgi: cartella php/ accanto all'eseguibile o in quella corrente, poi il PATH.
 // false se non c'è.
