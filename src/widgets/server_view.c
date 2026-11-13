@@ -340,14 +340,14 @@ bool server_panel_start(ServerPanel* p) {
         snprintf(p->error, sizeof(p->error), "Cannot start the server thread");
         return false;
     }
-    snprintf(p->url, sizeof(p->url), "http://127.0.0.1:%d/api/v1", sv_server_port(p->srv));
+    snprintf(p->url, sizeof(p->url), "http://127.0.0.1:%d%s", sv_server_port(p->srv), sv_server_api_prefix(p->srv));
     snprintf(p->site_url, sizeof(p->site_url), "http://127.0.0.1:%d/", sv_server_port(p->srv));
     p->mysql_addr[0] = '\0';
     if (sv_server_mysql_port(p->srv)) snprintf(p->mysql_addr, sizeof(p->mysql_addr), "mysql://127.0.0.1:%d", sv_server_mysql_port(p->srv));
     char ip[64];
     p->lan_url[0] = '\0';
     if (g_settings.server_lan && sv_local_ip(ip, sizeof(ip)))
-        snprintf(p->lan_url, sizeof(p->lan_url), "http://%s:%d/api/v1", ip, sv_server_port(p->srv));
+        snprintf(p->lan_url, sizeof(p->lan_url), "http://%s:%d%s", ip, sv_server_port(p->srv), sv_server_api_prefix(p->srv));
     p->log_seq = -1;            // aggiorna subito statistiche e registro
     p->nlog = 0;
     p->log_cleared = 0;

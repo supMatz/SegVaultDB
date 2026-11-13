@@ -20,10 +20,12 @@ export class SegVaultError extends Error {
 export class SegVault {
   /**
    * @param {string} url       indirizzo del server, es. "http://127.0.0.1:8484" ("" = stessa origine della pagina)
-   * @param {{database?: string, token?: string}} [options]
+   * @param {{database?: string, token?: string, prefix?: string}} [options]  prefix: dove sta l'API
+   *        (default "/api/v1"; quello di --api-prefix se il server lo cambia)
    */
   constructor(url = "", options = {}) {
     this.url = url.replace(/\/+$/, "");
+    this.prefix = (options.prefix ?? "/api/v1").replace(/\/+$/, "");
     this.database = options.database;
     this.token = options.token;
   }
@@ -32,7 +34,7 @@ export class SegVault {
     const headers = {};
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
-    const res = await fetch(`${this.url}/api/v1${path}`, {
+    const res = await fetch(`${this.url}${this.prefix}${path}`, {
       method, headers, body: body === undefined ? undefined : JSON.stringify(body),
     });
     let data;

@@ -317,6 +317,13 @@ int main(int argc, char** argv) {
         r = req(port, "GET", "/api/v1/health", NULL, NULL);
         CHECK(r.status == 200 && has(&r, "\"ok\":true"), "API still answers: %d", r.status);
         rfree(&r);
+        r = req(port, "GET", "/api/v1/utenti/3?x=1", NULL, NULL);        // una route di Laravel, non di SegVault
+        CHECK(r.status == 200 && has(&r, "SCRIPT_NAME=/index.php\n") && has(&r, "REQUEST_URI=/api/v1/utenti/3?x=1\n"),
+              "non-API path under /api/v1 goes to PHP: %d %s", r.status, r.body);
+        rfree(&r);
+        r = req(port, "POST", "/api/v1/query", "Content-Type: application/json\r\n", "{\"sql\":\"SELECT 41 + 1\"}");
+        CHECK(r.status == 200 && has(&r, "42"), "API paths stay with SegVault: %d %s", r.status, r.body);
+        rfree(&r);
 
         r = req(port, "GET", "/redirect.php", NULL, NULL);
         CHECK(r.status == 302 && hdr(&r, "Location: /dest?a=1"), "Location -> 302: %d %s", r.status, r.head);
@@ -363,6 +370,34 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 10; i++) { pthread_join(pt[i], NULL); ok += pp[i].ok; }
         CHECK(ok == 10, "10 parallel PHP requests on 3 workers: %d", ok);
         stop(s, th);
+    }
+
+    // ── prefisso dell'API spostato o spento ──
+    {
+        SvServerConfig cfg = { .port = 0, .static_dir = www, .quiet = true, .php_cgi = self, .php_workers = 1, .api_prefix = "/_segvault/" };
+        SvServer* s = start(&cfg, &th);
+        int port = sv_server_port(s);
+        CHECK(!strcmp(sv_server_api_prefix(s), "/_segvault"), "normalized prefix: %s", sv_server_api_prefix(s));
+        r = req(port, "GET", "/_segvault/health", NULL, NULL);
+        CHECK(r.status == 200 && has(&r, "\"ok\":true"), "API under the new prefix: %d", r.status);
+        rfree(&r);
+        r = req(port, "POST", "/api/v1/query", "Content-Type: application/json\r\n", "{}");
+        CHECK(r.status == 200 && has(&r, "SCRIPT_NAME=/index.php\n") && has(&r, "REQUEST_METHOD=POST"), "/api/v1/query belongs to the site: %d %s", r.status, r.body);
+        rfree(&r);
+        stop(s, th);
+        SvServerConfig off = { .port = 0, .static_dir = www, .quiet = true, .api_prefix = "none" };
+        s = start(&off, &th);
+        CHECK(!strcmp(sv_server_api_prefix(s), ""), "API off");
+        r = req(sv_server_port(s), "GET", "/api/v1/health", NULL, NULL);
+        CHECK(r.status == 404 && !has(&r, "\"ok\":true"), "API off: %d %s", r.status, r.body);
+        rfree(&r);
+        r = req(sv_server_port(s), "GET", "/style.css", NULL, NULL);
+        CHECK(r.status == 200, "site with the API off: %d", r.status);
+        rfree(&r);
+        stop(s, th);
+        char err[300];
+        SvServerConfig bad = { .port = 0, .quiet = true, .api_prefix = "/a/../b" };
+        CHECK(!sv_server_start(&bad, err, sizeof(err)) && strstr(err, "invalid API prefix"), "bad prefix: %s", err);
     }
 
     // ── backend esterno (php-fpm): host:porta ──

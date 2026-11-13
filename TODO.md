@@ -12,8 +12,8 @@ SegVault copre già database e phpMyAdmin; qui c'è quello che manca, in ordine 
 - [x] `index.php` come pagina predefinita; front controller (`/qualcosa` → `/index.php` se il file non esiste: URL "belli" di WordPress / Laravel)
 - [x] Un `.php` non viene mai servito come testo se PHP è spento (403, niente codice sorgente con le password)
 - [x] Tutti i metodi HTTP verso PHP (`POST`, `PUT`, `DELETE`, `PATCH`), corpi non JSON (form, multipart)
-- [ ] Prova con un php-cgi vero (il test la fa da solo se `php-cgi` è installato) e con WordPress
-- [ ] Prefisso dell'API configurabile: `/api/v1` di SegVault copre quello di un'app Laravel
+- [x] Prova con un php-cgi vero (PHP 8.5: PDO con prepared statement, `lastInsertId`, mysqli, redirect, cookie, URL belli)
+- [x] Prefisso dell'API configurabile (`--api-prefix`, anche `none`); con PHP i percorsi sotto `/api/v1` che non sono dell'API vanno al sito (Laravel)
 - [ ] Corpi `Transfer-Encoding: chunked` in ingresso
 - [ ] Pannello del server: interruttore PHP, percorso di `php-cgi` (ricerca automatica in `php/` accanto all'eseguibile e nel PATH), log degli errori PHP
 - [ ] Risposte grandi in streaming (ora la risposta di PHP è tenuta in memoria)
@@ -36,6 +36,7 @@ SegVault copre già database e phpMyAdmin; qui c'è quello che manca, in ordine 
 - [ ] `INSERT IGNORE`; verificare `REPLACE INTO` e `ON DUPLICATE KEY UPDATE`
 - [ ] `GROUP_CONCAT`, altre funzioni di stringa / data di MySQL
 - [ ] `LOCK TABLES` / `UNLOCK TABLES` accettati
+- [ ] `DECIMAL(p,s)` restituito con `s` decimali (`1.50`, non `1.5`) come MySQL
 - [ ] Prova completa: installazione di WordPress, phpBB, un progetto Laravel
 
 ## 4. Concorrenza

@@ -21,8 +21,10 @@ class SegVaultError(Exception):
 
 
 class SegVault:
-    def __init__(self, url="http://127.0.0.1:8484", database=None, token=None, timeout=30):
+    # prefix: dove sta l'API (quello di --api-prefix se il server lo cambia)
+    def __init__(self, url="http://127.0.0.1:8484", database=None, token=None, timeout=30, prefix="/api/v1"):
         self.url = url.rstrip("/")
+        self.prefix = prefix.rstrip("/")
         self.database = database
         self.token = token
         self.timeout = timeout
@@ -35,7 +37,7 @@ class SegVault:
             headers["Content-Type"] = "application/json"
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
-        req = urllib.request.Request(self.url + "/api/v1" + path, data=data, headers=headers, method=method)
+        req = urllib.request.Request(self.url + self.prefix + path, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as res:
                 status, payload = res.status, json.load(res)

@@ -61,7 +61,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
   static double now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6; }
 #endif
 
-#define API_PREFIX      "/api/v1"
+#define API_PREFIX      "/api/v1"     // prefisso predefinito (vedi SvServerConfig.api_prefix)
 #define MAX_HEADER      (16 * 1024)
 #define IDLE_TIMEOUT_MS 15000          // connessione keep-alive inattiva
 #define MAX_PARAMS      1024
@@ -84,6 +84,7 @@ struct SvServer {
     char*          cors;
     char*          default_db;
     char*          static_dir;
+    char           api[128];            // prefisso dell'API ("" = spenta)
     char*          doc_root;            // percorso assoluto di static_dir (SCRIPT_FILENAME per PHP)
     FcgiPool*      php;                 // NULL = PHP spento
     sock_t         listen_fd;
@@ -1448,10 +1449,22 @@ static bool basic_login(SvServer* s, const char* b64, char* user, size_t un) {
     return true;
 }
 
+// percorsi dell'API di SegVault (dopo il prefisso)
+static bool api_route(const char* sub) {
+    static const char* const R[] = { "/health", "/status", "/query", "/endpoints", "/sessions", "/databases" };
+    for (size_t i = 0; i < sizeof(R) / sizeof(R[0]); i++) {
+        size_t l = strlen(R[i]);
+        if (!strncmp(sub, R[i], l) && (sub[l] == '\0' || sub[l] == '/')) return true;
+    }
+    return false;
+}
+
 static void route(SvServer* s, Request* rq, Response* rs) {
-    bool api = !strncmp(rq->path, API_PREFIX, sizeof(API_PREFIX) - 1) &&
-               (rq->path[sizeof(API_PREFIX) - 1] == '\0' || rq->path[sizeof(API_PREFIX) - 1] == '/');
-    const char* sub = api ? rq->path + sizeof(API_PREFIX) - 1 : NULL;
+    size_t apl = strlen(s->api);
+    bool api = apl && !strncmp(rq->path, s->api, apl) && (rq->path[apl] == '\0' || rq->path[apl] == '/');
+    const char* sub = api ? rq->path + apl : NULL;
+    // con un sito PHP, /api/v1/utenti di Laravel è del sito: solo i percorsi dell'API restano a SegVault
+    if (api && s->php && !api_route(sub)) { api = false; sub = NULL; }
 
     // endpoint salvato: va cercato prima dei controlli (uno pubblico non chiede token né origine)
     bool ep = api && !strncmp(sub, "/endpoints/", 11) && sub[11];
@@ -1555,7 +1568,8 @@ static void route(SvServer* s, Request* rq, Response* rs) {
         return;
     }
     if (s->static_dir) { handle_web(s, rq, rs); return; }
-    json_error(rs, 404, "not found (the API is under " API_PREFIX ")");
+    if (apl) json_error(rs, 404, "not found (the API is under %s)", s->api);
+    else json_error(rs, 404, "not found");
 }
 
 // ── lettura della richiesta ─────────────────────────────────────
@@ -2291,6 +2305,22 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
         if (!s->php) { snprintf(err, errsz, "PHP: %s", perr); sv_server_free(s); return NULL; }
     }
     s->cfg.php_cgi = s->cfg.php_fcgi = NULL;
+    {
+        const char* ap = cfg->api_prefix ? cfg->api_prefix : API_PREFIX;
+        if (!strcmp(ap, "none") || !strcmp(ap, "off")) ap = "";
+        while (*ap == '/') ap++;
+        size_t l = strlen(ap);
+        while (l > 0 && ap[l - 1] == '/') l--;
+        bool ok = l < sizeof(s->api) - 2;
+        for (size_t i = 0; i < l && ok; i++) {
+            char c = ap[i];
+            ok = isalnum((unsigned char)c) || c == '/' || c == '_' || c == '-' || c == '.';
+            if (c == '.' && (i == 0 || ap[i - 1] == '/')) ok = false;          // niente "/." (file nascosti, "..")
+        }
+        if (!ok) { snprintf(err, errsz, "invalid API prefix '%.100s' (e.g. /api/v1, /_segvault, none)", cfg->api_prefix); sv_server_free(s); return NULL; }
+        if (l) snprintf(s->api, sizeof(s->api), "/%.*s", (int)l, ap);
+        s->cfg.api_prefix = NULL;
+    }
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -2344,6 +2374,8 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
 int sv_server_mysql_port(const SvServer* s) { return s->mysql_fd != BAD_SOCK ? s->mysql_port : 0; }
 
 const char* sv_server_php(const SvServer* s) { return s->php ? fcgi_pool_describe(s->php) : ""; }
+
+const char* sv_server_api_prefix(const SvServer* s) { return s->api; }
 
 int sv_server_port(const SvServer* s) { return s->port; }
 

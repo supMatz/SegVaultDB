@@ -138,6 +138,8 @@ static void usage(const char* argv0) {
            "      --php-fcgi ADDR   run them with a PHP FastCGI server already started (php-fpm):\n"
            "                        host:port or unix:/run/php/php-fpm.sock\n"
            "      --php-workers N   php-cgi processes, i.e. PHP requests at the same time (default 4)\n"
+           "      --api-prefix P    where the HTTP API lives (default /api/v1; none = HTTP API off).\n"
+           "                        With PHP, paths under it that are not API paths go to the site\n"
            "      --max-body MB     largest request body (default 16)\n"
            "      --timeout S       stop a request that runs longer than S seconds (default 30, 0 = never)\n"
            "      --no-auth         allow listening on a non-local address without a token\n"
@@ -178,6 +180,7 @@ int main(int argc, char** argv) {
         else if (ARG("--php", "--php")) php_arg = argv[++i];
         else if (ARG("--php-fcgi", "--php-fcgi")) cfg.php_fcgi = argv[++i];
         else if (ARG("--php-workers", "--php-workers")) cfg.php_workers = atoi(argv[++i]);
+        else if (ARG("--api-prefix", "--api-prefix")) cfg.api_prefix = argv[++i];
         else if (ARG("--max-body", "--max-body")) cfg.max_body = (size_t)atoi(argv[++i]) << 20;
         else if (ARG("--timeout", "--timeout")) cfg.timeout_ms = atoi(argv[++i]) * 1000;
         else if (!strcmp(a, "--no-auth")) no_auth = true;
@@ -275,7 +278,8 @@ int main(int argc, char** argv) {
         printf("  PHP:      %s\n", sv_server_php(g_server));
         if (!cfg.mysql) printf("            (scripts reach the database with mysqli / PDO if you add --mysql-port 3306)\n");
     }
-    printf("  API:      http://%s:%d/api/v1\n", host, port);
+    if (sv_server_api_prefix(g_server)[0]) printf("  API:      http://%s:%d%s\n", host, port, sv_server_api_prefix(g_server));
+    else printf("  API:      off (--api-prefix none)\n");
     if (cfg.mysql) printf("  MySQL:    %s:%d   (e.g. mysql -h %s -P %d -u root)\n", host, sv_server_mysql_port(g_server), host, sv_server_mysql_port(g_server));
     if (g_bk_dir) {
 #ifdef _WIN32

@@ -41,6 +41,7 @@ SEGVAULT_TOKEN=segreto ./segvault-server -b 0.0.0.0   # raggiungibile in rete: i
 | `--php PATH\|auto` | esegue i `.php` di `--static DIR` con `php-cgi` (FastCGI; `auto` lo cerca in `php/`, nel `PATH`, ...) |
 | `--php-fcgi ADDR` | li esegue con php-fpm già avviato: `host:porta` o `unix:/percorso.sock` |
 | `--php-workers N` | processi `php-cgi` (default 4) |
+| `--api-prefix P` | prefisso dell'API (default `/api/v1`; `none` = spenta). Con PHP, i percorsi sotto il prefisso che non sono dell'API vanno al sito |
 | `--max-body MB` | corpo massimo di una richiesta (default 16) |
 | `--timeout S` | ferma una richiesta che dura più di S secondi (default 30, `0` = mai) |
 | `--no-auth` | consente un indirizzo non locale senza token (sconsigliato) |
