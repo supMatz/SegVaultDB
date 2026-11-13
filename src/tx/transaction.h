@@ -3,7 +3,7 @@
 
 #include "../../include/common.h"
 
-#define SV_MAX_TRANSACTIONS 64
+#define SV_MAX_TRANSACTIONS 256
 
 typedef struct {
     uint64_t tx_id;

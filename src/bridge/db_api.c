@@ -48,6 +48,7 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
 // Lock del motore: le SELECT di db_execute_readonly lo prendono in lettura (in parallelo tra loro),
 // tutto il resto in scrittura (esclusivo). L'esclusivo è rientrante con un contatore per thread.
 #include "../platform_lock.h"
+#include "locks.h"
 static SvRwLock g_db_rw;
 static _Thread_local int g_lock_depth;
 static void db_mutex_init(void) { sv_rw_init(&g_db_rw); }
@@ -60,7 +61,7 @@ const char* db_init_error(void) { return g_init_error; }
 // ── Forward declarations ─────────────────────────────────────────
 static QueryResult* result_error(const char* msg);
 static void free_list_load(void);
-static struct DbSession* g_tx_owner;      // (sessioni: vedi più avanti)
+static int g_open_tx;                     // transazioni aperte, di tutte le sessioni (con il lock del motore)
 static QueryResult* result_ok(int rows_affected);
 
 // ── Stato globale del DB engine ──────────────────────────────────
@@ -161,7 +162,7 @@ bool db_cancel_requested(void) { return atomic_load(&g_cancel_requested) != 0; }
 #define SV_WAL_CHECKPOINT_BYTES (16L << 20)
 
 static bool do_checkpoint(void) {
-    if (!g_db.initialized || g_db.exec_ctx.tx_id) return false;
+    if (!g_db.initialized || g_open_tx > 0) return false;     // il log serve ancora alle transazioni aperte
     bp_flush_all(g_db.bp);
     if (catalog_save(g_db.catalog, g_db.cat_path) != SV_OK) return false;
     return wal_truncate(g_db.wal) == SV_OK;
@@ -233,7 +234,7 @@ static bool do_vacuum(int* freed) {
 }
 
 static void maybe_checkpoint(void) {
-    if (g_db.initialized && !g_db.exec_ctx.tx_id && wal_size(g_db.wal) > SV_WAL_CHECKPOINT_BYTES) do_checkpoint();
+    if (g_db.initialized && g_open_tx == 0 && wal_size(g_db.wal) > SV_WAL_CHECKPOINT_BYTES) do_checkpoint();
 }
 
 static int g_num_savepoints;
@@ -442,7 +443,7 @@ static QueryResult* exec_table_maint(ASTNode* stmt) {
     snprintf(opl, sizeof(opl), "%s", op);
     for (char* c = opl; *c; c++) *c = (char)tolower((unsigned char)*c);
     bool optimize = !strcmp(op, "OPTIMIZE");
-    if ((optimize) && (g_db.exec_ctx.tx_id || g_tx_owner)) return result_error("OPTIMIZE TABLE is not allowed while a transaction is open");
+    if ((optimize) && g_open_tx > 0) return result_error("OPTIMIZE TABLE is not allowed while a transaction is open");
     MaintOut m = { calloc(1, sizeof(QueryResult)), 0 };
     if (!m.r) return result_error("Out of memory");
     static const char* const NAMES[4] = { "Table", "Op", "Msg_type", "Msg_text" };
@@ -505,10 +506,11 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
         result = db_backup_impl(stmt->backup.path, err, sizeof(err)) ? result_ok(0) : result_error(err);
     } else if (stmt->type == NODE_VACUUM) {
         int freed = 0;
-        result = g_db.exec_ctx.tx_id || g_tx_owner ? result_error("VACUUM is not allowed while a transaction is open")
+        result = g_open_tx > 0 ? result_error("VACUUM is not allowed while a transaction is open")
                : do_vacuum(&freed) ? result_ok(freed) : result_error("VACUUM failed");
     } else if (stmt->type == NODE_CHECKPOINT) {
-        result = g_db.exec_ctx.tx_id ? result_error("CHECKPOINT is not allowed inside a transaction")
+        result = g_open_tx > 0 ? result_error(g_db.exec_ctx.tx_id ? "CHECKPOINT is not allowed inside a transaction"
+                                                                  : "CHECKPOINT is not allowed while a transaction is open")
                : do_checkpoint() ? result_ok(0) : result_error("Checkpoint failed");
     } else if (stmt->type == NODE_SAVEPOINT) {
         result = db_savepoint(stmt->savepoint.name) ? result_ok(0) : result_error("Failed to set savepoint");
@@ -655,10 +657,13 @@ static bool db_begin_impl(void) {
     if (!tx) return false;
     g_db.exec_ctx.tx_id = tx->tx_id;
     g_num_savepoints = 0;
+    g_open_tx++;
     wal_write(g_db.wal, LOG_BEGIN, tx->tx_id, 0,
               (SVRID){0,0}, NULL, 0, NULL, 0);
     return true;
 }
+
+static const void* lock_owner(void);
 
 static bool db_commit_impl(void) {
     if (!g_db.initialized || !g_db.exec_ctx.tx_id) return false;
@@ -668,6 +673,8 @@ static bool db_commit_impl(void) {
     txm_commit(g_db.txm, g_db.exec_ctx.tx_id);
     g_db.exec_ctx.tx_id = 0;
     g_num_savepoints = 0;
+    if (g_open_tx > 0) g_open_tx--;
+    lk_release_all(lock_owner());          // fine della transazione: i lock delle tabelle si liberano
     return true;
 }
 
@@ -686,7 +693,9 @@ static bool db_rollback_impl(void) {
     txm_abort(g_db.txm, g_db.exec_ctx.tx_id);
     g_db.exec_ctx.tx_id = 0;
     g_num_savepoints = 0;
+    if (g_open_tx > 0) g_open_tx--;
     executor_invalidate_indexes();   // le righe sono tornate indietro (e possono aver cambiato posizione)
+    lk_release_all(lock_owner());
     return true;
 }
 
@@ -735,9 +744,11 @@ static bool db_rollback_to_impl(const char* name) {
     off_t sp_off = g_savepoints[sp_idx].offset;
     wal_undo_tx_from(g_db.log_path, g_db.db_path, g_db.exec_ctx.tx_id, (long)sp_off);
 
-    if (sv_ftruncate(g_db.wal->fd, sp_off) != 0)
-        fprintf(stderr, "[SegVault] cannot shorten the transaction log after ROLLBACK TO\n");
-    sv_lseek(g_db.wal->fd, 0, SEEK_END);
+    // il log non si accorcia (dopo il savepoint ci sono anche le voci delle altre transazioni): una
+    // voce ROLLBACK_TO dice a ROLLBACK e al recupero che quelle voci sono già state annullate
+    int64_t sp64 = (int64_t)sp_off;
+    wal_write(g_db.wal, LOG_ROLLBACK_TO, g_db.exec_ctx.tx_id, 0, (SVRID){0,0}, (const uint8_t*)&sp64, 8, NULL, 0);
+    wal_flush(g_db.wal);
     g_num_savepoints = sp_idx + 1;      // il savepoint resta (come in SQL): ci si può tornare ancora
 
     bp_remove_all(g_db.bp);
@@ -1131,7 +1142,9 @@ struct DbSession {
 
 static DbSession  g_default_session;            // stato salvato della sessione predefinita
 static DbSession* g_active;                     // sessione attiva (NULL = predefinita)
-static DbSession* g_tx_owner;                   // sessione con una transazione aperta (sospesa)
+
+// proprietario dei lock delle tabelle: la sessione attiva (o quella predefinita)
+static const void* lock_owner(void) { return g_active ? (const void*)g_active : (const void*)&g_default_session; }
 
 static void session_save(DbSession* s) {
     s->cur_db = g_db.catalog ? g_db.catalog->current_db : -1;
@@ -1157,8 +1170,8 @@ DbSession* db_session_new(void) {
 
 bool db_session_enter(DbSession* s) {
     db_lock();
-    // una transazione aperta (di una sessione sospesa, o della sessione predefinita) blocca le altre
-    bool busy = (g_tx_owner && g_tx_owner != s) || (s && g_db.exec_ctx.tx_id && !g_active);
+    // più sessioni possono avere una transazione aperta: le tabelle le proteggono i lock (locks.h)
+    bool busy = g_active && g_active != s;
     if (!busy && s && !g_active) {
         session_save(&g_default_session);
         session_load(s);
@@ -1173,8 +1186,6 @@ void db_session_leave(DbSession* s) {
     db_lock();
     if (g_active == s) {
         session_save(s);
-        if (s->tx_id) g_tx_owner = s;
-        else if (g_tx_owner == s) g_tx_owner = NULL;
         session_load(&g_default_session);
         g_active = NULL;
     }
@@ -1187,20 +1198,13 @@ void db_session_end(DbSession* s) {
         db_rollback();
         db_session_leave(s);
     }
-    db_lock();
-    if (g_tx_owner == s) g_tx_owner = NULL;
-    db_unlock();
+    lk_release_all(s);                          // anche i lock di letture senza transazione
     free(s);
 }
 
 bool db_session_in_transaction(const DbSession* s) { return s && s->tx_id != 0; }
 
-bool db_session_blocked(void) {
-    db_lock();
-    bool b = g_tx_owner != NULL;
-    db_unlock();
-    return b;
-}
+bool db_session_blocked(void) { return false; }   // le transazioni non si escludono più a vicenda
 
 // ── letture in parallelo ────────────────────────────────────────
 
@@ -1211,7 +1215,7 @@ QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char
     sv_rw_rd(&g_db_rw);
     // una transazione aperta (di una sessione o della GUI): niente letture accanto ai suoi dati non
     // confermati; e un thread che ha già il lock esclusivo non può prenderlo anche in lettura
-    if (g_tx_owner || g_db.exec_ctx.tx_id || g_active || g_lock_depth) { sv_rw_rdunlock(&g_db_rw); *refused = true; return NULL; }
+    if (g_lock_depth) { sv_rw_rdunlock(&g_db_rw); *refused = true; return NULL; }
     TokenList* tokens = lexer_tokenize(sql);
     ParseResult* parsed = tokens ? parser_parse(tokens) : NULL;
     QueryResult* r = NULL;

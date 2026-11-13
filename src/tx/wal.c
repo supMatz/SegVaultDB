@@ -222,7 +222,8 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
         uint32_t old_data_len;
         uint8_t* data;
         uint8_t* old_data;
-        off_t    offset; // unused but kept for structure
+        off_t    offset; // posizione della voce nel log
+        bool     dead;   // già annullata da un ROLLBACK TO SAVEPOINT (non va annullata di nuovo)
     } LogEntry;
 
     int cap_entries = 1024;
@@ -230,10 +231,11 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
     if (!entries) { close(log_fd); close(db_fd); return SV_ERR; }
     int num_entries = 0;
 
-    uint64_t active_tx[64];
+    uint64_t active_tx[1024];
     int num_active = 0;
 
     uint8_t hdr[23];
+    off_t pos = 0;
     while (sv_read(log_fd, hdr, 23) == 23) {
         if (num_entries >= cap_entries) {
             LogEntry* ne = realloc(entries, sizeof(LogEntry) * (size_t)cap_entries * 2);
@@ -242,6 +244,8 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
             cap_entries *= 2;
         }
         LogEntry* e = &entries[num_entries];
+        e->offset = pos;
+        e->dead = false;
         e->type = hdr[0];
         memcpy(&e->tx_id, hdr + 1, 8);
         memcpy(&e->page_id, hdr + 9, 4);
@@ -259,9 +263,17 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
             break;
         }
 
+        pos += 23 + (off_t)e->data_len + (off_t)e->old_data_len;
+        // ROLLBACK TO: le voci della transazione dopo il savepoint sono già state annullate
+        if (e->type == LOG_ROLLBACK_TO && e->data && e->data_len >= 8) {
+            int64_t sp;
+            memcpy(&sp, e->data, 8);
+            for (int j = 0; j < num_entries; j++)
+                if (entries[j].tx_id == e->tx_id && entries[j].offset >= (off_t)sp) entries[j].dead = true;
+        }
         // Track transaction state
         if (e->type == LOG_BEGIN) {
-            if (num_active < 64) active_tx[num_active++] = e->tx_id;
+            if (num_active < 1024) active_tx[num_active++] = e->tx_id;
         } else if (e->type == LOG_COMMIT || e->type == LOG_ABORT) {
             for (int i = 0; i < num_active; i++) {
                 if (active_tx[i] == e->tx_id) {
@@ -295,7 +307,7 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
         for (int j = 0; j < num_active; j++) {
             if (active_tx[j] == e->tx_id) { is_active = true; break; }
         }
-        if (is_active) {
+        if (is_active && !e->dead) {
             undo_entry(db_fd, e->type, e->page_id, e->slot_id,
                        e->data, e->data_len, e->old_data, e->old_data_len);
         }
@@ -333,6 +345,8 @@ int wal_undo_tx_from(const char* log_path, const char* db_path, uint64_t tx_id, 
         uint32_t old_data_len;
         uint8_t* data;
         uint8_t* old_data;
+        off_t    offset;
+        bool     dead;
     } LogEntry;
 
     int cap_entries = 256;
@@ -341,6 +355,7 @@ int wal_undo_tx_from(const char* log_path, const char* db_path, uint64_t tx_id, 
     int num_entries = 0;
 
     uint8_t hdr[23];
+    off_t pos = from > 0 ? (off_t)from : 0;
     while (sv_read(log_fd, hdr, 23) == 23) {
         if (num_entries >= cap_entries) {
             LogEntry* ne = realloc(entries, sizeof(LogEntry) * (size_t)cap_entries * 2);
@@ -358,6 +373,9 @@ int wal_undo_tx_from(const char* log_path, const char* db_path, uint64_t tx_id, 
         memcpy(&e->old_data_len, hdr + 19, 4);
         e->data = NULL;
         e->old_data = NULL;
+        e->offset = pos;
+        e->dead = false;
+        pos += 23 + (off_t)e->data_len + (off_t)e->old_data_len;
 
         if (entry_tx_id != tx_id) {
             // Skip but advance file position
@@ -371,6 +389,11 @@ int wal_undo_tx_from(const char* log_path, const char* db_path, uint64_t tx_id, 
             e->data = NULL;
             break;                                       // voce troncata: fine del log
         }
+        if (e->type == LOG_ROLLBACK_TO && e->data && e->data_len >= 8) {   // voci già annullate da ROLLBACK TO
+            int64_t sp;
+            memcpy(&sp, e->data, 8);
+            for (int j = 0; j < num_entries; j++) if (entries[j].offset >= (off_t)sp) entries[j].dead = true;
+        }
         num_entries++;
     }
     sv_close(log_fd);
@@ -378,7 +401,7 @@ int wal_undo_tx_from(const char* log_path, const char* db_path, uint64_t tx_id, 
     // Undo in reverse order (le voci di controllo non toccano le pagine)
     for (int i = num_entries - 1; i >= 0; i--) {
         LogEntry* e = &entries[i];
-        if (e->type == LOG_INSERT || e->type == LOG_DELETE || e->type == LOG_UPDATE || e->type == LOG_UPDATE_MOVE)
+        if (!e->dead && (e->type == LOG_INSERT || e->type == LOG_DELETE || e->type == LOG_UPDATE || e->type == LOG_UPDATE_MOVE))
             undo_entry(db_fd, e->type, e->page_id, e->slot_id,
                        e->data, e->data_len, e->old_data, e->old_data_len);
         free(e->data);
