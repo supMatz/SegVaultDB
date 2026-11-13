@@ -53,7 +53,7 @@ WIDGET_SRCS = \
 	src/widgets/window.c
 
 # ── server HTTP/JSON (usato anche dalla GUI, modalità "API server") ──
-NET_SRCS = src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c src/server/mail.c src/widgets/png_write.c
+NET_SRCS = src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c src/server/mail.c src/server/rewrite.c src/widgets/png_write.c
 
 # ── DB engine source files ──
 ENGINE_SRCS = \
@@ -216,25 +216,25 @@ TEST_GRID_SRCS = tests/test_grid_edit.c src/widgets/grid_edit.c $(ENGINE_SRCS)
 test_grid_edit: $(TEST_GRID_SRCS) src/widgets/grid_edit.h
 	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_grid_edit $(TEST_GRID_SRCS) -lm -pthread
 
-TEST_SERVER_SRCS = tests/test_server.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c src/server/mail.c src/widgets/png_write.c src/widgets/sql_text.c $(ENGINE_SRCS)
+TEST_SERVER_SRCS = tests/test_server.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c src/server/mail.c src/server/rewrite.c src/widgets/png_write.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
 # il server HTTP: richieste reali su un socket locale
 test_server: $(TEST_SERVER_SRCS) src/server/server.h src/server/json.h
 	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_server $(TEST_SERVER_SRCS) -lm -pthread
 
-TEST_WEB_SRCS = tests/test_web.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c src/server/mail.c src/widgets/png_write.c src/widgets/sql_text.c $(ENGINE_SRCS)
+TEST_WEB_SRCS = tests/test_web.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c src/server/mail.c src/server/rewrite.c src/widgets/png_write.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
 # siti per nome, cruscotto, elenco dei file, reverse proxy (anche WebSocket)
 test_web: $(TEST_WEB_SRCS) src/server/server.h src/server/proxy.h
 	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_web $(TEST_WEB_SRCS) -lm -pthread
 
-TEST_MAIL_SRCS = tests/test_mail.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c src/server/mail.c src/widgets/png_write.c src/widgets/sql_text.c $(ENGINE_SRCS)
+TEST_MAIL_SRCS = tests/test_mail.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c src/server/mail.c src/server/rewrite.c src/widgets/png_write.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
 # cattura delle email: SMTP, MIME, pagine e API, sendmail, mail() di PHP
 test_mail: $(TEST_MAIL_SRCS) src/server/server.h src/server/mail.h
 	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_mail $(TEST_MAIL_SRCS) -lm -pthread
 
-TEST_PHP_SRCS = tests/test_php.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c src/server/mail.c src/widgets/png_write.c src/widgets/sql_text.c $(ENGINE_SRCS)
+TEST_PHP_SRCS = tests/test_php.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c src/server/mail.c src/server/rewrite.c src/widgets/png_write.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
 # PHP via FastCGI: il test fa anche da php-cgi finto (e prova quello vero se è installato)
 test_php: $(TEST_PHP_SRCS) src/server/server.h src/server/fastcgi.h src/server/json.h

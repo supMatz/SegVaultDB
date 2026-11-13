@@ -699,6 +699,152 @@ int main(int argc, char** argv) {
         unlink(p404);
     }
 
+    // ── .htaccess (mod_rewrite di WordPress e Laravel, accesso negato, Options -Indexes) ──
+    {
+        char w2[1200], d[1300];
+        snprintf(w2, sizeof(w2), "%s/w2", dir);
+        mkdir(w2, 0755);
+        put(w2, "index.php", "echo\n");
+        put(w2, "echo.php", "echo\n");
+        put(w2, "style.css", "body{}");
+        put(w2, "app.log", "log segreto");
+        put(w2, "app.txt", "testo");
+        put(w2, ".htaccess",
+            "# BEGIN WordPress\n"
+            "<IfModule mod_rewrite.c>\n"
+            "RewriteEngine On\n"
+            "RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]\n"
+            "RewriteBase /\n"
+            "RewriteRule ^old/(.*)$ /new/$1 [R=301,L]\n"
+            "RewriteRule ^shop/item/([0-9]+)/?$ echo.php?id=$1 [QSA,L]\n"
+            "RewriteRule ^blocked - [F]\n"
+            "RewriteRule ^removed - [G,L]\n"
+            "RewriteCond %{HTTP_HOST} ^www\\.(.+)$ [NC]\n"
+            "RewriteRule ^(.*)$ http://%1/$1 [R=301,L]\n"
+            "RewriteCond %{QUERY_STRING} (^|&)lang=(it|en) [OR]\n"
+            "RewriteCond %{HTTP:X-Lang} ^(de)$\n"
+            "RewriteRule ^hello$ echo.php?greeting=1 [L]\n"
+            "RewriteRule ^index\\.php$ - [L]\n"
+            "RewriteCond %{REQUEST_FILENAME} !-f\n"
+            "RewriteCond %{REQUEST_FILENAME} !-d\n"
+            "RewriteRule . /index.php [L]\n"
+            "</IfModule>\n"
+            "<IfModule !mod_rewrite.c>\n"
+            "Require all denied\n"
+            "</IfModule>\n"
+            "<FilesMatch \"\\.(log|ini)$\">\n"
+            "    Require all denied\n"
+            "</FilesMatch>\n"
+            "# END WordPress\n");
+        snprintf(d, sizeof(d), "%s/private", w2); mkdir(d, 0755);
+        put(d, ".htaccess", "Deny from all\n");
+        put(d, "secret.txt", "password");
+        snprintf(d, sizeof(d), "%s/private/open", w2); mkdir(d, 0755);
+        put(d, ".htaccess", "Require all granted\n");
+        put(d, "ok.txt", "aperto");
+        snprintf(d, sizeof(d), "%s/files", w2); mkdir(d, 0755);
+        put(d, ".htaccess", "Options -Indexes +FollowSymLinks\n");
+        put(d, "a.txt", "a");
+        // Laravel: il sito lara.localhost ha public/ come radice
+        snprintf(d, sizeof(d), "%s/lara", w2); mkdir(d, 0755);
+        snprintf(d, sizeof(d), "%s/lara/public", w2); mkdir(d, 0755);
+        put(d, "index.php", "echo\n");
+        put(d, ".htaccess",
+            "<IfModule mod_rewrite.c>\n"
+            "    <IfModule mod_negotiation.c>\n"
+            "        Options -MultiViews -Indexes\n"
+            "    </IfModule>\n\n"
+            "    RewriteEngine On\n\n"
+            "    # Handle Authorization Header\n"
+            "    RewriteCond %{HTTP:Authorization} .\n"
+            "    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]\n\n"
+            "    # Redirect Trailing Slashes If Not A Folder...\n"
+            "    RewriteCond %{REQUEST_FILENAME} !-d\n"
+            "    RewriteCond %{REQUEST_URI} (.+)/$\n"
+            "    RewriteRule ^ %1 [L,R=301]\n\n"
+            "    # Send Requests To Front Controller...\n"
+            "    RewriteCond %{REQUEST_FILENAME} !-d\n"
+            "    RewriteCond %{REQUEST_FILENAME} !-f\n"
+            "    RewriteRule ^ index.php [L]\n"
+            "</IfModule>\n");
+
+        SvServerConfig cfg = { .port = 0, .static_dir = w2, .quiet = true, .php_cgi = self, .php_workers = 2, .dir_listing = true };
+        SvServer* s = start(&cfg, &th);
+        int port = sv_server_port(s);
+        r = req(port, "GET", "/2026/11/ciao-mondo/?p=3", NULL, NULL);
+        CHECK(r.status == 200 && has(&r, "SCRIPT_NAME=/index.php\n") && has(&r, "REQUEST_URI=/2026/11/ciao-mondo/?p=3\n") &&
+              has(&r, "QUERY_STRING=p=3\n"), "WordPress permalink: %d %s", r.status, r.body);
+        rfree(&r);
+        r = req(port, "GET", "/style.css", NULL, NULL);
+        CHECK(r.status == 200 && !strcmp(r.body, "body{}"), "existing file not rewritten: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/old/page?x=1", NULL, NULL);
+        CHECK(r.status == 301 && hdr(&r, "Location: /new/page?x=1"), "R=301 with $1: %d %s", r.status, r.head);
+        rfree(&r);
+        r = req(port, "GET", "/shop/item/42/?ref=mail", NULL, NULL);
+        CHECK(r.status == 200 && has(&r, "SCRIPT_NAME=/echo.php\n") && has(&r, "QUERY_STRING=id=42&ref=mail\n") &&
+              has(&r, "REQUEST_URI=/shop/item/42/?ref=mail\n"), "QSA + RewriteBase: %d %s", r.status, r.body);
+        rfree(&r);
+        r = req(port, "GET", "/blocked/x", NULL, NULL);
+        CHECK(r.status == 403, "[F]: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/removed", NULL, NULL);
+        CHECK(r.status == 410, "[G]: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/a/b?c=d", "Host: www.example.test\r\n", NULL);
+        CHECK(r.status == 301 && hdr(&r, "Location: http://example.test/a/b?c=d"), "%%1 from RewriteCond, host redirect: %d %s", r.status, r.head);
+        rfree(&r);
+        r = req(port, "GET", "/hello?lang=it", NULL, NULL);
+        CHECK(r.status == 200 && has(&r, "QUERY_STRING=greeting=1\n"), "[OR] first: %d %s", r.status, r.body);
+        rfree(&r);
+        r = req(port, "GET", "/hello", "X-Lang: de\r\n", NULL);
+        CHECK(r.status == 200 && has(&r, "QUERY_STRING=greeting=1\n"), "[OR] second (%%{HTTP:X-Lang}): %d %s", r.status, r.body);
+        rfree(&r);
+        r = req(port, "GET", "/hello?lang=fr", NULL, NULL);
+        CHECK(r.status == 200 && has(&r, "SCRIPT_NAME=/index.php\n") && has(&r, "QUERY_STRING=lang=fr\n"), "[OR] none: %d %s", r.status, r.body);
+        rfree(&r);
+        r = req(port, "GET", "/app.log", NULL, NULL);
+        CHECK(r.status == 403 && !has(&r, "segreto"), "FilesMatch denied: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/app.txt", NULL, NULL);
+        CHECK(r.status == 200 && !strcmp(r.body, "testo"), "other files allowed: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/private/secret.txt", NULL, NULL);
+        CHECK(r.status == 403 && !has(&r, "password"), "Deny from all: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/private/open/ok.txt", NULL, NULL);
+        CHECK(r.status == 200 && !strcmp(r.body, "aperto"), "deeper Require all granted: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/files/", NULL, NULL);
+        CHECK(r.status != 200 || !has(&r, "a.txt"), "Options -Indexes: %d %s", r.status, r.body);
+        rfree(&r);
+        r = req(port, "GET", "/.htaccess", NULL, NULL);
+        CHECK(r.status == 404 && !has(&r, "RewriteEngine"), ".htaccess never served: %d", r.status);
+        rfree(&r);
+        // Laravel
+        r = req(port, "GET", "/users?page=2", "Host: lara.localhost\r\nAuthorization: Bearer abc\r\n", NULL);
+        CHECK(r.status == 200 && has(&r, "SCRIPT_NAME=/index.php\n") && has(&r, "QUERY_STRING=page=2\n") &&
+              has(&r, "REQUEST_URI=/users?page=2\n") && has(&r, "HTTP_AUTHORIZATION=Bearer abc\n"), "Laravel front controller: %d %s", r.status, r.body);
+        rfree(&r);
+        r = req(port, "GET", "/users/", "Host: lara.localhost\r\n", NULL);
+        CHECK(r.status == 301 && hdr(&r, "Location: /users") && !hdr(&r, "Location: /users/"), "Laravel trailing slash redirect: %d %s", r.status, r.head);
+        rfree(&r);
+        stop(s, th);
+
+        // --no-htaccess: le regole non valgono più (resta il front controller di SegVault)
+        SvServerConfig c2 = cfg;
+        c2.no_htaccess = true;
+        s = start(&c2, &th);
+        port = sv_server_port(s);
+        r = req(port, "GET", "/old/page", NULL, NULL);
+        CHECK(r.status == 200 && has(&r, "SCRIPT_NAME=/index.php\n"), "htaccess off: %d %s", r.status, r.head);
+        rfree(&r);
+        r = req(port, "GET", "/app.log", NULL, NULL);
+        CHECK(r.status == 200, "htaccess off, FilesMatch ignored: %d", r.status);
+        rfree(&r);
+        stop(s, th);
+    }
+
     // ── php-cgi vero, se c'è ──
     char php[1024];
     if (fcgi_find_php_cgi(php, sizeof(php))) {

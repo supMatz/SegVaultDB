@@ -30,7 +30,7 @@ SegVault copre già database e phpMyAdmin; qui c'è quello che manca, in ordine 
 - [x] Virtual host automatici come Laragon, senza toccare il file hosts: ogni cartella `www/NOME` è `http://NOME.localhost:PORTA` (anche `NOME.test` e i sottodomini `api.NOME.localhost`); `public/` come radice se la cartella non ha un index (Laravel, Symfony); siti espliciti `--site NOME=CARTELLA`, anche con un nome completo (`shop.example.com`)
 - [x] Reverse proxy per i dev server (`--site app=http://127.0.0.1:5173`: Vite, Next.js, Express, Django, Rails, ...): streaming, chunked, keep-alive, WebSocket (ricarica a caldo), `X-Forwarded-*`, pagina 502 che spiega come avviare il dev server
 - [x] Cruscotto su `http://localhost:PORTA/` (se la cartella non ha un index) e `/.segvault/`: servizi attivi e siti con il tipo di progetto riconosciuto (Laravel, WordPress, Symfony, Node, ...)
-- [ ] Regole di rewrite minime (alternativa a `.htaccess`)
+- [x] `.htaccess` come Apache: `mod_rewrite` (RewriteCond / RewriteRule con i flag usati da WordPress, Laravel, Symfony, ...), `Require all denied` / `Deny from all` (anche in `<Files>` / `<FilesMatch>`), `Options -Indexes`; `--no-htaccess` per spegnerli. Il motore regex ora ha i gruppi di cattura
 - [ ] HTTPS integrato (certificato self-signed generato al primo avvio, come XAMPP), anche per il protocollo MySQL
 - [ ] HTTP/2 su HTTPS (negoziato con ALPN): i browser usano HTTP/2 e HTTP/3 solo con TLS; con HTTP/2 cade il limite di 6 connessioni per host (Vite in sviluppo carica centinaia di moduli). HTTP/3 (QUIC) non porta vantaggi in locale
 

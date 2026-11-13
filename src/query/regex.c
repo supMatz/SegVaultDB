@@ -20,6 +20,7 @@ typedef struct RNode {
     uint8_t set[32];             // RN_CLASS: bit per byte
     int min, max;                // RN_REPEAT (max < 0 = infinito)
     bool lazy;
+    int group;                   // RN_GROUP: numero del gruppo di cattura (1, 2, ...; 0 = (?:...))
     struct RNode** kids;         // RN_SEQ / RN_ALT: figli; RN_GROUP / RN_REPEAT: kids[0]
     int nkids;
 } RNode;
@@ -35,6 +36,7 @@ typedef struct {
     char* err;
     size_t errn;
     bool failed;
+    int groups;                  // gruppi di cattura visti
 } RParse;
 
 static RNode* rn_new(RNType t) {
@@ -143,13 +145,16 @@ static RNode* parse_atom(RParse* r) {
     char c = *r->p;
     if (c == '(') {
         r->p++;
-        if (r->p[0] == '?' && r->p[1] == ':') r->p += 2;   // (?: ...) senza cattura: uguale
+        int num = 0;
+        if (r->p[0] == '?' && r->p[1] == ':') r->p += 2;   // (?: ...) senza cattura
+        else num = ++r->groups;
         RNode* inner = parse_alt(r);
         if (r->failed) { rn_free(inner); return NULL; }
         if (*r->p != ')') { rfail(r, "missing )"); rn_free(inner); return NULL; }
         r->p++;
         RNode* g = rn_new(RN_GROUP);
         if (!g || !rn_add(g, inner)) { rn_free(g); rn_free(inner); rfail(r, "out of memory"); return NULL; }
+        g->group = num;
         return g;
     }
     if (c == '[') return parse_class(r);
@@ -228,7 +233,7 @@ static RNode* parse_alt(RParse* r) {
 }
 
 SvRegex* sv_regex_compile(const char* pattern, bool icase, char* err, size_t errn) {
-    RParse r = { pattern ? pattern : "", icase, err, errn, false };
+    RParse r = { pattern ? pattern : "", icase, err, errn, false, 0 };
     if (errn) err[0] = '\0';
     RNode* root = parse_alt(&r);
     if (!r.failed && *r.p) rfail(&r, "unbalanced )");
@@ -262,6 +267,8 @@ typedef struct {
     bool icase;
     long steps;
     int depth;
+    size_t (*caps)[2];           // gruppi di cattura (NULL = non servono)
+    int ncaps;
 } MState;
 
 #define MAX_STEPS 2000000L
@@ -281,6 +288,14 @@ static bool m_node(MState* m, const RNode* n, size_t pos, const Cont* k, size_t*
 
 static bool m_cont(MState* m, size_t pos, const Cont* k, size_t* end) {
     if (!k) { *end = pos; return true; }
+    if (k->node->type == RN_GROUP && k->idx < 0) {            // fine di un gruppo di cattura
+        int g = k->node->group;
+        size_t old = m->caps[g][1];
+        m->caps[g][1] = pos;
+        if (m_cont(m, pos, k->next, end)) return true;
+        m->caps[g][1] = old;
+        return false;
+    }
     if (k->node->type == RN_SEQ) {
         if (k->idx >= k->node->nkids) return m_cont(m, pos, k->next, end);
         Cont c = { k->node, k->idx + 1, 0, 0, k->next };
@@ -340,8 +355,16 @@ static bool m_node_in(MState* m, const RNode* n, size_t pos, const Cont* k, size
             return pos == 0 && m_cont(m, pos, k, end);
         case RN_EOL:
             return pos == m->len && m_cont(m, pos, k, end);
-        case RN_GROUP:
-            return m_node(m, n->kids[0], pos, k, end);
+        case RN_GROUP: {
+            if (!m->caps || n->group <= 0 || n->group >= m->ncaps) return m_node(m, n->kids[0], pos, k, end);
+            size_t os = m->caps[n->group][0], oe = m->caps[n->group][1];
+            m->caps[n->group][0] = pos;
+            Cont close = { n, -1, 0, 0, k };
+            if (m_node(m, n->kids[0], pos, &close, end)) return true;
+            m->caps[n->group][0] = os;
+            m->caps[n->group][1] = oe;
+            return false;
+        }
         case RN_ALT:
             for (int i = 0; i < n->nkids; i++) if (m_node(m, n->kids[i], pos, k, end)) return true;
             return false;
@@ -359,10 +382,27 @@ static bool m_node_in(MState* m, const RNode* n, size_t pos, const Cont* k, size
 
 bool sv_regex_search(const SvRegex* re, const char* s, size_t from, size_t* start, size_t* end) {
     if (!re || !s) return false;
-    MState m = { s, strlen(s), re->icase, 0, 0 };
+    MState m = { s, strlen(s), re->icase, 0, 0, NULL, 0 };
     for (size_t p = from; p <= m.len; p++) {
         size_t e;
         if (m_node(&m, re->root, p, NULL, &e)) { *start = p; *end = e; return true; }
+        if (m.steps > MAX_STEPS) return false;
+    }
+    return false;
+}
+
+bool sv_regex_search_caps(const SvRegex* re, const char* s, size_t from, size_t caps[][2], int ncaps) {
+    if (!re || !s || ncaps < 1) return false;
+    MState m = { s, strlen(s), re->icase, 0, 0, caps, ncaps };
+    for (size_t p = from; p <= m.len; p++) {
+        for (int i = 0; i < ncaps; i++) caps[i][0] = caps[i][1] = (size_t)-1;
+        size_t e;
+        if (m_node(&m, re->root, p, NULL, &e)) {
+            caps[0][0] = p;
+            caps[0][1] = e;
+            for (int i = 1; i < ncaps; i++) if (caps[i][1] == (size_t)-1) caps[i][0] = (size_t)-1;
+            return true;
+        }
         if (m.steps > MAX_STEPS) return false;
     }
     return false;

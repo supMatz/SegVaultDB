@@ -44,6 +44,7 @@ SEGVAULT_TOKEN=segreto ./segvault-server -b 0.0.0.0   # raggiungibile in rete: i
 | `--site NOME=DEST` | un sito su `http://NOME.localhost:PORTA` (e `NOME.test`): `DEST` è una cartella oppure un dev server da raggiungere col reverse proxy (`http://127.0.0.1:5173`, anche solo `5173`; WebSocket compresi). Ripetibile |
 | `--no-auto-sites` | le sottocartelle di `--static` non diventano siti |
 | `--no-dir-listing` | 404 invece dell'elenco dei file per le cartelle senza index |
+| `--no-htaccess` | ignora i file `.htaccess` (di default valgono come in Apache, vedi sotto) |
 | `--mail-port P` | cattura delle email: un server SMTP sulla porta `P` (es. 1025) tiene ogni messaggio invece di consegnarlo; si leggono su `http://localhost:PORTA/.segvault/mail/` |
 | `--mail-dir DIR` | dove tenere i messaggi catturati (default `DATA/mail`) |
 | `--api-prefix P` | prefisso dell'API (default `/api/v1`; `none` = spenta). Con PHP, i percorsi sotto il prefisso che non sono dell'API vanno al sito |
@@ -303,6 +304,24 @@ in `.localhost`.
   servizi attivi e siti, con il tipo di progetto riconosciuto. Solo per i client di questa macchina.
 - Una cartella senza index mostra l'elenco dei suoi file (senza quelli nascosti); `--no-dir-listing`
   lo spegne.
+
+## .htaccess
+
+I progetti presi da Apache (XAMPP, UniServerZ, Laragon, hosting condivisi) funzionano senza
+modifiche: SegVault legge i `.htaccess` delle cartelle del percorso a ogni richiesta (una modifica
+vale subito), come Apache.
+
+- `mod_rewrite`: `RewriteEngine`, `RewriteBase`, `RewriteCond` (variabili `%{REQUEST_FILENAME}`,
+  `%{REQUEST_URI}`, `%{QUERY_STRING}`, `%{HTTP_HOST}`, `%{HTTP:Nome}`, `%{HTTP_USER_AGENT}`,
+  `%{REQUEST_METHOD}`, `%{HTTPS}`, `%{THE_REQUEST}`, ...; prove `-f -d -s -l`, regex, `!`, `=`, `<`, `>`;
+  flag `NC` e `OR`), `RewriteRule` (riferimenti `$N` e `%N`; flag `L`, `END`, `QSA`, `QSD`, `NC`,
+  `R[=301]`, `F`, `G`, `C`, `S=n`). Le regole di WordPress, Laravel, Symfony, CodeIgniter, Drupal e
+  Joomla funzionano così come sono. `REQUEST_URI` resta quello originale (come lo vede PHP con Apache).
+- `Require all denied` / `Deny from all` (anche dentro `<Files>` e `<FilesMatch>`): 403;
+  `Require all granted` in una sottocartella riapre.
+- `Options -Indexes`: niente elenco dei file.
+- I blocchi `<IfModule !...>`, `<Limit>`, `<If>` vengono saltati; le altre direttive (es. `Header`,
+  `php_value`, `ExpiresByType`) ignorate. Un pattern non valido viene scritto nel log e la regola saltata.
 
 ## Email di sviluppo (cattura)
 

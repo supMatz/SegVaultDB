@@ -161,6 +161,8 @@ static void usage(const char* argv0) {
            "                        (PHP mail() is routed there automatically)\n"
            "      --mail-dir DIR    where caught messages are kept (default DATA/mail)\n"
            "      --no-dir-listing  404 instead of a file list for folders without an index\n"
+           "      --no-htaccess     ignore .htaccess files (by default their mod_rewrite rules, Require all denied\n"
+           "                        and Options -Indexes apply, as in Apache)\n"
            "  -q, --quiet           do not log requests\n"
            "  -h, --help            this help\n\n"
            "API: GET /api/v1/health, GET /api/v1/status, POST /api/v1/query,\n"
@@ -224,6 +226,7 @@ int main(int argc, char** argv) {
         else if (ARG("--mail-port", "--mail-port")) { cfg.mail = true; cfg.mail_port = atoi(argv[++i]); }
         else if (ARG("--mail-dir", "--mail-dir")) cfg.mail_dir = argv[++i];
         else if (!strcmp(a, "--no-dir-listing")) cfg.dir_listing = false;
+        else if (!strcmp(a, "--no-htaccess")) cfg.no_htaccess = true;
         else if (a[0] == '-') { fprintf(stderr, "unknown or incomplete option: %s (see --help)\n", a); return 2; }
         else data_dir = a;
         #undef ARG

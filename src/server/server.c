@@ -11,6 +11,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #include "fastcgi.h"
 #include "proxy.h"
 #include "mail.h"
+#include "rewrite.h"
 #include "../widgets/png_write.h"
 #include "../bridge/db_api.h"
 #include "../bridge/auth.h"
@@ -171,6 +172,8 @@ typedef struct {
     char   site[128];                   // nome del sito ("" = quello predefinito)
     bool   upgrade;                     // Upgrade: websocket
     sock_t fd;                          // socket del client (risposte di PHP in streaming)
+    bool   rw_done;                     // .htaccess già applicato
+    bool   no_listing;                  // Options -Indexes in un .htaccess
 } Request;
 
 typedef struct {
@@ -1934,6 +1937,52 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
         // file nascosti e ".." no; /.well-known/ sì (certificati ACME, security.txt, ...)
         if (*q == '/' && q[1] == '.' && !(q == p && !strncmp(q, "/.well-known/", 13))) { web_not_found(rq, rs); return; }
     }
+    // .htaccess del sito (mod_rewrite, Require all denied, Options -Indexes), come Apache
+    if (!rq->rw_done && !s->cfg.no_htaccess) {
+        rq->rw_done = true;
+        RwRequest rr = { rq->root, rq->path, rq->query, rq->method, rq->host, rq->headers, rq->client, NULL, s->port };
+        char the_request[4200];
+        snprintf(the_request, sizeof(the_request), "%s %s HTTP/1.%d", rq->method, rq->uri, rq->http10 ? 0 : 1);
+        rr.the_request = the_request;
+        RwResult* rw = malloc(sizeof(RwResult));
+        if (!rw) { json_error(rs, 500, "out of memory"); return; }
+        rw_apply(&rr, rw);
+        if (rw->error[0] && !s->cfg.quiet) fprintf(stderr, "[htaccess] %s\n", rw->error);
+        rq->no_listing = rw->no_listing;
+        if (rw->action == RW_FORBIDDEN || rw->action == RW_GONE) {
+            int st = rw->action == RW_FORBIDDEN ? 403 : 410;
+            free(rw);
+            json_error(rs, st, st == 403 ? "forbidden (.htaccess)" : "gone");
+            return;
+        }
+        if (rw->action == RW_REDIRECT) {
+            size_t ll = strlen(rw->location);
+            bool bad = false;
+            for (size_t i = 0; i < ll; i++) if (rw->location[i] == '\r' || rw->location[i] == '\n') bad = true;
+            if (!bad) {
+                rs->own_headers = malloc(ll + 32);
+                if (rs->own_headers) {
+                    sprintf(rs->own_headers, "Location: %s\r\n", rw->location);
+                    rs->extra_headers = rs->own_headers;
+                }
+            }
+            rs->status = rw->status;
+            rs->content_type = "text/plain; charset=utf-8";
+            jb_lit(&rs->body, "redirect\n");
+            snprintf(rs->detail, sizeof(rs->detail), "htaccess -> %.100s", rw->location);
+            free(rw);
+            return;
+        }
+        if (rw->action == RW_REWRITE) {               // si ricomincia con il nuovo percorso (controlli compresi)
+            if (rw->path[0] != '/') { free(rw); web_not_found(rq, rs); return; }
+            snprintf(rq->path, sizeof(rq->path), "%s", rw->path);
+            snprintf(rq->query, sizeof(rq->query), "%s", rw->query);
+            free(rw);
+            handle_web(s, rq, rs);
+            return;
+        }
+        free(rw);
+    }
     bool get = !strcmp(rq->method, "GET") || !strcmp(rq->method, "HEAD");
     char script[2048] = "", info[2048] = "", full[4096];
 
@@ -1969,7 +2018,7 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
                 if (!path_is(idx, S_IFREG)) {
                     if (!get) { web_not_found(rq, rs); return; }
                     if (!strcmp(p, "/") && !rq->site[0] && client_is_local(rq)) dashboard(s, rs);
-                    else if (s->cfg.dir_listing) dir_listing(rq, rs, full);
+                    else if (s->cfg.dir_listing && !rq->no_listing) dir_listing(rq, rs, full);
                     else web_not_found(rq, rs);
                     return;
                 }
