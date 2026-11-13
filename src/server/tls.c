@@ -125,6 +125,9 @@ static struct {
     const char* (*SSL_get_servername)(const SSL*, int);
     SSL_CTX* (*SSL_set_SSL_CTX)(SSL*, SSL_CTX*);
     void     (*SSL_get0_alpn_selected)(const SSL*, const unsigned char**, unsigned int*);
+    const void* (*SSL_get_current_cipher)(const SSL*);
+    const char* (*SSL_CIPHER_get_name)(const void*);
+    const char* (*SSL_get_version)(const SSL*);
     int      (*SSL_select_next_proto)(unsigned char**, unsigned char*, const unsigned char*, unsigned int, const unsigned char*, unsigned int);
     // libcrypto
     EVP_PKEY* (*EVP_PKEY_Q_keygen)(void*, const char*, const char*, ...);
@@ -239,6 +242,7 @@ static bool openssl_load(char* err, size_t errsz) {
     S(SSL_CTX_ctrl); S(SSL_CTX_callback_ctrl); S(SSL_CTX_set_alpn_select_cb); S(SSL_new); S(SSL_free); S(SSL_set_fd);
     S(SSL_accept); S(SSL_read); S(SSL_write); S(SSL_pending); S(SSL_shutdown); S(SSL_get_error); S(SSL_get_servername);
     S(SSL_set_SSL_CTX); S(SSL_get0_alpn_selected); S(SSL_select_next_proto);
+    S(SSL_get_current_cipher); S(SSL_CIPHER_get_name); S(SSL_get_version);
     C(EVP_PKEY_Q_keygen); C(EVP_PKEY_free); C(EVP_sha256); C(X509_new); C(X509_free); C(X509_set_version);
     C(X509_get_serialNumber); C(ASN1_INTEGER_set); C(X509_getm_notBefore); C(X509_getm_notAfter); C(X509_gmtime_adj);
     C(X509_set_pubkey); C(X509_get_subject_name); C(X509_set_issuer_name); C(X509_NAME_add_entry_by_txt);
@@ -624,6 +628,56 @@ void tls_serve(TlsCtx* t, tls_sock fd, const char* client_ip, int client_port, i
     set_nonblock(fd, false);
     O.SSL_shutdown(s);
     O.SSL_free(s);
+}
+
+// ── TLS su una connessione già aperta (MySQL) ──
+
+struct TlsConn { SSL* s; };
+
+TlsConn* tls_accept(TlsCtx* t, tls_sock fd) {
+    SSL* s = O.SSL_new(t->def);
+    if (!s) return NULL;
+    O.SSL_set_fd(s, (int)fd);
+    if (O.SSL_accept(s) != 1) { O.SSL_free(s); return NULL; }
+    TlsConn* c = malloc(sizeof(TlsConn));
+    if (!c) { O.SSL_shutdown(s); O.SSL_free(s); return NULL; }
+    c->s = s;
+    return c;
+}
+
+int tls_read(TlsConn* c, char* buf, int n) {
+    for (;;) {
+        int r = O.SSL_read(c->s, buf, n);
+        if (r > 0) return r;
+        int e = O.SSL_get_error(c->s, r);
+        if (e == SSL_ERROR_ZERO_RETURN) return 0;
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) continue;   // record senza dati (es. ticket)
+        return -1;
+    }
+}
+
+bool tls_write(TlsConn* c, const char* p, size_t n) {
+    while (n > 0) {
+        int w = O.SSL_write(c->s, p, n > (1u << 30) ? (1 << 30) : (int)n);
+        if (w <= 0) {
+            int e = O.SSL_get_error(c->s, w);
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) continue;
+            return false;
+        }
+        p += w;
+        n -= (size_t)w;
+    }
+    return true;
+}
+
+const char* tls_cipher(TlsConn* c) { const char* n = O.SSL_CIPHER_get_name(O.SSL_get_current_cipher(c->s)); return n ? n : ""; }
+const char* tls_version(TlsConn* c) { const char* v = O.SSL_get_version(c->s); return v ? v : ""; }
+
+void tls_close(TlsConn* c) {
+    if (!c) return;
+    O.SSL_shutdown(c->s);
+    O.SSL_free(c->s);
+    free(c);
 }
 
 // ── fiducia nella CA ────────────────────────────────────────────

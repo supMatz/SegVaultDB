@@ -58,7 +58,8 @@ void mw_end(MwOut* o) {
 
 // ── pacchetti del server ─────────────────────────────────────────
 
-void mw_handshake(MwOut* o, uint32_t conn_id, const uint8_t scramble[20]) {
+void mw_handshake(MwOut* o, uint32_t conn_id, const uint8_t scramble[20], bool ssl) {
+    uint32_t caps = MW_SERVER_CAPS | (ssl ? MW_CLIENT_SSL : 0);
     mw_begin(o);
     mw_u8(o, 10);                                          // protocollo 10
     const char* ver = "8.0.35-SegVault";
@@ -66,10 +67,10 @@ void mw_handshake(MwOut* o, uint32_t conn_id, const uint8_t scramble[20]) {
     mw_u32(o, conn_id);
     mw_bytes(o, scramble, 8);
     mw_u8(o, 0);
-    mw_u16(o, MW_SERVER_CAPS & 0xffff);
+    mw_u16(o, caps & 0xffff);
     mw_u8(o, 45);                                          // utf8mb4_general_ci
     mw_u16(o, MW_STATUS_AUTOCOMMIT);
-    mw_u16(o, MW_SERVER_CAPS >> 16);
+    mw_u16(o, caps >> 16);
     mw_u8(o, 21);                                          // lunghezza dei dati di autenticazione
     uint8_t zero[10] = {0};
     mw_bytes(o, zero, 10);
@@ -319,6 +320,36 @@ static void text_row(MwOut* o, int n, const char* const* v) {
     mw_begin(o);
     for (int i = 0; i < n; i++) { if (v[i]) mw_lenz(o, v[i]); else mw_u8(o, 0xfb); }
     mw_end(o);
+}
+
+static void like_pattern(const char** pp, char* pat, size_t n) {
+    snprintf(pat, n, "%%");
+    if (!word(pp, "LIKE")) return;
+    const char* p = skip_ws(*pp);
+    if (*p != '\'') return;
+    const char* e = strchr(p + 1, '\'');
+    size_t l = e ? (size_t)(e - p - 1) : 0;
+    if (l >= n) l = n - 1;
+    memcpy(pat, p + 1, l);
+    pat[l] = '\0';
+}
+
+bool mw_is_show_status(const char* sql, char* pat, size_t patsz) {
+    const char* p = skip_ws(sql);
+    if (!word(&p, "SHOW")) return false;
+    if (!word(&p, "SESSION") && !word(&p, "GLOBAL")) word(&p, "LOCAL");
+    if (!word(&p, "STATUS")) return false;
+    like_pattern(&p, pat, patsz);
+    return true;
+}
+
+void mw_name_values(MwOut* o, const char* const* names, const char* const* values, int n, const char* pat, unsigned status) {
+    static const char* const N[] = { "Variable_name", "Value" };
+    text_header(o, 2, N);
+    mw_eof(o, status);
+    for (int i = 0; i < n; i++)
+        if (like(names[i], pat)) { const char* v[2] = { names[i], values[i] }; text_row(o, 2, v); }
+    mw_eof(o, status);
 }
 
 bool mw_client_noise(MwOut* o, const char* sql, unsigned status) {

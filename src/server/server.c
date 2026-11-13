@@ -157,6 +157,7 @@ typedef struct {
     bool      smtp;                    // connessione SMTP (cattura delle email)
     bool      tls;                     // connessione HTTPS da decifrare (porta https)
     bool      https;                   // richieste arrivate dal ponte TLS
+    TlsConn*  mytls;                   // protocollo MySQL cifrato (dopo la richiesta SSL del client)
 } Conn;
 
 // ── richiesta / risposta ────────────────────────────────────────
@@ -1768,11 +1769,11 @@ static bool has_index(const char* dir) {
 
 // radice di un sito automatico: la cartella, o la sua public/ se lei non ha un index (Laravel, Symfony)
 static void auto_root(const char* dir, char* out, size_t n) {
-    snprintf(out, n, "%s", dir);
+    snprintf(out, n, "%.4000s", dir);
     if (has_index(dir)) return;
     char pub[4200];
-    snprintf(pub, sizeof(pub), "%s/public", dir);
-    if (path_is(pub, S_IFDIR)) snprintf(out, n, "%s", pub);
+    snprintf(pub, sizeof(pub), "%.4000s/public", dir);
+    if (path_is(pub, S_IFDIR)) snprintf(out, n, "%.4000s", pub);
 }
 
 static const Site* find_site(SvServer* s, const char* name, size_t n) {
@@ -2935,16 +2936,38 @@ static void serve_connection(Conn* c) {
 typedef struct { uint8_t* p; size_t n; uint8_t seq; } MyPkt;
 
 // legge un pacchetto (anche spezzato in più parti da 16 MB); false su chiusura o errore
+// come fill(), anche attraverso TLS
+static bool my_fill(SvServer* s, Conn* c, InBuf* in, size_t need) {
+    if (!c->mytls) return fill(c->fd, in, need, &s->stop);
+    while (in->len < need) {
+        if (s->stop) return false;
+        if (in->cap < need + 1) {
+            size_t nc = in->cap ? in->cap : 8192;
+            while (nc < need + 1) nc *= 2;
+            char* nd = realloc(in->data, nc);
+            if (!nd) return false;
+            in->data = nd;
+            in->cap = nc;
+        }
+        size_t room = in->cap - 1 - in->len;
+        int r = tls_read(c->mytls, in->data + in->len, room > (1u << 30) ? (1 << 30) : (int)room);
+        if (r <= 0) return false;
+        in->len += (size_t)r;
+    }
+    in->data[in->len] = '\0';
+    return true;
+}
+
 static bool my_read(SvServer* s, Conn* c, InBuf* in, MyPkt* out, size_t max) {
     size_t total = 0;
     uint8_t* buf = NULL;
     for (;;) {
-        if (!fill(c->fd, in, 4, &s->stop)) { free(buf); return false; }
+        if (!my_fill(s, c, in, 4)) { free(buf); return false; }
         const uint8_t* h = (const uint8_t*)in->data;
         size_t len = (size_t)h[0] | (size_t)h[1] << 8 | (size_t)h[2] << 16;
         out->seq = h[3];
         if (total + len > max) { free(buf); return false; }
-        if (!fill(c->fd, in, 4 + len, &s->stop)) { free(buf); return false; }
+        if (!my_fill(s, c, in, 4 + len)) { free(buf); return false; }
         uint8_t* nb = realloc(buf, total + len + 1);
         if (!nb) { free(buf); return false; }
         buf = nb;
@@ -2961,7 +2984,7 @@ static bool my_read(SvServer* s, Conn* c, InBuf* in, MyPkt* out, size_t max) {
 }
 
 static bool my_send(Conn* c, MwOut* o) {
-    bool ok = !o->oom && send_all(c->fd, (const char*)o->p, o->n);
+    bool ok = !o->oom && (c->mytls ? tls_write(c->mytls, (const char*)o->p, o->n) : send_all(c->fd, (const char*)o->p, o->n));
     o->n = 0;
     return ok;
 }
@@ -3073,6 +3096,22 @@ static void my_query(SvServer* s, Conn* c, MwOut* o, char* sql, const char* user
         if ((kind == MW_KIND_COMMIT || kind == MW_KIND_ROLLBACK) && !in_transaction()) {
             sql[e] = saved;                                // niente da confermare: in MySQL non è un errore
             mw_ok(o, 0, 0, my_status(*autocommit) | more, NULL);
+            continue;
+        }
+        char pat[128];
+        if (mw_is_show_status(one, pat, sizeof(pat))) {        // SHOW STATUS (DBeaver, Adminer, phpMyAdmin, ...)
+            SvStats stt;
+            sv_server_stats(s, &stt);
+            char up[24], th[16], qs[24];
+            snprintf(up, sizeof(up), "%.0f", stt.uptime_s);
+            snprintf(th, sizeof(th), "%d", stt.connections);
+            snprintf(qs, sizeof(qs), "%lld", stt.requests);
+            const char* nm[] = { "Uptime", "Threads_connected", "Threads_running", "Questions", "Queries", "Ssl_cipher", "Ssl_version",
+                                 "Max_used_connections", "Open_tables", "Com_select" };
+            const char* vv[] = { up, th, "1", qs, qs, c->mytls ? tls_cipher(c->mytls) : "", c->mytls ? tls_version(c->mytls) : "",
+                                 th, "0", "0" };
+            mw_name_values(o, nm, vv, (int)(sizeof(nm) / sizeof(nm[0])), pat, my_status(*autocommit) | more);
+            sql[e] = saved;
             continue;
         }
         if (mw_client_noise(o, one, my_status(*autocommit) | more)) { sql[e] = saved; continue; }
@@ -3258,11 +3297,18 @@ static void serve_mysql(Conn* c) {
     mx_lock(&s->conn_mx);
     uint32_t id = ++s->mysql_ids;
     mx_unlock(&s->conn_mx);
-    mw_handshake(&o, id, scramble);
+    mw_handshake(&o, id, scramble, s->tls != NULL);
     if (!my_send(c, &o)) { free(o.p); return; }
 
     MyPkt pk;
     if (!my_read(s, c, &in, &pk, 65536)) { free(o.p); free(in.data); return; }
+    // richiesta SSL (32 byte con CLIENT_SSL): handshake TLS, poi il login arriva cifrato
+    if (s->tls && pk.n == 32 && (((uint32_t)pk.p[0] | (uint32_t)pk.p[1] << 8 | (uint32_t)pk.p[2] << 16 | (uint32_t)pk.p[3] << 24) & MW_CLIENT_SSL)) {
+        free(pk.p);
+        c->mytls = tls_accept(s->tls, c->fd);
+        if (!c->mytls) { free(o.p); free(in.data); return; }
+        if (!my_read(s, c, &in, &pk, 65536)) { tls_close(c->mytls); c->mytls = NULL; free(o.p); free(in.data); return; }
+    }
     MwLogin lg;
     bool parsed = mw_parse_login(pk.p, pk.n, &lg);
     o.seq = (uint8_t)(pk.seq + 1);
@@ -3378,6 +3424,7 @@ done:
 
 static void conn_finish(Conn* c) {
     SvServer* s = c->s;
+    if (c->mytls) tls_close(c->mytls);
     mx_lock(&s->conn_mx);
     s->conns[c->slot] = BAD_SOCK;
     s->active--;
@@ -3545,7 +3592,7 @@ int sv_ports_check(const SvServerConfig* cfg, char* msg, size_t msgsz) {
 }
 
 // percorso di questo eseguibile (per sendmail_path di PHP)
-static bool self_exe(char* out, size_t n) {
+static bool __attribute__((unused)) self_exe(char* out, size_t n) {
 #ifdef _WIN32
     DWORD k = GetModuleFileNameA(NULL, out, (DWORD)n);
     return k > 0 && k < n;
@@ -3633,6 +3680,13 @@ static bool svc_https_start(SvServer* s, char* err, size_t errsz) {
 }
 
 static bool svc_mysql_start(SvServer* s, char* err, size_t errsz) {
+    // TLS per il protocollo MySQL con la CA locale, se OpenSSL c'è (senza: connessioni in chiaro, come prima)
+    if (!s->tls && s->cert_dir) {
+        char terr[300];
+        s->tls = tls_create(s->cert_dir, terr, sizeof(terr));
+        if (s->tls && sv_random_token(s->tls_secret, 24))
+            snprintf(s->tls_info, sizeof(s->tls_info), "%s, CA %s", tls_library(s->tls), tls_ca_path(s->tls));
+    }
     int port;
     sock_t fd = listen_tcp(s->cfg.bind_addr, s->cfg.mysql_port, &port);
     if (fd == BAD_SOCK) { svc_port_error(s, s->cfg.mysql_port, "MySQL", err, errsz); return false; }
@@ -3982,7 +4036,7 @@ void sv_server_run(SvServer* s) {
         }
         Conn* c = malloc(sizeof(Conn));
         if (c) {
-            c->s = s; c->fd = fd; c->slot = slot; c->mysql = is_mysql; c->smtp = is_smtp; c->tls = is_tls; c->https = false;
+            c->s = s; c->fd = fd; c->slot = slot; c->mysql = is_mysql; c->smtp = is_smtp; c->tls = is_tls; c->https = false; c->mytls = NULL;
             const unsigned char* ip = (const unsigned char*)&peer.sin_addr.s_addr;
             snprintf(c->client, sizeof(c->client), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
             c->client_port = ntohs(peer.sin_port);

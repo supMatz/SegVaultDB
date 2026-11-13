@@ -71,7 +71,8 @@ void mw_bytes(MwOut* o, const void* d, size_t n);
 void mw_lenenc(MwOut* o, uint64_t v);
 void mw_lenstr(MwOut* o, const char* s, size_t n);
 
-void mw_handshake(MwOut* o, uint32_t conn_id, const uint8_t scramble[20]);
+// ssl: annuncia CLIENT_SSL (il client può chiedere TLS prima del login)
+void mw_handshake(MwOut* o, uint32_t conn_id, const uint8_t scramble[20], bool ssl);
 void mw_ok(MwOut* o, uint64_t affected, uint64_t insert_id, unsigned status, const char* info);
 void mw_err(MwOut* o, unsigned code, const char* sqlstate, const char* msg);
 void mw_eof(MwOut* o, unsigned status);
@@ -93,6 +94,10 @@ bool mw_parse_login(const uint8_t* p, size_t n, MwLogin* out);
 // istruzioni che i driver mandano all'avvio e che SegVault non ha (SET NAMES, SELECT @@version,
 // SHOW VARIABLES, SHOW WARNINGS, ...): se la riconosce scrive la risposta e restituisce true
 bool mw_client_noise(MwOut* o, const char* sql, unsigned status);
+// SHOW [GLOBAL | SESSION] STATUS [LIKE 'x']: true e il modello LIKE in pat ("%" senza LIKE)
+bool mw_is_show_status(const char* sql, char* pat, size_t patsz);
+// risultato a due colonne Variable_name / Value (solo i nomi che corrispondono a pat)
+void mw_name_values(MwOut* o, const char* const* names, const char* const* values, int n, const char* pat, unsigned status);
 
 // prepared statement: il testo resta com'è, a ogni EXECUTE i '?' diventano letterali SQL
 int  mw_count_params(const char* sql);                    // '?' fuori da stringhe e commenti

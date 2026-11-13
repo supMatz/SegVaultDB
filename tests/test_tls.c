@@ -200,6 +200,29 @@ int main(void) {
     pthread_join(th, NULL);
     sv_server_free(s);
 
+    // protocollo MySQL cifrato con la stessa CA (richiesta SSL del client, poi TLS)
+    if (system("openssl version >/dev/null 2>&1") == 0) {
+        SvServerConfig cm = { .port = 0, .quiet = true, .mysql = true, .mysql_port = 0, .cert_dir = certs };
+        s = sv_server_start(&cm, err, sizeof(err));
+        pthread_create(&th, NULL, run_server, s);
+        char cmd[1200];
+        snprintf(cmd, sizeof(cmd), "openssl s_client -starttls mysql -connect 127.0.0.1:%d -CAfile '%s' -verify_return_error </dev/null 2>&1",
+                 sv_server_mysql_port(s), g_ca);
+        FILE* pp = popen(cmd, "r");
+        char ob[16384];
+        size_t on = pp ? fread(ob, 1, sizeof(ob) - 1, pp) : 0;
+        ob[on] = 0;
+        if (pp) pclose(pp);
+        CHECK(strstr(ob, "Verify return code: 0 (ok)") && strstr(ob, "CN=localhost"), "MySQL protocol over TLS, verified: %.300s", ob);
+    } else {
+        SvServerConfig cm = { .port = 0, .quiet = true };
+        s = sv_server_start(&cm, err, sizeof(err));
+        pthread_create(&th, NULL, run_server, s);
+    }
+    sv_server_stop(s);
+    pthread_join(th, NULL);
+    sv_server_free(s);
+
     // senza HTTP/2; la CA resta la stessa
     cfg.http2 = false;
     s = sv_server_start(&cfg, err, sizeof(err));
