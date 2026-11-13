@@ -155,7 +155,7 @@ ViewAction start_screen_event(StartScreen* s, const sEvent* evt) {
 enum {
     HIT_COPY_URL, HIT_COPY_LAN, HIT_PORT_MINUS, HIT_PORT_PLUS, HIT_ACCESS_LOCAL, HIT_ACCESS_LAN,
     HIT_TOKEN_OFF, HIT_TOKEN_ON, HIT_COPY_TOKEN, HIT_NEW_TOKEN, HIT_CORS_OFF, HIT_CORS_ON, HIT_TIME_MINUS,
-    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_TAB_REQ, HIT_TAB_MON, HIT_MYSQL_OFF, HIT_MYSQL_ON, HIT_COPY_MYSQL, HIT_PHP_OFF, HIT_PHP_ON, HIT_MAIL_OFF, HIT_MAIL_ON, HIT_OPEN_MAIL, HIT_OPEN_DASH, HIT_HTTPS_OFF, HIT_HTTPS_ON, HIT_TRUST_CA, HIT_OPEN_HTTPS, HIT_COUNT
+    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_TAB_REQ, HIT_TAB_MON, HIT_MYSQL_OFF, HIT_MYSQL_ON, HIT_COPY_MYSQL, HIT_PHP_OFF, HIT_PHP_ON, HIT_MAIL_OFF, HIT_MAIL_ON, HIT_OPEN_MAIL, HIT_OPEN_DASH, HIT_HTTPS_OFF, HIT_HTTPS_ON, HIT_TRUST_CA, HIT_OPEN_HTTPS, HIT_EDIT_PHPINI, HIT_COUNT
 };
 
 enum { ACT_NONE, ACT_TOGGLE, ACT_EDITOR, ACT_COPY };
@@ -754,6 +754,9 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
             snprintf(msg, sizeof(msg), "php-cgi is looked for in a php folder next to SegVault, the PATH, C:\\xampp\\php "
                      "(or set php_cgi=PATH in server.ini).%s", g_settings.server_mysql ? "" : " Scripts reach the database through the MySQL protocol.");
         y += text_wrap(win, msg, x, y + 2, w, !g_settings.server_mysql && running ? TH_WARNING : TH_TEXT_FAINT, TH_FONT_SMALL) + 2;
+        int ew = link_w(p, "Edit php.ini");
+        link_btn(p, HIT_EDIT_PHPINI, (Rect){x - 8, y, ew, 24}, "Edit php.ini", true);
+        y += 26;
     }
     y += 12;
 
@@ -1402,6 +1405,18 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
         case HIT_OPEN_DASH:
             if (!platform_open_url(p->dash_url)) copy_text(p, hit, p->dash_url);
             break;
+        case HIT_EDIT_PHPINI: {
+            // php.ini del php-cgi in uso (creato da php.ini-development se manca); vale dal prossimo avvio
+            char php[1024] = "", ini[1200];
+            if (p->php_cgi[0]) snprintf(php, sizeof(php), "%s", p->php_cgi);
+            else if (!fcgi_find_php_cgi(php, sizeof(php))) { snprintf(p->error, sizeof(p->error), "php-cgi not found"); break; }
+            if (!fcgi_php_ini(php, true, ini, sizeof(ini)) || !platform_open_file(ini)) {
+                snprintf(p->error, sizeof(p->error), "Cannot open %.200s", ini);
+                break;
+            }
+            snprintf(p->flash, sizeof(p->flash), "Restart the server after saving");
+            break;
+        }
         case HIT_HTTPS_OFF: case HIT_HTTPS_ON:
             if (g_settings.server_https != (hit == HIT_HTTPS_ON)) { g_settings.server_https = hit == HIT_HTTPS_ON; config_changed(p); }
             break;

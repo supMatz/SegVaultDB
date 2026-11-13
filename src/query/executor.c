@@ -7973,7 +7973,9 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
 
     // colonne indicate
     int map[64];
-    int ncols = n->insert_stmt.num_cols > 0 ? n->insert_stmt.num_cols : nc;
+    // VALUES () / DEFAULT VALUES: nessun valore, ogni colonna prende il suo default
+    bool all_default = n->insert_stmt.num_cols == 0 && n->insert_stmt.num_values == 0 && !n->insert_stmt.select;
+    int ncols = n->insert_stmt.num_cols > 0 ? n->insert_stmt.num_cols : all_default ? 0 : nc;
     for (int i = 0; i < ncols; i++) {
         if (n->insert_stmt.num_cols == 0) { map[i] = i; continue; }
         int ci = catalog_get_col_index(ts, n->insert_stmt.columns[i]);

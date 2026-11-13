@@ -744,6 +744,25 @@ bool platform_open_url(const char* url) {
     return true;
 }
 
+bool platform_open_file(const char* path) {
+    struct stat st;
+    if (!path || path[0] != '/' || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    for (const char* c = path; *c; c++) if ((unsigned char)*c < ' ') return false;
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        setsid();
+        if (fork() == 0) {
+            execlp("xdg-open", "xdg-open", path, (char*)NULL);
+            _exit(127);
+        }
+        _exit(0);
+    }
+    int st2;
+    waitpid(pid, &st2, 0);
+    return true;
+}
+
 void platform_set_clipboard(PlatformWindow* win, const char* text) {
     if (!text) return;
     free(win->clip_text);

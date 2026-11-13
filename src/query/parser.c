@@ -1591,7 +1591,7 @@ static void parse_insert(ParserState* ps, ASTNode* n) {
     Token tn = table_tok(ps);
     if (tn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name after INSERT INTO", tn); return; }
     copy_text(ps, n->insert_stmt.table_name, sizeof(n->insert_stmt.table_name), tn.text);
-    if (match(ps, TOK_LPAREN)) {
+    if (match(ps, TOK_LPAREN) && !match(ps, TOK_RPAREN)) {      // MySQL: "()" = nessuna colonna (tutti i default)
         do {
             Token c = consume(ps);
             if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", c); return; }
@@ -1599,6 +1599,13 @@ static void parse_insert(ParserState* ps, ASTNode* n) {
             n->insert_stmt.columns[n->insert_stmt.num_cols++] = strdup(c.text);
         } while (match(ps, TOK_COMMA));
         if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')' after the column list", peek(ps)); return; }
+    }
+    if (ident_is(ps, "DEFAULT") && n->insert_stmt.num_cols == 0) {   // PostgreSQL / SQLite: DEFAULT VALUES
+        consume(ps);
+        if (!match(ps, TOK_VALUES)) { parse_fail(ps, "Expected VALUES after DEFAULT", peek(ps)); return; }
+        n->insert_stmt.num_rows = 1;
+        n->insert_stmt.num_values = 0;
+        return;
     }
     if (query_starts(ps, 0)) {                                    // INSERT INTO t SELECT ...
         n->insert_stmt.select = parse_query(ps);
@@ -1635,7 +1642,7 @@ static void parse_insert(ParserState* ps, ASTNode* n) {
         if (!match(ps, TOK_LPAREN)) { parse_fail(ps, "Expected '(' before the values", peek(ps)); return; }
         int count = 0;
         bool ok = true;
-        do {
+        if (peek(ps).type != TOK_RPAREN) do {                     // "()" = una riga di soli default
             if (count >= 64) { parse_fail(ps, "Too many values in INSERT (max 64)", peek(ps)); ok = false; break; }
             if (total + count >= cap) {
                 int nc = cap ? cap * 2 : 64;

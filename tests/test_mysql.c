@@ -121,6 +121,13 @@ int main(void) {
     t("INSERT INTO o (option_name, option_value) VALUES ('a', 'x'), ('b', 'y') AS n ON DUPLICATE KEY UPDATE option_value = CONCAT(o.option_value, n.option_value)", "OK:3");
     t("SELECT option_name, option_value FROM o ORDER BY option_name", "a|2x;b|y");
     t("INSERT IGNORE INTO o (option_name, option_value) VALUES ('a', 'dup'), ('c', 'z')", "OK:1");
+    // righe di soli default: () VALUES (), VALUES (), più righe, DEFAULT VALUES
+    t("CREATE TABLE visits (id INT AUTO_INCREMENT PRIMARY KEY, n INT DEFAULT 7, at DATETIME DEFAULT CURRENT_TIMESTAMP)", "OK:0");
+    t("INSERT INTO visits () VALUES ()", "OK:1");
+    t("INSERT INTO visits VALUES (), ()", "OK:2");
+    t("INSERT INTO visits DEFAULT VALUES", "OK:1");
+    t("SELECT COUNT(*), MAX(id), MIN(n), COUNT(at) FROM visits", "4|4|7|4");
+    t("INSERT INTO visits () VALUES (1)", "ERR:Column count");
     t("REPLACE INTO o (option_name, option_value) VALUES ('c', 'new')", "OK:2");
     t("INSERT INTO o SET option_name = 'd', option_value = 'set'", "OK:1");
     t("SELECT option_name, option_value FROM o ORDER BY option_name", "a|2x;b|y;c|new;d|set");

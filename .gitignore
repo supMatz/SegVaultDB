@@ -71,3 +71,7 @@ test_export_asan
 !/bin/**
 test_php_tsan
 test_mysql
+build-dist/
+bin/SegVault-*.zip
+bin/SegVault-*.tar.gz
+bin/linux-x86_64/segvault-server-static

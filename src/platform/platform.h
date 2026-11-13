@@ -176,6 +176,8 @@ char* platform_get_clipboard(PlatformWindow* win);   // stringa malloc'd (free()
 
 // apre un indirizzo (https://...) nel browser predefinito; false se non è possibile
 bool  platform_open_url(const char* url);
+// apre un file di testo esistente (es. php.ini) nell'editor del sistema; false se non c'è o non si può
+bool  platform_open_file(const char* path);
 
 // thread di lavoro (usato per eseguire le query senza bloccare l'interfaccia)
 typedef struct PlatformThread PlatformThread;

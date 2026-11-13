@@ -45,4 +45,14 @@ int fcgi_request(FcgiPool* p, const FcgiParam* params, int nparams, const char* 
 // false se non c'è.
 bool fcgi_find_php_cgi(char* out, size_t outsz);
 
+// PHP senza configurazione: se accanto a php-cgi non c'è un php.ini (lo zip di PHP per Windows non lo
+// ha) ma c'è la cartella ext/, impostazioni "-d" che attivano le estensioni presenti (mysqli,
+// pdo_mysql, openssl, mbstring, curl, gd, intl, zip, ...) e valori da sviluppo (errori visibili,
+// upload grandi). Scrive fino a max voci in out (ognuna < 1400 byte); ritorna quante
+int  fcgi_zero_config(const char* php_cgi, char out[][1400], int max);
+
+// php.ini di quel php-cgi: il percorso (accanto all'eseguibile); se manca e create, lo crea da
+// php.ini-development (o da zero) con le estensioni presenti già attive. false se non si può
+bool fcgi_php_ini(const char* php_cgi, bool create, char* path, size_t pathsz);
+
 #endif

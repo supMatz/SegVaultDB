@@ -676,3 +676,90 @@ bool fcgi_find_php_cgi(char* out, size_t outsz) {
     out[0] = '\0';
     return false;
 }
+
+// ── PHP senza configurazione ────────────────────────────────────
+
+static const char* const ZC_EXT[] = { "mysqli", "pdo_mysql", "openssl", "mbstring", "curl", "fileinfo", "gd", "intl",
+                                      "zip", "exif", "sodium", "sqlite3", "pdo_sqlite", "bz2", "gettext", "xsl", "ftp" };
+
+static void php_dir_of(const char* php_cgi, char* dir, size_t n) {
+    snprintf(dir, n, "%s", php_cgi);
+    char* sl = strrchr(dir, '/');
+#ifdef _WIN32
+    char* bs = strrchr(dir, '\\');
+    if (bs > sl) sl = bs;
+#endif
+    if (sl) *sl = '\0'; else snprintf(dir, n, ".");
+}
+
+// file dell'estensione nella cartella ext ("php_mysqli.dll" su Windows, "mysqli.so" altrove)
+static bool ext_present(const char* extdir, const char* name) {
+    char p[1600];
+    snprintf(p, sizeof(p), "%s/php_%s.dll", extdir, name);
+    if (is_file(p)) return true;
+    snprintf(p, sizeof(p), "%s/%s.so", extdir, name);
+    return is_file(p);
+}
+
+int fcgi_zero_config(const char* php_cgi, char out[][1400], int max) {
+    char dir[1100], ini[1200], ext[1200];
+    php_dir_of(php_cgi, dir, sizeof(dir));
+    snprintf(ini, sizeof(ini), "%s/php.ini", dir);
+    snprintf(ext, sizeof(ext), "%s/ext", dir);
+    struct stat st;
+    if (is_file(ini) || stat(ext, &st) != 0 || (st.st_mode & S_IFMT) != S_IFDIR) return 0;
+    int n = 0;
+    if (n < max) snprintf(out[n++], 1400, "extension_dir=%s", ext);
+    for (size_t i = 0; i < sizeof(ZC_EXT) / sizeof(ZC_EXT[0]) && n < max; i++)
+        if (ext_present(ext, ZC_EXT[i])) snprintf(out[n++], 1400, "extension=%s", ZC_EXT[i]);
+    static const char* const DEV[] = { "display_errors=On", "error_reporting=E_ALL", "memory_limit=512M", "upload_max_filesize=256M",
+                                       "post_max_size=256M", "max_execution_time=300", "date.timezone=UTC", "opcache.enable=1",
+                                       "opcache.validate_timestamps=1", "opcache.revalidate_freq=0" };
+    for (size_t i = 0; i < sizeof(DEV) / sizeof(DEV[0]) && n < max; i++) snprintf(out[n++], 1400, "%s", DEV[i]);
+    if (n < max && ext_present(ext, "opcache")) snprintf(out[n++], 1400, "zend_extension=opcache");
+    return n;
+}
+
+bool fcgi_php_ini(const char* php_cgi, bool create, char* path, size_t pathsz) {
+    char dir[1100], ext[1200];
+    php_dir_of(php_cgi, dir, sizeof(dir));
+    snprintf(path, pathsz, "%s/php.ini", dir);
+    if (is_file(path)) return true;
+#ifndef _WIN32
+    // PHP di sistema (Linux, macOS): il php.ini è quello della distribuzione, non accanto all'eseguibile
+    static const char* const SYS[] = { "/etc/php/php.ini", "/etc/php.ini", "/usr/local/etc/php/php.ini", "/opt/homebrew/etc/php/php.ini" };
+    for (size_t i = 0; i < sizeof(SYS) / sizeof(SYS[0]); i++)
+        if (is_file(SYS[i])) { snprintf(path, pathsz, "%s", SYS[i]); return true; }
+#endif
+    if (!create) return false;
+    char src[1200];
+    snprintf(src, sizeof(src), "%s/php.ini-development", dir);
+    snprintf(ext, sizeof(ext), "%s/ext", dir);
+    FILE* out = fopen(path, "wb");
+    if (!out) return false;
+    FILE* in = fopen(src, "rb");
+    if (in) {                                    // copia, con le estensioni presenti attive
+        char line[4096];
+        while (fgets(line, sizeof(line), in)) {
+            bool on = false;
+            if (!strncmp(line, ";extension=", 11)) {
+                char nm[64];
+                snprintf(nm, sizeof(nm), "%.60s", line + 11);
+                nm[strcspn(nm, "\r\n ")] = '\0';
+                for (size_t i = 0; i < sizeof(ZC_EXT) / sizeof(ZC_EXT[0]); i++)
+                    if (!strcmp(nm, ZC_EXT[i]) && ext_present(ext, nm)) on = true;
+            }
+            if (!strncmp(line, ";extension_dir = \"ext\"", 22)) { fputs("extension_dir = \"ext\"\n", out); continue; }
+            fputs(on ? line + 1 : line, out);
+        }
+        fclose(in);
+    } else {
+        fputs("; php.ini created by SegVault\n[PHP]\nextension_dir = \"ext\"\n", out);
+        for (size_t i = 0; i < sizeof(ZC_EXT) / sizeof(ZC_EXT[0]); i++)
+            if (ext_present(ext, ZC_EXT[i])) fprintf(out, "extension=%s\n", ZC_EXT[i]);
+        fputs("display_errors = On\nerror_reporting = E_ALL\nmemory_limit = 512M\nupload_max_filesize = 256M\n"
+              "post_max_size = 256M\nmax_execution_time = 300\ndate.timezone = UTC\n", out);
+    }
+    fclose(out);
+    return true;
+}

@@ -3418,9 +3418,14 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
         }
         char perr[300];
         // mail() di PHP verso la cattura delle email
-        char ini_buf[2][1400];
-        const char* ini[2];
+        static _Thread_local char ini_buf[36][1400];
+        const char* ini[36];
         int n_ini = 0;
+        // PHP senza php.ini (lo zip di PHP per Windows): estensioni presenti e valori da sviluppo
+        if (cfg->php_cgi && cfg->php_cgi[0]) {
+            int k = fcgi_zero_config(cfg->php_cgi, ini_buf + 2, 32);
+            for (int i = 0; i < k; i++) ini[n_ini++] = ini_buf[2 + i];
+        }
         if (s->mail) {
 #ifdef _WIN32
             snprintf(ini_buf[0], sizeof(ini_buf[0]), "SMTP=127.0.0.1");

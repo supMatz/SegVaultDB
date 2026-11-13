@@ -646,6 +646,14 @@ bool platform_open_url(const char* url) {
     return (INT_PTR)ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL) > 32;
 }
 
+bool platform_open_file(const char* path) {
+    DWORD at = path ? GetFileAttributesA(path) : INVALID_FILE_ATTRIBUTES;
+    if (at == INVALID_FILE_ATTRIBUTES || (at & FILE_ATTRIBUTE_DIRECTORY)) return false;
+    char q[1100];
+    snprintf(q, sizeof(q), "\"%s\"", path);
+    return (INT_PTR)ShellExecuteA(NULL, "open", "notepad.exe", q, NULL, SW_SHOWNORMAL) > 32;
+}
+
 void platform_set_clipboard(PlatformWindow* win, const char* text) {
     if (!text || !OpenClipboard(win->hwnd)) return;
     EmptyClipboard();

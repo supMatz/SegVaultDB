@@ -346,7 +346,7 @@ build-win/%.o: %.c
 clean:
 	$(RM) $(FULL_OBJS) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql test_examples test_examples_asan
 	$(RM) segvault-server segvault-server.exe libsegvault.a test_server test_server_asan test_web test_mail test_tls test_mysql test_php test_php_asan test_php_tsan test_grid_edit test_grid_edit_asan test_table_design test_table_design_asan test_schema_model test_schema_model_asan test_db_tools test_db_tools_asan test_png test_png_asan test_auth test_auth_asan test_sessions test_sessions_asan test_parallel test_parallel_asan test_parallel_tsan test_mysql_import test_mysql_import_asan test_overflow test_overflow_asan test_backup test_backup_asan test_export test_export_asan
-	$(RM) -r obj build-win build-server
+	$(RM) -r obj build-win build-server build-dist
 
 -include $(FULL_OBJS:.o=.d) $(WIN_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(WIN_SERVER_OBJS:.o=.d)
 
@@ -361,14 +361,29 @@ bench: bench_sql
 src/platform/fonts_embed.o build-win/src/platform/fonts_embed.o: $(wildcard assets/fonts/*.ttf)
 
 # ── eseguibili pronti da scaricare, nel repository (bin/): make dist ──
-# Linux: l'app desktop usa le librerie X11 del sistema (glibc 2.38+), il server è statico (ogni Linux x86-64).
-# Windows 10 / 11: nessuna DLL da installare. I font sono dentro gli eseguibili.
+# Linux: l'app desktop e il server usano le librerie del sistema (glibc 2.38+; HTTPS carica OpenSSL
+# all'avvio, cosa che un eseguibile statico non può fare); segvault-server-static va su ogni Linux
+# x86-64, senza HTTPS. Windows 10 / 11: nessuna DLL da installare (HTTPS usa quelle di PHP).
+# I font sono dentro gli eseguibili. Pacchetti portabili: bin/SegVault-VERSIONE-*.zip / .tar.gz
 WIN_STRIP ?= x86_64-w64-mingw32-strip
+VERSION := $(shell sed -n 's/.*SV_VERSION_STR *"\(.*\)".*/\1/p' include/common.h)
+PKG_WIN := SegVault-$(VERSION)-windows-x86_64
+PKG_LIN := SegVault-$(VERSION)-linux-x86_64
 dist: all windows
 	@mkdir -p bin/linux-x86_64 bin/windows-x86_64
 	strip -o bin/linux-x86_64/segvault segvault
-	$(CC) -O2 -static -o bin/linux-x86_64/segvault-server $(SERVER_OBJS) -lm -pthread
-	strip bin/linux-x86_64/segvault-server
+	strip -o bin/linux-x86_64/segvault-server segvault-server
+	$(CC) -O2 -static -o bin/linux-x86_64/segvault-server-static $(SERVER_OBJS) -lm -pthread -ldl 2>/dev/null
+	strip bin/linux-x86_64/segvault-server-static
 	$(WIN_STRIP) -o bin/windows-x86_64/segvault.exe segvault.exe
 	$(WIN_STRIP) -o bin/windows-x86_64/segvault-server.exe segvault-server.exe
-	@echo "=== bin/: eseguibili pronti ==="
+	rm -rf build-dist
+	mkdir -p build-dist/$(PKG_WIN)/php build-dist/$(PKG_LIN)
+	cp bin/windows-x86_64/segvault.exe bin/windows-x86_64/segvault-server.exe build-dist/$(PKG_WIN)/
+	for f in packaging/windows/*.cmd packaging/README.txt; do sed 's/$$/\r/' "$$f" > build-dist/$(PKG_WIN)/$$(basename "$$f"); done
+	printf 'Run get-php.cmd (next to segvault.exe) to download PHP here, or extract any PHP for Windows (Non Thread Safe, x64) into this folder.\r\n' > build-dist/$(PKG_WIN)/php/README.txt
+	cp -r packaging/www build-dist/$(PKG_WIN)/www
+	cp bin/linux-x86_64/segvault bin/linux-x86_64/segvault-server packaging/linux/start-server.sh packaging/README.txt build-dist/$(PKG_LIN)/
+	cp -r packaging/www build-dist/$(PKG_LIN)/www
+	cd build-dist && bsdtar -a -cf ../bin/$(PKG_WIN).zip $(PKG_WIN) && tar -czf ../bin/$(PKG_LIN).tar.gz $(PKG_LIN)
+	@echo "=== bin/: eseguibili pronti, $(PKG_WIN).zip, $(PKG_LIN).tar.gz ==="

@@ -61,8 +61,10 @@ SegVault copre già database e phpMyAdmin; qui c'è quello che manca, in ordine 
 - [x] Editor e server attivi insieme: l'editor SQL lavora mentre il server (web, PHP, MySQL, posta) resta acceso, con l'indicatore "● Server :8484" nella barra dei menu; le funzioni interne del server non toccano più la sessione dell'editor
 - [ ] Icona nella barra di sistema; installazione come servizio con un clic (Windows e systemd)
 - [ ] Controllo delle porte occupate per ogni servizio
-- [ ] Modifica di `php.ini` e della configurazione dal pannello
-- [ ] Pacchetto portabile: zip con `segvault(.exe)` + `php/` + `www/`, pronto all'uso
+- [~] Modifica di `php.ini` dal pannello (fatto); della configurazione del server dal pannello (porte fisse: 8484, 3306, 1025, 8443)
+- [x] Pacchetto portabile (`make dist`): `SegVault-VERSIONE-windows-x86_64.zip` e `-linux-x86_64.tar.gz` (1,8 MB, contro i ~150 MB di XAMPP) con eseguibili, `start-server`, `get-php.cmd` (scarica PHP 8.5/8.4/8.3 NTS con curl e tar di Windows), `trust-certificate.cmd`, il sito d'esempio `www/hello` (PHP + database), README
+- [x] PHP senza configurazione: senza `php.ini` accanto a `php-cgi` (lo zip di PHP per Windows) SegVault attiva le estensioni presenti (mysqli, pdo_mysql, openssl, mbstring, curl, gd, intl, zip, opcache, ...) e valori da sviluppo; "Edit php.ini" nel pannello lo crea da `php.ini-development` con le estensioni già attive e lo apre nell'editor
+- [x] `INSERT INTO t () VALUES ()`, `VALUES (), ()`, `DEFAULT VALUES`: righe di soli default (prima errore di sintassi)
 
 ## 6. Facoltativi (XAMPP li ha, servono a pochi)
 - [x] Cattura delle email (come Mailpit, integrata): server SMTP `--mail-port 1025` (AUTH con qualsiasi credenziale, pipelining, Bcc dalla busta), messaggi salvati in `DATA/mail/*.eml` (restano dopo un riavvio), pagina `/.segvault/mail/` con HTML in un iframe sandbox, testo, sorgente, allegati; API JSON con filtri (`?to=`, `?subject=`, `/latest`) per i test E2E; `mail()` di PHP instradato da solo (`sendmail_path` su Linux, `SMTP`/`smtp_port` su Windows)
