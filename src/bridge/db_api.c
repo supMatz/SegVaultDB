@@ -32,6 +32,7 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
   // grande della struttura reale (40 byte a 64 bit)
   #include <io.h>
   #include <sys/locking.h>
+  __declspec(dllimport) void __stdcall Sleep(unsigned long ms);   // (windows.h non si può includere)
   static int  db_lock_file(int fd) {
       long cur = _lseek(fd, 0, SEEK_CUR);
       _lseek(fd, 0, SEEK_SET);
@@ -51,7 +52,7 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
 #include "locks.h"
 static SvRwLock g_db_rw;
 static _Thread_local int g_lock_depth;
-static void db_mutex_init(void) { sv_rw_init(&g_db_rw); }
+static void db_mutex_init(void) { sv_rw_init(&g_db_rw); lk_init(); }
 static void db_lock(void)       { if (g_lock_depth++ == 0) sv_rw_wr(&g_db_rw); }
 static void db_unlock(void)     { if (--g_lock_depth == 0) sv_rw_wrunlock(&g_db_rw); }
 
@@ -560,6 +561,208 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
     return result;
 }
 
+
+typedef struct { char name[64]; off_t offset; } SavepointRec;
+
+struct DbSession {
+    int          cur_db;            // indice nel catalogo (-1 = nessuno)
+    uint64_t     tx_id;
+    SavepointRec sp[64];
+    int          nsp;
+    char         user[64];
+};
+
+// ── lock delle tabelle per statement (transazioni concorrenti, vedi locks.h) ──
+
+static int g_lock_wait_ms = 30000;
+void db_set_lock_wait_timeout(int ms) { g_lock_wait_ms = ms > 0 ? ms : 30000; }
+#define MAX_STMT_LOCKS 96
+
+static _Thread_local void (*g_wait_hook)(void*);
+static _Thread_local void* g_wait_ud;
+
+void db_set_lock_wait_hook(void (*hook)(void* ud), void* ud) { g_wait_hook = hook; g_wait_ud = ud; }
+
+typedef struct {
+    LkReq r[MAX_STMT_LOCKS];
+    int   n;
+    bool  overflow;               // troppe tabelle: si usa il lock globale esclusivo
+} LockSet;
+
+static void ls_add(LockSet* ls, int db, const char* name, uint8_t mode) {
+    char low[64];
+    size_t l = strlen(name);
+    if (l >= sizeof(low)) l = sizeof(low) - 1;
+    for (size_t i = 0; i < l; i++) low[i] = (char)tolower((unsigned char)name[i]);
+    low[l] = '\0';
+    for (int i = 0; i < ls->n; i++)
+        if (ls->r[i].db == db && !strcmp(ls->r[i].table, low)) { if (mode > ls->r[i].mode) ls->r[i].mode = mode; return; }
+    if (ls->n >= MAX_STMT_LOCKS) { ls->overflow = true; return; }
+    ls->r[ls->n].db = db;
+    memcpy(ls->r[ls->n].table, low, l + 1);
+    ls->r[ls->n].mode = mode;
+    ls->n++;
+}
+
+static uint8_t ls_mode(const LockSet* ls, int db, const char* name) {
+    for (int i = 0; i < ls->n; i++) if (ls->r[i].db == db && !strcasecmp(ls->r[i].table, name)) return ls->r[i].mode;
+    return 0;
+}
+
+static void ls_scan_text(LockSet* ls, int dbi, const char* sql, uint8_t mode, int depth);
+
+// una tabella (o vista, o procedura) con quello che può toccare: trigger, chiavi esterne, definizioni
+static void ls_name(LockSet* ls, int dbi, const char* name, uint8_t mode, int depth) {
+    if (dbi < 0 || dbi >= g_db.catalog->num_databases || depth > 8 || !name[0]) return;
+    Database* d = &g_db.catalog->databases[dbi];
+    for (int t = 0; t < d->num_tables; t++) {
+        if (strcasecmp(d->tables[t].name, name)) continue;
+        if (ls_mode(ls, dbi, name) >= mode) return;            // già visto (anche nei cicli di riferimenti)
+        ls_add(ls, dbi, name, mode);
+        if (mode != LK_X) return;
+        for (int g = 0; g < d->num_triggers; g++)               // i trigger possono scrivere ovunque
+            if (!strcasecmp(d->triggers[g].table_name, name)) ls_scan_text(ls, dbi, d->triggers[g].body, LK_X, depth + 1);
+        const TableSchema* ts = &d->tables[t];
+        for (int c = 0; c < ts->num_constraints; c++)           // tabelle riferite: controllate (lettura)
+            if (ts->constraints[c].kind == CONS_FOREIGN) ls_name(ls, dbi, ts->constraints[c].ref_table, LK_S, depth + 1);
+        for (int u = 0; u < d->num_tables; u++)                 // tabelle che la riferiscono: CASCADE / SET NULL
+            for (int c = 0; c < d->tables[u].num_constraints; c++)
+                if (d->tables[u].constraints[c].kind == CONS_FOREIGN && !strcasecmp(d->tables[u].constraints[c].ref_table, name))
+                    ls_name(ls, dbi, d->tables[u].name, LK_X, depth + 1);
+        return;
+    }
+    for (int v = 0; v < d->num_views; v++)
+        if (!strcasecmp(d->views[v].name, name)) { ls_scan_text(ls, dbi, d->views[v].definition, mode, depth + 1); return; }
+    for (int r = 0; r < d->num_routines; r++)
+        if (!strcasecmp(d->routines[r].name, name)) { ls_scan_text(ls, dbi, d->routines[r].body, LK_X, depth + 1); return; }
+}
+
+static int db_index_of(const char* name) {
+    for (int i = 0; i < g_db.catalog->num_databases; i++) if (!strcasecmp(g_db.catalog->databases[i].name, name)) return i;
+    return -1;
+}
+
+// ogni parola del testo che è il nome di una tabella / vista / procedura (sovrastima: sempre sicura)
+static void ls_scan_tokens(LockSet* ls, int dbi, const TokenList* tl, uint8_t mode, int depth) {
+    for (int i = 0; tl && i < tl->count; i++) {
+        const Token* t = &tl->tokens[i];
+        if (t->type == TOK_STRING || t->type == TOK_INTEGER || t->type == TOK_FLOAT || !t->text || !t->text[0]) continue;
+        if (!isalpha((unsigned char)t->text[0]) && t->text[0] != '_' && (unsigned char)t->text[0] < 0x80) continue;
+        if (i + 2 < tl->count && tl->tokens[i + 1].type == TOK_DOT && tl->tokens[i + 2].text) {   // db.tabella
+            int q = db_index_of(t->text);
+            if (q >= 0) { ls_name(ls, q, tl->tokens[i + 2].text, mode, depth); i += 2; continue; }
+        }
+        ls_name(ls, dbi, t->text, mode, depth);
+    }
+}
+
+static void ls_scan_text(LockSet* ls, int dbi, const char* sql, uint8_t mode, int depth) {
+    if (!sql || !sql[0] || depth > 8) return;
+    TokenList* tl = lexer_tokenize(sql);
+    ls_scan_tokens(ls, dbi, tl, mode, depth);
+    if (tl) lexer_free(tl);
+}
+
+// 0 = nessun lock (controllo delle transazioni, USE), 1 = lettura, 2 = scrittura, 3 = schema / manutenzione
+static int stmt_lock_kind(const ASTNode* st) {
+    switch (st->type) {
+    case NODE_BEGIN: case NODE_COMMIT: case NODE_ROLLBACK: case NODE_SAVEPOINT: case NODE_ROLLBACK_TO: case NODE_USE:
+        return 0;
+    case NODE_SELECT: case NODE_SHOW: case NODE_DESCRIBE: case NODE_EXPLAIN:
+        return 1;
+    case NODE_INSERT: case NODE_UPDATE: case NODE_DELETE: case NODE_CALL:
+        return 2;
+    default:
+        return 3;
+    }
+}
+
+// lock di uno statement: le tabelle del suo testo, più il lock globale (S per tutti, X per lo schema)
+static void stmt_locks(const ASTNode* st, const TokenList* tl, LockSet* ls, int dbi) {
+    ls->n = 0;
+    ls->overflow = false;
+    int kind = stmt_lock_kind(st);
+    if (kind == 0) return;
+    if (kind != 3) ls_scan_tokens(ls, dbi, tl, kind == 2 ? LK_X : LK_S, 0);
+    if (kind == 3 || ls->overflow) ls->n = 0;
+    LkReq* g = &ls->r[ls->n < MAX_STMT_LOCKS ? ls->n : MAX_STMT_LOCKS - 1];
+    g->db = -1;
+    snprintf(g->table, sizeof(g->table), "*");
+    g->mode = kind == 3 || ls->overflow ? LK_X : LK_S;
+    if (ls->n < MAX_STMT_LOCKS) ls->n++;
+}
+
+static const void* lock_owner(void);
+static void session_save(DbSession* s);
+static void session_load(const DbSession* s);
+static DbSession  g_default_session;
+static DbSession* g_active;
+
+// prende i lock; 0 = presi, 1 = deadlock, 2 = tempo scaduto. Mentre aspetta lascia il motore
+// (la sessione esce, il lock del motore si libera, l'hook del thread lascia passare gli altri)
+static int acquire_locks(const LockSet* ls) {
+    if (!ls->n) return 0;
+    double t0 = get_time_ms();
+    for (;;) {
+        const void* owner = lock_owner();
+        int r = lk_acquire(owner, ls->r, ls->n);
+        if (r == LK_GRANTED) return 0;
+        if (r == LK_DEADLOCK) return 1;
+        if (get_time_ms() - t0 > g_lock_wait_ms || g_lock_depth != 1) { lk_cancel_wait(owner); return 2; }
+        DbSession* s = g_active;
+        if (s) { session_save(s); session_load(&g_default_session); g_active = NULL; }
+        g_lock_depth = 0;
+        sv_rw_wrunlock(&g_db_rw);
+        if (g_wait_hook) g_wait_hook(g_wait_ud);
+        else {
+#ifdef _WIN32
+            Sleep(3);
+#else
+            struct timespec ts = { 0, 3000000 };
+            nanosleep(&ts, NULL);
+#endif
+        }
+        sv_rw_wr(&g_db_rw);
+        g_lock_depth = 1;
+        if (s) {
+            while (g_active) {                      // un'altra sessione è dentro: si aspetta che esca
+                g_lock_depth = 0;
+                sv_rw_wrunlock(&g_db_rw);
+                if (g_wait_hook) g_wait_hook(g_wait_ud);
+                else {
+#ifdef _WIN32
+                    Sleep(1);
+#else
+                    struct timespec ts1 = { 0, 1000000 };
+                    nanosleep(&ts1, NULL);
+#endif
+                }
+                sv_rw_wr(&g_db_rw);
+                g_lock_depth = 1;
+            }
+            session_save(&g_default_session);
+            session_load(s);
+            g_active = s;
+        }
+    }
+}
+
+static bool db_rollback_impl(void);
+
+// errore di lock per lo statement; un deadlock annulla la transazione (come MySQL)
+static QueryResult* lock_error(int why) {
+    if (why == 1) {
+        if (g_db.exec_ctx.tx_id) db_rollback_impl();
+        return result_error("Deadlock found when trying to get lock; try restarting transaction");
+    }
+    return result_error("Lock wait timeout exceeded; try restarting transaction (a table is in use by another session's open transaction)");
+}
+
+// a fine statement, senza transazione aperta, i lock si liberano subito
+static void release_if_autocommit(void) {
+    if (!g_db.exec_ctx.tx_id) lk_release_all(lock_owner());
+}
+
 static QueryResult* db_execute_impl(const char* sql) {
     if (!g_db.initialized) return result_error("DB non inizializzato");
     if (!sql || !sql[0])   return result_error("Query vuota");
@@ -584,8 +787,19 @@ static QueryResult* db_execute_impl(const char* sql) {
         return r;
     }
 
-    // Esegui il primo statement (multi-statement gestito da db_execute_multi)
-    QueryResult* result = parsed->count > 0 ? exec_one(parsed->statements[0]) : result_ok(0);
+    // Esegui il primo statement (multi-statement gestito da db_execute_multi), con i suoi lock
+    QueryResult* result;
+    if (parsed->count > 0) {
+        LockSet* ls = malloc(sizeof(LockSet));
+        if (!ls) result = result_error("Out of memory");
+        else {
+            stmt_locks(parsed->statements[0], tokens, ls, g_db.catalog->current_db);
+            int why = acquire_locks(ls);
+            result = why ? lock_error(why) : exec_one(parsed->statements[0]);
+            release_if_autocommit();
+            free(ls);
+        }
+    } else result = result_ok(0);
     if (result) result->exec_time_ms = get_time_ms() - t_start;
 
     parse_result_free(parsed);
@@ -611,11 +825,17 @@ static QueryResult** db_execute_multi_impl(const char* sql, int* out_count) {
     }
 
     QueryResult** results = SV_ALLOC_N(QueryResult*, parsed->count);
+    LockSet* ls = malloc(sizeof(LockSet));
     for (int i = 0; i < parsed->count; i++) {
-        results[i] = exec_one(parsed->statements[i]);
+        // i lock di ogni statement dal testo intero (sovrastima: più tabelle, mai meno)
+        int why = 0;
+        if (ls) { stmt_locks(parsed->statements[i], tokens, ls, g_db.catalog->current_db); why = acquire_locks(ls); }
+        results[i] = !ls ? result_error("Out of memory") : why ? lock_error(why) : exec_one(parsed->statements[i]);
+        release_if_autocommit();
         if (results[i])
             results[i]->exec_time_ms = get_time_ms() - t_start;
     }
+    free(ls);
     *out_count = parsed->count;
     wal_write_buffer(g_db.wal);
     maybe_checkpoint();
@@ -1130,18 +1350,9 @@ bool db_table_info(const char* db_name, const char* table, TableInfo* out, int* 
 
 // ── sessioni ────────────────────────────────────────────────────
 
-typedef struct { char name[64]; off_t offset; } SavepointRec;
 
-struct DbSession {
-    int          cur_db;            // indice nel catalogo (-1 = nessuno)
-    uint64_t     tx_id;
-    SavepointRec sp[64];
-    int          nsp;
-    char         user[64];
-};
 
-static DbSession  g_default_session;            // stato salvato della sessione predefinita
-static DbSession* g_active;                     // sessione attiva (NULL = predefinita)
+// g_default_session: stato salvato della sessione predefinita; g_active: sessione attiva (NULL = predefinita)
 
 // proprietario dei lock delle tabelle: la sessione attiva (o quella predefinita)
 static const void* lock_owner(void) { return g_active ? (const void*)g_active : (const void*)&g_default_session; }
@@ -1165,6 +1376,15 @@ static void session_load(const DbSession* s) {
 DbSession* db_session_new(void) {
     DbSession* s = calloc(1, sizeof(DbSession));
     if (s) s->cur_db = -1;
+    return s;
+}
+
+DbSession* db_session_new_temp(void) {
+    DbSession* s = calloc(1, sizeof(DbSession));
+    if (!s) return NULL;
+    db_lock();
+    s->cur_db = g_active ? g_default_session.cur_db : (g_db.catalog ? g_db.catalog->current_db : -1);
+    db_unlock();
     return s;
 }
 
@@ -1235,6 +1455,15 @@ QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char
         else if (q < 0) ok = false;                          // l'errore lo dà la via normale
         else idx = q;
     }
+    // le tabelle lette non devono essere in scrittura in una transazione aperta (niente letture sporche):
+    // lock S presi senza aspettare, altrimenti la via normale (che aspetta)
+    static _Thread_local char ro_owner;
+    LockSet* rls = NULL;
+    if (ok) {
+        rls = malloc(sizeof(LockSet));
+        if (rls) stmt_locks(parsed->statements[0], tokens, rls, idx);   // nomi non qualificati: il database della richiesta
+        if (!rls || !lk_try(&ro_owner, rls->r, rls->n)) { ok = false; *refused = true; }
+    }
     if (ok) {
         const char* dn = idx >= 0 ? g_db.catalog->databases[idx].name : "";
         if (infos) {
@@ -1262,6 +1491,7 @@ QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char
         }
         if (r) r->exec_time_ms = get_time_ms() - t0;
     } else *refused = true;
+    if (rls) { lk_release_all(&ro_owner); free(rls); }
     if (parsed) parse_result_free(parsed);
     if (tokens) lexer_free(tokens);
     sv_rw_rdunlock(&g_db_rw);
@@ -1535,7 +1765,7 @@ static bool bk_copy_dir(const char* from, const char* to, char* err, size_t errn
 static bool db_backup_impl(const char* dir, char* err, size_t errn) {
     if (!g_db.initialized) { snprintf(err, errn, "Database not initialized"); return false; }
     if (!dir || !dir[0]) { snprintf(err, errn, "Missing backup folder"); return false; }
-    if (g_db.exec_ctx.tx_id || g_tx_owner) { snprintf(err, errn, "BACKUP is not allowed while a transaction is open"); return false; }
+    if (g_open_tx > 0) { snprintf(err, errn, "BACKUP is not allowed while a transaction is open"); return false; }
     if (!strcmp(dir, g_db.data_dir)) { snprintf(err, errn, "The backup folder must not be the data folder"); return false; }
     char part[600];                                      // crea anche le cartelle intermedie
     snprintf(part, sizeof(part), "%s", dir);
@@ -1553,7 +1783,7 @@ static bool db_init_impl(const char* data_directory);
 
 static bool db_restore_impl(const char* dir, char* err, size_t errn) {
     if (!g_db.initialized) { snprintf(err, errn, "Database not initialized"); return false; }
-    if (g_db.exec_ctx.tx_id || g_tx_owner) { snprintf(err, errn, "Restore is not allowed while a transaction is open"); return false; }
+    if (g_open_tx > 0) { snprintf(err, errn, "Restore is not allowed while a transaction is open"); return false; }
     if (!dir || !bk_has_data(dir)) { snprintf(err, errn, "%.300s is not a SegVault backup (segvault.db missing)", dir ? dir : ""); return false; }
     if (!strcmp(dir, g_db.data_dir)) { snprintf(err, errn, "That is the data folder itself"); return false; }
     // i dati attuali restano in <dati>/before-restore: un ripristino sbagliato si può annullare

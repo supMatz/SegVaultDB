@@ -265,6 +265,17 @@ void db_columns_free(ColumnInfo* cols, int count);
 // La sessione predefinita (NULL) è quella della GUI e delle richieste senza sessione.
 typedef struct DbSession DbSession;
 DbSession* db_session_new(void);
+// sessione per una sola richiesta (HTTP senza sessione): parte dal database corrente della sessione
+// predefinita; db_session_end alla fine annulla una transazione lasciata aperta
+DbSession* db_session_new_temp(void);
+// Più transazioni possono essere aperte insieme (sessioni diverse): ogni statement prende lock S / X
+// sulle tabelle che usa (vedi locks.h) e li tiene fino a COMMIT / ROLLBACK. Chi trova una tabella
+// occupata aspetta: prima di aspettare esce dal motore e chiama questo hook (del thread), che deve
+// lasciare per un attimo il turno a chi tiene il lock (il server rilascia e riprende il suo mutex).
+// Senza hook il thread dorme qualche millisecondo. Dopo 30 s: "Lock wait timeout exceeded";
+// un ciclo di attese: "Deadlock found" e la transazione viene annullata (come MySQL).
+void db_set_lock_wait_hook(void (*hook)(void* ud), void* ud);
+void db_set_lock_wait_timeout(int ms);         // attesa massima di un lock (default 30000)
 // rende attiva s (NULL = una richiesta senza sessione); false se un'altra sessione ha una transazione
 // aperta (riprovare più tardi)
 bool db_session_enter(DbSession* s);

@@ -94,11 +94,20 @@ int main(void) {
     CHECK(!refused && r && !r->success && strstr(r->error, "time limit"), "per-read time limit: %s", r ? r->error : "refused");
     db_result_free(r);
 
-    // con una transazione aperta le letture parallele si fanno da parte
+    // con una transazione aperta: le letture parallele delle tabelle che scrive si fanno da parte
+    // (niente dati non confermati), quelle delle altre tabelle vanno avanti
     run("BEGIN");
-    r = db_execute_readonly("SELECT 1", "p", NULL, 0, &refused);
-    CHECK(refused, "refused while a transaction is open");
+    run("INSERT INTO w VALUES (100000, 1)");
+    r = db_execute_readonly("SELECT COUNT(*) FROM w", "p", NULL, 0, &refused);
+    CHECK(refused, "refused on a table written by an open transaction");
+    db_result_free(r);
+    r = db_execute_readonly("SELECT COUNT(*) FROM big", "p", NULL, 0, &refused);
+    CHECK(!refused && r && r->success, "allowed on another table");
+    db_result_free(r);
     run("ROLLBACK");
+    r = db_execute_readonly("SELECT COUNT(*) FROM w", "p", NULL, 0, &refused);
+    CHECK(!refused && r && r->success && !strcmp(r->rows[0].cells[0].value, "80"), "after ROLLBACK: %s", r && r->success ? r->rows[0].cells[0].value : "?");
+    db_result_free(r);
 
     // permessi dell'utente
     run("CREATE USER lu IDENTIFIED BY 'pass1234'");

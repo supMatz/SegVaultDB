@@ -218,10 +218,17 @@ curl -X DELETE http://127.0.0.1:8484/api/v1/sessions/3f9a...   # chiusa: una tra
 ```
 
 - La risposta di una query in sessione contiene `"session":{"id":...,"in_transaction":true|false}`.
-- **Una transazione alla volta.** Mentre una sessione ha una transazione aperta, le richieste delle
-  altre sessioni (e quelle senza sessione) aspettano il suo `COMMIT` / `ROLLBACK`, fino a 10 s; poi
-  ricevono HTTP 409. Così nessuno legge dati non ancora confermati e un `ROLLBACK` non annulla il
-  lavoro di altri (isolamento serializzabile). Tieni le transazioni brevi.
+- **Transazioni concorrenti.** Più sessioni (e connessioni MySQL) tengono aperte transazioni nello
+  stesso momento. Ogni statement prende un lock sulle tabelle che usa (condiviso per leggere, esclusivo
+  per scrivere: anche le tabelle toccate da trigger, chiavi esterne con `CASCADE`, viste e procedure)
+  e lo tiene fino a `COMMIT` / `ROLLBACK` (locking a due fasi stretto: isolamento serializzabile,
+  nessuna lettura di dati non confermati). Transazioni su tabelle diverse, o che leggono soltanto,
+  vanno avanti insieme; chi vuole una tabella in scrittura altrui aspetta il `COMMIT`, fino a 30 s
+  (`Lock wait timeout exceeded`, errore MySQL 1205). Un ciclo di attese viene riconosciuto subito:
+  una delle transazioni riceve `Deadlock found when trying to get lock; try restarting transaction`
+  (1213, come MySQL: Laravel, Doctrine e gli altri ORM la ripetono da soli) e viene annullata.
+  `CREATE` / `ALTER` / `DROP` aspettano che non ci siano transazioni aperte. Le richieste senza
+  sessione hanno una sessione propria per la durata della richiesta. Tieni le transazioni brevi.
 - Una transazione ferma da **30 s** viene annullata e una sessione inattiva da **5 minuti** viene
   chiusa: un client che si blocca o sparisce non ferma gli altri.
 - Con il login (`--users`) la sessione appartiene all'utente che l'ha creata.

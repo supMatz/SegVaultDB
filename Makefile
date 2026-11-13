@@ -72,6 +72,7 @@ ENGINE_SRCS = \
 	src/tx/wal.c \
 	src/tx/transaction.c \
 	src/bridge/db_api.c \
+	src/bridge/locks.c \
 	src/bridge/auth.c
 
 # ── Targets ──

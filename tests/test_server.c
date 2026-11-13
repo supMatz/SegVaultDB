@@ -353,6 +353,10 @@ static void* writer(void* arg) {
     return NULL;
 }
 
+// uno statement su una connessione MySQL in un thread (transazioni concorrenti)
+typedef struct { My* m; const char* sql; char out[512]; } CcArg;
+static void* cc_thread(void* p) { CcArg* a = p; char o[512]; my_query(a->m, a->sql, o, sizeof(o)); snprintf(a->out, sizeof(a->out), "%s", o); return NULL; }
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     char dir[] = "/tmp/svserverXXXXXX";
@@ -965,6 +969,45 @@ int main(void) {
         CHECK(strstr(out, " / ac"), "SET autocommit = 1 commits: %s", out);
         my_query(&m, "START TRANSACTION; DELETE FROM p WHERE id = 1; ROLLBACK WORK; SELECT COUNT(*) FROM p", out, sizeof(out));
         CHECK(!strcmp(out, "OK:0 / OK:1 / OK:0 / 3"), "START TRANSACTION / ROLLBACK WORK: %s", out);
+
+        // transazioni concorrenti: due connessioni con transazioni aperte insieme su tabelle diverse;
+        // chi tocca una tabella in uso aspetta il COMMIT; un deadlock annulla una delle due (1213)
+        my_query(&m, "CREATE TABLE q (id INT PRIMARY KEY, v INT); INSERT INTO q VALUES (1, 0)", out, sizeof(out));
+        My m2;
+        CHECK(my_connect(&m2, mp, "root", "tok4", "t", e, sizeof(e)), "second connection: %s", e);
+        my_query(&m, "START TRANSACTION; UPDATE p SET prezzo = 1 WHERE id = 1", out, sizeof(out));
+        CHECK(!strcmp(out, "OK:0 / OK:1"), "A opens a transaction on p: %s", out);
+        my_query(&m2, "START TRANSACTION; UPDATE q SET v = v + 1; SELECT v FROM q", out, sizeof(out));
+        CHECK(!strcmp(out, "OK:0 / OK:1 / 1"), "B opens one on q at the same time: %s", out);
+        CcArg ca = { &m2, "UPDATE p SET prezzo = 2 WHERE id = 1", "" };
+        pthread_t ct;
+        pthread_create(&ct, NULL, cc_thread, &ca);
+        usleep(150000);
+        CHECK(!ca.out[0], "B waits for the row A is writing: %s", ca.out);
+        my_query(&m, "COMMIT", out, sizeof(out));
+        pthread_join(ct, NULL);
+        CHECK(!strcmp(ca.out, "OK:1"), "B continues after A's COMMIT: %s", ca.out);
+        my_query(&m2, "COMMIT", out, sizeof(out));
+        my_query(&m, "SELECT prezzo FROM p WHERE id = 1; SELECT v FROM q", out, sizeof(out));
+        CHECK(!strcmp(out, "2 / 1"), "both committed: %s", out);
+        // deadlock
+        my_query(&m, "START TRANSACTION; UPDATE p SET prezzo = 3 WHERE id = 1", out, sizeof(out));
+        my_query(&m2, "START TRANSACTION; UPDATE q SET v = 10", out, sizeof(out));
+        CcArg da = { &m, "UPDATE q SET v = 20", "" }, db2 = { &m2, "UPDATE p SET prezzo = 4 WHERE id = 1", "" };
+        pthread_t d1, d2;
+        pthread_create(&d1, NULL, cc_thread, &da);
+        usleep(100000);
+        pthread_create(&d2, NULL, cc_thread, &db2);
+        pthread_join(d1, NULL);
+        pthread_join(d2, NULL);
+        bool a_lost = strstr(da.out, "ERR:1213") != NULL, b_lost = strstr(db2.out, "ERR:1213") != NULL;
+        CHECK(a_lost != b_lost && (a_lost ? !strcmp(db2.out, "OK:1") : !strcmp(da.out, "OK:1")), "deadlock: one gets 1213: [%s] [%s]", da.out, db2.out);
+        my_query(&m, "COMMIT", out, sizeof(out));
+        my_query(&m2, "COMMIT", out, sizeof(out));
+        my_query(&m, "SELECT prezzo FROM p WHERE id = 1; SELECT v FROM q", out, sizeof(out));
+        CHECK(!strcmp(out, a_lost ? "4 / 10" : "3 / 20"), "the winner's changes only: %s", out);
+        my_query(&m, "DROP TABLE q", out, sizeof(out));
+        close(m2.fd);
         close(m.fd);
         if (s4) { sv_server_stop(s4); pthread_join(th4, NULL); sv_server_free(s4); }
     }

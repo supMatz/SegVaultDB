@@ -52,7 +52,8 @@ SegVault copre già database e phpMyAdmin; qui c'è quello che manca, in ordine 
 - [x] Confronti senza distinzione di maiuscole per le tabelle con collation `_ci` (come MySQL: `=`, `IN`, indici, `UNIQUE`, `GROUP BY`, `DISTINCT`, `ORDER BY`, join); le tabelle native di SegVault restano case-sensitive
 
 ## 4. Concorrenza
-- [ ] Scritture concorrenti (lock sulle righe o MVCC); più transazioni aperte insieme
+- [x] Più transazioni aperte insieme (sessioni HTTP, connessioni MySQL, GUI): lock di tabella S / X per statement (anche trigger, chiavi esterne, viste, procedure) tenuti fino a COMMIT / ROLLBACK, attesa che lascia lavorare gli altri, deadlock riconosciuti (errore 1213, la vittima viene annullata), `Lock wait timeout` (1205) dopo 30 s; letture parallele solo su tabelle non in scrittura (niente letture sporche); recupero dopo un crash con più transazioni interlacciate; ROLLBACK TO senza troncare il log
+- [ ] Lock sulle righe o MVCC (letture che non aspettano mai le scritture)
 
 ## 5. Pannello di controllo stile XAMPP
 - [x] Pannello del server: interruttore della cattura delle email (porta 1025, "Open inbox (N)" aggiornato da solo), link al cruscotto "All sites", siti `site.NOME=DEST` letti da `server.ini`, messaggi chiari se la porta 1025 è già presa (Mailpit / MailHog)

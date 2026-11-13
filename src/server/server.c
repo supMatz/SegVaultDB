@@ -605,6 +605,15 @@ static void exec_end(SvServer* s) {
     mx_unlock(&s->exec_mx);
 }
 
+// un'altra sessione tiene un lock che serve a questa richiesta (vedi db_set_lock_wait_hook): il turno
+// sul motore passa per un attimo agli altri, poi si riprende
+static void lock_wait_hook(void* ud) {
+    SvServer* s = ud;
+    exec_end(s);
+    sleep_ms(2);
+    exec_begin(s);
+}
+
 // ── POST /api/v1/query ──────────────────────────────────────────
 
 // ── sessioni ────────────────────────────────────────────────────
@@ -779,14 +788,17 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
     if (!parallel) {
     exec_begin(s);
     expire_sessions(s);
-    // un'altra sessione ha una transazione aperta: si aspetta che finisca (o che scada)
-    for (double waited = 0; !db_session_enter(ss ? ss->db : NULL); waited += 20) {
+    // senza sessione la richiesta ha una sessione sua (transazione e lock propri), chiusa alla fine
+    DbSession* tmp = ss ? NULL : db_session_new_temp();
+    DbSession* ds = ss ? ss->db : tmp;
+    if (!ss && !tmp) { exec_end(s); free(ranges); free(script); json_error(rs, 500, "out of memory"); return; }
+    for (double waited = 0; !db_session_enter(ds); waited += 20) {
         exec_end(s);
         if (waited >= SESSION_WAIT_MS) {
             free(ranges);
             free(script);
-            json_error(rs, 409, "another session has an open transaction: retry after its COMMIT / ROLLBACK "
-                                "(an idle transaction is rolled back after %d s)", TX_IDLE_MS / 1000);
+            if (tmp) db_session_end(tmp);
+            json_error(rs, 409, "the engine is busy: retry");
             return;
         }
         sleep_ms(20);
@@ -795,7 +807,8 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
     }
     // permessi dell'utente della richiesta (vuoto = root), solo per gli statement di questa richiesta
     if (!db_set_user(user)) {
-        if (ss) db_session_leave(ss->db);
+        db_session_leave(ds);
+        if (tmp) db_session_end(tmp);
         exec_end(s);
         free(ranges);
         free(script);
@@ -863,6 +876,11 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
                          : "a transaction was left open and has been rolled back (end it with COMMIT)";
     }
     db_set_user(NULL);
+    if (tmp) {                                  // la sessione della richiesta finisce qui (lock compresi)
+        db_session_leave(tmp);
+        db_session_end(tmp);
+        prev_db[0] = '\0';
+    }
     cur = db_current_database();
     if (prev_db[0] && (!cur || strcmp(cur, prev_db))) {
         char use[160];
@@ -2734,6 +2752,7 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
 static void serve_connection(Conn* c) {
     InBuf in = {0};
     set_timeout(c->fd, IDLE_TIMEOUT_MS);
+    db_set_lock_wait_hook(lock_wait_hook, c->s);
     // connessione dal ponte TLS: "SVTLS <segreto> <ip> <porta>\r\n" prima della richiesta
     SvServer* s = c->s;
     if (s->tls && !strncmp(c->client, "127.", 4)) {
@@ -2801,6 +2820,8 @@ static bool my_send(Conn* c, MwOut* o) {
 static unsigned my_errcode(const char* m, const char** state) {
     *state = "HY000";
     if (strstr(m, "Access denied")) { *state = "42000"; return 1142; }
+    if (strstr(m, "Deadlock found")) { *state = "40001"; return 1213; }
+    if (strstr(m, "Lock wait timeout")) { *state = "HY000"; return 1205; }
     if (strstr(m, "Duplicate") || strstr(m, "duplicate") || strstr(m, "UNIQUE")) { *state = "23000"; return 1062; }
     if (strstr(m, "FOREIGN KEY") || strstr(m, "foreign key")) { *state = "23000"; return 1452; }
     if (strstr(m, "cannot be NULL") || strstr(m, "NOT NULL")) { *state = "23000"; return 1048; }
@@ -3066,6 +3087,7 @@ static void my_long_data(MyStmts* ss, const uint8_t* p, size_t n) {
 
 static void serve_mysql(Conn* c) {
     db_set_mysql_mode(true);                     // questo thread serve solo la connessione MySQL
+    db_set_lock_wait_hook(lock_wait_hook, c->s);
     SvServer* s = c->s;
     InBuf in = {0};
     MwOut o = {0};
