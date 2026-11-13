@@ -2,6 +2,8 @@
 #include "../platform_lock.h"
 #include "../table/overflow.h"
 #include "sqljson.h"
+#include "regex.h"
+#include "../bridge/auth.h"
 #include "platform_compat.h"
 #include <string.h>
 #include <ctype.h>
@@ -13,6 +15,10 @@
 #include <strings.h>
 #include <limits.h>
 #include <errno.h>
+#ifdef _WIN32
+__declspec(dllimport) void __stdcall Sleep(unsigned long ms);
+static void sv_win_sleep(unsigned long ms) { Sleep(ms); }
+#endif
 
 static QueryResult* result_error_msg(const char* msg) {
     QueryResult* r = calloc(1, sizeof(QueryResult));
@@ -78,7 +84,7 @@ static bool like_match_esc(const char* s, const char* p, char esc) {
     return *s == '\0';
 }
 
-static bool like_match(const char* s, const char* p) { return like_match_esc(s, p, 0); }
+static bool like_match(const char* s, const char* p) { return like_match_esc(s, p, '\\'); }   // come MySQL e PostgreSQL: \\ protegge % e _
 
 static QueryResult* unknown_column_error(const char* col, const char* clause) {
     char msg[200];
@@ -102,6 +108,67 @@ static QueryResult* exec_drop_db(ExecCtx* ctx, ASTNode* n) {
 
 static const char* add_constraint(ExecCtx* ctx, Database* db, TableSchema* ts, ConstraintDef* d, char* msg, size_t mn);
 static const char* check_value(const Column* c, const char* v, char* msg, size_t n);
+
+// DEFAULT CURRENT_TIMESTAMP / NOW() / LOCALTIMESTAMP / CURRENT_DATE: valore calcolato a ogni INSERT
+static bool default_is_now(const char* d) {
+    return !strcasecmp(d, "CURRENT_TIMESTAMP") || !strcasecmp(d, "NOW") || !strcasecmp(d, "LOCALTIMESTAMP") ||
+           !strcasecmp(d, "LOCALTIME") || !strcasecmp(d, "CURRENT_DATE") || !strcasecmp(d, "CURDATE") ||
+           !strcasecmp(d, "UTC_TIMESTAMP");
+}
+
+// ora attuale come testo per una colonna DATE / DATETIME (UTC_TIMESTAMP: in UTC)
+static void col_now_text(const char* fn, DataType t, char* out, size_t n) {
+    time_t now = time(NULL);
+    struct tm tmv;
+#ifdef _WIN32
+    if (fn && !strcasecmp(fn, "UTC_TIMESTAMP")) gmtime_s(&tmv, &now); else localtime_s(&tmv, &now);
+#else
+    if (fn && !strcasecmp(fn, "UTC_TIMESTAMP")) gmtime_r(&now, &tmv); else localtime_r(&now, &tmv);
+#endif
+    strftime(out, n, t == SV_TYPE_DATE ? "%Y-%m-%d" : "%Y-%m-%d %H:%M:%S", &tmv);
+}
+
+// numero decimale arrotondato a scale cifre (metà lontano da zero, come MySQL), senza passare dal double
+static bool decimal_round(const char* in, int scale, char* out, size_t n) {
+    while (isspace((unsigned char)*in)) in++;
+    bool neg = *in == '-';
+    if (*in == '-' || *in == '+') in++;
+    char ip[80], fp[80];
+    size_t il = 0, fl = 0;
+    while (isdigit((unsigned char)*in) && il < sizeof(ip) - 2) ip[il++] = *in++;
+    if (*in == '.') { in++; while (isdigit((unsigned char)*in) && fl < sizeof(fp) - 2) fp[fl++] = *in++; }
+    while (isspace((unsigned char)*in)) in++;
+    if (*in || (il == 0 && fl == 0)) return false;                 // esponenti e altro: lasciati come sono
+    if (il == 0) ip[il++] = '0';
+    while (fl < (size_t)scale) fp[fl++] = '0';
+    bool up = fl > (size_t)scale && fp[scale] >= '5';
+    char digits[170];
+    size_t dl = 0;
+    for (size_t i = 0; i < il; i++) digits[dl++] = ip[i];
+    for (int i = 0; i < scale; i++) digits[dl++] = fp[i];
+    for (size_t i = dl; up && i-- > 0; ) {                         // riporto
+        if (digits[i] == '9') { digits[i] = '0'; if (i == 0) { memmove(digits + 1, digits, dl++); digits[0] = '1'; il++; up = false; } }
+        else { digits[i]++; up = false; }
+    }
+    size_t lead = 0;                                               // zeri iniziali inutili
+    while (lead + 1 < dl - (size_t)scale && digits[lead] == '0') lead++;
+    bool zero = true;
+    for (size_t i = lead; i < dl; i++) if (digits[i] != '0') zero = false;
+    size_t o = 0;
+    if (neg && !zero && o + 1 < n) out[o++] = '-';
+    for (size_t i = lead; i < dl - (size_t)scale && o + 1 < n; i++) out[o++] = digits[i];
+    if (scale > 0 && o + 1 < n) out[o++] = '.';
+    for (size_t i = dl - (size_t)scale; i < dl && o + 1 < n; i++) out[o++] = digits[i];
+    out[o] = '\0';
+    return true;
+}
+
+// valore di una colonna da un testo, con le regole della colonna (DECIMAL(p, s): s decimali)
+static void column_set_from_text(Value* v, const Column* c, const char* text) {
+    char buf[200];
+    if (text && c->type == SV_TYPE_DECIMAL && c->decimal_prec > 0 && decimal_round(text, c->decimal_prec - 1, buf, sizeof(buf))) text = buf;
+    value_set_from_text(v, c->type, text);
+}
 static const Constraint* referenced_by(Database* db, const TableSchema* ts, const TableSchema** child);
 
 static QueryResult* exec_create_table(ExecCtx* ctx, ASTNode* n) {
@@ -157,13 +224,31 @@ static QueryResult* exec_create_table(ExecCtx* ctx, ASTNode* n) {
         col->size = cd->size;
         col->nullable = cd->nullable;
         col->auto_increment = cd->auto_increment;
+        snprintf(col->sqltype, sizeof(col->sqltype), "%s", cd->sqltype);
+        col->flags = cd->flags;
+        if (cd->comment[0] && cd->comment[0] != '\x01') snprintf(col->comment, sizeof(col->comment), "%s", cd->comment);
+        // DECIMAL(p, s): s decimali (decimal_prec = s + 1; 0 = come scritto, tabelle di prima)
+        if (col->type == SV_TYPE_DECIMAL) col->decimal_prec = cd->has_scale ? cd->scale + 1 : cd->size > 0 ? 1 : 0;
         if (cd->default_val[0])
             snprintf(col->default_val, sizeof(col->default_val), "%s", cd->default_val);
-        if (cd->default_val[0] && strcasecmp(cd->default_val, "NULL") && check_value(col, cd->default_val, msg, sizeof(msg))) {
+        col->has_default = cd->has_default && strcasecmp(cd->default_val, "NULL");       // anche DEFAULT ''
+        if (col->has_default && !default_is_now(cd->default_val) &&
+            check_value(col, cd->default_val, msg, sizeof(msg))) {
             free(ts);
             return result_error_msg(msg);
         }
+        // ENUM('a','b'): un CHECK con i valori ammessi
+        if (cd->comment[0] == '\x01' && n->create_table.num_cons < SV_MAX_CONS_DEFS) {
+            ConstraintDef* d = &n->create_table.cons[n->create_table.num_cons++];
+            memset(d, 0, sizeof(*d));
+            d->kind = CONS_CHECK;
+            snprintf(d->name, sizeof(d->name), "%.50s_chk_enum", cd->name);
+            snprintf(d->check, sizeof(d->check), "`%.64s` IN %.420s", cd->name, cd->comment + 1);
+        }
     }
+    if (n->create_table.collation[0]) snprintf(ts->collation, sizeof(ts->collation), "%s", n->create_table.collation);
+    if (n->create_table.comment[0]) snprintf(ts->comment, sizeof(ts->comment), "%s", n->create_table.comment);
+    if (n->create_table.auto_increment > 0) ts->auto_increment = (uint64_t)n->create_table.auto_increment;
 
     // vincoli: prima la chiave primaria (le chiavi esterne verso la tabella stessa la usano)
     const char* fail = NULL;
@@ -200,6 +285,28 @@ static QueryResult* exec_create_table(ExecCtx* ctx, ASTNode* n) {
             saved->root_page_id = pid;
             saved->num_pages = 1;
             bp_unpin(ctx->bp, pid, false);
+        }
+        // KEY / INDEX / FULLTEXT di MySQL: indici (si cerca con la prima colonna)
+        for (int k = 0; k < n->create_table.num_keys && saved->num_indexes < SV_MAX_INDEXES; k++) {
+            const TableKeyDef* kd = &n->create_table.keys[k];
+            bool ok = kd->ncols > 0;
+            for (int c = 0; c < kd->ncols && ok; c++) ok = catalog_get_col_index(saved, kd->cols[c]) >= 0;
+            if (!ok) {
+                snprintf(msg, sizeof(msg), "Unknown column in KEY '%.64s'", kd->name);
+                catalog_drop_table(ctx->catalog, db->name, saved->name);
+                return result_error_msg(msg);
+            }
+            Index* ix = &saved->indexes[saved->num_indexes++];
+            memset(ix, 0, sizeof(*ix));
+            if (kd->name[0]) snprintf(ix->name, sizeof(ix->name), "%s", kd->name);
+            else snprintf(ix->name, sizeof(ix->name), "%.63s", kd->cols[0]);
+            for (int j = 0; j < saved->num_indexes - 1; j++)             // nomi automatici distinti (col, col_2, ...)
+                if (!strcasecmp(saved->indexes[j].name, ix->name)) { snprintf(ix->name, sizeof(ix->name), "%.58s_%d", kd->cols[0], k + 2); break; }
+            snprintf(ix->col_name, sizeof(ix->col_name), "%s", kd->cols[0]);
+            snprintf(ix->type, sizeof(ix->type), "BTREE");
+            ix->ncols = (uint8_t)kd->ncols;
+            ix->fulltext = kd->fulltext;
+            for (int c = 0; c < kd->ncols; c++) snprintf(ix->cols[c], sizeof(ix->cols[c]), "%s", kd->cols[c]);
         }
     }
     return result_ok_msg(0);
@@ -297,10 +404,10 @@ static const char* rewrite_rows(ExecCtx* ctx, TableSchema* ts, TableSchema* ns, 
                 if (check_value(&ns->columns[i], txt, why, sizeof(why))) {
                     snprintf(cmsg, cmsgn, "Cannot change the type of '%.64s': %s", ns->columns[i].name, why);
                     fail = cmsg;
-                } else value_set_from_text(&nt->values[i], ns->columns[i].type, txt);
+                } else column_set_from_text(&nt->values[i], &ns->columns[i], txt);
             }
             else if (map[i] >= 0) value_copy(&nt->values[i], &t->values[map[i]], ns->columns[i].type);
-            else value_set_from_text(&nt->values[i], ns->columns[i].type, def);
+            else column_set_from_text(&nt->values[i], &ns->columns[i], def);
         }
         if (fail) { tuple_free(nt); tuple_free(t); break; }
         RID nr;
@@ -359,11 +466,14 @@ static QueryResult* alter_column_attr(ExecCtx* ctx, Database* db, TableSchema* t
                 snprintf(msg, sizeof(msg), "Column '%.64s' is NOT NULL: its DEFAULT cannot be NULL", name);
                 return result_error_msg(msg);
             }
+            if (!v[0] && !col->nullable) {}                       // DEFAULT '' va bene anche per NOT NULL
             snprintf(col->default_val, sizeof(col->default_val), "%s", strcasecmp(v, "NULL") ? v : "");
+            col->has_default = strcasecmp(v, "NULL") != 0;
             return result_ok_msg(0);
         }
         case ALT_DROP_DEFAULT:
             col->default_val[0] = '\0';
+            col->has_default = false;
             return result_ok_msg(0);
         case ALT_DROP_NOT_NULL:
             if (in_pk) { snprintf(msg, sizeof(msg), "Column '%.64s' is part of the primary key: it cannot be NULL", name); return result_error_msg(msg); }
@@ -488,7 +598,13 @@ static QueryResult* alter_column(ExecCtx* ctx, Database* db, TableSchema* ts, AS
             col->size = cd->size;
             col->nullable = cd->nullable;
             snprintf(col->default_val, sizeof(col->default_val), "%s", cd->default_val);
-            if (cd->default_val[0] && strcasecmp(cd->default_val, "NULL")) {
+            col->has_default = cd->has_default && strcasecmp(cd->default_val, "NULL");
+            col->sqltype[0] = '\0';
+            snprintf(col->sqltype, sizeof(col->sqltype), "%s", cd->sqltype);
+            col->flags = cd->flags;
+            if (cd->comment[0] && cd->comment[0] != '\x01') snprintf(col->comment, sizeof(col->comment), "%s", cd->comment);
+            if (col->type == SV_TYPE_DECIMAL) col->decimal_prec = cd->has_scale ? cd->scale + 1 : cd->size > 0 ? 1 : 0;
+            if (col->has_default && !default_is_now(cd->default_val)) {
                 def = col->default_val;
                 if (check_value(col, def, msg, sizeof(msg))) fail = msg;
             }
@@ -642,6 +758,7 @@ static int utf8_len(const char* s) {
 static bool valid_date(const char* s, const char** rest) {
     int y, m, d, k = 0;
     if (sscanf(s, "%4d-%2d-%2d%n", &y, &m, &d, &k) != 3 || k != 10) return false;
+    if (y == 0 && m == 0 && d == 0) { if (rest) *rest = s + 10; return true; }   // data zero di MySQL (0000-00-00)
     static const int DAYS[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
     if (m < 1 || m > 12 || d < 1) return false;
     int md = DAYS[m - 1] + (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0));
@@ -676,7 +793,7 @@ static const char* check_value(const Column* c, const char* v, char* msg, size_t
             }
             while (end && isspace((unsigned char)*end)) end++;
             if (end == p || !end || *end) { snprintf(msg, n, "Column '%s' expects an integer, got '%.40s'", c->name, v); return msg; }
-            if (range || (c->type == SV_TYPE_INT && (x < INT_MIN || x > INT_MAX))) {
+            if (range || (c->type == SV_TYPE_INT && (x < INT_MIN || x > INT_MAX)) || (x < 0 && (c->flags & COLF_UNSIGNED))) {
                 snprintf(msg, n, "Value %.40s is out of range for column '%s' (%s)", v, c->name, datatype_name(c->type));
                 return msg;
             }
@@ -1434,7 +1551,33 @@ static const FuncDef FUNCS[] = {
     { "JSON_EXTRACT", 2, 2 }, { "JSON_UNQUOTE", 1, 1 }, { "JSON_VALID", 1, 1 }, { "JSON_TYPE", 1, 1 },
     { "JSON_LENGTH", 1, 2 }, { "JSON_OBJECT", 0, 32 }, { "JSON_ARRAY", 0, 32 },
     { "MATCH_AGAINST", 3, 18 },
-    { "DATABASE", 0, 0 }, { "SCHEMA", 0, 0 }, { "VERSION", 0, 0 }, { "LAST_INSERT_ID", 0, 0 },
+    { "DATABASE", 0, 0 }, { "SCHEMA", 0, 0 }, { "VERSION", 0, 0 }, { "LAST_INSERT_ID", 0, 1 },
+    // MySQL
+    { "LOCATE", 2, 3 }, { "INSTR", 2, 2 }, { "LPAD", 3, 3 }, { "RPAD", 3, 3 }, { "REPEAT", 2, 2 }, { "SPACE", 1, 1 },
+    { "FIELD", 2, 32 }, { "FIND_IN_SET", 2, 2 }, { "ELT", 2, 32 }, { "SUBSTRING_INDEX", 3, 3 }, { "ASCII", 1, 1 }, { "ORD", 1, 1 },
+    { "CHAR", 1, 32 }, { "HEX", 1, 1 }, { "UNHEX", 1, 1 }, { "MD5", 1, 1 }, { "SHA1", 1, 1 }, { "SHA", 1, 1 }, { "SHA2", 2, 2 },
+    { "TO_BASE64", 1, 1 }, { "FROM_BASE64", 1, 1 }, { "QUOTE", 1, 1 }, { "STRCMP", 2, 2 }, { "FORMAT", 2, 3 },
+    { "BIT_LENGTH", 1, 1 }, { "OCTET_LENGTH", 1, 1 }, { "CHARSET", 1, 1 }, { "COLLATION", 1, 1 },
+    { "REGEXP_LIKE", 2, 3 }, { "REGEXP_REPLACE", 3, 6 }, { "REGEXP_SUBSTR", 2, 5 }, { "REGEXP_INSTR", 2, 6 }, { "TRIM_EX", 3, 3 },
+    { "BIN", 1, 1 }, { "OCT", 1, 1 }, { "CRC32", 1, 1 }, { "INET_ATON", 1, 1 }, { "INET_NTOA", 1, 1 },
+    { "RAND", 0, 1 }, { "PI", 0, 0 }, { "EXP", 1, 1 }, { "LN", 1, 1 }, { "LOG", 1, 2 }, { "LOG10", 1, 1 }, { "LOG2", 1, 1 },
+    { "TRUNCATE", 2, 2 }, { "GREATEST", 2, 32 }, { "LEAST", 2, 32 }, { "RADIANS", 1, 1 }, { "DEGREES", 1, 1 },
+    { "SIN", 1, 1 }, { "COS", 1, 1 }, { "TAN", 1, 1 }, { "COT", 1, 1 }, { "ASIN", 1, 1 }, { "ACOS", 1, 1 }, { "ATAN", 1, 2 },
+    { "ATAN2", 2, 2 }, { "INTDIV", 2, 2 },
+    { "DATE_FORMAT", 2, 2 }, { "TIME_FORMAT", 2, 2 }, { "STR_TO_DATE", 2, 2 }, { "UNIX_TIMESTAMP", 0, 1 }, { "FROM_UNIXTIME", 1, 2 },
+    { "DATE", 1, 1 }, { "TIME", 1, 1 }, { "HOUR", 1, 1 }, { "MINUTE", 1, 1 }, { "SECOND", 1, 1 }, { "MICROSECOND", 1, 1 },
+    { "DAYOFWEEK", 1, 1 }, { "DAYOFMONTH", 1, 1 }, { "DAYOFYEAR", 1, 1 }, { "WEEKDAY", 1, 1 }, { "WEEK", 1, 2 },
+    { "WEEKOFYEAR", 1, 1 }, { "YEARWEEK", 1, 2 }, { "QUARTER", 1, 1 }, { "MONTHNAME", 1, 1 }, { "DAYNAME", 1, 1 },
+    { "LAST_DAY", 1, 1 }, { "DATEDIFF", 2, 2 }, { "TIMEDIFF", 2, 2 }, { "TIMESTAMPDIFF", 3, 3 }, { "DATE_ADD", 2, 2 },
+    { "DATE_SUB", 2, 2 }, { "ADDDATE", 2, 2 }, { "SUBDATE", 2, 2 }, { "__INTERVAL", 2, 2 }, { "EXTRACT", 2, 2 },
+    { "MAKEDATE", 2, 2 }, { "MAKETIME", 3, 3 }, { "TO_DAYS", 1, 1 }, { "FROM_DAYS", 1, 1 }, { "TO_SECONDS", 1, 1 },
+    { "SEC_TO_TIME", 1, 1 }, { "TIME_TO_SEC", 1, 1 }, { "CONVERT_TZ", 3, 3 }, { "CAST", 2, 2 },
+    { "UTC_TIMESTAMP", 0, 0 }, { "UTC_DATE", 0, 0 }, { "UTC_TIME", 0, 0 }, { "CURTIME", 0, 0 }, { "CURRENT_TIME", 0, 0 },
+    { "SYSDATE", 0, 0 }, { "LOCALTIME", 0, 0 }, { "LOCALTIMESTAMP", 0, 0 },
+    { "FOUND_ROWS", 0, 0 }, { "ROW_COUNT", 0, 0 }, { "CONNECTION_ID", 0, 0 }, { "USER", 0, 0 }, { "CURRENT_USER", 0, 0 },
+    { "SESSION_USER", 0, 0 }, { "SYSTEM_USER", 0, 0 }, { "UUID", 0, 0 }, { "UUID_SHORT", 0, 0 }, { "SLEEP", 1, 1 },
+    { "GET_LOCK", 2, 2 }, { "RELEASE_LOCK", 1, 1 }, { "IS_FREE_LOCK", 1, 1 }, { "IS_USED_LOCK", 1, 1 }, { "RELEASE_ALL_LOCKS", 0, 0 },
+    { "ANY_VALUE", 1, 1 }, { "ISNULL", 1, 1 }, { "VALUES", 1, 1 },
 };
 
 static const FuncDef* find_func(const char* name) {
@@ -1785,10 +1928,1138 @@ static double ft_score(const char* const* docs, int nd, char* q, bool boolean) {
 // ultimo AUTO_INCREMENT generato da questo thread (LAST_INSERT_ID(); una connessione MySQL è un thread)
 static _Thread_local int64_t g_last_insert_id;
 
+
+// ═════════════════════════════════════════════════════════════════
+//  Funzioni di MySQL (stringhe, numeri, date, informazioni)
+// ═════════════════════════════════════════════════════════════════
+
+static _Thread_local long long g_found_rows;
+static _Thread_local long long g_select_total;    // righe dell'ultima query prima di OFFSET / LIMIT     // FOUND_ROWS(): righe dell'ultima SELECT (senza LIMIT con SQL_CALC_FOUND_ROWS)
+static _Thread_local long long g_row_count = -1; // ROW_COUNT(): righe modificate dall'ultimo statement
+
+// ── date ──
+typedef struct { int y, mo, d, h, mi, s; long us; bool has_date, has_time; } MyDT;
+
+static long long days_from_civil(long long y, int m, int d) {
+    y -= m <= 2;
+    long long era = (y >= 0 ? y : y - 399) / 400;
+    long long yoe = y - era * 400;
+    long long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+static void civil_from_days(long long z, int* y, int* m, int* d) {
+    z += 719468;
+    long long era = (z >= 0 ? z : z - 146096) / 146097;
+    long long doe = z - era * 146097;
+    long long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    long long yy = yoe + era * 400;
+    long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    long long mp = (5 * doy + 2) / 153;
+    *d = (int)(doy - (153 * mp + 2) / 5 + 1);
+    *m = (int)(mp < 10 ? mp + 3 : mp - 9);
+    *y = (int)(yy + (*m <= 2));
+}
+
+static int days_in_month(int y, int m) {
+    static const int D[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (m < 1 || m > 12) return 31;
+    return D[m - 1] + (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0));
+}
+
+// 'YYYY-MM-DD[ HH:MM[:SS[.f]]]', 'YYYY/MM/DD', 'YYYYMMDD[HHMMSS]', 'HH:MM:SS' (solo ora)
+static bool mydt_parse(const char* s, MyDT* t) {
+    memset(t, 0, sizeof(*t));
+    while (isspace((unsigned char)*s)) s++;
+    int k = 0, y, mo, d;
+    if (sscanf(s, "%d%*[-/.]%d%*[-/.]%d%n", &y, &mo, &d, &k) == 3 && k >= 8) {
+        t->y = y; t->mo = mo; t->d = d; t->has_date = true;
+        s += k;
+    } else {
+        int n = 0;
+        while (isdigit((unsigned char)s[n])) n++;
+        if (n == 8 || n == 14) {
+            char b[16];
+            memcpy(b, s, (size_t)n); b[n] = '\0';
+            t->y = (b[0] - '0') * 1000 + (b[1] - '0') * 100 + (b[2] - '0') * 10 + (b[3] - '0');
+            t->mo = (b[4] - '0') * 10 + (b[5] - '0');
+            t->d = (b[6] - '0') * 10 + (b[7] - '0');
+            t->has_date = true;
+            if (n == 14) {
+                t->h = (b[8] - '0') * 10 + (b[9] - '0'); t->mi = (b[10] - '0') * 10 + (b[11] - '0'); t->s = (b[12] - '0') * 10 + (b[13] - '0');
+                t->has_time = true;
+            }
+            s += n;
+        } else {
+            int h, mi, sec = 0;
+            if (sscanf(s, "%d:%d%n", &h, &mi, &k) == 2) {
+                t->h = h; t->mi = mi; s += k;
+                if (*s == ':') { if (sscanf(s + 1, "%d%n", &sec, &k) == 1) { t->s = sec; s += 1 + k; } }
+                if (*s == '.') { s++; long us = 0; int dg = 0; while (isdigit((unsigned char)*s) && dg < 6) { us = us * 10 + (*s++ - '0'); dg++; } while (dg++ < 6) us *= 10; t->us = us; }
+                t->has_time = true;
+                return h >= -838 && h <= 838 && mi >= 0 && mi < 60 && t->s >= 0 && t->s < 60;
+            }
+            return false;
+        }
+    }
+    if (*s == ' ' || *s == 'T') {
+        int h, mi, sec = 0;
+        if (sscanf(s + 1, "%d:%d%n", &h, &mi, &k) == 2) {
+            s += 1 + k;
+            if (*s == ':' && sscanf(s + 1, "%d%n", &sec, &k) == 1) s += 1 + k;
+            t->h = h; t->mi = mi; t->s = sec; t->has_time = true;
+            if (*s == '.') { s++; long us = 0; int dg = 0; while (isdigit((unsigned char)*s) && dg < 6) { us = us * 10 + (*s++ - '0'); dg++; } while (dg++ < 6) us *= 10; t->us = us; }
+        }
+    }
+    if (t->y == 0 && t->mo == 0 && t->d == 0) return true;          // data zero di MySQL
+    return t->mo >= 1 && t->mo <= 12 && t->d >= 1 && t->d <= days_in_month(t->y, t->mo) &&
+           t->h >= 0 && t->h < 24 && t->mi >= 0 && t->mi < 60 && t->s >= 0 && t->s < 60;
+}
+
+static long long mydt_secs(const MyDT* t) {
+    return days_from_civil(t->y, t->mo, t->d) * 86400LL + t->h * 3600LL + t->mi * 60LL + t->s;
+}
+
+static void mydt_from_secs(long long secs, MyDT* t) {
+    long long days = secs >= 0 ? secs / 86400 : -((-secs + 86399) / 86400);
+    long long rem = secs - days * 86400;
+    civil_from_days(days, &t->y, &t->mo, &t->d);
+    t->h = (int)(rem / 3600); t->mi = (int)(rem / 60 % 60); t->s = (int)(rem % 60);
+    t->has_date = true;
+}
+
+static void mydt_text(const MyDT* t, bool with_time, char* out, size_t n) {
+    if (!with_time) snprintf(out, n, "%04d-%02d-%02d", t->y, t->mo, t->d);
+    else if (t->us) snprintf(out, n, "%04d-%02d-%02d %02d:%02d:%02d.%06ld", t->y, t->mo, t->d, t->h, t->mi, t->s, t->us);
+    else snprintf(out, n, "%04d-%02d-%02d %02d:%02d:%02d", t->y, t->mo, t->d, t->h, t->mi, t->s);
+}
+
+static void local_now(MyDT* t, bool utc) {
+    time_t now = time(NULL);
+    struct tm tmv;
+#ifdef _WIN32
+    if (utc) gmtime_s(&tmv, &now); else localtime_s(&tmv, &now);
+#else
+    if (utc) gmtime_r(&now, &tmv); else localtime_r(&now, &tmv);
+#endif
+    memset(t, 0, sizeof(*t));
+    t->y = tmv.tm_year + 1900; t->mo = tmv.tm_mon + 1; t->d = tmv.tm_mday;
+    t->h = tmv.tm_hour; t->mi = tmv.tm_min; t->s = tmv.tm_sec;
+    t->has_date = t->has_time = true;
+}
+
+// differenza fra l'ora locale e UTC in secondi (per UNIX_TIMESTAMP / FROM_UNIXTIME)
+static long long tz_offset(time_t at) {
+    struct tm l, g;
+#ifdef _WIN32
+    localtime_s(&l, &at); gmtime_s(&g, &at);
+#else
+    localtime_r(&at, &l); gmtime_r(&at, &g);
+#endif
+    long long dl = days_from_civil(l.tm_year + 1900, l.tm_mon + 1, l.tm_mday) * 86400LL + l.tm_hour * 3600 + l.tm_min * 60 + l.tm_sec;
+    long long dg = days_from_civil(g.tm_year + 1900, g.tm_mon + 1, g.tm_mday) * 86400LL + g.tm_hour * 3600 + g.tm_min * 60 + g.tm_sec;
+    return dl - dg;
+}
+
+static const char* const MONTH_NAMES[] = { "January", "February", "March", "April", "May", "June", "July", "August",
+                                           "September", "October", "November", "December" };
+static const char* const DAY_NAMES[] = { "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday" };
+
+static int weekday_mon0(const MyDT* t) {          // 0 = lunedì
+    long long z = days_from_civil(t->y, t->mo, t->d);
+    long long w = (z + 3) % 7;                    // 1970-01-01 era giovedì
+    return (int)(w < 0 ? w + 7 : w);
+}
+
+static int day_of_year(const MyDT* t) { return (int)(days_from_civil(t->y, t->mo, t->d) - days_from_civil(t->y, 1, 1)) + 1; }
+
+// WEEK(d, mode) di MySQL: modi 0..7 (primo giorno, intervallo 0-53 o 1-53, regola della prima settimana)
+static int mysql_week(const MyDT* t, int mode, int* year_out) {
+    bool monday_first = mode & 1;
+    bool range1_53 = mode & 2;
+    bool first_week_4days = (mode == 1 || mode == 3 || mode == 4 || mode == 6);
+    if (mode == 4 || mode == 6) monday_first = false; else if (mode == 5 || mode == 7) monday_first = true;
+    if (mode == 1 || mode == 3) monday_first = true;
+    int y = t->y;
+    long long day = days_from_civil(t->y, t->mo, t->d);
+    long long jan1 = days_from_civil(y, 1, 1);
+    int wd_jan1 = (int)(((jan1 + 3) % 7 + 7) % 7);                     // 0 = lunedì
+    int first_day_off = monday_first ? wd_jan1 : (wd_jan1 + 1) % 7;    // giorni dall'inizio della settimana
+    long long week_start;
+    if (first_week_4days) week_start = first_day_off <= 3 ? jan1 - first_day_off : jan1 + (7 - first_day_off);
+    else week_start = first_day_off == 0 ? jan1 : jan1 + (7 - first_day_off);
+    int week;
+    if (day < week_start) {
+        if (!range1_53) { if (year_out) *year_out = y; return 0; }
+        MyDT prev = { y - 1, 12, 31, 0, 0, 0, 0, true, false };
+        return mysql_week(&prev, mode, year_out);
+    }
+    week = (int)((day - week_start) / 7) + 1;
+    if (year_out) *year_out = y;
+    if (range1_53 && week >= 52) {                                     // forse è la settimana 1 dell'anno dopo
+        long long njan1 = days_from_civil(y + 1, 1, 1);
+        int nwd = (int)(((njan1 + 3) % 7 + 7) % 7);
+        int noff = monday_first ? nwd : (nwd + 1) % 7;
+        long long nstart = first_week_4days ? (noff <= 3 ? njan1 - noff : njan1 + (7 - noff)) : (noff == 0 ? njan1 : njan1 + (7 - noff));
+        if (day >= nstart) { if (year_out) *year_out = y + 1; return 1; }
+    }
+    return week;
+}
+
+static void date_format_into(const MyDT* t, const char* fmt, TextBuf* tb) {
+    char b[64];
+    for (const char* p = fmt; *p; p++) {
+        if (*p != '%' || !p[1]) { tb_put(tb, p, 1); continue; }
+        p++;
+        b[0] = '\0';
+        int h12 = t->h % 12 == 0 ? 12 : t->h % 12;
+        switch (*p) {
+            case 'Y': snprintf(b, sizeof(b), "%04d", t->y); break;
+            case 'y': snprintf(b, sizeof(b), "%02d", t->y % 100); break;
+            case 'm': snprintf(b, sizeof(b), "%02d", t->mo); break;
+            case 'c': snprintf(b, sizeof(b), "%d", t->mo); break;
+            case 'd': snprintf(b, sizeof(b), "%02d", t->d); break;
+            case 'e': snprintf(b, sizeof(b), "%d", t->d); break;
+            case 'D': snprintf(b, sizeof(b), "%d%s", t->d, (t->d % 100 >= 11 && t->d % 100 <= 13) ? "th" : t->d % 10 == 1 ? "st" : t->d % 10 == 2 ? "nd" : t->d % 10 == 3 ? "rd" : "th"); break;
+            case 'H': snprintf(b, sizeof(b), "%02d", t->h); break;
+            case 'k': snprintf(b, sizeof(b), "%d", t->h); break;
+            case 'h': case 'I': snprintf(b, sizeof(b), "%02d", h12); break;
+            case 'l': snprintf(b, sizeof(b), "%d", h12); break;
+            case 'i': snprintf(b, sizeof(b), "%02d", t->mi); break;
+            case 's': case 'S': snprintf(b, sizeof(b), "%02d", t->s); break;
+            case 'f': snprintf(b, sizeof(b), "%06ld", t->us); break;
+            case 'p': snprintf(b, sizeof(b), "%s", t->h < 12 ? "AM" : "PM"); break;
+            case 'T': snprintf(b, sizeof(b), "%02d:%02d:%02d", t->h, t->mi, t->s); break;
+            case 'r': snprintf(b, sizeof(b), "%02d:%02d:%02d %s", h12, t->mi, t->s, t->h < 12 ? "AM" : "PM"); break;
+            case 'M': snprintf(b, sizeof(b), "%s", t->mo >= 1 && t->mo <= 12 ? MONTH_NAMES[t->mo - 1] : ""); break;
+            case 'b': snprintf(b, sizeof(b), "%.3s", t->mo >= 1 && t->mo <= 12 ? MONTH_NAMES[t->mo - 1] : ""); break;
+            case 'W': snprintf(b, sizeof(b), "%s", DAY_NAMES[weekday_mon0(t)]); break;
+            case 'a': snprintf(b, sizeof(b), "%.3s", DAY_NAMES[weekday_mon0(t)]); break;
+            case 'w': snprintf(b, sizeof(b), "%d", (weekday_mon0(t) + 1) % 7); break;
+            case 'j': snprintf(b, sizeof(b), "%03d", day_of_year(t)); break;
+            case 'U': snprintf(b, sizeof(b), "%02d", mysql_week(t, 0, NULL)); break;
+            case 'u': snprintf(b, sizeof(b), "%02d", mysql_week(t, 1, NULL)); break;
+            case 'V': snprintf(b, sizeof(b), "%02d", mysql_week(t, 2, NULL)); break;
+            case 'v': snprintf(b, sizeof(b), "%02d", mysql_week(t, 3, NULL)); break;
+            case 'X': { int yy; mysql_week(t, 2, &yy); snprintf(b, sizeof(b), "%04d", yy); break; }
+            case 'x': { int yy; mysql_week(t, 3, &yy); snprintf(b, sizeof(b), "%04d", yy); break; }
+            default: b[0] = *p; b[1] = '\0';
+        }
+        tb_put(tb, b, strlen(b));
+    }
+}
+
+// STR_TO_DATE: i formati più usati; false se il testo non corrisponde
+static bool str_to_date(const char* s, const char* fmt, MyDT* t) {
+    memset(t, 0, sizeof(*t));
+    bool pm = false, h12 = false;
+    for (const char* p = fmt; *p; p++) {
+        if (*p != '%') {
+            if (isspace((unsigned char)*p)) { while (isspace((unsigned char)*s)) s++; continue; }
+            if (*s != *p) return false;
+            s++;
+            continue;
+        }
+        p++;
+        int v = 0, n = 0;
+        int maxd = (*p == 'Y') ? 4 : (*p == 'f') ? 6 : (*p == 'j') ? 3 : 2;
+        switch (*p) {
+            case 'Y': case 'y': case 'm': case 'c': case 'd': case 'e': case 'H': case 'k': case 'h': case 'I': case 'l':
+            case 'i': case 's': case 'S': case 'f': case 'j':
+                while (n < maxd && isdigit((unsigned char)*s)) { v = v * 10 + (*s++ - '0'); n++; }
+                if (!n) return false;
+                if (*p == 'Y') t->y = v; else if (*p == 'y') t->y = v < 70 ? 2000 + v : 1900 + v;
+                else if (*p == 'm' || *p == 'c') t->mo = v; else if (*p == 'd' || *p == 'e') t->d = v;
+                else if (*p == 'H' || *p == 'k') t->h = v; else if (*p == 'i') t->mi = v; else if (*p == 's' || *p == 'S') t->s = v;
+                else if (*p == 'f') { while (n++ < 6) v *= 10; t->us = v; }
+                else if (*p == 'j') { MyDT x; mydt_from_secs((days_from_civil(t->y, 1, 1) + v - 1) * 86400LL, &x); t->mo = x.mo; t->d = x.d; }
+                else { t->h = v; h12 = true; }
+                break;
+            case 'p':
+                if (!strncasecmp(s, "PM", 2)) pm = true; else if (strncasecmp(s, "AM", 2)) return false;
+                s += 2;
+                break;
+            case 'M': case 'b': {
+                bool ok = false;
+                for (int m = 0; m < 12 && !ok; m++) {
+                    size_t l = *p == 'b' ? 3 : strlen(MONTH_NAMES[m]);
+                    if (!strncasecmp(s, MONTH_NAMES[m], l)) { t->mo = m + 1; s += l; ok = true; }
+                }
+                if (!ok) return false;
+                break;
+            }
+            case 'W': case 'a':
+                while (isalpha((unsigned char)*s)) s++;
+                break;
+            case 'T': if (sscanf(s, "%d:%d:%d%n", &t->h, &t->mi, &t->s, &n) != 3) return false; s += n; break;
+            case '%': if (*s++ != '%') return false; break;
+            default: return false;
+        }
+    }
+    if (h12) { if (t->h == 12) t->h = 0; if (pm) t->h += 12; }
+    t->has_date = true;
+    t->has_time = t->h || t->mi || t->s || strchr(fmt, 'H') || strchr(fmt, 'T') || strchr(fmt, 'i');
+    return t->mo >= 0 && t->mo <= 12 && t->d >= 0 && t->d <= 31 && t->h < 24 && t->mi < 60 && t->s < 60;
+}
+
+// aggiunge un INTERVAL (unità di MySQL, anche composte come DAY_HOUR '1 2'); false = valore non valido
+static bool mydt_add(MyDT* t, const char* unit, const char* val, int sign) {
+    long long parts[5] = {0};
+    int np = 0;
+    const char* p = val;
+    bool neg = false;
+    while (isspace((unsigned char)*p)) p++;
+    if (*p == '-') { neg = true; p++; }
+    while (*p && np < 5) {
+        if (isdigit((unsigned char)*p)) {
+            long long v = 0;
+            while (isdigit((unsigned char)*p)) v = v * 10 + (*p++ - '0');
+            parts[np++] = v;
+        } else if (*p == '.' && !strcmp(unit, "SECOND")) {      // INTERVAL 1.5 SECOND
+            p++;
+            long us = 0; int dg = 0;
+            while (isdigit((unsigned char)*p) && dg < 6) { us = us * 10 + (*p++ - '0'); dg++; }
+            while (dg++ < 6) us *= 10;
+            parts[np++] = us;
+        } else p++;
+    }
+    if (np == 0) return false;
+    long long sg = (neg ? -1 : 1) * sign;
+    long long secs = 0, months = 0;
+    #define LAST(k) (np >= (k) ? parts[np - (k)] : 0)
+    if (!strcmp(unit, "MICROSECOND")) secs = 0;
+    else if (!strcmp(unit, "SECOND")) secs = parts[0];
+    else if (!strcmp(unit, "MINUTE")) secs = parts[0] * 60;
+    else if (!strcmp(unit, "HOUR")) secs = parts[0] * 3600;
+    else if (!strcmp(unit, "DAY")) secs = parts[0] * 86400;
+    else if (!strcmp(unit, "WEEK")) secs = parts[0] * 7 * 86400;
+    else if (!strcmp(unit, "MONTH")) months = parts[0];
+    else if (!strcmp(unit, "QUARTER")) months = parts[0] * 3;
+    else if (!strcmp(unit, "YEAR")) months = parts[0] * 12;
+    else if (!strcmp(unit, "YEAR_MONTH")) months = LAST(2) * 12 + LAST(1);
+    else if (!strcmp(unit, "DAY_HOUR")) secs = LAST(2) * 86400 + LAST(1) * 3600;
+    else if (!strcmp(unit, "DAY_MINUTE")) secs = LAST(3) * 86400 + LAST(2) * 3600 + LAST(1) * 60;
+    else if (!strcmp(unit, "DAY_SECOND")) secs = LAST(4) * 86400 + LAST(3) * 3600 + LAST(2) * 60 + LAST(1);
+    else if (!strcmp(unit, "HOUR_MINUTE")) secs = LAST(2) * 3600 + LAST(1) * 60;
+    else if (!strcmp(unit, "HOUR_SECOND")) secs = LAST(3) * 3600 + LAST(2) * 60 + LAST(1);
+    else if (!strcmp(unit, "MINUTE_SECOND")) secs = LAST(2) * 60 + LAST(1);
+    else return false;
+    #undef LAST
+    if (months) {
+        long long total = (long long)t->y * 12 + (t->mo - 1) + sg * months;
+        t->y = (int)(total >= 0 ? total / 12 : -((-total + 11) / 12));
+        t->mo = (int)(total - (long long)t->y * 12) + 1;
+        int dim = days_in_month(t->y, t->mo);
+        if (t->d > dim) t->d = dim;                             // 31 gennaio + 1 mese = 28/29 febbraio
+    }
+    if (secs) {
+        MyDT r;
+        mydt_from_secs(mydt_secs(t) + sg * secs, &r);
+        r.us = t->us; r.has_time = t->has_time;
+        *t = r;
+    }
+    return t->y >= 0 && t->y <= 9999;
+}
+
+// ── hash e codifiche ──
+static void md5_bytes(const uint8_t* msg, size_t len, uint8_t out[16]) {
+    static const uint32_t K[64] = {
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501, 0x698098d8, 0x8b44f7af,
+        0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+        0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8,
+        0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244, 0x432aff97,
+        0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1, 0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+        0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391 };
+    static const uint8_t R[64] = { 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21 };
+    uint32_t h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476;
+    size_t total = ((len + 8) / 64 + 1) * 64;
+    uint8_t* m = calloc(total, 1);
+    if (!m) { memset(out, 0, 16); return; }
+    memcpy(m, msg, len);
+    m[len] = 0x80;
+    uint64_t bits = (uint64_t)len * 8;
+    for (int i = 0; i < 8; i++) m[total - 8 + i] = (uint8_t)(bits >> (8 * i));
+    for (size_t off = 0; off < total; off += 64) {
+        uint32_t w[16];
+        for (int i = 0; i < 16; i++) w[i] = (uint32_t)m[off + i * 4] | (uint32_t)m[off + i * 4 + 1] << 8 | (uint32_t)m[off + i * 4 + 2] << 16 | (uint32_t)m[off + i * 4 + 3] << 24;
+        uint32_t a = h0, b = h1, c = h2, d = h3;
+        for (int i = 0; i < 64; i++) {
+            uint32_t f; int g;
+            if (i < 16) { f = (b & c) | (~b & d); g = i; }
+            else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+            else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
+            else { f = c ^ (b | ~d); g = (7 * i) % 16; }
+            uint32_t tmp = d; d = c; c = b;
+            uint32_t x = a + f + K[i] + w[g];
+            b = b + ((x << R[i]) | (x >> (32 - R[i])));
+            a = tmp;
+        }
+        h0 += a; h1 += b; h2 += c; h3 += d;
+    }
+    free(m);
+    uint32_t h[4] = { h0, h1, h2, h3 };
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) out[i * 4 + j] = (uint8_t)(h[i] >> (8 * j));
+}
+
+static uint32_t crc32_bytes(const uint8_t* p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) {
+        c ^= p[i];
+        for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+    }
+    return c ^ 0xFFFFFFFFu;
+}
+
+static void hex_into(TextBuf* tb, const uint8_t* p, size_t n) {
+    static const char H[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) { char b[2] = { H[p[i] >> 4], H[p[i] & 15] }; tb_put(tb, b, 2); }
+}
+
+static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// ── valutazione ──
+// true se f è una funzione di questo blocco (e out è il risultato)
+static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
+    const char* f = e->func;
+    // senza argomenti
+    if (!strcmp(f, "FOUND_ROWS")) { ev_int(out, g_found_rows); return true; }
+    if (!strcmp(f, "ROW_COUNT")) { ev_int(out, g_row_count); return true; }
+    if (!strcmp(f, "CONNECTION_ID")) { ev_int(out, (int64_t)(((uintptr_t)&g_found_rows) >> 4) & 0x7fffffff); return true; }
+    if (!strcmp(f, "USER") || !strcmp(f, "CURRENT_USER") || !strcmp(f, "SESSION_USER") || !strcmp(f, "SYSTEM_USER")) {
+        ev_set_text(c, out, "root@localhost", 14);
+        return true;
+    }
+    if (!strcmp(f, "PI")) { ev_num(out, 3.141592653589793); return true; }
+    if (!strcmp(f, "RAND") && e->nargs == 0) { ev_num(out, (double)rand() / ((double)RAND_MAX + 1.0)); return true; }
+    if (!strcmp(f, "UUID")) {
+        char b[40];
+        unsigned r[8];
+        for (int i = 0; i < 8; i++) r[i] = (unsigned)rand() & 0xffff;
+        snprintf(b, sizeof(b), "%04x%04x-%04x-%04x-%04x-%04x%04x%04x", r[0], r[1], r[2], (r[3] & 0x0fff) | 0x1000, (r[4] & 0x3fff) | 0x8000, r[5], r[6], r[7]);
+        ev_set_text(c, out, b, strlen(b));
+        return true;
+    }
+    if (!strcmp(f, "UUID_SHORT")) { ev_int(out, ((int64_t)time(NULL) << 24) | (rand() & 0xffffff)); return true; }
+    if (!strcmp(f, "RELEASE_ALL_LOCKS")) { ev_int(out, 0); return true; }
+    if (!strcmp(f, "UTC_TIMESTAMP") || !strcmp(f, "UTC_DATE") || !strcmp(f, "UTC_TIME") || !strcmp(f, "SYSDATE") ||
+        !strcmp(f, "LOCALTIME") || !strcmp(f, "LOCALTIMESTAMP") || !strcmp(f, "CURTIME") || !strcmp(f, "CURRENT_TIME")) {
+        MyDT t;
+        local_now(&t, !strncmp(f, "UTC_", 4));
+        char b[32];
+        if (!strcmp(f, "UTC_DATE")) mydt_text(&t, false, b, sizeof(b));
+        else if (!strcmp(f, "UTC_TIME") || !strcmp(f, "CURTIME") || !strcmp(f, "CURRENT_TIME")) snprintf(b, sizeof(b), "%02d:%02d:%02d", t.h, t.mi, t.s);
+        else mydt_text(&t, true, b, sizeof(b));
+        ev_set_text(c, out, b, strlen(b));
+        return true;
+    }
+    if (!strcmp(f, "UNIX_TIMESTAMP") && e->nargs == 0) { ev_int(out, (int64_t)time(NULL)); return true; }
+
+    // funzioni con argomenti (valutati qui, fino a 32)
+    static const char* const MINE[] = {
+        "LOCATE", "INSTR", "LPAD", "RPAD", "REPEAT", "SPACE", "FIELD", "FIND_IN_SET", "ELT", "SUBSTRING_INDEX", "ASCII", "ORD",
+        "CHAR", "HEX", "UNHEX", "MD5", "SHA1", "SHA", "SHA2", "TO_BASE64", "FROM_BASE64", "QUOTE", "STRCMP", "FORMAT",
+        "BIT_LENGTH", "OCTET_LENGTH", "CHARSET", "COLLATION", "REGEXP_LIKE", "REGEXP_REPLACE", "REGEXP_SUBSTR", "REGEXP_INSTR",
+        "TRIM_EX", "BIN", "OCT", "CRC32", "INET_ATON", "INET_NTOA", "RAND", "EXP", "LN", "LOG", "LOG10", "LOG2", "TRUNCATE",
+        "GREATEST", "LEAST", "RADIANS", "DEGREES", "SIN", "COS", "TAN", "COT", "ASIN", "ACOS", "ATAN", "ATAN2", "INTDIV",
+        "DATE_FORMAT", "TIME_FORMAT", "STR_TO_DATE", "UNIX_TIMESTAMP", "FROM_UNIXTIME", "DATE", "TIME", "HOUR", "MINUTE",
+        "SECOND", "MICROSECOND", "DAYOFWEEK", "DAYOFMONTH", "DAYOFYEAR", "WEEKDAY", "WEEK", "WEEKOFYEAR", "YEARWEEK",
+        "QUARTER", "MONTHNAME", "DAYNAME", "LAST_DAY", "DATEDIFF", "TIMEDIFF", "TIMESTAMPDIFF", "DATE_ADD", "DATE_SUB",
+        "ADDDATE", "SUBDATE", "__INTERVAL", "EXTRACT", "MAKEDATE", "MAKETIME", "TO_DAYS", "FROM_DAYS", "TO_SECONDS",
+        "SEC_TO_TIME", "TIME_TO_SEC", "CONVERT_TZ", "CAST", "SLEEP", "GET_LOCK", "RELEASE_LOCK", "IS_FREE_LOCK",
+        "IS_USED_LOCK", "ANY_VALUE", "ISNULL", "VALUES", "LAST_INSERT_ID", "CHAR_LENGTH_BYTES" };
+    bool mine = false;
+    for (size_t i = 0; i < sizeof(MINE) / sizeof(MINE[0]) && !mine; i++) mine = !strcmp(f, MINE[i]);
+    if (!mine) return false;
+
+    // DATE_ADD(d, INTERVAL n unità): l'INTERVAL non è un valore, si legge qui
+    if ((!strcmp(f, "DATE_ADD") || !strcmp(f, "DATE_SUB") || !strcmp(f, "ADDDATE") || !strcmp(f, "SUBDATE")) && e->nargs == 2) {
+        int sign = (!strcmp(f, "DATE_SUB") || !strcmp(f, "SUBDATE")) ? -1 : 1;
+        EvalVal dv, iv;
+        eval_expr(e->args[0], c, &dv);
+        ASTExpr* ie = e->args[1];
+        bool interval = ie->type == EXPR_FUNC && !strcmp(ie->func, "__INTERVAL");
+        eval_expr(interval ? ie->args[0] : ie, c, &iv);
+        if (dv.null || iv.null) { ev_null(out); return true; }
+        MyDT t;
+        if (!mydt_parse(ev_s(&dv), &t) || !t.has_date) { ev_null(out); return true; }
+        const char* unit = interval && ie->args[1]->str_val ? ie->args[1]->str_val : "DAY";   // ADDDATE(d, n): giorni
+        char amt[64], b2[40];
+        snprintf(amt, sizeof(amt), "%s", ev_s(&iv));
+        bool date_only = !t.has_time && (!strcmp(unit, "DAY") || !strcmp(unit, "WEEK") || !strcmp(unit, "MONTH") ||
+                                         !strcmp(unit, "QUARTER") || !strcmp(unit, "YEAR") || !strcmp(unit, "YEAR_MONTH"));
+        if (!mydt_add(&t, unit, amt, sign)) { ev_null(out); return true; }
+        mydt_text(&t, !date_only, b2, sizeof(b2));
+        ev_set_text(c, out, b2, strlen(b2));
+        return true;
+    }
+
+    int na = e->nargs < 32 ? e->nargs : 32;
+    EvalVal a[na > 0 ? na : 1];                                // solo gli argomenti che ci sono (stack dei thread)
+    // ELT, FIELD, GREATEST, LEAST, ISNULL, CHAR, CONCAT-like: i NULL hanno regole proprie
+    bool null_ok = !strcmp(f, "FIELD") || !strcmp(f, "ELT") || !strcmp(f, "ISNULL") || !strcmp(f, "CHAR") || !strcmp(f, "VALUES") ||
+                   !strcmp(f, "ANY_VALUE") || !strcmp(f, "LAST_INSERT_ID") || !strcmp(f, "QUOTE") || !strcmp(f, "CAST");
+    for (int i = 0; i < na; i++) {
+        eval_expr(e->args[i], c, &a[i]);
+        if (a[i].null && !null_ok) { ev_null(out); return true; }
+    }
+    #define S(i) ev_s(&a[i])
+    #define N(i) ev_as_num(&a[i])
+    #define I(i) ((long long)ev_as_num(&a[i]))
+    char b[128];
+    TextBuf tb = {0};
+
+    if (!strcmp(f, "ISNULL")) { ev_int(out, a[0].null ? 1 : 0); return true; }
+    if (!strcmp(f, "ANY_VALUE") || !strcmp(f, "VALUES")) { if (a[0].null) ev_null(out); else ev_copy(out, &a[0]); return true; }
+    if (!strcmp(f, "LAST_INSERT_ID")) {                        // LAST_INSERT_ID(x): lo imposta e lo restituisce
+        if (na == 1 && !a[0].null) g_last_insert_id = (int64_t)N(0);
+        ev_int(out, g_last_insert_id);
+        return true;
+    }
+    if (!strcmp(f, "QUOTE")) {
+        if (a[0].null) { ev_set_text(c, out, "NULL", 4); return true; }
+        tb_put(&tb, "'", 1);
+        for (const char* p = S(0); *p; p++) { if (*p == '\'' || *p == '\\') tb_put(&tb, "\\", 1); tb_put(&tb, p, 1); }
+        tb_put(&tb, "'", 1);
+        tb_result(c, out, &tb);
+        return true;
+    }
+    if (!strcmp(f, "LOCATE") || !strcmp(f, "INSTR")) {         // LOCATE(sub, s [, pos]), INSTR(s, sub): posizione (1..), 0 = no
+        const char* sub = !strcmp(f, "INSTR") ? S(1) : S(0);
+        const char* s = !strcmp(f, "INSTR") ? S(0) : S(1);
+        long long from = na > 2 ? I(2) : 1;
+        if (from < 1) { ev_int(out, 0); return true; }
+        const char* start = utf8_at(s, (int)(from - 1));
+        const char* hit = NULL;
+        size_t sl = strlen(sub);
+        for (const char* p = start; *p && !hit; p++) if (!strncasecmp(p, sub, sl)) hit = p;
+        if (!sl) hit = start;
+        if (!hit) { ev_int(out, 0); return true; }
+        int pos = 1;
+        for (const char* p = s; p < hit; p++) if (((unsigned char)*p & 0xC0) != 0x80) pos++;
+        ev_int(out, pos);
+        return true;
+    }
+    if (!strcmp(f, "LPAD") || !strcmp(f, "RPAD")) {
+        const char* s = S(0);
+        long long len = I(1);
+        const char* pad = S(2);
+        int sl = utf8_len(s);
+        if (len < 0) { ev_null(out); return true; }
+        if (sl >= len) { const char* end = utf8_at(s, (int)len); ev_set_text(c, out, s, (size_t)(end - s)); return true; }
+        if (!*pad) { ev_null(out); return true; }
+        long long need = len - sl;
+        TextBuf padb = {0};
+        for (long long k = 0; k < need; ) {
+            const char* p = pad;
+            while (*p && k < need) { const char* q = utf8_at(p, 1); tb_put(&padb, p, (size_t)(q - p)); p = q; k++; }
+        }
+        if (f[0] == 'L') { tb_put(&tb, padb.d ? padb.d : "", padb.n); tb_put(&tb, s, strlen(s)); }
+        else { tb_put(&tb, s, strlen(s)); tb_put(&tb, padb.d ? padb.d : "", padb.n); }
+        free(padb.d);
+        tb_result(c, out, &tb);
+        return true;
+    }
+    if (!strcmp(f, "REPEAT") || !strcmp(f, "SPACE")) {
+        bool sp = f[0] == 'S';
+        long long n = sp ? I(0) : I(1);
+        const char* s = sp ? " " : S(0);
+        size_t l = strlen(s);
+        if (n <= 0 || !l) { ev_set_text(c, out, "", 0); return true; }
+        if ((size_t)n * l > SV_MAX_TEXT_BYTES) { ctx_error(c, "%s", "Result of REPEAT is too long"); ev_null(out); return true; }
+        for (long long i = 0; i < n; i++) tb_put(&tb, s, l);
+        tb_result(c, out, &tb);
+        return true;
+    }
+    if (!strcmp(f, "FIELD")) {                                  // FIELD(x, a, b, ...): posizione di x (0 = assente)
+        if (a[0].null) { ev_int(out, 0); return true; }
+        for (int i = 1; i < na; i++) if (!a[i].null && ev_cmp(&a[0], &a[i]) == 0) { ev_int(out, i); return true; }
+        ev_int(out, 0);
+        return true;
+    }
+    if (!strcmp(f, "ELT")) {
+        long long k = a[0].null ? 0 : I(0);
+        if (k < 1 || k >= na || a[k].null) { ev_null(out); return true; }
+        ev_copy(out, &a[k]);
+        return true;
+    }
+    if (!strcmp(f, "FIND_IN_SET")) {                            // FIND_IN_SET('b', 'a,b,c') = 2
+        const char* x = S(0);
+        const char* list = S(1);
+        size_t xl = strlen(x);
+        int pos = 1;
+        for (const char* p = list; ; pos++) {
+            const char* comma = strchr(p, ',');
+            size_t l = comma ? (size_t)(comma - p) : strlen(p);
+            if (l == xl && !strncasecmp(p, x, l)) { ev_int(out, *list ? pos : 0); return true; }
+            if (!comma) break;
+            p = comma + 1;
+        }
+        ev_int(out, 0);
+        return true;
+    }
+    if (!strcmp(f, "SUBSTRING_INDEX")) {                        // SUBSTRING_INDEX('a.b.c', '.', 2) = 'a.b'
+        const char* s = S(0);
+        const char* d = S(1);
+        long long n = I(2);
+        size_t dl = strlen(d), sl = strlen(s);
+        if (!dl || n == 0) { ev_set_text(c, out, "", 0); return true; }
+        if (n > 0) {
+            const char* p = s;
+            for (long long k = 0; k < n; k++) {
+                const char* hit = strstr(p, d);
+                if (!hit) { ev_set_text(c, out, s, sl); return true; }
+                if (k == n - 1) { ev_set_text(c, out, s, (size_t)(hit - s)); return true; }
+                p = hit + dl;
+            }
+        } else {
+            long long want = -n, found = 0;
+            for (size_t i = sl; i >= dl && i-- > 0; ) {
+                if (i + dl <= sl && !strncmp(s + i, d, dl)) {
+                    if (++found == want) { ev_set_text(c, out, s + i + dl, sl - i - dl); return true; }
+                }
+                if (i == 0) break;
+            }
+            ev_set_text(c, out, s, sl);
+            return true;
+        }
+        ev_set_text(c, out, s, sl);
+        return true;
+    }
+    if (!strcmp(f, "ASCII") || !strcmp(f, "ORD")) { ev_int(out, (unsigned char)S(0)[0]); return true; }
+    if (!strcmp(f, "CHAR")) {
+        for (int i = 0; i < na; i++) if (!a[i].null) { long long v = I(i); char ch = (char)(v & 0xff); tb_put(&tb, &ch, 1); }
+        tb_result(c, out, &tb);
+        return true;
+    }
+    if (!strcmp(f, "HEX")) {
+        if (a[0].is_num) { snprintf(b, sizeof(b), "%llX", (unsigned long long)I(0)); ev_set_text(c, out, b, strlen(b)); return true; }
+        const char* s = S(0);
+        static const char H[] = "0123456789ABCDEF";
+        for (const char* p = s; *p; p++) { char h[2] = { H[(unsigned char)*p >> 4], H[(unsigned char)*p & 15] }; tb_put(&tb, h, 2); }
+        tb_result(c, out, &tb);
+        return true;
+    }
+    if (!strcmp(f, "UNHEX")) {
+        const char* s = S(0);
+        size_t l = strlen(s);
+        if (l % 2) { ev_null(out); return true; }
+        for (size_t i = 0; i < l; i += 2) {
+            int hi = isdigit((unsigned char)s[i]) ? s[i] - '0' : isxdigit((unsigned char)s[i]) ? (tolower((unsigned char)s[i]) - 'a' + 10) : -1;
+            int lo = isdigit((unsigned char)s[i + 1]) ? s[i + 1] - '0' : isxdigit((unsigned char)s[i + 1]) ? (tolower((unsigned char)s[i + 1]) - 'a' + 10) : -1;
+            if (hi < 0 || lo < 0) { free(tb.d); ev_null(out); return true; }
+            char ch = (char)(hi * 16 + lo);
+            tb_put(&tb, &ch, 1);
+        }
+        tb_result(c, out, &tb);
+        return true;
+    }
+    if (!strcmp(f, "MD5") || !strcmp(f, "SHA1") || !strcmp(f, "SHA") || !strcmp(f, "SHA2")) {
+        const char* s = S(0);
+        uint8_t h[32];
+        size_t hl;
+        if (f[0] == 'M') { md5_bytes((const uint8_t*)s, strlen(s), h); hl = 16; }
+        else if (!strcmp(f, "SHA2")) {
+            long long bits = I(1);
+            if (bits != 256 && bits != 0) { ev_null(out); return true; }
+            auth_sha256(s, strlen(s), h); hl = 32;
+        } else { auth_sha1(s, strlen(s), h); hl = 20; }
+        hex_into(&tb, h, hl);
+        tb_result(c, out, &tb);
+        return true;
+    }
+    if (!strcmp(f, "CRC32")) { const char* s = S(0); ev_int(out, crc32_bytes((const uint8_t*)s, strlen(s))); return true; }
+    if (!strcmp(f, "TO_BASE64")) {
+        const unsigned char* s = (const unsigned char*)S(0);
+        size_t l = strlen((const char*)s);
+        for (size_t i = 0; i < l; i += 3) {
+            uint32_t v = (uint32_t)s[i] << 16 | (i + 1 < l ? (uint32_t)s[i + 1] << 8 : 0) | (i + 2 < l ? s[i + 2] : 0);
+            char q[4] = { B64[v >> 18], B64[(v >> 12) & 63], i + 1 < l ? B64[(v >> 6) & 63] : '=', i + 2 < l ? B64[v & 63] : '=' };
+            tb_put(&tb, q, 4);
+        }
+        tb_result(c, out, &tb);
+        return true;
+    }
+    if (!strcmp(f, "FROM_BASE64")) {
+        const char* s = S(0);
+        uint32_t acc = 0;
+        int bits = 0;
+        for (const char* p = s; *p; p++) {
+            const char* k = strchr(B64, *p);
+            if (*p == '=' || isspace((unsigned char)*p)) continue;
+            if (!k || !*p) { free(tb.d); ev_null(out); return true; }
+            acc = acc << 6 | (uint32_t)(k - B64);
+            bits += 6;
+            if (bits >= 8) { bits -= 8; char ch = (char)((acc >> bits) & 0xff); tb_put(&tb, &ch, 1); }
+        }
+        tb_result(c, out, &tb);
+        return true;
+    }
+    if (!strcmp(f, "STRCMP")) { int r = strcmp(S(0), S(1)); ev_int(out, r < 0 ? -1 : r > 0); return true; }
+    if (!strcmp(f, "FORMAT")) {                                 // FORMAT(1234567.891, 2) = '1,234,567.89'
+        long long d = I(1);
+        if (d < 0) d = 0;
+        if (d > 30) d = 30;
+        char num[96];
+        snprintf(num, sizeof(num), "%.*f", (int)d, N(0));
+        char* dot = strchr(num, '.');
+        size_t il = dot ? (size_t)(dot - num) : strlen(num);
+        size_t start = num[0] == '-' ? 1 : 0;
+        if (start) tb_put(&tb, "-", 1);
+        for (size_t i = start; i < il; i++) {
+            tb_put(&tb, &num[i], 1);
+            size_t left = il - i - 1;
+            if (left && left % 3 == 0) tb_put(&tb, ",", 1);
+        }
+        if (dot) tb_put(&tb, dot, strlen(dot));
+        tb_result(c, out, &tb);
+        return true;
+    }
+    if (!strcmp(f, "BIT_LENGTH")) { ev_int(out, (int64_t)strlen(S(0)) * 8); return true; }
+    if (!strcmp(f, "OCTET_LENGTH")) { ev_int(out, (int64_t)strlen(S(0))); return true; }
+    if (!strcmp(f, "CHARSET")) { ev_set_text(c, out, "utf8mb4", 7); return true; }
+    if (!strcmp(f, "COLLATION")) { ev_set_text(c, out, "utf8mb4_general_ci", 18); return true; }
+    if (!strcmp(f, "BIN") || !strcmp(f, "OCT")) {
+        unsigned long long v = (unsigned long long)I(0);
+        int base = f[0] == 'B' ? 2 : 8;
+        char tmp[70];
+        int k = 0;
+        do { tmp[k++] = (char)('0' + (int)(v % (unsigned)base)); v /= (unsigned)base; } while (v && k < 69);
+        for (int i = 0; i < k; i++) b[i] = tmp[k - 1 - i];
+        b[k] = '\0';
+        ev_set_text(c, out, b, (size_t)k);
+        return true;
+    }
+    if (!strcmp(f, "INET_ATON")) {
+        unsigned x[4];
+        if (sscanf(S(0), "%u.%u.%u.%u", &x[0], &x[1], &x[2], &x[3]) != 4 || x[0] > 255 || x[1] > 255 || x[2] > 255 || x[3] > 255) { ev_null(out); return true; }
+        ev_int(out, (int64_t)x[0] << 24 | x[1] << 16 | x[2] << 8 | x[3]);
+        return true;
+    }
+    if (!strcmp(f, "INET_NTOA")) {
+        long long v = I(0);
+        if (v < 0 || v > 4294967295LL) { ev_null(out); return true; }
+        snprintf(b, sizeof(b), "%lld.%lld.%lld.%lld", v >> 24 & 255, v >> 16 & 255, v >> 8 & 255, v & 255);
+        ev_set_text(c, out, b, strlen(b));
+        return true;
+    }
+    if (!strcmp(f, "TRIM_EX")) {                               // TRIM(LEADING|TRAILING|BOTH x FROM s)
+        const char* s = S(0);
+        const char* r = S(1);
+        const char* mode = S(2);
+        size_t rl = strlen(r), sl = strlen(s);
+        const char* p = s;
+        const char* end = s + sl;
+        if (rl && strcmp(mode, "TRAILING")) while ((size_t)(end - p) >= rl && !strncmp(p, r, rl)) p += rl;
+        if (rl && strcmp(mode, "LEADING")) while ((size_t)(end - p) >= rl && !strncmp(end - rl, r, rl)) end -= rl;
+        ev_set_text(c, out, p, (size_t)(end - p));
+        return true;
+    }
+    if (!strncmp(f, "REGEXP_", 7)) {
+        bool icase = true;
+        int mode_arg = !strcmp(f, "REGEXP_LIKE") ? 2 : !strcmp(f, "REGEXP_REPLACE") ? 5 : !strcmp(f, "REGEXP_SUBSTR") ? 4 : 5;
+        if (na > mode_arg && strchr(S(mode_arg), 'c')) icase = false;
+        char err[160];
+        SvRegex* re = sv_regex_compile(S(1), icase, err, sizeof(err));
+        if (!re) { ctx_error(c, "%s", err); ev_null(out); return true; }
+        const char* s = S(0);
+        if (!strcmp(f, "REGEXP_LIKE")) { ev_int(out, sv_regex_match(re, s) ? 1 : 0); sv_regex_free(re); return true; }
+        long long pos = na > 2 && strcmp(f, "REGEXP_REPLACE") ? I(2) : (na > 3 && !strcmp(f, "REGEXP_REPLACE") ? I(3) : 1);
+        long long occ = !strcmp(f, "REGEXP_REPLACE") ? (na > 4 ? I(4) : 0) : (na > 3 ? I(3) : 1);
+        if (pos < 1) pos = 1;
+        size_t from = (size_t)(utf8_at(s, (int)(pos - 1)) - s);
+        size_t st, en;
+        if (!strcmp(f, "REGEXP_REPLACE")) {                     // tutte (occ = 0) o la n-esima occorrenza
+            const char* rep = S(2);
+            tb_put(&tb, s, from);
+            size_t at = from;
+            long long k = 0;
+            while (at <= strlen(s) && sv_regex_search(re, s, at, &st, &en)) {
+                k++;
+                tb_put(&tb, s + at, st - at);
+                if (occ == 0 || k == occ) tb_put(&tb, rep, strlen(rep)); else tb_put(&tb, s + st, en - st);
+                if (en == st) { if (s[en]) tb_put(&tb, s + en, 1); at = en + 1; } else at = en;
+                if (occ && k == occ) break;
+            }
+            if (at < strlen(s)) tb_put(&tb, s + at, strlen(s) - at);
+            sv_regex_free(re);
+            tb_result(c, out, &tb);
+            return true;
+        }
+        size_t at = from;
+        bool found = false;
+        for (long long k = 0; k < (occ < 1 ? 1 : occ); k++) {
+            found = sv_regex_search(re, s, at, &st, &en);
+            if (!found) break;
+            at = en > st ? en : en + 1;
+        }
+        sv_regex_free(re);
+        if (!strcmp(f, "REGEXP_SUBSTR")) { if (found) ev_set_text(c, out, s + st, en - st); else ev_null(out); return true; }
+        if (!found) { ev_int(out, 0); return true; }
+        int p1 = 1;
+        for (size_t i = 0; i < st; i++) if (((unsigned char)s[i] & 0xC0) != 0x80) p1++;
+        ev_int(out, p1);
+        return true;
+    }
+    // numeri
+    if (!strcmp(f, "RAND")) { srand((unsigned)I(0)); ev_num(out, (double)rand() / ((double)RAND_MAX + 1.0)); return true; }
+    if (!strcmp(f, "INTDIV")) { double y = N(1); if (y == 0) { ev_null(out); return true; } ev_int(out, (int64_t)(N(0) / y)); return true; }
+    if (!strcmp(f, "GREATEST") || !strcmp(f, "LEAST")) {
+        bool g = f[0] == 'G';
+        int best = 0;
+        for (int i = 1; i < na; i++) { int r = ev_cmp(&a[i], &a[best]); if (g ? r > 0 : r < 0) best = i; }
+        ev_copy(out, &a[best]);
+        return true;
+    }
+    if (!strcmp(f, "TRUNCATE")) {
+        long long d = I(1);
+        double x = N(0), p = pow(10.0, (double)d);
+        double r = x >= 0 ? floor(x * p) / p : ceil(x * p) / p;
+        if (d <= 0 && fabs(r) < 9e18) ev_int(out, (int64_t)r); else ev_num(out, r);
+        return true;
+    }
+    {
+        static const struct { const char* n; int k; } MATH[] = {
+            { "EXP", 1 }, { "LN", 2 }, { "LOG10", 3 }, { "LOG2", 4 }, { "RADIANS", 5 }, { "DEGREES", 6 }, { "SIN", 7 }, { "COS", 8 },
+            { "TAN", 9 }, { "COT", 10 }, { "ASIN", 11 }, { "ACOS", 12 } };
+        for (size_t i = 0; i < sizeof(MATH) / sizeof(MATH[0]); i++)
+            if (!strcmp(f, MATH[i].n)) {
+                double x = N(0), r = 0;
+                switch (MATH[i].k) {
+                    case 1: r = exp(x); break;
+                    case 2: if (x <= 0) { ev_null(out); return true; } r = log(x); break;
+                    case 3: if (x <= 0) { ev_null(out); return true; } r = log10(x); break;
+                    case 4: if (x <= 0) { ev_null(out); return true; } r = log2(x); break;
+                    case 5: r = x * 3.141592653589793 / 180; break;
+                    case 6: r = x * 180 / 3.141592653589793; break;
+                    case 7: r = sin(x); break;
+                    case 8: r = cos(x); break;
+                    case 9: r = tan(x); break;
+                    case 10: r = 1 / tan(x); break;
+                    case 11: if (x < -1 || x > 1) { ev_null(out); return true; } r = asin(x); break;
+                    case 12: if (x < -1 || x > 1) { ev_null(out); return true; } r = acos(x); break;
+                }
+                ev_num(out, r);
+                return true;
+            }
+    }
+    if (!strcmp(f, "LOG")) {                                    // LOG(x) = ln, LOG(b, x)
+        if (na == 1) { if (N(0) <= 0) ev_null(out); else ev_num(out, log(N(0))); return true; }
+        if (N(0) <= 0 || N(0) == 1 || N(1) <= 0) { ev_null(out); return true; }
+        ev_num(out, log(N(1)) / log(N(0)));
+        return true;
+    }
+    if (!strcmp(f, "ATAN") || !strcmp(f, "ATAN2")) { ev_num(out, na == 2 ? atan2(N(0), N(1)) : atan(N(0))); return true; }
+    // CAST(x AS tipo)
+    if (!strcmp(f, "CAST")) {
+        if (a[0].null) { ev_null(out); return true; }
+        const char* ty = S(1);
+        if (!strncmp(ty, "SIGNED", 6) || !strncmp(ty, "UNSIGNED", 8) || !strncmp(ty, "INT", 3) || !strcmp(ty, "YEAR")) {
+            double v = N(0);
+            if (!strncmp(ty, "UNSIGNED", 8) && v < 0) v = 0;
+            ev_int(out, (int64_t)(v < 0 ? ceil(v - 0.5) : floor(v + 0.5)));
+            if (!a[0].is_num) {                                 // testo: come MySQL, la parte intera iniziale
+                char* end;
+                long long x = strtoll(S(0), &end, 10);
+                ev_int(out, !strncmp(ty, "UNSIGNED", 8) && x < 0 ? 0 : x);
+            }
+            return true;
+        }
+        if (!strncmp(ty, "DECIMAL", 7) || !strncmp(ty, "NUMERIC", 7)) {
+            int p = 10, sc = 0;
+            sscanf(ty, "%*[A-Z] ( %d , %d", &p, &sc);
+            sscanf(ty, "%*[A-Z](%d,%d", &p, &sc);
+            char buf[120];
+            snprintf(buf, sizeof(buf), "%.17g", N(0));
+            char rnd[160];
+            if (decimal_round(buf, sc, rnd, sizeof(rnd))) ev_set_text(c, out, rnd, strlen(rnd)); else ev_num(out, N(0));
+            out->is_num = true;
+            out->num = N(0);
+            return true;
+        }
+        if (!strcmp(ty, "DOUBLE") || !strcmp(ty, "FLOAT") || !strcmp(ty, "REAL")) { ev_num(out, N(0)); return true; }
+        if (!strcmp(ty, "DATE") || !strcmp(ty, "DATETIME") || !strncmp(ty, "DATETIME(", 9) || !strcmp(ty, "TIME")) {
+            MyDT t;
+            if (!mydt_parse(S(0), &t)) { ev_null(out); return true; }
+            if (!strcmp(ty, "TIME")) snprintf(b, sizeof(b), "%02d:%02d:%02d", t.h, t.mi, t.s);
+            else mydt_text(&t, strcmp(ty, "DATE") != 0, b, sizeof(b));
+            ev_set_text(c, out, b, strlen(b));
+            return true;
+        }
+        // CHAR[(n)], BINARY, JSON, NCHAR: testo
+        const char* s = S(0);
+        int n = -1;
+        if (sscanf(ty, "%*[A-Z](%d)", &n) == 1 && n >= 0) { const char* end = utf8_at(s, n); ev_set_text(c, out, s, (size_t)(end - s)); return true; }
+        ev_set_text(c, out, s, strlen(s));
+        return true;
+    }
+    // date
+    if (!strcmp(f, "UNIX_TIMESTAMP")) {
+        MyDT t;
+        if (!mydt_parse(S(0), &t) || !t.has_date) { ev_int(out, 0); return true; }
+        long long local = mydt_secs(&t);
+        ev_int(out, local - tz_offset((time_t)local));
+        return true;
+    }
+    if (!strcmp(f, "FROM_UNIXTIME")) {
+        long long secs = I(0);
+        MyDT t;
+        mydt_from_secs(secs + tz_offset((time_t)secs), &t);
+        t.has_time = true;
+        if (na > 1) { date_format_into(&t, S(1), &tb); tb_result(c, out, &tb); return true; }
+        mydt_text(&t, true, b, sizeof(b));
+        ev_set_text(c, out, b, strlen(b));
+        return true;
+    }
+    if (!strcmp(f, "STR_TO_DATE")) {
+        MyDT t;
+        if (!str_to_date(S(0), S(1), &t)) { ev_null(out); return true; }
+        mydt_text(&t, t.has_time, b, sizeof(b));
+        ev_set_text(c, out, b, strlen(b));
+        return true;
+    }
+    if (!strcmp(f, "SEC_TO_TIME")) {
+        long long v = I(0);
+        bool neg = v < 0;
+        if (neg) v = -v;
+        snprintf(b, sizeof(b), "%s%02lld:%02lld:%02lld", neg ? "-" : "", v / 3600, v / 60 % 60, v % 60);
+        ev_set_text(c, out, b, strlen(b));
+        return true;
+    }
+    if (!strcmp(f, "MAKEDATE")) {
+        long long y = I(0), doy = I(1);
+        if (doy < 1) { ev_null(out); return true; }
+        MyDT t;
+        mydt_from_secs((days_from_civil(y, 1, 1) + doy - 1) * 86400LL, &t);
+        mydt_text(&t, false, b, sizeof(b));
+        ev_set_text(c, out, b, strlen(b));
+        return true;
+    }
+    if (!strcmp(f, "MAKETIME")) { snprintf(b, sizeof(b), "%02lld:%02lld:%02lld", I(0), I(1), I(2)); ev_set_text(c, out, b, strlen(b)); return true; }
+    if (!strcmp(f, "FROM_DAYS")) {
+        MyDT t;
+        mydt_from_secs((I(0) - 719528) * 86400LL, &t);
+        mydt_text(&t, false, b, sizeof(b));
+        ev_set_text(c, out, b, strlen(b));
+        return true;
+    }
+    if (!strcmp(f, "CONVERT_TZ")) { ev_copy(out, &a[0]); return true; }   // fusi orari: niente tabelle, il valore resta
+    if (!strcmp(f, "__INTERVAL")) { ctx_error(c, "%s", "INTERVAL can only be used with DATE_ADD / DATE_SUB or + / -"); ev_null(out); return true; }
+    if (!strcmp(f, "DATE_ADD") || !strcmp(f, "DATE_SUB") || !strcmp(f, "ADDDATE") || !strcmp(f, "SUBDATE")) {
+        int sign = (!strcmp(f, "DATE_SUB") || !strcmp(f, "SUBDATE")) ? -1 : 1;
+        MyDT t;
+        if (!mydt_parse(S(0), &t) || !t.has_date) { ev_null(out); return true; }
+        const char* unit = "DAY";
+        EvalVal iv;
+        const char* amount;
+        ASTExpr* ie = e->args[1];
+        if (ie->type == EXPR_FUNC && !strcmp(ie->func, "__INTERVAL")) {
+            eval_expr(ie->args[0], c, &iv);
+            if (iv.null) { ev_null(out); return true; }
+            amount = ev_s(&iv);
+            unit = ie->args[1]->str_val;
+        } else amount = S(1);                                  // ADDDATE(d, n): giorni
+        char amt[64];
+        snprintf(amt, sizeof(amt), "%s", amount);
+        bool date_only = !t.has_time && (!strcmp(unit, "DAY") || !strcmp(unit, "WEEK") || !strcmp(unit, "MONTH") ||
+                                         !strcmp(unit, "QUARTER") || !strcmp(unit, "YEAR") || !strcmp(unit, "YEAR_MONTH"));
+        if (!mydt_add(&t, unit, amt, sign)) { ev_null(out); return true; }
+        mydt_text(&t, !date_only, b, sizeof(b));
+        ev_set_text(c, out, b, strlen(b));
+        return true;
+    }
+    if (!strcmp(f, "DATEDIFF")) {
+        MyDT x, y;
+        if (!mydt_parse(S(0), &x) || !mydt_parse(S(1), &y)) { ev_null(out); return true; }
+        ev_int(out, days_from_civil(x.y, x.mo, x.d) - days_from_civil(y.y, y.mo, y.d));
+        return true;
+    }
+    if (!strcmp(f, "TIMEDIFF")) {
+        MyDT x, y;
+        if (!mydt_parse(S(0), &x) || !mydt_parse(S(1), &y)) { ev_null(out); return true; }
+        long long d = (x.has_date ? mydt_secs(&x) : x.h * 3600LL + x.mi * 60 + x.s) - (y.has_date ? mydt_secs(&y) : y.h * 3600LL + y.mi * 60 + y.s);
+        bool neg = d < 0;
+        if (neg) d = -d;
+        snprintf(b, sizeof(b), "%s%02lld:%02lld:%02lld", neg ? "-" : "", d / 3600, d / 60 % 60, d % 60);
+        ev_set_text(c, out, b, strlen(b));
+        return true;
+    }
+    if (!strcmp(f, "TIMESTAMPDIFF")) {                          // (a, b, unità) dopo il parser
+        MyDT x, y;
+        if (!mydt_parse(S(0), &x) || !mydt_parse(S(1), &y)) { ev_null(out); return true; }
+        const char* u = S(2);
+        long long sx = mydt_secs(&x), sy = mydt_secs(&y);
+        if (!strcmp(u, "MONTH") || !strcmp(u, "QUARTER") || !strcmp(u, "YEAR")) {
+            long long m = ((long long)y.y * 12 + y.mo) - ((long long)x.y * 12 + x.mo);
+            // mese incompleto: non conta
+            long long rest_y = (long long)y.d * 86400 + y.h * 3600 + y.mi * 60 + y.s, rest_x = (long long)x.d * 86400 + x.h * 3600 + x.mi * 60 + x.s;
+            if (m > 0 && rest_y < rest_x) m--;
+            else if (m < 0 && rest_y > rest_x) m++;
+            ev_int(out, !strcmp(u, "MONTH") ? m : !strcmp(u, "QUARTER") ? m / 3 : m / 12);
+            return true;
+        }
+        long long d = sy - sx;
+        long long div = !strcmp(u, "SECOND") ? 1 : !strcmp(u, "MINUTE") ? 60 : !strcmp(u, "HOUR") ? 3600 : !strcmp(u, "DAY") ? 86400 :
+                        !strcmp(u, "WEEK") ? 604800 : !strcmp(u, "MICROSECOND") ? 0 : -1;
+        if (div < 0) { ctx_error(c, "Unknown unit %s in TIMESTAMPDIFF", u); ev_null(out); return true; }
+        ev_int(out, div == 0 ? d * 1000000 : d / div);
+        return true;
+    }
+    if (!strcmp(f, "SLEEP")) {
+        double s = N(0);
+        if (s > 0) {
+            long ms = (long)(s * 1000);
+            if (ms > 60000) ms = 60000;
+#ifdef _WIN32
+            sv_win_sleep((unsigned long)ms);
+#else
+            struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
+            nanosleep(&ts, NULL);
+#endif
+        }
+        ev_int(out, 0);
+        return true;
+    }
+    if (!strcmp(f, "GET_LOCK") || !strcmp(f, "RELEASE_LOCK") || !strcmp(f, "IS_FREE_LOCK")) { ev_int(out, 1); return true; }
+    if (!strcmp(f, "IS_USED_LOCK")) { ev_null(out); return true; }
+    if (!strcmp(f, "TIME_TO_SEC")) {
+        MyDT t;
+        if (!mydt_parse(S(0), &t)) { ev_null(out); return true; }
+        ev_int(out, t.h * 3600LL + t.mi * 60 + t.s);
+        return true;
+    }
+    // parti di una data
+    MyDT t;
+    if (!mydt_parse(S(f[0] == 'E' && !strcmp(f, "EXTRACT") ? 1 : 0), &t)) { ev_null(out); return true; }
+    if (!strcmp(f, "DATE")) { if (!t.has_date) { ev_null(out); return true; } mydt_text(&t, false, b, sizeof(b)); ev_set_text(c, out, b, strlen(b)); return true; }
+    if (!strcmp(f, "TIME")) { snprintf(b, sizeof(b), "%02d:%02d:%02d", t.h, t.mi, t.s); ev_set_text(c, out, b, strlen(b)); return true; }
+    if (!strcmp(f, "HOUR")) { ev_int(out, t.h); return true; }
+    if (!strcmp(f, "MINUTE")) { ev_int(out, t.mi); return true; }
+    if (!strcmp(f, "SECOND")) { ev_int(out, t.s); return true; }
+    if (!strcmp(f, "MICROSECOND")) { ev_int(out, t.us); return true; }
+    if (!t.has_date) { ev_null(out); return true; }
+    if (!strcmp(f, "DAYOFWEEK")) { ev_int(out, (weekday_mon0(&t) + 1) % 7 + 1); return true; }
+    if (!strcmp(f, "WEEKDAY")) { ev_int(out, weekday_mon0(&t)); return true; }
+    if (!strcmp(f, "DAYOFMONTH")) { ev_int(out, t.d); return true; }
+    if (!strcmp(f, "DAYOFYEAR")) { ev_int(out, day_of_year(&t)); return true; }
+    if (!strcmp(f, "WEEK")) { ev_int(out, mysql_week(&t, na > 1 ? (int)I(1) & 7 : 0, NULL)); return true; }
+    if (!strcmp(f, "WEEKOFYEAR")) { ev_int(out, mysql_week(&t, 3, NULL)); return true; }
+    if (!strcmp(f, "YEARWEEK")) { int yy; int w = mysql_week(&t, na > 1 ? ((int)I(1) & 7) | 2 : 2, &yy); ev_int(out, yy * 100 + w); return true; }
+    if (!strcmp(f, "QUARTER")) { ev_int(out, (t.mo + 2) / 3); return true; }
+    if (!strcmp(f, "MONTHNAME")) { const char* m = t.mo >= 1 && t.mo <= 12 ? MONTH_NAMES[t.mo - 1] : ""; ev_set_text(c, out, m, strlen(m)); return true; }
+    if (!strcmp(f, "DAYNAME")) { const char* d = DAY_NAMES[weekday_mon0(&t)]; ev_set_text(c, out, d, strlen(d)); return true; }
+    if (!strcmp(f, "LAST_DAY")) { t.d = days_in_month(t.y, t.mo); mydt_text(&t, false, b, sizeof(b)); ev_set_text(c, out, b, strlen(b)); return true; }
+    if (!strcmp(f, "TO_DAYS")) { ev_int(out, days_from_civil(t.y, t.mo, t.d) + 719528); return true; }
+    if (!strcmp(f, "TO_SECONDS")) { ev_int(out, (days_from_civil(t.y, t.mo, t.d) + 719528) * 86400LL + t.h * 3600 + t.mi * 60 + t.s); return true; }
+    if (!strcmp(f, "DATE_FORMAT") || !strcmp(f, "TIME_FORMAT")) { date_format_into(&t, S(1), &tb); tb_result(c, out, &tb); return true; }
+    if (!strcmp(f, "EXTRACT")) {
+        const char* u = S(0);
+        long long v = !strcmp(u, "YEAR") ? t.y : !strcmp(u, "MONTH") ? t.mo : !strcmp(u, "DAY") ? t.d : !strcmp(u, "HOUR") ? t.h :
+                      !strcmp(u, "MINUTE") ? t.mi : !strcmp(u, "SECOND") ? t.s : !strcmp(u, "MICROSECOND") ? t.us :
+                      !strcmp(u, "QUARTER") ? (t.mo + 2) / 3 : !strcmp(u, "WEEK") ? mysql_week(&t, 0, NULL) :
+                      !strcmp(u, "YEAR_MONTH") ? t.y * 100LL + t.mo : !strcmp(u, "DAY_HOUR") ? t.d * 100LL + t.h :
+                      !strcmp(u, "HOUR_MINUTE") ? t.h * 100LL + t.mi : !strcmp(u, "DAY_MINUTE") ? (t.d * 100LL + t.h) * 100 + t.mi :
+                      !strcmp(u, "MINUTE_SECOND") ? t.mi * 100LL + t.s : !strcmp(u, "HOUR_SECOND") ? (t.h * 100LL + t.mi) * 100 + t.s : -1;
+        if (v < 0) { ctx_error(c, "Unknown unit %s in EXTRACT", u); ev_null(out); return true; }
+        ev_int(out, v);
+        return true;
+    }
+    #undef S
+    #undef N
+    #undef I
+    free(tb.d);
+    return false;
+}
+
+// GROUP_CONCAT: argomenti = valori, chiavi di ORDER BY, separatore; col_name = "#gc nv no flags"
+typedef struct { char* text; EvalVal* keys; int nk; const char* flags; } GcItem;
+static int gc_cmp(const void* x, const void* y) {
+    const GcItem* a = x;
+    const GcItem* b = y;
+    for (int k = 0; k < a->nk; k++) {
+        int r;
+        if (a->keys[k].null || b->keys[k].null) r = a->keys[k].null - b->keys[k].null;
+        else r = ev_cmp(&a->keys[k], &b->keys[k]);
+        if (r) return a->flags[k] == 'D' ? -r : r;
+    }
+    return 0;
+}
+
+static void eval_group_concat(ASTExpr* e, EvalCtx* c, EvalVal* out) {
+    int nv = 1, no = 0;
+    char flags[40] = "";
+    sscanf(e->col_name, "#gc %d %d %39s", &nv, &no, flags);
+    const char* sep = e->args[e->nargs - 1]->str_val ? e->args[e->nargs - 1]->str_val : ",";
+    Tuple** saved = c->cur;
+    GcItem* items = calloc((size_t)(c->ngrp > 0 ? c->ngrp : 1), sizeof(GcItem));
+    EvalVal* keys = no ? calloc((size_t)(c->ngrp > 0 ? c->ngrp : 1) * (size_t)no, sizeof(EvalVal)) : NULL;
+    int n = 0;
+    StrMap seen = {0};
+    bool oom = !items || (no && !keys);
+    for (int k = 0; k < c->ngrp && !oom; k++) {
+        c->cur = c->grp[k];
+        TextBuf tb = {0};
+        bool null = false;
+        for (int i = 0; i < nv && !null; i++) {
+            EvalVal v;
+            eval_expr(e->args[i], c, &v);
+            if (v.null) null = true; else { const char* s = ev_s(&v); tb_put(&tb, s, strlen(s)); }
+        }
+        if (null) { free(tb.d); continue; }                    // una riga con un NULL non conta (come MySQL)
+        tb_put(&tb, "", 1);
+        if (tb.err) { free(tb.d); oom = true; break; }
+        if (e->agg_distinct) {
+            char key[KEY_BUF];
+            key_text(key, sizeof(key), tb.d);
+            SMSlot* sl = sm_slot(&seen, key, true);
+            if (!sl) { free(tb.d); oom = true; break; }
+            if (sl->val >= 0) { free(tb.d); continue; }
+            sl->val = 1;
+        }
+        items[n].text = tb.d;
+        items[n].nk = no;
+        items[n].flags = flags;
+        items[n].keys = keys ? &keys[(size_t)n * (size_t)no] : NULL;
+        for (int j = 0; j < no; j++) {
+            EvalVal* kv = &items[n].keys[j];
+            eval_expr(e->args[nv + j], c, kv);
+            if (!kv->null && !kv->is_num) {                    // il testo punta alla riga: copia
+                char* dup = strdup(ev_s(kv));
+                if (!dup) { oom = true; break; }
+                kv->str = dup;
+            }
+        }
+        n++;
+    }
+    c->cur = saved;
+    sm_free(&seen);
+    if (!oom && no) qsort(items, (size_t)n, sizeof(GcItem), gc_cmp);
+    TextBuf res = {0};
+    size_t limit = 1024 * 1024;                                // group_concat_max_len (MySQL: 1024; qui più generoso)
+    for (int i = 0; i < n && !oom; i++) {
+        if (i) tb_put(&res, sep, strlen(sep));
+        tb_put(&res, items[i].text, strlen(items[i].text));
+        if (res.n > limit) { res.n = limit; break; }
+    }
+    for (int i = 0; i < n; i++) {
+        free(items[i].text);
+        for (int j = 0; j < no; j++) if (!items[i].keys[j].null && !items[i].keys[j].is_num) free((char*)items[i].keys[j].str);
+    }
+    free(items);
+    free(keys);
+    if (oom) { free(res.d); ctx_error(c, "%s", "Out of memory in GROUP_CONCAT"); ev_null(out); return; }
+    if (n == 0) { free(res.d); ev_null(out); return; }
+    tb_result(c, out, &res);
+}
+
 static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     const char* f = e->func;
     EvalVal a[3];
     int na = e->nargs < 3 ? e->nargs : 3;
+
+    if (eval_mysql(e, c, out)) return;
 
     // MATCH(colonne) AGAINST('parole'): punteggio di pertinenza (0 = nessuna corrispondenza)
     if (!strcmp(f, "MATCH_AGAINST")) {
@@ -2038,6 +3309,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
 
 static void eval_aggregate(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     if (!c->grp) { ctx_error(c, "%s", "Aggregate used outside of a group"); ev_null(out); return; }
+    if (!strcmp(e->func, "GROUP_CONCAT")) { eval_group_concat(e, c, out); return; }
     bool count_star = e->nargs == 0;
     if (count_star) { ev_int(out, c->ngrp); return; }
 
@@ -2921,6 +4193,386 @@ static int cte_recursive(ExecCtx* x, Source* s, ASTCte* c, const CteScope* sc, i
 }
 
 // apre una sorgente: nome definito con WITH, tabella, vista o tabella derivata
+// ═════════════════════════════════════════════════════════════════
+//  information_schema: tabelle virtuali costruite dal catalogo (come in MySQL)
+// ═════════════════════════════════════════════════════════════════
+
+static _Thread_local bool g_infoschema;            // lo statement nomina information_schema.x
+static _Thread_local bool (*g_see_db)(const char* db);   // permessi dell'utente (NULL = vede tutto)
+
+void executor_set_infoschema(bool on) { g_infoschema = on; }
+void executor_set_db_filter(bool (*see)(const char* db)) { g_see_db = see; }
+
+typedef struct { Source* s; int cap; Tuple* t; int col; bool ok; } ISB;
+
+// schema da "NOME:s,NOME:i,..." (s = testo, i = intero)
+static TableSchema* is_schema(const char* name, const char* spec) {
+    TableSchema* ts = calloc(1, sizeof(TableSchema));
+    if (!ts) return NULL;
+    snprintf(ts->name, sizeof(ts->name), "%s", name);
+    const char* p = spec;
+    while (*p && ts->num_columns < SV_MAX_COLUMNS) {
+        const char* c = strchr(p, ':');
+        if (!c) break;
+        Column* col = &ts->columns[ts->num_columns++];
+        snprintf(col->name, sizeof(col->name), "%.*s", (int)(c - p), p);
+        col->type = c[1] == 'i' ? SV_TYPE_BIGINT : SV_TYPE_VARCHAR;
+        col->nullable = true;
+        p = c + 2;
+        if (*p == ',') p++;
+    }
+    return ts;
+}
+
+static void isb_row(ISB* b) {
+    b->t = tuple_create(b->s->ts->num_columns);
+    b->col = 0;
+    if (!b->t) b->ok = false;
+}
+static Value* isb_next(ISB* b) { return b->t && b->col < b->s->ts->num_columns ? &b->t->values[b->col++] : NULL; }
+static void isb_s(ISB* b, const char* v) {
+    Value* x = isb_next(b);
+    if (!x) return;
+    if (!v) { x->is_null = true; return; }
+    x->str_val = strdup(v);
+    x->owns_str = x->str_val != NULL;
+    if (!x->str_val) b->ok = false;
+}
+static void isb_i(ISB* b, long long v) { Value* x = isb_next(b); if (x) x->bigint_val = v; }
+static void isb_null(ISB* b) { Value* x = isb_next(b); if (x) x->is_null = true; }
+static void isb_end(ISB* b) {
+    if (!b->t) return;
+    while (b->col < b->s->ts->num_columns) isb_null(b);
+    if (!source_push(b->s, b->t, (RID){0, 0}, &b->cap)) { tuple_free(b->t); b->ok = false; }
+    b->t = NULL;
+}
+
+static bool is_see(const Database* d) { return !g_see_db || g_see_db(d->name); }
+
+// tipo SQL come lo mostra MySQL ("bigint(20) unsigned", "varchar(255)", "decimal(10,2)")
+static void is_coltype(const Column* c, char* out, size_t n) {
+    if (c->sqltype[0]) { snprintf(out, n, "%s", c->sqltype); return; }
+    switch (c->type) {
+        case SV_TYPE_INT:      snprintf(out, n, "int"); break;
+        case SV_TYPE_BIGINT:   snprintf(out, n, "bigint"); break;
+        case SV_TYPE_FLOAT:    snprintf(out, n, "double"); break;
+        case SV_TYPE_VARCHAR:  if (c->size > 0) snprintf(out, n, "varchar(%d)", c->size); else snprintf(out, n, "text"); break;
+        case SV_TYPE_CHAR:     snprintf(out, n, "char(%d)", c->size > 0 ? c->size : 1); break;
+        case SV_TYPE_TEXT:     snprintf(out, n, "text"); break;
+        case SV_TYPE_BOOL:     snprintf(out, n, "tinyint(1)"); break;
+        case SV_TYPE_DATE:     snprintf(out, n, "date"); break;
+        case SV_TYPE_DATETIME: snprintf(out, n, "datetime"); break;
+        case SV_TYPE_BLOB:     snprintf(out, n, "blob"); break;
+        case SV_TYPE_DECIMAL:
+            if (c->decimal_prec > 0) snprintf(out, n, "decimal(%d,%d)", c->size > 0 ? c->size : 10, c->decimal_prec - 1);
+            else snprintf(out, n, "decimal(65,30)");
+            break;
+        default: snprintf(out, n, "text");
+    }
+}
+
+// DATA_TYPE: il nome del tipo senza dimensioni né attributi
+static void is_datatype(const Column* c, char* out, size_t n) {
+    char t[64];
+    is_coltype(c, t, sizeof(t));
+    size_t l = strcspn(t, "( ");
+    snprintf(out, n, "%.*s", (int)l, t);
+}
+
+static bool is_text_col(const Column* c) {
+    return c->type == SV_TYPE_VARCHAR || c->type == SV_TYPE_CHAR || c->type == SV_TYPE_TEXT;
+}
+
+static long long is_char_max(const Column* c) {
+    if (c->type == SV_TYPE_VARCHAR || c->type == SV_TYPE_CHAR) return c->size > 0 ? c->size : 65535;
+    if (c->type == SV_TYPE_TEXT) {
+        const char* t = c->sqltype;
+        if (!strncmp(t, "tinytext", 8)) return 255;
+        if (!strncmp(t, "mediumtext", 10)) return 16777215;
+        if (!strncmp(t, "longtext", 8) || !strncmp(t, "json", 4)) return 4294967295LL;
+        return 65535;
+    }
+    return -1;
+}
+
+// PRI / UNI / MUL come la colonna Key di SHOW COLUMNS
+static const char* is_colkey(const TableSchema* ts, int ci) {
+    const char* name = ts->columns[ci].name;
+    if (ts->columns[ci].primary_key) return "PRI";
+    for (int k = 0; k < ts->num_constraints; k++) {
+        const Constraint* c = &ts->constraints[k];
+        if (c->kind == CONS_PRIMARY && c->ncols > 0 && c->cols[0] == ci) return "PRI";
+    }
+    for (int k = 0; k < ts->num_constraints; k++) {
+        const Constraint* c = &ts->constraints[k];
+        if (c->kind == CONS_UNIQUE && c->ncols == 1 && c->cols[0] == ci) return "UNI";
+    }
+    if (ts->columns[ci].unique) return "UNI";
+    for (int k = 0; k < ts->num_constraints; k++) {
+        const Constraint* c = &ts->constraints[k];
+        if ((c->kind == CONS_UNIQUE || c->kind == CONS_FOREIGN) && c->ncols > 0 && c->cols[0] == ci) return "MUL";
+    }
+    for (int i = 0; i < ts->num_indexes; i++) if (!strcasecmp(ts->indexes[i].col_name, name)) return "MUL";
+    return "";
+}
+
+static const char* is_fk_rule(int a) {
+    switch (a) {
+        case FK_CASCADE: return "CASCADE";
+        case FK_SET_NULL: return "SET NULL";
+        case FK_SET_DEFAULT: return "SET DEFAULT";
+        case FK_RESTRICT: return "RESTRICT";
+        default: return "NO ACTION";
+    }
+}
+
+static const char* is_collation(const TableSchema* ts) { return ts->collation[0] ? ts->collation : "utf8mb4_general_ci"; }
+
+static bool infoschema_open(ExecCtx* x, Source* s, const char* table, char* err, size_t errn) {
+    Catalog* cat = x->catalog;
+    char up[SV_MAX_NAME_LEN];
+    snprintf(up, sizeof(up), "%s", table);
+    for (char* q = up; *q; q++) *q = (char)toupper((unsigned char)*q);
+    static const struct { const char* name; const char* spec; } T[] = {
+        { "SCHEMATA", "CATALOG_NAME:s,SCHEMA_NAME:s,DEFAULT_CHARACTER_SET_NAME:s,DEFAULT_COLLATION_NAME:s,SQL_PATH:s,DEFAULT_ENCRYPTION:s" },
+        { "TABLES", "TABLE_CATALOG:s,TABLE_SCHEMA:s,TABLE_NAME:s,TABLE_TYPE:s,ENGINE:s,VERSION:i,ROW_FORMAT:s,TABLE_ROWS:i,"
+                    "AVG_ROW_LENGTH:i,DATA_LENGTH:i,MAX_DATA_LENGTH:i,INDEX_LENGTH:i,DATA_FREE:i,AUTO_INCREMENT:i,CREATE_TIME:s,"
+                    "UPDATE_TIME:s,CHECK_TIME:s,TABLE_COLLATION:s,CHECKSUM:i,CREATE_OPTIONS:s,TABLE_COMMENT:s" },
+        { "COLUMNS", "TABLE_CATALOG:s,TABLE_SCHEMA:s,TABLE_NAME:s,COLUMN_NAME:s,ORDINAL_POSITION:i,COLUMN_DEFAULT:s,IS_NULLABLE:s,"
+                     "DATA_TYPE:s,CHARACTER_MAXIMUM_LENGTH:i,CHARACTER_OCTET_LENGTH:i,NUMERIC_PRECISION:i,NUMERIC_SCALE:i,"
+                     "DATETIME_PRECISION:i,CHARACTER_SET_NAME:s,COLLATION_NAME:s,COLUMN_TYPE:s,COLUMN_KEY:s,EXTRA:s,PRIVILEGES:s,"
+                     "COLUMN_COMMENT:s,GENERATION_EXPRESSION:s,SRS_ID:i" },
+        { "STATISTICS", "TABLE_CATALOG:s,TABLE_SCHEMA:s,TABLE_NAME:s,NON_UNIQUE:i,INDEX_SCHEMA:s,INDEX_NAME:s,SEQ_IN_INDEX:i,"
+                        "COLUMN_NAME:s,COLLATION:s,CARDINALITY:i,SUB_PART:i,PACKED:s,NULLABLE:s,INDEX_TYPE:s,COMMENT:s,"
+                        "INDEX_COMMENT:s,IS_VISIBLE:s,EXPRESSION:s" },
+        { "TABLE_CONSTRAINTS", "CONSTRAINT_CATALOG:s,CONSTRAINT_SCHEMA:s,CONSTRAINT_NAME:s,TABLE_SCHEMA:s,TABLE_NAME:s,CONSTRAINT_TYPE:s,ENFORCED:s" },
+        { "KEY_COLUMN_USAGE", "CONSTRAINT_CATALOG:s,CONSTRAINT_SCHEMA:s,CONSTRAINT_NAME:s,TABLE_CATALOG:s,TABLE_SCHEMA:s,TABLE_NAME:s,"
+                              "COLUMN_NAME:s,ORDINAL_POSITION:i,POSITION_IN_UNIQUE_CONSTRAINT:i,REFERENCED_TABLE_SCHEMA:s,"
+                              "REFERENCED_TABLE_NAME:s,REFERENCED_COLUMN_NAME:s" },
+        { "REFERENTIAL_CONSTRAINTS", "CONSTRAINT_CATALOG:s,CONSTRAINT_SCHEMA:s,CONSTRAINT_NAME:s,UNIQUE_CONSTRAINT_CATALOG:s,"
+                                     "UNIQUE_CONSTRAINT_SCHEMA:s,UNIQUE_CONSTRAINT_NAME:s,MATCH_OPTION:s,UPDATE_RULE:s,DELETE_RULE:s,"
+                                     "TABLE_NAME:s,REFERENCED_TABLE_NAME:s" },
+        { "CHECK_CONSTRAINTS", "CONSTRAINT_CATALOG:s,CONSTRAINT_SCHEMA:s,CONSTRAINT_NAME:s,CHECK_CLAUSE:s" },
+        { "VIEWS", "TABLE_CATALOG:s,TABLE_SCHEMA:s,TABLE_NAME:s,VIEW_DEFINITION:s,CHECK_OPTION:s,IS_UPDATABLE:s,DEFINER:s,"
+                   "SECURITY_TYPE:s,CHARACTER_SET_CLIENT:s,COLLATION_CONNECTION:s" },
+        { "TRIGGERS", "TRIGGER_CATALOG:s,TRIGGER_SCHEMA:s,TRIGGER_NAME:s,EVENT_MANIPULATION:s,EVENT_OBJECT_CATALOG:s,"
+                      "EVENT_OBJECT_SCHEMA:s,EVENT_OBJECT_TABLE:s,ACTION_ORDER:i,ACTION_CONDITION:s,ACTION_STATEMENT:s,"
+                      "ACTION_ORIENTATION:s,ACTION_TIMING:s,CREATED:s,SQL_MODE:s,DEFINER:s" },
+        { "ROUTINES", "SPECIFIC_NAME:s,ROUTINE_CATALOG:s,ROUTINE_SCHEMA:s,ROUTINE_NAME:s,ROUTINE_TYPE:s,DATA_TYPE:s,ROUTINE_BODY:s,"
+                      "ROUTINE_DEFINITION:s,IS_DETERMINISTIC:s,SQL_DATA_ACCESS:s,SECURITY_TYPE:s,CREATED:s,LAST_ALTERED:s,"
+                      "SQL_MODE:s,ROUTINE_COMMENT:s,DEFINER:s" },
+        { "ENGINES", "ENGINE:s,SUPPORT:s,COMMENT:s,TRANSACTIONS:s,XA:s,SAVEPOINTS:s" },
+        { "CHARACTER_SETS", "CHARACTER_SET_NAME:s,DEFAULT_COLLATE_NAME:s,DESCRIPTION:s,MAXLEN:i" },
+        { "COLLATIONS", "COLLATION_NAME:s,CHARACTER_SET_NAME:s,ID:i,IS_DEFAULT:s,IS_COMPILED:s,SORTLEN:i,PAD_ATTRIBUTE:s" },
+        { "PROCESSLIST", "ID:i,USER:s,HOST:s,DB:s,COMMAND:s,TIME:i,STATE:s,INFO:s" },
+        { "PLUGINS", "PLUGIN_NAME:s,PLUGIN_VERSION:s,PLUGIN_STATUS:s,PLUGIN_TYPE:s" },
+        { "USER_PRIVILEGES", "GRANTEE:s,TABLE_CATALOG:s,PRIVILEGE_TYPE:s,IS_GRANTABLE:s" },
+        { "PARAMETERS", "SPECIFIC_CATALOG:s,SPECIFIC_SCHEMA:s,SPECIFIC_NAME:s,ORDINAL_POSITION:i,PARAMETER_MODE:s,PARAMETER_NAME:s,DATA_TYPE:s" },
+        { "EVENTS", "EVENT_CATALOG:s,EVENT_SCHEMA:s,EVENT_NAME:s" },
+        { "PARTITIONS", "TABLE_CATALOG:s,TABLE_SCHEMA:s,TABLE_NAME:s,PARTITION_NAME:s,TABLE_ROWS:i" },
+    };
+    int ti = -1;
+    for (size_t i = 0; i < sizeof(T) / sizeof(T[0]); i++) if (!strcmp(up, T[i].name)) ti = (int)i;
+    if (ti < 0) { snprintf(err, errn, "Unknown table '%.64s' in information_schema", table); return false; }
+    TableSchema* ts = is_schema(T[ti].name, T[ti].spec);
+    if (!ts) { snprintf(err, errn, "Out of memory"); return false; }
+    s->is_view = true;
+    s->own_ts = s->ts = ts;
+    ISB b = { s, 0, NULL, 0, true };
+    char buf[128], buf2[64];
+
+    for (int d = 0; d < cat->num_databases && b.ok; d++) {
+        Database* db = &cat->databases[d];
+        if (!is_see(db)) continue;
+        const char* sch = db->name;
+        if (ti == 0) {                                               // SCHEMATA
+            isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, "utf8mb4"); isb_s(&b, "utf8mb4_general_ci"); isb_null(&b); isb_s(&b, "NO"); isb_end(&b);
+            continue;
+        }
+        for (int t = 0; t < db->num_tables && b.ok; t++) {
+            TableSchema* tb = &db->tables[t];
+            switch (ti) {
+                case 1: {                                            // TABLES
+                    isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, tb->name); isb_s(&b, "BASE TABLE");
+                    isb_s(&b, "InnoDB"); isb_i(&b, 10); isb_s(&b, "Dynamic"); isb_i(&b, (long long)tb->num_rows);
+                    isb_i(&b, tb->num_rows ? (long long)tb->num_pages * SV_PAGE_SIZE / (long long)tb->num_rows : 0);
+                    isb_i(&b, (long long)tb->num_pages * SV_PAGE_SIZE); isb_i(&b, 0); isb_i(&b, 0); isb_i(&b, 0);
+                    long long ai = -1;
+                    for (int c = 0; c < tb->num_columns; c++)
+                        if (tb->columns[c].auto_increment) {
+                            MemIndex* ix = mi_get(x, db->name, tb, c);
+                            ai = (ix && ix->has_max ? ix->max_int : 0) + 1;
+                            if (tb->auto_increment > 0 && ai < (long long)tb->auto_increment) ai = (long long)tb->auto_increment;
+                        }
+                    if (ai > 0) isb_i(&b, ai); else isb_null(&b);
+                    isb_null(&b); isb_null(&b); isb_null(&b); isb_s(&b, is_collation(tb)); isb_null(&b); isb_s(&b, "");
+                    isb_s(&b, tb->comment);
+                    isb_end(&b);
+                    break;
+                }
+                case 2:                                              // COLUMNS
+                    for (int c = 0; c < tb->num_columns; c++) {
+                        const Column* col = &tb->columns[c];
+                        isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, tb->name); isb_s(&b, col->name); isb_i(&b, c + 1);
+                        if ((col->default_val[0] || col->has_default) && strcasecmp(col->default_val, "NULL")) isb_s(&b, col->default_val); else isb_null(&b);
+                        isb_s(&b, col->nullable && !col->primary_key ? "YES" : "NO");
+                        is_datatype(col, buf2, sizeof(buf2)); isb_s(&b, buf2);
+                        long long cm = is_char_max(col);
+                        if (cm >= 0) { isb_i(&b, cm); isb_i(&b, cm * 4 > 4294967295LL ? 4294967295LL : cm * 4); } else { isb_null(&b); isb_null(&b); }
+                        if (col->type == SV_TYPE_INT) { isb_i(&b, 10); isb_i(&b, 0); }
+                        else if (col->type == SV_TYPE_BIGINT) { isb_i(&b, 19); isb_i(&b, 0); }
+                        else if (col->type == SV_TYPE_FLOAT) { isb_i(&b, 22); isb_null(&b); }
+                        else if (col->type == SV_TYPE_DECIMAL) { isb_i(&b, col->size > 0 ? col->size : 65); isb_i(&b, col->decimal_prec > 0 ? col->decimal_prec - 1 : 30); }
+                        else if (col->type == SV_TYPE_BOOL) { isb_i(&b, 3); isb_i(&b, 0); }
+                        else { isb_null(&b); isb_null(&b); }
+                        if (col->type == SV_TYPE_DATETIME) isb_i(&b, 0); else isb_null(&b);
+                        if (is_text_col(col)) { isb_s(&b, "utf8mb4"); isb_s(&b, is_collation(tb)); } else { isb_null(&b); isb_null(&b); }
+                        is_coltype(col, buf, sizeof(buf)); isb_s(&b, buf);
+                        isb_s(&b, is_colkey(tb, c));
+                        snprintf(buf, sizeof(buf), "%s%s%s", col->auto_increment ? "auto_increment" : "",
+                                 default_is_now(col->default_val) ? "DEFAULT_GENERATED" : "",
+                                 (col->flags & COLF_ON_UPDATE_NOW) ? (default_is_now(col->default_val) ? " on update CURRENT_TIMESTAMP" : "on update CURRENT_TIMESTAMP") : "");
+                        isb_s(&b, buf);
+                        isb_s(&b, "select,insert,update,references"); isb_s(&b, col->comment); isb_s(&b, ""); isb_null(&b);
+                        isb_end(&b);
+                    }
+                    break;
+                case 3: {                                            // STATISTICS
+                    // chiave primaria e UNIQUE (vincoli), poi gli indici
+                    for (int k = 0; k < tb->num_constraints; k++) {
+                        const Constraint* c = &tb->constraints[k];
+                        if (c->kind != CONS_PRIMARY && c->kind != CONS_UNIQUE) continue;
+                        for (int j = 0; j < c->ncols; j++) {
+                            const Column* col = &tb->columns[c->cols[j]];
+                            isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, tb->name); isb_i(&b, 0); isb_s(&b, sch);
+                            isb_s(&b, c->kind == CONS_PRIMARY ? "PRIMARY" : c->name); isb_i(&b, j + 1); isb_s(&b, col->name);
+                            isb_s(&b, "A"); isb_i(&b, (long long)tb->num_rows); isb_null(&b); isb_null(&b);
+                            isb_s(&b, col->nullable && c->kind != CONS_PRIMARY ? "YES" : ""); isb_s(&b, "BTREE");
+                            isb_s(&b, ""); isb_s(&b, ""); isb_s(&b, "YES"); isb_null(&b);
+                            isb_end(&b);
+                        }
+                    }
+                    for (int i = 0; i < tb->num_indexes; i++) {
+                        const Index* ix = &tb->indexes[i];
+                        int nc = ix->ncols > 0 ? ix->ncols : 1;
+                        for (int j = 0; j < nc; j++) {
+                            const char* cn = ix->ncols > 0 ? ix->cols[j] : ix->col_name;
+                            int ci = catalog_get_col_index(tb, cn);
+                            isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, tb->name); isb_i(&b, ix->unique ? 0 : 1); isb_s(&b, sch);
+                            isb_s(&b, ix->name); isb_i(&b, j + 1); isb_s(&b, cn); isb_s(&b, ix->fulltext ? NULL : "A");
+                            isb_i(&b, (long long)tb->num_rows); isb_null(&b); isb_null(&b);
+                            isb_s(&b, ci >= 0 && tb->columns[ci].nullable ? "YES" : ""); isb_s(&b, ix->fulltext ? "FULLTEXT" : "BTREE");
+                            isb_s(&b, ""); isb_s(&b, ""); isb_s(&b, "YES"); isb_null(&b);
+                            isb_end(&b);
+                        }
+                    }
+                    break;
+                }
+                case 4:                                              // TABLE_CONSTRAINTS
+                    for (int k = 0; k < tb->num_constraints; k++) {
+                        const Constraint* c = &tb->constraints[k];
+                        const char* ty = c->kind == CONS_PRIMARY ? "PRIMARY KEY" : c->kind == CONS_UNIQUE ? "UNIQUE" :
+                                         c->kind == CONS_FOREIGN ? "FOREIGN KEY" : "CHECK";
+                        isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, c->kind == CONS_PRIMARY ? "PRIMARY" : c->name);
+                        isb_s(&b, sch); isb_s(&b, tb->name); isb_s(&b, ty); isb_s(&b, "YES"); isb_end(&b);
+                    }
+                    break;
+                case 5:                                              // KEY_COLUMN_USAGE
+                    for (int k = 0; k < tb->num_constraints; k++) {
+                        const Constraint* c = &tb->constraints[k];
+                        if (c->kind == CONS_CHECK) continue;
+                        for (int j = 0; j < c->ncols; j++) {
+                            isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, c->kind == CONS_PRIMARY ? "PRIMARY" : c->name);
+                            isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, tb->name); isb_s(&b, tb->columns[c->cols[j]].name); isb_i(&b, j + 1);
+                            if (c->kind == CONS_FOREIGN) {
+                                isb_i(&b, j + 1); isb_s(&b, sch); isb_s(&b, c->ref_table);
+                                const char* rc = c->ref_cols[j];
+                                if (!rc[0]) {                       // la chiave primaria della tabella riferita
+                                    TableSchema* rt = catalog_get_table(cat, sch, c->ref_table);
+                                    for (int q = 0; rt && q < rt->num_constraints && !rc[0]; q++)
+                                        if (rt->constraints[q].kind == CONS_PRIMARY && j < rt->constraints[q].ncols) rc = rt->columns[rt->constraints[q].cols[j]].name;
+                                }
+                                isb_s(&b, rc);
+                            } else { isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); }
+                            isb_end(&b);
+                        }
+                    }
+                    break;
+                case 6:                                              // REFERENTIAL_CONSTRAINTS
+                    for (int k = 0; k < tb->num_constraints; k++) {
+                        const Constraint* c = &tb->constraints[k];
+                        if (c->kind != CONS_FOREIGN) continue;
+                        isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, c->name); isb_s(&b, "def"); isb_s(&b, sch);
+                        isb_s(&b, "PRIMARY"); isb_s(&b, "NONE"); isb_s(&b, is_fk_rule(c->on_update)); isb_s(&b, is_fk_rule(c->on_delete));
+                        isb_s(&b, tb->name); isb_s(&b, c->ref_table); isb_end(&b);
+                    }
+                    break;
+                case 7:                                              // CHECK_CONSTRAINTS
+                    for (int k = 0; k < tb->num_constraints; k++) {
+                        const Constraint* c = &tb->constraints[k];
+                        if (c->kind != CONS_CHECK) continue;
+                        isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, c->name); isb_s(&b, c->check); isb_end(&b);
+                    }
+                    break;
+                default: break;
+            }
+        }
+        if (ti == 1)                                                 // TABLES: anche le viste
+            for (int v = 0; v < db->num_views && b.ok; v++) {
+                isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, db->views[v].name); isb_s(&b, "VIEW");
+                isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b);
+                isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b);
+                isb_s(&b, "VIEW"); isb_end(&b);
+            }
+        if (ti == 8)                                                 // VIEWS
+            for (int v = 0; v < db->num_views && b.ok; v++) {
+                isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, db->views[v].name); isb_s(&b, db->views[v].definition);
+                isb_s(&b, "NONE"); isb_s(&b, "NO"); isb_s(&b, "root@localhost"); isb_s(&b, "DEFINER"); isb_s(&b, "utf8mb4");
+                isb_s(&b, "utf8mb4_general_ci"); isb_end(&b);
+            }
+        if (ti == 9)                                                 // TRIGGERS
+            for (int g = 0; g < db->num_triggers && b.ok; g++) {
+                const TriggerSchema* tg = &db->triggers[g];
+                isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, tg->name); isb_s(&b, tg->event); isb_s(&b, "def");
+                isb_s(&b, sch); isb_s(&b, tg->table_name); isb_i(&b, g + 1); isb_null(&b); isb_s(&b, tg->body); isb_s(&b, "ROW");
+                isb_s(&b, tg->before ? "BEFORE" : "AFTER"); isb_null(&b); isb_s(&b, ""); isb_s(&b, "root@localhost"); isb_end(&b);
+            }
+        if (ti == 10)                                                // ROUTINES
+            for (int r = 0; r < db->num_routines && b.ok; r++) {
+                const RoutineSchema* rt = &db->routines[r];
+                isb_row(&b); isb_s(&b, rt->name); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, rt->name);
+                isb_s(&b, rt->is_function ? "FUNCTION" : "PROCEDURE"); isb_s(&b, rt->is_function ? rt->return_type : "");
+                isb_s(&b, "SQL"); isb_s(&b, rt->body); isb_s(&b, "NO"); isb_s(&b, "CONTAINS SQL"); isb_s(&b, "DEFINER");
+                isb_null(&b); isb_null(&b); isb_s(&b, ""); isb_s(&b, ""); isb_s(&b, "root@localhost"); isb_end(&b);
+            }
+    }
+    if (ti == 11) {
+        isb_row(&b); isb_s(&b, "InnoDB"); isb_s(&b, "DEFAULT"); isb_s(&b, "SegVault storage engine (transactions, row data in pages, WAL)");
+        isb_s(&b, "YES"); isb_s(&b, "NO"); isb_s(&b, "YES"); isb_end(&b);
+    }
+    if (ti == 12) {
+        static const char* const CS[][3] = { { "utf8mb4", "utf8mb4_general_ci", "UTF-8 Unicode" }, { "utf8mb3", "utf8mb3_general_ci", "UTF-8 Unicode" },
+                                             { "latin1", "latin1_swedish_ci", "cp1252 West European" }, { "ascii", "ascii_general_ci", "US ASCII" },
+                                             { "binary", "binary", "Binary pseudo charset" } };
+        static const int ML[] = { 4, 3, 1, 1, 1 };
+        for (int i = 0; i < 5; i++) { isb_row(&b); isb_s(&b, CS[i][0]); isb_s(&b, CS[i][1]); isb_s(&b, CS[i][2]); isb_i(&b, ML[i]); isb_end(&b); }
+    }
+    if (ti == 13) {
+        static const char* const CO[][2] = { { "utf8mb4_general_ci", "utf8mb4" }, { "utf8mb4_unicode_ci", "utf8mb4" }, { "utf8mb4_unicode_520_ci", "utf8mb4" },
+                                             { "utf8mb4_0900_ai_ci", "utf8mb4" }, { "utf8mb4_bin", "utf8mb4" }, { "utf8mb3_general_ci", "utf8mb3" },
+                                             { "latin1_swedish_ci", "latin1" }, { "ascii_general_ci", "ascii" }, { "binary", "binary" } };
+        static const int ID[] = { 45, 224, 246, 255, 46, 33, 8, 11, 63 };
+        for (int i = 0; i < 9; i++) {
+            isb_row(&b); isb_s(&b, CO[i][0]); isb_s(&b, CO[i][1]); isb_i(&b, ID[i]);
+            isb_s(&b, (i == 0 || i == 5 || i == 6 || i == 7 || i == 8) ? "Yes" : ""); isb_s(&b, "Yes"); isb_i(&b, 1); isb_s(&b, "PAD SPACE"); isb_end(&b);
+        }
+    }
+    if (!b.ok) { snprintf(err, errn, "Out of memory while reading information_schema"); return false; }
+    ts->num_rows = (uint64_t)s->n;
+    s->loaded = true;
+    return true;
+}
+
 static bool source_open(ExecCtx* x, Database* db, Source* s, const char* table, const char* alias, ASTNode* derived,
                         int depth, const CteScope* scope, char* err, size_t errn) {
     memset(s, 0, sizeof(*s));
@@ -2957,6 +4609,7 @@ static bool source_open(ExecCtx* x, Database* db, Source* s, const char* table, 
                 }
                 return true;
             }
+    if (g_infoschema) return infoschema_open(x, s, table, err, errn);
     if (!db) { snprintf(err, errn, "No database selected"); return false; }
     s->ts = catalog_get_table(x->catalog, db->name, table);
     if (s->ts) return true;
@@ -4250,7 +5903,7 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
         g_sort.keys = st.keys;
         g_sort.nkeys = nkeys;
         g_sort.desc = n->select_stmt.order_desc;
-        long want = apply_order && n->select_stmt.has_limit ? (long)n->select_stmt.offset + n->select_stmt.limit : -1;
+        long want = apply_order && n->select_stmt.has_limit && !n->select_stmt.calc_found ? (long)n->select_stmt.offset + n->select_stmt.limit : -1;
         if (want >= 0 && want < nkeep / 4) {
             // ORDER BY ... LIMIT k: le prime k righe con un heap (O(n log k)), poi si ordinano solo quelle
             int k = (int)want, hn = 0;
@@ -4280,6 +5933,7 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
     }
     int first = 0, count = nkeep;
     if (apply_order) {
+        g_select_total = nkeep;                                  // righe prima di LIMIT (SQL_CALC_FOUND_ROWS)
         first = n->select_stmt.offset < nkeep ? n->select_stmt.offset : nkeep;
         count = nkeep - first;
         if (n->select_stmt.has_limit && n->select_stmt.limit < count) count = n->select_stmt.limit;
@@ -4438,6 +6092,7 @@ static bool query_exec_inner(SelectPlan* p, EvalCtx* outer, int stop_after, ORow
     }
     int first = n->select_stmt.offset < nr ? n->select_stmt.offset : nr;
     int count = nr - first;
+    g_select_total = nr;
     if (n->select_stmt.has_limit && n->select_stmt.limit < count) count = n->select_stmt.limit;
     if (stop_after > 0 && count > stop_after) count = stop_after;
     res->ncols = acc.ncols;
@@ -5468,6 +7123,35 @@ static int cs_apply(ChangeSet* cs, char* msg, size_t mn, const char** fail) {
 }
 
 // righe nuove di un INSERT: CHECK, chiavi, chiavi esterne
+// ultimo conflitto di chiave di un INSERT (per INSERT IGNORE / REPLACE / ON DUPLICATE KEY UPDATE):
+// colonne della chiave e valori della riga proposta (testo; NULL = SQL NULL)
+static _Thread_local struct {
+    bool  set;
+    int   nkey, keycols[SV_MAX_KEY_COLS];
+    int   ncols;
+    char* text[SV_MAX_COLUMNS];
+} g_dup;
+
+static void dup_clear(void) {
+    for (int i = 0; i < g_dup.ncols; i++) { free(g_dup.text[i]); g_dup.text[i] = NULL; }
+    g_dup.ncols = 0;
+    g_dup.set = false;
+}
+
+static void dup_record(const TableSchema* ts, const Tuple* row, const int* cols, int n) {
+    dup_clear();
+    g_dup.set = true;
+    g_dup.nkey = n;
+    for (int k = 0; k < n; k++) g_dup.keycols[k] = cols[k];
+    g_dup.ncols = ts->num_columns;
+    for (int c = 0; c < ts->num_columns; c++) {
+        if (row->values[c].is_null) continue;
+        EvalVal ev;
+        ev_from_value(&ev, &row->values[c], ts->columns[c].type);
+        g_dup.text[c] = strdup(ev_s(&ev));
+    }
+}
+
 static const char* validate_inserts(ExecCtx* ctx, Database* db, TableSchema* ts, Tuple** rows, int nrows, char* msg, size_t mn) {
     Checks ck;
     if (checks_prepare(&ck, ts, msg, mn)) return msg;
@@ -5492,7 +7176,12 @@ static const char* validate_inserts(ExecCtx* ctx, Database* db, TableSchema* ts,
             const RidList* l = mi_lookup(ix, key);
             SMSlot* sl = sm_slot(&batch, key, true);
             if (!sl) { fail = "Out of memory"; break; }
-            if ((l && l->n > 0) || sl->val >= 0) { dup_message(ts, &keys[k], key, msg, mn); fail = msg; break; }
+            if ((l && l->n > 0) || sl->val >= 0) {
+                dup_message(ts, &keys[k], key, msg, mn);
+                dup_record(ts, rows[r], keys[k].cols, keys[k].n);
+                fail = msg;
+                break;
+            }
             sl->val = r;
         }
         sm_free(&batch);
@@ -5810,7 +7499,7 @@ static const char* trig_run(ExecCtx* ctx, TrigScope* sc, TableSchema* ts, TrigSt
                 if (sc->e.err[0]) { snprintf(msg, mn, "%.250s", sc->e.err); return msg; }
                 const char* tx = v2.null ? NULL : ev_s(&v2);     // v2 vive fino a value_set_from_text (che copia)
                 if (tx && check_value(&ts->columns[ci], tx, msg, mn)) return msg;
-                value_set_from_text(&newt->values[ci], ts->columns[ci].type, tx);
+                column_set_from_text(&newt->values[ci], &ts->columns[ci], tx);
                 break;
             }
             case TS_SIGNAL: {
@@ -6240,10 +7929,12 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     for (int i = 0; i < nc; i++) if (ts->columns[i].auto_increment) { ai = i; break; }
     int64_t auto_next = 0;
     int64_t last_generated = 0;     // ultimo valore AUTO_INCREMENT generato (last_insert_id)
+    char now_buf[SV_MAX_COLUMNS][24];  // DEFAULT CURRENT_TIMESTAMP della riga in costruzione (una per colonna)
     if (ai >= 0) {
         MemIndex* ix = mi_get(ctx, db->name, ts, ai);
         if (!ix) { orows_free(&srows); return result_error_msg("Out of memory (AUTO_INCREMENT index)"); }
         auto_next = ix->has_max ? ix->max_int : 0;
+        if (ts->auto_increment > 0 && auto_next < (int64_t)ts->auto_increment - 1) auto_next = (int64_t)ts->auto_increment - 1;
     }
 
     Tuple** tuples = calloc((size_t)(nrows ? nrows : 1), sizeof(Tuple*));
@@ -6294,7 +7985,10 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
         if (fail) break;
         for (int i = 0; i < nc; i++) {
             Column* c = &ts->columns[i];
-            if (!given[i] && c->default_val[0] && strcasecmp(c->default_val, "NULL") != 0) text[i] = c->default_val;
+            if (!given[i] && (c->default_val[0] || c->has_default) && strcasecmp(c->default_val, "NULL") != 0) {
+                if (default_is_now(c->default_val)) { col_now_text(c->default_val, c->type, now_buf[i], sizeof(now_buf[0])); text[i] = now_buf[i]; }
+                else text[i] = c->default_val;
+            }
             if (!given[i] && direct[i]) direct[i] = false;
             if (i == ai && direct[i]) {
                 int64_t x = c->type == SV_TYPE_INT ? dv[i].int_val : dv[i].bigint_val;
@@ -6326,7 +8020,7 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
         if (!tuples[r]) { fail = "Out of memory"; break; }
         for (int i = 0; i < nc; i++) {
             if (direct[i]) tuples[r]->values[i] = dv[i];
-            else value_set_from_text(&tuples[r]->values[i], ts->columns[i].type, text[i]);
+            else column_set_from_text(&tuples[r]->values[i], &ts->columns[i], text[i]);
         }
     }
     // trigger BEFORE (possono cambiare NEW o rifiutare la riga), poi i vincoli: CHECK,
@@ -6498,7 +8192,7 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
                 break;
             }
             if (text && check_value(c, text, msg, sizeof(msg))) { fail = msg; break; }
-            value_set_from_text(&nt[i]->values[ci], c->type, text);
+            column_set_from_text(&nt[i]->values[ci], c, text);
         }
     }
     ec.cur = NULL;
@@ -6669,7 +8363,7 @@ char* executor_create_statement(Catalog* cat, const char* db, const char* table,
         bool pk_here = (inline_pk && inline_pk->cols[0] == i) || (!has_pk_cons && c->primary_key);
         tb_add(&b, "%s\n    %s %s%s%s%s", i ? "," : "", c->name, type, pk_here ? " PRIMARY KEY" : "",
                c->auto_increment ? " AUTO_INCREMENT" : "", (!c->nullable && !c->primary_key) ? " NOT NULL" : "");
-        if (c->default_val[0]) {
+        if (c->default_val[0] || c->has_default) {
             bool num = c->type == SV_TYPE_INT || c->type == SV_TYPE_BIGINT || c->type == SV_TYPE_FLOAT ||
                        c->type == SV_TYPE_DECIMAL || c->type == SV_TYPE_BOOL || !strcasecmp(c->default_val, "NULL");
             tb_add(&b, num ? " DEFAULT %s" : " DEFAULT '%s'", c->default_val);
@@ -6908,12 +8602,15 @@ static QueryResult* exec_show(ExecCtx* ctx, ASTNode* n) {
     if (full || !strcmp(n->select_stmt.table_name, "TABLES")) {     // come MySQL: anche le viste
         Database* db = catalog_current_db(ctx->catalog);
         if (!db) return result_error_msg("No database selected");
-        static const char* const NAMES[] = { "Tables", "Table_type" };
+        char head[80];                                             // come MySQL: Tables_in_<database>
+        snprintf(head, sizeof(head), "Tables_in_%.63s", db->name);
+        const char* NAMES[] = { head, "Table_type" };
         QueryResult* r = text_result(full ? 2 : 1, NAMES);
         int cap = 0;
         for (int i = 0; r && i < db->num_tables + db->num_views; i++) {
             bool view = i >= db->num_tables;
             const char* v[2] = { view ? db->views[i - db->num_tables].name : db->tables[i].name, view ? "VIEW" : "BASE TABLE" };
+            if (n->select_stmt.has_show_like && !like_match_esc(v[0], n->select_stmt.show_like, '\\')) continue;
             if (!text_row(r, &cap, v)) { db_result_free(r); r = NULL; }
         }
         return r ? r : result_error_msg("Out of memory");
@@ -6930,11 +8627,12 @@ static QueryResult* exec_show(ExecCtx* ctx, ASTNode* n) {
         r->num_cols = 1;
         r->col_names = calloc(1, sizeof(char*));
         r->col_names[0] = strdup("Database");
-        r->num_rows = ctx->catalog->num_databases;
-        r->rows = calloc(r->num_rows, sizeof(Row));
-        for (int i = 0; i < r->num_rows; i++) {
+        r->rows = calloc((size_t)ctx->catalog->num_databases + 1, sizeof(Row));
+        r->num_rows = 0;
+        for (int i = 0; i < ctx->catalog->num_databases; i++) {
             const char* v = ctx->catalog->databases[i].name;
-            db_row_set(&r->rows[i], 1, &v, NULL);
+            if (n->select_stmt.has_show_like && !like_match_esc(v, n->select_stmt.show_like, '\\')) continue;
+            db_row_set(&r->rows[r->num_rows++], 1, &v, NULL);
         }
     } else {
         r->num_cols = 1;
@@ -7207,10 +8905,426 @@ static QueryResult* executor_run_impl(ExecCtx* ctx, ASTNode* stmt);
 
 // i testi calcolati restano validi per tutto lo statement (anche dentro i trigger, che
 // rientrano qui): l'arena si libera solo all'uscita dal livello più esterno
+
+
+// ── UPDATE / DELETE con più tabelle, alias, ORDER BY / LIMIT (MySQL) ──
+// 1. per ogni tabella bersaglio una SELECT sulla stessa FROM / WHERE / ORDER BY / LIMIT raccoglie la
+//    chiave (primaria, o tutte le colonne) delle righe da toccare e, per UPDATE, i nuovi valori;
+// 2. poi le righe vengono cancellate / aggiornate per chiave con statement semplici (vincoli, trigger,
+//    chiavi esterne come sempre). Tutte le SELECT vengono prima di ogni modifica, come in MySQL.
+
+static void sql_lit(TextBuf* tb, const char* v) {
+    if (!v) { tb_put(tb, "NULL", 4); return; }
+    tb_put(tb, "'", 1);
+    for (const char* p = v; *p; p++) { if (*p == '\'' || *p == '\\') tb_put(tb, p, 1); tb_put(tb, p, 1); }
+    tb_put(tb, "'", 1);
+}
+
+static void sql_ident(TextBuf* tb, const char* name) {
+    tb_put(tb, "`", 1);
+    for (const char* p = name; *p; p++) { if (*p == '`') tb_put(tb, "`", 1); tb_put(tb, p, 1); }
+    tb_put(tb, "`", 1);
+}
+
+static bool is_from_keyword(const char* w) {
+    static const char* const K[] = { "ON", "USING", "JOIN", "INNER", "LEFT", "RIGHT", "CROSS", "NATURAL", "STRAIGHT_JOIN",
+                                     "OUTER", "WHERE", "FULL", "SET", "ORDER", "LIMIT", "GROUP" };
+    for (size_t i = 0; i < sizeof(K) / sizeof(K[0]); i++) if (!strcasecmp(w, K[i])) return true;
+    return false;
+}
+
+// coppie alias -> tabella della clausola FROM (testo); un nome senza alias è alias di sé stesso
+static int from_aliases(const char* from, char out[][2][SV_MAX_NAME_LEN], int max) {
+    TokenList* tk = lexer_tokenize(from);
+    if (!tk) return 0;
+    int n = 0, depth = 0;
+    bool expect_table = true;
+    for (int i = 0; i < tk->count && n < max; i++) {
+        Token* t = &tk->tokens[i];
+        if (t->type == TOK_EOF) break;
+        if (t->type == TOK_LPAREN) { depth++; continue; }
+        if (t->type == TOK_RPAREN) { depth--; continue; }
+        if (depth > 0) continue;
+        if (t->type == TOK_COMMA || t->type == TOK_JOIN) { expect_table = true; continue; }
+        if (!expect_table || t->type != TOK_IDENTIFIER || is_from_keyword(t->text)) continue;
+        expect_table = false;
+        int j = i;
+        if (j + 2 < tk->count && tk->tokens[j + 1].type == TOK_DOT && tk->tokens[j + 2].type == TOK_IDENTIFIER) j += 2;   // db.tabella
+        snprintf(out[n][1], SV_MAX_NAME_LEN, "%s", tk->tokens[j].text);
+        snprintf(out[n][0], SV_MAX_NAME_LEN, "%s", tk->tokens[j].text);
+        int k = j + 1;
+        if (k < tk->count && tk->tokens[k].type == TOK_AS) k++;
+        if (k < tk->count && tk->tokens[k].type == TOK_IDENTIFIER && !is_from_keyword(tk->tokens[k].text)) {
+            snprintf(out[n][0], SV_MAX_NAME_LEN, "%s", tk->tokens[k].text);
+            j = k;
+        }
+        n++;
+        i = j;
+    }
+    lexer_free(tk);
+    return n;
+}
+
+static QueryResult* run_sql_select(ExecCtx* ctx, const char* sql) {
+    TokenList* tk = lexer_tokenize(sql);
+    ParseResult* pr = tk ? parser_parse(tk) : NULL;
+    QueryResult* r;
+    if (!pr || !pr->success || pr->count != 1) r = result_error_msg(pr && pr->error[0] ? pr->error : "Out of memory");
+    else r = run_select_ex(ctx, pr->statements[0], 0, false, false);
+    if (pr) parse_result_free(pr);
+    if (tk) lexer_free(tk);
+    return r;
+}
+
+static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n);
+static QueryResult* exec_delete(ExecCtx* ctx, ASTNode* n);
+
+static QueryResult* run_sql_dml(ExecCtx* ctx, const char* sql) {
+    TokenList* tk = lexer_tokenize(sql);
+    ParseResult* pr = tk ? parser_parse(tk) : NULL;
+    QueryResult* r;
+    if (!pr || !pr->success || pr->count != 1) r = result_error_msg(pr && pr->error[0] ? pr->error : "Out of memory");
+    else r = pr->statements[0]->type == NODE_DELETE ? exec_delete(ctx, pr->statements[0]) : exec_update(ctx, pr->statements[0]);
+    if (pr) parse_result_free(pr);
+    if (tk) lexer_free(tk);
+    return r;
+}
+
+typedef struct {
+    char         alias[SV_MAX_NAME_LEN];
+    char         table[SV_MAX_NAME_LEN];
+    int          idcols[SV_MAX_COLUMNS];   // colonne che identificano la riga
+    int          nid;
+    int          sets[SV_MAX_SETS];        // UPDATE: indici in n->update_stmt (colonne di questa tabella)
+    int          nsets;
+    QueryResult* rows;
+} DmlTarget;
+
+static QueryResult* exec_dml_multi(ExecCtx* ctx, ASTNode* n) {
+    bool del = n->type == NODE_DELETE;
+    Database* db = catalog_current_db(ctx->catalog);
+    if (!db) return result_error_msg("No database selected");
+    const char* from = del ? n->delete_stmt.multi_from : n->update_stmt.multi_from;
+    const char* where = del ? n->delete_stmt.multi_where : n->update_stmt.multi_where;
+    const char* ol = del ? n->delete_stmt.order_limit : n->update_stmt.order_limit;
+    char al[16][2][SV_MAX_NAME_LEN];
+    int nal = from_aliases(from, al, 16);
+    if (nal == 0) return result_error_msg("No table in the FROM clause");
+    if (ol && nal > 1) return result_error_msg("ORDER BY / LIMIT cannot be used with more than one table (as in MySQL)");
+    DmlTarget tg[8];
+    int ntg = 0;
+    char msg[400];
+    // tabelle bersaglio
+    if (del) {
+        for (int i = 0; i < n->delete_stmt.num_targets && ntg < 8; i++) {
+            memset(&tg[ntg], 0, sizeof(tg[ntg]));
+            snprintf(tg[ntg].alias, sizeof(tg[ntg].alias), "%s", n->delete_stmt.targets[i]);
+            ntg++;
+        }
+    } else {
+        for (int k = 0; k < n->update_stmt.num_sets; k++) {
+            const char* q = n->update_stmt.set_tables[k][0] ? n->update_stmt.set_tables[k] : al[0][0];
+            if (!q[0] || nal == 1) q = al[0][0];
+            int f = -1;
+            for (int i = 0; i < ntg; i++) if (!strcasecmp(tg[i].alias, q)) f = i;
+            if (f < 0) {
+                if (ntg >= 8) return result_error_msg("Too many tables in UPDATE");
+                memset(&tg[ntg], 0, sizeof(tg[ntg]));
+                snprintf(tg[ntg].alias, sizeof(tg[ntg].alias), "%s", q);
+                f = ntg++;
+            }
+            tg[f].sets[tg[f].nsets++] = k;
+        }
+    }
+    for (int i = 0; i < ntg; i++) {
+        int a = -1;
+        for (int k = 0; k < nal; k++) if (!strcasecmp(al[k][0], tg[i].alias)) a = k;
+        if (a < 0) for (int k = 0; k < nal; k++) if (!strcasecmp(al[k][1], tg[i].alias)) a = k;
+        if (a < 0) { snprintf(msg, sizeof(msg), "Unknown table '%.64s' in %s", tg[i].alias, del ? "DELETE" : "UPDATE"); return result_error_msg(msg); }
+        snprintf(tg[i].alias, sizeof(tg[i].alias), "%s", al[a][0]);
+        snprintf(tg[i].table, sizeof(tg[i].table), "%s", al[a][1]);
+        TableSchema* ts = catalog_get_table(ctx->catalog, db->name, tg[i].table);
+        if (!ts) { snprintf(msg, sizeof(msg), "Table '%.64s' not found", tg[i].table); return result_error_msg(msg); }
+        for (int k = 0; k < ts->num_constraints && !tg[i].nid; k++)
+            if (ts->constraints[k].kind == CONS_PRIMARY)
+                for (int j = 0; j < ts->constraints[k].ncols; j++) tg[i].idcols[tg[i].nid++] = ts->constraints[k].cols[j];
+        if (!tg[i].nid) for (int c = 0; c < ts->num_columns; c++) if (ts->columns[c].primary_key) tg[i].idcols[tg[i].nid++] = c;
+        if (!tg[i].nid) for (int c = 0; c < ts->num_columns; c++) tg[i].idcols[tg[i].nid++] = c;
+        for (int s = 0; s < tg[i].nsets; s++)
+            if (catalog_get_col_index(ts, n->update_stmt.set_cols[tg[i].sets[s]]) < 0)
+                return unknown_column_error(n->update_stmt.set_cols[tg[i].sets[s]], "UPDATE");
+    }
+    // 1. le righe da toccare (tutte prima di cambiare qualcosa)
+    QueryResult* fail = NULL;
+    for (int i = 0; i < ntg && !fail; i++) {
+        TableSchema* ts = catalog_get_table(ctx->catalog, db->name, tg[i].table);
+        TextBuf q = {0};
+        tb_put(&q, "SELECT ", 7);
+        for (int k = 0; k < tg[i].nid; k++) {
+            if (k) tb_put(&q, ", ", 2);
+            sql_ident(&q, tg[i].alias);
+            tb_put(&q, ".", 1);
+            sql_ident(&q, ts->columns[tg[i].idcols[k]].name);
+        }
+        for (int s = 0; s < tg[i].nsets; s++) {
+            const char* t = n->update_stmt.set_texts[tg[i].sets[s]];
+            tb_put(&q, ", (", 3);
+            tb_put(&q, t ? t : "NULL", strlen(t ? t : "NULL"));
+            tb_put(&q, ")", 1);
+        }
+        tb_put(&q, " FROM ", 6);
+        tb_put(&q, from, strlen(from));
+        if (where) { tb_put(&q, " WHERE ", 7); tb_put(&q, where, strlen(where)); }
+        if (ol) { tb_put(&q, " ", 1); tb_put(&q, ol, strlen(ol)); }
+        tb_put(&q, "", 1);
+        if (q.err) { free(q.d); fail = result_error_msg("Out of memory"); break; }
+        tg[i].rows = run_sql_select(ctx, q.d);
+        free(q.d);
+        if (!tg[i].rows || !tg[i].rows->success) { fail = tg[i].rows; tg[i].rows = NULL; }
+    }
+    // 2. le modifiche, per chiave
+    long long affected = 0;
+    for (int i = 0; i < ntg && !fail; i++) {
+        TableSchema* ts = catalog_get_table(ctx->catalog, db->name, tg[i].table);
+        QueryResult* r = tg[i].rows;
+        StrMap seen = {0};
+        bool single = tg[i].nid == 1;
+        TextBuf batch = {0};
+        int inb = 0;
+        for (int row = 0; row <= r->num_rows && !fail; row++) {
+            bool flush = row == r->num_rows || (del && single && inb >= 500);
+            if (flush && inb) {                                    // DELETE ... WHERE id IN (...)
+                tb_put(&batch, ")", 1);
+                tb_put(&batch, "", 1);
+                QueryResult* d = batch.err ? result_error_msg("Out of memory") : run_sql_dml(ctx, batch.d);
+                free(batch.d);
+                memset(&batch, 0, sizeof(batch));
+                inb = 0;
+                if (!d || !d->success) { fail = d ? d : result_error_msg("Out of memory"); break; }
+                affected += d->rows_affected;
+                db_result_free(d);
+            }
+            if (row == r->num_rows) break;
+            const Row* rw = &r->rows[row];
+            // una riga legata a più righe delle altre tabelle si tocca una volta sola
+            TextBuf key = {0};
+            for (int k = 0; k < tg[i].nid; k++) {
+                const Cell* cl = &rw->cells[k];
+                tb_put(&key, cl->is_null ? "\x01" : cl->value, strlen(cl->is_null ? "\x01" : cl->value));
+                tb_put(&key, "\x02", 1);
+            }
+            tb_put(&key, "", 1);
+            char kb[KEY_BUF];
+            key_text(kb, sizeof(kb), key.d ? key.d : "");
+            free(key.d);
+            SMSlot* sl = sm_slot(&seen, kb, true);
+            if (!sl) { fail = result_error_msg("Out of memory"); break; }
+            if (sl->val >= 0) continue;
+            sl->val = 1;
+            if (del && single) {
+                if (!inb) { tb_put(&batch, "DELETE FROM ", 12); sql_ident(&batch, ts->name); tb_put(&batch, " WHERE ", 7); sql_ident(&batch, ts->columns[tg[i].idcols[0]].name); tb_put(&batch, " IN (", 5); }
+                else tb_put(&batch, ", ", 2);
+                sql_lit(&batch, rw->cells[0].is_null ? NULL : rw->cells[0].value);
+                inb++;
+                continue;
+            }
+            TextBuf st = {0};
+            if (del) { tb_put(&st, "DELETE FROM ", 12); sql_ident(&st, ts->name); }
+            else {
+                tb_put(&st, "UPDATE ", 7);
+                sql_ident(&st, ts->name);
+                tb_put(&st, " SET ", 5);
+                for (int s = 0; s < tg[i].nsets; s++) {
+                    if (s) tb_put(&st, ", ", 2);
+                    sql_ident(&st, n->update_stmt.set_cols[tg[i].sets[s]]);
+                    tb_put(&st, " = ", 3);
+                    const Cell* cl = &rw->cells[tg[i].nid + s];
+                    sql_lit(&st, cl->is_null ? NULL : cl->value);
+                }
+            }
+            tb_put(&st, " WHERE ", 7);
+            for (int k = 0; k < tg[i].nid; k++) {
+                if (k) tb_put(&st, " AND ", 5);
+                sql_ident(&st, ts->columns[tg[i].idcols[k]].name);
+                const Cell* cl = &rw->cells[k];
+                if (cl->is_null) tb_put(&st, " IS NULL", 8);
+                else { tb_put(&st, " = ", 3); sql_lit(&st, cl->value); }
+            }
+            tb_put(&st, "", 1);
+            QueryResult* d = st.err ? result_error_msg("Out of memory") : run_sql_dml(ctx, st.d);
+            free(st.d);
+            if (!d || !d->success) { fail = d ? d : result_error_msg("Out of memory"); break; }
+            affected += d->rows_affected;
+            db_result_free(d);
+            ts = catalog_get_table(ctx->catalog, db->name, tg[i].table);
+        }
+        free(batch.d);
+        sm_free(&seen);
+    }
+    for (int i = 0; i < ntg; i++) db_result_free(tg[i].rows);
+    if (fail) return fail;
+    snprintf(msg, sizeof(msg), "%lld", affected);
+    return result_ok_msg((int)affected);
+}
+
+// ── INSERT IGNORE / REPLACE / ON DUPLICATE KEY UPDATE (MySQL) ──
+// Le righe vanno una alla volta come INSERT normali (trigger, vincoli, AUTO_INCREMENT come sempre);
+// una riga respinta per una chiave duplicata viene saltata (IGNORE), sostituisce le righe in
+// conflitto (REPLACE) o aggiorna la riga esistente (ON DUPLICATE KEY UPDATE, con VALUES(col)).
+
+static ASTExpr* lit_expr(const char* text) {
+    ASTExpr* e = calloc(1, sizeof(ASTExpr));
+    if (!e) return NULL;
+    if (!text) { e->type = EXPR_NULL; return e; }
+    e->type = EXPR_STRING;
+    e->str_val = strdup(text);
+    if (!e->str_val) { free(e); return NULL; }
+    return e;
+}
+
+// VALUES(col) e alias.col -> il valore proposto per col
+static ASTExpr* dup_subst(ASTExpr* e, const TableSchema* ts, const char* alias) {
+    if (!e) return NULL;
+    if (e->type == EXPR_FUNC && !strcmp(e->func, "VALUES") && e->nargs == 1 && e->args[0]->type == EXPR_COLUMN) {
+        int ci = catalog_get_col_index((TableSchema*)ts, e->args[0]->col_name);
+        if (ci >= 0) { ASTExpr* l = lit_expr(ci < g_dup.ncols ? g_dup.text[ci] : NULL); ast_expr_free(e); return l; }
+    }
+    if (e->type == EXPR_COLUMN && alias[0] && !strcasecmp(e->table_name, alias)) {
+        int ci = catalog_get_col_index((TableSchema*)ts, e->col_name);
+        if (ci >= 0) { ASTExpr* l = lit_expr(ci < g_dup.ncols ? g_dup.text[ci] : NULL); ast_expr_free(e); return l; }
+    }
+    e->left = dup_subst(e->left, ts, alias);
+    e->right = dup_subst(e->right, ts, alias);
+    for (int i = 0; i < e->nargs; i++) e->args[i] = dup_subst(e->args[i], ts, alias);
+    return e;
+}
+
+// WHERE chiave = valori della riga in conflitto
+static ASTExpr* dup_where(const TableSchema* ts, char* err, size_t errn) {
+    char sql[4096];
+    size_t o = 0;
+    for (int k = 0; k < g_dup.nkey && o < sizeof(sql) - 200; k++) {
+        int ci = g_dup.keycols[k];
+        const char* v = ci < g_dup.ncols ? g_dup.text[ci] : NULL;
+        o += (size_t)snprintf(sql + o, sizeof(sql) - o, "%s`%s` = '", k ? " AND " : "", ts->columns[ci].name);
+        for (const char* q = v ? v : ""; *q && o < sizeof(sql) - 8; q++) {
+            if (*q == '\'' || *q == '\\') sql[o++] = *q;
+            sql[o++] = *q;
+        }
+        o += (size_t)snprintf(sql + o, sizeof(sql) - o, "'");
+    }
+    TokenList* tk = lexer_tokenize(sql);
+    ASTExpr* e = tk ? parser_parse_expr(tk, err, errn) : NULL;
+    if (tk) lexer_free(tk);
+    return e;
+}
+
+static QueryResult* exec_insert_mysql(ExecCtx* ctx, ASTNode* n) {
+    Database* db = catalog_current_db(ctx->catalog);
+    if (!db) return result_error_msg("No database selected");
+    TableSchema* ts = catalog_get_table(ctx->catalog, db->name, n->insert_stmt.table_name);
+    if (!ts) return exec_insert(ctx, n);                         // il messaggio giusto lo dà exec_insert
+    char tsname[SV_MAX_NAME_LEN];
+    snprintf(tsname, sizeof(tsname), "%s", ts->name);
+    // righe: i VALUES, o il risultato della SELECT trasformato in letterali
+    ASTExpr** vals = n->insert_stmt.values;
+    int nrows = n->insert_stmt.num_rows, nv = n->insert_stmt.num_values;
+    ASTExpr** owned = NULL;
+    if (n->insert_stmt.select) {
+        QueryResult* sr = run_select_ex(ctx, n->insert_stmt.select, 0, false, false);
+        if (!sr || !sr->success) return sr ? sr : result_error_msg("Out of memory");
+        nrows = sr->num_rows;
+        nv = sr->num_cols;
+        owned = calloc((size_t)(nrows * nv) + 1, sizeof(ASTExpr*));
+        for (int r = 0; owned && r < nrows; r++)
+            for (int c = 0; c < nv; c++) {
+                const Cell* cell = &sr->rows[r].cells[c];
+                owned[r * nv + c] = lit_expr(cell->is_null ? NULL : cell->value);
+            }
+        db_result_free(sr);
+        if (!owned) return result_error_msg("Out of memory");
+        vals = owned;
+    }
+    long long affected = 0;
+    int64_t last_id = 0;
+    QueryResult* fail = NULL;
+    for (int i = 0; i < nrows && !fail; i++) {
+        ASTNode one = *n;                                        // copia superficiale: niente da liberare
+        one.insert_stmt.select = NULL;
+        one.insert_stmt.values = vals + (size_t)i * (size_t)nv;
+        one.insert_stmt.num_rows = 1;
+        one.insert_stmt.num_values = nv;
+        one.insert_stmt.mode = INS_NORMAL;
+        one.insert_stmt.num_dup = 0;
+        for (int attempt = 0; attempt < SV_MAX_CONSTRAINTS + 2 && !fail; attempt++) {
+            dup_clear();
+            QueryResult* r = exec_insert(ctx, &one);
+            if (r && r->success) {
+                affected += r->rows_affected;
+                if (r->last_insert_id) last_id = r->last_insert_id;
+                db_result_free(r);
+                break;
+            }
+            if (!r || !g_dup.set || (n->insert_stmt.mode == INS_NORMAL && n->insert_stmt.num_dup == 0)) { fail = r ? r : result_error_msg("Out of memory"); break; }
+            db_result_free(r);
+            if (n->insert_stmt.mode == INS_IGNORE && n->insert_stmt.num_dup == 0) break;      // riga saltata
+            char err[300] = "";
+            ASTExpr* where = dup_where(ts, err, sizeof(err));
+            if (!where) { fail = result_error_msg(err[0] ? err : "Out of memory"); break; }
+            ASTNode op;
+            memset(&op, 0, sizeof(op));
+            if (n->insert_stmt.mode == INS_REPLACE) {            // via le righe in conflitto, poi di nuovo l'INSERT
+                op.type = NODE_DELETE;
+                snprintf(op.delete_stmt.table_name, sizeof(op.delete_stmt.table_name), "%s", tsname);
+                op.delete_stmt.where = where;
+                QueryResult* d = exec_delete(ctx, &op);
+                ast_expr_free(where);
+                if (!d || !d->success) { fail = d ? d : result_error_msg("Out of memory"); break; }
+                affected += d->rows_affected;
+                db_result_free(d);
+                continue;
+            }
+            op.type = NODE_UPDATE;                               // ON DUPLICATE KEY UPDATE
+            snprintf(op.update_stmt.table_name, sizeof(op.update_stmt.table_name), "%s", tsname);
+            op.update_stmt.where = where;
+            op.update_stmt.num_sets = n->insert_stmt.num_dup;
+            for (int k = 0; k < n->insert_stmt.num_dup; k++) {
+                snprintf(op.update_stmt.set_cols[k], sizeof(op.update_stmt.set_cols[k]), "%s", n->insert_stmt.dup_cols[k]);
+                op.update_stmt.set_exprs[k] = dup_subst(ast_expr_clone(n->insert_stmt.dup_exprs[k]), ts, n->insert_stmt.row_alias);
+            }
+            QueryResult* u = exec_update(ctx, &op);
+            for (int k = 0; k < op.update_stmt.num_sets; k++) ast_expr_free(op.update_stmt.set_exprs[k]);
+            ast_expr_free(where);
+            if (!u || !u->success) { fail = u ? u : result_error_msg("Out of memory"); break; }
+            affected += u->rows_affected > 0 ? 2 : 0;            // come MySQL: 2 = riga esistente aggiornata
+            db_result_free(u);
+            break;
+        }
+        ts = catalog_get_table(ctx->catalog, db->name, tsname);
+        if (!ts) break;
+    }
+    dup_clear();
+    if (owned) { for (int i = 0; i < nrows * nv; i++) ast_expr_free(owned[i]); free(owned); }
+    if (fail) return fail;
+    QueryResult* ok = result_ok_msg((int)affected);
+    if (ok && last_id > 0 && last_id <= INT32_MAX) ok->last_insert_id = (int)last_id;
+    return ok;
+}
+
 QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt) {
     g_run_depth++;
+    g_select_total = -1;
     QueryResult* r = executor_run_impl(ctx, stmt);
-    if (--g_run_depth == 0) arena_free(&g_text_arena);
+    if (--g_run_depth == 0) {
+        arena_free(&g_text_arena);
+        // FOUND_ROWS() e ROW_COUNT() riguardano lo statement di primo livello (come in MySQL)
+        if (r && r->success && stmt->type == NODE_SELECT)
+            g_found_rows = stmt->select_stmt.calc_found && g_select_total >= 0 ? g_select_total : r->num_rows;
+        if (r && r->success) {
+            bool dml = stmt->type == NODE_INSERT || stmt->type == NODE_UPDATE || stmt->type == NODE_DELETE;
+            g_row_count = dml ? r->rows_affected : stmt->type == NODE_SELECT ? -1 : 0;
+        }
+    }
     return r;
 }
 
@@ -7224,10 +9338,11 @@ static QueryResult* executor_run_impl(ExecCtx* ctx, ASTNode* stmt) {
         case NODE_CREATE_TABLE: return exec_create_table(ctx, stmt);
         case NODE_DROP_TABLE:   return exec_drop_table(ctx, stmt);
         case NODE_ALTER_TABLE:  return exec_alter_table(ctx, stmt);
-        case NODE_INSERT:       return exec_insert(ctx, stmt);
+        case NODE_INSERT:       return stmt->insert_stmt.mode != INS_NORMAL || stmt->insert_stmt.num_dup > 0 ?
+                                       exec_insert_mysql(ctx, stmt) : exec_insert(ctx, stmt);
         case NODE_SELECT:       return run_select(ctx, stmt, 0, false);
-        case NODE_UPDATE:       return exec_update(ctx, stmt);
-        case NODE_DELETE:       return exec_delete(ctx, stmt);
+        case NODE_UPDATE:       return stmt->update_stmt.multi_from ? exec_dml_multi(ctx, stmt) : exec_update(ctx, stmt);
+        case NODE_DELETE:       return stmt->delete_stmt.multi_from ? exec_dml_multi(ctx, stmt) : exec_delete(ctx, stmt);
         case NODE_USE:          return exec_use(ctx, stmt);
         case NODE_SHOW:         return exec_show(ctx, stmt);
         case NODE_DESCRIBE:     return exec_describe(ctx, stmt);

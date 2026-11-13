@@ -253,7 +253,11 @@ static QueryResult* exec_atomic(ASTNode* stmt) {
     Database* db = catalog_current_db(g_db.catalog);
     bool dml = stmt->type == NODE_INSERT || stmt->type == NODE_UPDATE || stmt->type == NODE_DELETE;
     // CALL: la procedura è atomica come uno statement (se un'istruzione fallisce si annulla tutto)
-    if (stmt->type != NODE_CALL && (!dml || !db || db->num_triggers == 0)) return executor_run(&g_db.exec_ctx, stmt);
+    // INSERT IGNORE / REPLACE / ON DUPLICATE KEY UPDATE: più passi (INSERT, DELETE, UPDATE) per uno statement
+    bool mysql_insert = (stmt->type == NODE_INSERT && (stmt->insert_stmt.mode != INS_NORMAL || stmt->insert_stmt.num_dup > 0)) ||
+                        (stmt->type == NODE_UPDATE && stmt->update_stmt.multi_from) ||
+                        (stmt->type == NODE_DELETE && stmt->delete_stmt.multi_from);
+    if (stmt->type != NODE_CALL && !mysql_insert && (!dml || !db || db->num_triggers == 0)) return executor_run(&g_db.exec_ctx, stmt);
     if (!g_db.exec_ctx.tx_id) {
         if (!db_begin()) return executor_run(&g_db.exec_ctx, stmt);
         QueryResult* r = executor_run(&g_db.exec_ctx, stmt);
@@ -270,8 +274,14 @@ static QueryResult* exec_atomic(ASTNode* stmt) {
 }
 
 // database di uno statement con nomi qualificati (shop.prodotto): indice, o -1 con un messaggio
+#define QUAL_INFOSCHEMA (-3)   // information_schema.x: tabelle virtuali del catalogo
+
 static int qual_db_index(const ASTNode* stmt, int cur, char* err, size_t errn) {
     if (!stmt->qual_db[0]) return cur;
+    if (!strcasecmp(stmt->qual_db, "information_schema")) {
+        if (stmt->type != NODE_SELECT && stmt->type != NODE_EXPLAIN) { snprintf(err, errn, "information_schema is read-only"); return -1; }
+        return QUAL_INFOSCHEMA;
+    }
     int q = -1;
     for (int i = 0; i < g_db.catalog->num_databases; i++)
         if (!strcasecmp(g_db.catalog->databases[i].name, stmt->qual_db)) q = i;
@@ -285,6 +295,8 @@ static int qual_db_index(const ASTNode* stmt, int cur, char* err, size_t errn) {
 }
 
 static QueryResult* exec_one_in(ASTNode* stmt);
+static _Thread_local char g_see_user[64];
+static bool see_db_of_session(const char* db) { return auth_can_see_db(g_see_user[0] ? g_see_user : g_session_user, db); }
 static bool db_backup_impl(const char* dir, char* err, size_t errn);
 
 // statement con shop.prodotto: gira nel database shop (solo per questo statement e questo thread)
@@ -294,6 +306,20 @@ static QueryResult* exec_one(ASTNode* stmt) {
     Database* cur = catalog_current_db(g_db.catalog);
     int ci = cur ? (int)(cur - g_db.catalog->databases) : -1;
     int q = qual_db_index(stmt, ci, err, sizeof(err));
+    if (q == QUAL_INFOSCHEMA) {                          // tutti la leggono; ognuno vede i suoi database
+        executor_set_infoschema(true);
+        executor_set_db_filter(g_session_user[0] ? see_db_of_session : NULL);
+        char saved[64];
+        snprintf(saved, sizeof(saved), "%s", g_session_user);
+        snprintf(g_see_user, sizeof(g_see_user), "%s", saved);   // il filtro usa l'utente vero
+        g_session_user[0] = '\0';                        // niente controllo dei permessi sulle tabelle virtuali
+        QueryResult* r = exec_one_in(stmt);
+        snprintf(g_session_user, sizeof(g_session_user), "%s", saved);
+        g_see_user[0] = '\0';
+        executor_set_infoschema(false);
+        executor_set_db_filter(NULL);
+        return r;
+    }
     if (q < 0) return result_error(err);
     if (q == ci) return exec_one_in(stmt);
     int prev = catalog_get_thread_db();
@@ -1198,14 +1224,21 @@ QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char
     bool ok = parsed && parsed->success && parsed->count == 1 && parsed->statements[0]->type == NODE_SELECT &&
               (!dbname || !dbname[0] || idx >= 0) && (!user || !user[0] || auth_user_exists(user));
     char err[300];
+    bool infos = false;
     if (ok && parsed->statements[0]->qual_db[0]) {           // shop.prodotto: il database dello statement
         int q = qual_db_index(parsed->statements[0], idx, err, sizeof(err));
-        if (q < 0) ok = false;                               // l'errore lo dà la via normale
+        if (q == QUAL_INFOSCHEMA) infos = true;
+        else if (q < 0) ok = false;                          // l'errore lo dà la via normale
         else idx = q;
     }
     if (ok) {
         const char* dn = idx >= 0 ? g_db.catalog->databases[idx].name : "";
-        if (user && user[0] && !auth_check(user, parsed->statements[0], dn, err, sizeof(err))) r = result_error(err);
+        if (infos) {
+            executor_set_infoschema(true);
+            snprintf(g_see_user, sizeof(g_see_user), "%s", user ? user : "");
+            executor_set_db_filter(user && user[0] ? see_db_of_session : NULL);
+        }
+        if (!infos && user && user[0] && !auth_check(user, parsed->statements[0], dn, err, sizeof(err))) r = result_error(err);
         else {
             catalog_set_thread_db(idx);
             sv_scan_set_deadline(timeout_ms > 0 ? t0 + timeout_ms : 0);
@@ -1215,6 +1248,9 @@ QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char
             bool late = timeout_ms > 0 && get_time_ms() > t0 + timeout_ms && (!r || !r->success);
             sv_scan_set_deadline(0);
             catalog_set_thread_db(-2);
+            executor_set_infoschema(false);
+            executor_set_db_filter(NULL);
+            g_see_user[0] = '\0';
             if (late || !r) {
                 if (r) db_result_free(r);
                 r = result_error(late ? "Query cancelled: time limit reached" : "Out of memory");

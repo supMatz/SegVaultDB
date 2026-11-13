@@ -32,6 +32,11 @@ QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt);
 // scarta gli indici in memoria (da chiamare dopo ROLLBACK o modifiche alle pagine fuori dall'executor)
 void executor_invalidate_indexes(void);
 
+// information_schema: lo statement (di questo thread) legge le tabelle virtuali del catalogo;
+// see (NULL = tutto) dice quali database mostrare all'utente
+void executor_set_infoschema(bool on);
+void executor_set_db_filter(bool (*see)(const char* db));
+
 // CREATE TABLE della tabella (with_fk: con le chiavi esterne) e ALTER TABLE per le sue chiavi
 // esterne; stringhe da liberare con free
 char* executor_create_statement(Catalog* cat, const char* db, const char* table, bool with_fk);

@@ -440,10 +440,15 @@ static bool next_is(ParserState* ps, int ahead, TokenType tt) {
 
 static ASTExpr* parse_expr(ParserState* ps);
 static ASTExpr* parse_additive(ParserState* ps);
+static ASTExpr* mkfunc2(const char* name, ASTExpr* a, ASTExpr* b);
+static bool is_interval(const ASTExpr* e);
+static bool peek2_ident(ParserState* ps, const char* w);
 static ASTExpr* parse_match(ParserState* ps);
 
 
 static bool ident_is(ParserState* ps, const char* word);
+static bool word_is(ParserState* ps, const char* word);
+static bool tokens_text(ParserState* ps, int from, int to, char* out, size_t cap);
 
 // testo di un frame: "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW"
 void frame_text(const WindowSpec* w, char* buf, size_t n) {
@@ -644,6 +649,274 @@ static ASTExpr* parse_call(ParserState* ps) {
     return e;
 }
 
+
+// funzione con due argomenti già analizzati (NULL se manca memoria: gli argomenti vengono liberati)
+static ASTExpr* mkfunc2(const char* name, ASTExpr* a, ASTExpr* b) {
+    ASTExpr* f = new_expr(EXPR_FUNC);
+    if (!f || !a || !b) { ast_expr_free(f); ast_expr_free(a); ast_expr_free(b); return NULL; }
+    snprintf(f->func, sizeof(f->func), "%s", name);
+    f->args = calloc(2, sizeof(ASTExpr*));
+    if (!f->args) { ast_expr_free(f); ast_expr_free(a); ast_expr_free(b); return NULL; }
+    f->args[0] = a;
+    f->args[1] = b;
+    f->nargs = 2;
+    f->depth = (a->depth > b->depth ? a->depth : b->depth) + 1;
+    return f;
+}
+
+// aggiunge un terzo argomento a una funzione di mkfunc2
+static ASTExpr* add_arg(ASTExpr* f, ASTExpr* x) {
+    if (!f || !x) { ast_expr_free(f); ast_expr_free(x); return NULL; }
+    ASTExpr** na = realloc(f->args, (size_t)(f->nargs + 1) * sizeof(ASTExpr*));
+    if (!na) { ast_expr_free(f); ast_expr_free(x); return NULL; }
+    f->args = na;
+    f->args[f->nargs++] = x;
+    if (x->depth + 1 > f->depth) f->depth = x->depth + 1;
+    return f;
+}
+
+static ASTExpr* mkstr(const char* text) {
+    ASTExpr* e = new_expr(EXPR_STRING);
+    if (e && !(e->str_val = strdup(text))) { free(e); return NULL; }
+    return e;
+}
+
+static bool is_interval(const ASTExpr* e) { return e->type == EXPR_FUNC && !strcmp(e->func, "__INTERVAL"); }
+
+// unità di INTERVAL / EXTRACT / TIMESTAMPDIFF (DAY, HOUR, DAY_HOUR, ...): testo maiuscolo
+static bool parse_unit(ParserState* ps, char* out, size_t n) {
+    Token u = consume(ps);
+    if (u.type != TOK_IDENTIFIER && u.type != TOK_STRING) { parse_fail(ps, "Expected a time unit (DAY, HOUR, ...)", u); return false; }
+    copy_text(ps, out, n, u.text);
+    for (char* q = out; *q; q++) *q = (char)toupper((unsigned char)*q);
+    return true;
+}
+
+static ASTExpr* parse_unary(ParserState* ps);
+
+// forme di MySQL con parole chiave fra gli argomenti; NULL (posizione invariata) se non è una di queste
+static ASTExpr* parse_special_form(ParserState* ps) {
+    Token t = peek(ps);
+    if (t.type != TOK_IDENTIFIER || !t.text) return NULL;
+    const char* w = t.text;
+    bool call = next_is(ps, 1, TOK_LPAREN);
+    static const char* const NOW_WORDS[] = { "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME", "LOCALTIME", "LOCALTIMESTAMP",
+                                             "UTC_TIMESTAMP", "UTC_DATE", "UTC_TIME", "CURRENT_USER" };
+    if (!call) {
+        for (size_t i = 0; i < sizeof(NOW_WORDS) / sizeof(NOW_WORDS[0]); i++)
+            if (!strcasecmp(w, NOW_WORDS[i])) {
+                consume(ps);
+                ASTExpr* f = new_expr(EXPR_FUNC);
+                if (f) snprintf(f->func, sizeof(f->func), "%s", NOW_WORDS[i]);
+                return f;
+            }
+        if (w[0] == '_' && next_is(ps, 1, TOK_STRING)) { consume(ps); Token st = consume(ps); return mkstr(st.text); }   // _utf8mb4'x'
+        if ((!strcasecmp(w, "DATE") || !strcasecmp(w, "TIME") || !strcasecmp(w, "TIMESTAMP")) && next_is(ps, 1, TOK_STRING)) {
+            consume(ps); Token st = consume(ps); return mkstr(st.text);
+        }
+        if (!strcasecmp(w, "BINARY") && !next_is(ps, 1, TOK_COMMA) && !next_is(ps, 1, TOK_RPAREN) && !next_is(ps, 1, TOK_EOF)) {
+            consume(ps);
+            return parse_unary(ps);
+        }
+        if (!strcasecmp(w, "INTERVAL") && !next_is(ps, 1, TOK_COMMA) && !next_is(ps, 1, TOK_RPAREN) && !next_is(ps, 1, TOK_EOF)) {
+            consume(ps);
+            ASTExpr* v = parse_unary(ps);
+            char unit[32];
+            if (!v || !parse_unit(ps, unit, sizeof(unit))) { ast_expr_free(v); return NULL; }
+            return mkfunc2("__INTERVAL", v, mkstr(unit));
+        }
+        return NULL;
+    }
+    if (!strcasecmp(w, "CAST") || !strcasecmp(w, "CONVERT")) {   // CAST(x AS tipo), CONVERT(x, tipo), CONVERT(x USING cs)
+        bool cast = !strcasecmp(w, "CAST");
+        consume(ps); consume(ps);
+        ASTExpr* v = parse_expr(ps);
+        if (!v) return NULL;
+        if (!cast && ident_is(ps, "USING")) {
+            consume(ps); consume(ps);
+            if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')'", peek(ps)); ast_expr_free(v); return NULL; }
+            return v;
+        }
+        if (cast ? !match(ps, TOK_AS) : !match(ps, TOK_COMMA)) {
+            parse_fail(ps, cast ? "Expected AS in CAST" : "Expected ',' in CONVERT", peek(ps));
+            ast_expr_free(v);
+            return NULL;
+        }
+        char ty[64] = "";
+        size_t tl = 0;
+        int depth = 0;
+        while (peek(ps).type != TOK_EOF && (depth > 0 || peek(ps).type != TOK_RPAREN)) {   // tipo, anche DECIMAL(10,2)
+            Token x = consume(ps);
+            if (x.type == TOK_LPAREN) depth++;
+            if (x.type == TOK_RPAREN) depth--;
+            const char* txt = x.type == TOK_LPAREN ? "(" : x.type == TOK_RPAREN ? ")" : x.type == TOK_COMMA ? "," : x.text ? x.text : "";
+            bool space = tl > 0 && x.type != TOK_LPAREN && x.type != TOK_RPAREN && x.type != TOK_COMMA && ty[tl - 1] != '(' && ty[tl - 1] != ',';
+            int k = snprintf(ty + tl, sizeof(ty) - tl, "%s%s", space ? " " : "", txt);
+            if (k > 0) tl += (size_t)k;
+            if (tl >= sizeof(ty)) tl = sizeof(ty) - 1;
+        }
+        if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')'", peek(ps)); ast_expr_free(v); return NULL; }
+        for (char* q = ty; *q; q++) *q = (char)toupper((unsigned char)*q);
+        return mkfunc2("CAST", v, mkstr(ty));
+    }
+    if (!strcasecmp(w, "EXTRACT")) {                            // EXTRACT(unità FROM data)
+        consume(ps); consume(ps);
+        char unit[32];
+        if (!parse_unit(ps, unit, sizeof(unit))) return NULL;
+        if (!match(ps, TOK_FROM)) { parse_fail(ps, "Expected FROM in EXTRACT", peek(ps)); return NULL; }
+        ASTExpr* v = parse_expr(ps);
+        if (!v) return NULL;
+        if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')'", peek(ps)); ast_expr_free(v); return NULL; }
+        return mkfunc2("EXTRACT", mkstr(unit), v);
+    }
+    if (!strcasecmp(w, "TIMESTAMPDIFF") || !strcasecmp(w, "TIMESTAMPADD")) {   // TIMESTAMPDIFF(unità, a, b)
+        bool diff = !strcasecmp(w, "TIMESTAMPDIFF");
+        consume(ps); consume(ps);
+        char unit[32];
+        if (!parse_unit(ps, unit, sizeof(unit))) return NULL;
+        if (!match(ps, TOK_COMMA)) { parse_fail(ps, "Expected ','", peek(ps)); return NULL; }
+        ASTExpr* a = parse_expr(ps);
+        if (!a) return NULL;
+        if (!match(ps, TOK_COMMA)) { ast_expr_free(a); parse_fail(ps, "Expected ','", peek(ps)); return NULL; }
+        ASTExpr* b = parse_expr(ps);
+        if (!b) { ast_expr_free(a); return NULL; }
+        if (!match(ps, TOK_RPAREN)) { ast_expr_free(a); ast_expr_free(b); parse_fail(ps, "Expected ')'", peek(ps)); return NULL; }
+        if (!diff) return mkfunc2("DATE_ADD", b, mkfunc2("__INTERVAL", a, mkstr(unit)));
+        return add_arg(mkfunc2("TIMESTAMPDIFF", a, b), mkstr(unit));
+    }
+    if (!strcasecmp(w, "POSITION")) {                           // POSITION(sub IN s)
+        int save = ps->pos;
+        consume(ps); consume(ps);
+        ASTExpr* a = parse_additive(ps);
+        if (!a || !match(ps, TOK_IN)) { ast_expr_free(a); ps->pos = save; return NULL; }
+        ASTExpr* b = parse_expr(ps);
+        if (!b) { ast_expr_free(a); return NULL; }
+        if (!match(ps, TOK_RPAREN)) { ast_expr_free(a); ast_expr_free(b); parse_fail(ps, "Expected ')'", peek(ps)); return NULL; }
+        return mkfunc2("LOCATE", a, b);
+    }
+    if (!strcasecmp(w, "TRIM")) {                               // TRIM([LEADING|TRAILING|BOTH] [x] FROM s) / TRIM(s)
+        consume(ps); consume(ps);
+        char mode[12] = "BOTH";
+        bool kw = false;
+        if (ident_is(ps, "LEADING") || ident_is(ps, "TRAILING") || ident_is(ps, "BOTH")) {
+            Token m = consume(ps);
+            copy_text(ps, mode, sizeof(mode), m.text);
+            for (char* q = mode; *q; q++) *q = (char)toupper((unsigned char)*q);
+            kw = true;
+        }
+        ASTExpr* rem = NULL;
+        ASTExpr* str = NULL;
+        if (kw && match(ps, TOK_FROM)) str = parse_expr(ps);
+        else {
+            ASTExpr* first = parse_expr(ps);
+            if (!first) return NULL;
+            if (match(ps, TOK_FROM)) { rem = first; str = parse_expr(ps); }
+            else str = first;
+        }
+        if (!str || !match(ps, TOK_RPAREN)) {
+            ast_expr_free(rem); ast_expr_free(str);
+            if (ps->result->success) parse_fail(ps, "Expected ')' to close TRIM", peek(ps));
+            return NULL;
+        }
+        if (!rem && !kw) {
+            ASTExpr* f = new_expr(EXPR_FUNC);
+            if (!f) { ast_expr_free(str); return NULL; }
+            snprintf(f->func, sizeof(f->func), "TRIM");
+            f->args = calloc(1, sizeof(ASTExpr*));
+            if (!f->args) { ast_expr_free(f); ast_expr_free(str); return NULL; }
+            f->args[0] = str; f->nargs = 1; f->depth = str->depth + 1;
+            return f;
+        }
+        return add_arg(mkfunc2("TRIM_EX", str, rem ? rem : mkstr(" ")), mkstr(mode));
+    }
+    if (!strcasecmp(w, "SUBSTRING") || !strcasecmp(w, "SUBSTR") || !strcasecmp(w, "MID")) {   // SUBSTRING(s FROM a [FOR b])
+        int save = ps->pos;
+        consume(ps); consume(ps);
+        ASTExpr* s0 = parse_expr(ps);
+        if (!s0) return NULL;
+        if (!match(ps, TOK_FROM)) {                            // forma con le virgole: parse_call (MID = SUBSTRING)
+            ast_expr_free(s0);
+            ps->pos = save;
+            if (!strcasecmp(w, "MID")) {
+                consume(ps); consume(ps);
+                ASTExpr* f = new_expr(EXPR_FUNC);
+                if (!f) return NULL;
+                snprintf(f->func, sizeof(f->func), "SUBSTRING");
+                f->args = calloc(3, sizeof(ASTExpr*));
+                if (!f->args) { ast_expr_free(f); return NULL; }
+                do {
+                    if (f->nargs >= 3) { parse_fail(ps, "MID takes 2 or 3 arguments", peek(ps)); break; }
+                    ASTExpr* a = parse_expr(ps);
+                    if (!a) break;
+                    f->args[f->nargs++] = a;
+                    if (a->depth + 1 > f->depth) f->depth = a->depth + 1;
+                } while (match(ps, TOK_COMMA));
+                if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')'", peek(ps));
+                if (!ps->result->success) { ast_expr_free(f); return NULL; }
+                return f;
+            }
+            return NULL;
+        }
+        ASTExpr* a = parse_expr(ps);
+        ASTExpr* b = NULL;
+        if (a && word_is(ps, "FOR")) { consume(ps); b = parse_expr(ps); }
+        if (!a || !match(ps, TOK_RPAREN)) {
+            ast_expr_free(s0); ast_expr_free(a); ast_expr_free(b);
+            if (ps->result->success) parse_fail(ps, "Expected ')'", peek(ps));
+            return NULL;
+        }
+        ASTExpr* f = mkfunc2("SUBSTRING", s0, a);
+        return b ? add_arg(f, b) : f;
+    }
+    if (!strcasecmp(w, "GROUP_CONCAT")) {                       // GROUP_CONCAT([DISTINCT] e, ... [ORDER BY ...] [SEPARATOR 's'])
+        consume(ps); consume(ps);
+        ASTExpr* e = new_expr(EXPR_AGG);
+        if (!e) return NULL;
+        snprintf(e->func, sizeof(e->func), "GROUP_CONCAT");
+        if (match(ps, TOK_DISTINCT)) e->agg_distinct = true;
+        e->args = calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
+        if (!e->args) { ast_expr_free(e); return NULL; }
+        int nv = 0, no = 0;
+        char flags[MAX_FUNC_ARGS + 1] = "";
+        do {
+            if (e->nargs >= MAX_FUNC_ARGS - 2) { parse_fail(ps, "Too many GROUP_CONCAT arguments", peek(ps)); break; }
+            ASTExpr* a = parse_expr(ps);
+            if (!a) break;
+            e->args[e->nargs++] = a;
+            nv++;
+        } while (ps->result->success && match(ps, TOK_COMMA));
+        if (ps->result->success && match(ps, TOK_ORDER)) {
+            expect(ps, TOK_BY);
+            do {
+                if (e->nargs >= MAX_FUNC_ARGS - 1) { parse_fail(ps, "Too many ORDER BY keys", peek(ps)); break; }
+                ASTExpr* a = parse_expr(ps);
+                if (!a) break;
+                e->args[e->nargs++] = a;
+                char d = 'A';
+                if (match(ps, TOK_DESC)) d = 'D'; else match(ps, TOK_ASC);
+                flags[no++] = d;
+                flags[no] = '\0';
+            } while (ps->result->success && match(ps, TOK_COMMA));
+        }
+        char sep[128] = ",";
+        if (ps->result->success && ident_is(ps, "SEPARATOR")) {
+            consume(ps);
+            Token st = consume(ps);
+            if (st.type != TOK_STRING) parse_fail(ps, "Expected a quoted SEPARATOR", st);
+            else copy_text(ps, sep, sizeof(sep), st.text);
+        }
+        if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' to close GROUP_CONCAT", peek(ps));
+        if (!ps->result->success) { ast_expr_free(e); return NULL; }
+        ASTExpr* se = mkstr(sep);
+        if (!se) { ast_expr_free(e); return NULL; }
+        e->args[e->nargs++] = se;
+        snprintf(e->col_name, sizeof(e->col_name), "#gc %d %d %s", nv, no, flags);   // valori, chiavi, ASC/DESC
+        for (int i = 0; i < e->nargs; i++) if (e->args[i]->depth + 1 > e->depth) e->depth = e->args[i]->depth + 1;
+        return e;
+    }
+    return NULL;
+}
+
 static ASTExpr* parse_primary(ParserState* ps) {
     Token t = peek(ps);
     ASTExpr* e = NULL;
@@ -684,8 +957,16 @@ static ASTExpr* parse_primary(ParserState* ps) {
         case TOK_DATABASE:                                       // DATABASE() (come MySQL)
             if (next_is(ps, 1, TOK_LPAREN)) return parse_call(ps);
             break;
+        case TOK_VALUES:                                         // VALUES(col) in ON DUPLICATE KEY UPDATE
+        case TOK_TRUNCATE:                                       // TRUNCATE(x, d)
+            if (next_is(ps, 1, TOK_LPAREN)) return parse_call(ps);
+            break;
         case TOK_IDENTIFIER: case TOK_LEFT: case TOK_RIGHT:   // LEFT(...)/RIGHT(...) sono funzioni
             if (t.type == TOK_IDENTIFIER && next_is(ps, 1, TOK_LPAREN) && !strcasecmp(t.text, "MATCH")) return parse_match(ps);
+            if (t.type == TOK_IDENTIFIER) {
+                ASTExpr* sp = parse_special_form(ps);
+                if (sp || !ps->result->success) return sp;
+            }
             if (next_is(ps, 1, TOK_LPAREN)) return parse_call(ps);
             if (t.type != TOK_IDENTIFIER) break;
             e = new_expr(EXPR_COLUMN);
@@ -789,6 +1070,20 @@ static ASTExpr* parse_multiplicative(ParserState* ps) {
         if (match(ps, TOK_STAR))       op = OP_MUL;
         else if (match(ps, TOK_SLASH)) op = OP_DIV;
         else if (match(ps, TOK_PERCENT)) op = OP_MOD;
+        else if (ident_is(ps, "DIV") || ident_is(ps, "MOD")) {   // a DIV b (divisione intera), a MOD b
+            bool div = ident_is(ps, "DIV");
+            consume(ps);
+            ASTExpr* f = new_expr(EXPR_FUNC);
+            ASTExpr* r = parse_unary(ps);
+            if (!f || !r) { ast_expr_free(f); ast_expr_free(r); ast_expr_free(e); return NULL; }
+            snprintf(f->func, sizeof(f->func), "%s", div ? "INTDIV" : "MOD");
+            f->args = calloc(2, sizeof(ASTExpr*));
+            if (!f->args) { ast_expr_free(f); ast_expr_free(r); ast_expr_free(e); return NULL; }
+            f->args[0] = e; f->args[1] = r; f->nargs = 2;
+            f->depth = (e->depth > r->depth ? e->depth : r->depth) + 1;
+            e = depth_check(ps, f);
+            continue;
+        }
         else break;
         e = depth_check(ps, new_binary(op, e, parse_unary(ps)));
     }
@@ -832,7 +1127,11 @@ static ASTExpr* parse_additive(ParserState* ps) {
         if (match(ps, TOK_PLUS))       op = OP_PLUS;
         else if (match(ps, TOK_MINUS)) op = OP_MINUS;
         else break;
-        e = depth_check(ps, new_binary(op, e, parse_multiplicative(ps)));
+        ASTExpr* r = parse_multiplicative(ps);
+        // data + INTERVAL n unità  ->  DATE_ADD(data, ...)   (anche INTERVAL n unità + data)
+        if (r && is_interval(r)) { e = depth_check(ps, mkfunc2(op == OP_PLUS ? "DATE_ADD" : "DATE_SUB", e, r)); continue; }
+        if (e && is_interval(e) && op == OP_PLUS) { e = depth_check(ps, mkfunc2("DATE_ADD", r, e)); continue; }
+        e = depth_check(ps, new_binary(op, e, r));
     }
     return e;
 }
@@ -860,6 +1159,18 @@ static ASTExpr* parse_predicate(ParserState* ps) {
             pat = new_binary(OP_ESCAPE, pat, esc);
         }
         return new_binary(neg ? OP_NOT_LIKE : OP_LIKE, left, pat);
+    }
+    if (ident_is(ps, "REGEXP") || ident_is(ps, "RLIKE")) {        // x [NOT] REGEXP p
+        consume(ps);
+        ASTExpr* pat = parse_additive(ps);
+        ASTExpr* f = new_expr(EXPR_FUNC);
+        if (!pat || !f) { ast_expr_free(pat); ast_expr_free(f); ast_expr_free(left); return NULL; }
+        snprintf(f->func, sizeof(f->func), "REGEXP_LIKE");
+        f->args = calloc(2, sizeof(ASTExpr*));
+        if (!f->args) { ast_expr_free(pat); ast_expr_free(f); ast_expr_free(left); return NULL; }
+        f->args[0] = left; f->args[1] = pat; f->nargs = 2;
+        f->depth = (left->depth > pat->depth ? left->depth : pat->depth) + 1;
+        return neg ? new_unary(OP_NOT, f) : f;
     }
     if (match(ps, TOK_BETWEEN)) {
         // x BETWEEN a AND b  ->  x >= a AND x <= b   (NOT: x < a OR x > b)
@@ -964,6 +1275,12 @@ static bool ident_is(ParserState* ps, const char* word) {
     return t.type == TOK_IDENTIFIER && strcasecmp(t.text, word) == 0;
 }
 
+// la parola corrente è word, anche se il lexer la considera una parola chiave (FOR, ...)
+static bool word_is(ParserState* ps, const char* word) {
+    Token t = peek(ps);
+    return t.text && t.type != TOK_STRING && strcasecmp(t.text, word) == 0;
+}
+
 // parole che dopo un nome di tabella non possono essere un alias
 static bool alias_forbidden(ParserState* ps) {
     static const char* const W[] = { "INNER", "CROSS", "OUTER", "OFFSET", "INTERSECT", "EXCEPT", "MINUS", "NATURAL", "FULL", "USING", "WINDOW", "WITH" };   // WITH: ... WITH CHECK OPTION delle viste
@@ -1065,8 +1382,15 @@ static ASTNode* parse_select_core(ParserState* ps) {
     n->type = NODE_SELECT;
     if (!match(ps, TOK_SELECT)) { parse_fail(ps, "Expected SELECT", peek(ps)); return n; }
 
-    if (match(ps, TOK_DISTINCT)) n->select_stmt.distinct = true;
-    else match(ps, TOK_ALL);
+    for (;;) {                                         // DISTINCT / ALL e i modificatori di MySQL
+        if (match(ps, TOK_DISTINCT)) { n->select_stmt.distinct = true; continue; }
+        if (match(ps, TOK_ALL)) continue;
+        if (ident_is(ps, "DISTINCTROW")) { consume(ps); n->select_stmt.distinct = true; continue; }
+        if (ident_is(ps, "SQL_CALC_FOUND_ROWS")) { consume(ps); n->select_stmt.calc_found = true; continue; }
+        if (ident_is(ps, "SQL_NO_CACHE") || ident_is(ps, "SQL_CACHE") || ident_is(ps, "HIGH_PRIORITY") || ident_is(ps, "STRAIGHT_JOIN") ||
+            ident_is(ps, "SQL_SMALL_RESULT") || ident_is(ps, "SQL_BIG_RESULT") || ident_is(ps, "SQL_BUFFER_RESULT")) { consume(ps); continue; }
+        break;
+    }
 
     // elenco: *  |  tabella.*  |  espressione [[AS] alias]
     n->select_stmt.num_cols = 0;
@@ -1153,6 +1477,16 @@ static void parse_order_limit(ParserState* ps, ASTNode* n) {
             n->select_stmt.offset = atoi(b.text);
         }
     }
+    // FOR UPDATE / FOR SHARE [NOWAIT | SKIP LOCKED] / LOCK IN SHARE MODE: i lock li prende già la transazione
+    if (ps->result->success && word_is(ps, "FOR") && (peek2_ident(ps, "UPDATE") || peek2_ident(ps, "SHARE") || next_is(ps, 1, TOK_UPDATE))) {
+        consume(ps); consume(ps);
+        if (ident_is(ps, "NOWAIT")) consume(ps);
+        else if (ident_is(ps, "SKIP")) { consume(ps); if (ident_is(ps, "LOCKED")) consume(ps); }
+    } else if (ps->result->success && ident_is(ps, "LOCK") && next_is(ps, 1, TOK_IN)) {
+        consume(ps); consume(ps);
+        if (ident_is(ps, "SHARE")) consume(ps);
+        if (ident_is(ps, "MODE")) consume(ps);
+    }
 }
 
 // query := [WITH nome AS (query) {, ...}] core { (UNION [ALL] | INTERSECT | EXCEPT) core }
@@ -1226,9 +1560,34 @@ static ASTNode* parse_query(ParserState* ps) {
 static ASTNode* parse_select(ParserState* ps) { return parse_query(ps); }
 
 // INSERT INTO t [(colonne)] VALUES (espr, ...) [, (espr, ...)] ...
+static bool peek2_ident(ParserState* ps, const char* w);
+
+// [ON DUPLICATE KEY UPDATE col = espr {, col = espr}]
+static void parse_on_duplicate(ParserState* ps, ASTNode* n) {
+    if (!ps->result->success || peek(ps).type != TOK_ON || !peek2_ident(ps, "DUPLICATE")) return;
+    consume(ps);
+    consume(ps);
+    if (!match(ps, TOK_KEY) || !match(ps, TOK_UPDATE)) { parse_fail(ps, "Expected ON DUPLICATE KEY UPDATE", peek(ps)); return; }
+    do {
+        if (n->insert_stmt.num_dup >= SV_MAX_SETS) { parse_fail(ps, "Too many columns in ON DUPLICATE KEY UPDATE", peek(ps)); return; }
+        Token c = consume(ps);
+        if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", c); return; }
+        if (match(ps, TOK_DOT)) { c = consume(ps); if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", c); return; } }
+        if (!match(ps, TOK_EQ)) { parse_fail(ps, "Expected '='", peek(ps)); return; }
+        ASTExpr* v = parse_expr(ps);
+        if (!v) return;
+        int k = n->insert_stmt.num_dup++;
+        copy_text(ps, n->insert_stmt.dup_cols[k], sizeof(n->insert_stmt.dup_cols[k]), c.text);
+        n->insert_stmt.dup_exprs[k] = v;
+    } while (match(ps, TOK_COMMA));
+}
+
 static void parse_insert(ParserState* ps, ASTNode* n) {
     n->type = NODE_INSERT;
-    expect(ps, TOK_INTO);
+    // MySQL: INSERT [LOW_PRIORITY | DELAYED | HIGH_PRIORITY] [IGNORE] [INTO] t
+    while (ident_is(ps, "LOW_PRIORITY") || ident_is(ps, "DELAYED") || ident_is(ps, "HIGH_PRIORITY")) consume(ps);
+    if (ident_is(ps, "IGNORE")) { consume(ps); n->insert_stmt.mode = INS_IGNORE; }
+    match(ps, TOK_INTO);
     Token tn = table_tok(ps);
     if (tn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name after INSERT INTO", tn); return; }
     copy_text(ps, n->insert_stmt.table_name, sizeof(n->insert_stmt.table_name), tn.text);
@@ -1243,9 +1602,33 @@ static void parse_insert(ParserState* ps, ASTNode* n) {
     }
     if (query_starts(ps, 0)) {                                    // INSERT INTO t SELECT ...
         n->insert_stmt.select = parse_query(ps);
+        parse_on_duplicate(ps, n);
         return;
     }
-    if (!match(ps, TOK_VALUES)) { parse_fail(ps, "Expected VALUES or SELECT", peek(ps)); return; }
+    if (match(ps, TOK_SET) && n->insert_stmt.num_cols == 0) {    // MySQL: INSERT INTO t SET a = 1, b = 2
+        int cap = 0;
+        do {
+            Token c = consume(ps);
+            if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name in SET", c); return; }
+            if (n->insert_stmt.num_cols >= 64) { parse_fail(ps, "Too many columns in INSERT (max 64)", c); return; }
+            if (!match(ps, TOK_EQ)) { parse_fail(ps, "Expected '=' in SET", peek(ps)); return; }
+            ASTExpr* v = parse_expr(ps);
+            if (!v) return;
+            if (n->insert_stmt.num_cols >= cap) {
+                cap = cap ? cap * 2 : 16;
+                ASTExpr** nv = realloc(n->insert_stmt.values, sizeof(ASTExpr*) * (size_t)cap);
+                if (!nv) { ast_expr_free(v); parse_fail(ps, "Out of memory", peek(ps)); return; }
+                n->insert_stmt.values = nv;
+            }
+            n->insert_stmt.columns[n->insert_stmt.num_cols] = strdup(c.text);
+            n->insert_stmt.values[n->insert_stmt.num_cols++] = v;
+            n->insert_stmt.num_values = n->insert_stmt.num_cols;
+            n->insert_stmt.num_rows = 1;
+        } while (match(ps, TOK_COMMA));
+        parse_on_duplicate(ps, n);
+        return;
+    }
+    if (!match(ps, TOK_VALUES) && !(ident_is(ps, "VALUE") && (consume(ps), true))) { parse_fail(ps, "Expected VALUES or SELECT", peek(ps)); return; }
     // i valori sono in un unico array, riga dopo riga; nell'AST restano solo righe complete
     int cap = 0, total = 0;
     do {
@@ -1278,32 +1661,183 @@ static void parse_insert(ParserState* ps, ASTNode* n) {
         total += count;
         n->insert_stmt.num_rows++;
     } while (match(ps, TOK_COMMA));
+    if (match(ps, TOK_AS)) {                                      // MySQL 8: VALUES (...) AS nuovo [(colonne)]
+        Token a = consume(ps);
+        if (a.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected an alias after AS", a); return; }
+        copy_text(ps, n->insert_stmt.row_alias, sizeof(n->insert_stmt.row_alias), a.text);
+        if (peek(ps).type == TOK_LPAREN) { while (peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) consume(ps); expect(ps, TOK_RPAREN); }
+    }
+    parse_on_duplicate(ps, n);
 }
 
 // UPDATE t SET col = espr {, col = espr} [WHERE condizione]
+
+// ── UPDATE / DELETE di MySQL con più tabelle o ORDER BY / LIMIT: parti come testo ──
+
+// fine della parte corrente: la prima parola fra stops (a profondità 0 di parentesi), ';' o la fine
+static int scan_until(ParserState* ps, int from, const char* const* stops, int nstops) {
+    int depth = 0, i = from;
+    for (; i < ps->tokens->count; i++) {
+        const Token* t = &ps->tokens->tokens[i];
+        if (t->type == TOK_EOF || (t->type == TOK_SEMICOLON && depth == 0)) break;
+        if (t->type == TOK_LPAREN) depth++;
+        else if (t->type == TOK_RPAREN) { if (depth == 0) break; depth--; }
+        else if (depth == 0 && t->text && t->type != TOK_STRING)
+            for (int k = 0; k < nstops; k++) if (!strcasecmp(t->text, stops[k])) return i;
+    }
+    return i;
+}
+
+static char* text_of(ParserState* ps, int from, int to) {
+    if (to <= from) return NULL;
+    char* buf = malloc(SV_MAX_SQL_LEN);
+    if (!buf) { parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
+    if (!tokens_text(ps, from, to, buf, SV_MAX_SQL_LEN)) { free(buf); parse_fail(ps, "Statement is too long", peek(ps)); return NULL; }
+    char* r = strdup(buf);
+    free(buf);
+    return r;
+}
+
+// [WHERE ...] [ORDER BY ... ] [LIMIT ...] in coda: testo
+static void tail_texts(ParserState* ps, char** where, char** order_limit) {
+    static const char* const ST[] = { "ORDER", "LIMIT" };
+    if (match(ps, TOK_WHERE)) {
+        int start = ps->pos, end = scan_until(ps, start, ST, 2);
+        *where = text_of(ps, start, end);
+        ps->pos = end;
+    }
+    if (peek(ps).type == TOK_ORDER || peek(ps).type == TOK_LIMIT) {
+        int start = ps->pos, end = scan_until(ps, start, NULL, 0);
+        *order_limit = text_of(ps, start, end);
+        ps->pos = end;
+    }
+}
+
+// DELETE dopo la parola DELETE: la forma semplice va nei campi di sempre, le altre come testo
+static void parse_delete(ParserState* ps, ASTNode* n) {
+    n->type = NODE_DELETE;
+    while (ident_is(ps, "LOW_PRIORITY") || ident_is(ps, "QUICK") || ident_is(ps, "IGNORE")) consume(ps);
+    static const char* const FROM_END[] = { "WHERE", "ORDER", "LIMIT" };
+    if (!match(ps, TOK_FROM)) {                                  // DELETE a, b FROM ... WHERE ...
+        do {
+            Token t = consume(ps);
+            if (t.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name after DELETE", t); return; }
+            if (n->delete_stmt.num_targets >= 8) { parse_fail(ps, "Too many tables in DELETE (max 8)", t); return; }
+            copy_text(ps, n->delete_stmt.targets[n->delete_stmt.num_targets++], 64, t.text);
+            if (match(ps, TOK_DOT)) consume(ps);                 // a.*
+        } while (match(ps, TOK_COMMA));
+        if (!match(ps, TOK_FROM)) { parse_fail(ps, "Expected FROM", peek(ps)); return; }
+        int start = ps->pos, end = scan_until(ps, start, FROM_END, 3);
+        n->delete_stmt.multi_from = text_of(ps, start, end);
+        ps->pos = end;
+        tail_texts(ps, &n->delete_stmt.multi_where, &n->delete_stmt.order_limit);
+        snprintf(n->delete_stmt.table_name, sizeof(n->delete_stmt.table_name), "%s", n->delete_stmt.targets[0]);
+        return;
+    }
+    int tstart = ps->pos;
+    Token tn = table_tok(ps);
+    if (tn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name after DELETE FROM", tn); return; }
+    copy_text(ps, n->delete_stmt.table_name, sizeof(n->delete_stmt.table_name), tn.text);
+    if (peek(ps).type == TOK_COMMA || ident_is(ps, "USING")) {   // DELETE FROM a, b USING t1 a, t2 b WHERE ...
+        ps->pos = tstart;
+        do {
+            Token t = consume(ps);
+            if (t.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name", t); return; }
+            if (n->delete_stmt.num_targets >= 8) { parse_fail(ps, "Too many tables in DELETE (max 8)", t); return; }
+            copy_text(ps, n->delete_stmt.targets[n->delete_stmt.num_targets++], 64, t.text);
+            if (match(ps, TOK_DOT)) consume(ps);
+        } while (match(ps, TOK_COMMA));
+        if (!ident_is(ps, "USING")) { parse_fail(ps, "Expected USING", peek(ps)); return; }
+        consume(ps);
+        int start = ps->pos, end = scan_until(ps, start, FROM_END, 3);
+        n->delete_stmt.multi_from = text_of(ps, start, end);
+        ps->pos = end;
+        tail_texts(ps, &n->delete_stmt.multi_where, &n->delete_stmt.order_limit);
+        return;
+    }
+    bool alias = match(ps, TOK_AS) || (peek(ps).type == TOK_IDENTIFIER && !ident_is(ps, "USING"));
+    if (alias || (ps->result->success && peek(ps).type != TOK_WHERE && peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF)) {
+        // DELETE FROM t x WHERE ... / ORDER BY / LIMIT: come testo
+        ps->pos = tstart;
+        int end = scan_until(ps, tstart, FROM_END, 3);
+        n->delete_stmt.multi_from = text_of(ps, tstart, end);
+        ps->pos = end;
+        snprintf(n->delete_stmt.targets[0], 64, "%s", n->delete_stmt.table_name);
+        // l'alias (se c'è) è la tabella da cui cancellare
+        if (end - tstart >= 2) {
+            const Token* last = &ps->tokens->tokens[end - 1];
+            if (last->type == TOK_IDENTIFIER && end - 1 > tstart) copy_text(ps, n->delete_stmt.targets[0], 64, last->text);
+        }
+        n->delete_stmt.num_targets = 1;
+        tail_texts(ps, &n->delete_stmt.multi_where, &n->delete_stmt.order_limit);
+        return;
+    }
+    if (ps->result->success && match(ps, TOK_WHERE)) {
+        int wstart = ps->pos;
+        n->delete_stmt.where = parse_expr(ps);
+        if (ps->result->success && (peek(ps).type == TOK_ORDER || peek(ps).type == TOK_LIMIT)) {   // ... WHERE x ORDER BY / LIMIT
+            n->delete_stmt.multi_where = text_of(ps, wstart, ps->pos);
+            n->delete_stmt.multi_from = strdup(n->delete_stmt.table_name);
+            snprintf(n->delete_stmt.targets[0], 64, "%s", n->delete_stmt.table_name);
+            n->delete_stmt.num_targets = 1;
+            int start = ps->pos, end = scan_until(ps, start, NULL, 0);
+            n->delete_stmt.order_limit = text_of(ps, start, end);
+            ps->pos = end;
+        }
+    }
+}
+
 static void parse_update(ParserState* ps, ASTNode* n) {
     n->type = NODE_UPDATE;
+    while (ident_is(ps, "LOW_PRIORITY") || ident_is(ps, "IGNORE")) consume(ps);
+    int tstart = ps->pos;
     Token tn = table_tok(ps);
     if (tn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name after UPDATE", tn); return; }
     copy_text(ps, n->update_stmt.table_name, sizeof(n->update_stmt.table_name), tn.text);
+    if (peek(ps).type != TOK_SET) {                              // MySQL: UPDATE t1 a JOIN t2 b ON ... SET ...
+        static const char* const ST[] = { "SET" };
+        int end = scan_until(ps, tstart, ST, 1);
+        n->update_stmt.multi_from = text_of(ps, tstart, end);
+        ps->pos = end;
+    }
     if (!match(ps, TOK_SET)) { parse_fail(ps, "Expected SET", peek(ps)); return; }
     do {
         if (n->update_stmt.num_sets >= SV_MAX_SETS) { parse_fail(ps, "Too many columns in SET", peek(ps)); return; }
         Token cn = consume(ps);
         if (cn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name in SET", cn); return; }
         Token col = cn;
+        char qual[64] = "";
         if (match(ps, TOK_DOT)) {                     // tabella.colonna
+            copy_text(ps, qual, sizeof(qual), cn.text);
             col = consume(ps);
             if (col.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name in SET", col); return; }
         }
         if (!match(ps, TOK_EQ)) { parse_fail(ps, "Expected '=' in SET", peek(ps)); return; }
+        int vstart = ps->pos;
         ASTExpr* v = parse_expr(ps);
         if (!v) return;
         int k = n->update_stmt.num_sets++;
         copy_text(ps, n->update_stmt.set_cols[k], sizeof(n->update_stmt.set_cols[k]), col.text);
+        memcpy(n->update_stmt.set_tables[k], qual, sizeof(qual));
         n->update_stmt.set_exprs[k] = v;
+        if (n->update_stmt.multi_from) n->update_stmt.set_texts[k] = text_of(ps, vstart, ps->pos);
     } while (match(ps, TOK_COMMA));
-    if (match(ps, TOK_WHERE)) n->update_stmt.where = parse_expr(ps);
+    if (n->update_stmt.multi_from) { tail_texts(ps, &n->update_stmt.multi_where, &n->update_stmt.order_limit); return; }
+    int wstart = -1;
+    if (match(ps, TOK_WHERE)) { wstart = ps->pos; n->update_stmt.where = parse_expr(ps); }
+    if (ps->result->success && (peek(ps).type == TOK_ORDER || peek(ps).type == TOK_LIMIT)) {   // UPDATE t SET ... ORDER BY / LIMIT
+        n->update_stmt.multi_from = strdup(n->update_stmt.table_name);
+        if (wstart >= 0) n->update_stmt.multi_where = text_of(ps, wstart, ps->pos);
+        int start = ps->pos, end = scan_until(ps, start, NULL, 0);
+        n->update_stmt.order_limit = text_of(ps, start, end);
+        ps->pos = end;
+        // i testi delle espressioni: dal formato dell'AST
+        for (int k = 0; k < n->update_stmt.num_sets; k++) {
+            char buf[4096];
+            ast_expr_format(n->update_stmt.set_exprs[k], buf, sizeof(buf));
+            n->update_stmt.set_texts[k] = strdup(buf);
+        }
+    }
 }
 
 static void parse_column_ref(ParserState* ps, ASTExpr* e) {
@@ -1695,6 +2229,9 @@ static int parse_name_list(ParserState* ps, char names[][64], int max) {
         if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", c); return n; }
         if (n >= max) { parse_fail(ps, "Too many columns in the key (max 8)", c); return n; }
         copy_text(ps, names[n++], 64, c.text);
+        // MySQL: prefisso dell'indice col(191) e direzione
+        if (peek(ps).type == TOK_LPAREN && next_is(ps, 1, TOK_INTEGER) && next_is(ps, 2, TOK_RPAREN)) { consume(ps); consume(ps); consume(ps); }
+        if (peek(ps).type == TOK_ASC || peek(ps).type == TOK_DESC) consume(ps);
     } while (match(ps, TOK_COMMA));
     if (!match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' after the column list", peek(ps));
     return n;
@@ -1748,18 +2285,37 @@ static ConstraintDef* new_cons(ParserState* ps, ASTNode* n) {
     return c;
 }
 
+// USING BTREE | HASH e altre opzioni d'indice di MySQL (KEY_BLOCK_SIZE = n, COMMENT 'x', VISIBLE)
+static void skip_index_using(ParserState* ps) {
+    for (;;) {
+        if (ident_is(ps, "USING")) { consume(ps); consume(ps); continue; }
+        if (ident_is(ps, "KEY_BLOCK_SIZE")) { consume(ps); match(ps, TOK_EQ); consume(ps); continue; }
+        if (ident_is(ps, "COMMENT") && next_is(ps, 1, TOK_STRING)) { consume(ps); consume(ps); continue; }
+        if (ident_is(ps, "VISIBLE") || ident_is(ps, "INVISIBLE")) { consume(ps); continue; }
+        return;
+    }
+}
+
 // vincolo di tabella (dopo l'eventuale CONSTRAINT nome); false se non è un vincolo
 static bool parse_table_constraint(ParserState* ps, ConstraintDef* c) {
     if (ident_is(ps, "PRIMARY")) {
         consume(ps);
         expect(ps, TOK_KEY);
         c->kind = CONS_PRIMARY;
+        skip_index_using(ps);
         c->ncols = parse_name_list(ps, c->cols, 8);
+        skip_index_using(ps);
     } else if (ident_is(ps, "UNIQUE")) {
         consume(ps);
-        if (peek(ps).type == TOK_KEY) consume(ps);
+        if (peek(ps).type == TOK_KEY || peek(ps).type == TOK_INDEX) consume(ps);
+        if (peek(ps).type == TOK_IDENTIFIER && !ident_is(ps, "USING")) {           // UNIQUE KEY nome (colonne)
+            Token nm = consume(ps);
+            if (!c->name[0]) copy_text(ps, c->name, sizeof(c->name), nm.text);
+        }
         c->kind = CONS_UNIQUE;
+        skip_index_using(ps);
         c->ncols = parse_name_list(ps, c->cols, 8);
+        skip_index_using(ps);
     } else if (ident_is(ps, "FOREIGN")) {
         consume(ps);
         expect(ps, TOK_KEY);
@@ -1779,21 +2335,109 @@ static bool parse_table_constraint(ParserState* ps, ConstraintDef* c) {
 }
 
 // definizione di colonna: nome tipo [(n [, m])] modificatori (vincoli di colonna in n->create_table.cons)
-// tipo di una colonna: nome [(dimensione [, decimali])]
+// tipo di una colonna: nome [(dimensione [, decimali])], anche nei nomi di MySQL (bigint(20) unsigned,
+// longtext, enum('a','b'), double precision, ...): cd->type diventa il tipo di SegVault, cd->sqltype
+// conserva il tipo come scritto (SHOW COLUMNS, information_schema)
 static bool parse_type_spec(ParserState* ps, ColumnDef* cd) {
     Token ct = consume(ps);
     if (ct.type != TOK_IDENTIFIER && ct.type != TOK_BOOLEAN) { parse_fail(ps, "Expected a column type", ct); return false; }
-    copy_text(ps, cd->type, sizeof(cd->type), ct.text);
-    if (match(ps, TOK_LPAREN)) {
-        Token sz = consume(ps);
-        if (sz.type != TOK_INTEGER) { parse_fail(ps, "Expected a size", sz); return false; }
-        cd->size = atoi(sz.text);
-        if (match(ps, TOK_COMMA)) {                    // DECIMAL(p, s)
-            Token sc = consume(ps);
-            if (sc.type != TOK_INTEGER) { parse_fail(ps, "Expected the number of decimal digits", sc); return false; }
-        }
-        if (!expect(ps, TOK_RPAREN)) return false;
+    char base[40];
+    copy_text(ps, base, sizeof(base), ct.text);
+    for (char* q = base; *q; q++) *q = (char)tolower((unsigned char)*q);
+    // nomi in due parole
+    if (!strcmp(base, "double") && ident_is(ps, "PRECISION")) consume(ps);
+    else if ((!strcmp(base, "character") || !strcmp(base, "char")) && ident_is(ps, "VARYING")) { consume(ps); snprintf(base, sizeof(base), "varchar"); }
+    else if (!strcmp(base, "national") && (ident_is(ps, "CHAR") || ident_is(ps, "VARCHAR") || ident_is(ps, "CHARACTER"))) {
+        Token t2 = consume(ps);
+        copy_text(ps, base, sizeof(base), t2.text);
+        for (char* q = base; *q; q++) *q = (char)tolower((unsigned char)*q);
+        if (ident_is(ps, "VARYING")) { consume(ps); snprintf(base, sizeof(base), "varchar"); }
+    } else if (!strcmp(base, "long") && (ident_is(ps, "VARCHAR") || ident_is(ps, "VARBINARY"))) {
+        Token t2 = consume(ps);
+        snprintf(base, sizeof(base), "%s", !strcasecmp(t2.text, "VARBINARY") ? "mediumblob" : "mediumtext");
     }
+    char sql[48];
+    snprintf(sql, sizeof(sql), "%s", base);
+    bool is_enum = !strcmp(base, "enum"), is_set = !strcmp(base, "set");
+    int maxlen = 0;
+    if (match(ps, TOK_LPAREN)) {
+        if (is_enum || is_set) {                       // enum('a','b'): diventa un CHECK (enum)
+            char list[480];
+            size_t ll = 0;
+            list[0] = '\0';
+            do {
+                Token v = consume(ps);
+                if (v.type != TOK_STRING) { parse_fail(ps, "Expected a quoted value in ENUM / SET", v); return false; }
+                size_t vl = v.text ? strlen(v.text) : 0;
+                if ((int)vl > maxlen) maxlen = (int)vl;
+                if (ll + vl * 2 + 6 < sizeof(list)) {
+                    { char sep = ll ? ',' : '('; list[ll++] = sep; }
+                    list[ll++] = '\'';
+                    for (const char* q = v.text; q && *q; q++) { if (*q == '\'') list[ll++] = '\''; list[ll++] = *q; }
+                    list[ll++] = '\'';
+                    list[ll] = '\0';
+                }
+            } while (match(ps, TOK_COMMA));
+            if (!expect(ps, TOK_RPAREN)) return false;
+            list[ll++] = ')';
+            list[ll] = '\0';
+            snprintf(sql, sizeof(sql), "%s%.*s", base, (int)(sizeof(sql) - strlen(base) - 1), list);
+            if (is_enum) snprintf(cd->comment, sizeof(cd->comment), "\x01%s", list);   // segnaposto: diventa un CHECK
+        } else {
+            Token sz = consume(ps);
+            if (sz.type != TOK_INTEGER) { parse_fail(ps, "Expected a size", sz); return false; }
+            cd->size = atoi(sz.text);
+            if (match(ps, TOK_COMMA)) {                    // DECIMAL(p, s)
+                Token sc = consume(ps);
+                if (sc.type != TOK_INTEGER) { parse_fail(ps, "Expected the number of decimal digits", sc); return false; }
+                cd->scale = atoi(sc.text);
+                cd->has_scale = true;
+                snprintf(sql + strlen(sql), sizeof(sql) - strlen(sql), "(%d,%d)", cd->size, cd->scale);
+            } else snprintf(sql + strlen(sql), sizeof(sql) - strlen(sql), "(%d)", cd->size);
+            if (!expect(ps, TOK_RPAREN)) return false;
+        }
+    }
+    // attributi del tipo
+    for (;;) {
+        if (ident_is(ps, "UNSIGNED")) { consume(ps); cd->flags |= COLF_UNSIGNED; continue; }
+        if (ident_is(ps, "SIGNED") || ident_is(ps, "ZEROFILL")) { consume(ps); continue; }
+        if (ident_is(ps, "BINARY") || ident_is(ps, "ASCII") || ident_is(ps, "UNICODE")) { consume(ps); continue; }
+        break;
+    }
+    if (cd->flags & COLF_UNSIGNED) snprintf(sql + strlen(sql), sizeof(sql) - strlen(sql), " unsigned");
+    snprintf(cd->sqltype, sizeof(cd->sqltype), "%s", sql);
+
+    // tipo di SegVault
+    static const struct { const char* my; const char* sv; } MAP[] = {
+        { "integer", "INT" }, { "int", "INT" }, { "mediumint", "INT" }, { "smallint", "INT" }, { "tinyint", "INT" }, { "int1", "INT" },
+        { "int2", "INT" }, { "int3", "INT" }, { "int4", "INT" }, { "middleint", "INT" }, { "year", "INT" },
+        { "bigint", "BIGINT" }, { "int8", "BIGINT" }, { "serial", "BIGINT" }, { "bit", "BIGINT" },
+        { "float", "FLOAT" }, { "double", "FLOAT" }, { "real", "FLOAT" }, { "float4", "FLOAT" }, { "float8", "FLOAT" },
+        { "decimal", "DECIMAL" }, { "numeric", "DECIMAL" }, { "dec", "DECIMAL" }, { "fixed", "DECIMAL" },
+        { "char", "CHAR" }, { "character", "CHAR" }, { "nchar", "CHAR" },
+        { "varchar", "VARCHAR" }, { "nvarchar", "VARCHAR" }, { "varchar2", "VARCHAR" }, { "time", "VARCHAR" },
+        { "text", "TEXT" }, { "tinytext", "TEXT" }, { "mediumtext", "TEXT" }, { "longtext", "TEXT" }, { "json", "TEXT" },
+        { "enum", "VARCHAR" }, { "set", "TEXT" }, { "clob", "TEXT" }, { "string", "TEXT" },
+        { "blob", "BLOB" }, { "tinyblob", "BLOB" }, { "mediumblob", "BLOB" }, { "longblob", "BLOB" }, { "binary", "BLOB" },
+        { "varbinary", "BLOB" }, { "bytea", "BLOB" }, { "geometry", "BLOB" }, { "point", "BLOB" }, { "linestring", "BLOB" },
+        { "polygon", "BLOB" },
+        { "bool", "BOOL" }, { "boolean", "BOOL" },
+        { "date", "DATE" }, { "datetime", "DATETIME" }, { "timestamp", "DATETIME" },
+    };
+    const char* sv = NULL;
+    for (size_t i = 0; i < sizeof(MAP) / sizeof(MAP[0]) && !sv; i++) if (!strcmp(base, MAP[i].my)) sv = MAP[i].sv;
+    if (!sv) { copy_text(ps, cd->type, sizeof(cd->type), ct.text); cd->sqltype[0] = '\0'; return true; }   // l'executor dirà "Unknown type"
+    snprintf(cd->type, sizeof(cd->type), "%s", sv);
+    // un INT UNSIGNED arriva a 4294967295: serve un BIGINT
+    if (!strcmp(sv, "INT") && (cd->flags & COLF_UNSIGNED) && (!strcmp(base, "int") || !strcmp(base, "integer") || !strcmp(base, "mediumint")))
+        snprintf(cd->type, sizeof(cd->type), "BIGINT");
+    if (!strcmp(base, "time")) cd->size = 20;
+    if (is_enum) cd->size = maxlen > 0 ? maxlen : 1;
+    if (!strcmp(sv, "INT") || !strcmp(sv, "BIGINT") || !strcmp(sv, "FLOAT") || !strcmp(sv, "TEXT") || !strcmp(sv, "BLOB") ||
+        !strcmp(sv, "DATE") || !strcmp(sv, "DATETIME") || !strcmp(sv, "BOOL")) cd->size = 0;   // (n) di MySQL = larghezza di visualizzazione
+    if (!strcmp(base, "serial")) { cd->auto_increment = true; cd->nullable = false; cd->flags |= COLF_UNSIGNED; }
+    // il tipo scritto serve solo se dice più del tipo di SegVault
+    if (!strcasecmp(cd->sqltype, cd->type)) cd->sqltype[0] = '\0';
     return true;
 }
 
@@ -1806,7 +2450,27 @@ static bool parse_default_value(ParserState* ps, char* out, size_t n) {
         snprintf(out, n, "%s%.100s", dv.type == TOK_MINUS ? "-" : "", num.text);
         return true;
     }
-    if (dv.type == TOK_INTEGER || dv.type == TOK_FLOAT || dv.type == TOK_STRING || dv.type == TOK_NULL || dv.type == TOK_IDENTIFIER) {
+    if (dv.type == TOK_IDENTIFIER && peek(ps).type == TOK_LPAREN) {        // CURRENT_TIMESTAMP(6), NOW()
+        copy_text(ps, out, n, dv.text);
+        consume(ps);
+        while (peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) consume(ps);
+        expect(ps, TOK_RPAREN);
+        return true;
+    }
+    if (dv.type == TOK_LPAREN) {                                           // DEFAULT (espressione): il testo
+        int start = ps->pos, depth = 1;
+        while (depth > 0 && peek(ps).type != TOK_EOF) {
+            Token t = consume(ps);
+            if (t.type == TOK_LPAREN) depth++;
+            else if (t.type == TOK_RPAREN) depth--;
+        }
+        if (!tokens_text(ps, start, ps->pos - 1, out, n)) { parse_fail(ps, "DEFAULT expression is too long", dv); return false; }
+        size_t l = strlen(out);                                            // valore fra apici: senza apici
+        if (l >= 2 && out[0] == '\'' && out[l - 1] == '\'') { memmove(out, out + 1, l - 2); out[l - 2] = '\0'; }
+        return true;
+    }
+    if (dv.type == TOK_INTEGER || dv.type == TOK_FLOAT || dv.type == TOK_STRING || dv.type == TOK_NULL || dv.type == TOK_IDENTIFIER ||
+        dv.type == TOK_BOOLEAN) {
         copy_text(ps, out, n, dv.text);
         return true;
     }
@@ -1856,6 +2520,7 @@ static void parse_column_def(ParserState* ps, ASTNode* n) {
             }
         } else if (ident_is(ps, "UNIQUE")) {
             consume(ps);
+            if (peek(ps).type == TOK_KEY) consume(ps);               // UNIQUE KEY
             ConstraintDef* c = new_cons(ps, n);
             if (!c) return;
             memcpy(c->name, ccn, sizeof(c->name));
@@ -1864,9 +2529,39 @@ static void parse_column_def(ParserState* ps, ASTNode* n) {
         } else if (ident_is(ps, "AUTO_INCREMENT") || ident_is(ps, "AUTOINCREMENT")) {
             consume(ps);
             cd->auto_increment = true;
+        } else if (ident_is(ps, "COMMENT")) {                         // MySQL: COMMENT 'testo'
+            consume(ps);
+            Token cm = consume(ps);
+            if (cm.type != TOK_STRING) { parse_fail(ps, "Expected a quoted comment", cm); return; }
+            if (cd->comment[0] != '\x01') copy_text(ps, cd->comment, sizeof(cd->comment), cm.text);
+        } else if (ident_is(ps, "COLLATE") || ident_is(ps, "CHARSET") || ident_is(ps, "CHARACTER")) {
+            bool cs = ident_is(ps, "CHARACTER");
+            consume(ps);
+            if (cs && ident_is(ps, "SET")) consume(ps);
+            else if (cs && peek(ps).type == TOK_SET) consume(ps);
+            match(ps, TOK_EQ);
+            consume(ps);
+        } else if (ident_is(ps, "UNSIGNED") || ident_is(ps, "SIGNED") || ident_is(ps, "ZEROFILL") ||
+                   ident_is(ps, "VISIBLE") || ident_is(ps, "INVISIBLE")) {
+            if (ident_is(ps, "UNSIGNED")) cd->flags |= COLF_UNSIGNED;
+            consume(ps);
+        } else if (ident_is(ps, "COLUMN_FORMAT") || ident_is(ps, "STORAGE")) {
+            consume(ps);
+            consume(ps);
+        } else if (match(ps, TOK_ON)) {                               // ON UPDATE CURRENT_TIMESTAMP[(n)]
+            if (!match(ps, TOK_UPDATE)) { parse_fail(ps, "Expected UPDATE after ON", peek(ps)); return; }
+            Token f = consume(ps);
+            if (f.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected CURRENT_TIMESTAMP after ON UPDATE", f); return; }
+            if (match(ps, TOK_LPAREN)) { while (peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) consume(ps); expect(ps, TOK_RPAREN); }
+            cd->flags |= COLF_ON_UPDATE_NOW;
+        } else if (peek(ps).type == TOK_KEY) {                       // MySQL: "col INT KEY" = PRIMARY KEY
+            consume(ps);
+            cd->primary_key = true;
+            cd->nullable = false;
         } else if (ident_is(ps, "DEFAULT")) {
             consume(ps);
             if (!parse_default_value(ps, cd->default_val, sizeof(cd->default_val))) return;
+            cd->has_default = true;
         } else if (ident_is(ps, "CHECK")) {
             consume(ps);
             ConstraintDef* c = new_cons(ps, n);
@@ -1913,10 +2608,49 @@ static void parse_create_table(ParserState* ps, ASTNode* n) {
             if (!parse_table_constraint(ps, c)) { parse_fail(ps, "Expected PRIMARY KEY, UNIQUE, FOREIGN KEY or CHECK", peek(ps)); return; }
             continue;
         }
+        // MySQL: KEY | INDEX | FULLTEXT [KEY|INDEX] | SPATIAL [KEY|INDEX] [nome] (colonne)
+        bool fulltext = ident_is(ps, "FULLTEXT"), spatial = ident_is(ps, "SPATIAL");
+        if (peek(ps).type == TOK_KEY || peek(ps).type == TOK_INDEX || fulltext || spatial) {
+            consume(ps);
+            if ((fulltext || spatial) && (peek(ps).type == TOK_KEY || peek(ps).type == TOK_INDEX)) consume(ps);
+            if (n->create_table.num_keys >= SV_MAX_KEY_DEFS) { parse_fail(ps, "Too many indexes (max 16)", peek(ps)); return; }
+            TableKeyDef* k = &n->create_table.keys[n->create_table.num_keys];
+            memset(k, 0, sizeof(*k));
+            if (peek(ps).type == TOK_IDENTIFIER && !ident_is(ps, "USING")) { Token nm = consume(ps); copy_text(ps, k->name, sizeof(k->name), nm.text); }
+            skip_index_using(ps);
+            k->ncols = parse_name_list(ps, k->cols, 8);
+            skip_index_using(ps);
+            k->fulltext = fulltext;
+            if (!ps->result->success) return;
+            if (!spatial) n->create_table.num_keys++;
+            continue;
+        }
         parse_column_def(ps, n);
         if (!ps->result->success) return;
     } while (match(ps, TOK_COMMA));
-    expect(ps, TOK_RPAREN);
+    if (!expect(ps, TOK_RPAREN)) return;
+    // opzioni di tabella di MySQL: ENGINE = x, [DEFAULT] CHARSET = x, COLLATE x, AUTO_INCREMENT = n, COMMENT = '...'
+    while (ps->result->success && peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF) {
+        if (match(ps, TOK_COMMA)) continue;
+        if (ident_is(ps, "DEFAULT")) { consume(ps); continue; }
+        Token o = consume(ps);
+        if (o.type != TOK_IDENTIFIER && o.type != TOK_SET) { parse_fail(ps, "Unexpected text after the column list", o); return; }
+        char opt[40];
+        copy_text(ps, opt, sizeof(opt), o.text);
+        if (!strcasecmp(opt, "CHARACTER") && (ident_is(ps, "SET") || peek(ps).type == TOK_SET)) { consume(ps); snprintf(opt, sizeof(opt), "CHARSET"); }
+        if (!strcasecmp(opt, "PARTITION")) { parse_fail(ps, "PARTITION BY is not supported", o); return; }
+        match(ps, TOK_EQ);
+        Token v = consume(ps);
+        if (v.type == TOK_EOF || v.type == TOK_SEMICOLON) { parse_fail(ps, "Expected a value for the table option", v); return; }
+        if (!strcasecmp(opt, "COMMENT")) copy_text(ps, n->create_table.comment, sizeof(n->create_table.comment), v.text);
+        else if (!strcasecmp(opt, "COLLATE")) copy_text(ps, n->create_table.collation, sizeof(n->create_table.collation), v.text);
+        else if (!strcasecmp(opt, "CHARSET") && !n->create_table.collation[0] && v.text) {
+            if (!strncasecmp(v.text, "utf8mb4", 7)) snprintf(n->create_table.collation, sizeof(n->create_table.collation), "utf8mb4_general_ci");
+            else if (!strncasecmp(v.text, "utf8", 4)) snprintf(n->create_table.collation, sizeof(n->create_table.collation), "utf8mb3_general_ci");
+            else if (!strncasecmp(v.text, "latin1", 6)) snprintf(n->create_table.collation, sizeof(n->create_table.collation), "latin1_swedish_ci");
+        } else if (!strcasecmp(opt, "AUTO_INCREMENT") && v.text) n->create_table.auto_increment = atoll(v.text);
+        // ENGINE, ROW_FORMAT, STATS_*, KEY_BLOCK_SIZE, ...: accettate e ignorate
+    }
 }
 
 static bool view_option(Token t) {
@@ -1973,6 +2707,180 @@ static void parse_view_def(ParserState* ps, ASTNode* n) {
     if (!fits) parse_fail(ps, "View definition is too long (max 64 KB)", peek(ps));
 }
 
+// il token dopo quello corrente è la parola w?
+static bool peek2_ident(ParserState* ps, const char* w) {
+    if (ps->pos + 1 >= ps->tokens->count) return false;
+    const Token* t = &ps->tokens->tokens[ps->pos + 1];
+    return t->text && !strcasecmp(t->text, w);
+}
+
+// ── SHOW di MySQL ────────────────────────────────────────────────
+// SHOW COLUMNS, SHOW INDEX / KEYS, SHOW TABLE STATUS, SHOW DATABASES LIKE, SHOW CREATE DATABASE,
+// SHOW ENGINES, ... diventano SELECT su information_schema (stessi nomi di colonna di MySQL).
+
+// letterale SQL fra apici
+static void sql_quote(char* out, size_t n, const char* v) {
+    size_t o = 0;
+    if (o + 1 < n) out[o++] = '\'';
+    for (; v && *v && o + 3 < n; v++) {
+        if (*v == '\'' || *v == '\\') out[o++] = *v;
+        out[o++] = *v;
+    }
+    if (o + 1 < n) out[o++] = '\'';
+    out[o] = '\0';
+}
+
+// [FROM | IN] nome [. nome]: table = ultima parte, db = prima (se c'è)
+static bool show_target(ParserState* ps, char* db, char* table) {
+    db[0] = table[0] = '\0';
+    if (!match(ps, TOK_FROM) && !match(ps, TOK_IN)) { parse_fail(ps, "Expected FROM table", peek(ps)); return false; }
+    Token a = consume(ps);
+    if (a.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name", a); return false; }
+    copy_text(ps, table, 64, a.text);
+    if (match(ps, TOK_DOT)) {
+        Token b = consume(ps);
+        if (b.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name", b); return false; }
+        memcpy(db, table, 64);
+        copy_text(ps, table, 64, b.text);
+    }
+    if (match(ps, TOK_FROM) || match(ps, TOK_IN)) {            // SHOW COLUMNS FROM t FROM db
+        Token d = consume(ps);
+        if (d.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a database name", d); return false; }
+        copy_text(ps, db, 64, d.text);
+    }
+    return true;
+}
+
+// [LIKE 'p' | WHERE condizione] in coda: like = condizione SQL sulla colonna, where = testo
+static bool show_filter(ParserState* ps, const char* like_col, char* like, size_t ln, char* where, size_t wn) {
+    like[0] = where[0] = '\0';
+    if (ident_is(ps, "LIKE") || peek(ps).type == TOK_LIKE) {
+        consume(ps);
+        Token p = consume(ps);
+        if (p.type != TOK_STRING) { parse_fail(ps, "Expected a quoted pattern after LIKE", p); return false; }
+        char q[300];
+        sql_quote(q, sizeof(q), p.text);
+        snprintf(like, ln, " AND %s LIKE %s", like_col, q);
+    } else if (match(ps, TOK_WHERE)) {
+        int start = ps->pos;
+        while (peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF) consume(ps);
+        if (!tokens_text(ps, start, ps->pos, where, wn)) { parse_fail(ps, "WHERE condition is too long", peek(ps)); return false; }
+    }
+    return true;
+}
+
+static ASTNode* parse_generated(ParserState* ps, const char* sql) {
+    TokenList* tk = lexer_tokenize(sql);
+    ParseResult* pr = tk ? parser_parse(tk) : NULL;
+    ASTNode* st = NULL;
+    if (pr && pr->success && pr->count == 1) { st = pr->statements[0]; pr->count = 0; }
+    else parse_fail(ps, pr && pr->error[0] ? pr->error : "Out of memory", peek(ps));
+    if (pr) parse_result_free(pr);
+    if (tk) lexer_free(tk);
+    if (st) snprintf(ps->qual_db, sizeof(ps->qual_db), "information_schema");
+    return st;
+}
+
+// NULL (posizione invariata) se non è uno dei SHOW di MySQL gestiti così
+static ASTNode* parse_show_mysql(ParserState* ps) {
+    int save = ps->pos;
+    bool full = false;
+    if (ident_is(ps, "FULL")) { consume(ps); full = true; }
+    char db[64], table[64], like[400], where[2048], schema[200], sql[6000], tq[200];
+    if (ident_is(ps, "COLUMNS") || ident_is(ps, "FIELDS")) {
+        consume(ps);
+        if (!show_target(ps, db, table) || !show_filter(ps, "COLUMN_NAME", like, sizeof(like), where, sizeof(where))) return NULL;
+        if (db[0]) sql_quote(schema, sizeof(schema), db); else snprintf(schema, sizeof(schema), "DATABASE()");
+        sql_quote(tq, sizeof(tq), table);
+        snprintf(sql, sizeof(sql),
+                 "SELECT COLUMN_NAME AS `Field`, COLUMN_TYPE AS `Type`, %s IS_NULLABLE AS `Null`, COLUMN_KEY AS `Key`, "
+                 "COLUMN_DEFAULT AS `Default`, EXTRA AS `Extra`%s FROM information_schema.COLUMNS "
+                 "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s%s ORDER BY ORDINAL_POSITION",
+                 full ? "COLLATION_NAME AS `Collation`," : "", full ? ", PRIVILEGES AS `Privileges`, COLUMN_COMMENT AS `Comment`" : "",
+                 schema, tq, like);
+    } else if ((peek(ps).type == TOK_INDEX && !full) || ident_is(ps, "KEYS")) {
+        consume(ps);
+        if (!show_target(ps, db, table) || !show_filter(ps, "INDEX_NAME", like, sizeof(like), where, sizeof(where))) return NULL;
+        if (db[0]) sql_quote(schema, sizeof(schema), db); else snprintf(schema, sizeof(schema), "DATABASE()");
+        sql_quote(tq, sizeof(tq), table);
+        snprintf(sql, sizeof(sql),
+                 "SELECT TABLE_NAME AS `Table`, NON_UNIQUE AS `Non_unique`, INDEX_NAME AS `Key_name`, SEQ_IN_INDEX AS `Seq_in_index`, "
+                 "COLUMN_NAME AS `Column_name`, COLLATION AS `Collation`, CARDINALITY AS `Cardinality`, SUB_PART AS `Sub_part`, "
+                 "PACKED AS `Packed`, NULLABLE AS `Null`, INDEX_TYPE AS `Index_type`, COMMENT AS `Comment`, "
+                 "INDEX_COMMENT AS `Index_comment`, IS_VISIBLE AS `Visible`, EXPRESSION AS `Expression` "
+                 "FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s%s", schema, tq, like);
+    } else if (peek(ps).type == TOK_TABLE && !full) {
+        consume(ps);
+        if (!ident_is(ps, "STATUS")) { ps->pos = save; return NULL; }
+        consume(ps);
+        db[0] = '\0';
+        if (match(ps, TOK_FROM) || match(ps, TOK_IN)) { Token d = consume(ps); copy_text(ps, db, sizeof(db), d.text); }
+        if (!show_filter(ps, "TABLE_NAME", like, sizeof(like), where, sizeof(where))) return NULL;
+        if (db[0]) sql_quote(schema, sizeof(schema), db); else snprintf(schema, sizeof(schema), "DATABASE()");
+        snprintf(sql, sizeof(sql),
+                 "SELECT TABLE_NAME AS `Name`, ENGINE AS `Engine`, VERSION AS `Version`, ROW_FORMAT AS `Row_format`, "
+                 "TABLE_ROWS AS `Rows`, AVG_ROW_LENGTH AS `Avg_row_length`, DATA_LENGTH AS `Data_length`, "
+                 "MAX_DATA_LENGTH AS `Max_data_length`, INDEX_LENGTH AS `Index_length`, DATA_FREE AS `Data_free`, "
+                 "AUTO_INCREMENT AS `Auto_increment`, CREATE_TIME AS `Create_time`, UPDATE_TIME AS `Update_time`, "
+                 "CHECK_TIME AS `Check_time`, TABLE_COLLATION AS `Collation`, CHECKSUM AS `Checksum`, "
+                 "CREATE_OPTIONS AS `Create_options`, TABLE_COMMENT AS `Comment` FROM information_schema.TABLES "
+                 "WHERE TABLE_SCHEMA = %s%s", schema, like);
+    } else if (!full && (ident_is(ps, "DATABASES") || ident_is(ps, "SCHEMAS")) &&
+               (next_is(ps, 1, TOK_LIKE) || next_is(ps, 1, TOK_WHERE))) {
+        consume(ps);
+        if (!show_filter(ps, "SCHEMA_NAME", like, sizeof(like), where, sizeof(where))) return NULL;
+        snprintf(sql, sizeof(sql), "SELECT SCHEMA_NAME AS `Database` FROM information_schema.SCHEMATA WHERE 1 = 1%s ORDER BY SCHEMA_NAME", like);
+    } else if (!full && peek(ps).type == TOK_CREATE && (next_is(ps, 1, TOK_DATABASE) || (peek2_ident(ps, "SCHEMA")))) {
+        consume(ps);
+        consume(ps);
+        if (ident_is(ps, "IF")) { consume(ps); match(ps, TOK_NOT); match(ps, TOK_EXISTS); }
+        Token d = consume(ps);
+        if (d.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a database name", d); return NULL; }
+        copy_text(ps, db, sizeof(db), d.text);
+        sql_quote(schema, sizeof(schema), db);
+        char create[300], cq[400];
+        snprintf(create, sizeof(create), "CREATE DATABASE `%s` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci */", db);
+        sql_quote(cq, sizeof(cq), create);
+        snprintf(sql, sizeof(sql), "SELECT SCHEMA_NAME AS `Database`, %s AS `Create Database` FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s", cq, schema);
+    } else if (!full && ident_is(ps, "ENGINES")) {
+        consume(ps);
+        snprintf(sql, sizeof(sql), "SELECT ENGINE AS `Engine`, SUPPORT AS `Support`, COMMENT AS `Comment`, TRANSACTIONS AS `Transactions`, "
+                 "XA AS `XA`, SAVEPOINTS AS `Savepoints` FROM information_schema.ENGINES");
+    } else if (!full && (ident_is(ps, "CHARSET") || (ident_is(ps, "CHARACTER") && (next_is(ps, 1, TOK_SET) || peek2_ident(ps, "SET"))))) {
+        if (ident_is(ps, "CHARACTER")) consume(ps);
+        consume(ps);
+        if (!show_filter(ps, "CHARACTER_SET_NAME", like, sizeof(like), where, sizeof(where))) return NULL;
+        snprintf(sql, sizeof(sql), "SELECT CHARACTER_SET_NAME AS `Charset`, DESCRIPTION AS `Description`, DEFAULT_COLLATE_NAME AS "
+                 "`Default collation`, MAXLEN AS `Maxlen` FROM information_schema.CHARACTER_SETS WHERE 1 = 1%s", like);
+    } else if (!full && ident_is(ps, "COLLATION")) {
+        consume(ps);
+        if (!show_filter(ps, "COLLATION_NAME", like, sizeof(like), where, sizeof(where))) return NULL;
+        snprintf(sql, sizeof(sql), "SELECT COLLATION_NAME AS `Collation`, CHARACTER_SET_NAME AS `Charset`, ID AS `Id`, IS_DEFAULT AS "
+                 "`Default`, IS_COMPILED AS `Compiled`, SORTLEN AS `Sortlen`, PAD_ATTRIBUTE AS `Pad_attribute` "
+                 "FROM information_schema.COLLATIONS WHERE 1 = 1%s", like);
+    } else if (ident_is(ps, "PROCESSLIST")) {
+        consume(ps);
+        snprintf(sql, sizeof(sql), "SELECT ID AS `Id`, USER AS `User`, HOST AS `Host`, DB AS `db`, COMMAND AS `Command`, TIME AS `Time`, "
+                 "STATE AS `State`, INFO AS `Info` FROM information_schema.PROCESSLIST");
+    } else if (!full && (ident_is(ps, "WARNINGS") || ident_is(ps, "ERRORS") || ident_is(ps, "PLUGINS"))) {
+        bool plugins = ident_is(ps, "PLUGINS");
+        consume(ps);
+        while (peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF) consume(ps);    // LIMIT ...
+        if (plugins) snprintf(sql, sizeof(sql), "SELECT PLUGIN_NAME AS `Name`, PLUGIN_STATUS AS `Status`, PLUGIN_TYPE AS `Type` FROM information_schema.PLUGINS");
+        else snprintf(sql, sizeof(sql), "SELECT STATE AS `Level`, ID AS `Code`, INFO AS `Message` FROM information_schema.PROCESSLIST");
+    } else {
+        ps->pos = save;
+        return NULL;
+    }
+    if (!ps->result->success) return NULL;
+    if (where[0]) {                                            // SHOW ... WHERE: filtro sul risultato
+        char wrapped[sizeof(sql) + sizeof(where) + 64];
+        snprintf(wrapped, sizeof(wrapped), "SELECT * FROM (%s) AS show_result WHERE %s", sql, where);
+        return parse_generated(ps, wrapped);
+    }
+    return parse_generated(ps, sql);
+}
+
 static ASTNode* parse_statement(ParserState* ps) {
     ASTNode* n = calloc(1, sizeof(ASTNode));
     if (!n) return NULL;
@@ -2001,7 +2909,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             copy_text(ps, n->maint.tables[n->maint.ntables++], 64, tn.text);
         } while (match(ps, TOK_COMMA));
         while (ident_is(ps, "QUICK") || ident_is(ps, "FAST") || ident_is(ps, "MEDIUM") || ident_is(ps, "EXTENDED") ||
-               ident_is(ps, "CHANGED") || ident_is(ps, "FOR") || ident_is(ps, "UPGRADE")) consume(ps);   // opzioni di MySQL
+               ident_is(ps, "CHANGED") || word_is(ps, "FOR") || ident_is(ps, "UPGRADE")) consume(ps);   // opzioni di MySQL
         return n;
     }
     if (ident_is(ps, "BACKUP")) {                         // BACKUP [DATABASE] TO 'cartella'
@@ -2029,12 +2937,7 @@ static ASTNode* parse_statement(ParserState* ps) {
             break;
         case TOK_DELETE: {
             consume(ps);
-            n->type = NODE_DELETE;
-            expect(ps, TOK_FROM);
-            Token tn = table_tok(ps);
-            if (tn.type != TOK_IDENTIFIER) parse_fail(ps, "Expected a table name after DELETE FROM", tn);
-            copy_text(ps, n->delete_stmt.table_name, sizeof(n->delete_stmt.table_name), tn.text);
-            if (ps->result->success && match(ps, TOK_WHERE)) n->delete_stmt.where = parse_expr(ps);
+            parse_delete(ps, n);
             break;
         }
         case TOK_CREATE: {
@@ -2197,7 +3100,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                 } else if (ident_is(ps, "DEFAULT")) {
                     consume(ps);
                     n->alter_table.alter_kind = set ? ALT_SET_DEFAULT : ALT_DROP_DEFAULT;
-                    if (set) parse_default_value(ps, d->default_val, sizeof(d->default_val));
+                    if (set) { parse_default_value(ps, d->default_val, sizeof(d->default_val)); d->has_default = true; }
                 } else if (match(ps, TOK_NOT)) {
                     if (!match(ps, TOK_NULL)) { parse_fail(ps, "Expected NULL after NOT", peek(ps)); break; }
                     n->alter_table.alter_kind = set ? ALT_SET_NOT_NULL : ALT_DROP_NOT_NULL;
@@ -2257,6 +3160,8 @@ static ASTNode* parse_statement(ParserState* ps) {
         }
         case TOK_SHOW: {
             consume(ps);
+            ASTNode* mysql_show = parse_show_mysql(ps);
+            if (mysql_show || !ps->result->success) { free_node(n); return mysql_show; }
             n->type = NODE_SHOW;
             // SHOW DATABASES | TABLES | STATUS | CREATE TABLE t | CONSTRAINTS FROM t | INDEXES FROM t
             // (il tipo va in table_name, la tabella in table_alias)
@@ -2273,6 +3178,20 @@ static ASTNode* parse_statement(ParserState* ps) {
             else if (!strcasecmp(what.text, "CONSTRAINTS")) { kind = "CONSTRAINTS"; needs_table = true; }
             else if (what.type == TOK_INDEX || !strcasecmp(what.text, "INDEXES") || !strcasecmp(what.text, "KEYS")) { kind = "INDEXES"; needs_table = true; }
             if (!kind) { parse_fail(ps, "Expected DATABASES, TABLES, FULL TABLES, STATUS, TRIGGERS, CREATE TABLE / VIEW, CONSTRAINTS or INDEXES after SHOW", what); break; }
+            if ((!strcmp(kind, "TABLES") || !strcmp(kind, "FULL TABLES") || !strcmp(kind, "DATABASES")) && ps->result->success) {
+                if (strcmp(kind, "DATABASES") && (match(ps, TOK_FROM) || match(ps, TOK_IN))) {   // SHOW TABLES FROM db
+                    Token d = consume(ps);
+                    if (d.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a database name", d); break; }
+                    copy_text(ps, ps->qual_db, sizeof(ps->qual_db), d.text);
+                }
+                if (ident_is(ps, "LIKE") || peek(ps).type == TOK_LIKE) {                     // ... LIKE 'wp\_%'
+                    consume(ps);
+                    Token p = consume(ps);
+                    if (p.type != TOK_STRING) { parse_fail(ps, "Expected a quoted pattern after LIKE", p); break; }
+                    copy_text(ps, n->select_stmt.show_like, sizeof(n->select_stmt.show_like), p.text);
+                    n->select_stmt.has_show_like = true;
+                }
+            }
             if (!strcmp(kind, "TRIGGERS") && (match(ps, TOK_FROM) || match(ps, TOK_IN))) {      // SHOW TRIGGERS [FROM t]
                 Token tn = table_tok(ps);
                 if (tn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name", tn); break; }
@@ -2352,6 +3271,12 @@ static ASTNode* parse_statement(ParserState* ps) {
             if (query_starts(ps, 0)) { free(n); return parse_query(ps); }   // WITH ...
             if (ident_is(ps, "CHECKPOINT")) { consume(ps); n->type = NODE_CHECKPOINT; break; }
             if (ident_is(ps, "VACUUM")) { consume(ps); n->type = NODE_VACUUM; break; }
+            if (ident_is(ps, "REPLACE") && !next_is(ps, 1, TOK_LPAREN)) {   // MySQL: REPLACE [INTO] t ...
+                consume(ps);
+                parse_insert(ps, n);
+                n->insert_stmt.mode = INS_REPLACE;
+                break;
+            }
             snprintf(ps->result->error, sizeof(ps->result->error),
                      "Unexpected token: %.200s at line %d", t.text, t.line);
             ps->result->success = false;
@@ -2438,13 +3363,16 @@ static void free_node(ASTNode* n) {
                 ast_expr_free(n->insert_stmt.values[j]);
             free(n->insert_stmt.values);
             free_node(n->insert_stmt.select);
+            for (int j = 0; j < n->insert_stmt.num_dup; j++) ast_expr_free(n->insert_stmt.dup_exprs[j]);
             break;
         case NODE_UPDATE:
-            for (int j = 0; j < n->update_stmt.num_sets; j++) ast_expr_free(n->update_stmt.set_exprs[j]);
+            for (int j = 0; j < n->update_stmt.num_sets; j++) { ast_expr_free(n->update_stmt.set_exprs[j]); free(n->update_stmt.set_texts[j]); }
             ast_expr_free(n->update_stmt.where);
+            free(n->update_stmt.multi_from); free(n->update_stmt.multi_where); free(n->update_stmt.order_limit);
             break;
         case NODE_DELETE:
             ast_expr_free(n->delete_stmt.where);
+            free(n->delete_stmt.multi_from); free(n->delete_stmt.multi_where); free(n->delete_stmt.order_limit);
             break;
         case NODE_EXPLAIN:
             free_node((ASTNode*)n->explain.stmt);

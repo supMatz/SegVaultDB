@@ -53,11 +53,59 @@ Catalog* catalog_create(void) {
 // letto e alla prima chiusura riscritto nel formato v2.
 
 #define CAT_MAGIC   "SVCAT2\0\0"
-#define CAT_VERSION 4u   // v3: il flag "nullable" delle colonne è significativo (NOT NULL applicato)
+#define CAT_VERSION 5u   // v3: il flag "nullable" delle colonne è significativo (NOT NULL applicato)
                          // v4: vincoli (PRIMARY KEY composta, UNIQUE, FOREIGN KEY, CHECK) in coda a TableSchema
+                         // v5: tipo SQL originale e flag delle colonne, colonne degli indici, collation
 
-// TableSchema fino alla v3: gli stessi campi senza i vincoli in coda
-#define TABLE_V3_SIZE offsetof(TableSchema, num_constraints)
+// ── formati precedenti (v1..v4): stesse strutture senza i campi della v5 ──
+typedef struct {
+    char name[SV_MAX_NAME_LEN]; DataType type; int size; int decimal_prec;
+    bool nullable, primary_key, auto_increment, unique, has_default;
+    char default_val[128]; char comment[256];
+} ColumnV4;
+typedef struct {
+    char name[SV_MAX_NAME_LEN]; char col_name[SV_MAX_NAME_LEN]; bool unique; char type[16]; uint32_t root_page_id;
+} IndexV4;
+typedef struct {
+    char name[SV_MAX_NAME_LEN];
+    ColumnV4 columns[SV_MAX_COLUMNS]; int num_columns;
+    IndexV4 indexes[SV_MAX_INDEXES]; int num_indexes;
+    uint32_t root_page_id, num_pages; uint64_t num_rows; char comment[256];
+    int num_constraints; Constraint constraints[SV_MAX_CONSTRAINTS];
+} TableSchemaV4;
+
+// TableSchema fino alla v3: gli stessi campi della v4 senza i vincoli in coda
+#define TABLE_V3_SIZE offsetof(TableSchemaV4, num_constraints)
+
+static void table_from_v4(TableSchema* t, const TableSchemaV4* o) {
+    memset(t, 0, sizeof(*t));
+    memcpy(t->name, o->name, sizeof(t->name));
+    t->num_columns = o->num_columns >= 0 && o->num_columns <= SV_MAX_COLUMNS ? o->num_columns : 0;
+    for (int i = 0; i < SV_MAX_COLUMNS; i++) {
+        Column* c = &t->columns[i];
+        const ColumnV4* oc = &o->columns[i];
+        memcpy(c->name, oc->name, sizeof(c->name));
+        c->type = oc->type; c->size = oc->size; c->decimal_prec = oc->decimal_prec;
+        c->nullable = oc->nullable; c->primary_key = oc->primary_key; c->auto_increment = oc->auto_increment;
+        c->unique = oc->unique; c->has_default = oc->has_default;
+        memcpy(c->default_val, oc->default_val, sizeof(c->default_val));
+        memcpy(c->comment, oc->comment, sizeof(c->comment));
+    }
+    t->num_indexes = o->num_indexes >= 0 && o->num_indexes <= SV_MAX_INDEXES ? o->num_indexes : 0;
+    for (int i = 0; i < SV_MAX_INDEXES; i++) {
+        Index* x = &t->indexes[i];
+        const IndexV4* ox = &o->indexes[i];
+        memcpy(x->name, ox->name, sizeof(x->name));
+        memcpy(x->col_name, ox->col_name, sizeof(x->col_name));
+        x->unique = ox->unique;
+        memcpy(x->type, ox->type, sizeof(x->type));
+        x->root_page_id = ox->root_page_id;
+    }
+    t->root_page_id = o->root_page_id; t->num_pages = o->num_pages; t->num_rows = o->num_rows;
+    memcpy(t->comment, o->comment, sizeof(t->comment));
+    t->num_constraints = o->num_constraints >= 0 && o->num_constraints <= SV_MAX_CONSTRAINTS ? o->num_constraints : 0;
+    memcpy(t->constraints, o->constraints, sizeof(t->constraints));
+}
 
 // formato più vecchio (v1): la struct Catalog intera, con le TableSchema senza vincoli
 typedef struct { uint8_t raw[TABLE_V3_SIZE]; } TableSchemaV3;
@@ -137,8 +185,17 @@ Catalog* catalog_load(const char* path) {
                  nr >= 0 && nr <= 64 && ntr >= 0 && ntr <= 64;
             if (!ok) break;
             db->num_tables = nt; db->num_views = nv; db->num_routines = nr; db->num_triggers = ntr;
-            if (version >= 4u) ok = read_all(fd, db->tables, sizeof(TableSchema) * (size_t)nt);
-            else for (int t = 0; ok && t < nt; t++) ok = read_all(fd, &db->tables[t], TABLE_V3_SIZE);   // senza vincoli
+            if (version >= 5u) ok = read_all(fd, db->tables, sizeof(TableSchema) * (size_t)nt);
+            else {
+                TableSchemaV4* old = calloc(1, sizeof(TableSchemaV4));
+                ok = old != NULL;
+                for (int t = 0; ok && t < nt; t++) {
+                    memset(old, 0, sizeof(*old));
+                    ok = read_all(fd, old, version >= 4u ? sizeof(TableSchemaV4) : TABLE_V3_SIZE);   // v3: senza vincoli
+                    if (ok) table_from_v4(&db->tables[t], old);
+                }
+                free(old);
+            }
             ok = ok &&
                  read_all(fd, db->views,    sizeof(ViewSchema)    * (size_t)nv) &&
                  read_all(fd, db->routines, sizeof(RoutineSchema) * (size_t)nr) &&
@@ -159,7 +216,12 @@ Catalog* catalog_load(const char* path) {
             if (od->num_tables < 0 || od->num_tables > SV_MAX_TABLES) { ok = false; break; }
             memcpy(nd->name, od->name, sizeof(nd->name));
             nd->num_tables = od->num_tables;
-            for (int t = 0; t < od->num_tables; t++) memcpy(&nd->tables[t], od->tables[t].raw, TABLE_V3_SIZE);
+            for (int t = 0; t < od->num_tables; t++) {
+                TableSchemaV4 tmp;
+                memset(&tmp, 0, sizeof(tmp));
+                memcpy(&tmp, od->tables[t].raw, TABLE_V3_SIZE);
+                table_from_v4(&nd->tables[t], &tmp);
+            }
             memcpy(nd->views, od->views, sizeof(nd->views));       nd->num_views = od->num_views;
             memcpy(nd->routines, od->routines, sizeof(nd->routines)); nd->num_routines = od->num_routines;
             memcpy(nd->triggers, od->triggers, sizeof(nd->triggers)); nd->num_triggers = od->num_triggers;

@@ -87,7 +87,7 @@ typedef struct ASTExpr {
     struct ASTExpr** args;    // EXPR_FUNC / EXPR_AGG: argomenti
     int      nargs;
     bool     agg_distinct;    // COUNT(DISTINCT x)
-    char     func[16];        // EXPR_AGG / EXPR_FUNC: nome della funzione (maiuscolo)
+    char     func[32];        // EXPR_AGG / EXPR_FUNC: nome della funzione (maiuscolo)
     char     alias[64];       // SELECT ... AS alias
     // risoluzione fatta dall'executor prima di eseguire (EXPR_COLUMN):
     //   > 0  sorgente * 1024 + colonna + 1      < 0  alias della SELECT numero -(bound + 1)
@@ -118,7 +118,23 @@ typedef struct {
     bool     primary_key;
     bool     auto_increment;
     char     default_val[128];
+    bool     has_default;            // DEFAULT presente (anche DEFAULT '')
+    // dialetto MySQL
+    int      scale;                  // DECIMAL(p, s): s (se has_scale)
+    bool     has_scale;
+    char     sqltype[48];            // tipo come scritto, in minuscolo ("bigint(20) unsigned")
+    uint8_t  flags;                  // COLF_* (schema.h)
+    char     comment[256];
 } ColumnDef;
+
+// KEY / INDEX / FULLTEXT KEY di CREATE TABLE (UNIQUE KEY diventa un vincolo)
+typedef struct {
+    char     name[64];
+    int      ncols;
+    char     cols[8][64];
+    bool     fulltext;
+} TableKeyDef;
+#define SV_MAX_KEY_DEFS 16
 
 // vincolo di CREATE TABLE / ALTER TABLE ADD CONSTRAINT (di colonna o di tabella)
 typedef struct {
@@ -163,6 +179,7 @@ enum { SETOP_NONE, SETOP_UNION, SETOP_INTERSECT, SETOP_EXCEPT };
 #define SV_MAX_ORDER   8
 #define SV_MAX_GROUP   16
 #define SV_MAX_SETS    64
+enum { INS_NORMAL, INS_IGNORE, INS_REPLACE };
 
 typedef struct ASTNode {
     StmtType type;
@@ -175,6 +192,8 @@ typedef struct ASTNode {
             int        num_cols;
             char       table_name[64];
             char       table_alias[64];  // "" = nessun alias
+            char       show_like[128];   // SHOW TABLES / DATABASES LIKE 'p'
+            bool       has_show_like;
             ASTExpr*   where;
             ASTExpr*   order_exprs[SV_MAX_ORDER];
             bool       order_desc[SV_MAX_ORDER];
@@ -183,6 +202,7 @@ typedef struct ASTNode {
             int        offset;
             bool       has_limit;      // LIMIT presente (LIMIT 0 = nessuna riga)
             bool       distinct;
+            bool       calc_found;     // SQL_CALC_FOUND_ROWS: FOUND_ROWS() = righe senza LIMIT
             ASTExpr*   group_exprs[SV_MAX_GROUP];
             int        num_group;
             ASTExpr*   having;
@@ -205,6 +225,11 @@ typedef struct ASTNode {
             int        num_values;     // valori per riga
             int        num_rows;
             struct ASTNode* select;    // INSERT INTO t [(colonne)] SELECT ...
+            int        mode;           // INS_* (INSERT IGNORE, REPLACE)
+            char       dup_cols[SV_MAX_SETS][64];   // ON DUPLICATE KEY UPDATE col = espr, ...
+            ASTExpr*   dup_exprs[SV_MAX_SETS];
+            int        num_dup;
+            char       row_alias[64];  // VALUES (...) AS nuovo: nuovo.col = il valore proposto
         } insert_stmt;
         struct {
             char       table_name[64];
@@ -212,10 +237,22 @@ typedef struct ASTNode {
             ASTExpr*   set_exprs[SV_MAX_SETS];
             int        num_sets;
             ASTExpr*   where;
+            // MySQL: UPDATE con più tabelle (JOIN), alias, ORDER BY / LIMIT: tutto come testo SQL
+            char*      multi_from;            // "t1 a JOIN t2 b ON ..." (NULL = forma semplice)
+            char*      multi_where;           // condizione (NULL = nessuna)
+            char*      order_limit;           // "ORDER BY ... LIMIT n" (NULL = nessuno)
+            char       set_tables[SV_MAX_SETS][64];   // a.col: "a" ("" = non qualificata)
+            char*      set_texts[SV_MAX_SETS];        // testo dell'espressione
         } update_stmt;
         struct {
             char       table_name[64];
             ASTExpr*   where;
+            // MySQL: DELETE a, b FROM ..., DELETE FROM t AS x ..., ORDER BY / LIMIT
+            char*      multi_from;
+            char*      multi_where;
+            char*      order_limit;
+            char       targets[8][64];        // tabelle (o alias) da cui si cancella
+            int        num_targets;
         } delete_stmt;
         struct {
             char       db_name[64];
@@ -229,6 +266,11 @@ typedef struct ASTNode {
             int        num_columns;
             ConstraintDef cons[SV_MAX_CONS_DEFS];
             int        num_cons;
+            TableKeyDef keys[SV_MAX_KEY_DEFS];
+            int        num_keys;
+            char       comment[256];          // COMMENT = '...'
+            char       collation[40];         // [DEFAULT] COLLATE x / CHARSET x
+            long long  auto_increment;        // AUTO_INCREMENT = n
         } create_table;
         struct {
             char       table_name[64];

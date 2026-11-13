@@ -42,7 +42,13 @@ typedef struct {
     bool       has_default;
     char       default_val[128];
     char       comment[256];
+    // ── dal formato v5 del catalogo ──
+    char       sqltype[48];    // tipo come è stato scritto ("bigint(20) unsigned", "longtext"); "" = dal tipo
+    uint8_t    flags;          // COLF_*
 } Column;
+
+#define COLF_UNSIGNED      0x01   // UNSIGNED: niente valori negativi
+#define COLF_ON_UPDATE_NOW 0x02   // ON UPDATE CURRENT_TIMESTAMP
 
 // -- definizione indice --
 typedef struct {
@@ -51,6 +57,10 @@ typedef struct {
     bool     unique;
     char     type[16];         // "BTREE" o "HASH"
     uint32_t root_page_id;     // Prima pagina del B+Tree di questo indice
+    // ── dal formato v5: tutte le colonne (col_name è la prima, quella usata per cercare) ──
+    uint8_t  ncols;            // 0 = solo col_name (cataloghi precedenti)
+    uint8_t  fulltext;         // FULLTEXT KEY
+    char     cols[8][SV_MAX_NAME_LEN];
 } Index;
 
 // -- vincoli di integrità --
@@ -87,6 +97,9 @@ typedef struct {
     // ── dal formato v4 del catalogo (i campi precedenti hanno la disposizione di prima) ──
     int       num_constraints;
     Constraint constraints[SV_MAX_CONSTRAINTS];
+    // ── dal formato v5 ──
+    char      collation[40];   // DEFAULT COLLATE della tabella ("" = utf8mb4_general_ci)
+    uint64_t  auto_increment;  // AUTO_INCREMENT = n di CREATE TABLE (prossimo valore minimo; 0 = nessuno)
 } TableSchema;
 
 // -- definizione vista --
