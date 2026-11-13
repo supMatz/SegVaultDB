@@ -37,6 +37,11 @@ void executor_invalidate_indexes(void);
 void executor_set_infoschema(bool on);
 void executor_set_db_filter(bool (*see)(const char* db));
 
+// modalità MySQL (connessioni del protocollo MySQL): le regole permissive di MySQL al posto di quelle
+// dello standard, es. SELECT DISTINCT ... ORDER BY una colonna non selezionata
+void executor_set_mysql_mode(bool on);
+bool executor_mysql_mode(void);
+
 // CREATE TABLE della tabella (with_fk: con le chiavi esterne) e ALTER TABLE per le sue chiavi
 // esterne; stringhe da liberare con free
 char* executor_create_statement(Catalog* cat, const char* db, const char* table, bool with_fk);

@@ -3552,9 +3552,13 @@ static bool find_index_eq(ASTExpr* w, TableSchema* ts, int* out_ci, char* key, s
         int ci = (col->bound - 1) % 1024;
         if (!col_is_indexed(ts, ci)) continue;
         DataType t = ts->columns[ci].type;
+        double d;
         if (is_int_type(t) && val->type == EXPR_INT) {
             if (t == SV_TYPE_INT && (val->int_val < INT32_MIN || val->int_val > INT32_MAX)) continue;
             snprintf(key, keyn, "%lld", (long long)val->int_val);
+        } else if (is_int_type(t) && val->type == EXPR_STRING && val->str_val && text_is_number(val->str_val, &d) &&
+                   d == floor(d) && fabs(d) <= 2147483647.0) {                // WHERE id = '5'
+            snprintf(key, keyn, "%lld", (long long)d);
         } else if (is_text_type(t) && val->type == EXPR_STRING) {
             key_text(key, keyn, val->str_val ? val->str_val : "");
         } else {
@@ -4201,6 +4205,9 @@ static _Thread_local bool g_infoschema;            // lo statement nomina inform
 static _Thread_local bool (*g_see_db)(const char* db);   // permessi dell'utente (NULL = vede tutto)
 
 void executor_set_infoschema(bool on) { g_infoschema = on; }
+static _Thread_local bool g_mysql_mode;
+void executor_set_mysql_mode(bool on) { g_mysql_mode = on; }
+bool executor_mysql_mode(void) { return g_mysql_mode; }
 void executor_set_db_filter(bool (*see)(const char* db)) { g_see_db = see; }
 
 typedef struct { Source* s; int cap; Tuple* t; int col; bool ok; } ISB;
@@ -4760,9 +4767,16 @@ static bool range_worth(const Source* S, int n) {
 // chiave di ricerca dal valore calcolato; false se il tipo non è confrontabile esattamente
 static bool probe_text(const EvalVal* v, DataType col, char* buf, size_t n) {
     if (v->null) return false;
-    if (is_int_type(col) && v->is_int) {
-        if (col == SV_TYPE_INT && (v->inum < INT32_MIN || v->inum > INT32_MAX)) return false;
-        snprintf(buf, n, "%lld", (long long)v->inum);
+    if (is_int_type(col)) {
+        // colonna intera: anche 1.0 e '1' (MySQL: WHERE ID = '1') trovano la chiave 1
+        long long x;
+        double d;
+        if (v->is_int) x = v->inum;
+        else if (v->is_num) { if (v->num != floor(v->num) || fabs(v->num) > 9e18) return false; x = (long long)v->num; }
+        else if (text_is_number(ev_s(v), &d) && d == floor(d) && fabs(d) <= 9e18) x = (long long)d;
+        else return false;
+        if (col == SV_TYPE_INT && (x < INT32_MIN || x > INT32_MAX)) return false;
+        snprintf(buf, n, "%lld", x);
         return true;
     }
     if (is_text_type(col) && !v->is_num) { key_text(buf, n, ev_s(v)); return true; }
@@ -4981,7 +4995,7 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
         // SELECT DISTINCT: l'ordine deve dipendere solo dalle colonne restituite (come MySQL 5.7+ e
         // PostgreSQL); con un'altra espressione ogni riga distinta ne avrebbe più valori e l'ordine
         // sarebbe arbitrario
-        for (int i = 0; n->select_stmt.distinct && !p->compound && i < n->select_stmt.num_order; i++) {
+        for (int i = 0; n->select_stmt.distinct && !p->compound && !g_mysql_mode && i < n->select_stmt.num_order; i++) {
             ASTExpr* o = n->select_stmt.order_exprs[i];
             if (o->type == EXPR_INT || (o->type == EXPR_COLUMN && o->bound < 0)) continue;
             bool found = false;
@@ -5123,11 +5137,13 @@ static bool plan_load(SelectPlan* p) {
                 EvalVal kv;
                 eval_expr(p->probe_key[s], &ec, &kv);
                 char key[KEY_BUF];
-                MemIndex* ix = mi_get(p->x, db->name, S->ts, p->probe_col[s]);
+                bool keyed = probe_text(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key));
+                // un valore che non diventa una chiave della colonna (testo contro numero, ...): si legge tutto
+                MemIndex* ix = keyed || kv.null ? mi_get(p->x, db->name, S->ts, p->probe_col[s]) : NULL;
                 if (ix) {
                     done = true;
                     p->used_index[s] = true;
-                    const RidList* l = probe_text(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key)) ? mi_lookup(ix, key) : NULL;
+                    const RidList* l = keyed ? mi_lookup(ix, key) : NULL;
                     for (int i = 0; l && i < l->n; i++) {
                         Tuple* t = heap_get(hf, l->r[i], S->ts);
                         if (!t) continue;
@@ -7012,6 +7028,14 @@ static const char* row_fits(const TableSchema* ts, const Tuple* t, char* msg, si
     if (sz > SV_MAX_ROW_BYTES) {
         snprintf(msg, mn, "Row too large for table '%.64s' (%llu bytes, at most %d MB per row)", ts->name, (unsigned long long)sz, (int)(SV_MAX_ROW_BYTES >> 20));
         return msg;
+    }
+    for (int c = 0; c < ts->num_columns && c < t->num_values; c++) {          // UNSIGNED: niente negativi
+        const Column* col = &ts->columns[c];
+        const Value* v = &t->values[c];
+        if (!(col->flags & COLF_UNSIGNED) || v->is_null) continue;
+        double x = col->type == SV_TYPE_INT ? v->int_val : col->type == SV_TYPE_BIGINT ? (double)v->bigint_val :
+                   col->type == SV_TYPE_FLOAT ? v->float_val : col->type == SV_TYPE_DECIMAL && v->str_val ? strtod(v->str_val, NULL) : 0;
+        if (x < 0) { snprintf(msg, mn, "Value %g is out of range for column '%.64s' (UNSIGNED)", x, col->name); return msg; }
     }
     return NULL;
 }

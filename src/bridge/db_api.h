@@ -280,6 +280,9 @@ bool db_session_blocked(void);                  // una sessione ha una transazio
 // aperta, il database non esiste, ...: allora va eseguita con db_execute.
 QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char* user, int timeout_ms, bool* refused);
 
+// modalità MySQL per il thread corrente (connessioni del protocollo MySQL): regole permissive di MySQL
+void db_set_mysql_mode(bool on);
+
 // ── statistiche del motore (pagina Monitor del server; come SHOW STATUS, senza sessione) ──
 typedef struct {
     int       page_size;

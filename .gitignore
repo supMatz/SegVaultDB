@@ -64,3 +64,4 @@ test_export_asan
 !/bin/
 !/bin/**
 test_php_tsan
+test_mysql

@@ -32,14 +32,20 @@ SegVault copre già database e phpMyAdmin; qui c'è quello che manca, in ordine 
 - [ ] HTTPS integrato (certificato self-signed generato al primo avvio, come XAMPP), anche per il protocollo MySQL
 
 ## 3. Compatibilità MySQL per le app vere
-- [ ] `information_schema` (TABLES, COLUMNS, STATISTICS, KEY_COLUMN_USAGE, ...): lo usano WordPress, Laravel, Doctrine, i tool grafici
-- [ ] `SHOW TABLE STATUS`, `SHOW FULL COLUMNS`, `SHOW CREATE DATABASE`
-- [ ] `SQL_CALC_FOUND_ROWS` / `FOUND_ROWS()`
-- [ ] `INSERT IGNORE`; verificare `REPLACE INTO` e `ON DUPLICATE KEY UPDATE`
-- [ ] `GROUP_CONCAT`, altre funzioni di stringa / data di MySQL
-- [ ] `LOCK TABLES` / `UNLOCK TABLES` accettati
-- [ ] `DECIMAL(p,s)` restituito con `s` decimali (`1.50`, non `1.5`) come MySQL
-- [ ] Prova completa: installazione di WordPress, phpBB, un progetto Laravel
+- [x] `CREATE TABLE` nel dialetto di MySQL: `bigint(20) unsigned`, `longtext`, `enum(...)` (diventa un `CHECK`), `KEY` / `INDEX` / `FULLTEXT` / `UNIQUE KEY nome`, prefissi `col(191)`, `ENGINE=`, `CHARSET`, `COLLATE`, `AUTO_INCREMENT=n`, `COMMENT`, `ON UPDATE CURRENT_TIMESTAMP`, `DEFAULT CURRENT_TIMESTAMP`, `DEFAULT ''`
+- [x] Catalogo v5: tipo SQL originale, `UNSIGNED`, colonne degli indici, collation (cataloghi v1–v4 convertiti al caricamento)
+- [x] `information_schema` (SCHEMATA, TABLES, COLUMNS, STATISTICS, TABLE_CONSTRAINTS, KEY_COLUMN_USAGE, REFERENTIAL_CONSTRAINTS, CHECK_CONSTRAINTS, VIEWS, TRIGGERS, ROUTINES, ENGINES, CHARACTER_SETS, COLLATIONS, ...), filtrato per i permessi dell'utente
+- [x] `SHOW [FULL] COLUMNS / FIELDS`, `SHOW INDEX / KEYS`, `SHOW TABLE STATUS`, `SHOW TABLES [FROM db] LIKE`, `SHOW DATABASES LIKE`, `SHOW CREATE DATABASE`, `SHOW ENGINES / COLLATION / CHARSET / WARNINGS / PROCESSLIST`, anche con `WHERE`
+- [x] `SQL_CALC_FOUND_ROWS` / `FOUND_ROWS()`, `ROW_COUNT()`, `FOR UPDATE`, `LOCK IN SHARE MODE`, `DISTINCTROW`, `SQL_NO_CACHE`
+- [x] `INSERT IGNORE`, `REPLACE INTO`, `INSERT ... SET`, `ON DUPLICATE KEY UPDATE` con `VALUES(col)` e l'alias di MySQL 8
+- [x] `UPDATE` / `DELETE` su più tabelle (`DELETE a, b FROM ...`, `UPDATE t1 JOIN t2 ... SET`), `ORDER BY` / `LIMIT`, alias
+- [x] `REGEXP` / `RLIKE` / `REGEXP_LIKE / REPLACE / SUBSTR / INSTR` (motore di espressioni regolari proprio, anche su Windows)
+- [x] `GROUP_CONCAT([DISTINCT] ... ORDER BY ... SEPARATOR ...)`, più di 100 funzioni di stringa, numeri, date e informazione (`DATE_FORMAT`, `STR_TO_DATE`, `DATE_ADD` con `INTERVAL`, `TIMESTAMPDIFF`, `UNIX_TIMESTAMP`, `MD5`, `SHA2`, `CAST`, `CONVERT`, `EXTRACT`, ...)
+- [x] `DECIMAL(p,s)` con `s` decimali (`1.50`), date zero `0000-00-00`, `LIKE` con `\` come escape (come MySQL e PostgreSQL)
+- [x] Modalità MySQL per le connessioni del protocollo MySQL (regole permissive di MySQL: `DISTINCT ... ORDER BY` su colonne non selezionate); nomi di colonna senza alias (`t.*, tt.*`)
+- [x] Bug del motore trovati con WordPress: `WHERE id = '1'` sulla chiave primaria restituiva 0 righe (ora la chiave viene convertita), buffer non inizializzati in `SHOW`
+- [x] Prova completa con **WordPress 7.1.4**: installazione, login, tutta l'amministrazione, articoli con `meta_query` / `tax_query`, paginazione, ricerca, commenti, utenti, transient, cestino, menu, feed, API REST: nessun errore di database (`test_mysql`: 112 controlli)
+- [ ] Confronti senza distinzione di maiuscole come le collation `_ci` di MySQL (`WHERE user_login = 'Admin'`)
 
 ## 4. Concorrenza
 - [ ] Scritture concorrenti (lock sulle righe o MVCC); più transazioni aperte insieme

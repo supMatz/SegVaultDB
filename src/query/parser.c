@@ -2786,7 +2786,7 @@ static ASTNode* parse_show_mysql(ParserState* ps) {
     int save = ps->pos;
     bool full = false;
     if (ident_is(ps, "FULL")) { consume(ps); full = true; }
-    char db[64], table[64], like[400], where[2048], schema[200], sql[6000], tq[200];
+    char db[64] = "", table[64] = "", like[400] = "", where[2048] = "", schema[200] = "", sql[6000] = "", tq[200] = "";
     if (ident_is(ps, "COLUMNS") || ident_is(ps, "FIELDS")) {
         consume(ps);
         if (!show_target(ps, db, table) || !show_filter(ps, "COLUMN_NAME", like, sizeof(like), where, sizeof(where))) return NULL;

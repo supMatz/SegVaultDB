@@ -119,10 +119,11 @@ SQL_TEST_SRCS = tests/test_sql.c $(ENGINE_SRCS)
 
 EXAMPLES_TEST_SRCS = tests/test_examples.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
-test: test_engine test_btree test_sql test_examples test_server test_php test_grid_edit test_table_design test_schema_model test_db_tools test_png test_auth test_sessions test_parallel test_mysql_import test_overflow test_backup test_export
+test: test_engine test_btree test_sql test_mysql test_examples test_server test_php test_grid_edit test_table_design test_schema_model test_db_tools test_png test_auth test_sessions test_parallel test_mysql_import test_overflow test_backup test_export
 	./test_btree
 	./test_engine
 	./test_sql
+	./test_mysql
 	./test_examples
 	./test_server
 	./test_php
@@ -229,6 +230,10 @@ test_php: $(TEST_PHP_SRCS) src/server/server.h src/server/fastcgi.h src/server/j
 test_examples: $(EXAMPLES_TEST_SRCS) $(wildcard examples/*.sql)
 	$(CC) $(CFLAGS) -I. $(INCLUDES) -o test_examples $(EXAMPLES_TEST_SRCS) -lm -pthread
 
+# compatibilità con il dialetto di MySQL (applicazioni PHP: WordPress, Laravel, ...)
+test_mysql: tests/test_mysql.c $(ENGINE_SRCS)
+	$(CC) $(CFLAGS) -I. $(INCLUDES) -o test_mysql tests/test_mysql.c $(ENGINE_SRCS) -lm -pthread
+
 test_sql: $(SQL_TEST_SRCS)
 	$(CC) $(CFLAGS) -I. $(INCLUDES) -o test_sql $(SQL_TEST_SRCS) -lm -pthread
 
@@ -318,7 +323,7 @@ build-win/%.o: %.c
 
 clean:
 	$(RM) $(FULL_OBJS) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql test_examples test_examples_asan
-	$(RM) segvault-server segvault-server.exe libsegvault.a test_server test_server_asan test_php test_php_asan test_php_tsan test_grid_edit test_grid_edit_asan test_table_design test_table_design_asan test_schema_model test_schema_model_asan test_db_tools test_db_tools_asan test_png test_png_asan test_auth test_auth_asan test_sessions test_sessions_asan test_parallel test_parallel_asan test_parallel_tsan test_mysql_import test_mysql_import_asan test_overflow test_overflow_asan test_backup test_backup_asan test_export test_export_asan
+	$(RM) segvault-server segvault-server.exe libsegvault.a test_server test_server_asan test_mysql test_php test_php_asan test_php_tsan test_grid_edit test_grid_edit_asan test_table_design test_table_design_asan test_schema_model test_schema_model_asan test_db_tools test_db_tools_asan test_png test_png_asan test_auth test_auth_asan test_sessions test_sessions_asan test_parallel test_parallel_asan test_parallel_tsan test_mysql_import test_mysql_import_asan test_overflow test_overflow_asan test_backup test_backup_asan test_export test_export_asan
 	$(RM) -r obj build-win build-server
 
 -include $(FULL_OBJS:.o=.d) $(WIN_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(WIN_SERVER_OBJS:.o=.d)

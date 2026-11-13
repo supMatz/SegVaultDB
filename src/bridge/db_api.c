@@ -1607,3 +1607,5 @@ bool db_init(const char* data_directory) {
     db_unlock();
     return r;
 }
+
+void db_set_mysql_mode(bool on) { executor_set_mysql_mode(on); }

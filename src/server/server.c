@@ -2373,6 +2373,7 @@ static void my_long_data(MyStmts* ss, const uint8_t* p, size_t n) {
 }
 
 static void serve_mysql(Conn* c) {
+    db_set_mysql_mode(true);                     // questo thread serve solo la connessione MySQL
     SvServer* s = c->s;
     InBuf in = {0};
     MwOut o = {0};

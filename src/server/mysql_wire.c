@@ -144,7 +144,25 @@ static void map_type(const char* t, unsigned* type, unsigned* flags, unsigned* c
 
 // bin: risultati in formato binario (prepared statement): INT diventa BIGINT, perché un intero di
 // SegVault può non stare in 32 bit e nel formato binario la larghezza è quella del tipo
+// "alias.colonna" (nome qualificato di SegVault quando due tabelle hanno colonne omonime): MySQL dà
+// il nome della colonna da solo e l'alias come tabella (PHP fetch_object / fetch_assoc usano il nome)
+static bool split_qualified(const char* name, char* tbl, size_t tn, const char** col) {
+    const char* dot = strchr(name, '.');
+    if (!dot || dot == name || !dot[1] || strchr(dot + 1, '.')) return false;
+    for (const char* p = name; *p; p++)
+        if (p != dot && !(isalnum((unsigned char)*p) || *p == '_' || *p == '$' || (unsigned char)*p >= 0x80)) return false;
+    snprintf(tbl, tn, "%.*s", (int)(dot - name), name);
+    *col = dot + 1;
+    return true;
+}
+
 static void column_def_ex(MwOut* o, const char* db, const char* table, const char* name, const char* type, bool bin) {
+    char qtable[80];
+    const char* col;
+    if (name && split_qualified(name, qtable, sizeof(qtable), &col)) {
+        if (!table || !table[0]) table = qtable;
+        name = col;
+    }
     unsigned ty, fl, cs, dec;
     uint32_t len;
     map_type(type, &ty, &fl, &cs, &len, &dec);
