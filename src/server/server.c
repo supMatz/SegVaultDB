@@ -891,9 +891,18 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
     }
     db_set_user(NULL);
     if (tmp) {                                  // la sessione della richiesta finisce qui (lock compresi)
+        // come prima delle sessioni temporanee: senza un database corrente, il primo USE resta
+        char keep[128] = "";
+        const char* now_db = db_current_database();
+        if (!prev_db[0] && now_db) snprintf(keep, sizeof(keep), "%s", now_db);
         db_session_leave(tmp);
         db_session_end(tmp);
         prev_db[0] = '\0';
+        if (keep[0] && !db_current_database()) {
+            char use[160];
+            snprintf(use, sizeof(use), "USE %s", keep);
+            db_result_free(db_execute(use));
+        }
     }
     cur = db_current_database();
     if (prev_db[0] && (!cur || strcmp(cur, prev_db))) {
