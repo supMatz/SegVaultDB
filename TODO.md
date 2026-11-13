@@ -57,7 +57,7 @@ SegVault copre già database e phpMyAdmin; qui c'è quello che manca, in ordine 
 
 ## 5. Pannello di controllo stile XAMPP
 - [x] Pannello del server: interruttore della cattura delle email (porta 1025, "Open inbox (N)" aggiornato da solo), link al cruscotto "All sites", siti `site.NOME=DEST` letti da `server.ini`, messaggi chiari se la porta 1025 è già presa (Mailpit / MailHog)
-- [ ] Servizi separati (Web, PHP, MySQL) avviabili e fermabili uno per uno, con il loro log
+- [x] Servizi separati avviabili e fermabili uno per uno a server acceso (PHP, MySQL, posta, HTTPS: `sv_server_service`; le connessioni degli altri non si interrompono, le richieste PHP in corso finiscono prima dello stop), registro con il servizio di ogni voce e filtri nel pannello (Web, PHP, API, MySQL, Mail); le query delle app via protocollo MySQL e i messaggi catturati entrano nel registro (anche su stderr)
 - [x] Editor e server attivi insieme: l'editor SQL lavora mentre il server (web, PHP, MySQL, posta) resta acceso, con l'indicatore "● Server :8484" nella barra dei menu; le funzioni interne del server non toccano più la sessione dell'editor
 - [ ] Icona nella barra di sistema; installazione come servizio con un clic (Windows e systemd)
 - [x] Controllo delle porte occupate per ogni servizio, tutte in un messaggio e con il programma che le usa ("port 3306 (MySQL) is in use by mysqld (pid 812)"; Linux da /proc, Windows con GetExtendedTcpTable); porte di MySQL, posta e HTTPS configurabili (Settings > Server)

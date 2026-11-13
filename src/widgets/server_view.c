@@ -155,7 +155,7 @@ ViewAction start_screen_event(StartScreen* s, const sEvent* evt) {
 enum {
     HIT_COPY_URL, HIT_COPY_LAN, HIT_PORT_MINUS, HIT_PORT_PLUS, HIT_ACCESS_LOCAL, HIT_ACCESS_LAN,
     HIT_TOKEN_OFF, HIT_TOKEN_ON, HIT_COPY_TOKEN, HIT_NEW_TOKEN, HIT_CORS_OFF, HIT_CORS_ON, HIT_TIME_MINUS,
-    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_TAB_REQ, HIT_TAB_MON, HIT_MYSQL_OFF, HIT_MYSQL_ON, HIT_COPY_MYSQL, HIT_PHP_OFF, HIT_PHP_ON, HIT_MAIL_OFF, HIT_MAIL_ON, HIT_OPEN_MAIL, HIT_OPEN_DASH, HIT_HTTPS_OFF, HIT_HTTPS_ON, HIT_TRUST_CA, HIT_OPEN_HTTPS, HIT_EDIT_PHPINI, HIT_COUNT
+    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_TAB_REQ, HIT_TAB_MON, HIT_MYSQL_OFF, HIT_MYSQL_ON, HIT_COPY_MYSQL, HIT_PHP_OFF, HIT_PHP_ON, HIT_MAIL_OFF, HIT_MAIL_ON, HIT_OPEN_MAIL, HIT_OPEN_DASH, HIT_HTTPS_OFF, HIT_HTTPS_ON, HIT_TRUST_CA, HIT_OPEN_HTTPS, HIT_EDIT_PHPINI, HIT_LF0, HIT_LF1, HIT_LF2, HIT_LF3, HIT_LF4, HIT_LF5, HIT_COUNT
 };
 
 enum { ACT_NONE, ACT_TOGGLE, ACT_EDITOR, ACT_COPY };
@@ -198,6 +198,7 @@ struct ServerPanel {
     char            site_url[96];
     char            mail_url[128], dash_url[128], https_url[128];
     char            trust_msg[400];  // esito di "Trust certificate"
+    int             log_filter;      // registro: 0 tutto, 1 web, 2 PHP, 3 API, 4 MySQL, 5 posta
     int             mail_count;
     // siti con nome da server.ini ("site.blog=/percorso" o "site.app=http://127.0.0.1:5173")
     char            site_name[32][64];
@@ -320,6 +321,40 @@ static void save_settings(ServerPanel* p) {
 
 static void run_server_thread(void* arg) { sv_server_run((SvServer*)arg); }
 
+// indirizzi dei servizi accesi (dopo l'avvio e dopo ogni interruttore)
+static void panel_addrs(ServerPanel* p) {
+    if (!p->srv) return;
+    snprintf(p->php_desc, sizeof(p->php_desc), "%s", sv_server_php(p->srv));
+    snprintf(p->mail_url, sizeof(p->mail_url), "http://localhost:%d/.segvault/mail/", sv_server_port(p->srv));
+    snprintf(p->dash_url, sizeof(p->dash_url), "http://localhost:%d/.segvault/", sv_server_port(p->srv));
+    p->mail_count = sv_server_mail_count(p->srv);
+    p->https_url[0] = '\0';
+    if (sv_server_https_port(p->srv)) snprintf(p->https_url, sizeof(p->https_url), "https://localhost:%d/", sv_server_https_port(p->srv));
+    p->mysql_addr[0] = '\0';
+    if (sv_server_mysql_port(p->srv)) snprintf(p->mysql_addr, sizeof(p->mysql_addr), "mysql://127.0.0.1:%d", sv_server_mysql_port(p->srv));
+}
+
+// un servizio acceso o spento: con il server in funzione cambia solo lui (gli altri non si fermano)
+static void service_switch(ServerPanel* p, int* setting, bool on, SvService svc) {
+    if (*setting == (int)on) return;
+    *setting = on;
+    save_settings(p);
+    if (!p->srv) return;
+    char e[400];
+    p->error[0] = '\0';
+    if (!sv_server_service(p->srv, svc, on, e, sizeof(e))) {
+        if (strstr(e, "no php-cgi configured")) {     // PHP non era pronto all'avvio (cartella web scelta dopo): riavvio
+            server_panel_stop(p);
+            server_panel_start(p);
+            return;
+        }
+        snprintf(p->error, sizeof(p->error), "%s%s", e, strstr(e, "is in use") ? ". Stop that program or change the port in Settings > Server" : "");
+        *setting = !on;
+        save_settings(p);
+    }
+    panel_addrs(p);
+}
+
 bool server_panel_start(ServerPanel* p) {
     if (!p) return false;
     if (p->srv) return true;
@@ -342,14 +377,17 @@ bool server_panel_start(ServerPanel* p) {
         }
     }
     // PHP: il php-cgi di server.ini, altrimenti cercato (php/ accanto a SegVault, PATH, C:\xampp\php, ...)
+    // trovato anche con PHP spento: si potrà accendere con il server in funzione
     char php[1024] = "";
+    if (p->php_cgi[0]) snprintf(php, sizeof(php), "%s", p->php_cgi);
+    else if (!fcgi_find_php_cgi(php, sizeof(php))) php[0] = '\0';
+    if (!web[0] && p->n_sites == 0) php[0] = '\0';
     if (g_settings.server_php) {
-        if (!web[0]) {
+        if (!web[0] && p->n_sites == 0) {
             snprintf(p->error, sizeof(p->error), "PHP runs the files of the web folder: choose one below (or turn PHP off)");
             return false;
         }
-        if (p->php_cgi[0]) snprintf(php, sizeof(php), "%s", p->php_cgi);
-        else if (!fcgi_find_php_cgi(php, sizeof(php))) {
+        if (!php[0]) {
             snprintf(p->error, sizeof(p->error), "php-cgi not found: put PHP in a php folder next to SegVault, install it "
                      "(e.g. XAMPP, or php-cgi on Linux), or write php_cgi=PATH in server.ini");
             return false;
@@ -372,6 +410,7 @@ bool server_panel_start(ServerPanel* p) {
         .cert_dir    = cert_dir,
         .http2       = true,
         .php_cgi     = php[0] ? php : NULL,
+        .php_start_off = !g_settings.server_php,
         .static_dir  = web[0] ? web : NULL,
         .bind_addr   = g_settings.server_lan ? "0.0.0.0" : "127.0.0.1",
         .port        = g_settings.server_port,
@@ -389,7 +428,7 @@ bool server_panel_start(ServerPanel* p) {
     if (!p->srv && strstr(err, "is in use"))
         snprintf(err + strlen(err), sizeof(err) - strlen(err), ". Stop that program, turn the service off, or change its port in Settings > Server");
     if (!p->srv) { snprintf(p->error, sizeof(p->error), "%s", err); return false; }
-    snprintf(p->php_desc, sizeof(p->php_desc), "%s", sv_server_php(p->srv));
+    panel_addrs(p);
     p->thread = platform_thread_start(run_server_thread, p->srv);
     if (!p->thread) {
         sv_server_free(p->srv);
@@ -399,13 +438,7 @@ bool server_panel_start(ServerPanel* p) {
     }
     snprintf(p->url, sizeof(p->url), "http://127.0.0.1:%d%s", sv_server_port(p->srv), sv_server_api_prefix(p->srv));
     snprintf(p->site_url, sizeof(p->site_url), "http://127.0.0.1:%d/", sv_server_port(p->srv));
-    snprintf(p->mail_url, sizeof(p->mail_url), "http://localhost:%d/.segvault/mail/", sv_server_port(p->srv));
-    snprintf(p->dash_url, sizeof(p->dash_url), "http://localhost:%d/.segvault/", sv_server_port(p->srv));
-    p->mail_count = sv_server_mail_count(p->srv);
-    p->https_url[0] = '\0';
-    if (sv_server_https_port(p->srv)) snprintf(p->https_url, sizeof(p->https_url), "https://localhost:%d/", sv_server_https_port(p->srv));
-    p->mysql_addr[0] = '\0';
-    if (sv_server_mysql_port(p->srv)) snprintf(p->mysql_addr, sizeof(p->mysql_addr), "mysql://127.0.0.1:%d", sv_server_mysql_port(p->srv));
+    panel_addrs(p);
     char ip[64];
     p->lan_url[0] = '\0';
     if (g_settings.server_lan && sv_local_ip(ip, sizeof(ip)))
@@ -653,6 +686,8 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
             link_btn(p, HIT_COPY_MYSQL, (Rect){x + w - cw, y, cw, 24}, "Copy", true);
             y += 26;
         }
+        if (p->error[0])                                // un servizio che non è partito
+            y += text_wrap(win, p->error, x, y + 4, w, TH_ERROR_TEXT, TH_FONT_SMALL + 1) + 2;
     } else {
         y += text_wrap(win, p->error[0] ? p->error : "Not running. Press F5 or Start server.", x, y + 4, w,
                        p->error[0] ? TH_ERROR_TEXT : TH_TEXT_FAINT, TH_FONT_SMALL + 1) + 2;
@@ -1099,6 +1134,19 @@ static void draw_monitor(ServerPanel* p, int x0, int cw, int top, int bottom) {
     }
 }
 
+static const char* const LOG_FILTERS[6] = { "All", "Web", "PHP", "API", "MySQL", "Mail" };
+
+static bool log_match(const ServerPanel* p, const SvLogEntry* e) {
+    switch (p->log_filter) {
+    case 1: return !strcmp(e->svc, "web") || !strcmp(e->svc, "proxy") || !e->svc[0];
+    case 2: return !strcmp(e->svc, "php");
+    case 3: return !strcmp(e->svc, "api");
+    case 4: return !strcmp(e->svc, "mysql");
+    case 5: return !strcmp(e->svc, "mail");
+    default: return true;
+    }
+}
+
 static void draw_requests(ServerPanel* p, int SW, int W, int H) {
     PlatformWindow* win = p->win;
     bool running = p->srv != NULL;
@@ -1121,26 +1169,44 @@ static void draw_requests(ServerPanel* p, int SW, int W, int H) {
     } else snprintf(msg, sizeof(msg), "Server stopped");
     int clw = link_w(p, "Clear");
     int shown = 0;
-    for (int i = 0; i < p->nlog; i++) if (p->log[i].seq > p->log_cleared) shown++;
-    if (p->tab == 0) link_btn(p, HIT_CLEAR_LOG, (Rect){x0 + cw - clw - 12, st.y + 7, clw, st.h - 14}, "Clear", shown > 0);
-    ui_text_clipped(win, msg, hx + 16, ui_text_y(win, st, TH_FONT_UI, FONT_UI), x0 + cw - clw - 28 - (hx + 16),
+    for (int i = 0; i < p->nlog; i++) if (p->log[i].seq > p->log_cleared && log_match(p, &p->log[i])) shown++;
+    int right = x0 + cw - 12;
+    for (int f = 0; f < 6; f++) p->hit[HIT_LF0 + f] = (Rect){0, 0, 0, 0};
+    if (p->tab == 0) {
+        link_btn(p, HIT_CLEAR_LOG, (Rect){right - clw, st.y + 7, clw, st.h - 14}, "Clear", shown > 0);
+        right -= clw + 10;
+        // filtro per servizio, da destra a sinistra (se c'è spazio)
+        for (int f = 5; f >= 0; f--) {
+            int fw = platform_measure_text_ex(win, LOG_FILTERS[f], -1, TH_FONT_SMALL + 1, FONT_UI) + 16;
+            if (right - fw < hx + 260) break;
+            Rect r = { right - fw, st.y + 8, fw, st.h - 16 };
+            p->hit[HIT_LF0 + f] = r;
+            bool on = p->log_filter == f, hov = in_rect(r, p->mx, p->my);
+            if (on || hov) platform_fill_rect_rounded(win, r, on ? TH_ACCENT_SOFT : TH_HOVER, 5);
+            platform_draw_text_ex(win, LOG_FILTERS[f], -1, (Point){r.x + 8, ui_text_y(win, r, TH_FONT_SMALL + 1, FONT_UI)},
+                                  on ? TH_ACCENT_TEXT : TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_UI);
+            right = r.x - 2;
+        }
+        right -= 8;
+    }
+    ui_text_clipped(win, msg, hx + 16, ui_text_y(win, st, TH_FONT_UI, FONT_UI), right - (hx + 16),
                     TH_TEXT, TH_FONT_UI, FONT_UI);
 
     if (p->tab == 1) { draw_monitor(p, x0, cw, top + SP_HEADER_H, bottom); return; }
 
     // griglia del registro
-    static const char* const COLS[7] = { "time", "client", "method", "path", "status", "ms", "sql / message" };
-    int widths[6] = { 78, 118, 66, 190, 60, 64 };
-    if (cw < 820) { widths[1] = 0; widths[3] = 150; }
-    if (cw < 600) { widths[2] = 0; widths[5] = 0; }
-    int cx[8];
+    static const char* const COLS[8] = { "time", "service", "client", "method", "path / query", "status", "ms", "sql / message" };
+    int widths[7] = { 78, 64, 118, 66, 220, 60, 64 };
+    if (cw < 900) { widths[2] = 0; widths[4] = 170; }
+    if (cw < 640) { widths[3] = 0; widths[6] = 0; widths[1] = 0; }
+    int cx[9];
     cx[0] = x0 + 16;
-    for (int i = 0; i < 6; i++) cx[i + 1] = cx[i] + widths[i];
-    cx[7] = x0 + cw - 12;
+    for (int i = 0; i < 7; i++) cx[i + 1] = cx[i] + widths[i];
+    cx[8] = x0 + cw - 12;
     Rect gh = { x0, top + SP_HEADER_H, cw, 30 };
     platform_fill_rect(win, gh, TH_SURFACE_2);
     platform_fill_rect(win, (Rect){x0, gh.y + gh.h - 1, cw, 1}, TH_BORDER);
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < 8; i++) {
         if (cx[i + 1] - cx[i] <= 0) continue;
         platform_draw_text_ex(win, COLS[i], -1, (Point){cx[i], ui_text_y(win, gh, TH_FONT_SMALL + 1, FONT_UI_BOLD)},
                               TH_TEXT_MUTED, TH_FONT_SMALL + 1, FONT_UI_BOLD);
@@ -1166,7 +1232,7 @@ static void draw_requests(ServerPanel* p, int SW, int W, int H) {
     int row = 0;
     for (int i = 0; i < p->nlog; i++) {
         const SvLogEntry* e = &p->log[i];
-        if (e->seq <= p->log_cleared) continue;
+        if (e->seq <= p->log_cleared || !log_match(p, e)) continue;
         if (row++ < p->log_scroll) continue;
         int yy = ry + (row - 1 - p->log_scroll) * SP_ROW_H;
         if (yy > bottom) break;
@@ -1181,11 +1247,11 @@ static void draw_requests(ServerPanel* p, int SW, int W, int H) {
         char who[120];
         if (e->user[0]) snprintf(who, sizeof(who), "%.60s@%.48s", e->user, e->client);
         else snprintf(who, sizeof(who), "%.48s", e->client);
-        const char* vals[7] = { e->when, who, e->method, e->path, status, ms, e->detail };
-        for (int k = 0; k < 7; k++) {
+        const char* vals[8] = { e->when, e->svc[0] ? e->svc : "web", who, e->method, e->path, status, ms, e->detail };
+        for (int k = 0; k < 8; k++) {
             int cwk = cx[k + 1] - cx[k] - 10;
             if (cwk <= 0) continue;
-            Color c = k == 4 ? sc : k == 6 ? (e->status >= 400 ? TH_ERROR_TEXT : TH_CELL_TEXT) : k == 0 ? TH_TEXT_DIM : TH_CELL_TEXT;
+            Color c = k == 5 ? sc : k == 7 ? (e->status >= 400 ? TH_ERROR_TEXT : TH_CELL_TEXT) : k == 0 || k == 1 ? TH_TEXT_DIM : TH_CELL_TEXT;
             ui_text_clipped(win, vals[k], cx[k], ty, cwk, c, TH_FONT_SMALL + 1, FONT_MONO);
         }
     }
@@ -1347,7 +1413,7 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
     }
     int hit = -1;
     for (int i = 0; i < HIT_COUNT && hit < 0; i++) if (in_rect(p->hit[i], x, y)) hit = i;
-    if (hit >= 0 && hit != HIT_TAB_REQ && hit != HIT_TAB_MON && hit != HIT_CLEAR_LOG && side_hidden(p, x, y)) hit = -1;
+    if (hit >= 0 && hit != HIT_TAB_REQ && hit != HIT_TAB_MON && hit != HIT_CLEAR_LOG && (hit < HIT_LF0 || hit > HIT_LF5) && side_hidden(p, x, y)) hit = -1;
     char ex[400];
     switch (hit) {
         case HIT_COPY_URL: copy_text(p, hit, p->url); break;
@@ -1362,6 +1428,10 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
         case HIT_TOKEN_OFF: case HIT_TOKEN_ON:
             if (g_settings.server_token != (hit == HIT_TOKEN_ON)) { g_settings.server_token = hit == HIT_TOKEN_ON; config_changed(p); }
             break;
+        case HIT_LF0: case HIT_LF1: case HIT_LF2: case HIT_LF3: case HIT_LF4: case HIT_LF5:
+            p->log_filter = hit - HIT_LF0;
+            p->log_scroll = 0;
+            break;
         case HIT_TAB_REQ: case HIT_TAB_MON:
             p->tab = hit == HIT_TAB_MON;
             p->last_mon = 0;
@@ -1370,11 +1440,11 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
             if (g_settings.server_users != (hit == HIT_USERS_ON)) { g_settings.server_users = hit == HIT_USERS_ON; config_changed(p); }
             break;
         case HIT_MYSQL_OFF: case HIT_MYSQL_ON:
-            if (g_settings.server_mysql != (hit == HIT_MYSQL_ON)) { g_settings.server_mysql = hit == HIT_MYSQL_ON; config_changed(p); }
+            service_switch(p, &g_settings.server_mysql, hit == HIT_MYSQL_ON, SV_SVC_MYSQL);
             break;
         case HIT_COPY_MYSQL: copy_text(p, hit, p->mysql_addr); break;
         case HIT_PHP_OFF: case HIT_PHP_ON:
-            if (g_settings.server_php != (hit == HIT_PHP_ON)) { g_settings.server_php = hit == HIT_PHP_ON; config_changed(p); }
+            service_switch(p, &g_settings.server_php, hit == HIT_PHP_ON, SV_SVC_PHP);
             break;
         case HIT_COPY_TOKEN: copy_text(p, hit, p->token); break;
         case HIT_NEW_TOKEN:
@@ -1420,7 +1490,7 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
             break;
         }
         case HIT_HTTPS_OFF: case HIT_HTTPS_ON:
-            if (g_settings.server_https != (hit == HIT_HTTPS_ON)) { g_settings.server_https = hit == HIT_HTTPS_ON; config_changed(p); }
+            service_switch(p, &g_settings.server_https, hit == HIT_HTTPS_ON, SV_SVC_HTTPS);
             break;
         case HIT_OPEN_HTTPS:
             if (!platform_open_url(p->https_url)) copy_text(p, hit, p->https_url);
@@ -1437,7 +1507,7 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
             break;
         }
         case HIT_MAIL_OFF: case HIT_MAIL_ON:
-            if (g_settings.server_mail != (hit == HIT_MAIL_ON)) { g_settings.server_mail = hit == HIT_MAIL_ON; config_changed(p); }
+            service_switch(p, &g_settings.server_mail, hit == HIT_MAIL_ON, SV_SVC_MAIL);
             break;
         case HIT_CLEAR_WEB:
             if (we) line_edit_set_text(we, "");

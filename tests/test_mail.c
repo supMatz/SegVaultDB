@@ -52,7 +52,7 @@ static int smtp_reply(int fd, char* last, size_t n) {
         line[k] = 0;
         if (k >= 4 && line[3] == ' ') {
             line[strcspn(line, "\r\n")] = 0;
-            if (last) snprintf(last, n, "%s", line);
+            if (last) snprintf(last, n, "%.500s", line);
             return atoi(line);
         }
     }

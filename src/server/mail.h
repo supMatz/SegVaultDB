@@ -27,6 +27,9 @@ typedef struct MailStore MailStore;
 MailStore* mail_store_open(const char* dir, char* err, size_t errsz);
 void       mail_store_free(MailStore* m);
 int        mail_count(MailStore* m);
+// chiamata a ogni messaggio salvato (per il registro del server), fuori dai lock dell'archivio
+typedef void (*MailNotify)(void* ud, const char* client, const char* from, const char* to, const char* subject, long id);
+void       mail_set_notify(MailStore* m, MailNotify fn, void* ud);
 
 // una connessione SMTP (dal suo thread): risponde finché il client non chiude o stop
 void mail_smtp_serve(MailStore* m, ml_sock fd, const char* client, atomic_int* stop);

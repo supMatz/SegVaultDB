@@ -43,6 +43,7 @@ typedef struct {
     const char* php_cgi;      // percorso di php-cgi: SegVault avvia e sorveglia php_workers processi
     const char* php_fcgi;     // oppure un backend già avviato: "host:porta" o "unix:/percorso.sock" (php-fpm)
     int         php_workers;  // processi php-cgi (0 = 4): richieste PHP eseguite insieme
+    bool        php_start_off;// PHP configurato ma spento all'avvio (si accende con sv_server_service)
     const char* api_prefix;   // dove sta l'API HTTP (NULL = "/api/v1"; "none" = spenta, resta il protocollo MySQL).
                               // Con PHP le richieste sotto il prefisso che non sono dell'API vanno al sito
     // siti (virtual host). Ogni sottocartella di static_dir è anche un sito automatico:
@@ -89,6 +90,7 @@ typedef struct {
     char      client[48];     // indirizzo del client
     char      detail[120];    // primo statement SQL o messaggio d'errore
     char      user[64];       // utente del login ("" = token o nessun login)
+    char      svc[8];         // servizio: "web", "php", "api", "proxy", "mysql" (una query), "mail" (un messaggio)
     int       status;
     double    ms;
 } SvLogEntry;
@@ -109,6 +111,12 @@ int       sv_server_mysql_port(const SvServer* s);   // 0 se il protocollo MySQL
 int       sv_server_mail_port(const SvServer* s);    // 0 se la cattura delle email è spenta
 int       sv_server_mail_count(SvServer* s);         // messaggi catturati
 int       sv_server_https_port(const SvServer* s);   // 0 se HTTPS è spento
+// servizi accesi e spenti con il server in funzione, senza toccare gli altri (porte e cartelle quelle
+// della configurazione). Spegnere chiude anche le connessioni di quel servizio; con PHP le richieste in
+// corso finiscono prima che i processi php-cgi si fermino.
+typedef enum { SV_SVC_PHP = 1, SV_SVC_MYSQL, SV_SVC_MAIL, SV_SVC_HTTPS } SvService;
+bool      sv_server_service(SvServer* s, SvService svc, bool on, char* err, size_t errsz);
+bool      sv_server_service_on(const SvServer* s, SvService svc);
 const char* sv_server_tls_info(const SvServer* s);   // libreria TLS e CA ("" se spento)
 const char* sv_server_php(const SvServer* s);
 const char* sv_server_api_prefix(const SvServer* s);  // "/api/v1", "" se l'API HTTP è spenta         // descrizione del backend PHP ("" se spento)

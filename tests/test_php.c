@@ -449,6 +449,24 @@ int main(int argc, char** argv) {
         CHECK(hdr(&r, "Transfer-Encoding: chunked") && !hdr(&r, "Content-Length"), "large PHP response streamed: %s", r.head);
         rfree(&r);
 
+        // PHP spento e riacceso con il server in funzione (gli altri servizi non si fermano)
+        {
+            char e2[300];
+            CHECK(sv_server_service(s, SV_SVC_PHP, false, e2, sizeof(e2)) && !sv_server_service_on(s, SV_SVC_PHP), "PHP off");
+            r = req(port, "GET", "/echo.php", NULL, NULL);
+            CHECK(r.status == 403 && !has(&r, "segreta"), "php off at run time: %d", r.status);
+            rfree(&r);
+            r = req(port, "GET", "/style.css", NULL, NULL);
+            CHECK(r.status == 200, "static files still served: %d", r.status);
+            rfree(&r);
+            CHECK(sv_server_service(s, SV_SVC_PHP, true, e2, sizeof(e2)) && sv_server_service_on(s, SV_SVC_PHP), "PHP on again: %s", e2);
+            r = req(port, "GET", "/echo.php", NULL, NULL);
+            CHECK(r.status == 200 && has(&r, "REQUEST_METHOD=GET"), "php back: %d", r.status);
+            rfree(&r);
+            SvLogEntry le;
+            CHECK(sv_server_recent(s, &le, 1) == 1 && !strcmp(le.svc, "php"), "PHP requests tagged: %s", le.svc);
+        }
+
         // un processo che muore viene riavviato
         r = req(port, "GET", "/crash.php", NULL, NULL);
         CHECK(r.status == 502, "crashed worker: %d %s", r.status, r.body);

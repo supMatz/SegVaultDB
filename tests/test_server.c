@@ -1010,6 +1010,55 @@ int main(void) {
         close(m2.fd);
         close(m.fd);
         if (s4) { sv_server_stop(s4); pthread_join(th4, NULL); sv_server_free(s4); }
+
+        // servizi accesi e spenti con il server in funzione; le query MySQL e le email nel registro
+        SvServerConfig cfg5 = { .port = 0, .token = "tok5", .quiet = true, .mysql_port = 0, .mail_port = 0, .mail_dir = "/tmp/sv_svc_mail" };
+        SvServer* s5 = sv_server_start(&cfg5, err, sizeof(err));
+        pthread_t th5;
+        pthread_create(&th5, NULL, run_server, s5);
+        char e5[300];
+        CHECK(!sv_server_service_on(s5, SV_SVC_MYSQL) && sv_server_mysql_port(s5) == 0, "MySQL off at start");
+        CHECK(sv_server_service(s5, SV_SVC_MYSQL, true, e5, sizeof(e5)) && sv_server_mysql_port(s5) > 0, "MySQL turned on: %s", e5);
+        int mp5 = sv_server_mysql_port(s5);
+        My m5;
+        CHECK(my_connect(&m5, mp5, "root", "tok5", NULL, e, sizeof(e)), "connect after turning MySQL on: %s", e);
+        my_query(&m5, "SELECT 6 * 7", out, sizeof(out));
+        CHECK(!strcmp(out, "42"), "query: %s", out);
+        SvLogEntry le[4];
+        int nle = sv_server_recent(s5, le, 4);
+        CHECK(nle >= 1 && !strcmp(le[0].svc, "mysql") && strstr(le[0].path, "SELECT 6 * 7") && !strcmp(le[0].detail, "1 row"),
+              "query in the log: %s %s %s", nle ? le[0].svc : "", nle ? le[0].path : "", nle ? le[0].detail : "");
+        CHECK(sv_server_service(s5, SV_SVC_MYSQL, false, e5, sizeof(e5)) && !sv_server_service_on(s5, SV_SVC_MYSQL), "MySQL turned off");
+        my_query(&m5, "SELECT 1", out, sizeof(out));
+        CHECK(!strcmp(out, "read failed") || !strncmp(out, "send", 4), "open MySQL connection closed: %s", out);
+        close(m5.fd);
+        usleep(300000);
+        int fdc = connect_to(mp5);
+        CHECK(fdc < 0, "nothing listens on the MySQL port any more");
+        if (fdc >= 0) close(fdc);
+        r = request(sv_server_port(s5), "GET", "/api/v1/health", NULL, NULL);
+        CHECK(r.status == 200, "HTTP untouched by the MySQL switch: %d", r.status);
+        resp_free(&r);
+        // posta: accesa, un messaggio, nel registro con il servizio "mail"
+        CHECK(sv_server_service(s5, SV_SVC_MAIL, true, e5, sizeof(e5)) && sv_server_mail_port(s5) > 0, "mail on: %s", e5);
+        int sf = connect_to(sv_server_mail_port(s5));
+        char sb[512];
+        const char* sm = "HELO x\r\nMAIL FROM:<a@x>\r\nRCPT TO:<b@x>\r\nDATA\r\nSubject: svc test\r\n\r\nhi\r\n.\r\nQUIT\r\n";
+        if (send(sf, sm, strlen(sm), 0)) {}
+        size_t sg = 0;
+        for (;;) { ssize_t g = recv(sf, sb + sg, sizeof(sb) - 1 - sg, 0); if (g <= 0) break; sg += (size_t)g; }
+        sb[sg] = 0;
+        close(sf);
+        nle = sv_server_recent(s5, le, 4);
+        CHECK(nle >= 1 && !strcmp(le[0].svc, "mail") && strstr(le[0].detail, "svc test") && strstr(le[0].path, "b@x"),
+              "mail in the log: %s %s %s", nle ? le[0].svc : "", nle ? le[0].path : "", nle ? le[0].detail : "");
+        CHECK(sv_server_service(s5, SV_SVC_MAIL, false, e5, sizeof(e5)) && sv_server_mail_port(s5) == 0, "mail off");
+        r = request(sv_server_port(s5), "GET", "/api/v1/health", NULL, NULL);
+        nle = sv_server_recent(s5, le, 1);
+        CHECK(nle == 1 && !strcmp(le[0].svc, "api"), "API requests tagged: %s", nle ? le[0].svc : "");
+        resp_free(&r);
+        sv_server_stop(s5); pthread_join(th5, NULL); sv_server_free(s5);
+        if (system("rm -rf /tmp/sv_svc_mail")) {}
     }
 
     sv_server_stop(s);

@@ -76,7 +76,11 @@ struct MailStore {
     MailEnt* v;                          // dal più vecchio
     int      n, cap;
     long     next_id;
+    MailNotify notify;
+    void*    notify_ud;
 };
+
+void mail_set_notify(MailStore* m, MailNotify fn, void* ud) { m->notify = fn; m->notify_ud = ud; }
 
 // ── testo: decodifiche ──────────────────────────────────────────
 
@@ -475,7 +479,7 @@ static void remove_at(MailStore* m, int i) {
 }
 
 // salva un messaggio arrivato; ritorna l'id (0 se non si è potuto scrivere)
-static long store_message(MailStore* m, const char* from, char rcpt[][256], int nrcpt, const char* data, size_t n) {
+static long store_message(MailStore* m, const char* client, const char* from, char rcpt[][256], int nrcpt, const char* data, size_t n) {
     JsonBuf f = {0};
     jb_printf(&f, "Return-Path: <%s>\r\nX-SegVault-Rcpt: ", from);
     for (int i = 0; i < nrcpt; i++) jb_printf(&f, "%s%s", i ? ", " : "", rcpt[i]);
@@ -489,9 +493,9 @@ static long store_message(MailStore* m, const char* from, char rcpt[][256], int 
     FILE* fp = fopen(path, "wb");
     bool ok = fp && fwrite(f.data, 1, f.len, fp) == f.len;
     if (fp && fclose(fp) != 0) ok = false;
+    MailEnt e;
+    memset(&e, 0, sizeof(e));
     if (ok) {
-        MailEnt e;
-        memset(&e, 0, sizeof(e));
         e.id = id;
         e.when = (long long)time(NULL);
         e.size = (long long)f.len;
@@ -500,6 +504,7 @@ static long store_message(MailStore* m, const char* from, char rcpt[][256], int 
         while (m->n > MAIL_MAX_KEEP) remove_at(m, 0);
     } else remove(path);
     mx_unlock(&m->mx);
+    if (ok && m->notify) m->notify(m->notify_ud, client ? client : "", e.from, e.to, e.subject, id);
     free(f.data);
     return ok ? id : 0;
 }
@@ -633,7 +638,7 @@ void mail_smtp_serve(MailStore* m, ml_sock fd, const char* client, atomic_int* s
                 }
                 if (too_big || msg.oom) ok = reply(fd, "552 5.3.4 Message too big\r\n");
                 else {
-                    long id = store_message(m, from, rcpt, nrcpt, msg.data ? msg.data : "", msg.len);
+                    long id = store_message(m, client, from, rcpt, nrcpt, msg.data ? msg.data : "", msg.len);
                     char r[96];
                     if (id) snprintf(r, sizeof(r), "250 2.0.0 Ok: queued as %ld\r\n", id);
                     else snprintf(r, sizeof(r), "451 4.3.0 Cannot store the message\r\n");
@@ -661,7 +666,6 @@ void mail_smtp_serve(MailStore* m, ml_sock fd, const char* client, atomic_int* s
         free(line.data);
         if (!ok) { free(rcpt); return; }
     }
-    (void)client;
 }
 
 // ── web ─────────────────────────────────────────────────────────
