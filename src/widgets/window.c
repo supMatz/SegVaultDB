@@ -2468,7 +2468,7 @@ static const CtxInfo CTX_INFO[CTX_ACTION_COUNT] = {
     [CTX_OPEN]          = { "Open SQL file\xe2\x80\xa6", "Ctrl+O" },
     [CTX_SAVE]          = { "Save",                      "Ctrl+S" },
     [CTX_SAVE_AS]       = { "Save as\xe2\x80\xa6",       "Ctrl+Shift+S" },
-    [CTX_SERVER]        = { "Start API server\xe2\x80\xa6", NULL },
+    [CTX_SERVER]        = { "Server: web, PHP, MySQL\xe2\x80\xa6", NULL },
     [CTX_QUIT]          = { "Exit",                      NULL },
     [CTX_UNDO]          = { "Undo",                      "Ctrl+Z" },
     [CTX_REDO]          = { "Redo",                      "Ctrl+Y" },
@@ -2844,9 +2844,28 @@ static void draw_menubar(AppWindow* app) {
     snprintf(name, sizeof(name), "%.200s%s", app->file_path[0] ? base_name(app->file_path) : "untitled.sql",
              app->modified ? "  \xe2\x97\x8f" : "");
     int nw = platform_measure_text_ex(win, name, -1, TH_FONT_SMALL + 1, FONT_UI);
-    if (W - 16 - nw > x + 20)
-        platform_draw_text_ex(win, name, -1, (Point){W - 16 - nw, ui_text_y(win, (Rect){0, 0, 0, MENUBAR_H}, TH_FONT_SMALL + 1, FONT_UI)},
+    int right = W - 16;
+    if (right - nw > x + 20) {
+        platform_draw_text_ex(win, name, -1, (Point){right - nw, ui_text_y(win, (Rect){0, 0, 0, MENUBAR_H}, TH_FONT_SMALL + 1, FONT_UI)},
                               TH_TEXT_DIM, TH_FONT_SMALL + 1, FONT_UI);
+        right -= nw + 14;
+    }
+    // il server continua a girare mentre si lavora nell'editor: indicatore cliccabile
+    app->server_pill = (Rect){0, 0, 0, 0};
+    if (server_panel_running(app->server)) {
+        char lbl[48];
+        snprintf(lbl, sizeof(lbl), "Server :%d", g_settings.server_port);
+        int lw = platform_measure_text_ex(win, lbl, -1, TH_FONT_SMALL + 1, FONT_UI_BOLD);
+        Rect pill = { right - (lw + 30), 4, lw + 30, MENUBAR_H - 8 };
+        if (pill.x > x + 20) {
+            bool hov = rect_has(pill, app->mouse_x, app->mouse_y);
+            ui_round_box(win, pill, hov ? TH_ELEVATED_HOVER : TH_ELEVATED, TH_BORDER, pill.h / 2);
+            ui_circle(win, pill.x + 12, pill.y + pill.h / 2, 4, TH_SUCCESS);
+            platform_draw_text_ex(win, lbl, -1, (Point){pill.x + 22, ui_text_y(win, pill, TH_FONT_SMALL + 1, FONT_UI_BOLD)},
+                                  TH_TEXT, TH_FONT_SMALL + 1, FONT_UI_BOLD);
+            app->server_pill = pill;
+        }
+    }
 }
 
 // ── azioni ───────────────────────────────────────────────────────
@@ -3618,6 +3637,10 @@ static bool menubar_handle_event(AppWindow* app, sEvent* evt) {
     }
     if (evt->type != EVT_MOUSE_DOWN && evt->type != EVT_MOUSE_MOVE) return false;
     if (evt->mouse_y >= MENUBAR_H) return false;
+    if (evt->type == EVT_MOUSE_DOWN && app->menu_open < 0 && rect_has(app->server_pill, evt->mouse_x, evt->mouse_y)) {
+        app_window_set_mode(app, APP_MODE_SERVER);          // la pagina del server (che resta acceso)
+        return true;
+    }
     int hit = -1;
     for (int i = 0; i < MENU_COUNT; i++) if (rect_has(app->menu_rects[i], evt->mouse_x, evt->mouse_y)) hit = i;
     if (evt->type == EVT_MOUSE_MOVE) {
@@ -5815,32 +5838,23 @@ void app_window_set_data_dir(AppWindow* app, const char* dir) {
 void app_window_set_mode(AppWindow* app, AppMode mode) {
     if (!app || mode == app->mode) return;
     if (mode == APP_MODE_SERVER) {
-        // il server usa lo stesso motore: niente query in corso né transazioni lasciate aperte
-        if (app->job) {
-            app->mode = APP_MODE_EDITOR;
-            set_status(app, STATUS_ERROR, "Wait for the running query (or stop it) before starting the API server", "");
-            return;
-        }
-        update_session(app);
-        if (app->in_transaction) {
-            app->mode = APP_MODE_EDITOR;
-            set_status(app, STATUS_ERROR, "Commit or roll back the open transaction before starting the API server", "");
-            return;
-        }
+        // il server e l'editor lavorano insieme sullo stesso motore: ogni connessione ha la sua sessione
+        // e le transazioni si proteggono con i lock delle tabelle (vedi db_api.h)
         app->menu_open = -1;
         app->ctx_kind = 0;
         app->settings_open = false;
         td_close(app->td);
         app->theme_menu_open = false;
         app->mode = APP_MODE_SERVER;
-        server_panel_start(app->server);      // un errore (es. porta occupata) resta visibile nel pannello
+        if (!server_panel_running(app->server))
+            server_panel_start(app->server);  // un errore (es. porta occupata) resta visibile nel pannello
     } else if (mode == APP_MODE_EDITOR) {
         bool was_server = app->mode == APP_MODE_SERVER;
-        server_panel_stop(app->server);
-        app->mode = APP_MODE_EDITOR;
+        app->mode = APP_MODE_EDITOR;          // il server resta acceso (si ferma dalla sua pagina)
         update_session(app);                  // le app possono aver cambiato schema e dati
         refresh_tree(app);
-        if (was_server) set_status(app, STATUS_INFO, "API server stopped", "");
+        if (was_server && server_panel_running(app->server))
+            set_status(app, STATUS_INFO, "The server keeps running: click \"Server\" in the menu bar to see it or stop it", "");
     } else {
         app->mode = mode;
     }

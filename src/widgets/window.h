@@ -149,6 +149,7 @@ typedef struct {
     // -- barra dei menu --
     int          menu_open;         // menu aperto (-1 = nessuno)
     Rect         menu_rects[10];    // titoli dei menu (calcolati nel disegno)
+    Rect         server_pill;       // "● Server :8484" nella barra dei menu quando il server gira (clic: pagina del server)
     int          menu_hover;        // titolo sotto il mouse (-1 = nessuno)
 
     struct TableDesigner* td;       // designer di tabelle (creazione / struttura)

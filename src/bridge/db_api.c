@@ -1439,7 +1439,8 @@ QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char
     TokenList* tokens = lexer_tokenize(sql);
     ParseResult* parsed = tokens ? parser_parse(tokens) : NULL;
     QueryResult* r = NULL;
-    int idx = g_db.catalog->current_db;
+    // database della richiesta, altrimenti quello della sessione predefinita (non di una sessione attiva)
+    int idx = g_active ? g_default_session.cur_db : g_db.catalog->current_db;
     if (dbname && dbname[0]) {
         idx = -1;
         for (int i = 0; i < g_db.catalog->num_databases; i++) if (!strcasecmp(g_db.catalog->databases[i].name, dbname)) idx = i;

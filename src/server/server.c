@@ -605,6 +605,20 @@ static void exec_end(SvServer* s) {
     mx_unlock(&s->exec_mx);
 }
 
+// il motore per una funzione interna del server (endpoint salvati): una sessione temporanea, così la
+// sessione predefinita (l'editor della GUI, che lavora insieme al server) non cambia database
+static DbSession* engine_enter(SvServer* s) {
+    mx_lock(&s->exec_mx);
+    DbSession* t = db_session_new_temp();
+    if (t && !db_session_enter(t)) { db_session_end(t); t = NULL; }
+    return t;
+}
+
+static void engine_leave(SvServer* s, DbSession* t) {
+    if (t) { db_session_leave(t); db_session_end(t); }
+    mx_unlock(&s->exec_mx);
+}
+
 // un'altra sessione tiene un lock che serve a questa richiesta (vedi db_set_lock_wait_hook): il turno
 // sul motore passa per un attimo agli altri, poi si riprende
 static void lock_wait_hook(void* ud) {
@@ -993,7 +1007,7 @@ static int endpoint_lookup(SvServer* s, const char* db, const char* name, char**
                            char* err, size_t errn) {
     *sql_out = NULL;
     *is_public = false;
-    mx_lock(&s->exec_mx);
+    DbSession* es = engine_enter(s);
     char prev[128] = "";
     const char* cur = db_current_database();
     if (cur) snprintf(prev, sizeof(prev), "%s", cur);
@@ -1017,7 +1031,7 @@ static int endpoint_lookup(SvServer* s, const char* db, const char* name, char**
     db_result_free(r);
     cur = db_current_database();
     if (prev[0] && (!cur || strcmp(cur, prev))) { snprintf(q, sizeof(q), "USE %.63s", prev); db_result_free(db_execute(q)); }
-    mx_unlock(&s->exec_mx);
+    engine_leave(s, es);
     return found;
 }
 
@@ -1082,7 +1096,7 @@ static void handle_endpoint(SvServer* s, Request* rq, Response* rs, const char* 
 }
 
 static void handle_endpoint_list(SvServer* s, Request* rq, Response* rs, const char* db) {
-    mx_lock(&s->exec_mx);
+    DbSession* es = engine_enter(s);
     char prev[128] = "";
     const char* cur = db_current_database();
     if (cur) snprintf(prev, sizeof(prev), "%s", cur);
@@ -1112,7 +1126,7 @@ static void handle_endpoint_list(SvServer* s, Request* rq, Response* rs, const c
     db_result_free(r);
     cur = db_current_database();
     if (prev[0] && (!cur || strcmp(cur, prev))) { snprintf(q, sizeof(q), "USE %.63s", prev); db_result_free(db_execute(q)); }
-    mx_unlock(&s->exec_mx);
+    engine_leave(s, es);
     (void)rq;
 }
 
