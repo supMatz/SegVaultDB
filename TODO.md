@@ -15,7 +15,7 @@ SegVault copre già database e phpMyAdmin; qui c'è quello che manca, in ordine 
 - [x] Prova con un php-cgi vero (PHP 8.5: PDO con prepared statement, `lastInsertId`, mysqli, redirect, cookie, URL belli)
 - [x] Prefisso dell'API configurabile (`--api-prefix`, anche `none`); con PHP i percorsi sotto `/api/v1` che non sono dell'API vanno al sito (Laravel)
 - [x] Corpi `Transfer-Encoding: chunked` in ingresso (API e PHP; `Content-Length` + chunked rifiutati contro il request smuggling)
-- [ ] Pannello del server: interruttore PHP, percorso di `php-cgi` (ricerca automatica in `php/` accanto all'eseguibile e nel PATH), log degli errori PHP
+- [x] Pannello del server: interruttore PHP, `php-cgi` cercato da solo (o `php_cgi=` in `server.ini`), errori PHP nel registro; colonna delle opzioni che scorre
 - [ ] Risposte grandi in streaming (ora la risposta di PHP è tenuta in memoria)
 
 ## 2. Server web completo

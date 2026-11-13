@@ -368,6 +368,8 @@ delle richieste al posto dei risultati.
 - **Registro** in tempo reale delle ultime 200 richieste, con l'SQL così come è stato inviato (con i `?`: i valori dei parametri, come password o dati personali, non compaiono a schermo).
 - **MySQL protocol** (*Port 3306*): le app PHP, Python e Java e il client `mysql` si collegano come a MySQL (`127.0.0.1:3306`); l'indirizzo `mysql://` compare fra quelli da copiare. Se la porta è occupata (MySQL o XAMPP già avviati) il pannello lo dice.
 - **Web folder:** una cartella con il sito (come la `htdocs` di XAMPP) viene servita su `/` insieme all'API su `/api/v1`, sulla stessa porta e quindi senza CORS; *Open site* lo apre nel browser. Il percorso è salvato in `<data>/server.ini`.
+- **PHP** (*Run .php files*): i file `.php` della Web folder vengono eseguiti con `php-cgi`, come in XAMPP (vedi [PHP](#api-usare-segvault-da-siti-web-e-app-desktop) sotto). `php-cgi` viene cercato nella cartella `php/` accanto a SegVault, nel `PATH`, in `C:\xampp\php`, ...; un percorso diverso va in `server.ini` come `php_cgi=...`. Gli avvisi e gli errori di PHP compaiono nel registro delle richieste; con PHP conviene accendere anche *MySQL protocol*.
+- Le opzioni scorrono con la rotella quando la finestra è bassa.
 - **Monitor** (scheda accanto a *Requests*): richieste al secondo, tempo medio e p95, percentuale di
   errori, righe inviate, connessioni aperte e percentuale di pagine trovate in cache; due grafici degli
   ultimi 2 minuti (richieste al secondo con gli errori in rosso, tempo di risposta medio e massimo, con

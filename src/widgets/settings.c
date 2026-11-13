@@ -104,6 +104,8 @@ static SettingDef DEFS[] = {
       SET_BOOL, S(server_users), 0, 0, 1, ON_OFF, 2 },
     { "Server", "server_mysql", "MySQL protocol (port 3306)", "PHP (mysqli, PDO), Python, Java and the mysql client connect as to a MySQL server",
       SET_BOOL, S(server_mysql), 0, 0, 1, ON_OFF, 2 },
+    { "Server", "server_php", "Run PHP in the web folder", "The .php files of the web folder run with php-cgi (php/ next to SegVault, the PATH, C:\\xampp\\php, ...)",
+      SET_BOOL, S(server_php), 0, 0, 1, ON_OFF, 2 },
     { "Server", "server_cors", "Allow web apps from any origin", "CORS for pages served elsewhere (e.g. a dev server); requires the token",
       SET_BOOL, S(server_cors), 0, 0, 1, ON_OFF, 2 },
     { "Server", "server_timeout", "Request time limit (s)", "A request running longer is stopped (0 = no limit)",

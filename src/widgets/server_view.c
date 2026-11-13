@@ -4,6 +4,7 @@
 #include "line_edit.h"
 #include "button.h"
 #include "../server/server.h"
+#include "../server/fastcgi.h"
 #include "../bridge/db_api.h"
 #include "../../include/common.h"
 #include <stdio.h>
@@ -153,7 +154,7 @@ ViewAction start_screen_event(StartScreen* s, const sEvent* evt) {
 enum {
     HIT_COPY_URL, HIT_COPY_LAN, HIT_PORT_MINUS, HIT_PORT_PLUS, HIT_ACCESS_LOCAL, HIT_ACCESS_LAN,
     HIT_TOKEN_OFF, HIT_TOKEN_ON, HIT_COPY_TOKEN, HIT_NEW_TOKEN, HIT_CORS_OFF, HIT_CORS_ON, HIT_TIME_MINUS,
-    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_TAB_REQ, HIT_TAB_MON, HIT_MYSQL_OFF, HIT_MYSQL_ON, HIT_COPY_MYSQL, HIT_COUNT
+    HIT_TIME_PLUS, HIT_COPY_EXAMPLE, HIT_CLEAR_LOG, HIT_OPEN_SITE, HIT_CLEAR_WEB, HIT_USERS_OFF, HIT_USERS_ON, HIT_TAB_REQ, HIT_TAB_MON, HIT_MYSQL_OFF, HIT_MYSQL_ON, HIT_COPY_MYSQL, HIT_PHP_OFF, HIT_PHP_ON, HIT_COUNT
 };
 
 enum { ACT_NONE, ACT_TOGGLE, ACT_EDITOR, ACT_COPY };
@@ -176,6 +177,9 @@ struct ServerPanel {
     long long       log_cleared;     // richieste nascoste da "Clear"
     int             log_scroll;
     Rect            log_rect;
+    Rect            side_view;       // parte visibile della colonna delle opzioni (scorre con la rotella)
+    int             side_scroll;     // pixel scorsi
+    int             side_content;    // altezza del contenuto
     uint64_t        last_poll;
     int             last_uptime;
     LineEdit*       port_edit;
@@ -188,6 +192,8 @@ struct ServerPanel {
     char            flash[64];       // "Copied" al posto del testo del controllo
     LineEdit*       web_edit;        // cartella del sito servito insieme all'API (come la htdocs di XAMPP)
     char            web_dir[1024];
+    char            php_cgi[1024];   // percorso di php-cgi scelto a mano (server.ini "php_cgi="); "" = cercato
+    char            php_desc[600];   // processi PHP del server avviato
     char            site_url[96];
     int             flash_hit;
     uint64_t        flash_until;
@@ -262,7 +268,7 @@ static bool token_load(ServerPanel* p, bool regenerate) {
     return true;
 }
 
-// cartella web in <data>/server.ini ("web_folder=...")
+// cartella web e PHP in <data>/server.ini ("web_folder=...", "php_cgi=...")
 static void web_path(ServerPanel* p, char* out, size_t n) {
     snprintf(out, n, "%s%s%s", p->data_dir, p->data_dir[0] ? "/" : "", "server.ini");
 }
@@ -270,12 +276,14 @@ static void web_path(ServerPanel* p, char* out, size_t n) {
 static void web_load(ServerPanel* p) {
     char path[600], line[1200];
     p->web_dir[0] = '\0';
+    p->php_cgi[0] = '\0';
     web_path(p, path, sizeof(path));
     FILE* f = fopen(path, "rb");
     if (!f) return;
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\r\n")] = '\0';
         if (!strncmp(line, "web_folder=", 11)) snprintf(p->web_dir, sizeof(p->web_dir), "%.1000s", line + 11);
+        if (!strncmp(line, "php_cgi=", 8)) snprintf(p->php_cgi, sizeof(p->php_cgi), "%.1000s", line + 8);
     }
     fclose(f);
 }
@@ -286,6 +294,7 @@ static void web_save(ServerPanel* p) {
     FILE* f = fopen(path, "wb");
     if (!f) return;
     fprintf(f, "web_folder=%s\n", p->web_dir);
+    if (p->php_cgi[0]) fprintf(f, "php_cgi=%s\n", p->php_cgi);
     fclose(f);
 }
 
@@ -316,7 +325,22 @@ bool server_panel_start(ServerPanel* p) {
             return false;
         }
     }
+    // PHP: il php-cgi di server.ini, altrimenti cercato (php/ accanto a SegVault, PATH, C:\xampp\php, ...)
+    char php[1024] = "";
+    if (g_settings.server_php) {
+        if (!web[0]) {
+            snprintf(p->error, sizeof(p->error), "PHP runs the files of the web folder: choose one below (or turn PHP off)");
+            return false;
+        }
+        if (p->php_cgi[0]) snprintf(php, sizeof(php), "%s", p->php_cgi);
+        else if (!fcgi_find_php_cgi(php, sizeof(php))) {
+            snprintf(p->error, sizeof(p->error), "php-cgi not found: put PHP in a php folder next to SegVault, install it "
+                     "(e.g. XAMPP, or php-cgi on Linux), or write php_cgi=PATH in server.ini");
+            return false;
+        }
+    }
     SvServerConfig cfg = {
+        .php_cgi     = php[0] ? php : NULL,
         .static_dir  = web[0] ? web : NULL,
         .bind_addr   = g_settings.server_lan ? "0.0.0.0" : "127.0.0.1",
         .port        = g_settings.server_port,
@@ -333,6 +357,7 @@ bool server_panel_start(ServerPanel* p) {
     if (!p->srv && cfg.mysql && strstr(err, "MySQL"))
         snprintf(err + strlen(err), sizeof(err) - strlen(err), " - is MySQL / XAMPP already running? Stop it or turn the MySQL protocol off");
     if (!p->srv) { snprintf(p->error, sizeof(p->error), "%s", err); return false; }
+    snprintf(p->php_desc, sizeof(p->php_desc), "%s", sv_server_php(p->srv));
     p->thread = platform_thread_start(run_server_thread, p->srv);
     if (!p->thread) {
         sv_server_free(p->srv);
@@ -547,6 +572,15 @@ static void draw_toolbar(ServerPanel* p, int W) {
     }
 }
 
+static bool rect_inside(Rect a, Rect b) {
+    return a.y >= b.y && a.y + a.h <= b.y + b.h;
+}
+
+// un punto della colonna delle opzioni nascosto dallo scorrimento (sotto l'intestazione o il piè di pagina)
+static bool side_hidden(const ServerPanel* p, int x, int y) {
+    return x < p->side_view.x + p->side_view.w && !in_rect(p->side_view, x, y);
+}
+
 static void draw_sidebar(ServerPanel* p, int SW, int H) {
     PlatformWindow* win = p->win;
     int top = SP_TOOLBAR_H, bottom = H - SP_FOOTER_H;
@@ -554,9 +588,12 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
     Rect hdr = { 0, top, SW - 1, SP_HEADER_H };
     platform_draw_text_ex(win, "SERVER", -1, (Point){18, ui_text_y(win, hdr, TH_FONT_SMALL, FONT_UI_BOLD)}, TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI_BOLD);
     platform_fill_rect(win, (Rect){SW - 1, top, 1, bottom - top}, TH_BORDER);
-    platform_set_clip(win, (Rect){0, top, SW - 1, bottom - top});
+    // le opzioni scorrono sotto l'intestazione "SERVER" quando la finestra è bassa
+    p->side_view = (Rect){ 0, top + SP_HEADER_H, SW - 1, SV_MAX(0, bottom - top - SP_HEADER_H) };
+    p->side_scroll = SV_CLAMP(p->side_scroll, 0, SV_MAX(0, p->side_content - p->side_view.h));
+    platform_set_clip(win, p->side_view);
 
-    int x = 18, w = SW - 36, y = top + SP_HEADER_H + 4;
+    int x = 18, w = SW - 36, y0 = top + SP_HEADER_H + 4, y = y0 - p->side_scroll;
     char buf[64];
     bool running = p->srv != NULL;
 
@@ -662,6 +699,22 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
     }
     y += 12;
 
+    // PHP nella cartella web (come Apache + PHP di XAMPP)
+    y = section_label(win, "PHP", x, y);
+    segmented(p, HIT_PHP_OFF, (Rect){x, y, w, 28}, "Off", "Run .php files", g_settings.server_php ? 1 : 0, true);
+    y += 28 + 4;
+    if (g_settings.server_php) {
+        char msg[800];
+        if (running && p->php_desc[0])
+            snprintf(msg, sizeof(msg), "%s. Pretty URLs go to index.php; PHP warnings appear in the request log.%s", p->php_desc,
+                     g_settings.server_mysql ? "" : " Turn the MySQL protocol on so scripts reach the database (mysqli, PDO).");
+        else
+            snprintf(msg, sizeof(msg), "php-cgi is looked for in a php folder next to SegVault, the PATH, C:\\xampp\\php "
+                     "(or set php_cgi=PATH in server.ini).%s", g_settings.server_mysql ? "" : " Scripts reach the database through the MySQL protocol.");
+        y += text_wrap(win, msg, x, y + 2, w, !g_settings.server_mysql && running ? TH_WARNING : TH_TEXT_FAINT, TH_FONT_SMALL) + 2;
+    }
+    y += 12;
+
     // prova rapida
     y = section_label(win, "TRY IT", x, y);
     char ex[400];
@@ -670,9 +723,20 @@ static void draw_sidebar(ServerPanel* p, int SW, int H) {
     y += text_wrap(win, ex, x, y + 2, w, TH_TEXT_MUTED, TH_FONT_SMALL) + 2;
     link_btn(p, HIT_COPY_EXAMPLE, (Rect){x - 8, y, cw, 24}, "Copy curl", true);
     y += 30;
-    if (y < bottom - 24)
-        platform_draw_text_ex(win, running ? "Option changes restart the server" : "Saved in settings.ini", -1,
-                              (Point){x, y}, TH_TEXT_FAINT, TH_FONT_SMALL, FONT_UI);
+    platform_draw_text_ex(win, running ? "Option changes restart the server" : "Saved in settings.ini", -1,
+                          (Point){x, y}, TH_TEXT_FAINT, TH_FONT_SMALL, FONT_UI);
+    y += 28;
+    p->side_content = y + p->side_scroll - y0 + 4;
+    // barra di scorrimento sottile quando le opzioni non entrano
+    Rect sv = p->side_view;
+    if (p->side_content > sv.h && sv.h > 40) {
+        int th = SV_MAX(30, sv.h * sv.h / p->side_content);
+        int ty = sv.y + (sv.h - th) * p->side_scroll / SV_MAX(1, p->side_content - sv.h);
+        platform_fill_rect_rounded(win, (Rect){SW - 7, ty + 2, 4, th - 4}, TH_BORDER_STRONG, 2);
+    }
+    // campi fuori dalla parte visibile: non disegnati altrove e non cliccabili
+    if (p->port_edit && !rect_inside(p->port_edit->base.bounds, sv)) p->port_edit->base.visible = false;
+    if (p->web_edit && !rect_inside(p->web_edit->base.bounds, sv)) p->web_edit->base.visible = false;
     platform_reset_clip(win);
 }
 
@@ -1128,6 +1192,9 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
     }
     if (evt->type == EVT_MOUSE_WHEEL) {
         if (in_rect(p->log_rect, evt->mouse_x, evt->mouse_y)) { p->log_scroll -= evt->wheel_delta * 3; if (p->log_scroll < 0) p->log_scroll = 0; }
+        else if (in_rect(p->side_view, evt->mouse_x, evt->mouse_y)) {
+            p->side_scroll = SV_CLAMP(p->side_scroll - evt->wheel_delta * 48, 0, SV_MAX(0, p->side_content - p->side_view.h));
+        }
         return VIEW_REDRAW;
     }
     // cartella web: Invio conferma (e riavvia il server), Esc annulla
@@ -1164,7 +1231,7 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
 
     int x = evt->mouse_x, y = evt->mouse_y;
     if (we) {
-        if (in_rect(we->base.bounds, x, y)) {
+        if (we->base.visible && in_rect(we->base.bounds, x, y) && !side_hidden(p, x, y)) {
             if (pe && line_edit_focused(pe)) commit_port(p);
             if (!line_edit_focused(we)) line_edit_focus(we, true);
             widget_handle_event((Widget*)we, evt);
@@ -1173,7 +1240,7 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
         if (line_edit_focused(we)) web_commit(p);
     }
     if (pe) {
-        if (in_rect(pe->base.bounds, x, y)) {
+        if (pe->base.visible && in_rect(pe->base.bounds, x, y) && !side_hidden(p, x, y)) {
             if (!line_edit_focused(pe)) { line_edit_focus(pe, true); line_edit_select_all(pe); }
             else widget_handle_event((Widget*)pe, evt);
             return VIEW_REDRAW;
@@ -1182,6 +1249,7 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
     }
     int hit = -1;
     for (int i = 0; i < HIT_COUNT && hit < 0; i++) if (in_rect(p->hit[i], x, y)) hit = i;
+    if (hit >= 0 && hit != HIT_TAB_REQ && hit != HIT_TAB_MON && hit != HIT_CLEAR_LOG && side_hidden(p, x, y)) hit = -1;
     char ex[400];
     switch (hit) {
         case HIT_COPY_URL: copy_text(p, hit, p->url); break;
@@ -1207,6 +1275,9 @@ ViewAction server_panel_event(ServerPanel* p, sEvent* evt) {
             if (g_settings.server_mysql != (hit == HIT_MYSQL_ON)) { g_settings.server_mysql = hit == HIT_MYSQL_ON; config_changed(p); }
             break;
         case HIT_COPY_MYSQL: copy_text(p, hit, p->mysql_addr); break;
+        case HIT_PHP_OFF: case HIT_PHP_ON:
+            if (g_settings.server_php != (hit == HIT_PHP_ON)) { g_settings.server_php = hit == HIT_PHP_ON; config_changed(p); }
+            break;
         case HIT_COPY_TOKEN: copy_text(p, hit, p->token); break;
         case HIT_NEW_TOKEN:
             token_load(p, true);                        // le app con il token vecchio ricevono 401
