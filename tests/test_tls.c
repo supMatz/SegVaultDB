@@ -213,7 +213,10 @@ int main(void) {
         size_t on = pp ? fread(ob, 1, sizeof(ob) - 1, pp) : 0;
         ob[on] = 0;
         if (pp) pclose(pp);
-        CHECK(strstr(ob, "Verify return code: 0 (ok)") && strstr(ob, "CN=localhost"), "MySQL protocol over TLS, verified: %.300s", ob);
+        // OpenSSL 3.0 (Ubuntu) scrive "CN = localhost", le versioni recenti "CN=localhost"
+        const char* vr = strstr(ob, "Verify return code:");
+        CHECK(vr && !strncmp(vr, "Verify return code: 0 (ok)", 26) && (strstr(ob, "CN=localhost") || strstr(ob, "CN = localhost")),
+              "MySQL protocol over TLS, verified: %.200s", vr ? vr : ob);
     } else {
         SvServerConfig cm = { .port = 0, .quiet = true };
         s = sv_server_start(&cm, err, sizeof(err));
