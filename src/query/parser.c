@@ -710,7 +710,8 @@ static ASTExpr* parse_special_form(ParserState* ps) {
                 if (f) snprintf(f->func, sizeof(f->func), "%s", NOW_WORDS[i]);
                 return f;
             }
-        if (w[0] == '_' && next_is(ps, 1, TOK_STRING)) { consume(ps); Token st = consume(ps); return mkstr(st.text); }   // _utf8mb4'x'
+        // _utf8mb4'x', N'x' (stringa "nazionale"), X'41' resta un testo: introduttori di MySQL
+        if ((w[0] == '_' || ((w[0] == 'N' || w[0] == 'n') && !w[1])) && next_is(ps, 1, TOK_STRING)) { consume(ps); Token st = consume(ps); return mkstr(st.text); }
         if ((!strcasecmp(w, "DATE") || !strcasecmp(w, "TIME") || !strcasecmp(w, "TIMESTAMP")) && next_is(ps, 1, TOK_STRING)) {
             consume(ps); Token st = consume(ps); return mkstr(st.text);
         }
@@ -2197,6 +2198,18 @@ static ASTNode* parse_create_trigger(ParserState* ps, ASTNode* n) {
 // ═════════════════════════════════════════════════════════════════
 
 // testo SQL dei token [from, to): le stringhe tornano fra apici (con '' raddoppiati)
+// un nome che, scritto senza virgolette, non tornerebbe lo stesso identificatore (spazi, simboli,
+// cifra iniziale, parola riservata): nel testo ricostruito va tra backtick (`zip code`, `order`)
+static bool ident_needs_quotes(const char* t) {
+    if (!t || !t[0] || isdigit((unsigned char)t[0])) return true;
+    for (const char* q = t; *q; q++)
+        if (!isalnum((unsigned char)*q) && *q != '_' && *q != '$' && (unsigned char)*q < 0x80) return true;
+    TokenList* tl = lexer_tokenize(t);
+    bool plain = tl && tl->count >= 1 && tl->tokens[0].type == TOK_IDENTIFIER && (tl->count == 1 || tl->tokens[1].type == TOK_EOF);
+    if (tl) lexer_free(tl);
+    return !plain;
+}
+
 static bool tokens_text(ParserState* ps, int from, int to, char* out, size_t cap) {
     size_t di = 0;
     out[0] = '\0';
@@ -2212,6 +2225,8 @@ static bool tokens_text(ParserState* ps, int from, int to, char* out, size_t cap
             }
             piece[k++] = '\'';
             piece[k] = '\0';
+        } else if (t->type == TOK_IDENTIFIER && ident_needs_quotes(t->text) && !strchr(t->text, '`')) {
+            snprintf(piece, sizeof(piece), "`%s`", t->text);
         } else {
             snprintf(piece, sizeof(piece), "%s", t->text);
         }
@@ -2262,6 +2277,8 @@ static int parse_fk_action(ParserState* ps) {
 static void parse_references(ParserState* ps, ConstraintDef* c) {
     Token t = consume(ps);
     if (t.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name after REFERENCES", t); return; }
+    // REFERENCES db.tabella (dump di MySQL Workbench): il database è quello della tabella creata
+    if (peek(ps).type == TOK_DOT && next_is(ps, 1, TOK_IDENTIFIER)) { consume(ps); t = consume(ps); }
     copy_text(ps, c->ref_table, sizeof(c->ref_table), t.text);
     if (peek(ps).type == TOK_LPAREN) c->nref = parse_name_list(ps, c->ref_cols, 8);
     while (ps->result->success && peek(ps).type == TOK_ON) {
@@ -2347,7 +2364,8 @@ static bool parse_table_constraint(ParserState* ps, ConstraintDef* c) {
 // conserva il tipo come scritto (SHOW COLUMNS, information_schema)
 static bool parse_type_spec(ParserState* ps, ColumnDef* cd) {
     Token ct = consume(ps);
-    if (ct.type != TOK_IDENTIFIER && ct.type != TOK_BOOLEAN) { parse_fail(ps, "Expected a column type", ct); return false; }
+    // SET('a','b') di MySQL: "SET" è anche una parola chiave
+    if (ct.type != TOK_IDENTIFIER && ct.type != TOK_BOOLEAN && ct.type != TOK_SET) { parse_fail(ps, "Expected a column type", ct); return false; }
     char base[40];
     copy_text(ps, base, sizeof(base), ct.text);
     for (char* q = base; *q; q++) *q = (char)tolower((unsigned char)*q);
@@ -2409,6 +2427,7 @@ static bool parse_type_spec(ParserState* ps, ColumnDef* cd) {
         if (ident_is(ps, "UNSIGNED")) { consume(ps); cd->flags |= COLF_UNSIGNED; continue; }
         if (ident_is(ps, "SIGNED") || ident_is(ps, "ZEROFILL")) { consume(ps); continue; }
         if (ident_is(ps, "BINARY") || ident_is(ps, "ASCII") || ident_is(ps, "UNICODE")) { consume(ps); continue; }
+        if (ident_is(ps, "SRID") && next_is(ps, 1, TOK_INTEGER)) { consume(ps); consume(ps); continue; }   // GEOMETRY SRID 0
         break;
     }
     if (cd->flags & COLF_UNSIGNED) snprintf(sql + strlen(sql), sizeof(sql) - strlen(sql), " unsigned");
@@ -2427,7 +2446,8 @@ static bool parse_type_spec(ParserState* ps, ColumnDef* cd) {
         { "enum", "VARCHAR" }, { "set", "TEXT" }, { "clob", "TEXT" }, { "string", "TEXT" },
         { "blob", "BLOB" }, { "tinyblob", "BLOB" }, { "mediumblob", "BLOB" }, { "longblob", "BLOB" }, { "binary", "BLOB" },
         { "varbinary", "BLOB" }, { "bytea", "BLOB" }, { "geometry", "BLOB" }, { "point", "BLOB" }, { "linestring", "BLOB" },
-        { "polygon", "BLOB" },
+        { "polygon", "BLOB" }, { "multipoint", "BLOB" }, { "multilinestring", "BLOB" }, { "multipolygon", "BLOB" },
+        { "geometrycollection", "BLOB" }, { "geomcollection", "BLOB" },
         { "bool", "BOOL" }, { "boolean", "BOOL" },
         { "date", "DATE" }, { "datetime", "DATETIME" }, { "timestamp", "DATETIME" },
     };
@@ -2971,10 +2991,12 @@ static ASTNode* parse_statement(ParserState* ps) {
             }
             if (sub.type == TOK_IDENTIFIER && sub.text && !strcasecmp(sub.text, "PROCEDURE")) {
                 return parse_create_procedure(ps, n);
-            } else if (sub.type == TOK_DATABASE) {
-                n->type = NODE_CREATE_DB;
+            } else if (sub.type == TOK_DATABASE || (sub.type == TOK_IDENTIFIER && sub.text && !strcasecmp(sub.text, "SCHEMA"))) {
+                n->type = NODE_CREATE_DB;                        // CREATE SCHEMA è un sinonimo (MySQL)
                 Token dn = consume(ps);
                 copy_text(ps, n->create_db.db_name, sizeof(n->create_db.db_name), dn.text);
+                // opzioni di MySQL: [DEFAULT] CHARACTER SET / CHARSET / COLLATE [=] x, ENCRYPTION = 'N' (ignorate)
+                while (peek(ps).type != TOK_EOF && peek(ps).type != TOK_SEMICOLON) consume(ps);
             } else if (sub.type == TOK_TRIGGER) {
                 return parse_create_trigger(ps, n);
             } else if (sub.type == TOK_TABLE) {
@@ -3127,7 +3149,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                 if (!match(ps, TOK_EXISTS)) { parse_fail(ps, "Expected IF EXISTS", peek(ps)); break; }
                 n->if_exists = true;
             }
-            if (sub.type == TOK_DATABASE) {
+            if (sub.type == TOK_DATABASE || (sub.type == TOK_IDENTIFIER && sub.text && !strcasecmp(sub.text, "SCHEMA"))) {
                 n->type = NODE_DROP_DB;
                 Token dn = consume(ps);
                 copy_text(ps, n->drop_db.db_name, sizeof(n->drop_db.db_name), dn.text);
@@ -3155,6 +3177,26 @@ static ASTNode* parse_statement(ParserState* ps) {
                 n->type = NODE_DROP_TRIGGER;
                 Token tg = consume(ps);
                 copy_text(ps, n->drop_trigger.name, sizeof(n->drop_trigger.name), tg.text);
+            }
+            break;
+        }
+        case TOK_SET: {
+            // SET @a = 1, @@session.x = y, NAMES utf8mb4, sql_mode = '...', FOREIGN_KEY_CHECKS = 0, TIME_ZONE = ...:
+            // le variabili di sessione di MySQL. Si accettano tutte; FOREIGN_KEY_CHECKS cambia davvero i controlli
+            consume(ps);
+            n->type = NODE_SET;
+            n->set_fk_checks = -1;
+            while (peek(ps).type != TOK_EOF && peek(ps).type != TOK_SEMICOLON) {
+                Token t = consume(ps);
+                if (t.type != TOK_IDENTIFIER || !t.text || strcasecmp(t.text, "FOREIGN_KEY_CHECKS")) continue;
+                // il valore dopo '=' (anche @VAR: il ripristino a fine dump, che riaccende i controlli)
+                if (match(ps, TOK_EQ)) {
+                    Token v = consume(ps);
+                    if (v.type == TOK_INTEGER) n->set_fk_checks = atoi(v.text) != 0;
+                    else if (v.text && (!strcasecmp(v.text, "ON") || !strcasecmp(v.text, "TRUE"))) n->set_fk_checks = 1;
+                    else if (v.text && (!strcasecmp(v.text, "OFF") || !strcasecmp(v.text, "FALSE"))) n->set_fk_checks = 0;
+                    else n->set_fk_checks = 1;
+                }
             }
             break;
         }

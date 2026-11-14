@@ -86,6 +86,30 @@ static const char* DUMP =
 "/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;\n"
 "-- Dump completed on 2024-03-05\n";
 
+// sintassi dei dump classici (classicmodels, Northwind, Sakila, world)
+static const char* DUMP2 =
+"# commento con il cancelletto\n"
+"SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0;\n"
+"CREATE SCHEMA IF NOT EXISTS `scuola` DEFAULT CHARACTER SET utf8mb4 ;\n"
+"USE `scuola`;\n"
+"CREATE TABLE figlio (id INT PRIMARY KEY, padre_id INT, prezzo DECIMAL(5,2), sigla VARCHAR(10), tag SET('a','b'),\n"
+"  CONSTRAINT fk_padre FOREIGN KEY (padre_id) REFERENCES scuola.padre (id)) ENGINE=InnoDB;\n"
+"CREATE TABLE padre (id INT PRIMARY KEY, nome VARCHAR(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin, foto BLOB);\n"
+"INSERT INTO figlio VALUES (1, 7, .5, N'AB', 'a,b');\n"
+"INSERT INTO padre VALUES (8, X'4369616F', NULL);\n"
+"COMMIT;\n"
+"SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS;\n"
+"CREATE VIEW elenco AS SELECT f.id AS `codice figlio`, p.nome AS `nome padre` FROM figlio f JOIN padre p ON p.id = f.padre_id;\n"
+"DELIMITER $$\n"
+"CREATE FUNCTION doppio(x INT) RETURNS INT DETERMINISTIC\n"
+"BEGIN\n"
+"  DECLARE r INT;\n"
+"  CASE WHEN x > 0 THEN SET r = x * 2; ELSE SET r = 0; END CASE;\n"
+"  RETURN r;\n"
+"END$$\n"
+"DELIMITER ;\n"
+"SELECT 1;\n";
+
 static const char* scalar(const char* sql) {
     static char buf[300];
     QueryResult* r = db_execute(sql);
@@ -94,15 +118,28 @@ static const char* scalar(const char* sql) {
     return buf;
 }
 
+// "nome:colonna nome:colonna ..." da SHOW INDEX
+static const char* indexes(const char* table) {
+    static char buf[1000];
+    char q[128];
+    snprintf(q, sizeof(q), "SHOW INDEX FROM %s", table);
+    QueryResult* r = db_execute(q);
+    buf[0] = 0;
+    for (int i = 0; r && r->success && i < r->num_rows; i++) {
+        size_t l = strlen(buf);
+        snprintf(buf + l, sizeof(buf) - l, "%s:%s ", r->rows[i].cells[2].value, r->rows[i].cells[4].value);
+    }
+    if (r && !r->success) snprintf(buf, sizeof(buf), "%.900s", r->error);
+    db_result_free(r);
+    return buf;
+}
+
 int main(void) {
     CHECK(mysql_looks_like_dump(DUMP) && !mysql_looks_like_dump("SELECT 1;"), "detection");
     MyImportStats st;
     char* sql = mysql_translate(DUMP, &st);
-    CHECK(sql && !strstr(sql, "ENGINE") && !strstr(sql, "unsigned") && !strstr(sql, "COLLATE") && !strstr(sql, "LOCK TABLES"), "cleaned:\n%s", sql ? sql : "");
-    CHECK(sql && strstr(sql, "CREATE INDEX `ix_nome` ON `cliente` (`nome`)") && strstr(sql, "CONSTRAINT `uq_email` UNIQUE (`email`)"), "indexes: %s", sql ? sql : "");
-    CHECK(sql && strstr(sql, "CREATE INDEX `ix_tipo_attivo` ON `cliente` (`tipo`,`attivo`)"), "multi-column index kept");
-    CHECK(sql && strstr(sql, "CREATE INDEX `ix_ordine_quando` ON `ordine` (`quando`)"), "unnamed index: %s", sql ? sql : "");
-    CHECK(st.indexes_dropped == 1, "fulltext index reported: %d", st.indexes_dropped);
+    // le CREATE TABLE di MySQL arrivano al motore così come sono (il dialetto è capito direttamente)
+    CHECK(sql && !strstr(sql, "LOCK TABLES") && strstr(sql, "CREATE TABLE `cliente`"), "cleaned:\n%s", sql ? sql : "");
     CHECK(st.skipped >= 5, "skipped SET/LOCK/...: %d", st.skipped);
 
     if (system("rm -rf /tmp/sv_my_test && mkdir -p /tmp/sv_my_test") != 0) return 1;
@@ -122,6 +159,11 @@ int main(void) {
         sql[r[i].end] = save;
     }
     CHECK(errors == 0, "all translated statements run (%d errors)", errors);
+    const char* ix = indexes("cliente");
+    CHECK(strstr(ix, "ix_nome:nome ") && strstr(ix, "uq_email:email ") && strstr(ix, "ft_note:note "), "indexes: %s", ix);
+    CHECK(strstr(ix, "ix_tipo_attivo:tipo ix_tipo_attivo:attivo "), "multi-column index kept: %s", ix);
+    ix = indexes("ordine");
+    CHECK(strstr(ix, ":quando "), "unnamed index: %s", ix);
     CHECK(!strcmp(scalar("SELECT COUNT(*) FROM cliente"), "3") && !strcmp(scalar("SELECT COUNT(*) FROM ordine"), "2"), "rows imported");
     CHECK(!strcmp(scalar("SELECT nome FROM cliente WHERE id = 2"), "L'Ottica Srl"), "escaped quote: %s", scalar("SELECT nome FROM cliente WHERE id = 2"));
     CHECK(!strcmp(scalar("SELECT note FROM cliente WHERE id = 1"), "dice \"ciao\"; e poi va"), "semicolon inside a string: %s", scalar("SELECT note FROM cliente WHERE id = 1"));
@@ -140,6 +182,44 @@ int main(void) {
     q = db_execute("DELETE FROM cliente WHERE id = 1");
     db_result_free(q);
     CHECK(!strcmp(scalar("SELECT COUNT(*) FROM ordine"), "1"), "foreign key ON DELETE CASCADE kept");
+    free(sql);
+
+    // dump "classici": controlli delle chiavi esterne spenti, SCHEMA, # e /*! */, letterali MySQL
+    CHECK(mysql_looks_like_dump(DUMP2), "DELIMITER script detected as a dump");
+    sql = mysql_translate(DUMP2, &st);
+    CHECK(sql != NULL, "translate dump 2");
+    len = (int)strlen(sql);
+    n = sql_split(sql, len, r, 128);
+    int fails = 0, stmts = 0;
+    const char* last_fail = "";
+    for (int i = 0; i < n; i++) {
+        if (!r[i].has_code) continue;
+        stmts++;
+        char save = sql[r[i].end];
+        sql[r[i].end] = '\0';
+        QueryResult* x = db_execute(sql + r[i].code_start);
+        if (!x || !x->success) {
+            fails++;
+            last_fail = strncmp(sql + r[i].code_start, "CREATE FUNCTION", 15) ? "other" : "function";
+            if (strcmp(last_fail, "function")) printf("  stmt failed: %.120s -> %s\n", sql + r[i].code_start, x ? x->error : "null");
+        }
+        db_result_free(x);
+        sql[r[i].end] = save;
+    }
+    CHECK(fails <= 1 && (fails == 0 || !strcmp(last_fail, "function")), "dump 2 runs (%d failures, last %s)", fails, last_fail);
+    CHECK(stmts == 12, "CREATE FUNCTION ... END CASE ... END is one statement (%d statements)", stmts);
+    CHECK(!strcmp(scalar("SELECT prezzo FROM scuola.figlio"), "0.50"), ".5 literal: %s", scalar("SELECT prezzo FROM scuola.figlio"));
+    CHECK(!strcmp(scalar("SELECT sigla FROM scuola.figlio"), "AB"), "N'' string: %s", scalar("SELECT sigla FROM scuola.figlio"));
+    CHECK(!strcmp(scalar("SELECT tag FROM scuola.figlio"), "a,b"), "SET type: %s", scalar("SELECT tag FROM scuola.figlio"));
+    q = db_execute("/*!40000 INSERT INTO scuola.padre VALUES (7, _utf8mb4'Pino', 0x89504E47) */");   // fuori dai dump: eseguito
+    db_result_free(q);
+    CHECK(!strcmp(scalar("SELECT nome FROM scuola.padre WHERE id = 7"), "Pino"), "executable comment + introducer: %s", scalar("SELECT nome FROM scuola.padre WHERE id = 7"));
+    CHECK(!strcmp(scalar("SELECT nome FROM scuola.padre WHERE id = 8"), "Ciao"), "X'..' literal: %s", scalar("SELECT nome FROM scuola.padre WHERE id = 8"));
+    CHECK(!strcmp(scalar("SELECT `nome padre` FROM scuola.elenco WHERE `codice figlio` = 1"), "Pino"), "view alias with spaces: %s",
+          scalar("SELECT `nome padre` FROM scuola.elenco WHERE `codice figlio` = 1"));
+    q = db_execute("INSERT INTO scuola.figlio (id, padre_id) VALUES (2, 99)");
+    CHECK(q && !q->success, "foreign key checks back on after the dump");
+    db_result_free(q);
     free(sql);
     db_shutdown();
     if (system("rm -rf /tmp/sv_my_test")) {}

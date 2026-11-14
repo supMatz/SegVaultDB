@@ -27,7 +27,8 @@ static void puts_(Buf* b, const char* s) { put(b, s, strlen(s)); }
 bool mysql_looks_like_dump(const char* sql) {
     if (!sql) return false;
     return strstr(sql, "MySQL dump") || strstr(sql, "MariaDB dump") || strstr(sql, "phpMyAdmin SQL Dump") ||
-           strstr(sql, "ENGINE=") || strstr(sql, "LOCK TABLES") || strstr(sql, "/*!40101");
+           strstr(sql, "ENGINE=") || strstr(sql, "LOCK TABLES") || strstr(sql, "/*!40101") ||
+           !strncasecmp(sql, "DELIMITER ", 10) || strstr(sql, "\nDELIMITER ") || strstr(sql, "\ndelimiter ");
 }
 
 // ── token di una definizione: parola, stringa, `nome`, (gruppo), simbolo ──
@@ -75,168 +76,6 @@ static int tokenize(const char* s, int n, Tk* out, int max) {
 }
 
 static bool is(const Tk* t, const char* w) { return t->t == T_WORD && (int)strlen(w) == t->n && !strncasecmp(t->s, w, (size_t)t->n); }
-
-// colonne di "(a, b)": quante sono, e la prima in out (con i `)
-static int paren_cols(const Tk* p, char* first, size_t fn) {
-    Tk in[64];
-    int k = tokenize(p->s + 1, p->n - 2, in, 64), cols = 0;
-    first[0] = '\0';
-    for (int i = 0; i < k; i++) {
-        if (in[i].t == T_BQ || in[i].t == T_WORD) {
-            if (!cols) snprintf(first, fn, "%.*s", in[i].n, in[i].s);
-            cols++;
-            if (i + 1 < k && in[i + 1].t == T_PAREN) i++;          // prefisso: col(10)
-        }
-    }
-    return cols;
-}
-
-// tipo MySQL -> tipo SegVault (args = "(...)" o NULL)
-static void map_type(const Tk* type, const Tk* args, char* out, size_t n, bool* numeric) {
-    char t[32];
-    snprintf(t, sizeof(t), "%.*s", type->n < 31 ? type->n : 31, type->s);
-    for (char* c = t; *c; c++) *c = (char)tolower((unsigned char)*c);
-    *numeric = false;
-    static const char* const INTS[] = { "tinyint", "smallint", "mediumint", "int", "integer", "year", "bit", NULL };
-    for (int i = 0; INTS[i]; i++) if (!strcmp(t, INTS[i])) { snprintf(out, n, "INT"); *numeric = true; return; }
-    if (!strcmp(t, "bigint")) { snprintf(out, n, "BIGINT"); *numeric = true; return; }
-    if (!strcmp(t, "float") || !strcmp(t, "double") || !strcmp(t, "real")) { snprintf(out, n, "FLOAT"); *numeric = true; return; }
-    if (!strcmp(t, "decimal") || !strcmp(t, "numeric") || !strcmp(t, "dec")) { snprintf(out, n, "DECIMAL"); *numeric = true; return; }
-    if (!strcmp(t, "bool") || !strcmp(t, "boolean")) { snprintf(out, n, "BOOL"); return; }
-    if ((!strcmp(t, "varchar") || !strcmp(t, "char")) && args) { snprintf(out, n, "%s%.*s", t[0] == 'v' ? "VARCHAR" : "CHAR", args->n, args->s); return; }
-    if (!strcmp(t, "date")) { snprintf(out, n, "DATE"); return; }
-    if (!strcmp(t, "datetime") || !strcmp(t, "timestamp")) { snprintf(out, n, "DATETIME"); return; }
-    if (!strcmp(t, "time")) { snprintf(out, n, "VARCHAR(16)"); return; }
-    if ((!strcmp(t, "enum") || !strcmp(t, "set")) && args) {     // il valore più lungo (SET: tutti insieme)
-        Tk in[256];
-        int k = tokenize(args->s + 1, args->n - 2, in, 256), mx = 1, sum = 0;
-        for (int i = 0; i < k; i++) if (in[i].t == T_STR) { int l = in[i].n - 2; if (l > mx) mx = l; sum += l + 1; }
-        snprintf(out, n, "VARCHAR(%d)", t[0] == 's' ? (sum > 1 ? sum : 1) : mx);
-        return;
-    }
-    if (strstr(t, "blob") || strstr(t, "binary")) { snprintf(out, n, "BLOB"); return; }
-    snprintf(out, n, "TEXT");                       // text, tinytext, mediumtext, longtext, json, ...
-}
-
-static void tk_put(Buf* b, const Tk* t) { put(b, t->s, (size_t)t->n); }
-
-// una colonna: nome tipo[(args)] attributi...
-static void column(Buf* b, const Tk* tk, int k) {
-    if (k < 2) { for (int i = 0; i < k; i++) { tk_put(b, &tk[i]); puts_(b, " "); } return; }
-    tk_put(b, &tk[0]);
-    int i = 1;
-    const Tk* args = i + 1 < k && tk[i + 1].t == T_PAREN ? &tk[i + 1] : NULL;
-    char type[64];
-    bool numeric;
-    map_type(&tk[i], args, type, sizeof(type), &numeric);
-    puts_(b, " ");
-    puts_(b, type);
-    i += args ? 2 : 1;
-    while (i < k) {
-        const Tk* t = &tk[i];
-        if (is(t, "unsigned") || is(t, "signed") || is(t, "zerofill")) { i++; continue; }
-        if (is(t, "CHARACTER") && i + 2 < k) { i += 3; continue; }
-        if ((is(t, "CHARSET") || is(t, "COLLATE") || is(t, "COMMENT") || is(t, "USING")) && i + 1 < k) { i += 2; continue; }
-        if (is(t, "ON") && i + 1 < k && is(&tk[i + 1], "UPDATE")) { i += 3; if (i < k && tk[i].t == T_PAREN) i++; continue; }
-        if (is(t, "GENERATED") || is(t, "AS") || is(t, "STORED") || is(t, "VIRTUAL") || is(t, "ALWAYS")) { i++; if (i < k && tk[i].t == T_PAREN) i++; continue; }
-        if (is(t, "DEFAULT") && i + 1 < k) {
-            const Tk* v = &tk[i + 1];
-            i += 2;
-            if (i < k && tk[i].t == T_PAREN) i++;
-            if (is(v, "CURRENT_TIMESTAMP") || is(v, "NOW") || is(v, "CURRENT_DATE") || is(v, "LOCALTIMESTAMP")) continue;
-            puts_(b, " DEFAULT ");
-            if (numeric && v->t == T_STR && v->n > 2) put(b, v->s + 1, (size_t)v->n - 2);   // '0.00' -> 0.00
-            else tk_put(b, v);
-            continue;
-        }
-        puts_(b, " ");
-        tk_put(b, t);
-        i++;
-    }
-}
-
-// CREATE TABLE di MySQL -> SegVault (+ CREATE INDEX dopo)
-static void create_table(Buf* out, const char* s, int n, MyImportStats* st) {
-    Tk tk[16];
-    int k = tokenize(s, n, tk, 16), body = -1;
-    for (int i = 0; i < k; i++) if (tk[i].t == T_PAREN) { body = i; break; }
-    if (body < 3) { put(out, s, (size_t)n); puts_(out, ";\n"); return; }
-    const Tk* name = &tk[body - 1];
-    for (int i = 0; i < body; i++) { tk_put(out, &tk[i]); puts_(out, " "); }
-    puts_(out, "(\n");
-    Buf post = {0};
-    // elementi separati dalle virgole al primo livello
-    const char* p = tk[body].s + 1;
-    const char* end = tk[body].s + tk[body].n - 1;
-    bool first = true;
-    while (p < end) {
-        const char* q = p;
-        int d = 0;
-        for (; q < end; q++) {
-            if (*q == '\'' || *q == '"' || *q == '`') { q = tk[body].s + skip_quoted(tk[body].s, (int)(q - tk[body].s), tk[body].n, *q) - 1; continue; }
-            if (*q == '(') d++;
-            else if (*q == ')') d--;
-            else if (*q == ',' && d == 0) break;
-        }
-        Tk it[128];
-        int m = tokenize(p, (int)(q - p), it, 128);
-        p = q + 1;
-        if (!m) continue;
-        Buf item = {0};
-        if (is(&it[0], "KEY") || is(&it[0], "INDEX") || is(&it[0], "FULLTEXT") || is(&it[0], "SPATIAL")) {
-            int pi = -1;
-            for (int i = 0; i < m; i++) if (it[i].t == T_PAREN) { pi = i; break; }
-            char col[80];
-            int nc = pi > 0 ? paren_cols(&it[pi], col, sizeof(col)) : 0;
-            if ((is(&it[0], "KEY") || is(&it[0], "INDEX")) && nc >= 1) {
-                // anche a più colonne (con lunghezze di prefisso e ASC/DESC): il motore le accetta
-                puts_(&post, "CREATE INDEX ");
-                if (pi >= 2) tk_put(&post, &it[1]);
-                else {                                         // senza nome: ix_tabella_colonna (senza backtick)
-                    char ix[200];
-                    snprintf(ix, sizeof(ix), "`ix_%.*s_%.60s`", name->n, name->s, col);
-                    size_t w = 1;
-                    for (size_t r = 1; ix[r]; r++) if (ix[r] != '`' || !ix[r + 1]) ix[w++] = ix[r];
-                    ix[w] = '\0';
-                    puts_(&post, ix);
-                }
-                puts_(&post, " ON ");
-                tk_put(&post, name);
-                puts_(&post, " ");
-                tk_put(&post, &it[pi]);
-                puts_(&post, ";\n");
-            } else st->indexes_dropped++;
-            continue;
-        }
-        if (is(&it[0], "UNIQUE")) {
-            int pi = -1;
-            for (int i = 0; i < m; i++) if (it[i].t == T_PAREN) { pi = i; break; }
-            if (pi < 0) continue;
-            int ni = pi - 1;
-            if (ni >= 1 && !is(&it[ni], "KEY") && !is(&it[ni], "INDEX") && !is(&it[ni], "UNIQUE")) {
-                puts_(&item, "CONSTRAINT "); tk_put(&item, &it[ni]); puts_(&item, " ");
-            }
-            puts_(&item, "UNIQUE ");
-            tk_put(&item, &it[pi]);
-        } else if (is(&it[0], "PRIMARY") || is(&it[0], "CONSTRAINT") || is(&it[0], "FOREIGN") || is(&it[0], "CHECK")) {
-            for (int i = 0; i < m; i++) {
-                if (is(&it[i], "USING") && i + 1 < m) { i++; continue; }
-                tk_put(&item, &it[i]);
-                puts_(&item, " ");
-            }
-        } else column(&item, it, m);
-        if (item.p) {
-            puts_(out, first ? "    " : ",\n    ");
-            puts_(out, item.p);
-            first = false;
-        }
-        free(item.p);
-    }
-    puts_(out, "\n);\n");                    // le opzioni della tabella (ENGINE=, CHARSET, ...) restano fuori
-    if (post.p) { puts_(out, post.p); st->statements += 1; }
-    free(post.p);
-    if (post.oom || out->oom) out->oom = true;
-}
 
 // Prima della divisione in istruzioni:
 //  - DELIMITER ;; ... ;; (procedure e trigger dei dump): le righe DELIMITER spariscono e il
@@ -291,7 +130,10 @@ static char* mysql_prepare(const char* in) {
         if (c == '/' && i + 2 < n && in[i + 1] == '*') {
             const char* e = strstr(in + i + 2, "*/");
             size_t j = e ? (size_t)(e - in) + 2 : n;
-            if (in[i + 2] == '!' && i + 8 <= n && versioned_ok(in + i + 3)) {
+            // anche /*!40014 SET ... FOREIGN_KEY_CHECKS ... */: i dati di mysqldump arrivano in qualunque ordine
+            bool fk = false;
+            for (size_t q = i + 3; e && q + 18 <= (size_t)(e - in); q++) if (!strncasecmp(in + q, "FOREIGN_KEY_CHECKS", 18)) { fk = true; break; }
+            if (in[i + 2] == '!' && i + 8 <= n && (versioned_ok(in + i + 3) || fk)) {
                 puts_(&out, " ");
                 put(&out, in + i + 8, (e ? (size_t)(e - in) : n) - (i + 8));
                 puts_(&out, " ");
@@ -336,11 +178,20 @@ char* mysql_translate(const char* sql_in, MyImportStats* st) {
         Tk tk[6];
         int k = tokenize(s, sn, tk, 6);
         if (!k) { st->skipped++; continue; }                        // solo /*! ... */
+        // SET FOREIGN_KEY_CHECKS resta: con i controlli spenti i dati possono arrivare in qualunque ordine
+        bool fkset = false;                     // SET ... FOREIGN_KEY_CHECKS = ... (anche dopo @OLD_... = @@...)
+        for (int q = 0; is(&tk[0], "SET") && q + 18 <= sn; q++) if (!strncasecmp(s + q, "FOREIGN_KEY_CHECKS", 18)) { fkset = true; break; }
+        if (fkset) {
+            st->statements++;
+            put(&out, s, (size_t)sn);
+            puts_(&out, ";\n");
+            continue;
+        }
         if (is(&tk[0], "SET") || is(&tk[0], "LOCK") || is(&tk[0], "UNLOCK") ||
             (is(&tk[0], "ALTER") && k >= 4 && (is(&tk[3], "DISABLE") || is(&tk[3], "ENABLE")))) { st->skipped++; continue; }
         st->statements++;
         if (is(&tk[0], "START") && k >= 2 && is(&tk[1], "TRANSACTION")) { puts_(&out, "BEGIN;\n"); continue; }
-        if (is(&tk[0], "CREATE") && k >= 2 && is(&tk[1], "TABLE")) { create_table(&out, s, sn, st); continue; }
+        // CREATE TABLE: il motore capisce il dialetto di MySQL (tipi, KEY, FULLTEXT, ENGINE=, ...): passa così com'è
         put(&out, s, (size_t)sn);
         puts_(&out, ";\n");
     }

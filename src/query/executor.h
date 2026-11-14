@@ -54,4 +54,9 @@ typedef void (*ExecChangeHook)(uint64_t tx_id, const char* db, const char* table
                                const uint8_t* old, size_t old_len);
 void executor_set_change_hook(ExecChangeHook hook);
 
+// SET FOREIGN_KEY_CHECKS = 0 / 1 (dei dump di MySQL): con i controlli spenti una riga può riferire una
+// riga che non c'è ancora (i dati arrivano in qualunque ordine), come in MySQL
+void executor_set_fk_checks(bool on);
+bool executor_fk_checks(void);
+
 #endif

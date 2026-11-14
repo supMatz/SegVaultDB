@@ -141,6 +141,7 @@ TokenList* lexer_tokenize(const char* sql) {
     size_t scap = 0;
     lx.start = lx.pos = sql;
     lx.line = 1; lx.col = 1;
+    bool in_exec = false;             // dentro un commento eseguibile di MySQL /*!40014 ... */
 
     while (*lx.pos) {
         skip_whitespace(&lx);
@@ -149,8 +150,18 @@ TokenList* lexer_tokenize(const char* sql) {
 
         lx.start = lx.pos;
 
-        // Single-line comments
-        if (*lx.pos == '-' && *(lx.pos+1) == '-') {
+        // fine del commento eseguibile: il contenuto era SQL normale
+        if (in_exec && *lx.pos == '*' && *(lx.pos+1) == '/') { lx.pos += 2; in_exec = false; continue; }
+        // /*!NNNNN ... */: MySQL lo esegue (mysqldump ci mette SET FOREIGN_KEY_CHECKS = 0, ...)
+        if (!in_exec && *lx.pos == '/' && *(lx.pos+1) == '*' && *(lx.pos+2) == '!') {
+            lx.pos += 3;
+            while (isdigit((unsigned char)*lx.pos)) lx.pos++;
+            in_exec = true;
+            continue;
+        }
+
+        // Single-line comments ("--" e "#" di MySQL)
+        if ((*lx.pos == '-' && *(lx.pos+1) == '-') || *lx.pos == '#') {
             while (*lx.pos && *lx.pos != '\n') lx.pos++;
             continue;
         }
@@ -247,6 +258,46 @@ TokenList* lexer_tokenize(const char* sql) {
             continue;
         }
 
+        // 0x4142 / X'4142' di MySQL (dump: immagini, campi binari): i byte diventano testo; se non sono
+        // testo leggibile (zeri, byte di controllo) resta la forma 0x... (come la mostra phpMyAdmin)
+        {
+            bool hx0 = *lx.pos == '0' && (lx.pos[1] == 'x' || lx.pos[1] == 'X') && isxdigit((unsigned char)lx.pos[2]);
+            bool hxq = (*lx.pos == 'x' || *lx.pos == 'X') && lx.pos[1] == '\'';
+            const char* h = (hx0 || hxq) ? lx.pos + 2 : lx.pos;   // solo se i due caratteri ci sono
+            const char* e = h;
+            while ((hx0 || hxq) && isxdigit((unsigned char)*e)) e++;
+            if (hxq && *e != '\'') hxq = false;
+            if ((hx0 && !isalnum((unsigned char)*e) && *e != '_') || hxq) {
+                size_t nd = (size_t)(e - h);
+                size_t need = nd + 4;
+                if (need > LEX_MAX_STRING) need = LEX_MAX_STRING;
+                if (need > scap) { char* nb = realloc(sbuf, need); if (nb) { sbuf = nb; scap = need; } }
+                tok.type = TOK_STRING; tok.line = lx.line; tok.col = lx.col; tok.ext = NULL;
+                size_t n = 0;
+                bool text = sbuf && nd % 2 == 0;
+                for (size_t i = 0; text && i + 1 < nd && n + 1 < scap; i += 2) {
+                    int hi = isdigit((unsigned char)h[i]) ? h[i] - '0' : (tolower((unsigned char)h[i]) - 'a' + 10);
+                    int lo = isdigit((unsigned char)h[i + 1]) ? h[i + 1] - '0' : (tolower((unsigned char)h[i + 1]) - 'a' + 10);
+                    unsigned char b = (unsigned char)(hi * 16 + lo);
+                    if (b == 0 || (b < 0x20 && b != '\t' && b != '\n' && b != '\r') || b == 0x7f) text = false;
+                    sbuf[n++] = (char)b;
+                }
+                if (!text && sbuf) {                         // binario: si tiene la forma esadecimale
+                    n = 0;
+                    if (n + 2 < scap) { sbuf[n++] = '0'; sbuf[n++] = 'x'; }
+                    for (size_t i = 0; i < nd && n + 1 < scap; i++) sbuf[n++] = h[i];
+                }
+                if (!sbuf) n = 0;
+                if (n < sizeof(tok.text)) { if (n) memcpy(tok.text, sbuf, n); tok.text[n] = '\0'; }
+                else { sbuf[n] = '\0'; tok.ext = sbuf; tok.ext_len = n; }
+                lx.pos = e + (hxq ? 1 : 0);
+                lx.start = lx.pos;
+                add_token(list, &tok);
+                tok.ext = NULL;
+                continue;
+            }
+        }
+
         // Numbers: interi e decimali (un '-' iniziale fa parte del numero quando non può
         // essere una sottrazione, es. VALUES (1, -5) o WHERE x = -3)
         bool neg = false;
@@ -255,7 +306,13 @@ TokenList* lexer_tokenize(const char* sql) {
             neg = !(pt == TOK_IDENTIFIER || pt == TOK_INTEGER || pt == TOK_FLOAT ||
                     pt == TOK_STRING || pt == TOK_RPAREN);
         }
-        if (isdigit((unsigned char)*lx.pos) || neg) {
+        // ".5" (senza zero iniziale, come nei dump di Northwind): numero se non segue un nome (t.5 resta t . 5)
+        bool lead_dot = false;
+        if (*lx.pos == '.' && isdigit((unsigned char)lx.pos[1])) {
+            TokenType pt = list->count > 0 ? list->tokens[list->count - 1].type : TOK_EOF;
+            lead_dot = !(pt == TOK_IDENTIFIER || pt == TOK_RPAREN || pt == TOK_STRING);
+        }
+        if (isdigit((unsigned char)*lx.pos) || neg || lead_dot) {
             bool is_float = false;
             if (neg) lx.pos++;
             while (isdigit((unsigned char)*lx.pos) || (*lx.pos == '.' && !is_float)) {

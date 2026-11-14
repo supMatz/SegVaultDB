@@ -56,6 +56,7 @@ typedef struct {
     int         scroll_y;       // righe scrollate
     int         font_size;
     int         hover_row;      // riga sotto il mouse (-1 = nessuna)
+    char        current_db[128];// database in uso nella sessione: segnato con un punto e il colore d'accento
 
     // doppio click
     uint64_t    last_click_ms;
@@ -100,6 +101,9 @@ void tree_view_refresh(TreeView* tv);
 
 // seleziona un nodo programmaticamente
 void tree_view_select(TreeView* tv, TreeNode* node);
+
+// database in uso (NULL / "" = nessuno); ritorna il suo nodo, se c'è
+TreeNode* tree_view_set_current_db(TreeView* tv, const char* db);
 
 // numero di righe attualmente visibili (nodi espansi inclusi) e righe che entrano nel widget
 int  tree_view_row_count(TreeView* tv);

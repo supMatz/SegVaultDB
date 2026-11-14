@@ -11,6 +11,7 @@ SCOPO: Implementa platform.h usando le API native Windows.
 #include <windows.h>   // API Win32 completa
 #include <windowsx.h>  // GET_X_LPARAM, GET_Y_LPARAM
 #include <shellapi.h>  // ShellExecuteA (platform_open_url)
+#include <commdlg.h>   // GetOpenFileNameA / GetSaveFileNameA
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -685,6 +686,65 @@ bool platform_open_file(const char* path) {
     char q[1100];
     snprintf(q, sizeof(q), "\"%s\"", path);
     return (INT_PTR)ShellExecuteA(NULL, "open", "notepad.exe", q, NULL, SW_SHOWNORMAL) > 32;
+}
+
+// ── finestra Apri / Salva di Windows ──
+int platform_file_dialog(PlatformWindow* win, FileDialogKind kind, const char* title, const char* filter,
+                         const char* initial, char* out, size_t outsz) {
+    if (!out || outsz < 2) return -1;
+    out[0] = '\0';
+    // "SQL files|*.sql;*.txt" -> "SQL files\0*.sql;*.txt\0All files\0*.*\0\0"
+    char flt[512];
+    size_t fl = 0;
+    char defext[16] = "";
+    if (filter && *filter) {
+        const char* bar = strchr(filter, '|');
+        const char* pats = bar ? bar + 1 : "*.*";
+        int nn = bar ? (int)(bar - filter) : (int)strlen(filter);
+        fl += (size_t)snprintf(flt + fl, sizeof(flt) - fl, "%.*s (%s)", nn, filter, pats) + 1;
+        if (fl < sizeof(flt)) fl += (size_t)snprintf(flt + fl, sizeof(flt) - fl, "%s", pats) + 1;
+        const char* dot = strstr(pats, "*.");
+        if (dot) {
+            int k = 0;
+            for (dot += 2; *dot && *dot != ';' && *dot != '*' && k < (int)sizeof(defext) - 1; dot++) defext[k++] = *dot;
+            defext[k] = '\0';
+        }
+    }
+    if (fl < sizeof(flt)) fl += (size_t)snprintf(flt + fl, sizeof(flt) - fl, "All files (*.*)") + 1;
+    if (fl < sizeof(flt)) fl += (size_t)snprintf(flt + fl, sizeof(flt) - fl, "*.*") + 1;
+    if (fl < sizeof(flt)) flt[fl] = '\0'; else { flt[sizeof(flt) - 2] = '\0'; flt[sizeof(flt) - 1] = '\0'; }
+
+    char file[MAX_PATH * 4] = "", dir[MAX_PATH * 4] = "";
+    if (initial && *initial) {
+        char ini[MAX_PATH * 4];
+        snprintf(ini, sizeof(ini), "%s", initial);
+        for (char* c = ini; *c; c++) if (*c == '/') *c = '\\';
+        DWORD at = GetFileAttributesA(ini);
+        if (at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY)) {
+            snprintf(dir, sizeof(dir), "%s", ini);
+        } else {
+            char* sl = strrchr(ini, '\\');
+            if (sl) { *sl = '\0'; snprintf(dir, sizeof(dir), "%s", ini); snprintf(file, sizeof(file), "%s", sl + 1); }
+            else snprintf(file, sizeof(file), "%s", ini);
+        }
+    }
+    OPENFILENAMEA ofn;
+    memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize  = sizeof(ofn);
+    ofn.hwndOwner    = win ? win->hwnd : NULL;
+    ofn.lpstrFilter  = flt;
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFile    = file;
+    ofn.nMaxFile     = sizeof(file);
+    ofn.lpstrInitialDir = dir[0] ? dir : NULL;
+    ofn.lpstrTitle   = title && *title ? title : NULL;
+    ofn.lpstrDefExt  = defext[0] ? defext : NULL;
+    ofn.Flags        = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER | OFN_HIDEREADONLY |
+                       (kind == FILE_DIALOG_SAVE ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
+    BOOL ok = kind == FILE_DIALOG_SAVE ? GetSaveFileNameA(&ofn) : GetOpenFileNameA(&ofn);
+    if (!ok) return CommDlgExtendedError() == 0 ? 0 : -1;
+    snprintf(out, outsz, "%s", file);
+    return 1;
 }
 
 // ── area di notifica ──

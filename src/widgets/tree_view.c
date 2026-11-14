@@ -1,6 +1,7 @@
 #include "tree_view.h"
 #include "theme.h"
 #include "../bridge/db_api.h"
+#include <stdio.h>
 #include <string.h>
 
 // ── navigazione delle righe visibili ─────────────────────────────
@@ -86,6 +87,9 @@ static int draw_node(TreeView* tv, PlatformWindow* win, TreeNode* node, int dept
             FontStyle fs = (child->type == TREE_NODE_DATABASE) ? FONT_UI_BOLD : FONT_UI;
             Color tc = (child->type == TREE_NODE_COLUMN) ? TH_TEXT_MUTED : tv->color_text;
             if (child == tv->selected) tc = TH_TEXT;
+            bool in_use = child->type == TREE_NODE_DATABASE && tv->current_db[0] &&
+                          strcmp(child->label, tv->current_db) == 0;
+            if (in_use) tc = TH_ACCENT;
             int ty = ui_text_y(win, (Rect){0, y, 0, TREE_ROW_H}, tv->font_size, fs);
 
             // info extra (tipo colonna) allineata a destra
@@ -111,6 +115,10 @@ static int draw_node(TreeView* tv, PlatformWindow* win, TreeNode* node, int dept
                 extra_w = cw + 8;
             }
 
+            if (in_use) {                       // punto "in uso", come l'indicatore in alto a destra
+                platform_fill_rect_rounded(win, (Rect){right - extra_w - 8, cy - 4, 8, 8}, TH_ACCENT, 4);
+                extra_w += 14;
+            }
             ui_text_clipped(win, child->label, lx, ty, right - lx - extra_w, tc, tv->font_size, fs);
         }
 
@@ -317,6 +325,16 @@ void tree_view_select(TreeView* tv, TreeNode* node) {
     if (tv->selected) tv->selected->selected = false;
     node->selected = true;
     tv->selected   = node;
+}
+
+TreeNode* tree_view_set_current_db(TreeView* tv, const char* db) {
+    if (!tv) return NULL;
+    snprintf(tv->current_db, sizeof(tv->current_db), "%s", db ? db : "");
+    if (!tv->root || !tv->current_db[0]) return NULL;
+    for (int i = 0; i < tv->root->num_children; i++)
+        if (tv->root->children[i].type == TREE_NODE_DATABASE && !strcmp(tv->root->children[i].label, tv->current_db))
+            return &tv->root->children[i];
+    return NULL;
 }
 
 int tree_view_row_count(TreeView* tv) { return tv ? count_rows(tv->root) : 0; }

@@ -11,6 +11,7 @@ SCOPO: astrarre Win32 e Xlib in un'unica interfaccia.
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 // tipi geometrici (point, rectangle [x offset from left, y offset from top, h altezza, w larghezza], color)
 typedef struct { int x, y; } Point;
@@ -182,6 +183,15 @@ char* platform_get_clipboard(PlatformWindow* win);   // stringa malloc'd (free()
 bool  platform_open_url(const char* url);
 // apre un file di testo esistente (es. php.ini) nell'editor del sistema; false se non c'è o non si può
 bool  platform_open_file(const char* path);
+
+// finestra "Apri" / "Salva con nome" del sistema (Windows: quella di Esplora risorse; Linux: zenity o
+// kdialog, come GNOME e KDE). filter: "SQL files|*.sql;*.txt" ("All files" viene aggiunto); initial:
+// cartella o file proposto (anche NULL). Ritorna 1 = scelto (percorso in out), 0 = annullato,
+// -1 = nessuna finestra disponibile (il chiamante chiede il percorso a mano).
+// Linux: non usa X11, si può chiamare da un thread di lavoro; Windows: dal thread della finestra.
+typedef enum { FILE_DIALOG_OPEN, FILE_DIALOG_SAVE } FileDialogKind;
+int   platform_file_dialog(PlatformWindow* win, FileDialogKind kind, const char* title, const char* filter,
+                           const char* initial, char* out, size_t outsz);
 
 // icona nell'area di notifica (Windows; X11 con un system tray XEmbed: KDE, XFCE, Cinnamon, MATE, ...).
 // false se non c'è un'area di notifica. Clic: EVT_TRAY_OPEN; menu (Windows): gli altri EVT_TRAY_*

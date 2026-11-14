@@ -59,6 +59,9 @@ typedef struct RunJob {
     bool         cancelled;       // fermato prima di uno statement
     bool         keep_going;      // Settings: continua dopo un errore
     int          nerrors;         // statement falliti (con keep_going)
+    bool         import;          // import di un file: le stored routine non supportate vengono saltate
+    int          routines_skipped;
+    char         routines[256];   // nomi delle routine saltate ("a, b, c")
     char         label[96];       // descrizione per lo stato ("Import of clienti.csv", ...)
     atomic_int   done;
     atomic_int   cancel;
@@ -131,9 +134,21 @@ static void update_completions(AppWindow* app) {
     free(l.v);
 }
 
+static const char* find_db_name(TreeNode* node);
+
+// l'albero segue il database in uso: punto sul suo nodo e selezione spostata lì se era su un altro database
+static void sync_tree_db(AppWindow* app) {
+    if (!app->tree) return;
+    const char* db = db_current_database();
+    TreeNode* cur = tree_view_set_current_db(app->tree, db);
+    const char* sel_db = app->tree->selected ? find_db_name(app->tree->selected) : NULL;
+    if (cur && (!sel_db || strcmp(sel_db, cur->label) != 0)) tree_view_select(app->tree, cur);
+}
+
 static void update_session(AppWindow* app) {
     const char* db = db_current_database();
     label_set_text(app->lbl_db_name, db && db[0] ? db : "no database");
+    sync_tree_db(app);
     SessionInfo* s = db_session_info();
     app->in_transaction = s ? s->in_transaction : false;
     if (s) db_session_free(s);
@@ -775,6 +790,7 @@ static void refresh_tree(AppWindow* app) {
     int old_scroll = app->tree->scroll_y;
     tree_view_refresh(app->tree);
     app->tree->scroll_y = old_scroll;
+    sync_tree_db(app);
 
     if (!names) return;
     root = app->tree->root;
@@ -800,8 +816,23 @@ static void refresh_tree(AppWindow* app) {
 }
 
 // click su un nodo: caricamento lazy dei figli quando viene espanso
+static bool use_database(AppWindow* app, const char* db);
+
 static void on_tree_select(TreeNode* node, void* ud) {
-    if (busy_guard((AppWindow*)ud)) return;   // il motore è occupato dal thread di lavoro
+    AppWindow* app = (AppWindow*)ud;
+    if (busy_guard(app)) return;   // il motore è occupato dal thread di lavoro
+    // il database del nodo cliccato diventa quello in uso: albero e indicatore in alto mostrano lo stesso
+    const char* db = node ? find_db_name(node) : NULL;
+    if (db) {
+        const char* cur = db_current_database();
+        if (!cur || strcmp(cur, db) != 0) {
+            char name[128], msg[200];
+            snprintf(name, sizeof(name), "%s", db);
+            bool ok = use_database(app, name);
+            snprintf(msg, sizeof(msg), ok ? "Using database %s" : "Cannot use database %s", name);
+            set_status(app, ok ? STATUS_OK : STATUS_ERROR, msg, "");
+        }
+    }
     if (!node || !node->expanded) return;
     if (node->type == TREE_NODE_DATABASE && !node->loaded) {
         load_db_children(node);
@@ -817,7 +848,7 @@ static bool use_database(AppWindow* app, const char* db) {
     const char* cur = db_current_database();
     if (cur && strcmp(cur, db) == 0) return true;
     char sql[256];
-    snprintf(sql, sizeof(sql), "USE %s;", db);
+    snprintf(sql, sizeof(sql), "USE `%.200s`;", db);
     QueryResult* r = db_execute(sql);
     bool ok = r && r->success;
     if (r) db_result_free(r);
@@ -1299,6 +1330,94 @@ static void bar_submit(AppWindow* app, bool shift, bool ctrl) {
         }
         default: break;
     }
+}
+
+// ── finestra "Sfoglia" del sistema per i file (apri, salva, importa, esegui, esporta, dump) ──
+// La barra del percorso si apre comunque (con il percorso proposto) e resta come ripiego: se il sistema
+// non ha una finestra di scelta (Linux senza zenity / kdialog) il percorso si scrive lì.
+// Su Linux la finestra gira in un thread (l'interfaccia continua a ridisegnarsi); su Windows è modale.
+typedef struct {
+    bool            active;
+    atomic_int      done;
+    int             result;               // 1 scelto, 0 annullato, -1 nessuna finestra disponibile
+    BarMode         mode;
+    FileDialogKind  kind;
+    PlatformWindow* win;
+    PlatformThread* th;
+    char            title[64], filter[160], initial[1100], out[1100];
+} FilePick;
+static FilePick g_pick;
+static bool     g_no_file_dialog;          // già provato: nessuna finestra di scelta nel sistema
+
+static bool bar_is_file_mode(BarMode m) {
+    return m == BAR_OPEN || m == BAR_SAVE_AS || m == BAR_EXPORT || m == BAR_IMPORT_CSV || m == BAR_RUN_FILE || m == BAR_DUMP;
+}
+
+static void file_pick_worker(void* arg) {
+    FilePick* p = (FilePick*)arg;
+    p->result = platform_file_dialog(NULL, p->kind, p->title, p->filter, p->initial, p->out, sizeof(p->out));
+    atomic_store(&p->done, 1);
+}
+
+static void file_pick_finish(AppWindow* app) {
+    FilePick* p = &g_pick;
+    p->active = false;
+    if (p->result == 1) {
+        if (app->bar_mode != p->mode) bar_open(app, p->mode, false);
+        line_edit_set_text(app->bar_input, p->out);
+        app->bar_input->anchor = -1;
+        bar_submit(app, false, false);           // come Invio nella barra: stessi controlli e messaggi
+    } else if (p->result == 0) {
+        if (app->bar_mode == p->mode) bar_close(app);
+    } else {
+        g_no_file_dialog = true;
+        set_status(app, STATUS_INFO, "No file dialog on this system (install zenity or kdialog): "
+                   "type the path and press Enter", "");
+    }
+}
+
+// apre la finestra di scelta per la barra appena aperta (modalità e percorso proposto dalla barra)
+static void file_pick_start(AppWindow* app) {
+    if (!bar_is_file_mode(app->bar_mode) || g_no_file_dialog) return;
+    FilePick* p = &g_pick;
+    if (p->active) { set_status(app, STATUS_INFO, "A file dialog is already open", ""); return; }
+    BarMode m = app->bar_mode;
+    p->mode = m;
+    p->kind = (m == BAR_SAVE_AS || m == BAR_EXPORT || m == BAR_DUMP) ? FILE_DIALOG_SAVE : FILE_DIALOG_OPEN;
+    const char* title = m == BAR_OPEN ? "Open SQL file" : m == BAR_SAVE_AS ? "Save SQL file as"
+                      : m == BAR_EXPORT ? "Export results" : m == BAR_IMPORT_CSV ? "Import CSV file"
+                      : m == BAR_RUN_FILE ? "Run / import SQL file (also MySQL dumps)" : "Save database dump";
+    snprintf(p->title, sizeof(p->title), "%s", title);
+    snprintf(p->filter, sizeof(p->filter), "%s",
+             m == BAR_IMPORT_CSV ? "CSV files|*.csv;*.tsv;*.txt"
+           : m == BAR_EXPORT     ? "Results|*.csv;*.tsv;*.json;*.md;*.html;*.sql;*.xlsx;*.pdf"
+                                 : "SQL files|*.sql;*.txt");
+    expand_path(app->bar_input->text, p->initial, sizeof(p->initial));
+    p->out[0] = '\0';
+    p->result = -1;
+    atomic_store(&p->done, 0);
+    p->active = true;
+#ifdef _WIN32
+    p->result = platform_file_dialog(app->win, p->kind, p->title, p->filter, p->initial, p->out, sizeof(p->out));
+    file_pick_finish(app);
+#else
+    p->th = platform_thread_start(file_pick_worker, p);
+    if (!p->th) { file_pick_worker(p); file_pick_finish(app); }   // senza thread: bloccante
+#endif
+}
+
+// chiamato a ogni giro: la finestra di scelta (thread) ha finito?
+static bool file_pick_tick(AppWindow* app) {
+    if (!g_pick.active || !atomic_load(&g_pick.done)) return false;
+    if (g_pick.th) { platform_thread_join(g_pick.th); g_pick.th = NULL; }
+    file_pick_finish(app);
+    return true;
+}
+
+// barra del percorso + finestra "Sfoglia"
+static void bar_open_file(AppWindow* app, BarMode mode) {
+    bar_open(app, mode, false);
+    file_pick_start(app);
 }
 
 static void on_bar_input_change(LineEdit* le, void* ud) {
@@ -2925,6 +3044,7 @@ static void open_export_bar(AppWindow* app, ExportFormat f) {
     size_t n = strlen(buf);
     snprintf(buf + n, sizeof(buf) - n, "%s", export_format_ext(f));
     line_edit_set_text(app->bar_input, buf);
+    file_pick_start(app);
 }
 
 // ── pagine: editor SQL / designer dello schema ──────────────────
@@ -3299,7 +3419,7 @@ static void ctx_run(AppWindow* app, int a) {
         case CTX_SORT_CLEAR: table_view_sort(tv, -1, true); break;
         case CTX_FIT_COL:    table_view_fit_column(tv, tv->selected_col); break;
         case CTX_COPY_ALL:   copy_results_as(app, EXPORT_TSV); break;
-        case CTX_EXPORT:     bar_open(app, BAR_EXPORT, false); break;
+        case CTX_EXPORT:     bar_open_file(app, BAR_EXPORT); break;
         case CTX_FK_PARENT: case CTX_FK_CHILDREN: fk_follow(app, a == CTX_FK_PARENT, true); break;
         case CTX_SAVE_QUERY: bar_open(app, BAR_SAVE_QUERY, false); break;
         case CTX_TBL_CHECK: case CTX_TBL_ANALYZE: case CTX_TBL_OPTIMIZE: {
@@ -3389,9 +3509,9 @@ static void ctx_run(AppWindow* app, int a) {
 
         // file
         case CTX_NEW:     cmd_new(app); break;
-        case CTX_OPEN:    bar_open(app, BAR_OPEN, false); break;
-        case CTX_SAVE:    if (app->file_path[0]) save_to(app, app->file_path); else bar_open(app, BAR_SAVE_AS, false); break;
-        case CTX_SAVE_AS: bar_open(app, BAR_SAVE_AS, false); break;
+        case CTX_OPEN:    bar_open_file(app, BAR_OPEN); break;
+        case CTX_SAVE:    if (app->file_path[0]) save_to(app, app->file_path); else bar_open_file(app, BAR_SAVE_AS); break;
+        case CTX_SAVE_AS: bar_open_file(app, BAR_SAVE_AS); break;
         case CTX_QUIT:    app->quit_requested = true; break;
         case CTX_SERVER:  app_window_set_mode(app, APP_MODE_SERVER); break;
         case CTX_EDIT_CELL:    edit_begin(app, NULL); break;
@@ -3404,9 +3524,9 @@ static void ctx_run(AppWindow* app, int a) {
             app->del_src = table_view_source_row(app->results, app->results->selected_row);
             row_delete(app);
             break;
-        case CTX_RUN_FILE:   bar_open(app, BAR_RUN_FILE, false); break;
-        case CTX_IMPORT_CSV: bar_open(app, BAR_IMPORT_CSV, false); break;
-        case CTX_DUMP_DB:    bar_open(app, BAR_DUMP, false); break;
+        case CTX_RUN_FILE:   bar_open_file(app, BAR_RUN_FILE); break;
+        case CTX_IMPORT_CSV: bar_open_file(app, BAR_IMPORT_CSV); break;
+        case CTX_DUMP_DB:    bar_open_file(app, BAR_DUMP); break;
         case CTX_BACKUP:     bar_open(app, BAR_BACKUP, false); break;
         case CTX_RESTORE:    bar_open(app, BAR_RESTORE, false); break;
 
@@ -4076,6 +4196,8 @@ static bool import_csv(AppWindow* app, const char* path) {
     return true;
 }
 
+static bool g_next_run_import;          // il prossimo run_text viene da un file (dump / script)
+
 static bool run_file(AppWindow* app, const char* path) {
     char* sql = read_whole_file(path, NULL);
     if (!sql) {
@@ -4091,13 +4213,14 @@ static bool run_file(AppWindow* app, const char* path) {
         if (tr) {
             free(sql);
             sql = tr;
-            snprintf(label, sizeof(label), "Import of MySQL dump %.200s (%d skipped%s)", base_name(path), st.skipped,
-                     st.indexes_dropped ? ", FULLTEXT indexes left out (MATCH ... AGAINST works without them)" : "");
+            snprintf(label, sizeof(label), "Import of MySQL dump %.200s", base_name(path));
+            g_next_run_import = true;
             run_text(app, sql, 0, false, label);
             return true;
         }
     }
     snprintf(label, sizeof(label), "Run of %s", base_name(path));
+    g_next_run_import = true;
     run_text(app, sql, 0, false, label);
     return true;
 }
@@ -4819,7 +4942,7 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
                 case 't':
                     if (shift) { set_theme(app, (theme_current() + 1) % theme_count(), true); return; }
                     break;
-                case 'o': bar_open(app, BAR_OPEN, false); return;
+                case 'o': bar_open_file(app, BAR_OPEN); return;
                 case ',': settings_open_panel(app); return;
                 case 'b': ctx_run(app, CTX_TOGGLE_SIDEBAR); return;
 
@@ -4827,11 +4950,11 @@ void app_window_handle_event(AppWindow* app, sEvent* evt) {
                 case 'e':
                     if (shift) { ctx_run(app, CTX_EXPLAIN); return; }
                     if (app->results->result && app->results->result->num_cols > 0 &&
-                        app->results->msg_kind == TABLE_MSG_NONE) bar_open(app, BAR_EXPORT, false);
+                        app->results->msg_kind == TABLE_MSG_NONE) bar_open_file(app, BAR_EXPORT);
                     else set_status(app, STATUS_INFO, "Nothing to export: run a query first", "");
                     return;
                 case 's':
-                    if (shift || !app->file_path[0]) bar_open(app, BAR_SAVE_AS, false);
+                    if (shift || !app->file_path[0]) bar_open_file(app, BAR_SAVE_AS);
                     else save_to(app, app->file_path);
                     return;
                 default: break;
@@ -4968,6 +5091,7 @@ bool app_window_tick(AppWindow* app, uint64_t now_ms) {
     if (!app) return false;
     if (app->mode == APP_MODE_SERVER) return server_panel_tick(app->server, now_ms);
     if (app->mode == APP_MODE_START) return false;
+    if (file_pick_tick(app)) return true;
     bool a = textbox_tick(app->editor, now_ms);
     bool b = line_edit_tick(app->bar_input, now_ms);
     bool c = line_edit_tick(app->bar_replace_input, now_ms);
@@ -5397,6 +5521,39 @@ void app_window_run_query(AppWindow* app) {
 // Durante l'esecuzione la GUI non chiama il motore (explorer, commit/rollback bloccati).
 
 
+// "CREATE [OR REPLACE] [DEFINER = ...] PROCEDURE|FUNCTION|EVENT nome": nome in out
+static bool routine_name(const char* s, char* out, size_t outsz) {
+    const char* p = s;
+    int words = 0;
+    while (*p && words < 8) {
+        while (*p && (isspace((unsigned char)*p) || *p == '=' || *p == '@')) p++;
+        if (*p == '`' || *p == '\'' || *p == '"') {              // `root`@`localhost`
+            char q = *p++;
+            while (*p && *p != q) p++;
+            if (*p) p++;
+            continue;
+        }
+        const char* w = p;
+        while (*p && (isalnum((unsigned char)*p) || *p == '_')) p++;
+        if (p == w) return false;
+        words++;
+        int wn = (int)(p - w);
+        if (words == 1 && !(wn == 6 && !strncasecmp(w, "CREATE", 6))) return false;
+        if ((wn == 5 && !strncasecmp(w, "TABLE", 5)) || (wn == 4 && !strncasecmp(w, "VIEW", 4)) ||
+            (wn == 5 && !strncasecmp(w, "INDEX", 5)) || (wn == 7 && !strncasecmp(w, "TRIGGER", 7))) return false;
+        if ((wn == 9 && !strncasecmp(w, "PROCEDURE", 9)) || (wn == 8 && !strncasecmp(w, "FUNCTION", 8)) ||
+            (wn == 5 && !strncasecmp(w, "EVENT", 5))) {
+            while (*p && isspace((unsigned char)*p)) p++;
+            if (*p == '`') p++;
+            const char* nm = p;
+            while (*p && (isalnum((unsigned char)*p) || *p == '_' || *p == '.')) p++;
+            snprintf(out, outsz, "%.*s", (int)(p - nm), nm);
+            return p > nm;
+        }
+    }
+    return false;
+}
+
 static void run_worker(void* arg) {
     RunJob* j = (RunJob*)arg;
     for (int i = 0; i < j->n; i++) {
@@ -5415,6 +5572,17 @@ static void run_worker(void* arg) {
         j->log[j->log_n++] = (RunLog){ stmt, res && res->success,
                                        res ? (res->num_cols > 0 ? res->num_rows : res->rows_affected) : 0,
                                        res ? res->exec_time_ms : 0 };
+        char rname[96];
+        if (res && !res->success && j->import && routine_name(stmt, rname, sizeof(rname))) {
+            // dump con stored procedure / funzioni che il motore non sa ancora eseguire: saltate, l'import continua
+            j->routines_skipped++;
+            size_t rl = strlen(j->routines);
+            if (rl + strlen(rname) + 3 < sizeof(j->routines))
+                snprintf(j->routines + rl, sizeof(j->routines) - rl, "%s%s", rl ? ", " : "", rname);
+            j->log[j->log_n - 1].ok = false;
+            db_result_free(res);
+            continue;
+        }
         if (!res || !res->success) {
             bool cancelled = res && strcmp(res->error, "Query cancelled") == 0;
             j->nerrors++;
@@ -5555,6 +5723,8 @@ static void run_text(AppWindow* app, char* text, int base, bool from_editor, con
     if (!j || !ranges) { free(j); free(ranges); free(text); return; }
     j->text = text;
     j->ranges = ranges;
+    j->import = g_next_run_import;
+    g_next_run_import = false;
     j->n = sql_split(text, (int)strlen(text), ranges, max_ranges);
     for (int i = 0; i < j->n; i++) if (ranges[i].has_code) j->total_code++;
     if (j->total_code == 0) {
@@ -5724,12 +5894,29 @@ static void finish_run(AppWindow* app) {
         snprintf(msg, sizeof(msg), "%d of %d statements failed \xc2\xb7 first at line %d: %s", j->nerrors,
                  j->executed, line + 1, j->failed ? j->failed->error : "?");
         set_status(app, STATUS_ERROR, msg, "");
+    } else if (j->label[0] && j->failed_idx == 0 && !j->cancelled && j->routines_skipped) {
+        snprintf(msg, sizeof(msg), "%s: done \xc2\xb7 %d statement%s \xc2\xb7 %d stored routine%s not imported "
+                 "(DECLARE / functions not supported yet): %s", j->label, j->executed - j->routines_skipped,
+                 j->executed - j->routines_skipped == 1 ? "" : "s", j->routines_skipped,
+                 j->routines_skipped == 1 ? "" : "s", j->routines);
+        set_status(app, STATUS_INFO, msg, "");
+        if (app->results->msg_kind != TABLE_MSG_NONE) {   // nessuna griglia: il riepilogo va anche al centro
+            char title[160], detail[700];
+            snprintf(title, sizeof(title), "Import done \xc2\xb7 %d statements", j->executed - j->routines_skipped);
+            snprintf(detail, sizeof(detail), "Tables, views, triggers and data were imported. %d stored procedure%s / "
+                     "function%s use statements SegVault does not run yet (DECLARE, RETURN, SELECT ... INTO, loops) "
+                     "and were left out: %s.", j->routines_skipped, j->routines_skipped == 1 ? "" : "s",
+                     j->routines_skipped == 1 ? "" : "s", j->routines);
+            table_view_set_message(app->results, TABLE_MSG_OK, title, detail);
+        }
     } else if (j->label[0] && j->failed_idx == 0 && !j->cancelled) {
         snprintf(msg, sizeof(msg), "%s: done \xc2\xb7 %d statement%s", j->label, j->executed, j->executed == 1 ? "" : "s");
         set_status(app, STATUS_OK, msg, "");
     }
 
     bool changed = j->changed;
+    // un dump fermato a metà lascerebbe SET FOREIGN_KEY_CHECKS = 0 nella sessione dell'editor
+    if (j->import) db_result_free(db_execute("SET FOREIGN_KEY_CHECKS = 1"));
     job_free(j);
     db_clear_cancel();
 

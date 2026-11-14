@@ -680,7 +680,7 @@ bool auth_check(const char* user, const ASTNode* stmt, const char* cur_db, char*
         case NODE_SELECT: case NODE_INSERT: case NODE_UPDATE: case NODE_DELETE: case NODE_EXPLAIN:
             walk_node(&k, stmt);
             break;
-        case NODE_BEGIN: case NODE_COMMIT: case NODE_ROLLBACK: case NODE_SAVEPOINT: case NODE_ROLLBACK_TO:
+        case NODE_BEGIN: case NODE_COMMIT: case NODE_ROLLBACK: case NODE_SAVEPOINT: case NODE_ROLLBACK_TO: case NODE_SET:
             break;
         case NODE_USE:
             if (!any_in_db(user, stmt->use_stmt.db_name)) {

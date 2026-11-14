@@ -339,7 +339,7 @@ L'editor chiude automaticamente parentesi e apici, mantiene l'indentazione andan
 
 **Trova e sostituisci:** `Ctrl+F` si apre precompilato con la selezione o la parola sotto il cursore; in `Ctrl+H`, `Enter` nel campo di sostituzione sostituisce e `Ctrl+Enter` sostituisce tutto; `Esc` chiude la barra.
 
-**File, sessione e cronologia:** i percorsi si scrivono nella barra in alto dell'editor (`~` viene espanso); aprire un file o creare uno script nuovo resta annullabile con `Ctrl+Z`, e il footer mostra il nome del file con un pallino se ci sono modifiche non salvate. Alla chiusura (anche con `Ctrl+C` / `SIGTERM` dal terminale) script, cursore, file aperto, zoom e tema vengono salvati e ripristinati all'avvio successivo. Ogni statement eseguito finisce nella cronologia (data, esito, righe, durata): si apre nella griglia dei risultati, e doppio click o `Enter` aggiungono lo statement in fondo allo script.
+**File, sessione e cronologia:** *Open*, *Save as*, *Import*, *Run SQL file*, *Export* e *Database dump* aprono la finestra **Sfoglia** del sistema (Esplora risorse su Windows; quella di GNOME / KDE su Linux, con `zenity` o `kdialog`); il percorso scelto compare anche nella barra in alto dell'editor, dove si può sempre scrivere a mano (`~` viene espanso; senza `zenity` / `kdialog` si usa solo la barra); aprire un file o creare uno script nuovo resta annullabile con `Ctrl+Z`, e il footer mostra il nome del file con un pallino se ci sono modifiche non salvate. Alla chiusura (anche con `Ctrl+C` / `SIGTERM` dal terminale) script, cursore, file aperto, zoom e tema vengono salvati e ripristinati all'avvio successivo. Ogni statement eseguito finisce nella cronologia (data, esito, righe, durata): si apre nella griglia dei risultati, e doppio click o `Enter` aggiungono lo statement in fondo allo script.
 
 ### Explorer, risultati, import ed export
 
@@ -379,7 +379,7 @@ Gli stessi comandi si scrivono in SQL: `CREATE USER`, `GRANT`, `REVOKE`, `SHOW G
 - *Drop database…*; su una tabella *Empty table…* (`TRUNCATE`) e *Drop table…*, con una conferma che
   dice quante righe si perdono (le chiavi esterne che puntano alla tabella vengono tolte prima).
 
-**Explorer:** click per espandere database e tabelle; doppio click su un database = `USE`, su una tabella = anteprima dei dati (`SELECT * … LIMIT 200`), su una colonna = inserisce il nome nell'editor.
+**Explorer:** click su un database (o su una sua tabella) = diventa il **database in uso**, lo stesso dell'indicatore in alto a destra, segnato nell'albero con un punto e il colore d'accento (anche dopo un `USE` scritto nell'editor); click per espandere database e tabelle; doppio click su una tabella = anteprima dei dati (`SELECT * … LIMIT 200`), su una colonna = inserisce il nome nell'editor.
 
 **Tasto destro sull'explorer:** su un database *Use this database* e *New table…*; su una tabella
 *Browse data*, *Structure of …*, *Insert SELECT into editor*, *Insert CREATE TABLE into editor* e
@@ -439,7 +439,7 @@ referenced row*) apre la riga riferita; su una chiave primaria, *Show rows that 
 mostra le righe che la riferiscono.
 
 **Export** (menu *Export*): **Excel (`.xlsx`)** con numeri veri, intestazione in grassetto e prima riga bloccata, **PDF** (tabella su pagine A4 orizzontali), CSV, TSV, JSON, Markdown, HTML o `INSERT` SQL, su file o negli appunti (`Ctrl+Shift+C` copia tutto come TSV, da incollare in un foglio di calcolo; `Ctrl+E` esporta in CSV). *Database dump* scrive in un file `.sql` le istruzioni che ricreano il database corrente (tabelle, dati, chiavi esterne, viste, trigger e procedure).
-**Import** (menu *Import*): un file CSV diventa una tabella (tipi delle colonne riconosciuti dai dati); *Run SQL file / MySQL dump* esegue uno script senza aprirlo. Un **dump di MySQL / MariaDB / phpMyAdmin** viene riconosciuto e tradotto prima: `SET`, `LOCK TABLES` e simili saltati, tipi MySQL convertiti (`tinyint`, `mediumtext`, `json`, `timestamp`, `enum`, `set`, ...), attributi e opzioni (`unsigned`, `COLLATE`, `COMMENT`, `ENGINE=`, ...) tolti, `KEY` → `CREATE INDEX`, `UNIQUE KEY` → vincolo `UNIQUE`, chiavi esterne mantenute, viste, trigger e procedure ricreati (`DELIMITER` e i commenti `/*!50001 ... */` compresi; anche gli indici su più colonne; i `FULLTEXT` restano fuori, ma `MATCH ... AGAINST` funziona lo stesso).
+**Import** (menu *Import*): un file CSV diventa una tabella (tipi delle colonne riconosciuti dai dati); *Run SQL file / MySQL dump* esegue uno script senza aprirlo. Un **dump di MySQL / MariaDB / phpMyAdmin** o uno script con `DELIMITER` viene riconosciuto e preparato: `LOCK TABLES` e i `SET` di sessione saltati, `DELIMITER` e i commenti `/*!50001 ... */` di viste, trigger e procedure risolti; il resto arriva al motore così com'è, perché SegVault capisce il dialetto di MySQL: `UNSIGNED`, `KEY` / `UNIQUE KEY` / `FULLTEXT KEY`, `ON UPDATE CURRENT_TIMESTAMP`, `ENGINE=InnoDB DEFAULT CHARSET=...`, `CHARACTER SET` / `COLLATE` sulle colonne, `CREATE SCHEMA`, `SET FOREIGN_KEY_CHECKS = 0` (tabelle e dati in qualunque ordine, controlli di nuovo attivi alla fine), tipi `SET(...)` e spaziali, letterali `0x...`, `X'...'`, `N'...'`, `_utf8mb4'...'`, `.5`, commenti `#` e `/*! ... */`. Provati per intero i database d'esempio **classicmodels**, **Northwind**, **world** e **Sakila** (tabelle, viste, trigger e tutti i dati). Le stored procedure / funzioni che usano istruzioni non ancora supportate (`DECLARE`, `RETURN`, `SELECT ... INTO`, cicli: in Sakila sono 6) vengono saltate con un avviso che le elenca, senza fermare l'import.
 
 ### Menu e impostazioni
 
@@ -1275,7 +1275,7 @@ Ogni widget estende `Widget` mettendolo come **primo campo** della propria struc
 | *(schermate)* | `server_view.h` / `server_view.c` | Scelta iniziale e pannello del server |
 | *(utenti)* | `users_view.*`; `src/bridge/auth.*` | Pannello Users & permissions; utenti, password, `GRANT` e controllo dei permessi nel motore |
 | *(immagini)* | `png_write.h` / `png_write.c` | Encoder PNG senza librerie (deflate con LZ77 e Huffman fisso) |
-| *(import MySQL)* | `mysql_import.h` / `mysql_import.c` | Traduzione dei dump di MySQL / MariaDB nel dialetto di SegVault |
+| *(import MySQL)* | `mysql_import.h` / `mysql_import.c` | Preparazione dei dump di MySQL / MariaDB (`DELIMITER`, commenti versionati, `SET` di sessione) |
 | *(strumenti)* | `db_tools.h` / `db_tools.c` | Ricerca in tutto il database e panoramica delle tabelle |
 | *(designer)* | `table_design.*`, `table_designer.*` | Struttura di una tabella e SQL che la realizza (`CREATE` / `ALTER`); il modulo del designer |
 | *(griglia)* | `grid_edit.h` / `grid_edit.c` | SQL per modificare i dati nella griglia dei risultati |

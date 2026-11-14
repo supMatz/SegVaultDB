@@ -18,11 +18,12 @@ static int skip_quoted_or_comment(const char* s, int len, int i) {
         }
         return len;
     }
-    if (c == '-' && i + 1 < len && s[i + 1] == '-') {
-        int j = i + 2;
+    if ((c == '-' && i + 1 < len && s[i + 1] == '-') || c == '#') {    // "#" commento di MySQL
+        int j = i + 1;
         while (j < len && s[j] != '\n') j++;
         return j;
     }
+    if (c == '/' && i + 2 < len && s[i + 1] == '*' && s[i + 2] == '!') return i;   // /*!... */ eseguibile: codice
     if (c == '/' && i + 1 < len && s[i + 1] == '*') {
         int j = i + 2;
         while (j + 1 < len && !(s[j] == '*' && s[j + 1] == '/')) j++;
@@ -39,7 +40,7 @@ static bool word_eq(const char* s, int a, int b, const char* w) {
 }
 
 // Divide lo script negli statement separati da ';' (fuori da stringhe e commenti).
-// Dentro CREATE TRIGGER / PROCEDURE ... BEGIN ... END i ';' del corpo non separano: si conta la
+// Dentro CREATE TRIGGER / PROCEDURE / FUNCTION / EVENT ... BEGIN ... END i ';' del corpo non separano: si conta la
 // profondità dei blocchi (BEGIN e CASE aprono, END chiude; END IF chiude un IF).
 int sql_split(const char* s, int len, SqlRange* out, int max_out) {
     int n = 0, i = 0, start = 0, code_start = -1;
@@ -77,11 +78,14 @@ int sql_split(const char* s, int len, SqlRange* out, int max_out) {
             int e = i;
             while (e < len && (isalnum((unsigned char)s[e]) || s[e] == '_')) e++;
             words++;
-            if (words <= 4 && (word_eq(s, i, e, "TRIGGER") || word_eq(s, i, e, "PROCEDURE")) && word_eq(s, code_start, code_start + 6, "CREATE")) trigger = true;
+            if (words <= 4 && (word_eq(s, i, e, "TRIGGER") || word_eq(s, i, e, "PROCEDURE") ||
+                               word_eq(s, i, e, "FUNCTION") || word_eq(s, i, e, "EVENT")) && word_eq(s, code_start, code_start + 6, "CREATE")) trigger = true;
             if (trigger) {
-                bool closes_if = prev_end && (word_eq(s, i, e, "IF") || word_eq(s, i, e, "LOOP") || word_eq(s, i, e, "WHILE"));
+                bool closes_if = prev_end && (word_eq(s, i, e, "IF") || word_eq(s, i, e, "LOOP") ||
+                                              word_eq(s, i, e, "WHILE") || word_eq(s, i, e, "REPEAT"));
                 if (closes_if) depth++;                          // "END IF": l'END non chiudeva un BEGIN
-                if (word_eq(s, i, e, "BEGIN") || word_eq(s, i, e, "CASE")) depth++;
+                if (prev_end && word_eq(s, i, e, "CASE")) { }    // "END CASE": l'END ha già chiuso il CASE
+                else if (word_eq(s, i, e, "BEGIN") || word_eq(s, i, e, "CASE")) depth++;
                 else if (word_eq(s, i, e, "END")) depth--;
                 prev_end = word_eq(s, i, e, "END");
                 if (depth < 0) depth = 0;

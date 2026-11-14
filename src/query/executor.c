@@ -6734,6 +6734,10 @@ static int pk_column(const TableSchema* ts) {
 
 static void rid_key(RID r, char* buf, size_t n) { snprintf(buf, n, "%u:%u", r.page_id, (unsigned)r.slot_id); }
 
+static bool g_fk_checks = true;
+void executor_set_fk_checks(bool on) { g_fk_checks = on; }
+bool executor_fk_checks(void) { return g_fk_checks; }
+
 static ExecChangeHook g_change_hook;
 void executor_set_change_hook(ExecChangeHook hook) { g_change_hook = hook; }
 
@@ -7172,8 +7176,8 @@ static const char* cs_validate(ChangeSet* cs, char* msg, size_t mn) {
                 for (int q = 0; l && q < l->n; q++)
                     if (cs_find(cs, T, l->r[q]) < 0) { dup_message(T, &keys[k], nkey, msg, mn); fail = msg; break; }
             }
-            // chiavi esterne della riga modificata
-            for (int fi = 0; fi < T->num_constraints && !fail; fi++) {
+            // chiavi esterne della riga modificata (SET FOREIGN_KEY_CHECKS = 0: non controllate, come MySQL)
+            for (int fi = 0; g_fk_checks && fi < T->num_constraints && !fail; fi++) {
                 const Constraint* f = &T->constraints[fi];
                 if (f->kind != CONS_FOREIGN) continue;
                 int fc[SV_MAX_KEY_COLS];
@@ -7296,7 +7300,7 @@ static const char* validate_inserts(ExecCtx* ctx, Database* db, TableSchema* ts,
         }
         sm_free(&batch);
     }
-    for (int fi = 0; fi < ts->num_constraints && !fail; fi++) {
+    for (int fi = 0; g_fk_checks && fi < ts->num_constraints && !fail; fi++) {   // FOREIGN_KEY_CHECKS = 0: niente
         const Constraint* f = &ts->constraints[fi];
         if (f->kind != CONS_FOREIGN) continue;
         TableSchema* P = catalog_get_table(ctx->catalog, db->name, f->ref_table);
@@ -7389,7 +7393,15 @@ static const char* add_constraint(ExecCtx* ctx, Database* db, TableSchema* ts, C
     if (d->kind == CONS_FOREIGN) {
         bool self = !strcasecmp(d->ref_table, ts->name);
         TableSchema* P = self ? ts : catalog_get_table(ctx->catalog, db->name, d->ref_table);
-        if (!P) { snprintf(msg, mn, "Referenced table '%.64s' not found", d->ref_table); return msg; }
+        if (!P && (g_fk_checks || d->nref != d->ncols)) { snprintf(msg, mn, "Referenced table '%.64s' not found", d->ref_table); return msg; }
+        if (!P) {
+            // SET FOREIGN_KEY_CHECKS = 0 (dump di MySQL): la tabella riferita viene creata più avanti; il
+            // vincolo resta per nome e vale quando c'è (come in MySQL)
+            snprintf(c.ref_table, sizeof(c.ref_table), "%s", d->ref_table);
+            for (int k = 0; k < d->ncols; k++) snprintf(c.ref_cols[k], sizeof(c.ref_cols[k]), "%s", d->ref_cols[k]);
+            c.on_delete = (uint8_t)d->on_delete;
+            c.on_update = (uint8_t)d->on_update;
+        } else {
         snprintf(c.ref_table, sizeof(c.ref_table), "%s", P->name);
         int pc[SV_MAX_KEY_COLS];
         int np = d->nref;
@@ -7435,10 +7447,12 @@ static const char* add_constraint(ExecCtx* ctx, Database* db, TableSchema* ts, C
                 snprintf(msg, mn, "SET NULL is impossible: column '%.64s' is NOT NULL", ts->columns[c.cols[k]].name);
                 return msg;
             }
+        }
     }
 
-    // i dati esistenti devono già rispettare il vincolo (ALTER TABLE ADD CONSTRAINT)
-    if (ts->num_rows > 0 || ts->root_page_id) {
+    // i dati esistenti devono già rispettare il vincolo (ALTER TABLE ADD CONSTRAINT); con
+    // FOREIGN_KEY_CHECKS = 0 le chiavi esterne non si verificano (come in MySQL)
+    if ((ts->num_rows > 0 || ts->root_page_id) && !(d->kind == CONS_FOREIGN && !g_fk_checks)) {
         HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
         HeapScan* scan = hf ? heap_scan_open(hf, ts) : NULL;
         StrMap seen = {0};
@@ -9450,8 +9464,12 @@ static QueryResult* executor_run_impl(ExecCtx* ctx, ASTNode* stmt) {
         case NODE_CREATE_TABLE: return exec_create_table(ctx, stmt);
         case NODE_DROP_TABLE:   return exec_drop_table(ctx, stmt);
         case NODE_ALTER_TABLE:  return exec_alter_table(ctx, stmt);
-        case NODE_INSERT:       return stmt->insert_stmt.mode != INS_NORMAL || stmt->insert_stmt.num_dup > 0 ?
-                                       exec_insert_mysql(ctx, stmt) : exec_insert(ctx, stmt);
+        case NODE_INSERT: {
+            if (stmt->insert_stmt.mode != INS_NORMAL || stmt->insert_stmt.num_dup > 0) return exec_insert_mysql(ctx, stmt);
+            QueryResult* r = exec_insert(ctx, stmt);
+            dup_clear();           // il conflitto registrato serve solo a exec_insert_mysql: niente resti nel thread
+            return r;
+        }
         case NODE_SELECT:       return run_select(ctx, stmt, 0, false);
         case NODE_UPDATE:       return stmt->update_stmt.multi_from ? exec_dml_multi(ctx, stmt) : exec_update(ctx, stmt);
         case NODE_DELETE:       return stmt->delete_stmt.multi_from ? exec_dml_multi(ctx, stmt) : exec_delete(ctx, stmt);

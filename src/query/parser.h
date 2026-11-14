@@ -18,6 +18,7 @@ typedef enum {
     NODE_BACKUP,
     NODE_TABLE_MAINT,  // CHECK / ANALYZE / OPTIMIZE / REPAIR TABLE t [, ...]       // BACKUP [DATABASE] TO 'cartella'
     NODE_VACUUM,       // recupera le pagine di overflow non più usate
+    NODE_SET,          // SET @x = ..., SET NAMES ..., SET FOREIGN_KEY_CHECKS = 0, ... (variabili di MySQL)
 } StmtType;
 
 typedef enum { JOIN_INNER, JOIN_LEFT, JOIN_RIGHT, JOIN_CROSS, JOIN_FULL } JoinType;
@@ -186,6 +187,7 @@ typedef struct ASTNode {
     bool     if_exists;        // DROP ... IF EXISTS / CREATE ... IF NOT EXISTS
     char     qual_db[64];      // database dei nomi qualificati (shop.prodotto); "" = quello corrente
     bool     qual_mixed;       // anche tabelle senza database: valide solo se il corrente è qual_db
+    int      set_fk_checks;    // NODE_SET: FOREIGN_KEY_CHECKS = 0 / 1 (-1 = non nominato)
     union {
         struct {
             ASTExpr*   columns[64];

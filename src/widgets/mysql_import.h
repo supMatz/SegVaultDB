@@ -1,11 +1,11 @@
 /*
-SCOPO: import dei dump di MySQL / MariaDB (mysqldump, export di phpMyAdmin): traduce lo script nel
-       dialetto di SegVault prima di eseguirlo.
-       - salta SET, LOCK / UNLOCK TABLES, ALTER TABLE ... DISABLE / ENABLE KEYS
-       - CREATE TABLE: tipi MySQL (tinyint, mediumtext, json, timestamp, enum, ...) e attributi
-         (unsigned, COLLATE, CHARACTER SET, COMMENT, ON UPDATE) tradotti o tolti; opzioni della
-         tabella (ENGINE=, CHARSET, AUTO_INCREMENT=) tolte; KEY -> CREATE INDEX (una colonna),
-         UNIQUE KEY -> CONSTRAINT ... UNIQUE
+SCOPO: import dei dump di MySQL / MariaDB (mysqldump, export di phpMyAdmin, script con DELIMITER come
+       classicmodels, Northwind, Sakila, world): prepara lo script prima di eseguirlo.
+       - DELIMITER ;; ... ;; tolti; i commenti versionati di viste, trigger, procedure e
+         FOREIGN_KEY_CHECKS ("!50001 ...") diventano testo normale
+       - salta SET (tranne FOREIGN_KEY_CHECKS), LOCK / UNLOCK TABLES, ALTER TABLE ... DISABLE / ENABLE KEYS
+       - CREATE TABLE e il resto passano così come sono: il motore capisce il dialetto di MySQL
+         (UNSIGNED, KEY, FULLTEXT, ON UPDATE, ENGINE=, CHARSET, COLLATE, SET(...), 0x.., N'..', ...)
        Nessuna dipendenza dal motore.
 */
 #ifndef MYSQL_IMPORT_H
@@ -16,7 +16,7 @@ SCOPO: import dei dump di MySQL / MariaDB (mysqldump, export di phpMyAdmin): tra
 typedef struct {
     int statements;     // statement nel risultato
     int skipped;        // statement saltati (SET, LOCK, ...)
-    int indexes_dropped;// indici FULLTEXT / SPATIAL non riportati (MATCH ... AGAINST funziona anche senza)
+    int indexes_dropped;// sempre 0: gli indici FULLTEXT / SPATIAL ora arrivano al motore
 } MyImportStats;
 
 bool  mysql_looks_like_dump(const char* sql);                 // intestazione di mysqldump / phpMyAdmin, ENGINE=, ...

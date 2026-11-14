@@ -495,12 +495,16 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
         char err[300];
         if (!auth_check(g_session_user, stmt, cur_db_name(), err, sizeof(err))) return result_error(err);
     }
-    if (stmt->type == NODE_BEGIN) {
+    if (stmt->type == NODE_SET) {                 // variabili di sessione di MySQL: accettate
+        if (stmt->set_fk_checks >= 0) executor_set_fk_checks(stmt->set_fk_checks != 0);
+        result = result_ok(0);
+    } else if (stmt->type == NODE_BEGIN) {
         result = db_begin() ? result_ok(0) : result_error("Failed to begin transaction");
     } else if (stmt->type == NODE_COMMIT) {
-        result = db_commit() ? result_ok(0) : result_error("Failed to commit");
+        // senza transazione aperta è un OK, come in MySQL (i dump finiscono spesso con COMMIT)
+        result = !g_db.exec_ctx.tx_id || db_commit() ? result_ok(0) : result_error("Failed to commit");
     } else if (stmt->type == NODE_ROLLBACK && stmt->rollback_to.name[0] == 0) {
-        result = db_rollback() ? result_ok(0) : result_error("Failed to rollback");
+        result = !g_db.exec_ctx.tx_id || db_rollback() ? result_ok(0) : result_error("Failed to rollback");
     } else if (stmt->type == NODE_TABLE_MAINT) {
         result = exec_table_maint(stmt);
     } else if (stmt->type == NODE_BACKUP) {
@@ -566,6 +570,7 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
 typedef struct { char name[64]; off_t offset; uint64_t chg_seq; } SavepointRec;
 
 struct DbSession {
+    bool         fk_off;            // SET FOREIGN_KEY_CHECKS = 0 in questa sessione
     int          cur_db;            // indice nel catalogo (-1 = nessuno)
     uint64_t     tx_id;
     SavepointRec sp[64];
@@ -826,7 +831,7 @@ static void ls_scan_text(LockSet* ls, int dbi, const char* sql, uint8_t mode, in
 // 0 = nessun lock (controllo delle transazioni, USE), 1 = lettura, 2 = scrittura, 3 = schema / manutenzione
 static int stmt_lock_kind(const ASTNode* st) {
     switch (st->type) {
-    case NODE_BEGIN: case NODE_COMMIT: case NODE_ROLLBACK: case NODE_SAVEPOINT: case NODE_ROLLBACK_TO: case NODE_USE:
+    case NODE_BEGIN: case NODE_COMMIT: case NODE_ROLLBACK: case NODE_SAVEPOINT: case NODE_ROLLBACK_TO: case NODE_USE: case NODE_SET:
         return 0;
     case NODE_SELECT: case NODE_SHOW: case NODE_DESCRIBE: case NODE_EXPLAIN:
         return 1;
@@ -1559,6 +1564,7 @@ static const void* lock_owner(void) { return g_active ? (const void*)g_active : 
 static void session_save(DbSession* s) {
     s->cur_db = g_db.catalog ? g_db.catalog->current_db : -1;
     s->tx_id = g_db.exec_ctx.tx_id;
+    s->fk_off = !executor_fk_checks();
     s->nsp = g_num_savepoints;
     memcpy(s->sp, g_savepoints, sizeof(s->sp));
     snprintf(s->user, sizeof(s->user), "%s", g_session_user);
@@ -1567,6 +1573,7 @@ static void session_save(DbSession* s) {
 static void session_load(const DbSession* s) {
     if (g_db.catalog) g_db.catalog->current_db = s->cur_db < g_db.catalog->num_databases ? s->cur_db : -1;
     g_db.exec_ctx.tx_id = s->tx_id;
+    executor_set_fk_checks(!s->fk_off);
     g_num_savepoints = s->nsp;
     memcpy(g_savepoints, s->sp, sizeof(g_savepoints));
     snprintf(g_session_user, sizeof(g_session_user), "%s", s->user);

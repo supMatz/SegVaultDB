@@ -21,6 +21,8 @@ SCOPO: Stessa interfaccia di win32.c ma usa Xlib (Linux/X11).
 #include <unistd.h>      // readlink
 #include <sys/stat.h>
 #include <sys/wait.h>    // waitpid (platform_open_url)
+#include <fcntl.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -886,6 +888,124 @@ bool platform_open_file(const char* path) {
     int st2;
     waitpid(pid, &st2, 0);
     return true;
+}
+
+// ── finestra Apri / Salva: zenity (GNOME, XFCE, ...) o kdialog (KDE) ──
+
+static bool in_path(const char* prog, char* full, size_t fn) {
+    const char* path = getenv("PATH");
+    if (!path || !*path) path = "/usr/local/bin:/usr/bin:/bin";
+    while (*path) {
+        const char* e = strchr(path, ':');
+        size_t n = e ? (size_t)(e - path) : strlen(path);
+        if (n) {
+            snprintf(full, fn, "%.*s/%s", (int)n, path, prog);
+            if (access(full, X_OK) == 0) return true;
+        }
+        path += n + (e ? 1 : 0);
+    }
+    return false;
+}
+
+// esegue argv e legge stdout (prima riga): 1 = uscita 0 con un percorso, 0 = annullato, -1 = non parte
+static int run_chooser(char* const* argv, char* out, size_t outsz) {
+    int fd[2];
+    if (pipe(fd) != 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(fd[0]); close(fd[1]); return -1; }
+    if (pid == 0) {
+        dup2(fd[1], 1);
+        int nul = open("/dev/null", O_WRONLY);
+        if (nul >= 0) dup2(nul, 2);
+        close(fd[0]); close(fd[1]);
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    close(fd[1]);
+    size_t got = 0;
+    char buf[4096];
+    for (;;) {
+        ssize_t r = read(fd[0], buf + got, sizeof(buf) - 1 - got);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        got += (size_t)r;
+        if (got >= sizeof(buf) - 1) break;
+    }
+    buf[got] = '\0';
+    close(fd[0]);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (!WIFEXITED(st) || WEXITSTATUS(st) == 127) return -1;
+    char* nl = strchr(buf, '\n');
+    if (nl) *nl = '\0';
+    if (WEXITSTATUS(st) != 0 || !buf[0]) return 0;
+    snprintf(out, outsz, "%s", buf);
+    return 1;
+}
+
+int platform_file_dialog(PlatformWindow* win, FileDialogKind kind, const char* title, const char* filter,
+                         const char* initial, char* out, size_t outsz) {
+    (void)win;
+    if (!out || !outsz) return -1;
+    out[0] = '\0';
+    // "SQL files|*.sql;*.txt" -> nome e modelli separati da spazi
+    char fname[128] = "", fpat[256] = "";
+    if (filter && *filter) {
+        const char* bar = strchr(filter, '|');
+        snprintf(fname, sizeof(fname), "%.*s", bar ? (int)(bar - filter) : (int)strlen(filter), filter);
+        snprintf(fpat, sizeof(fpat), "%s", bar ? bar + 1 : "*");
+        for (char* c = fpat; *c; c++) if (*c == ';') *c = ' ';
+    }
+    char start[1200];
+    snprintf(start, sizeof(start), "%s", initial && *initial ? initial : (getenv("HOME") ? getenv("HOME") : "/"));
+    struct stat st;
+    size_t sl = strlen(start);
+    if (stat(start, &st) == 0 && S_ISDIR(st.st_mode) && sl && start[sl - 1] != '/' && sl + 1 < sizeof(start)) {
+        start[sl] = '/'; start[sl + 1] = '\0';                  // zenity: cartella di partenza solo con la '/'
+    }
+    const char* t = title && *title ? title : (kind == FILE_DIALOG_SAVE ? "Save as" : "Open");
+    char prog[1100];
+    const char* desk = getenv("XDG_CURRENT_DESKTOP");
+    bool kde = desk && strstr(desk, "KDE");
+    for (int pass = 0; pass < 2; pass++) {
+        bool use_kdialog = (pass == 0) == kde;
+        char* argv[16];
+        int a = 0;
+        char a_title[300], a_file[1300], a_f1[400], a_f2[64];
+        if (!use_kdialog) {
+            if (!in_path("zenity", prog, sizeof(prog)) && !in_path("qarma", prog, sizeof(prog))) continue;
+            argv[a++] = prog;
+            argv[a++] = "--file-selection";
+            snprintf(a_title, sizeof(a_title), "--title=%s", t);
+            argv[a++] = a_title;
+            if (kind == FILE_DIALOG_SAVE) argv[a++] = "--save";
+            snprintf(a_file, sizeof(a_file), "--filename=%s", start);
+            argv[a++] = a_file;
+            if (fpat[0]) {
+                snprintf(a_f1, sizeof(a_f1), "--file-filter=%s | %s", fname[0] ? fname : "Files", fpat);
+                argv[a++] = a_f1;
+                snprintf(a_f2, sizeof(a_f2), "--file-filter=All files | *");
+                argv[a++] = a_f2;
+            }
+        } else {
+            if (!in_path("kdialog", prog, sizeof(prog))) continue;
+            argv[a++] = prog;
+            argv[a++] = "--title";
+            snprintf(a_title, sizeof(a_title), "%s", t);
+            argv[a++] = a_title;
+            argv[a++] = kind == FILE_DIALOG_SAVE ? "--getsavefilename" : "--getopenfilename";
+            snprintf(a_file, sizeof(a_file), "%s", start);
+            argv[a++] = a_file;
+            if (fpat[0]) {
+                snprintf(a_f1, sizeof(a_f1), "%s|%s\n*|All files", fpat, fname[0] ? fname : "Files");
+                argv[a++] = a_f1;
+            }
+        }
+        argv[a] = NULL;
+        int r = run_chooser(argv, out, outsz);
+        if (r >= 0) return r;
+    }
+    return -1;
 }
 
 void platform_set_clipboard(PlatformWindow* win, const char* text) {
