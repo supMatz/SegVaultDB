@@ -35,6 +35,11 @@ typedef struct UserVars UserVars;
 UserVars* executor_uservars(void);
 void      executor_set_uservars(UserVars* v);
 void      executor_uservars_free(UserVars* v);
+// PREPARE / EXECUTE / DEALLOCATE PREPARE della sessione
+bool        executor_prepare_store(const char* name, const char* sql);
+const char* executor_prepare_get(const char* name);
+bool        executor_prepare_drop(const char* name);
+char*       executor_uservar_literal(const char* name);      // @nome come letterale SQL (malloc'd)
 // assegnazioni di SET @a = espr, ... (NODE_SET)
 QueryResult* executor_set_session_vars(ExecCtx* ctx, ASTNode* stmt);
 

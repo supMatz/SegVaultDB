@@ -13,6 +13,7 @@ typedef struct {
     int        depth;          // annidamento corrente delle espressioni
     char       qual_db[64];    // database dei nomi db.tabella dello statement ("" = nessuno)
     bool       plain_table;    // lo statement usa anche tabelle senza database
+    int        gs_nested;      // rilettura di una SELECT con ROLLUP / CUBE / GROUPING SETS (un ramo)
 } ParserState;
 
 #define MAX_EXPR_DEPTH 128     // parentesi, operatori e funzioni annidati
@@ -1729,7 +1730,157 @@ static void parse_select_into(ParserState* ps, ASTNode* n) {
     } while (match(ps, TOK_COMMA));
 }
 
+// ── ROLLUP / CUBE / GROUPING SETS: un ramo (UNION ALL) per insieme di raggruppamento ──
+
+static bool expr_same(const ASTExpr* a, const ASTExpr* b) {
+    char x[512], y[512];
+    ast_expr_format(a, x, sizeof(x));
+    ast_expr_format(b, y, sizeof(y));
+    return !strcasecmp(x, y);
+}
+
+// in e: le espressioni tolte dal raggruppamento diventano NULL, GROUPING(x) diventa 1 (tolta) o 0
+static ASTExpr* gs_rewrite(ASTExpr* e, ASTExpr** removed, int nr, ASTExpr** kept, int nk) {
+    if (!e) return NULL;
+    if (e->type == EXPR_FUNC && !strcmp(e->func, "GROUPING")) {
+        int64_t v = 0;
+        for (int a = 0; a < e->nargs; a++) {
+            bool rm = false;
+            for (int i = 0; i < nr && !rm; i++) rm = expr_same(e->args[a], removed[i]);
+            v = (v << 1) | (rm ? 1 : 0);
+        }
+        ASTExpr* lit = new_expr(EXPR_INT);
+        if (!lit) return e;
+        lit->int_val = v;
+        if (e->alias[0]) snprintf(lit->alias, sizeof(lit->alias), "%s", e->alias);
+        else ast_expr_format(e, lit->alias, sizeof(lit->alias));
+        ast_expr_free(e);
+        return lit;
+    }
+    if (e->type != EXPR_AGG && e->type != EXPR_WINDOW) {
+        bool keep = false;
+        for (int i = 0; i < nk && !keep; i++) keep = expr_same(e, kept[i]);
+        if (!keep)
+            for (int i = 0; i < nr; i++)
+                if (expr_same(e, removed[i])) {
+                    ASTExpr* nl = new_expr(EXPR_NULL);
+                    if (!nl) return e;
+                    if (e->alias[0]) snprintf(nl->alias, sizeof(nl->alias), "%s", e->alias);
+                    else if (e->type == EXPR_COLUMN) snprintf(nl->alias, sizeof(nl->alias), "%s", e->col_name);
+                    ast_expr_free(e);
+                    return nl;
+                }
+    }
+    if (e->type == EXPR_AGG) return e;                       // dentro un aggregato i valori restano quelli delle righe
+    e->left = gs_rewrite(e->left, removed, nr, kept, nk);
+    e->right = gs_rewrite(e->right, removed, nr, kept, nk);
+    for (int i = 0; i < e->nargs; i++) e->args[i] = gs_rewrite(e->args[i], removed, nr, kept, nk);
+    return e;
+}
+
+// tiene le espressioni di GROUP BY del bit mask (le altre vengono tolte e diventano NULL nell'elenco)
+static void gs_apply(ASTNode* n, uint32_t mask) {
+    ASTExpr* kept[SV_MAX_GROUP];
+    ASTExpr* removed[SV_MAX_GROUP];
+    int nk = 0, nr = 0;
+    for (int j = 0; j < n->select_stmt.num_group; j++) {
+        if (mask >> j & 1u) kept[nk++] = n->select_stmt.group_exprs[j];
+        else removed[nr++] = n->select_stmt.group_exprs[j];
+    }
+    for (int i = 0; i < n->select_stmt.num_cols; i++)
+        n->select_stmt.columns[i] = gs_rewrite(n->select_stmt.columns[i], removed, nr, kept, nk);
+    n->select_stmt.having = gs_rewrite(n->select_stmt.having, removed, nr, kept, nk);
+    for (int i = 0; i < nr; i++) ast_expr_free(removed[i]);
+    for (int i = 0; i < nk; i++) n->select_stmt.group_exprs[i] = kept[i];
+    n->select_stmt.num_group = nk;
+}
+
+// GROUP BY con ROLLUP(...) / CUBE(...) / GROUPING SETS (...) / ... WITH ROLLUP: espressioni distinte in
+// group_exprs, insiemi (bit mask) in sets; false se è un GROUP BY normale
+static bool parse_group_by(ParserState* ps, ASTNode* n, uint32_t* sets, int* nsets) {
+    *nsets = 0;
+    uint32_t plain = 0;
+    uint32_t base_sets[64];
+    int nb = 0;
+    bool special = false;
+    #define G_ADD(ex, idx) do { int _f = -1; \
+        for (int _j = 0; _j < n->select_stmt.num_group; _j++) if (expr_same(n->select_stmt.group_exprs[_j], ex)) { _f = _j; break; } \
+        if (_f >= 0) { ast_expr_free(ex); idx = _f; } \
+        else if (n->select_stmt.num_group >= SV_MAX_GROUP || n->select_stmt.num_group >= 16) { ast_expr_free(ex); parse_fail(ps, "Too many GROUP BY expressions", peek(ps)); return false; } \
+        else { idx = n->select_stmt.num_group; n->select_stmt.group_exprs[n->select_stmt.num_group++] = ex; } } while (0)
+    // prodotto degli insiemi delle parti (come lo standard: GROUP BY a, ROLLUP(b) = (a, b), (a))
+    uint32_t acc[64] = { 0 };
+    int nacc = 1;
+    do {
+        uint32_t part[64];
+        int np = 0;
+        if ((ident_is(ps, "ROLLUP") || ident_is(ps, "CUBE")) && next_is(ps, 1, TOK_LPAREN)) {
+            bool cube = ident_is(ps, "CUBE");
+            consume(ps); consume(ps);
+            int idx[16], ni = 0;
+            do {
+                ASTExpr* g = parse_expr(ps);
+                if (!g || ni >= 16) { ast_expr_free(g); if (ps->result->success) parse_fail(ps, "Too many ROLLUP / CUBE expressions", peek(ps)); return false; }
+                G_ADD(g, idx[ni]);
+                ni++;
+            } while (match(ps, TOK_COMMA));
+            if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')'", peek(ps)); return false; }
+            if (cube && ni > 6) { parse_fail(ps, "CUBE supports up to 6 expressions", peek(ps)); return false; }
+            if (cube) for (int m = (1 << ni) - 1; m >= 0; m--) { uint32_t s = 0; for (int k = 0; k < ni; k++) if (m >> (ni - 1 - k) & 1) s |= 1u << idx[k]; part[np++] = s; }
+            else for (int k = ni; k >= 0; k--) { uint32_t s = 0; for (int q = 0; q < k; q++) s |= 1u << idx[q]; part[np++] = s; }
+            special = true;
+        } else if (ident_is(ps, "GROUPING") && peek2_ident(ps, "SETS")) {
+            consume(ps); consume(ps);
+            if (!match(ps, TOK_LPAREN)) { parse_fail(ps, "Expected '(' after GROUPING SETS", peek(ps)); return false; }
+            do {
+                uint32_t s = 0;
+                if (match(ps, TOK_LPAREN)) {
+                    if (!match(ps, TOK_RPAREN)) {
+                        do { ASTExpr* g = parse_expr(ps); int ix; if (!g) return false; G_ADD(g, ix); s |= 1u << ix; } while (match(ps, TOK_COMMA));
+                        if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')'", peek(ps)); return false; }
+                    }
+                } else { ASTExpr* g = parse_expr(ps); int ix; if (!g) return false; G_ADD(g, ix); s |= 1u << ix; }
+                if (np >= 64) { parse_fail(ps, "Too many grouping sets (max 64)", peek(ps)); return false; }
+                part[np++] = s;
+            } while (match(ps, TOK_COMMA));
+            if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')' after GROUPING SETS", peek(ps)); return false; }
+            special = true;
+        } else {
+            ASTExpr* g = parse_expr(ps);
+            if (!g) return false;
+            int ix;
+            G_ADD(g, ix);
+            plain |= 1u << ix;
+            part[np++] = 1u << ix;
+        }
+        uint32_t nx[64];
+        int nn = 0;
+        for (int a = 0; a < nacc; a++)
+            for (int b = 0; b < np; b++) {
+                if (nn >= 64) { parse_fail(ps, "Too many grouping sets (max 64)", peek(ps)); return false; }
+                nx[nn++] = acc[a] | part[b];
+            }
+        memcpy(acc, nx, sizeof(uint32_t) * (size_t)nn);
+        nacc = nn;
+    } while (ps->result->success && match(ps, TOK_COMMA));
+    #undef G_ADD
+    if (ident_is(ps, "WITH") && peek2_ident(ps, "ROLLUP")) {   // GROUP BY a, b WITH ROLLUP (MySQL)
+        consume(ps); consume(ps);
+        if (special) { parse_fail(ps, "WITH ROLLUP cannot be combined with ROLLUP / CUBE / GROUPING SETS", peek(ps)); return false; }
+        int ng = n->select_stmt.num_group;
+        nacc = 0;
+        for (int k = ng; k >= 0; k--) acc[nacc++] = k == 32 ? 0xFFFFFFFFu : ((1u << k) - 1u);
+        special = true;
+    }
+    (void)plain; (void)base_sets; (void)nb;
+    if (!special) return false;
+    memcpy(sets, acc, sizeof(uint32_t) * (size_t)nacc);
+    *nsets = nacc;
+    return true;
+}
+
 static ASTNode* parse_select_core(ParserState* ps) {
+    int core_start = ps->pos;
     ASTNode* n = calloc(1, sizeof(ASTNode));
     if (!n) return NULL;
     n->type = NODE_SELECT;
@@ -1785,14 +1936,11 @@ static ASTNode* parse_select_core(ParserState* ps) {
 
     if (ps->result->success && match(ps, TOK_WHERE)) n->select_stmt.where = parse_expr(ps);
 
+    uint32_t gsets[64];
+    int ngsets = 0;
     if (ps->result->success && match(ps, TOK_GROUP)) {
         expect(ps, TOK_BY);
-        do {
-            if (n->select_stmt.num_group >= SV_MAX_GROUP) { parse_fail(ps, "Too many GROUP BY expressions", peek(ps)); break; }
-            ASTExpr* g = parse_expr(ps);
-            if (!g) break;
-            n->select_stmt.group_exprs[n->select_stmt.num_group++] = g;
-        } while (ps->result->success && match(ps, TOK_COMMA));
+        if (!parse_group_by(ps, n, gsets, &ngsets)) ngsets = 0;
     }
 
     if (ps->result->success && match(ps, TOK_HAVING)) n->select_stmt.having = parse_expr(ps);
@@ -1812,6 +1960,28 @@ static ASTNode* parse_select_core(ParserState* ps) {
             for (int i = 0; i < def.nord; i++) ast_expr_free(def.ord[i]);
         } while (ps->result->success && match(ps, TOK_COMMA));
     }
+    // ROLLUP / CUBE / GROUPING SETS: questo nodo è il primo insieme, gli altri sono riletture della stessa SELECT
+    if (ps->result->success && ngsets > 0 && !ps->gs_nested) {
+        int end = ps->pos;
+        ASTNode* tail = n;
+        for (int k = 1; k < ngsets && ps->result->success; k++) {
+            ps->pos = core_start;
+            ps->gs_nested++;
+            ASTNode* arm = parse_select_core(ps);
+            ps->gs_nested--;
+            if (!arm || !ps->result->success) { free_node(arm); break; }
+            gs_apply(arm, gsets[k]);
+            tail->select_stmt.set_op = SETOP_UNION;
+            tail->select_stmt.set_all = true;
+            tail->select_stmt.set_next = arm;
+            tail = arm;
+        }
+        ps->pos = end;
+        gs_apply(n, gsets[0]);
+    } else if (ps->result->success && ngsets > 0) {
+        // rilettura: solo le espressioni (il chiamante applica il suo insieme)
+    }
+
     return n;
 }
 
@@ -1959,6 +2129,46 @@ static bool peek2_ident(ParserState* ps, const char* w);
 
 // [ON DUPLICATE KEY UPDATE col = espr {, col = espr}]
 static void parse_on_duplicate(ParserState* ps, ASTNode* n) {
+    // PostgreSQL / SQLite: ON CONFLICT [(colonne) | ON CONSTRAINT nome] DO NOTHING | DO UPDATE SET c = espr [, ...] [WHERE cond]
+    // (EXCLUDED.c è il valore proposto): come INSERT IGNORE / ON DUPLICATE KEY UPDATE
+    if (ps->result->success && peek(ps).type == TOK_ON && peek2_ident(ps, "CONFLICT")) {
+        consume(ps); consume(ps);
+        if (match(ps, TOK_LPAREN)) { while (peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) consume(ps); match(ps, TOK_RPAREN); }
+        else if (peek(ps).type == TOK_ON && peek2_ident(ps, "CONSTRAINT")) { consume(ps); consume(ps); consume(ps); }
+        if (!ident_is(ps, "DO")) { parse_fail(ps, "Expected DO NOTHING or DO UPDATE after ON CONFLICT", peek(ps)); return; }
+        consume(ps);
+        if (ident_is(ps, "NOTHING")) { consume(ps); n->insert_stmt.mode = INS_IGNORE; return; }
+        if (!match(ps, TOK_UPDATE) || !match(ps, TOK_SET)) { parse_fail(ps, "Expected DO UPDATE SET", peek(ps)); return; }
+        snprintf(n->insert_stmt.row_alias, sizeof(n->insert_stmt.row_alias), "EXCLUDED");
+        do {
+            if (n->insert_stmt.num_dup >= SV_MAX_SETS) { parse_fail(ps, "Too many columns in ON CONFLICT DO UPDATE", peek(ps)); return; }
+            Token c = consume(ps);
+            if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", c); return; }
+            if (!match(ps, TOK_EQ)) { parse_fail(ps, "Expected '='", peek(ps)); return; }
+            ASTExpr* v = parse_expr(ps);
+            if (!v) return;
+            int k = n->insert_stmt.num_dup++;
+            copy_text(ps, n->insert_stmt.dup_cols[k], sizeof(n->insert_stmt.dup_cols[k]), c.text);
+            n->insert_stmt.dup_exprs[k] = v;
+        } while (match(ps, TOK_COMMA));
+        if (match(ps, TOK_WHERE)) {                       // aggiorna solo se cond: c = CASE WHEN cond THEN nuovo ELSE c END
+            ASTExpr* cond = parse_expr(ps);
+            if (!cond) return;
+            for (int k = 0; k < n->insert_stmt.num_dup; k++) {
+                ASTExpr* cs = new_expr(EXPR_CASE);
+                ASTExpr** a = cs ? calloc(2, sizeof(ASTExpr*)) : NULL;
+                ASTExpr* keep = new_expr(EXPR_COLUMN);
+                if (!a || !keep) { free(cs); free(a); free(keep); ast_expr_free(cond); parse_fail(ps, "Out of memory", peek(ps)); return; }
+                snprintf(keep->col_name, sizeof(keep->col_name), "%s", n->insert_stmt.dup_cols[k]);
+                a[0] = k == n->insert_stmt.num_dup - 1 ? cond : ast_expr_clone(cond);
+                a[1] = n->insert_stmt.dup_exprs[k];
+                cs->args = a; cs->nargs = 2; cs->right = keep;
+                cs->depth = (a[0]->depth > a[1]->depth ? a[0]->depth : a[1]->depth) + 1;
+                n->insert_stmt.dup_exprs[k] = cs;
+            }
+        }
+        return;
+    }
     if (!ps->result->success || peek(ps).type != TOK_ON || !peek2_ident(ps, "DUPLICATE")) return;
     consume(ps);
     consume(ps);
@@ -2737,7 +2947,7 @@ TrigProgram* parser_parse_trigger(TokenList* tokens) {
     ParseResult r;
     memset(&r, 0, sizeof(r));
     r.success = true;
-    ParserState ps = { tokens, 0, &r, 0, "", false };
+    ParserState ps = { tokens, 0, &r, 0, "", false, 0 };
     parse_trigger_rest(&ps, p);
     match(&ps, TOK_SEMICOLON);
     if (r.success && peek(&ps).type != TOK_EOF) parse_fail(&ps, "Unexpected text after the trigger body", peek(&ps));
@@ -2766,7 +2976,7 @@ TrigProgram* parser_parse_procedure(TokenList* tokens, int start) {
     ParseResult r;
     memset(&r, 0, sizeof(r));
     r.success = true;
-    ParserState ps = { tokens, start, &r, 0, "", false };
+    ParserState ps = { tokens, start, &r, 0, "", false, 0 };
     p->for_each_row = false;
     skip_routine_traits(&ps);
     if (match(&ps, TOK_BEGIN)) {
@@ -2845,7 +3055,7 @@ RoutineDef* parser_parse_routine(TokenList* tokens, bool is_function) {
     ParseResult r;
     memset(&r, 0, sizeof(r));
     r.success = true;
-    ParserState ps = { tokens, 0, &r, 0, "", false };
+    ParserState ps = { tokens, 0, &r, 0, "", false, 0 };
     parse_routine_def(&ps, d);
     match(&ps, TOK_SEMICOLON);
     if (r.success && peek(&ps).type != TOK_EOF) parse_fail(&ps, "Unexpected text after the routine body", peek(&ps));
@@ -2878,6 +3088,121 @@ static ASTNode* parse_create_procedure(ParserState* ps, ASTNode* n, bool is_func
     if (!tokens_text(ps, start, ps->pos, n->create_trigger.body, sizeof(n->create_trigger.body)))
         parse_fail(ps, "Routine is too long", peek(ps));
     return n;
+}
+
+// testo SQL dei token [from, to) (malloc'd)
+static char* text_dup(ParserState* ps, int from, int to) {
+    char* buf = malloc(SV_MAX_SQL_LEN);
+    if (!buf) { parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
+    if (!tokens_text(ps, from, to, buf, SV_MAX_SQL_LEN)) { free(buf); parse_fail(ps, "Statement is too long", peek(ps)); return NULL; }
+    char* r = strdup(buf);
+    free(buf);
+    return r;
+}
+
+// testo di un'espressione (analizzata per controllarla e trovarne la fine)
+static char* expr_text(ParserState* ps) {
+    int st = ps->pos;
+    ASTExpr* e = parse_expr(ps);
+    if (!e) return NULL;
+    ast_expr_free(e);
+    return text_dup(ps, st, ps->pos);
+}
+
+static void parse_merge(ParserState* ps, ASTNode* n) {
+    n->type = NODE_MERGE;
+    Token t = table_tok(ps);
+    if (t.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the target table after MERGE INTO", t); return; }
+    copy_text(ps, n->merge.target, sizeof(n->merge.target), t.text);
+    parse_table_alias(ps, n->merge.talias, sizeof(n->merge.talias));
+    if (!n->merge.talias[0]) snprintf(n->merge.talias, sizeof(n->merge.talias), "%s", n->merge.target);
+    if (!ident_is(ps, "USING")) { parse_fail(ps, "Expected USING after the MERGE target", peek(ps)); return; }
+    consume(ps);
+    int st = ps->pos;
+    if (peek(ps).type == TOK_LPAREN) {                    // (subquery) o (VALUES ...)
+        int d = 0;
+        do {
+            Token x = consume(ps);
+            if (x.type == TOK_EOF) { parse_fail(ps, "Expected ')' after the MERGE source", x); return; }
+            if (x.type == TOK_LPAREN) d++; else if (x.type == TOK_RPAREN) d--;
+        } while (d > 0);
+    } else {
+        Token src = table_tok(ps);
+        if (src.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the source table after USING", src); return; }
+    }
+    int src_end = ps->pos;
+    char sa[64] = "";
+    parse_table_alias(ps, sa, sizeof(sa));
+    if (sa[0]) snprintf(n->merge.salias, sizeof(n->merge.salias), "%s", sa);
+    else if (ps->tokens->tokens[st].type == TOK_IDENTIFIER) snprintf(n->merge.salias, sizeof(n->merge.salias), "%s", ps->tokens->tokens[st].text);
+    else { parse_fail(ps, "The MERGE source needs an alias", peek(ps)); return; }
+    int cols_st = ps->pos;                               // alias(colonne)
+    if (sa[0] && peek(ps).type == TOK_LPAREN) { while (peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) consume(ps); match(ps, TOK_RPAREN); }
+    char* src = text_dup(ps, st, src_end);
+    char* cols = ps->pos > cols_st ? text_dup(ps, cols_st, ps->pos) : NULL;
+    if (!src) { free(cols); return; }
+    size_t need = strlen(src) + strlen(sa[0] ? sa : n->merge.salias) + (cols ? strlen(cols) : 0) + 16;
+    n->merge.source = malloc(need);
+    if (n->merge.source) snprintf(n->merge.source, need, "%s AS `%s`%s", src, n->merge.salias, cols ? cols : "");
+    free(src); free(cols);
+    if (!n->merge.source) { parse_fail(ps, "Out of memory", peek(ps)); return; }
+    if (!match(ps, TOK_ON)) { parse_fail(ps, "Expected ON after the MERGE source", peek(ps)); return; }
+    n->merge.on = expr_text(ps);
+    if (!n->merge.on) return;
+    while (ps->result->success && match(ps, TOK_WHEN)) {
+        if (n->merge.nwhen >= 8) { parse_fail(ps, "Too many WHEN clauses (max 8)", peek(ps)); return; }
+        MergeWhen* w = &n->merge.when[n->merge.nwhen++];
+        bool not = match(ps, TOK_NOT);
+        if (!ident_is(ps, "MATCHED")) { parse_fail(ps, "Expected MATCHED after WHEN", peek(ps)); return; }
+        consume(ps);
+        w->matched = !not;
+        if (match(ps, TOK_BY)) {
+            if (ident_is(ps, "TARGET") && not) consume(ps);
+            else { parse_fail(ps, "WHEN NOT MATCHED BY SOURCE is not supported", peek(ps)); return; }
+        }
+        if (match(ps, TOK_AND)) { w->cond = expr_text(ps); if (!w->cond) return; }
+        if (!match(ps, TOK_THEN)) { parse_fail(ps, "Expected THEN", peek(ps)); return; }
+        if (w->matched && match(ps, TOK_UPDATE)) {
+            w->kind = 0;
+            if (!match(ps, TOK_SET)) { parse_fail(ps, "Expected SET after UPDATE", peek(ps)); return; }
+            do {
+                if (w->n >= 32) { parse_fail(ps, "Too many columns (max 32)", peek(ps)); return; }
+                Token c = consume(ps);
+                if (c.type == TOK_IDENTIFIER && match(ps, TOK_DOT)) c = consume(ps);      // t.col
+                if (c.type != TOK_IDENTIFIER || !match(ps, TOK_EQ)) { parse_fail(ps, "Expected column = value", c); return; }
+                copy_text(ps, w->cols[w->n], 64, c.text);
+                w->vals[w->n] = expr_text(ps);
+                if (!w->vals[w->n]) return;
+                w->n++;
+            } while (match(ps, TOK_COMMA));
+        } else if (w->matched && match(ps, TOK_DELETE)) {
+            w->kind = 1;
+        } else if (!w->matched && match(ps, TOK_INSERT)) {
+            w->kind = 2;
+            if (match(ps, TOK_LPAREN)) {
+                w->has_cols = true;
+                int k = 0;
+                do {
+                    Token c = consume(ps);
+                    if (c.type != TOK_IDENTIFIER || k >= 32) { parse_fail(ps, "Expected a column name", c); return; }
+                    copy_text(ps, w->cols[k++], 64, c.text);
+                } while (match(ps, TOK_COMMA));
+                if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')'", peek(ps)); return; }
+            }
+            if (!match(ps, TOK_VALUES) || !match(ps, TOK_LPAREN)) { parse_fail(ps, "Expected VALUES (...) after INSERT", peek(ps)); return; }
+            do {
+                if (w->n >= 32) { parse_fail(ps, "Too many values (max 32)", peek(ps)); return; }
+                w->vals[w->n] = expr_text(ps);
+                if (!w->vals[w->n]) return;
+                w->n++;
+            } while (match(ps, TOK_COMMA));
+            if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')' after the values", peek(ps)); return; }
+        } else {
+            parse_fail(ps, w->matched ? "Expected UPDATE or DELETE after WHEN MATCHED THEN" : "Expected INSERT after WHEN NOT MATCHED THEN", peek(ps));
+            return;
+        }
+    }
+    if (ps->result->success && n->merge.nwhen == 0) parse_fail(ps, "Expected WHEN in MERGE", peek(ps));
 }
 
 // CALL nome(argomenti)
@@ -3312,6 +3637,19 @@ static void parse_column_def(ParserState* ps, ASTNode* n) {
         } else if (ident_is(ps, "AUTO_INCREMENT") || ident_is(ps, "AUTOINCREMENT")) {
             consume(ps);
             cd->auto_increment = true;
+        } else if (ident_is(ps, "GENERATED") && (peek2_ident(ps, "ALWAYS") || next_is(ps, 1, TOK_BY))) {
+            // GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY [(START WITH n INCREMENT BY k)] (standard): AUTO_INCREMENT
+            consume(ps);
+            if (ident_is(ps, "ALWAYS")) consume(ps);
+            else { consume(ps); if (ident_is(ps, "DEFAULT")) consume(ps); }
+            if (!match(ps, TOK_AS) || !ident_is(ps, "IDENTITY")) { parse_fail(ps, "Expected AS IDENTITY (computed columns are not supported)", peek(ps)); return; }
+            consume(ps);
+            if (match(ps, TOK_LPAREN)) { while (peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) consume(ps); match(ps, TOK_RPAREN); }
+            cd->auto_increment = true;
+        } else if (ident_is(ps, "IDENTITY")) {                        // SQL Server: IDENTITY [(1, 1)]
+            consume(ps);
+            if (match(ps, TOK_LPAREN)) { while (peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) consume(ps); match(ps, TOK_RPAREN); }
+            cd->auto_increment = true;
         } else if (ident_is(ps, "COMMENT")) {                         // MySQL: COMMENT 'testo'
             consume(ps);
             Token cm = consume(ps);
@@ -3716,6 +4054,8 @@ static ASTNode* parse_statement(ParserState* ps) {
     if (!n) return NULL;
     Token t = peek(ps);
     if (ident_is(ps, "CALL") && next_is(ps, 1, TOK_IDENTIFIER)) { parse_call_stmt(ps, n); return n; }
+    // MERGE INTO t [AS a] USING s [AS b] ON cond {WHEN [NOT] MATCHED [AND cond] THEN UPDATE SET ... | DELETE | INSERT ...}
+    if (ident_is(ps, "MERGE") && next_is(ps, 1, TOK_INTO)) { consume(ps); consume(ps); parse_merge(ps, n); return n; }
     // TABLE t (standard) = SELECT * FROM t
     if (t.type == TOK_TABLE && next_is(ps, 1, TOK_IDENTIFIER)) {
         consume(ps);
@@ -4212,6 +4552,27 @@ static ASTNode* parse_statement(ParserState* ps) {
             free(n);
             return NULL;
     }
+    // RETURNING espr [[AS] nome], ... | *
+    if (ps->result->success && (n->type == NODE_INSERT || n->type == NODE_UPDATE || n->type == NODE_DELETE) && ident_is(ps, "RETURNING")) {
+        consume(ps);
+        n->returning = calloc(64, sizeof(ASTExpr*));
+        if (!n->returning) { parse_fail(ps, "Out of memory", peek(ps)); return n; }
+        do {
+            if (n->nret >= 64) { parse_fail(ps, "Too many RETURNING expressions (max 64)", peek(ps)); break; }
+            ASTExpr* e;
+            if (peek(ps).type == TOK_STAR) { consume(ps); e = new_expr(EXPR_STAR); }
+            else {
+                e = parse_expr(ps);
+                if (e && (match(ps, TOK_AS) || (peek(ps).type == TOK_IDENTIFIER))) {
+                    Token al = consume(ps);
+                    if (al.type != TOK_IDENTIFIER && al.type != TOK_STRING) parse_fail(ps, "Expected a name after AS", al);
+                    else copy_text(ps, e->alias, sizeof(e->alias), al.text);
+                }
+            }
+            if (!e) break;
+            n->returning[n->nret++] = e;
+        } while (ps->result->success && match(ps, TOK_COMMA));
+    }
     return n;
 }
 
@@ -4224,6 +4585,7 @@ ParseResult* parser_parse(TokenList* tokens) {
     r->statements = NULL;
 
     ParserState ps;
+    memset(&ps, 0, sizeof(ps));
     ps.tokens = tokens;
     ps.pos = 0;
     ps.result = r;
@@ -4261,7 +4623,7 @@ ASTExpr* parser_parse_expr(TokenList* tokens, char* err, size_t errn) {
     ParseResult r;
     memset(&r, 0, sizeof(r));
     r.success = true;
-    ParserState ps = { tokens, 0, &r, 0, "", false };
+    ParserState ps = { tokens, 0, &r, 0, "", false, 0 };
     ASTExpr* e = parse_expr(&ps);
     if (r.success && peek(&ps).type != TOK_EOF) parse_fail(&ps, "Unexpected text after the condition", peek(&ps));
     if (!r.success) { ast_expr_free(e); snprintf(err, errn, "%s", r.error); return NULL; }
@@ -4270,6 +4632,8 @@ ASTExpr* parser_parse_expr(TokenList* tokens, char* err, size_t errn) {
 
 static void free_node(ASTNode* n) {
     if (!n) return;
+    for (int j = 0; j < n->nret; j++) ast_expr_free(n->returning[j]);
+    free(n->returning);
     switch (n->type) {
         case NODE_SELECT:
             for (int j = 0; j < n->select_stmt.num_cols; j++) ast_expr_free(n->select_stmt.columns[j]);
@@ -4314,6 +4678,13 @@ static void free_node(ASTNode* n) {
             break;
         case NODE_CALL:
             for (int j = 0; j < n->call.nargs; j++) ast_expr_free(n->call.args[j]);
+            break;
+        case NODE_MERGE:
+            free(n->merge.source); free(n->merge.on);
+            for (int w = 0; w < n->merge.nwhen; w++) {
+                free(n->merge.when[w].cond);
+                for (int j = 0; j < n->merge.when[w].n; j++) free(n->merge.when[w].vals[j]);
+            }
             break;
         case NODE_SET:
             for (int j = 0; j < n->set_n; j++) ast_expr_free(n->set_exprs[j]);

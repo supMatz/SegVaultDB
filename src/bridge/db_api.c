@@ -969,6 +969,98 @@ static void release_if_autocommit(void) {
     if (!g_db.exec_ctx.tx_id) lk_release_all(lock_owner());
 }
 
+static QueryResult* db_execute_impl(const char* sql);
+
+// '?' fuori da stringhe, identificatori `...` e commenti
+static const char* next_placeholder(const char* p) {
+    for (; *p; p++) {
+        if (*p == '\'' || *p == '"' || *p == '`') {
+            char q = *p;
+            for (p++; *p && *p != q; p++) if (*p == '\\' && q != '`' && p[1]) p++;
+            if (!*p) return NULL;
+            continue;
+        }
+        if (*p == '-' && p[1] == '-') { while (*p && *p != '\n') p++; if (!*p) return NULL; continue; }
+        if (*p == '#') { while (*p && *p != '\n') p++; if (!*p) return NULL; continue; }
+        if (*p == '/' && p[1] == '*') { const char* e = strstr(p + 2, "*/"); if (!e) return NULL; p = e + 1; continue; }
+        if (*p == '?') return p;
+    }
+    return NULL;
+}
+
+// PREPARE nome FROM 'sql' | @var; EXECUTE nome [USING @a, ...]; {DEALLOCATE | DROP} PREPARE nome.
+// NULL se lo statement non è uno di questi
+static QueryResult* prepared_statement(const TokenList* tk) {
+    const Token* t = tk->tokens;
+    int n = tk->count;
+    #define TW(i, w) ((i) < n && t[i].text && t[i].type != TOK_STRING && !strcasecmp(t[i].text, w))
+    if (TW(0, "PREPARE") && n >= 4 && t[1].type == TOK_IDENTIFIER && TW(2, "FROM")) {
+        char* text = NULL;
+        if (t[3].type == TOK_STRING) text = strdup(t[3].text);
+        else if (t[3].type == TOK_IDENTIFIER && t[3].text[0] == '@') {
+            text = executor_uservar_literal(t[3].text + 1);
+            if (text && text[0] == '\'') {                        // il testo della variabile, senza apici
+                TokenList* lt = lexer_tokenize(text);
+                char* raw = lt && lt->count > 0 && lt->tokens[0].type == TOK_STRING ? strdup(lt->tokens[0].text) : NULL;
+                if (lt) lexer_free(lt);
+                free(text);
+                text = raw;
+            } else { free(text); text = NULL; }
+        }
+        if (!text) return result_error("PREPARE needs FROM 'statement' or FROM @variable with the statement text");
+        bool ok = executor_prepare_store(t[1].text, text);
+        free(text);
+        return ok ? result_ok(0) : result_error("Out of memory");
+    }
+    if ((TW(0, "DEALLOCATE") || (t[0].type == TOK_DROP)) && TW(1, "PREPARE") && n >= 3) {
+        if (!executor_prepare_drop(t[2].text)) {
+            char m[200]; snprintf(m, sizeof(m), "Unknown prepared statement handler (%.64s) given to DEALLOCATE PREPARE", t[2].text);
+            return result_error(m);
+        }
+        return result_ok(0);
+    }
+    if (TW(0, "EXECUTE") && n >= 2 && t[1].type == TOK_IDENTIFIER) {
+        const char* sql = executor_prepare_get(t[1].text);
+        if (!sql) { char m[200]; snprintf(m, sizeof(m), "Unknown prepared statement handler (%.64s) given to EXECUTE", t[1].text); return result_error(m); }
+        char* args[64];
+        int na = 0;
+        if (TW(2, "USING")) {
+            for (int i = 3; i < n && t[i].type != TOK_EOF && t[i].type != TOK_SEMICOLON && na < 64; i++) {
+                if (t[i].type == TOK_COMMA) continue;
+                if (t[i].type != TOK_IDENTIFIER || t[i].text[0] != '@') { for (int k = 0; k < na; k++) free(args[k]); return result_error("EXECUTE ... USING takes @variables"); }
+                args[na++] = executor_uservar_literal(t[i].text + 1);
+            }
+        }
+        int need = 0;
+        for (const char* p = next_placeholder(sql); p; p = next_placeholder(p + 1)) need++;
+        if (need != na) {
+            for (int k = 0; k < na; k++) free(args[k]);
+            return result_error("Incorrect arguments to EXECUTE: the number of ? and of USING variables differ");
+        }
+        size_t len = strlen(sql) + 1;
+        for (int k = 0; k < na; k++) len += args[k] ? strlen(args[k]) : 4;
+        char* full = malloc(len);
+        if (!full) { for (int k = 0; k < na; k++) free(args[k]); return result_error("Out of memory"); }
+        size_t o = 0;
+        const char* from = sql;
+        int k = 0;
+        for (const char* p = next_placeholder(sql); p; p = next_placeholder(p + 1)) {
+            memcpy(full + o, from, (size_t)(p - from)); o += (size_t)(p - from);
+            const char* v = args[k] ? args[k] : "NULL";
+            memcpy(full + o, v, strlen(v)); o += strlen(v);
+            from = p + 1;
+            k++;
+        }
+        strcpy(full + o, from);
+        for (int i = 0; i < na; i++) free(args[i]);
+        QueryResult* r = db_execute_impl(full);
+        free(full);
+        return r;
+    }
+    #undef TW
+    return NULL;
+}
+
 static QueryResult* db_execute_impl(const char* sql) {
     if (!g_db.initialized) return result_error("DB non inizializzato");
     if (!sql || !sql[0])   return result_error("Query vuota");
@@ -977,6 +1069,8 @@ static QueryResult* db_execute_impl(const char* sql) {
 
     // Pipeline: tokenize → parse → execute
     TokenList*   tokens = lexer_tokenize(sql);
+    QueryResult* prep = tokens ? prepared_statement(tokens) : NULL;
+    if (prep) { lexer_free(tokens); prep->exec_time_ms = get_time_ms() - t_start; return prep; }
     void* admin = NULL;               // CREATE USER, GRANT, SHOW GRANTS, ...: gestiti da auth.c
     if (tokens && auth_statement(tokens, g_session_user, cur_db_name(), &admin)) {
         lexer_free(tokens);
@@ -1024,6 +1118,15 @@ static QueryResult** db_execute_multi_impl(const char* sql, int* out_count) {
     double t_start = get_time_ms();
 
     TokenList*   tokens = lexer_tokenize(sql);
+    QueryResult* prep = tokens ? prepared_statement(tokens) : NULL;    // PREPARE / EXECUTE / DEALLOCATE (uno solo)
+    if (prep) {
+        lexer_free(tokens);
+        QueryResult** one = SV_ALLOC_N(QueryResult*, 1);
+        if (!one) { db_result_free(prep); return NULL; }
+        one[0] = prep;
+        *out_count = 1;
+        return one;
+    }
     ParseResult* parsed = parser_parse(tokens);
 
     if (!parsed->success || parsed->count == 0) {

@@ -18,10 +18,22 @@ typedef enum {
     NODE_BACKUP,
     NODE_TABLE_MAINT,  // CHECK / ANALYZE / OPTIMIZE / REPAIR TABLE t [, ...]       // BACKUP [DATABASE] TO 'cartella'
     NODE_VACUUM,       // recupera le pagine di overflow non più usate
+    NODE_MERGE,        // MERGE INTO t USING s ON ... WHEN [NOT] MATCHED THEN ...
     NODE_SET,          // SET @x = ..., SET NAMES ..., SET FOREIGN_KEY_CHECKS = 0, ... (variabili di MySQL)
 } StmtType;
 
 typedef enum { JOIN_INNER, JOIN_LEFT, JOIN_RIGHT, JOIN_CROSS, JOIN_FULL } JoinType;
+
+// clausola WHEN di MERGE (testi SQL)
+typedef struct {
+    int    kind;                // 0 UPDATE, 1 DELETE, 2 INSERT
+    bool   matched;
+    char*  cond;                // AND ... (NULL = nessuna)
+    char   cols[32][64];        // UPDATE SET / INSERT (colonne)
+    char*  vals[32];
+    int    n;
+    bool   has_cols;
+} MergeWhen;
 
 typedef enum { EXPR_COLUMN, EXPR_INT, EXPR_FLOAT, EXPR_STRING, EXPR_STAR,
                EXPR_BINARY, EXPR_UNARY, EXPR_NULL,
@@ -190,6 +202,9 @@ typedef struct ASTNode {
     char     qual_db[64];      // database dei nomi qualificati (shop.prodotto); "" = quello corrente
     bool     qual_mixed;       // anche tabelle senza database: valide solo se il corrente è qual_db
     int      set_fk_checks;    // NODE_SET: FOREIGN_KEY_CHECKS = 0 / 1 (-1 = non nominato)
+    // INSERT / UPDATE / DELETE ... RETURNING espr [AS nome], ... | * (PostgreSQL)
+    struct ASTExpr** returning;
+    int      nret;
     // NODE_SET: assegnazioni di variabili di sessione (SET @a = 1, @b := 2)
     char   (*set_names)[64];
     struct ASTExpr** set_exprs;
@@ -347,6 +362,14 @@ typedef struct ASTNode {
             char       name[64];
             bool       is_function;     // DROP FUNCTION (NODE_DROP_PROCEDURE)
         } drop_trigger;
+        // MERGE: le parti come testo SQL (eseguite come INSERT / UPDATE / DELETE)
+        struct {
+            char       target[64], talias[64], salias[64];
+            char*      source;              // tabella o (subquery), con " AS alias[(colonne)]"
+            char*      on;
+            MergeWhen  when[8];
+            int        nwhen;
+        } merge;
         struct {
             char       name[64];
             ASTExpr*   args[32];

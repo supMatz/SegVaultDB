@@ -567,8 +567,12 @@ CREATE TABLE [IF NOT EXISTS] esame (
     PRIMARY KEY (studente, corso),                          -- chiave composta
     CONSTRAINT lode_solo_30 CHECK (lode = 0 OR voto = 30)   -- vincolo di tupla con nome
 );
-DROP TABLE [IF EXISTS] esame;
+DROP TABLE [IF EXISTS] esame [, altra ...];
 TRUNCATE TABLE esame;
+CREATE TABLE promossi AS SELECT studente, voto FROM esame WHERE voto >= 18;   -- colonne e righe del risultato
+CREATE TABLE esame_copia LIKE esame;                                          -- stessa struttura, vuota
+RENAME TABLE esame_copia TO esame_2024;
+CREATE TEMPORARY TABLE t (...);   -- in una procedura: eliminata alla fine della CALL
 
 ALTER TABLE esame RENAME TO esami;
 ALTER TABLE studente ADD [COLUMN] email VARCHAR(60) DEFAULT 'n/d';      -- le righe esistenti ricevono il DEFAULT
@@ -605,10 +609,27 @@ INSERT INTO studente VALUES (1, 'Anna', 'Milano'), (2, 'Bruno', 'Roma');
 INSERT INTO studente (matricola, nome) VALUES (3, 'Carla');
 INSERT INTO archivio SELECT * FROM esame WHERE data < '2020-01-01';
 
+INSERT INTO utente (email, nome) VALUES ('a@x.it', 'Anna')
+    ON CONFLICT (email) DO UPDATE SET nome = EXCLUDED.nome         -- PostgreSQL; anche DO NOTHING
+    RETURNING id, nome;                                              -- le righe scritte (anche UPDATE e DELETE)
+INSERT INTO utente (email, nome) VALUES ('a@x.it', 'Anna') ON DUPLICATE KEY UPDATE nome = VALUES(nome);   -- MySQL
+
 UPDATE esame SET voto = voto + 1, lode = 0 WHERE corso = 'BD1' AND voto < 30;
 DELETE FROM esame WHERE studente NOT IN (SELECT matricola FROM studente);
 -- subquery correlata: gli esami sotto la media del proprio corso
 DELETE FROM esame WHERE voto < (SELECT AVG(e2.voto) FROM esame e2 WHERE e2.corso = esame.corso);
+
+-- MERGE (standard SQL): aggiorna, cancella o inserisce secondo la corrispondenza con un'altra tabella
+MERGE INTO magazzino AS m USING arrivi AS a ON m.codice = a.codice
+WHEN MATCHED AND a.qta = 0 THEN DELETE
+WHEN MATCHED THEN UPDATE SET qta = m.qta + a.qta
+WHEN NOT MATCHED THEN INSERT (codice, qta) VALUES (a.codice, a.qta);
+
+-- istruzioni preparate e variabili di sessione
+SET @min = 24;
+PREPARE bravi FROM 'SELECT studente FROM esame WHERE voto >= ?';
+EXECUTE bravi USING @min;          DEALLOCATE PREPARE bravi;
+SELECT COUNT(*) INTO @n FROM esame;   SELECT @n, @n := @n + 1, @@version;
 ```
 
 ### Interrogazioni
@@ -618,26 +639,27 @@ SELECT [DISTINCT] espressioni [AS alias]
 FROM t1 [alias] { , t2 | [NATURAL] [INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER] | CROSS] JOIN t2 [alias]
                   [ON condizione | USING (colonne)] }
 WHERE condizione
-GROUP BY espressioni HAVING condizione
-ORDER BY espressioni [ASC | DESC]
-LIMIT n [OFFSET m];
+GROUP BY espressioni [WITH ROLLUP] | ROLLUP (...) | CUBE (...) | GROUPING SETS ((...), ...)  HAVING condizione
+WINDOW w AS (PARTITION BY ... ORDER BY ...)
+ORDER BY espressioni [ASC | DESC] [NULLS FIRST | NULLS LAST]
+LIMIT n [OFFSET m]   |   OFFSET m ROWS FETCH FIRST n ROWS ONLY;
 ```
 
 | Costrutto | Esempio |
 |---|---|
-| Operatori | `+ - * / %`, `= <> != < > <= >=`, `AND OR NOT` (logica a tre valori), `IS [NOT] NULL`, `[NOT] LIKE 'a%_'` (senza distinzione maiuscole/minuscole; `ESCAPE '!'` rende letterali `%` e `_`: `LIKE '100!%' ESCAPE '!'`), `[NOT] BETWEEN`, `[NOT] IN (lista)`; `/` fra interi dà un decimale (`7 / 2` = 3.5, come MySQL), la divisione per zero dà `NULL` |
-| Aggregati | `COUNT(*)`, `COUNT([DISTINCT] x)`, `SUM`, `AVG`, `MIN`, `MAX` (anche su espressioni) |
+| Operatori | `+ - * / %`, `DIV`, `= <> != < > <= >=`, `<=>` (uguale anche fra NULL), `AND OR NOT XOR`, `&& \|\| !` (in modalità MySQL `\|\|` è OR, altrimenti concatena), bit a bit `& \| ^ ~ << >>`, `IS [NOT] TRUE / FALSE / UNKNOWN`, `IS [NOT] DISTINCT FROM`, valori di riga `(a, b) = (1, 2)` e `(a, b) IN ((1, 2), (3, 4))`, `AND OR NOT` (logica a tre valori), `IS [NOT] NULL`, `[NOT] LIKE 'a%_'` (senza distinzione maiuscole/minuscole; `ESCAPE '!'` rende letterali `%` e `_`: `LIKE '100!%' ESCAPE '!'`), `[NOT] BETWEEN`, `[NOT] IN (lista)`; `/` fra interi dà un decimale (`7 / 2` = 3.5, come MySQL), la divisione per zero dà `NULL` |
+| Aggregati | `COUNT(*)`, `COUNT([DISTINCT] x)`, `SUM`, `AVG`, `MIN`, `MAX` (anche su espressioni), `GROUP_CONCAT(x ORDER BY y SEPARATOR ', ')`, `STRING_AGG(x, ', ' ORDER BY y)`, `LISTAGG(x, ', ') WITHIN GROUP (ORDER BY y)`, `STDDEV` / `STDDEV_POP` / `STDDEV_SAMP` / `VARIANCE` / `VAR_POP` / `VAR_SAMP`, `BIT_AND` / `BIT_OR` / `BIT_XOR`, `BOOL_AND` / `BOOL_OR` / `EVERY`, `JSON_ARRAYAGG`, `JSON_OBJECTAGG`; `COUNT(*) FILTER (WHERE ...)`; con `ROLLUP` / `CUBE` / `GROUPING SETS` i subtotali e `GROUPING(x)` |
 | Subquery | `x IN (SELECT ...)`, `NOT IN`, `EXISTS`, `NOT EXISTS`, `x > ALL (SELECT ...)`, `x = ANY / SOME (...)`, subquery scalari `(SELECT MAX(voto) FROM esame)` in `SELECT`, `WHERE`, `HAVING`, `SET`; correlate a qualunque profondità |
 | Insiemi | `UNION [ALL]`, `INTERSECT`, `EXCEPT` (`INTERSECT` lega più degli altri), `ORDER BY` / `LIMIT` sul risultato |
-| Tabelle derivate | `FROM (SELECT ...) AS t`, `JOIN (SELECT ...) AS t ON ...` |
+| Tabelle derivate | `FROM (SELECT ...) AS t`, `JOIN (SELECT ...) AS t ON ...`, nomi delle colonne `AS t(a, b)`, righe costanti `(VALUES (1, 'a'), (2, 'b')) AS v(n, s)`; `VALUES (...), (...)` e `TABLE t` come istruzioni; gli hint `USE / FORCE / IGNORE INDEX (...)` sono accettati |
 | `WITH` | `WITH medie (studente, media) AS (SELECT ...), migliori AS (SELECT ... FROM medie) SELECT ...` |
 | `WITH RECURSIVE` | `WITH RECURSIVE sotto AS (SELECT id FROM persona WHERE id = 1 UNION SELECT p.id FROM persona p JOIN sotto s ON p.capo = s.id) SELECT ...` — con `UNION` i cicli terminano; una ricorsione senza fine viene fermata dopo 1000 passi |
-| Funzioni finestra | `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `NTILE(n)`, `LAG(x [, k [, def]])`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `COUNT/SUM/AVG/MIN/MAX(...)` con `OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS \| RANGE BETWEEN ... AND ...])`: frame con `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`, `UNBOUNDED FOLLOWING` |
+| Funzioni finestra | `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `PERCENT_RANK()`, `CUME_DIST()`, `NTILE(n)`, `LAG(x [, k [, def]])`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE(x, n)`, finestre con nome (`OVER w` ... `WINDOW w AS (...)`), `COUNT/SUM/AVG/MIN/MAX(...)` con `OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS \| RANGE BETWEEN ... AND ...])`: frame con `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`, `UNBOUNDED FOLLOWING` |
 | `CASE` | `CASE WHEN voto >= 28 THEN 'alto' ELSE 'basso' END`, `CASE cfu WHEN 6 THEN ... END` |
-| Funzioni | `UPPER`, `LOWER`, `LENGTH`, `CHAR_LENGTH`, `TRIM`, `CONCAT`, `CONCAT_WS`, `SUBSTRING`, `LEFT`, `RIGHT`, `REPLACE`, `REVERSE`, `ABS`, `ROUND`, `FLOOR`, `CEIL`, `MOD`, `POWER`, `SQRT`, `SIGN`, `COALESCE`, `IFNULL`, `NULLIF`, `IF`, `NOW`, `CURDATE`, `YEAR`, `MONTH`, `DAY` |
+| Funzioni | Testo: `UPPER`, `LOWER`, `INITCAP`, `LENGTH`, `CHAR_LENGTH`, `TRIM`, `CONCAT`, `CONCAT_WS`, `SUBSTRING`, `LEFT`, `RIGHT`, `REPLACE`, `REVERSE`, `LPAD`, `RPAD`, `LOCATE`, `INSTR`, `SPLIT_PART`, `SUBSTRING_INDEX`, `TRANSLATE`, `OVERLAY(s PLACING r FROM n FOR m)`, `STARTS_WITH`, `SOUNDEX`, `REGEXP_LIKE` / `REPLACE` / `SUBSTR` / `INSTR` / `COUNT`, `CHR`, `ASCII`, `HEX`, `MD5`, `SHA2`, `TO_BASE64`, ...; numeri: `ABS`, `ROUND`, `TRUNCATE`, `FLOOR`, `CEIL`, `MOD`, `POWER`, `SQRT`, `EXP`, `LN`, `LOG`, `SIN` ... `ATAN2`, `CONV`, `BIN`, `RAND`, `GREATEST`, `LEAST`; date: `NOW`, `CURDATE`, `DATE_FORMAT`, `STR_TO_DATE`, `DATE_ADD` / `DATE_SUB` / `+ INTERVAL n DAY`, `DATEDIFF`, `TIMESTAMPDIFF`, `EXTRACT`, `DATE_PART`, `DATE_TRUNC`, `LAST_DAY`, `DAYNAME`, `WEEK`, ...; altro: `COALESCE`, `IFNULL`, `NULLIF`, `IF`, `CAST`, `UUID`, `MAKE_SET`, `EXPORT_SET` |
 | Full-text | `WHERE MATCH(titolo, testo) AGAINST('basi dati')` con punteggio di pertinenza (`ORDER BY MATCH(...) AGAINST(...) DESC`); `IN BOOLEAN MODE`: `+obbligatoria -esclusa prefis* "frase esatta"`. Senza distinzione maiuscole/minuscole, anche con lettere accentate; senza indice (legge ogni riga) |
 | Nomi qualificati | `SELECT * FROM shop.prodotto`, `INSERT INTO shop.prodotto ...`, `DROP TABLE shop.vecchia`, `shop.prodotto.nome`: l'istruzione usa quel database senza cambiare quello corrente (`USE`); per ora un solo database per istruzione |
-| JSON | Su colonne di testo, come MySQL: `JSON_VALID(doc)`, `JSON_EXTRACT(doc, '$.cliente.nome')` (percorsi `$`, `.chiave`, `."con spazi"`, `[n]`; `NULL` se il percorso manca), `doc->'$.tag[0]'` (= `JSON_EXTRACT`), `doc->>'$.nome'` (senza virgolette, = `JSON_UNQUOTE(JSON_EXTRACT(...))`), `JSON_UNQUOTE`, `JSON_TYPE`, `JSON_LENGTH(doc [, percorso])`, `JSON_OBJECT('a', 1, 'b', x)`, `JSON_ARRAY(1, 'z', NULL)`. Esempio: `SELECT id FROM ordine WHERE dati->>'$.stato' = 'pagato'` |
+| JSON | Su colonne di testo, come MySQL: `JSON_VALID(doc)`, `JSON_EXTRACT(doc, '$.cliente.nome')` (percorsi `$`, `.chiave`, `."con spazi"`, `[n]`; `NULL` se il percorso manca), `doc->'$.tag[0]'` (= `JSON_EXTRACT`), `doc->>'$.nome'` (senza virgolette, = `JSON_UNQUOTE(JSON_EXTRACT(...))`), `JSON_UNQUOTE`, `JSON_TYPE`, `JSON_LENGTH(doc [, percorso])`, `JSON_OBJECT('a', 1, 'b', x)`, `JSON_ARRAY(1, 'z', NULL)`, modifiche `JSON_SET` / `JSON_INSERT` / `JSON_REPLACE` / `JSON_REMOVE` / `JSON_ARRAY_APPEND` / `JSON_MERGE_PATCH`, ricerche `JSON_CONTAINS` / `JSON_CONTAINS_PATH` / `JSON_SEARCH` / `JSON_KEYS`, `JSON_DEPTH`, `JSON_PRETTY`, `JSON_QUOTE`. Esempio: `SELECT id FROM ordine WHERE dati->>'$.stato' = 'pagato'` |
 
 Un alias nasconde il nome della tabella, come in SQL standard: in `... FROM esame e2 WHERE e2.corso = esame.corso` il secondo `esame` è la query esterna.
 Con `SELECT DISTINCT`, `ORDER BY` può usare solo ciò che la query restituisce (una colonna, un alias, una posizione o la stessa espressione), come in MySQL e PostgreSQL: altrimenti l'ordine non sarebbe definito e la query viene rifiutata.
@@ -696,26 +718,45 @@ DROP TRIGGER [IF EXISTS] nome;   SHOW TRIGGERS [FROM tabella];
 
 `NEW` e `OLD` si usano nel corpo come le colonne di una query esterna (`WHERE id = NEW.conto`). Un trigger può attivarne altri fino a 16 livelli; se fallisce, l'intero statement che lo ha attivato viene annullato. Scattano anche per le righe modificate dalle azioni `CASCADE` / `SET NULL` / `SET DEFAULT` delle chiavi esterne.
 
-### Stored procedure
+### Stored procedure e funzioni
 
 ```sql
-CREATE PROCEDURE bonifico(IN da INT, a INT, importo INT)
+CREATE PROCEDURE bonifico(IN da INT, IN a INT, IN importo DECIMAL(8,2), OUT esito VARCHAR(40))
 BEGIN
+    DECLARE saldo_da DECIMAL(8,2);
+    DECLARE EXIT HANDLER FOR NOT FOUND SET esito = 'conto inesistente';
     IF importo <= 0 THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'importo non valido'; END IF;
+    SELECT saldo INTO saldo_da FROM conto WHERE id = da;
     UPDATE conto SET saldo = saldo - importo WHERE id = da;
     UPDATE conto SET saldo = saldo + importo WHERE id = a;
-    SELECT id, saldo FROM conto;
+    SET esito = 'ok';
 END;
+CALL bonifico(1, 2, 30, @esito);   SELECT @esito;
 
-CALL bonifico(1, 2, 30);         -- restituisce il risultato dell'ultima SELECT
-DROP PROCEDURE [IF EXISTS] bonifico;
+CREATE FUNCTION fattoriale(n INT) RETURNS BIGINT DETERMINISTIC
+BEGIN
+    DECLARE r BIGINT DEFAULT 1;
+    WHILE n > 1 DO SET r = r * n; SET n = n - 1; END WHILE;
+    RETURN r;
+END;
+SELECT nome, fattoriale(cfu) FROM corso WHERE fattoriale(cfu) > 100;
+
+DROP PROCEDURE [IF EXISTS] bonifico;   DROP FUNCTION [IF EXISTS] fattoriale;
+SHOW PROCEDURE STATUS;   SHOW FUNCTION STATUS;   SHOW CREATE PROCEDURE bonifico;
 ```
 
-Il corpo ha le stesse istruzioni dei trigger (`INSERT`, `UPDATE`, `DELETE`, `SELECT`, `CALL`, `IF`,
-`SIGNAL`); i parametri sono solo `IN` (i valori si restituiscono con una `SELECT`). Una `CALL` è
-atomica: se un'istruzione fallisce (un vincolo, un `SIGNAL`) tutte le modifiche della procedura
-vengono annullate. Con gli utenti del server ogni istruzione è controllata con i permessi di chi
-chiama la procedura. Le procedure compaiono nell'albero a sinistra e nel *Database dump*.
+Nel corpo (anche dei trigger): `DECLARE` di variabili con tipo e `DEFAULT`, `SET`, `SELECT ... INTO`,
+blocchi `BEGIN ... END` annidati con etichette, `IF` / `ELSEIF`, `CASE ... END CASE`, cicli `WHILE`,
+`REPEAT ... UNTIL`, `LOOP` con `LEAVE` e `ITERATE`, cursori (`DECLARE c CURSOR FOR SELECT ...`, `OPEN`,
+`FETCH ... INTO`, `CLOSE`), handler (`DECLARE CONTINUE | EXIT HANDLER FOR NOT FOUND | SQLEXCEPTION |
+SQLSTATE '...'`), `SIGNAL` / `RESIGNAL`, `RETURN` (funzioni), `CALL`, `INSERT` / `UPDATE` / `DELETE`,
+`CREATE TEMPORARY TABLE`. I parametri sono `IN`, `OUT` o `INOUT` (verso `@variabili` o variabili della
+routine che chiama). Una `CALL` è atomica: se un'istruzione fallisce senza un handler, tutte le
+modifiche della procedura vengono annullate; il risultato è quello dell'ultima `SELECT`. Una funzione
+si usa in qualunque espressione; le variabili della routine valgono come costanti per l'ottimizzatore
+(indici). Con gli utenti del server ogni istruzione è controllata con i permessi di chi chiama. Le
+routine compaiono nell'albero a sinistra e nel *Database dump*; i dump di MySQL con procedure e
+funzioni (Sakila) si importano per intero.
 
 ### Tipi di dato
 
@@ -748,7 +789,7 @@ chiama la procedura. Le procedure compaiono nell'albero a sinistra e nel *Databa
 
 ### Non supportato
 
-Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), funzioni definite dall'utente e parametri `OUT` delle procedure, tabelle di database diversi nella stessa istruzione (`shop.prodotto JOIN uni.esame`), scritture in parallelo: le richieste di sola lettura girano insieme, quelle che scrivono una alla volta, e una sola sessione per volta può avere una transazione aperta (vedi [Roadmap](#roadmap)).
+Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), `LATERAL`, `JSON_TABLE`, sequenze (`CREATE SEQUENCE`; si usano `AUTO_INCREMENT`, `SERIAL` o `GENERATED ... AS IDENTITY`), eventi pianificati (`CREATE EVENT`), tabelle di database diversi nella stessa istruzione (`shop.prodotto JOIN uni.esame`), colonne calcolate (`GENERATED ALWAYS AS (espressione)`).
 
 ---
 

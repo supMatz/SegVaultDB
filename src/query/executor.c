@@ -963,6 +963,22 @@ static CellType cell_type_of(DataType t) {
 // ═════════════════════════════════════════════════════════════════
 
 #define SUBK_UDF 100      // EXPR_FUNC con subkind SUBK_UDF: funzione definita dall'utente (CREATE FUNCTION)
+
+// righe scritte da INSERT / UPDATE / DELETE ... RETURNING (solo quelle dello statement, non dei trigger)
+typedef struct { bool on; int depth; char table[SV_MAX_NAME_LEN]; Tuple** v; int n, cap; } RetCapture;
+static _Thread_local RetCapture g_cap;
+static Tuple* tuple_clone(const Tuple* t, const TableSchema* ts);
+static void cap_add(const ExecCtx* ctx, const TableSchema* ts, const Tuple* t) {
+    if (!g_cap.on || ctx->trig_depth != g_cap.depth || strcasecmp(ts->name, g_cap.table) || !t) return;
+    if (g_cap.n == g_cap.cap) {
+        int nc = g_cap.cap ? g_cap.cap * 2 : 16;
+        Tuple** nv = realloc(g_cap.v, sizeof(Tuple*) * (size_t)nc);
+        if (!nv) return;
+        g_cap.v = nv; g_cap.cap = nc;
+    }
+    Tuple* c = tuple_clone(t, ts);
+    if (c) g_cap.v[g_cap.n++] = c;
+}
 static Tuple* rt_scope_row(void* routine, int s, const TableSchema** ts);   // riga s (NEW / OLD / variabili) della routine
 static _Thread_local int64_t g_last_insert_id;
 #define EV_STR_MAX 511   // come Cell.value: un testo più lungo non entrerebbe nel risultato
@@ -2001,7 +2017,8 @@ static void ev_set_text(EvalCtx* c, EvalVal* out, const char* s, size_t n) {
 // Ogni sessione ha le sue (db_api le scambia con executor_set_uservars); i nomi non distinguono
 // maiuscole e minuscole, come in MySQL. Una variabile mai assegnata vale NULL.
 typedef struct { char name[64]; bool null, is_num, is_int; int64_t inum; double num; char* text; } UVar;   // text: anche dei DECIMAL
-struct UserVars { UVar* v; int n, cap; };
+typedef struct { char name[64]; char* sql; } UPrep;
+struct UserVars { UVar* v; int n, cap; UPrep* prep; int nprep; };
 static UserVars* g_uvars;
 
 UserVars* executor_uservars(void) { return g_uvars; }
@@ -2010,6 +2027,8 @@ void executor_uservars_free(UserVars* v) {
     if (!v) return;
     for (int i = 0; i < v->n; i++) free(v->v[i].text);
     free(v->v);
+    for (int i = 0; i < v->nprep; i++) free(v->prep[i].sql);
+    free(v->prep);
     free(v);
     if (g_uvars == v) g_uvars = NULL;
 }
@@ -2049,6 +2068,51 @@ static void uservar_set(const char* name, const EvalVal* v) {
     u->is_int = u->is_num && v->is_int;
     u->inum = v->inum;
     u->num = v->num;
+}
+
+// PREPARE nome FROM '...': testo delle istruzioni preparate della sessione
+bool executor_prepare_store(const char* name, const char* sql) {
+    if (!g_uvars && !(g_uvars = calloc(1, sizeof(UserVars)))) return false;
+    char* dup = strdup(sql);
+    if (!dup) return false;
+    for (int i = 0; i < g_uvars->nprep; i++)
+        if (!strcasecmp(g_uvars->prep[i].name, name)) { free(g_uvars->prep[i].sql); g_uvars->prep[i].sql = dup; return true; }
+    UPrep* np = realloc(g_uvars->prep, sizeof(UPrep) * (size_t)(g_uvars->nprep + 1));
+    if (!np) { free(dup); return false; }
+    g_uvars->prep = np;
+    snprintf(np[g_uvars->nprep].name, sizeof(np[0].name), "%s", name);
+    np[g_uvars->nprep++].sql = dup;
+    return true;
+}
+const char* executor_prepare_get(const char* name) {
+    for (int i = 0; g_uvars && i < g_uvars->nprep; i++) if (!strcasecmp(g_uvars->prep[i].name, name)) return g_uvars->prep[i].sql;
+    return NULL;
+}
+bool executor_prepare_drop(const char* name) {
+    for (int i = 0; g_uvars && i < g_uvars->nprep; i++)
+        if (!strcasecmp(g_uvars->prep[i].name, name)) {
+            free(g_uvars->prep[i].sql);
+            g_uvars->prep[i] = g_uvars->prep[--g_uvars->nprep];
+            return true;
+        }
+    return false;
+}
+// valore di @nome come letterale SQL (NULL, numero, 'testo' con apici e backslash raddoppiati); malloc'd
+char* executor_uservar_literal(const char* name) {
+    UVar* u = uservar_find(name, false);
+    if (!u || u->null) return strdup("NULL");
+    char b[64];
+    if (u->is_num && !u->text) { if (u->is_int) snprintf(b, sizeof(b), "%lld", (long long)u->inum); else snprintf(b, sizeof(b), "%.17g", u->num); return strdup(b); }
+    if (u->is_num) return strdup(u->text);
+    const char* t = u->text ? u->text : "";
+    char* o = malloc(strlen(t) * 2 + 3);
+    if (!o) return NULL;
+    size_t k = 0;
+    o[k++] = '\'';
+    for (; *t; t++) { if (*t == '\'' || *t == '\\') o[k++] = *t; o[k++] = *t; }
+    o[k++] = '\'';
+    o[k] = '\0';
+    return o;
 }
 
 static void uservar_get(const char* name, EvalVal* out) {
@@ -3472,7 +3536,12 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             }
             if (!strcmp(f, "JSON_DEPTH")) { ev_int(out, sj_depth(v)); free(docc); return true; }
             if (!strcmp(f, "JSON_PRETTY")) r = sj_pretty(docc);
-            else { char* tmp = strndup(v, vl); r = tmp ? sj_keys(tmp, vl) : NULL; free(tmp); }
+            else {
+                char* tmp = malloc(vl + 1);                       // (strndup non c'è su MinGW)
+                if (tmp) { memcpy(tmp, v, vl); tmp[vl] = '\0'; }
+                r = tmp ? sj_keys(tmp, vl) : NULL;
+                free(tmp);
+            }
         } else if (!strcmp(f, "JSON_CONTAINS")) {
             EvalVal cv; eval_expr(e->args[1], c, &cv);
             if (cv.null) { free(docc); ev_null(out); return true; }
@@ -9478,6 +9547,7 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
         ts->num_pages = hf->num_pages;
         free(hf);
     }
+    for (int r = 0; r < done; r++) cap_add(ctx, ts, tuples[r]);   // RETURNING
     const char* tfail = NULL;
     for (int r = 0; r < done && !tfail; r++)                      // trigger AFTER
         tfail = fire_triggers(ctx, db, ts, "INSERT", false, true, NULL, tuples[r], NULL, 0, msg, sizeof(msg));
@@ -9640,6 +9710,7 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
                 fail = fire_triggers(ctx, db, ts, "UPDATE", false, true, cs.v[i].old, cs.v[i].nt, set_ci, n->update_stmt.num_sets, msg, sizeof(msg));
         if (!fail) fail = fire_cascaded(ctx, db, &cs, false, msg, sizeof(msg));
         if (!fail) fail = fire_triggers(ctx, db, ts, "UPDATE", false, false, NULL, NULL, set_ci, n->update_stmt.num_sets, msg, sizeof(msg));
+        for (int i = 0; i < cs.n && !fail; i++) if (cs.v[i].direct && cs.v[i].ts == ts) cap_add(ctx, ts, cs.v[i].nt);   // RETURNING
         cs_free(&cs);
     }
     for (int i = 0; i < nm; i++) if (nt[i]) tuple_free(nt[i]);
@@ -9697,6 +9768,7 @@ static QueryResult* exec_delete(ExecCtx* ctx, ASTNode* n) {
         if (cs.v[i].direct) fail = fire_triggers(ctx, db, ts, "DELETE", false, true, cs.v[i].old, NULL, NULL, 0, msg, sizeof(msg));
     if (!fail) fail = fire_cascaded(ctx, db, &cs, false, msg, sizeof(msg));
     if (!fail) fail = fire_triggers(ctx, db, ts, "DELETE", false, false, NULL, NULL, NULL, 0, msg, sizeof(msg));
+    for (int i = 0; i < cs.n && !fail; i++) if (cs.v[i].direct && cs.v[i].ts == ts) cap_add(ctx, ts, cs.v[i].old);   // RETURNING
     cs_free(&cs);
     free(idx);
     source_free(&s);
@@ -10798,10 +10870,236 @@ QueryResult* executor_set_session_vars(ExecCtx* ctx, ASTNode* stmt) {
     return result_ok_msg(0);
 }
 
+static QueryResult* executor_run_impl(ExecCtx* ctx, ASTNode* stmt);
+static QueryResult* exec_merge(ExecCtx* ctx, ASTNode* n);
+
+// testo SQL di un solo statement, eseguito qui (MERGE)
+static QueryResult* run_sql_text(ExecCtx* ctx, const char* sql) {
+    TokenList* tk = lexer_tokenize(sql);
+    ParseResult* pr = tk ? parser_parse(tk) : NULL;
+    QueryResult* r;
+    if (!pr || !pr->success || pr->count != 1) {
+        char m[400];
+        snprintf(m, sizeof(m), "MERGE: %.300s", pr ? pr->error : "out of memory");
+        r = result_error_msg(m);
+    } else r = executor_run(ctx, pr->statements[0]);
+    parse_result_free(pr);
+    lexer_free(tk);
+    return r;
+}
+
+// valore come letterale SQL (apici e backslash raddoppiati)
+static void sql_literal(TextBuf* tb, const Cell* c) {
+    if (c->is_null) { tb_put(tb, "NULL", 4); return; }
+    tb_put(tb, "'", 1);
+    for (const char* p = c->value ? c->value : ""; *p; p++) {
+        if (*p == '\'' || *p == '\\') tb_put(tb, p, 1);
+        tb_put(tb, p, 1);
+    }
+    tb_put(tb, "'", 1);
+}
+
+// MERGE INTO t USING s ON cond WHEN ...: le righe di s senza corrispondenza si calcolano prima (sul contenuto
+// iniziale di t), poi UPDATE / DELETE delle righe con corrispondenza, poi gli INSERT
+static QueryResult* exec_merge(ExecCtx* ctx, ASTNode* n) {
+    Database* db = catalog_current_db(ctx->catalog);
+    if (!db) return result_error_msg("No database selected");
+    const char* T = n->merge.target;
+    const char* ta = n->merge.talias;
+    size_t cap = SV_MAX_SQL_LEN;
+    char* q = malloc(cap);
+    if (!q) return result_error_msg("Out of memory");
+    long long affected = 0;
+    QueryResult* fail = NULL;
+    // 1. righe nuove (NOT MATCHED): valori calcolati adesso
+    QueryResult* ins[8] = {0};
+    for (int w = 0; w < n->merge.nwhen && !fail; w++) {
+        MergeWhen* c = &n->merge.when[w];
+        if (c->kind != 2) continue;
+        TextBuf tb = {0};
+        tb_put(&tb, "SELECT ", 7);
+        for (int k = 0; k < c->n; k++) { if (k) tb_put(&tb, ", ", 2); tb_put(&tb, c->vals[k], strlen(c->vals[k])); }
+        snprintf(q, cap, " FROM %s WHERE NOT EXISTS (SELECT 1 FROM `%s` AS `%s` WHERE %s)%s%s%s",
+                 n->merge.source, T, ta, n->merge.on, c->cond ? " AND (" : "", c->cond ? c->cond : "", c->cond ? ")" : "");
+        tb_put(&tb, q, strlen(q));
+        if (tb.err || !tb.d) { free(tb.d); fail = result_error_msg("Out of memory"); break; }
+        ins[w] = run_sql_text(ctx, tb.d);
+        free(tb.d);
+        if (!ins[w] || !ins[w]->success) { fail = ins[w]; ins[w] = NULL; }
+    }
+    // 2. righe con corrispondenza: la prima clausola WHEN MATCHED che vale
+    TextBuf prev = {0};                                   // condizioni delle clausole precedenti
+    for (int w = 0; w < n->merge.nwhen && !fail; w++) {
+        MergeWhen* c = &n->merge.when[w];
+        if (c->kind == 2) continue;
+        char extra[SV_MAX_SQL_LEN / 4];
+        snprintf(extra, sizeof(extra), "%s%s%s%s%s%s", c->cond ? " AND (" : "", c->cond ? c->cond : "", c->cond ? ")" : "",
+                 prev.d ? " AND NOT (" : "", prev.d ? prev.d : "", prev.d ? ")" : "");
+        TextBuf tb = {0};
+        if (c->kind == 1) {
+            snprintf(q, cap, "DELETE FROM `%s` AS `%s` WHERE EXISTS (SELECT 1 FROM %s WHERE (%s)%s)", T, ta, n->merge.source, n->merge.on, extra);
+            tb_put(&tb, q, strlen(q));
+        } else {
+            snprintf(q, cap, "UPDATE `%s` AS `%s` SET ", T, ta);
+            tb_put(&tb, q, strlen(q));
+            for (int k = 0; k < c->n; k++) {
+                snprintf(q, cap, "%s`%s` = (SELECT %s FROM %s WHERE (%s)%s LIMIT 1)", k ? ", " : "", c->cols[k], c->vals[k],
+                         n->merge.source, n->merge.on, extra);
+                tb_put(&tb, q, strlen(q));
+            }
+            snprintf(q, cap, " WHERE EXISTS (SELECT 1 FROM %s WHERE (%s)%s)", n->merge.source, n->merge.on, extra);
+            tb_put(&tb, q, strlen(q));
+        }
+        if (tb.err || !tb.d) { free(tb.d); fail = result_error_msg("Out of memory"); break; }
+        QueryResult* r = run_sql_text(ctx, tb.d);
+        free(tb.d);
+        if (!r || !r->success) { fail = r; break; }
+        affected += r->rows_affected;
+        db_result_free(r);
+        // le clausole dopo valgono solo per le righe che questa non ha preso
+        char one[SV_MAX_SQL_LEN / 4];
+        snprintf(one, sizeof(one), "EXISTS (SELECT 1 FROM %s WHERE (%s)%s%s%s)", n->merge.source, n->merge.on,
+                 c->cond ? " AND (" : "", c->cond ? c->cond : "", c->cond ? ")" : "");
+        if (prev.d) tb_put(&prev, " OR ", 4);
+        tb_put(&prev, one, strlen(one));
+    }
+    free(prev.d);
+    // 3. INSERT delle righe senza corrispondenza
+    for (int w = 0; w < n->merge.nwhen && !fail; w++) {
+        MergeWhen* c = &n->merge.when[w];
+        if (c->kind != 2 || !ins[w] || ins[w]->num_rows == 0) continue;
+        TextBuf tb = {0};
+        snprintf(q, cap, "INSERT INTO `%s` ", T);
+        tb_put(&tb, q, strlen(q));
+        if (c->has_cols) {
+            tb_put(&tb, "(", 1);
+            for (int k = 0; k < c->n; k++) { if (k) tb_put(&tb, ", ", 2); tb_put(&tb, "`", 1); tb_put(&tb, c->cols[k], strlen(c->cols[k])); tb_put(&tb, "`", 1); }
+            tb_put(&tb, ") ", 2);
+        }
+        tb_put(&tb, "VALUES ", 7);
+        for (int r = 0; r < ins[w]->num_rows; r++) {
+            tb_put(&tb, r ? ", (" : "(", r ? 3 : 1);
+            for (int k = 0; k < ins[w]->num_cols; k++) { if (k) tb_put(&tb, ", ", 2); sql_literal(&tb, &ins[w]->rows[r].cells[k]); }
+            tb_put(&tb, ")", 1);
+        }
+        if (tb.err || !tb.d) { free(tb.d); fail = result_error_msg("Out of memory"); break; }
+        QueryResult* r = run_sql_text(ctx, tb.d);
+        free(tb.d);
+        if (!r || !r->success) { fail = r; break; }
+        affected += r->rows_affected;
+        db_result_free(r);
+    }
+    for (int w = 0; w < 8; w++) db_result_free(ins[w]);
+    free(q);
+    if (fail) return fail;
+    return result_ok_msg((int)affected);
+}
+
+// INSERT / UPDATE / DELETE ... RETURNING: lo statement, poi le espressioni sulle righe scritte (nuove; vecchie per DELETE)
+static QueryResult* exec_returning(ExecCtx* ctx, ASTNode* stmt) {
+    Database* db = catalog_current_db(ctx->catalog);
+    if (!db) return result_error_msg("No database selected");
+    const char* tname = stmt->type == NODE_INSERT ? stmt->insert_stmt.table_name
+                      : stmt->type == NODE_UPDATE ? stmt->update_stmt.table_name : stmt->delete_stmt.table_name;
+    if (stmt->type == NODE_UPDATE && stmt->update_stmt.multi_from) return result_error_msg("RETURNING is not supported with UPDATE ... ORDER BY / LIMIT or joins");
+    if (stmt->type == NODE_DELETE && stmt->delete_stmt.multi_from) return result_error_msg("RETURNING is not supported with DELETE ... ORDER BY / LIMIT or joins");
+    TableSchema* ts = catalog_get_table(ctx->catalog, db->name, tname);
+    if (!ts) return executor_run_impl(ctx, stmt);              // il messaggio d'errore giusto
+    RetCapture saved = g_cap;
+    memset(&g_cap, 0, sizeof(g_cap));
+    g_cap.on = true;
+    g_cap.depth = ctx->trig_depth;
+    snprintf(g_cap.table, sizeof(g_cap.table), "%s", ts->name);
+    int nret = stmt->nret;
+    stmt->nret = 0;                                             // lo statement normale
+    QueryResult* r = executor_run_impl(ctx, stmt);
+    stmt->nret = nret;
+    RetCapture cap = g_cap;
+    g_cap = saved;
+    QueryResult* out = NULL;
+    if (r && r->success) {
+        ts = catalog_get_table(ctx->catalog, db->name, tname);
+        Source s;
+        memset(&s, 0, sizeof(s));
+        snprintf(s.name, sizeof(s.name), "%s", ts->name);
+        snprintf(s.table, sizeof(s.table), "%s", ts->name);
+        s.ts = ts;
+        BindCtx b;
+        memset(&b, 0, sizeof(b));
+        b.src = &s; b.nsrc = 1; b.mode = BIND_ROW; b.x = ctx; b.outer = ctx->trig_bind; b.clause = "RETURNING";
+        // colonne: * diventa tutte le colonne della tabella
+        ASTExpr* cols[SV_MAX_COLUMNS];
+        char names[SV_MAX_COLUMNS][128];
+        int nc = 0;
+        ASTExpr* owned[SV_MAX_COLUMNS];
+        int nown = 0;
+        for (int k = 0; k < nret && nc < SV_MAX_COLUMNS; k++) {
+            ASTExpr* e = stmt->returning[k];
+            if (e->type == EXPR_STAR) {
+                for (int ci = 0; ci < ts->num_columns && nc < SV_MAX_COLUMNS; ci++) {
+                    ASTExpr* c = calloc(1, sizeof(ASTExpr));
+                    if (!c) break;
+                    c->type = EXPR_COLUMN;
+                    snprintf(c->col_name, sizeof(c->col_name), "%s", ts->columns[ci].name);
+                    owned[nown++] = c;
+                    snprintf(names[nc], sizeof(names[nc]), "%s", ts->columns[ci].name);
+                    cols[nc++] = c;
+                }
+                continue;
+            }
+            if (e->alias[0]) snprintf(names[nc], sizeof(names[nc]), "%s", e->alias);
+            else if (e->type == EXPR_COLUMN) snprintf(names[nc], sizeof(names[nc]), "%s", e->col_name);
+            else ast_expr_format(e, names[nc], sizeof(names[nc]));
+            cols[nc++] = e;
+        }
+        for (int k = 0; k < nc; k++) bind_expr(cols[k], &b);
+        if (b.err[0]) out = result_error_msg(b.err);
+        else {
+            const char* np[SV_MAX_COLUMNS] = {0};
+            for (int k = 0; k < nc; k++) np[k] = names[k];
+            out = text_result(nc, np);
+            EvalCtx ec;
+            memset(&ec, 0, sizeof(ec));
+            Tuple* cur[1];
+            ec.src = &s; ec.nsrc = 1; ec.cur = cur; ec.x = ctx; ec.outer = ctx->trig_eval;
+            int cap_rows = 0;
+            bool all_int[SV_MAX_COLUMNS], all_num[SV_MAX_COLUMNS];
+            for (int k = 0; k < nc; k++) all_int[k] = all_num[k] = true;
+            for (int i = 0; out && i < cap.n; i++) {
+                cur[0] = cap.v[i];
+                char* vals[SV_MAX_COLUMNS] = {0};
+                for (int k = 0; k < nc; k++) {
+                    EvalVal v;
+                    eval_expr(cols[k], &ec, &v);
+                    if (!v.null && !v.is_int) all_int[k] = false;
+                    if (!v.null && !v.is_num) all_num[k] = false;
+                    vals[k] = v.null ? NULL : strdup(ev_s(&v));
+                }
+                if (ec.err[0]) { for (int k = 0; k < nc; k++) free(vals[k]); db_result_free(out); out = result_error_msg(ec.err); break; }
+                text_row(out, &cap_rows, (const char* const*)vals);
+                for (int k = 0; k < nc; k++) free(vals[k]);
+            }
+            for (int k = 0; out && out->success && k < nc; k++) {      // tipi: delle colonne, o dai valori
+                const char* ty = cols[k]->type == EXPR_COLUMN && cols[k]->bound > 0 && cols[k]->outer == 0
+                                 ? datatype_name(ts->columns[(cols[k]->bound - 1) % 1024].type)
+                                 : cap.n && all_int[k] ? "BIGINT" : cap.n && all_num[k] ? "FLOAT" : "VARCHAR";
+                free(out->col_types[k]);
+                out->col_types[k] = strdup(ty);
+            }
+            if (out && out->success) out->rows_affected = r->rows_affected;
+        }
+        for (int k = 0; k < nown; k++) ast_expr_free(owned[k]);
+        db_result_free(r);
+    } else out = r;
+    for (int i = 0; i < cap.n; i++) tuple_free(cap.v[i]);
+    free(cap.v);
+    return out;
+}
+
 QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt) {
     g_run_depth++;
     g_select_total = -1;
-    QueryResult* r = executor_run_impl(ctx, stmt);
+    QueryResult* r = stmt->nret > 0 ? exec_returning(ctx, stmt) : executor_run_impl(ctx, stmt);
     if (--g_run_depth == 0) {
         arena_free(&g_text_arena);
         // FOUND_ROWS() e ROW_COUNT() riguardano lo statement di primo livello (come in MySQL)
@@ -10875,6 +11173,7 @@ static QueryResult* executor_run_impl(ExecCtx* ctx, ASTNode* stmt) {
         case NODE_CREATE_PROCEDURE: return exec_create_procedure(ctx, stmt);
         case NODE_DROP_PROCEDURE: return exec_drop_procedure(ctx, stmt);
         case NODE_CALL: return exec_call(ctx, stmt);
+        case NODE_MERGE: return exec_merge(ctx, stmt);
         case NODE_CHECKPOINT:   return result_ok_msg(0);
         case NODE_VACUUM:       return result_ok_msg(0);
         case NODE_DROP_TRIGGER: return exec_drop_trigger(ctx, stmt);
