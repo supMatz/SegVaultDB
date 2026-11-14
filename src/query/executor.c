@@ -1638,6 +1638,7 @@ typedef struct {
     bool         loaded;
     bool         arena_rows;               // righe nell'arena (non si liberano una per una)
     Arena        arena;
+    char         db[SV_MAX_NAME_LEN];      // database della tabella ("" = il corrente)
     // sorgente laterale (LATERAL (subquery), JSON_TABLE, GENERATE_SERIES): righe ricalcolate per ogni
     // combinazione delle sorgenti a sinistra, tenute in pool fino alla prossima esecuzione del piano
     bool         lateral;
@@ -1988,6 +1989,11 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
                 return;
             }
             if (b->in_agg) { bind_error(b, "Window functions cannot be inside an aggregate"); return; }
+            if (e->win->frame == FRAME_RANGE && e->win->nord != 1 &&
+                (e->win->fs == FB_PREC || e->win->fs == FB_FOLL || e->win->fe == FB_PREC || e->win->fe == FB_FOLL)) {
+                bind_error(b, "A RANGE frame with n PRECEDING / FOLLOWING needs exactly one ORDER BY expression");
+                return;
+            }
             for (int i = 0; i < e->nargs; i++) bind_expr(e->args[i], b);
             for (int i = 0; i < e->win->npart; i++) bind_expr(e->win->part[i], b);
             for (int i = 0; i < e->win->nord; i++) bind_expr(e->win->ord[i], b);
@@ -5730,8 +5736,13 @@ static bool infoschema_open(ExecCtx* x, Source* s, const char* table, char* err,
 }
 
 static bool source_open(ExecCtx* x, Database* db, Source* s, const char* table, const char* alias, ASTNode* derived,
-                        int depth, const CteScope* scope, char* err, size_t errn) {
+                        int depth, const CteScope* scope, char* err, size_t errn, const char* tdb) {
     memset(s, 0, sizeof(*s));
+    if (tdb && tdb[0] && !derived) {                       // db.tabella: quel database (anche diverso dal corrente)
+        db = catalog_get_db(x->catalog, tdb);
+        if (!db) { snprintf(err, errn, "Unknown database '%.63s'", tdb); return false; }
+        snprintf(s->db, sizeof(s->db), "%s", db->name);
+    }
     snprintf(s->table, sizeof(s->table), "%s", table);
     snprintf(s->name, sizeof(s->name), "%s", alias && alias[0] ? alias : table);
     if (depth >= MAX_VIEW_DEPTH) { snprintf(err, errn, "'%.64s' is nested too deeply (or refers to itself)", table); return false; }
@@ -5891,8 +5902,8 @@ static void find_range(SelectPlan* p, int s, ExprVec* conds) {
 // valuta gli estremi dell'intervallo e prende i RID dall'indice; false = indice non utilizzabile
 // (tipo dell'estremo non confrontabile con quello della colonna, memoria, lettura annullata)
 static bool range_rids(SelectPlan* p, int s, EvalCtx* ec, RID** rids, int* n) {
-    Database* db = catalog_current_db(p->x->catalog);
     Source* S = &p->src[s];
+    Database* db = S->db[0] ? catalog_get_db(p->x->catalog, S->db) : catalog_current_db(p->x->catalog);
     int ci = p->range_col[s];
     if (!db || ci < 0) return false;
     bool numeric = is_int_type(S->ts->columns[ci].type);
@@ -6043,14 +6054,14 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
         bool ok = n->select_stmt.from_tf
             ? lateral_open(p, p->nsrc, NULL, n->select_stmt.from_tf, n->select_stmt.table_alias, outer, scope, err, errn)
             : source_open(x, db, &p->src[p->nsrc], n->select_stmt.table_name, n->select_stmt.table_alias,
-                          n->select_stmt.from_sub, depth, scope, err, errn);
+                          n->select_stmt.from_sub, depth, scope, err, errn, n->select_stmt.table_db);
         p->nsrc++;
         if (!ok) { plan_free(p); return NULL; }
     }
     for (int j = 0; j < n->select_stmt.num_joins; j++) {
         ASTJoin* jn = &n->select_stmt.joins[j];
         bool ok = jn->lateral ? lateral_open(p, p->nsrc, jn->sub, jn->tf, jn->alias, outer, scope, err, errn)
-                              : source_open(x, db, &p->src[p->nsrc], jn->table_name, jn->alias, jn->sub, depth, scope, err, errn);
+                              : source_open(x, db, &p->src[p->nsrc], jn->table_name, jn->alias, jn->sub, depth, scope, err, errn, jn->table_db);
         p->nsrc++;
         if (!ok) { plan_free(p); return NULL; }
     }
@@ -6380,7 +6391,7 @@ static bool plan_load(SelectPlan* p) {
                 char key[KEY_BUF];
                 bool keyed = probe_text_ci(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key), col_is_ci(S->ts, p->probe_col[s]));
                 // un valore che non diventa una chiave della colonna (testo contro numero, ...): si legge tutto
-                MemIndex* ix = keyed || kv.null ? mi_get(p->x, db->name, S->ts, p->probe_col[s]) : NULL;
+                MemIndex* ix = keyed || kv.null ? mi_get(p->x, S->db[0] ? S->db : db->name, S->ts, p->probe_col[s]) : NULL;
                 if (ix) {
                     done = true;
                     p->used_index[s] = true;
@@ -6914,6 +6925,22 @@ static void wacc_result(const WinAcc* a, const char* f, SortKey* out) {
     else out->null = true;
 }
 
+// valore numerico della chiave di ORDER BY per i frame RANGE con distanza (date: secondi); false se NULL
+static bool range_key(const SortKey* k, bool time, double* out) {
+    if (k->null) return false;
+    if (!time) {
+        if (k->is_num) { *out = k->num; return true; }
+        return k->str && text_is_number(k->str, out);
+    }
+    MyDT t;
+    if (!k->str || !mydt_parse(k->str, &t) || !t.has_date) return false;
+    int64_t y = t.y - (t.mo <= 2), era = (y >= 0 ? y : y - 399) / 400;   // giorni dal 1970-01-01 (calendario civile)
+    int64_t yoe = y - era * 400, mp = (t.mo + 9) % 12, doy = (153 * mp + 2) / 5 + t.d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy, days = era * 146097 + doe - 719468;
+    *out = (double)(days * 86400 + t.h * 3600 + t.mi * 60 + t.s);
+    return true;
+}
+
 // Funzione finestra con un frame esplicito su una partizione [start, end) (posizioni in idx).
 // Gli estremi del frame [lo, hi] non diminuiscono mai passando alla riga successiva: il
 // frame "scorre" e ogni riga entra ed esce una volta sola (somme e conteggi aggiornati,
@@ -6930,6 +6957,20 @@ static bool window_frame(const WindowSpec* ws, const char* f, bool star, int sta
     int qh = 0, qt = 0;                         // coda monotona di MIN / MAX: dq[qh..qt)
     int cl = start, ch = start - 1;             // frame attuale [cl, ch]
     int pg = start, pge = start;                // gruppo di pari della riga (RANGE)
+    // RANGE n PRECEDING / FOLLOWING: estremi per valore della chiave (che cresce con r, anche con DESC
+    // contando il segno); le righe con la chiave NULL formano un gruppo a parte
+    bool by_value = ws->frame == FRAME_RANGE && (ws->fs == FB_PREC || ws->fs == FB_FOLL || ws->fe == FB_PREC || ws->fe == FB_FOLL);
+    double sgn = ws->nord > 0 && ws->desc[0] ? -1.0 : 1.0;
+    int va = start, vb = start;                 // righe con la chiave non NULL: [va, vb)
+    if (by_value) {
+        double x;
+        while (va < end && !range_key(&KEY(va)[ws->npart], ws->range_time, &x)) va++;
+        vb = va;
+        while (vb < end && range_key(&KEY(vb)[ws->npart], ws->range_time, &x)) vb++;
+    }
+    int lp = va, hp = va - 1;                   // estremi che avanzano
+    #define RV(i) (range_key(&KEY(i)[ws->npart], ws->range_time, &rvtmp), sgn * rvtmp)
+    double rvtmp = 0;
     for (int r = start; r < end; r++) {
         if (r >= pge) {
             pg = r;
@@ -6937,6 +6978,28 @@ static bool window_frame(const WindowSpec* ws, const char* f, bool star, int sta
             while (pge < end && keys_equal(KEY(pg), KEY(pge), ws->npart, K)) pge++;
         }
         int64_t lo, hi;
+        if (by_value) {
+            double cv;
+            if (r < va || r >= vb || !range_key(&KEY(r)[ws->npart], ws->range_time, &cv)) { lo = pg; hi = pge - 1; }
+            else {
+                cv *= sgn;
+                if (ws->fs == FB_UNB_PREC) lo = start;
+                else if (ws->fs == FB_CURRENT) lo = pg;
+                else {
+                    double target = ws->fs == FB_PREC ? cv - (double)ws->fs_off : cv + (double)ws->fs_off;
+                    while (lp < vb && RV(lp) < target) lp++;
+                    lo = lp;
+                }
+                if (ws->fe == FB_UNB_FOLL) hi = end - 1;
+                else if (ws->fe == FB_CURRENT) hi = pge - 1;
+                else {
+                    double target = ws->fe == FB_PREC ? cv - (double)ws->fe_off : cv + (double)ws->fe_off;
+                    while (hp + 1 < vb && RV(hp + 1) <= target) hp++;
+                    hi = hp;
+                }
+            }
+            goto have_bounds;
+        }
         switch (ws->fs) {
             case FB_UNB_PREC: lo = start; break;
             case FB_PREC:     lo = (int64_t)r - ws->fs_off; break;
@@ -6949,6 +7012,7 @@ static bool window_frame(const WindowSpec* ws, const char* f, bool star, int sta
             case FB_FOLL:     hi = (int64_t)r + ws->fe_off; break;
             default:          hi = ws->frame == FRAME_RANGE ? pge - 1 : r; break;
         }
+    have_bounds:
         if (lo < start) lo = start;
         if (hi > end - 1) hi = end - 1;
         if (lo > end) lo = end;
@@ -6997,6 +7061,7 @@ static bool window_frame(const WindowSpec* ws, const char* f, bool star, int sta
         else if (!strcmp(f, "SUM")) { o->is_num = true; o->num = dsum; }
         else { o->is_num = true; o->num = dsum / (double)count; }   // AVG
     }
+    #undef RV
     #undef KEY
     #undef ARG
     return true;

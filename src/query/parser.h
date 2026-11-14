@@ -61,6 +61,7 @@ typedef struct WindowSpec {
     int64_t         fs_off, fe_off;// n di "n PRECEDING / n FOLLOWING"
     int             slot;          // posizione fra le funzioni finestra della query (executor)
     char            ref[64];       // OVER nome: finestra definita nella clausola WINDOW (risolta dal parser)
+    bool            range_time;    // RANGE INTERVAL n unità PRECEDING: fs_off / fe_off in secondi
 } WindowSpec;
 
 // tipi di subquery
@@ -197,6 +198,7 @@ typedef struct {
     bool       using_built;    // condizione ON già costruita da NATURAL / USING
     bool       lateral;        // LATERAL (subquery) / CROSS APPLY / OUTER APPLY: ricalcolata per ogni riga a sinistra
     TableFunc* tf;             // JOIN JSON_TABLE(...) / GENERATE_SERIES(...) (sempre laterale)
+    char       table_db[64];   // JOIN db.tabella ("" = il database corrente)
 } ASTJoin;
 
 // WITH nome AS (SELECT ...)
@@ -222,6 +224,9 @@ typedef struct ASTNode {
     bool     if_exists;        // DROP ... IF EXISTS / CREATE ... IF NOT EXISTS
     char     qual_db[64];      // database dei nomi qualificati (shop.prodotto); "" = quello corrente
     bool     qual_mixed;       // anche tabelle senza database: valide solo se il corrente è qual_db
+    // tutti i database nominati (shop.prodotto JOIN uni.esame): i permessi si controllano su ognuno
+    char     qual_dbs[8][64];
+    int      nqual_dbs;
     int      set_fk_checks;    // NODE_SET: FOREIGN_KEY_CHECKS = 0 / 1 (-1 = non nominato)
     // ALTER TABLE t op1, op2, ...: le operazioni dopo la prima (ALTER, CREATE / DROP INDEX), eseguite in ordine
     struct ASTNode* chain;
@@ -260,6 +265,7 @@ typedef struct ASTNode {
             int        num_joins;
             struct ASTNode* from_sub;  // FROM (SELECT ...) alias: tabella derivata
             TableFunc* from_tf;        // FROM JSON_TABLE(...) / GENERATE_SERIES(...) alias
+            char       table_db[64];   // FROM db.tabella: il database della prima sorgente ("" = corrente)
             // SELECT ... UNION [ALL] / INTERSECT / EXCEPT SELECT ...: catena dei rami.
             // Con set_next != NULL, ORDER BY e LIMIT di questo nodo valgono per l'intero risultato.
             struct ASTNode* set_next;

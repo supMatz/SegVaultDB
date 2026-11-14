@@ -499,6 +499,9 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
     if (g_session_user[0]) {         // permessi dell'utente della sessione
         char err[300];
         if (!auth_check(g_session_user, stmt, cur_db_name(), err, sizeof(err))) return result_error(err);
+        // shop.prodotto JOIN uni.esame: gli stessi permessi su ogni database nominato
+        for (int i = 0; i < stmt->nqual_dbs; i++)
+            if (!auth_check(g_session_user, stmt, stmt->qual_dbs[i], err, sizeof(err))) return result_error(err);
     }
     if (stmt->type == NODE_SET) {                 // variabili di sessione di MySQL: accettate
         if (stmt->set_fk_checks >= 0) executor_set_fk_checks(stmt->set_fk_checks != 0);
@@ -1779,7 +1782,7 @@ QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char
     }
     // solo una SELECT, in un database esistente, con un utente che esiste; il resto va per la via normale
     bool ok = parsed && parsed->success && parsed->count == 1 && parsed->statements[0]->type == NODE_SELECT &&
-              parsed->statements[0]->select_stmt.num_into == 0 &&
+              parsed->statements[0]->select_stmt.num_into == 0 && parsed->statements[0]->nqual_dbs <= 1 &&
               (!dbname || !dbname[0] || idx >= 0) && (!user || !user[0] || auth_user_exists(user));
     // @variabili (stato della sessione) e funzioni dell'utente (possono scrivere): via normale
     for (int i = 0; ok && tokens && i < tokens->count; i++) {

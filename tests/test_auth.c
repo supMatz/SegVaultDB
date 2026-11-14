@@ -109,6 +109,12 @@ int main(void) {
     CHECK(has_row("SHOW GRANTS", "TO anna"), "own grants visible");
     CHECK(denied("SHOW GRANTS FOR bob"), "others' grants hidden");
     CHECK(denied("USE hr") && denied("CREATE DATABASE altro"), "other database");
+    // query su più database: i permessi valgono su ogni database nominato
+    CHECK(denied("SELECT * FROM hr.stipendio"), "qualified table of another database");
+    CHECK(denied("SELECT * FROM prodotto p JOIN hr.stipendio s ON s.id = p.id"), "cross-database join");
+    CHECK(denied("SELECT nome FROM prodotto WHERE id IN (SELECT id FROM hr.stipendio)"), "cross-database subquery");
+    CHECK(denied("INSERT INTO ordine SELECT id, id, euro FROM hr.stipendio"), "cross-database INSERT ... SELECT");
+    CHECK(rows("SELECT p.nome FROM shop.prodotto p JOIN ordine o ON o.prodotto = p.id") == 2, "qualified own database: %s", g_err);
     CHECK(rows("SHOW DATABASES") == 1 && has_row("SHOW DATABASES", "shop"), "SHOW DATABASES lists only allowed databases");
     CHECK(ok("USE shop") && ok("BEGIN") && ok("ROLLBACK"), "use, transactions");
 

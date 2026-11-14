@@ -236,9 +236,9 @@ int main(void) {
     t("SELECT COUNT(*) FROM altro.q", "1");
     t("SELECT nome FROM altro.p p WHERE p.id = 1", "UNO");
     t("SELECT * FROM p", "ERR:");                                       // il database corrente non cambia
-    t("SELECT * FROM altro.p JOIN js ON 1 = 1", "ERR:different databases");
+    t("SELECT * FROM altro.p JOIN js ON 1 = 1", "ERR:'js' not found");          // js: database corrente (dove non c'è più)
     t("SELECT * FROM nessuno.p", "ERR:Unknown database");
-    t("SELECT * FROM altro.p, shop.js", "ERR:different databases");
+    t("SELECT * FROM altro.p, shop.js", "ERR:not found");
     t("CREATE INDEX ix_nome ON altro.p (nome)", "OK:0");
     t("DROP INDEX ix_nome ON altro.p", "OK:0");
     t("ALTER TABLE altro.p ADD COLUMN eta INT", "OK:0");
@@ -701,7 +701,9 @@ int main(void) {
     t("SELECT DISTINCT voto, COUNT(*) OVER (ORDER BY voto DESC RANGE UNBOUNDED PRECEDING) FROM esame ORDER BY voto DESC LIMIT 2", "30|3;28|4");
     t("SELECT corso, voto, ROUND(AVG(voto) OVER (PARTITION BY corso ORDER BY voto ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), 1) FROM esame "
       "WHERE corso <> 'BD2' ORDER BY corso, voto", "AN1|24|24;AN1|25|24.5;AN1|30|27.5;BD1|18|18;BD1|27|22.5;BD1|30|28.5");
-    t("SELECT SUM(voto) OVER (ORDER BY voto RANGE 1 PRECEDING) FROM esame", "ERR:RANGE frames support only");
+    t("SELECT voto, SUM(voto) OVER (ORDER BY voto RANGE 1 PRECEDING) FROM esame ORDER BY voto", "18|18;22|22;24|24;25|49;27|27;28|55;30|90;30|90;30|90");
+    t("SELECT voto, COUNT(*) OVER (ORDER BY voto DESC RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM esame ORDER BY voto LIMIT 3", "18|1;22|2;24|3");
+    t("SELECT SUM(voto) OVER (ORDER BY voto, corso RANGE 1 PRECEDING) FROM esame", "ERR:exactly one ORDER BY");
     t("SELECT SUM(voto) OVER (ORDER BY voto ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM esame", "ERR:must start before it ends");
     t("SELECT SUM(voto) OVER (ROWS BETWEEN 1 PRECEDING) FROM esame", "ERR:Expected AND");
     // CASE
@@ -1457,6 +1459,24 @@ int main(void) {
     t("DROP SEQUENCE giro", "OK:0");
     t("DROP SEQUENCE giro", "ERR:does not exist");
     t("DROP SEQUENCE IF EXISTS giro", "OK:0");
+    // RANGE con INTERVAL sulle date; query su più database
+    t("CREATE TABLE incassi (g DATE, x INT)", "OK:0");
+    t("INSERT INTO incassi VALUES ('2024-01-01',10),('2024-01-02',20),('2024-01-05',30),('2024-01-06',40),('2024-01-10',50)", "OK:5");
+    t("SELECT g, SUM(x) OVER (ORDER BY g RANGE BETWEEN INTERVAL 2 DAY PRECEDING AND CURRENT ROW) FROM incassi ORDER BY g",
+      "2024-01-01|10;2024-01-02|30;2024-01-05|30;2024-01-06|70;2024-01-10|50");
+    t("CREATE DATABASE negozio", "OK:0");
+    t("CREATE TABLE negozio.articolo (id INT PRIMARY KEY, nome VARCHAR(10))", "OK:0");
+    t("INSERT INTO negozio.articolo VALUES (1, 'penna'), (2, 'zaino')", "OK:2");
+    t("CREATE TABLE righe (art INT, qta INT)", "OK:0");
+    t("INSERT INTO righe VALUES (1, 3), (2, 1), (1, 2)", "OK:3");
+    t("SELECT a.nome, SUM(r.qta) FROM negozio.articolo a JOIN righe r ON r.art = a.id GROUP BY a.nome ORDER BY a.nome", "penna|5;zaino|1");
+    t("SELECT nome FROM negozio.articolo WHERE id IN (SELECT art FROM rt.righe WHERE qta > 2)", "penna");
+    t("CREATE TABLE copia_art (n VARCHAR(10))", "OK:0");
+    t("INSERT INTO copia_art SELECT nome FROM negozio.articolo", "OK:2");
+    t("DELETE FROM copia_art WHERE n = (SELECT nome FROM negozio.articolo WHERE id = 2)", "OK:1");
+    t("SELECT n FROM copia_art", "penna");
+    t("INSERT INTO negozio.articolo SELECT 3, 'gomma' FROM rt.righe LIMIT 1", "OK:1");
+    t("SELECT COUNT(*) FROM negozio.articolo", "3");
     t("SHOW FUNCTION STATUS", "#7");
     t("SHOW PROCEDURE STATUS LIKE 'p%'", "#2");
     t("SELECT `Type` FROM (SHOW FUNCTION STATUS) AS s LIMIT 1", "ERR:");

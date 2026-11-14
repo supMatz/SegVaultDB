@@ -14,6 +14,11 @@ typedef struct {
     char       qual_db[64];    // database dei nomi db.tabella dello statement ("" = nessuno)
     bool       plain_table;    // lo statement usa anche tabelle senza database
     int        gs_nested;      // rilettura di una SELECT con ROLLUP / CUBE / GROUPING SETS (un ramo)
+    char       tok_db[64];     // database dell'ultimo nome di tabella letto ("" = senza)
+    char       dbs[8][64];     // tutti i database nominati dallo statement
+    int        ndbs;
+    int        ntables;        // nomi di tabella letti nello statement (il primo è la destinazione di INSERT / UPDATE / DELETE)
+    bool       first_qualified;
 } ParserState;
 
 #define MAX_EXPR_DEPTH 128     // parentesi, operatori e funzioni annidati
@@ -79,16 +84,26 @@ static void parse_fail(ParserState* ps, const char* msg, Token at);
 static Token table_tok(ParserState* ps) {
     Token t = consume(ps);
     if (t.type != TOK_IDENTIFIER) return t;
+    if (ps->ntables++ == 0) ps->first_qualified = peek(ps).type == TOK_DOT && next_is(ps, 1, TOK_IDENTIFIER);
     if (peek(ps).type == TOK_DOT && next_is(ps, 1, TOK_IDENTIFIER)) {
         consume(ps);
         Token n = consume(ps);
-        if (strlen(t.text) >= sizeof(ps->qual_db)) parse_fail(ps, "Database name is too long", t);
-        else if (ps->qual_db[0] && strcasecmp(ps->qual_db, t.text))
-            parse_fail(ps, "Tables of different databases in one statement are not supported yet", t);
-        else snprintf(ps->qual_db, sizeof(ps->qual_db), "%s", t.text);
+        if (strlen(t.text) >= sizeof(ps->qual_db)) { parse_fail(ps, "Database name is too long", t); return n; }
+        bool is_info = !strcasecmp(t.text, "information_schema");
+        if (ps->qual_db[0] && strcasecmp(ps->qual_db, t.text) && (is_info || !strcasecmp(ps->qual_db, "information_schema")))
+            parse_fail(ps, "information_schema cannot be joined with tables of other databases", t);
+        else if (!ps->qual_db[0]) snprintf(ps->qual_db, sizeof(ps->qual_db), "%s", t.text);
+        snprintf(ps->tok_db, sizeof(ps->tok_db), "%s", is_info ? "" : t.text);   // information_schema: tabelle virtuali
+        bool seen = false;                                  // elenco dei database (permessi)
+        for (int i = 0; i < ps->ndbs; i++) if (!strcasecmp(ps->dbs[i], t.text)) seen = true;
+        if (!seen && !is_info) {
+            if (ps->ndbs >= 8) parse_fail(ps, "Too many databases in one statement (max 8)", t);
+            else snprintf(ps->dbs[ps->ndbs++], 64, "%s", t.text);
+        }
         return n;
     }
     ps->plain_table = true;
+    ps->tok_db[0] = '\0';
     return t;
 }
 
@@ -220,6 +235,7 @@ ASTExpr* ast_expr_clone(const ASTExpr* e) {
         c->win->slot = e->win->slot;
         c->win->frame = e->win->frame; c->win->fs = e->win->fs; c->win->fe = e->win->fe;
         c->win->fs_off = e->win->fs_off; c->win->fe_off = e->win->fe_off;
+        c->win->range_time = e->win->range_time;
         for (int i = 0; i < e->win->npart; i++) { c->win->part[i] = ast_expr_clone(e->win->part[i]); c->win->npart = i + 1; if (!c->win->part[i]) { ast_expr_free(c); return NULL; } }
         for (int i = 0; i < e->win->nord; i++) {
             c->win->ord[i] = ast_expr_clone(e->win->ord[i]); c->win->desc[i] = e->win->desc[i]; c->win->nord = i + 1;
@@ -495,15 +511,22 @@ static bool tokens_text(ParserState* ps, int from, int to, char* out, size_t cap
 
 // testo di un frame: "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW"
 void frame_text(const WindowSpec* w, char* buf, size_t n) {
-    char b[2][40];
+    char b[2][64];
     int k[2] = { w->fs, w->fe };
     int64_t off[2] = { w->fs_off, w->fe_off };
     for (int i = 0; i < 2; i++) {
         switch (k[i]) {
             case FB_UNB_PREC: snprintf(b[i], sizeof(b[i]), "UNBOUNDED PRECEDING"); break;
-            case FB_PREC:     snprintf(b[i], sizeof(b[i]), "%lld PRECEDING", (long long)off[i]); break;
+            case FB_PREC: case FB_FOLL: {
+                const char* dir = k[i] == FB_PREC ? "PRECEDING" : "FOLLOWING";
+                if (!w->range_time) { snprintf(b[i], sizeof(b[i]), "%lld %s", (long long)off[i], dir); break; }
+                static const struct { const char* u; int64_t s; } U[] = { { "WEEK", 604800 }, { "DAY", 86400 }, { "HOUR", 3600 }, { "MINUTE", 60 }, { "SECOND", 1 } };
+                size_t u = 0;
+                while (u + 1 < sizeof(U) / sizeof(U[0]) && (off[i] % U[u].s)) u++;
+                snprintf(b[i], sizeof(b[i]), "INTERVAL %lld %s %s", (long long)(off[i] / U[u].s), U[u].u, dir);
+                break;
+            }
             case FB_CURRENT:  snprintf(b[i], sizeof(b[i]), "CURRENT ROW"); break;
-            case FB_FOLL:     snprintf(b[i], sizeof(b[i]), "%lld FOLLOWING", (long long)off[i]); break;
             default:          snprintf(b[i], sizeof(b[i]), "UNBOUNDED FOLLOWING"); break;
         }
     }
@@ -511,8 +534,25 @@ void frame_text(const WindowSpec* w, char* buf, size_t n) {
 }
 
 // un estremo del frame; end = true per quello dopo AND
-static bool parse_frame_bound(ParserState* ps, int* kind, int64_t* off) {
+static bool parse_frame_bound(ParserState* ps, int* kind, int64_t* off, bool* time) {
     Token t = peek(ps);
+    if (ident_is(ps, "INTERVAL") && next_is(ps, 1, TOK_INTEGER)) {   // INTERVAL n unità PRECEDING | FOLLOWING (RANGE su date)
+        consume(ps);
+        int64_t n = strtoll(consume(ps).text, NULL, 10);
+        Token u = consume(ps);
+        static const struct { const char* u; int64_t s; } U[] = { { "SECOND", 1 }, { "MINUTE", 60 }, { "HOUR", 3600 },
+                                                                   { "DAY", 86400 }, { "WEEK", 604800 } };
+        int64_t mult = 0;
+        for (size_t i = 0; i < sizeof(U) / sizeof(U[0]); i++)
+            if (u.text && (!strcasecmp(u.text, U[i].u) || (!strncasecmp(u.text, U[i].u, strlen(U[i].u)) && toupper((unsigned char)u.text[strlen(U[i].u)]) == 'S' && !u.text[strlen(U[i].u) + 1]))) mult = U[i].s;
+        if (!mult) { parse_fail(ps, "Window frame INTERVAL units: SECOND, MINUTE, HOUR, DAY, WEEK", u); return false; }
+        *off = n * mult;
+        *time = true;
+        if (ident_is(ps, "PRECEDING")) { consume(ps); *kind = FB_PREC; return true; }
+        if (ident_is(ps, "FOLLOWING")) { consume(ps); *kind = FB_FOLL; return true; }
+        parse_fail(ps, "Expected PRECEDING or FOLLOWING after the interval", peek(ps));
+        return false;
+    }
     if (ident_is(ps, "UNBOUNDED")) {
         consume(ps);
         if (ident_is(ps, "PRECEDING")) { consume(ps); *kind = FB_UNB_PREC; return true; }
@@ -545,15 +585,17 @@ static void parse_frame(ParserState* ps, WindowSpec* w) {
     w->frame = ident_is(ps, "ROWS") ? FRAME_ROWS : FRAME_RANGE;
     consume(ps);
     w->fe = FB_CURRENT;
+    bool time = false;
     if (match(ps, TOK_BETWEEN)) {
-        if (!parse_frame_bound(ps, &w->fs, &w->fs_off)) return;
+        if (!parse_frame_bound(ps, &w->fs, &w->fs_off, &time)) return;
         if (!match(ps, TOK_AND)) { parse_fail(ps, "Expected AND in the window frame", peek(ps)); return; }
-        if (!parse_frame_bound(ps, &w->fe, &w->fe_off)) return;
-    } else if (!parse_frame_bound(ps, &w->fs, &w->fs_off)) return;
+        if (!parse_frame_bound(ps, &w->fe, &w->fe_off, &time)) return;
+    } else if (!parse_frame_bound(ps, &w->fs, &w->fs_off, &time)) return;
+    w->range_time = time;
     if (w->fs == FB_UNB_FOLL || w->fe == FB_UNB_PREC || w->fs > w->fe)
         parse_fail(ps, "The window frame must start before it ends", t);
-    else if (w->frame == FRAME_RANGE && (w->fs == FB_PREC || w->fs == FB_FOLL || w->fe == FB_PREC || w->fe == FB_FOLL))
-        parse_fail(ps, "RANGE frames support only UNBOUNDED and CURRENT ROW (use ROWS for n PRECEDING / FOLLOWING)", t);
+    else if (time && w->frame != FRAME_RANGE)
+        parse_fail(ps, "INTERVAL offsets need a RANGE frame", t);
 }
 
 // all'offset ahead inizia una query (SELECT ... o WITH ...)?
@@ -1163,9 +1205,7 @@ static ASTExpr* parse_primary(ParserState* ps) {
                 if (peek(ps).type == TOK_DOT && next_is(ps, 1, TOK_IDENTIFIER)) {   // db.tabella.colonna
                     consume(ps);
                     Token col = consume(ps);
-                    if (ps->qual_db[0] && strcasecmp(ps->qual_db, t.text))
-                        parse_fail(ps, "Tables of different databases in one statement are not supported yet", t);
-                    t = c;
+                    t = c;                               // (il database l'ha già dato il nome della tabella)
                     c = col;
                 }
                 if (!strcasecmp(c.text, "NEXTVAL") || !strcasecmp(c.text, "CURRVAL")) {   // s.NEXTVAL (Oracle)
@@ -1741,6 +1781,7 @@ static void parse_from_clause(ParserState* ps, ASTNode* n) {
         Token first = table_tok(ps);
         if (first.type != TOK_IDENTIFIER) parse_fail(ps, "Expected a table name after FROM", first);
         copy_text(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name), first.text);
+        snprintf(n->select_stmt.table_db, sizeof(n->select_stmt.table_db), "%s", ps->tok_db);
         parse_table_alias(ps, n->select_stmt.table_alias, sizeof(n->select_stmt.table_alias));
     }
 
@@ -1790,6 +1831,7 @@ static void parse_from_clause(ParserState* ps, ASTNode* n) {
             Token tt = table_tok(ps);
             if (tt.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name after JOIN", tt); break; }
             copy_text(ps, j->table_name, sizeof(j->table_name), tt.text);
+            snprintf(j->table_db, sizeof(j->table_db), "%s", ps->tok_db);
             parse_table_alias(ps, j->alias, sizeof(j->alias));
         }
         j->natural = natural;
@@ -3063,7 +3105,7 @@ TrigProgram* parser_parse_trigger(TokenList* tokens) {
     ParseResult r;
     memset(&r, 0, sizeof(r));
     r.success = true;
-    ParserState ps = { tokens, 0, &r, 0, "", false, 0 };
+    ParserState ps = { .tokens = tokens, .pos = 0, .result = &r };
     parse_trigger_rest(&ps, p);
     match(&ps, TOK_SEMICOLON);
     if (r.success && peek(&ps).type != TOK_EOF) parse_fail(&ps, "Unexpected text after the trigger body", peek(&ps));
@@ -3092,7 +3134,7 @@ TrigProgram* parser_parse_procedure(TokenList* tokens, int start) {
     ParseResult r;
     memset(&r, 0, sizeof(r));
     r.success = true;
-    ParserState ps = { tokens, start, &r, 0, "", false, 0 };
+    ParserState ps = { .tokens = tokens, .pos = start, .result = &r };
     p->for_each_row = false;
     skip_routine_traits(&ps);
     if (match(&ps, TOK_BEGIN)) {
@@ -3171,7 +3213,7 @@ RoutineDef* parser_parse_routine(TokenList* tokens, bool is_function) {
     ParseResult r;
     memset(&r, 0, sizeof(r));
     r.success = true;
-    ParserState ps = { tokens, 0, &r, 0, "", false, 0 };
+    ParserState ps = { .tokens = tokens, .pos = 0, .result = &r };
     parse_routine_def(&ps, d);
     match(&ps, TOK_SEMICOLON);
     if (r.success && peek(&ps).type != TOK_EOF) parse_fail(&ps, "Unexpected text after the routine body", peek(&ps));
@@ -4912,10 +4954,27 @@ ParseResult* parser_parse(TokenList* tokens) {
     while (peek(&ps).type != TOK_EOF) {
         ps.qual_db[0] = '\0';
         ps.plain_table = false;
+        ps.ndbs = 0;
+        ps.ntables = 0;
+        ps.first_qualified = false;
         ASTNode* stmt = parse_statement(&ps);
         if (stmt) {
             memcpy(stmt->qual_db, ps.qual_db, sizeof(stmt->qual_db));
             stmt->qual_mixed = ps.qual_db[0] && ps.plain_table;
+            memcpy(stmt->qual_dbs, ps.dbs, sizeof(stmt->qual_dbs));
+            stmt->nqual_dbs = ps.ndbs;
+            // SELECT con tabelle qualificate (non information_schema): ogni sorgente usa il suo database,
+            // quelle senza database il corrente (come MySQL); niente cambio di database per lo statement
+            if (stmt->type == NODE_SELECT && ps.ndbs > 0 && strcasecmp(ps.qual_db, "information_schema")) {
+                stmt->qual_db[0] = '\0';
+                stmt->qual_mixed = false;
+            }
+            // INSERT / UPDATE / DELETE su una tabella del database corrente con sorgenti qualificate: nessun cambio
+            if ((stmt->type == NODE_INSERT || stmt->type == NODE_UPDATE || stmt->type == NODE_DELETE) && ps.ndbs > 0 &&
+                !ps.first_qualified && strcasecmp(ps.qual_db, "information_schema")) {
+                stmt->qual_db[0] = '\0';
+                stmt->qual_mixed = false;
+            }
             add_stmt(&ps, stmt);
         }
         match(&ps, TOK_SEMICOLON);
@@ -4929,7 +4988,7 @@ ASTExpr* parser_parse_expr(TokenList* tokens, char* err, size_t errn) {
     ParseResult r;
     memset(&r, 0, sizeof(r));
     r.success = true;
-    ParserState ps = { tokens, 0, &r, 0, "", false, 0 };
+    ParserState ps = { .tokens = tokens, .pos = 0, .result = &r };
     ASTExpr* e = parse_expr(&ps);
     if (r.success && peek(&ps).type != TOK_EOF) parse_fail(&ps, "Unexpected text after the condition", peek(&ps));
     if (!r.success) { ast_expr_free(e); snprintf(err, errn, "%s", r.error); return NULL; }
