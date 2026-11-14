@@ -248,7 +248,7 @@ int main() {
     test_sql("SHOW DATABASES", "SHOW DATABASES", 1);
     test_fail("SHOW nonsense", "SHOW FOO", "Expected DATABASES, TABLES");
 
-    test_fail("ALTER unsupported form", "ALTER TABLE t1 CHANGE x INT", "Expected RENAME, ADD, DROP or ALTER");
+    test_fail("ALTER unsupported form", "ALTER TABLE t1 SWAP x INT", "Expected RENAME, ADD, DROP");
 
     // Cleanup
     test_sql("DROP VIEW", "DROP VIEW v1", -1);

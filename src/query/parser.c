@@ -4049,6 +4049,178 @@ static ASTNode* parse_show_mysql(ParserState* ps) {
     return parse_generated(ps, sql);
 }
 
+// un'operazione di ALTER TABLE (dopo il nome della tabella)
+static void parse_alter_op(ParserState* ps, ASTNode* n) {
+            // MySQL: CHANGE [COLUMN] vecchio nuovo tipo [attributi]: RENAME COLUMN (se il nome cambia) + tipo
+            if (ident_is(ps, "CHANGE")) {
+                consume(ps);
+                if (ident_is(ps, "COLUMN")) consume(ps);
+                Token a = consume(ps);
+                if (a.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the column name after CHANGE", a); return; }
+                int save = ps->pos;
+                Token b = consume(ps);
+                if (b.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the new column name", b); return; }
+                (void)save;
+                ColumnDef* d = &n->alter_table.alter_def;
+                memset(d, 0, sizeof(*d));
+                if (!parse_type_spec(ps, d)) { if (ps->result->success) parse_fail(ps, "Expected the column type", peek(ps)); return; }
+                // attributi di MySQL dopo il tipo (NULL / NOT NULL / DEFAULT / COMMENT / AFTER ...): accettati
+                while (peek(ps).type != TOK_COMMA && peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF) consume(ps);
+                copy_text(ps, n->alter_table.alter_col, sizeof(n->alter_table.alter_col), a.text);
+                n->alter_table.alter_kind = ALT_TYPE;
+                if (strcasecmp(a.text, b.text)) {                 // nome nuovo: prima il tipo, poi RENAME COLUMN
+                    ASTNode* rn = calloc(1, sizeof(ASTNode));
+                    if (!rn) { parse_fail(ps, "Out of memory", peek(ps)); return; }
+                    rn->type = NODE_ALTER_TABLE;
+                    snprintf(rn->alter_table.table_name, sizeof(rn->alter_table.table_name), "%s", n->alter_table.table_name);
+                    copy_text(ps, rn->alter_table.rename_from, sizeof(rn->alter_table.rename_from), a.text);
+                    copy_text(ps, rn->alter_table.rename_to, sizeof(rn->alter_table.rename_to), b.text);
+                    rn->chain = n->chain;
+                    n->chain = rn;
+                }
+                return;
+            }
+            if (match(ps, TOK_RENAME) && ident_is(ps, "COLUMN")) {         // RENAME COLUMN a TO b
+                consume(ps);
+                Token a = consume(ps);
+                if (a.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the column name after RENAME COLUMN", a); return; }
+                if (!expect(ps, TOK_TO)) return;
+                Token b = consume(ps);
+                if (b.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the new column name after TO", b); return; }
+                copy_text(ps, n->alter_table.rename_from, sizeof(n->alter_table.rename_from), a.text);
+                copy_text(ps, n->alter_table.rename_to, sizeof(n->alter_table.rename_to), b.text);
+            } else if (ps->tokens->tokens[ps->pos - 1].type == TOK_RENAME) {
+                expect(ps, TOK_TO);
+                Token nn = consume(ps);
+                if (nn.type != TOK_IDENTIFIER) parse_fail(ps, "Expected the new table name after RENAME TO", nn);
+                copy_text(ps, n->alter_table.new_name, sizeof(n->alter_table.new_name), nn.text);
+            } else if (ident_is(ps, "ADD")) {
+                // ALTER TABLE t ADD [CONSTRAINT nome] PRIMARY KEY | UNIQUE | FOREIGN KEY | CHECK ...
+                consume(ps);
+                // ADD {INDEX | KEY | FULLTEXT [INDEX] | SPATIAL [INDEX]} [nome] (colonne): CREATE INDEX (Laravel, Doctrine)
+                if (peek(ps).type == TOK_INDEX || peek(ps).type == TOK_KEY || ident_is(ps, "FULLTEXT") || ident_is(ps, "SPATIAL")) {
+                    if (ident_is(ps, "FULLTEXT") || ident_is(ps, "SPATIAL")) { consume(ps); if (peek(ps).type == TOK_INDEX || peek(ps).type == TOK_KEY) consume(ps); }
+                    else consume(ps);
+                    char iname[64] = "";
+                    if (peek(ps).type == TOK_IDENTIFIER) copy_text(ps, iname, sizeof(iname), consume(ps).text);
+                    if (!match(ps, TOK_LPAREN)) { parse_fail(ps, "Expected '(' and the index columns", peek(ps)); return; }
+                    Token c0 = consume(ps);
+                    if (c0.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name in the index", c0); return; }
+                    while (peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) consume(ps);    // altre colonne, prefissi, ASC / DESC
+                    match(ps, TOK_RPAREN);
+                    if (ident_is(ps, "USING")) { consume(ps); consume(ps); }
+                    ASTNode* ix = calloc(1, sizeof(ASTNode));
+                    if (!ix) { parse_fail(ps, "Out of memory", peek(ps)); return; }
+                    ix->type = NODE_CREATE_INDEX;
+                    if (!iname[0]) snprintf(iname, sizeof(iname), "%.24s_%.24s_index", n->alter_table.table_name, c0.text);
+                    snprintf(ix->create_index.index_name, sizeof(ix->create_index.index_name), "%s", iname);
+                    snprintf(ix->create_index.table_name, sizeof(ix->create_index.table_name), "%s", n->alter_table.table_name);
+                    copy_text(ps, ix->create_index.col_name, sizeof(ix->create_index.col_name), c0.text);
+                    n->alter_table.noop = true;
+                    n->chain = ix;
+                    return;
+                }
+                if (ident_is(ps, "COLUMN") || (peek(ps).type == TOK_IDENTIFIER && !ident_is(ps, "CONSTRAINT") &&
+                    !ident_is(ps, "PRIMARY") && !ident_is(ps, "UNIQUE") && !ident_is(ps, "FOREIGN") && !ident_is(ps, "CHECK"))) {
+                    if (ident_is(ps, "COLUMN")) consume(ps);           // ADD [COLUMN] nome tipo modificatori
+                    ASTNode* def = calloc(1, sizeof(ASTNode));
+                    if (!def) { parse_fail(ps, "Out of memory", peek(ps)); return; }
+                    def->type = NODE_CREATE_TABLE;
+                    n->alter_table.add_column = def;
+                    parse_column_def(ps, def);
+                    // AFTER colonna | FIRST di MySQL: accettati (la colonna nuova va in fondo)
+                    if (match(ps, TOK_AFTER)) consume(ps);
+                    else if (ident_is(ps, "FIRST")) consume(ps);
+                    return;
+                }
+                ConstraintDef* c = &n->alter_table.add;
+                memset(c, 0, sizeof(*c));
+                if (ident_is(ps, "CONSTRAINT")) {
+                    consume(ps);
+                    Token nm = consume(ps);
+                    if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a name after CONSTRAINT", nm); return; }
+                    copy_text(ps, c->name, sizeof(c->name), nm.text);
+                }
+                if (!parse_table_constraint(ps, c))
+                    parse_fail(ps, "Expected PRIMARY KEY, UNIQUE, FOREIGN KEY or CHECK after ADD", peek(ps));
+                n->alter_table.has_add = true;
+            } else if (match(ps, TOK_DROP)) {
+                if (peek(ps).type == TOK_INDEX || peek(ps).type == TOK_KEY) {   // DROP {INDEX | KEY} nome
+                    consume(ps);
+                    Token in = consume(ps);
+                    if (in.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the index name", in); return; }
+                    ASTNode* ix = calloc(1, sizeof(ASTNode));
+                    if (!ix) { parse_fail(ps, "Out of memory", peek(ps)); return; }
+                    ix->type = NODE_DROP_INDEX;
+                    copy_text(ps, ix->drop_index.index_name, sizeof(ix->drop_index.index_name), in.text);
+                    snprintf(ix->drop_index.table_name, sizeof(ix->drop_index.table_name), "%s", n->alter_table.table_name);
+                    n->alter_table.noop = true;
+                    n->chain = ix;
+                    return;
+                }
+                if (ident_is(ps, "PRIMARY") && next_is(ps, 1, TOK_KEY)) {       // DROP PRIMARY KEY: il vincolo della chiave
+                    consume(ps); consume(ps);
+                    snprintf(n->alter_table.drop_constraint, sizeof(n->alter_table.drop_constraint), "PRIMARY");
+                    return;
+                }
+                if (ident_is(ps, "FOREIGN") && next_is(ps, 1, TOK_KEY)) {       // DROP FOREIGN KEY nome (MySQL)
+                    consume(ps); consume(ps);
+                    Token fk = consume(ps);
+                    if (fk.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the foreign key name", fk); return; }
+                    copy_text(ps, n->alter_table.drop_constraint, sizeof(n->alter_table.drop_constraint), fk.text);
+                    return;
+                }
+                if (!ident_is(ps, "CONSTRAINT")) {                          // DROP [COLUMN] nome
+                    if (ident_is(ps, "COLUMN")) consume(ps);
+                    Token c = consume(ps);
+                    if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the column name after DROP", c); return; }
+                    copy_text(ps, n->alter_table.drop_column, sizeof(n->alter_table.drop_column), c.text);
+                    return;
+                }
+                consume(ps);
+                Token nm = consume(ps);
+                if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the constraint name", nm); return; }
+                copy_text(ps, n->alter_table.drop_constraint, sizeof(n->alter_table.drop_constraint), nm.text);
+            } else if (match(ps, TOK_ALTER) || ident_is(ps, "MODIFY")) {
+                // ALTER [COLUMN] c TYPE t | SET DATA TYPE t | SET DEFAULT v | DROP DEFAULT | SET / DROP NOT NULL
+                bool modify = ps->tokens->tokens[ps->pos - 1].type != TOK_ALTER;
+                if (modify) consume(ps);
+                if (ident_is(ps, "COLUMN")) consume(ps);
+                Token c = consume(ps);
+                if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the column name", c); return; }
+                copy_text(ps, n->alter_table.alter_col, sizeof(n->alter_table.alter_col), c.text);
+                ColumnDef* d = &n->alter_table.alter_def;
+                memset(d, 0, sizeof(*d));
+                if (modify) {                                     // MODIFY c tipo [attributi di MySQL: accettati]
+                    n->alter_table.alter_kind = ALT_TYPE;
+                    parse_type_spec(ps, d);
+                    while (ps->result->success && peek(ps).type != TOK_COMMA && peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF) consume(ps);
+                    return;
+                }
+                if (ident_is(ps, "TYPE")) { consume(ps); n->alter_table.alter_kind = ALT_TYPE; parse_type_spec(ps, d); return; }
+                bool set = match(ps, TOK_SET);
+                if (!set && !match(ps, TOK_DROP)) { parse_fail(ps, "Expected TYPE, SET or DROP after the column name", peek(ps)); return; }
+                if (set && ident_is(ps, "DATA")) {
+                    consume(ps);
+                    if (!ident_is(ps, "TYPE")) { parse_fail(ps, "Expected TYPE after SET DATA", peek(ps)); return; }
+                    consume(ps);
+                    n->alter_table.alter_kind = ALT_TYPE;
+                    parse_type_spec(ps, d);
+                } else if (ident_is(ps, "DEFAULT")) {
+                    consume(ps);
+                    n->alter_table.alter_kind = set ? ALT_SET_DEFAULT : ALT_DROP_DEFAULT;
+                    if (set) { parse_default_value(ps, d->default_val, sizeof(d->default_val)); d->has_default = true; }
+                } else if (match(ps, TOK_NOT)) {
+                    if (!match(ps, TOK_NULL)) { parse_fail(ps, "Expected NULL after NOT", peek(ps)); return; }
+                    n->alter_table.alter_kind = set ? ALT_SET_NOT_NULL : ALT_DROP_NOT_NULL;
+                } else {
+                    parse_fail(ps, set ? "Expected DATA TYPE, DEFAULT or NOT NULL after SET" : "Expected DEFAULT or NOT NULL after DROP", peek(ps));
+                }
+            } else {
+                parse_fail(ps, "Expected RENAME, ADD, DROP, CHANGE, MODIFY or ALTER after ALTER TABLE name", peek(ps));
+            }
+}
+
 static ASTNode* parse_statement(ParserState* ps) {
     ASTNode* n = calloc(1, sizeof(ASTNode));
     if (!n) return NULL;
@@ -4241,91 +4413,27 @@ static ASTNode* parse_statement(ParserState* ps) {
             n->type = NODE_ALTER_TABLE;
             Token tn = table_tok(ps);
             copy_text(ps, n->alter_table.table_name, sizeof(n->alter_table.table_name), tn.text);
-            if (match(ps, TOK_RENAME) && ident_is(ps, "COLUMN")) {         // RENAME COLUMN a TO b
-                consume(ps);
-                Token a = consume(ps);
-                if (a.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the column name after RENAME COLUMN", a); break; }
-                if (!expect(ps, TOK_TO)) break;
-                Token b = consume(ps);
-                if (b.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the new column name after TO", b); break; }
-                copy_text(ps, n->alter_table.rename_from, sizeof(n->alter_table.rename_from), a.text);
-                copy_text(ps, n->alter_table.rename_to, sizeof(n->alter_table.rename_to), b.text);
-            } else if (ps->tokens->tokens[ps->pos - 1].type == TOK_RENAME) {
-                expect(ps, TOK_TO);
-                Token nn = consume(ps);
-                if (nn.type != TOK_IDENTIFIER) parse_fail(ps, "Expected the new table name after RENAME TO", nn);
-                copy_text(ps, n->alter_table.new_name, sizeof(n->alter_table.new_name), nn.text);
-            } else if (ident_is(ps, "ADD")) {
-                // ALTER TABLE t ADD [CONSTRAINT nome] PRIMARY KEY | UNIQUE | FOREIGN KEY | CHECK ...
-                consume(ps);
-                if (ident_is(ps, "COLUMN") || (peek(ps).type == TOK_IDENTIFIER && !ident_is(ps, "CONSTRAINT") &&
-                    !ident_is(ps, "PRIMARY") && !ident_is(ps, "UNIQUE") && !ident_is(ps, "FOREIGN") && !ident_is(ps, "CHECK"))) {
-                    if (ident_is(ps, "COLUMN")) consume(ps);           // ADD [COLUMN] nome tipo modificatori
-                    ASTNode* def = calloc(1, sizeof(ASTNode));
-                    if (!def) { parse_fail(ps, "Out of memory", peek(ps)); break; }
-                    def->type = NODE_CREATE_TABLE;
-                    n->alter_table.add_column = def;
-                    parse_column_def(ps, def);
-                    // AFTER colonna | FIRST di MySQL: accettati (la colonna nuova va in fondo)
-                    if (match(ps, TOK_AFTER)) consume(ps);
-                    else if (ident_is(ps, "FIRST")) consume(ps);
-                    break;
+            // ALTER TABLE t op1, op2, ...: una catena di nodi (eseguiti in ordine)
+            ASTNode* cur = n;
+            for (;;) {
+                parse_alter_op(ps, cur);
+                while (cur->chain && cur->chain->type == NODE_ALTER_TABLE) cur = cur->chain;   // (CHANGE ne aggiunge uno)
+                if (cur->chain) {                       // ADD / DROP INDEX: nodo dell'indice, poi un ALTER vuoto per le altre
+                    ASTNode* hold = calloc(1, sizeof(ASTNode));
+                    if (!hold) { parse_fail(ps, "Out of memory", peek(ps)); break; }
+                    hold->type = NODE_ALTER_TABLE;
+                    hold->alter_table.noop = true;
+                    snprintf(hold->alter_table.table_name, sizeof(hold->alter_table.table_name), "%s", n->alter_table.table_name);
+                    cur->chain->chain = hold;
+                    cur = hold;
                 }
-                ConstraintDef* c = &n->alter_table.add;
-                memset(c, 0, sizeof(*c));
-                if (ident_is(ps, "CONSTRAINT")) {
-                    consume(ps);
-                    Token nm = consume(ps);
-                    if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a name after CONSTRAINT", nm); break; }
-                    copy_text(ps, c->name, sizeof(c->name), nm.text);
-                }
-                if (!parse_table_constraint(ps, c))
-                    parse_fail(ps, "Expected PRIMARY KEY, UNIQUE, FOREIGN KEY or CHECK after ADD", peek(ps));
-                n->alter_table.has_add = true;
-            } else if (match(ps, TOK_DROP)) {
-                if (!ident_is(ps, "CONSTRAINT")) {                          // DROP [COLUMN] nome
-                    if (ident_is(ps, "COLUMN")) consume(ps);
-                    Token c = consume(ps);
-                    if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the column name after DROP", c); break; }
-                    copy_text(ps, n->alter_table.drop_column, sizeof(n->alter_table.drop_column), c.text);
-                    break;
-                }
-                consume(ps);
-                Token nm = consume(ps);
-                if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the constraint name", nm); break; }
-                copy_text(ps, n->alter_table.drop_constraint, sizeof(n->alter_table.drop_constraint), nm.text);
-            } else if (match(ps, TOK_ALTER) || ident_is(ps, "MODIFY")) {
-                // ALTER [COLUMN] c TYPE t | SET DATA TYPE t | SET DEFAULT v | DROP DEFAULT | SET / DROP NOT NULL
-                bool modify = ps->tokens->tokens[ps->pos - 1].type != TOK_ALTER;
-                if (modify) consume(ps);
-                if (ident_is(ps, "COLUMN")) consume(ps);
-                Token c = consume(ps);
-                if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the column name", c); break; }
-                copy_text(ps, n->alter_table.alter_col, sizeof(n->alter_table.alter_col), c.text);
-                ColumnDef* d = &n->alter_table.alter_def;
-                memset(d, 0, sizeof(*d));
-                if (modify) { n->alter_table.alter_kind = ALT_TYPE; parse_type_spec(ps, d); break; }
-                if (ident_is(ps, "TYPE")) { consume(ps); n->alter_table.alter_kind = ALT_TYPE; parse_type_spec(ps, d); break; }
-                bool set = match(ps, TOK_SET);
-                if (!set && !match(ps, TOK_DROP)) { parse_fail(ps, "Expected TYPE, SET or DROP after the column name", peek(ps)); break; }
-                if (set && ident_is(ps, "DATA")) {
-                    consume(ps);
-                    if (!ident_is(ps, "TYPE")) { parse_fail(ps, "Expected TYPE after SET DATA", peek(ps)); break; }
-                    consume(ps);
-                    n->alter_table.alter_kind = ALT_TYPE;
-                    parse_type_spec(ps, d);
-                } else if (ident_is(ps, "DEFAULT")) {
-                    consume(ps);
-                    n->alter_table.alter_kind = set ? ALT_SET_DEFAULT : ALT_DROP_DEFAULT;
-                    if (set) { parse_default_value(ps, d->default_val, sizeof(d->default_val)); d->has_default = true; }
-                } else if (match(ps, TOK_NOT)) {
-                    if (!match(ps, TOK_NULL)) { parse_fail(ps, "Expected NULL after NOT", peek(ps)); break; }
-                    n->alter_table.alter_kind = set ? ALT_SET_NOT_NULL : ALT_DROP_NOT_NULL;
-                } else {
-                    parse_fail(ps, set ? "Expected DATA TYPE, DEFAULT or NOT NULL after SET" : "Expected DEFAULT or NOT NULL after DROP", peek(ps));
-                }
-            } else {
-                parse_fail(ps, "Expected RENAME, ADD, DROP or ALTER after ALTER TABLE name", peek(ps));
+                if (!ps->result->success || !match(ps, TOK_COMMA)) break;
+                ASTNode* nx = calloc(1, sizeof(ASTNode));
+                if (!nx) { parse_fail(ps, "Out of memory", peek(ps)); break; }
+                nx->type = NODE_ALTER_TABLE;
+                snprintf(nx->alter_table.table_name, sizeof(nx->alter_table.table_name), "%s", n->alter_table.table_name);
+                cur->chain = nx;
+                cur = nx;
             }
             break;
         }
@@ -4632,6 +4740,7 @@ ASTExpr* parser_parse_expr(TokenList* tokens, char* err, size_t errn) {
 
 static void free_node(ASTNode* n) {
     if (!n) return;
+    free_node(n->chain);
     for (int j = 0; j < n->nret; j++) ast_expr_free(n->returning[j]);
     free(n->returning);
     switch (n->type) {

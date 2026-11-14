@@ -202,6 +202,8 @@ typedef struct ASTNode {
     char     qual_db[64];      // database dei nomi qualificati (shop.prodotto); "" = quello corrente
     bool     qual_mixed;       // anche tabelle senza database: valide solo se il corrente è qual_db
     int      set_fk_checks;    // NODE_SET: FOREIGN_KEY_CHECKS = 0 / 1 (-1 = non nominato)
+    // ALTER TABLE t op1, op2, ...: le operazioni dopo la prima (ALTER, CREATE / DROP INDEX), eseguite in ordine
+    struct ASTNode* chain;
     // INSERT / UPDATE / DELETE ... RETURNING espr [AS nome], ... | * (PostgreSQL)
     struct ASTExpr** returning;
     int      nret;
@@ -317,6 +319,7 @@ typedef struct ASTNode {
             char       alter_col[64];
             int        alter_kind;            // ALT_*
             ColumnDef  alter_def;             // tipo e dimensione (TYPE) o valore (SET DEFAULT)
+            bool       noop;                  // l'operazione è nel nodo next (ADD INDEX / DROP INDEX)
         } alter_table;
         struct {
             char       table_name[64];

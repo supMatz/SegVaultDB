@@ -1381,6 +1381,21 @@ int main(void) {
     t("CREATE TABLE idt2 (id INT IDENTITY(1, 1) PRIMARY KEY, x INT)", "OK:0");
     t("INSERT INTO idt (x) VALUES (5), (6) RETURNING id", "1;2");
     t("CREATE TABLE calc (a INT, b INT GENERATED ALWAYS AS (a * 2))", "ERR:computed columns are not supported");
+    // ALTER TABLE con più operazioni (migrazioni di Laravel / Doctrine), CHANGE, ADD / DROP INDEX
+    t("create table `lu` (`id` bigint unsigned not null auto_increment primary key, `name` varchar(255) not null, `email` varchar(255) not null)", "OK:0");
+    t("insert into lu (name, email) values ('Anna', 'a@x.it')", "OK:1");
+    t("alter table `lu` add unique `lu_email_unique`(`email`)", "OK:0");
+    t("alter table `lu` add `votes` int not null default '0' after `name`, add `bio` text null, add index `lu_votes_index`(`votes`)", "OK:0");
+    t("SELECT votes, bio FROM lu", "0|NULL");
+    t("SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_NAME = 'lu' ORDER BY INDEX_NAME", "PRIMARY;lu_email_unique;lu_votes_index");
+    t("alter table lu change bio about varchar(500) null, modify name varchar(100) not null", "OK:0");
+    t("SELECT name, about FROM lu", "Anna|NULL");
+    t("alter table lu drop index lu_votes_index, drop column votes", "OK:0");
+    t("SELECT * FROM lu", "1|Anna|a@x.it|NULL");
+    t("alter table lu add column x int, add column x int", "ERR:");
+    t("CREATE TABLE lp (id INT PRIMARY KEY, uid BIGINT, CONSTRAINT lp_uid_fk FOREIGN KEY (uid) REFERENCES lu (id))", "OK:0");
+    t("ALTER TABLE lp DROP FOREIGN KEY lp_uid_fk", "OK:0");
+    t("INSERT INTO lp VALUES (1, 99)", "OK:1");
     t("SHOW FUNCTION STATUS", "#7");
     t("SHOW PROCEDURE STATUS LIKE 'p%'", "#2");
     t("SELECT `Type` FROM (SHOW FUNCTION STATUS) AS s LIMIT 1", "ERR:");

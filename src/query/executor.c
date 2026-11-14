@@ -11144,7 +11144,19 @@ static QueryResult* executor_run_impl(ExecCtx* ctx, ASTNode* stmt) {
             }
             return r;
         }
-        case NODE_ALTER_TABLE:  return exec_alter_table(ctx, stmt);
+        case NODE_ALTER_TABLE: {
+            // ALTER TABLE t op1, op2, ...: in ordine, fino al primo errore
+            QueryResult* r = stmt->alter_table.noop ? result_ok_msg(0) : exec_alter_table(ctx, stmt);
+            long long affected = r && r->success ? r->rows_affected : 0;
+            for (ASTNode* c = stmt->chain; c && r && r->success; c = c->chain) {
+                db_result_free(r);
+                r = c->type == NODE_ALTER_TABLE && c->alter_table.noop ? result_ok_msg(0)
+                  : c->type == NODE_ALTER_TABLE ? exec_alter_table(ctx, c) : executor_run_impl(ctx, c);
+                if (r && r->success) affected += r->rows_affected;
+            }
+            if (r && r->success && stmt->chain) r->rows_affected = (int)affected;
+            return r;
+        }
         case NODE_INSERT: {
             if (stmt->insert_stmt.mode != INS_NORMAL || stmt->insert_stmt.num_dup > 0) return exec_insert_mysql(ctx, stmt);
             QueryResult* r = exec_insert(ctx, stmt);
