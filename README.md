@@ -1583,14 +1583,25 @@ Fatto nella 1.1 (dettagli in [TODO.md](TODO.md)): server di sviluppo completo (P
 proxy, HTTPS + HTTP/2, posta, `.htaccess`, CGI), transazioni concorrenti con MVCC, compatibilità MySQL
 provata con WordPress, servizi indipendenti, area di notifica, pacchetti portabili.
 
+Fatto nella 1.1.1: import dei dump classici di MySQL (classicmodels, Northwind, world, Sakila), database in
+uso sempre uguale tra albero, Designer e indicatore, finestra *Sfoglia* del sistema per aprire e salvare i file.
+
+Fatto nella 1.2: linguaggio completo delle stored procedure e delle funzioni (variabili, cicli, cursori,
+handler, `OUT` / `INOUT`), `@variabili` e operatori di MySQL, `PREPARE` / `EXECUTE`, `LATERAL` / `APPLY`,
+`JSON_TABLE` con `NESTED PATH`, `GENERATE_SERIES`, `ROLLUP` / `CUBE` / `GROUPING SETS`, query su più database,
+frame `RANGE` per valore, `RETURNING`, `ON CONFLICT`, `MERGE`, colonne calcolate, sequenze, `ALTER TABLE` con
+più operazioni, molte nuove funzioni (aggregati statistici, finestra, JSON, testo, date).
+
 Prossimi passi:
 
-1. **Motore** — lock sulle righe per le scritture concorrenti sulla stessa tabella; indice full-text;
+1. **SQL** — eventi pianificati (`CREATE EVENT`), colonne calcolate `VIRTUAL` (oggi salvate come `STORED`),
+   frame `RANGE` con `INTERVAL` di mesi e anni.
+2. **Motore** — lock sulle righe per le scritture concorrenti sulla stessa tabella; indice full-text;
    più tabelle, colonne e indici per database.
-2. **Sviluppo** — supporto a più versioni di PHP in parallelo (una per sito), Node.js e Python gestiti
+3. **Sviluppo** — supporto a più versioni di PHP in parallelo (una per sito), Node.js e Python gestiti
    dal pannello, terminale integrato, Redis compatibile.
-3. **GUI** — costruttore visuale di query, editor di trigger e viste, interfaccia in italiano.
-4. **Portata** — versione macOS nativa, interfaccia web, firma degli eseguibili Windows.
+4. **GUI** — costruttore visuale di query, editor di trigger e viste, interfaccia in italiano.
+5. **Portata** — versione macOS nativa, interfaccia web, firma degli eseguibili Windows.
 
 ## Licenza
 
