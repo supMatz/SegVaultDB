@@ -47,6 +47,7 @@ typedef struct WindowSpec {
     int             fs, fe;        // FB_* di inizio e fine
     int64_t         fs_off, fe_off;// n di "n PRECEDING / n FOLLOWING"
     int             slot;          // posizione fra le funzioni finestra della query (executor)
+    char            ref[64];       // OVER nome: finestra definita nella clausola WINDOW (risolta dal parser)
 } WindowSpec;
 
 // tipi di subquery
@@ -204,6 +205,7 @@ typedef struct ASTNode {
             ASTExpr*   where;
             ASTExpr*   order_exprs[SV_MAX_ORDER];
             bool       order_desc[SV_MAX_ORDER];
+            char       order_nulls[SV_MAX_ORDER];   // 0 = come MySQL (NULL primi in ASC), 'F' = NULLS FIRST, 'L' = NULLS LAST
             int        num_order;
             int        limit;
             int        offset;
@@ -282,6 +284,8 @@ typedef struct ASTNode {
             char       collation[40];         // [DEFAULT] COLLATE x / CHARSET x
             long long  auto_increment;        // AUTO_INCREMENT = n
             bool       temporary;             // CREATE TEMPORARY TABLE
+            struct ASTNode* as_select;        // CREATE TABLE t AS SELECT ...
+            char       like_table[64];        // CREATE TABLE t LIKE s
         } create_table;
         struct {
             char       table_name[64];
@@ -302,6 +306,8 @@ typedef struct ASTNode {
         struct {
             char       table_name[64];
             bool       temporary;             // DROP TEMPORARY TABLE
+            char       more[15][64];          // DROP TABLE a, b, c: le tabelle dopo la prima
+            int        nmore;
         } drop_table;
         struct {
             char       index_name[64];

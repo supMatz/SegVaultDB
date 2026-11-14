@@ -464,7 +464,9 @@ static ASTExpr* depth_check(ParserState* ps, ASTExpr* e) {
 }
 
 static bool is_aggregate_name(const char* s) {
-    static const char* AGG[] = { "COUNT", "SUM", "AVG", "MIN", "MAX" };
+    static const char* AGG[] = { "COUNT", "SUM", "AVG", "MIN", "MAX",
+        "STDDEV", "STD", "STDDEV_POP", "STDDEV_SAMP", "VARIANCE", "VAR_POP", "VAR_SAMP",
+        "BIT_AND", "BIT_OR", "BIT_XOR", "BOOL_AND", "BOOL_OR", "EVERY", "JSON_ARRAYAGG", "JSON_OBJECTAGG" };
     for (size_t i = 0; i < sizeof(AGG) / sizeof(AGG[0]); i++)
         if (strcasecmp(s, AGG[i]) == 0) return true;
     return false;
@@ -481,6 +483,7 @@ static ASTExpr* mkfunc2(const char* name, ASTExpr* a, ASTExpr* b);
 static bool is_interval(const ASTExpr* e);
 static bool peek2_ident(ParserState* ps, const char* w);
 static ASTExpr* parse_match(ParserState* ps);
+static void parse_window_spec(ParserState* ps, WindowSpec* w);
 static ASTExpr* op_call(ParserState* ps, const char* name, ASTExpr* a, ASTExpr* b);
 static ASTExpr* json_call(const char* name, ASTExpr* a, ASTExpr* b);
 
@@ -650,16 +653,54 @@ static ASTExpr* parse_call(ParserState* ps) {
         } while (ps->result->success && match(ps, TOK_COMMA));
     }
     if (!match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' to close the function call", peek(ps));
-    if (agg && e->nargs != (strcmp(e->col_name, "*") == 0 ? 0 : 1))
-        parse_fail(ps, "Aggregate functions take exactly one argument", fn);
+    int want = !strcmp(e->func, "JSON_OBJECTAGG") ? 2 : 1;
+    if (agg && e->nargs != (strcmp(e->col_name, "*") == 0 ? 0 : want))
+        parse_fail(ps, want == 2 ? "JSON_OBJECTAGG takes a key and a value" : "Aggregate functions take exactly one argument", fn);
     if (!ps->result->success) { ast_expr_free(e); return NULL; }
+    // aggregato FILTER (WHERE condizione): conta / somma solo le righe che la soddisfano
+    if (agg && ident_is(ps, "FILTER") && next_is(ps, 1, TOK_LPAREN)) {
+        consume(ps); consume(ps);
+        if (!match(ps, TOK_WHERE)) { parse_fail(ps, "Expected WHERE in FILTER", peek(ps)); ast_expr_free(e); return NULL; }
+        ASTExpr* cond = parse_expr(ps);
+        if (!cond || !match(ps, TOK_RPAREN)) { if (ps->result->success) parse_fail(ps, "Expected ')' after FILTER", peek(ps)); ast_expr_free(cond); ast_expr_free(e); return NULL; }
+        ASTExpr* cs = new_expr(EXPR_CASE);
+        ASTExpr** ca = cs ? calloc(2, sizeof(ASTExpr*)) : NULL;
+        if (!ca) { free(cs); ast_expr_free(cond); ast_expr_free(e); return NULL; }
+        bool star = !strcmp(e->col_name, "*");
+        ASTExpr* val = star ? new_expr(EXPR_INT) : e->args[0];
+        if (star && val) val->int_val = 1;
+        ca[0] = cond; ca[1] = val;
+        cs->args = ca; cs->nargs = 2;
+        cs->depth = (cond->depth > (val ? val->depth : 0) ? cond->depth : (val ? val->depth : 0)) + 1;
+        if (star) {
+            e->args = calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
+            if (!e->args) { ast_expr_free(cs); ast_expr_free(e); return NULL; }
+            e->col_name[0] = '\0';
+            e->nargs = 1;
+        }
+        e->args[0] = cs;
+        if (cs->depth + 1 > e->depth) e->depth = cs->depth + 1;
+    }
     if (ident_is(ps, "OVER")) {                       // funzione finestra
         consume(ps);
-        if (!match(ps, TOK_LPAREN)) { parse_fail(ps, "Expected '(' after OVER", peek(ps)); ast_expr_free(e); return NULL; }
         WindowSpec* w = calloc(1, sizeof(WindowSpec));
         if (!w) { ast_expr_free(e); parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
         e->win = w;
         e->type = EXPR_WINDOW;
+        if (peek(ps).type == TOK_IDENTIFIER) {         // OVER nome (clausola WINDOW)
+            copy_text(ps, w->ref, sizeof(w->ref), consume(ps).text);
+            return e;
+        }
+        if (!match(ps, TOK_LPAREN)) { parse_fail(ps, "Expected '(' after OVER", peek(ps)); ast_expr_free(e); return NULL; }
+        parse_window_spec(ps, w);
+        if (!ps->result->success) { ast_expr_free(e); return NULL; }
+    }
+    return e;
+}
+
+// corpo di OVER ( ... ) dopo '(': [PARTITION BY ...] [ORDER BY ...] [frame] ')'
+static void parse_window_spec(ParserState* ps, WindowSpec* w) {
+    {
         if (ident_is(ps, "PARTITION")) {
             consume(ps);
             expect(ps, TOK_BY);
@@ -683,9 +724,7 @@ static ASTExpr* parse_call(ParserState* ps) {
         }
         if (ps->result->success && (ident_is(ps, "ROWS") || ident_is(ps, "RANGE"))) parse_frame(ps, w);
         if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' to close OVER", peek(ps));
-        if (!ps->result->success) { ast_expr_free(e); return NULL; }
     }
-    return e;
 }
 
 
@@ -908,6 +947,79 @@ static ASTExpr* parse_special_form(ParserState* ps) {
         ASTExpr* f = mkfunc2("SUBSTRING", s0, a);
         return b ? add_arg(f, b) : f;
     }
+    // OVERLAY(s PLACING r FROM n [FOR m]) (standard)
+    if (!strcasecmp(w, "OVERLAY") && next_is(ps, 1, TOK_LPAREN)) {
+        int save = ps->pos;
+        consume(ps); consume(ps);
+        ASTExpr* s0 = parse_expr(ps);
+        if (!s0 || !ident_is(ps, "PLACING")) { ast_expr_free(s0); ps->pos = save; ps->result->success = true; ps->result->error[0] = '\0'; return NULL; }
+        consume(ps);
+        ASTExpr* r = parse_expr(ps);
+        ASTExpr* from = NULL;
+        ASTExpr* len = NULL;
+        if (r && match(ps, TOK_FROM)) from = parse_expr(ps);
+        if (from && match(ps, TOK_FOR)) len = parse_expr(ps);
+        if (!from || !match(ps, TOK_RPAREN)) {
+            if (ps->result->success) parse_fail(ps, "Expected OVERLAY(text PLACING text FROM n [FOR m])", peek(ps));
+            ast_expr_free(s0); ast_expr_free(r); ast_expr_free(from); ast_expr_free(len);
+            return NULL;
+        }
+        ASTExpr* fn = json_call("OVERLAY", s0, r);
+        fn = add_arg(fn, from);
+        return len ? add_arg(fn, len) : fn;
+    }
+    // STRING_AGG(e, sep [ORDER BY ...]) (PostgreSQL / SQL Server) e LISTAGG(e [, sep]) [WITHIN GROUP (ORDER BY ...)]
+    // (standard, Oracle): come GROUP_CONCAT
+    if (!strcasecmp(w, "STRING_AGG") || !strcasecmp(w, "LISTAGG")) {
+        bool lst = !strcasecmp(w, "LISTAGG");
+        consume(ps); consume(ps);
+        ASTExpr* e = new_expr(EXPR_AGG);
+        if (!e) return NULL;
+        snprintf(e->func, sizeof(e->func), "GROUP_CONCAT");
+        if (match(ps, TOK_DISTINCT)) e->agg_distinct = true;
+        e->args = calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
+        if (!e->args) { ast_expr_free(e); return NULL; }
+        ASTExpr* v = parse_expr(ps);
+        if (!v) { ast_expr_free(e); return NULL; }
+        e->args[e->nargs++] = v;
+        char sep[128] = "";
+        if (match(ps, TOK_COMMA)) {
+            Token st = consume(ps);
+            if (st.type != TOK_STRING) { parse_fail(ps, "Expected a quoted separator", st); ast_expr_free(e); return NULL; }
+            copy_text(ps, sep, sizeof(sep), st.text);
+        } else if (!lst) { parse_fail(ps, "STRING_AGG needs a separator", peek(ps)); ast_expr_free(e); return NULL; }
+        char flags[MAX_FUNC_ARGS + 1] = "";
+        int no = 0;
+        bool within = false;
+        if (ps->result->success && peek(ps).type != TOK_ORDER && !match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')'", peek(ps)); ast_expr_free(e); return NULL; }
+        else if (peek(ps).type != TOK_ORDER) within = lst && ident_is(ps, "WITHIN");
+        if (within) {                                              // WITHIN GROUP (ORDER BY ...)
+            consume(ps);
+            if (peek(ps).type != TOK_GROUP || !next_is(ps, 1, TOK_LPAREN)) { parse_fail(ps, "Expected WITHIN GROUP (ORDER BY ...)", peek(ps)); ast_expr_free(e); return NULL; }
+            consume(ps); consume(ps);
+        }
+        if (match(ps, TOK_ORDER)) {
+            expect(ps, TOK_BY);
+            do {
+                if (e->nargs >= MAX_FUNC_ARGS - 1) { parse_fail(ps, "Too many ORDER BY keys", peek(ps)); break; }
+                ASTExpr* a = parse_expr(ps);
+                if (!a) break;
+                e->args[e->nargs++] = a;
+                char d = 'A';
+                if (match(ps, TOK_DESC)) d = 'D'; else match(ps, TOK_ASC);
+                flags[no++] = d;
+                flags[no] = '\0';
+            } while (ps->result->success && match(ps, TOK_COMMA));
+            if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')'", peek(ps));
+        }
+        if (!ps->result->success) { ast_expr_free(e); return NULL; }
+        ASTExpr* se = mkstr(sep);
+        if (!se) { ast_expr_free(e); return NULL; }
+        e->args[e->nargs++] = se;
+        snprintf(e->col_name, sizeof(e->col_name), "#gc 1 %d %s", no, flags);
+        for (int i = 0; i < e->nargs; i++) if (e->args[i]->depth + 1 > e->depth) e->depth = e->args[i]->depth + 1;
+        return e;
+    }
     if (!strcasecmp(w, "GROUP_CONCAT")) {                       // GROUP_CONCAT([DISTINCT] e, ... [ORDER BY ...] [SEPARATOR 's'])
         consume(ps); consume(ps);
         ASTExpr* e = new_expr(EXPR_AGG);
@@ -991,6 +1103,20 @@ static ASTExpr* parse_primary(ParserState* ps) {
             if (query_starts(ps, 1)) return parse_subquery(ps, SUBQ_SCALAR, OP_EQ, NULL);
             consume(ps);
             e = parse_expr(ps);
+            if (e && peek(ps).type == TOK_COMMA) {          // (a, b, ...): valore di riga (confronti e IN)
+                ASTExpr* row = new_expr(EXPR_FUNC);
+                if (!row || !(row->args = calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*)))) { free(row); ast_expr_free(e); return NULL; }
+                snprintf(row->func, sizeof(row->func), "__ROW");
+                row->args[row->nargs++] = e;
+                while (ps->result->success && match(ps, TOK_COMMA)) {
+                    if (row->nargs >= MAX_FUNC_ARGS) { parse_fail(ps, "Too many values in a row", peek(ps)); break; }
+                    ASTExpr* x = parse_expr(ps);
+                    if (!x) break;
+                    row->args[row->nargs++] = x;
+                }
+                for (int i = 0; i < row->nargs; i++) if (row->args[i]->depth + 1 > row->depth) row->depth = row->args[i]->depth + 1;
+                e = row;
+            }
             if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')'", peek(ps)); ast_expr_free(e); return NULL; }
             return e;
         }
@@ -1201,6 +1327,26 @@ static ASTExpr* op_call(ParserState* ps, const char* name, ASTExpr* a, ASTExpr* 
     return depth_check(ps, json_call(name, a, b));
 }
 
+static bool is_row(const ASTExpr* e) { return e && e->type == EXPR_FUNC && !strcmp(e->func, "__ROW"); }
+
+// confronto, anche fra valori di riga: (a, b) = (x, y) -> a = x AND b = y; <> -> NOT (...)
+static ASTExpr* row_or_binary(ParserState* ps, OpType op, ASTExpr* l, ASTExpr* r) {
+    if (!l || !r || (!is_row(l) && !is_row(r))) return new_binary(op, l, r);
+    if (!is_row(l) || !is_row(r) || l->nargs != r->nargs || (op != OP_EQ && op != OP_NEQ)) {
+        parse_fail(ps, "Row values can be compared with = and <> (or IN) only, with the same number of values", peek(ps));
+        ast_expr_free(l); ast_expr_free(r);
+        return NULL;
+    }
+    ASTExpr* acc = NULL;
+    for (int i = 0; i < l->nargs; i++) {
+        ASTExpr* eq = new_binary(OP_EQ, l->args[i], r->args[i]);
+        l->args[i] = r->args[i] = NULL;
+        acc = acc ? new_binary(OP_AND, acc, eq) : eq;
+    }
+    ast_expr_free(l); ast_expr_free(r);
+    return op == OP_NEQ ? new_unary(OP_NOT, acc) : acc;
+}
+
 // a | b, a & b, a << b, a >> b (MySQL): sopra + e -, sotto i confronti
 static ASTExpr* parse_shift(ParserState* ps) {
     ASTExpr* e = parse_additive(ps);
@@ -1290,7 +1436,7 @@ static ASTExpr* parse_predicate(ParserState* ps) {
         do {
             ASTExpr* v = parse_expr(ps);
             if (!v) { ok = false; break; }
-            ASTExpr* cmp = new_binary(neg ? OP_NEQ : OP_EQ, ast_expr_clone(left), v);
+            ASTExpr* cmp = row_or_binary(ps, neg ? OP_NEQ : OP_EQ, ast_expr_clone(left), v);
             if (!cmp || !elist_push(&terms, cmp)) { ast_expr_free(cmp); ok = false; break; }
         } while (ps->result->success && match(ps, TOK_COMMA));
         ast_expr_free(left);
@@ -1315,7 +1461,7 @@ static ASTExpr* parse_predicate(ParserState* ps) {
         if (!query_starts(ps, 1)) { parse_fail(ps, "ANY / ALL need a subquery", peek(ps)); ast_expr_free(left); return NULL; }
         return parse_subquery(ps, quant_all ? SUBQ_ALL : SUBQ_ANY, op, left);
     }
-    return new_binary(op, left, parse_bitor(ps));
+    return row_or_binary(ps, op, left, parse_bitor(ps));
 }
 
 static ASTExpr* parse_not(ParserState* ps) {
@@ -1394,28 +1540,93 @@ static bool alias_forbidden(ParserState* ps) {
     return false;
 }
 
+// MySQL: USE | FORCE | IGNORE {INDEX | KEY} [FOR JOIN | ORDER BY | GROUP BY] (indici): accettati, il piano lo
+// sceglie comunque SegVault
+static bool index_hint_here(ParserState* ps) {
+    return (peek(ps).type == TOK_USE || ident_is(ps, "FORCE") || ident_is(ps, "IGNORE")) &&
+           (next_is(ps, 1, TOK_INDEX) || next_is(ps, 1, TOK_KEY));
+}
+static void skip_index_hints(ParserState* ps) {
+    while (ps->result->success && index_hint_here(ps)) {
+        consume(ps); consume(ps);
+        if (match(ps, TOK_FOR)) { if (!match(ps, TOK_JOIN)) { consume(ps); match(ps, TOK_BY); } }
+        if (!match(ps, TOK_LPAREN)) { parse_fail(ps, "Expected '(' after USE / FORCE / IGNORE INDEX", peek(ps)); return; }
+        while (peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) consume(ps);
+        match(ps, TOK_RPAREN);
+    }
+}
+
 // [AS] alias dopo un nome di tabella
 static void parse_table_alias(ParserState* ps, char* alias, size_t cap) {
     bool as = match(ps, TOK_AS);
     Token t = peek(ps);
-    if (t.type != TOK_IDENTIFIER || alias_forbidden(ps)) {
+    if (t.type != TOK_IDENTIFIER || alias_forbidden(ps) || (!as && index_hint_here(ps))) {
         if (as) parse_fail(ps, "Expected an alias after AS", t);
+        skip_index_hints(ps);
         return;
     }
     consume(ps);
     copy_text(ps, alias, cap, t.text);
+    skip_index_hints(ps);
 }
 
 // [AS] alias dopo una tabella derivata: obbligatorio in SQL standard, qui facoltativo
+// (VALUES (a, b), (c, d)): una SELECT di costanti per riga, unite con UNION ALL (colonne column1, column2, ...)
+static ASTNode* parse_values_rows(ParserState* ps) {
+    consume(ps);                                         // VALUES
+    ASTNode* head = NULL;
+    ASTNode* tail = NULL;
+    int width = -1;
+    do {
+        if (ident_is(ps, "ROW")) consume(ps);            // VALUES ROW(1, 2) di MySQL
+        else if (peek(ps).type == TOK_ROW) consume(ps);
+        if (!match(ps, TOK_LPAREN)) { parse_fail(ps, "Expected '(' in VALUES", peek(ps)); break; }
+        ASTNode* r = calloc(1, sizeof(ASTNode));
+        if (!r) { parse_fail(ps, "Out of memory", peek(ps)); break; }
+        r->type = NODE_SELECT;
+        do {
+            if (r->select_stmt.num_cols >= 64) { parse_fail(ps, "Too many values in a VALUES row (max 64)", peek(ps)); break; }
+            ASTExpr* e = parse_expr(ps);
+            if (!e) break;
+            int k = r->select_stmt.num_cols++;
+            r->select_stmt.columns[k] = e;
+            snprintf(e->alias, sizeof(e->alias), "column%d", k + 1);
+        } while (ps->result->success && match(ps, TOK_COMMA));
+        if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' after the VALUES row", peek(ps));
+        if (ps->result->success && width >= 0 && r->select_stmt.num_cols != width) parse_fail(ps, "All VALUES rows need the same number of values", peek(ps));
+        width = r->select_stmt.num_cols;
+        if (!head) head = r;
+        else { tail->select_stmt.set_op = SETOP_UNION; tail->select_stmt.set_all = true; tail->select_stmt.set_next = r; }
+        tail = r;
+    } while (ps->result->success && match(ps, TOK_COMMA));
+    return head;
+}
+
+// alias(colonne) di una tabella derivata: nomi delle colonne della sua SELECT
+static void derived_col_names(ParserState* ps, ASTNode* q) {
+    if (!match(ps, TOK_LPAREN)) return;
+    int k = 0;
+    do {
+        Token c = consume(ps);
+        if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", c); return; }
+        if (q && q->type == NODE_SELECT && k < q->select_stmt.num_cols && q->select_stmt.columns[k]->type != EXPR_STAR)
+            copy_text(ps, q->select_stmt.columns[k]->alias, sizeof(q->select_stmt.columns[k]->alias), c.text);
+        else if (q && q->type == NODE_SELECT) { parse_fail(ps, "More column names than columns in the subquery", c); return; }
+        k++;
+    } while (match(ps, TOK_COMMA));
+    if (!match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' after the column names", peek(ps));
+}
+
 static ASTNode* parse_derived(ParserState* ps, char* name, size_t cap) {
     consume(ps);   // '('
     if (++ps->depth > MAX_EXPR_DEPTH) { parse_fail(ps, "Query is too complex", peek(ps)); ps->depth--; return NULL; }
-    ASTNode* q = parse_query(ps);
+    ASTNode* q = peek(ps).type == TOK_VALUES ? parse_values_rows(ps) : parse_query(ps);
     ps->depth--;
     if (!ps->result->success) return q;
     if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')' after the subquery in FROM", peek(ps)); return q; }
     char alias[64] = "";
     parse_table_alias(ps, alias, sizeof(alias));
+    if (alias[0] && peek(ps).type == TOK_LPAREN) derived_col_names(ps, q);
     copy_text(ps, name, cap, alias[0] ? alias : "subquery");
     return q;
 }
@@ -1426,7 +1637,7 @@ static void parse_from_clause(ParserState* ps, ASTNode* n) {
     // FROM fonte [[AS] alias] { , fonte [[AS] alias]
     //   | [INNER | CROSS | LEFT [OUTER] | RIGHT [OUTER]] JOIN fonte [[AS] alias] [ON condizione] }
     // fonte := tabella | vista | '(' SELECT ... ')'
-    if (peek(ps).type == TOK_LPAREN && query_starts(ps, 1)) {
+    if (peek(ps).type == TOK_LPAREN && (query_starts(ps, 1) || next_is(ps, 1, TOK_VALUES))) {
         n->select_stmt.from_sub = parse_derived(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name));
         memcpy(n->select_stmt.table_alias, n->select_stmt.table_name, sizeof(n->select_stmt.table_alias));
     } else {
@@ -1454,7 +1665,7 @@ static void parse_from_clause(ParserState* ps, ASTNode* n) {
         ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
         memset(j, 0, sizeof(ASTJoin));
         j->type = jt;
-        if (peek(ps).type == TOK_LPAREN && query_starts(ps, 1)) {
+        if (peek(ps).type == TOK_LPAREN && (query_starts(ps, 1) || next_is(ps, 1, TOK_VALUES))) {
             j->sub = parse_derived(ps, j->table_name, sizeof(j->table_name));
             memcpy(j->alias, j->table_name, sizeof(j->alias));
             if (!ps->result->success) break;
@@ -1480,6 +1691,30 @@ static void parse_from_clause(ParserState* ps, ASTNode* n) {
         }
         else if (jt == JOIN_LEFT || jt == JOIN_RIGHT || jt == JOIN_FULL) parse_fail(ps, "LEFT, RIGHT and FULL JOIN need ON, USING or NATURAL", peek(ps));
     }
+}
+
+// OVER nome -> copia della finestra definita con WINDOW nome AS (...)
+static void win_resolve(ASTExpr* e, const char* name, const WindowSpec* def) {
+    if (!e) return;
+    if (e->type == EXPR_WINDOW && e->win && e->win->ref[0] && !strcasecmp(e->win->ref, name)) {
+        WindowSpec* w = e->win;
+        w->ref[0] = '\0';
+        for (int i = 0; i < def->npart; i++) w->part[w->npart++] = ast_expr_clone(def->part[i]);
+        for (int i = 0; i < def->nord; i++) { w->ord[w->nord] = ast_expr_clone(def->ord[i]); w->desc[w->nord] = def->desc[i]; w->nord++; }
+        w->frame = def->frame; w->fs = def->fs; w->fe = def->fe; w->fs_off = def->fs_off; w->fe_off = def->fe_off;
+    }
+    win_resolve(e->left, name, def);
+    win_resolve(e->right, name, def);
+    for (int i = 0; i < e->nargs; i++) win_resolve(e->args[i], name, def);
+}
+
+// una finestra OVER nome senza WINDOW nome AS (...)
+static bool win_unresolved(const ASTExpr* e) {
+    if (!e) return false;
+    if (e->type == EXPR_WINDOW && e->win && e->win->ref[0]) return true;
+    if (win_unresolved(e->left) || win_unresolved(e->right)) return true;
+    for (int i = 0; i < e->nargs; i++) if (win_unresolved(e->args[i])) return true;
+    return false;
 }
 
 // SELECT ... INTO v1, @v2 (dopo l'elenco o in fondo alla query); INTO OUTFILE / DUMPFILE non ci sono
@@ -1561,6 +1796,22 @@ static ASTNode* parse_select_core(ParserState* ps) {
     }
 
     if (ps->result->success && match(ps, TOK_HAVING)) n->select_stmt.having = parse_expr(ps);
+    // WINDOW w AS (spec) [, ...]: le funzioni con OVER w prendono quella finestra
+    if (ps->result->success && ident_is(ps, "WINDOW") && next_is(ps, 1, TOK_IDENTIFIER)) {
+        consume(ps);
+        do {
+            Token nm = consume(ps);
+            if (nm.type != TOK_IDENTIFIER || !match(ps, TOK_AS) || !match(ps, TOK_LPAREN)) { parse_fail(ps, "Expected name AS (window) after WINDOW", nm); break; }
+            WindowSpec def;
+            memset(&def, 0, sizeof(def));
+            parse_window_spec(ps, &def);
+            if (ps->result->success) {
+                for (int i = 0; i < n->select_stmt.num_cols; i++) win_resolve(n->select_stmt.columns[i], nm.text, &def);
+            }
+            for (int i = 0; i < def.npart; i++) ast_expr_free(def.part[i]);
+            for (int i = 0; i < def.nord; i++) ast_expr_free(def.ord[i]);
+        } while (ps->result->success && match(ps, TOK_COMMA));
+    }
     return n;
 }
 
@@ -1576,7 +1827,28 @@ static void parse_order_limit(ParserState* ps, ASTNode* n) {
             n->select_stmt.order_exprs[k] = o;
             if (match(ps, TOK_DESC)) n->select_stmt.order_desc[k] = true;
             else match(ps, TOK_ASC);
+            if (ident_is(ps, "NULLS") && (peek2_ident(ps, "FIRST") || peek2_ident(ps, "LAST"))) {   // NULLS FIRST | LAST
+                consume(ps);
+                n->select_stmt.order_nulls[k] = (char)toupper((unsigned char)consume(ps).text[0]);
+            }
         } while (ps->result->success && match(ps, TOK_COMMA));
+    }
+    // standard: OFFSET n {ROW | ROWS} [FETCH {FIRST | NEXT} [n] {ROW | ROWS} ONLY]
+    if (ps->result->success && ident_is(ps, "OFFSET") && next_is(ps, 1, TOK_INTEGER)) {
+        consume(ps);
+        n->select_stmt.offset = atoi(consume(ps).text);
+        if (peek(ps).type == TOK_ROW || ident_is(ps, "ROWS")) consume(ps);
+        if (!ident_is(ps, "FETCH")) { n->select_stmt.has_limit = true; n->select_stmt.limit = INT32_MAX; }
+    }
+    if (ps->result->success && ident_is(ps, "FETCH") && (peek2_ident(ps, "FIRST") || peek2_ident(ps, "NEXT"))) {
+        consume(ps); consume(ps);
+        int lim = 1;
+        if (peek(ps).type == TOK_INTEGER) lim = atoi(consume(ps).text);
+        if (peek(ps).type == TOK_ROW || ident_is(ps, "ROWS")) consume(ps);
+        if (!ident_is(ps, "ONLY")) { parse_fail(ps, "Expected ONLY after FETCH FIRST n ROWS (WITH TIES is not supported)", peek(ps)); return; }
+        consume(ps);
+        n->select_stmt.limit = lim;
+        n->select_stmt.has_limit = true;
     }
 
     if (ps->result->success && match(ps, TOK_LIMIT)) {
@@ -1674,6 +1946,9 @@ static ASTNode* parse_query(ParserState* ps) {
     }
     parse_order_limit(ps, head);
     if (ps->result->success && peek(ps).type == TOK_INTO && head->select_stmt.num_into == 0) parse_select_into(ps, head);
+    for (ASTNode* arm = head; arm && ps->result->success; arm = arm->select_stmt.set_next)
+        for (int i = 0; i < arm->select_stmt.num_cols; i++)
+            if (win_unresolved(arm->select_stmt.columns[i])) { parse_fail(ps, "Unknown window name after OVER (define it with WINDOW name AS (...))", peek(ps)); break; }
     return head;
 }
 
@@ -3096,6 +3371,18 @@ static void parse_create_table(ParserState* ps, ASTNode* n) {
     Token tn = table_tok(ps);
     if (tn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name after CREATE TABLE", tn); return; }
     copy_text(ps, n->create_table.table_name, sizeof(n->create_table.table_name), tn.text);
+    if (match(ps, TOK_LIKE)) {                                   // CREATE TABLE t LIKE s: stessa struttura, vuota
+        Token src = table_tok(ps);
+        if (src.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name after LIKE", src); return; }
+        copy_text(ps, n->create_table.like_table, sizeof(n->create_table.like_table), src.text);
+        return;
+    }
+    if (peek(ps).type == TOK_AS || query_starts(ps, 0)) {        // CREATE TABLE t [AS] SELECT ...: colonne e righe del risultato
+        match(ps, TOK_AS);
+        if (!query_starts(ps, 0)) { parse_fail(ps, "Expected SELECT after AS", peek(ps)); return; }
+        n->create_table.as_select = parse_query(ps);
+        return;
+    }
     if (!expect(ps, TOK_LPAREN)) return;
     do {
         if (!ps->result->success) return;
@@ -3378,6 +3665,13 @@ static ASTNode* parse_show_mysql(ParserState* ps) {
                  "'utf8mb4' AS `character_set_client`, 'utf8mb4_general_ci' AS `collation_connection`, 'utf8mb4_general_ci' AS `Database Collation` "
                  "FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_TYPE = '%s' AND ROUTINE_NAME = %s",
                  fn ? "Function" : "Procedure", fn ? "FUNCTION" : "PROCEDURE", fn ? "Function" : "Procedure", fn ? "FUNCTION" : "PROCEDURE", nq);
+    } else if (!full && (ident_is(ps, "VARIABLES") || ((ident_is(ps, "GLOBAL") || ident_is(ps, "SESSION")) && peek2_ident(ps, "VARIABLES")))) {
+        if (!ident_is(ps, "VARIABLES")) consume(ps);
+        consume(ps);
+        if (!show_filter(ps, "VARIABLE_NAME", like, sizeof(like), where, sizeof(where))) return NULL;
+        snprintf(sql, sizeof(sql), "SELECT * FROM (SELECT VARIABLE_NAME AS `Variable_name`, VARIABLE_VALUE AS `Value` "
+                 "FROM information_schema.SESSION_VARIABLES WHERE 1 = 1%s) AS v", like);
+        if (where[0]) { size_t l = strlen(sql); snprintf(sql + l, sizeof(sql) - l, " WHERE %s", where); }
     } else if (!full && ident_is(ps, "ENGINES")) {
         consume(ps);
         snprintf(sql, sizeof(sql), "SELECT ENGINE AS `Engine`, SUPPORT AS `Support`, COMMENT AS `Comment`, TRANSACTIONS AS `Transactions`, "
@@ -3422,6 +3716,41 @@ static ASTNode* parse_statement(ParserState* ps) {
     if (!n) return NULL;
     Token t = peek(ps);
     if (ident_is(ps, "CALL") && next_is(ps, 1, TOK_IDENTIFIER)) { parse_call_stmt(ps, n); return n; }
+    // TABLE t (standard) = SELECT * FROM t
+    if (t.type == TOK_TABLE && next_is(ps, 1, TOK_IDENTIFIER)) {
+        consume(ps);
+        n->type = NODE_SELECT;
+        ASTExpr* star = new_expr(EXPR_STAR);
+        if (!star) { parse_fail(ps, "Out of memory", t); return n; }
+        n->select_stmt.columns[n->select_stmt.num_cols++] = star;
+        Token tn = table_tok(ps);
+        copy_text(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name), tn.text);
+        parse_order_limit(ps, n);
+        return n;
+    }
+    // VALUES (1, 2), (3, 4) come istruzione (standard): righe di costanti
+    if (t.type == TOK_VALUES && next_is(ps, 1, TOK_LPAREN)) { free(n); ASTNode* q = parse_values_rows(ps); if (q) parse_order_limit(ps, q); return q; }
+    // RELEASE SAVEPOINT x, LOCK TABLES ..., UNLOCK TABLES: accettati (i lock li prendono già le transazioni)
+    if ((ident_is(ps, "RELEASE") && next_is(ps, 1, TOK_SAVEPOINT)) ||
+        ((ident_is(ps, "LOCK") || ident_is(ps, "UNLOCK")) && (peek2_ident(ps, "TABLES") || peek2_ident(ps, "TABLE")))) {
+        n->type = NODE_SET;
+        n->set_fk_checks = -1;
+        while (peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF) consume(ps);
+        return n;
+    }
+    // RENAME TABLE a TO b (MySQL) = ALTER TABLE a RENAME TO b
+    if (t.type == TOK_RENAME && next_is(ps, 1, TOK_TABLE)) {
+        consume(ps); consume(ps);
+        n->type = NODE_ALTER_TABLE;
+        Token a = table_tok(ps);
+        if (a.type != TOK_IDENTIFIER || !expect(ps, TOK_TO)) { if (ps->result->success) parse_fail(ps, "Expected RENAME TABLE a TO b", a); return n; }
+        Token b = consume(ps);
+        if (b.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the new table name", b); return n; }
+        copy_text(ps, n->alter_table.table_name, sizeof(n->alter_table.table_name), a.text);
+        copy_text(ps, n->alter_table.new_name, sizeof(n->alter_table.new_name), b.text);
+        if (peek(ps).type == TOK_COMMA) parse_fail(ps, "Rename one table per statement", peek(ps));
+        return n;
+    }
     // START TRANSACTION [READ WRITE | READ ONLY | WITH CONSISTENT SNAPSHOT] = BEGIN (MySQL)
     if (ident_is(ps, "START") && next_is(ps, 1, TOK_TRANSACTION)) {
         consume(ps);
@@ -3597,6 +3926,9 @@ static ASTNode* parse_statement(ParserState* ps) {
                     def->type = NODE_CREATE_TABLE;
                     n->alter_table.add_column = def;
                     parse_column_def(ps, def);
+                    // AFTER colonna | FIRST di MySQL: accettati (la colonna nuova va in fondo)
+                    if (match(ps, TOK_AFTER)) consume(ps);
+                    else if (ident_is(ps, "FIRST")) consume(ps);
                     break;
                 }
                 ConstraintDef* c = &n->alter_table.add;
@@ -3679,6 +4011,13 @@ static ASTNode* parse_statement(ParserState* ps) {
                 n->drop_table.temporary = temporary;
                 Token tn = table_tok(ps);
                 copy_text(ps, n->drop_table.table_name, sizeof(n->drop_table.table_name), tn.text);
+                while (match(ps, TOK_COMMA)) {                    // DROP TABLE a, b, c
+                    if (n->drop_table.nmore >= 15) { parse_fail(ps, "Too many tables (max 16)", peek(ps)); break; }
+                    Token t2 = table_tok(ps);
+                    if (t2.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name", t2); break; }
+                    copy_text(ps, n->drop_table.more[n->drop_table.nmore++], 64, t2.text);
+                }
+                if (ident_is(ps, "CASCADE") || ident_is(ps, "RESTRICT")) consume(ps);
             } else if (sub.type == TOK_VIEW) {
                 n->type = NODE_DROP_VIEW;
                 Token vn = consume(ps);
@@ -3969,6 +4308,9 @@ static void free_node(ASTNode* n) {
             break;
         case NODE_ALTER_TABLE:
             free_node(n->alter_table.add_column);
+            break;
+        case NODE_CREATE_TABLE:
+            free_node(n->create_table.as_select);
             break;
         case NODE_CALL:
             for (int j = 0; j < n->call.nargs; j++) ast_expr_free(n->call.args[j]);

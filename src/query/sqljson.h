@@ -20,4 +20,13 @@ char*       sj_unquote(const char* value, size_t len);
 // stringa JSON (con virgolette ed escape) di un testo (malloc'd)
 char*       sj_quote(const char* s);
 
+// modifica: op 0 SET, 1 INSERT, 2 REPLACE, 3 REMOVE, 4 ARRAY_APPEND (val: testo JSON). malloc'd; NULL se non valido
+char*       sj_modify(const char* doc, const char* path, const char* val, int op);
+char*       sj_keys(const char* value, size_t len);                 // ["a", "b"] di un oggetto, NULL altrimenti
+bool        sj_contains(const char* target, size_t tl, const char* cand, size_t cl);
+int         sj_depth(const char* value);
+char*       sj_pretty(const char* doc);
+char*       sj_search(const char* doc, bool all, const char* pattern);   // NULL se nessuna corrispondenza
+char*       sj_merge_patch(const char* a, const char* patch);
+
 #endif

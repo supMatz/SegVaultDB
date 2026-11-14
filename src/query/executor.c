@@ -175,6 +175,10 @@ static const Constraint* referenced_by(Database* db, const TableSchema* ts, cons
 static void rt_temp_created(const char* db, const char* table);
 static bool rt_is_temp(const char* db, const char* table);
 static QueryResult* exec_create_table_impl(ExecCtx* ctx, ASTNode* n);
+static QueryResult* exec_create_table_as(ExecCtx* ctx, ASTNode* n);
+static QueryResult* exec_create_table_like(ExecCtx* ctx, ASTNode* n);
+static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n);
+static QueryResult* run_select(ExecCtx* ctx, ASTNode* n, int depth, bool explain);
 
 // CREATE [TEMPORARY] TABLE: una tabella TEMPORARY creata in una routine sparisce alla fine della CALL
 // più esterna (fuori dalle routine è una tabella normale, da eliminare con DROP)
@@ -190,8 +194,89 @@ static QueryResult* exec_create_table(ExecCtx* ctx, ASTNode* n) {
         db_result_free(exec_drop_table(ctx, dn));
         free(dn);
     }
-    QueryResult* r = exec_create_table_impl(ctx, n);
+    QueryResult* r = n->create_table.as_select ? exec_create_table_as(ctx, n)
+                   : n->create_table.like_table[0] ? exec_create_table_like(ctx, n)
+                   : exec_create_table_impl(ctx, n);
     if (temp && r && r->success) rt_temp_created(db->name, n->create_table.table_name);
+    return r;
+}
+
+// CREATE TABLE t AS SELECT ...: colonne con i nomi e i tipi del risultato, poi le righe
+static QueryResult* exec_create_table_as(ExecCtx* ctx, ASTNode* n) {
+    Database* db = catalog_current_db(ctx->catalog);
+    char msg[300];
+    if (catalog_get_table(ctx->catalog, db->name, n->create_table.table_name) || catalog_get_view(ctx->catalog, db->name, n->create_table.table_name)) {
+        if (n->if_exists) return result_ok_msg(0);
+        snprintf(msg, sizeof(msg), "Table or view '%.64s' already exists", n->create_table.table_name);
+        return result_error_msg(msg);
+    }
+    ASTNode* q = n->create_table.as_select;
+    QueryResult* r = run_select(ctx, q, 0, false);
+    if (!r || !r->success) return r ? r : result_error_msg("Out of memory");
+    ASTNode* cn = calloc(1, sizeof(ASTNode));
+    if (!cn) { db_result_free(r); return result_error_msg("Out of memory"); }
+    cn->type = NODE_CREATE_TABLE;
+    snprintf(cn->create_table.table_name, sizeof(cn->create_table.table_name), "%s", n->create_table.table_name);
+    for (int i = 0; i < r->num_cols && i < SV_MAX_COLUMNS; i++) {
+        ColumnDef* d = &cn->create_table.columns[cn->create_table.num_columns++];
+        const char* nm = r->col_names[i] ? r->col_names[i] : "";
+        const char* dot = strrchr(nm, '.');                      // "t.col" -> "col"
+        snprintf(d->name, sizeof(d->name), "%s", dot && dot[1] ? dot + 1 : nm[0] ? nm : "col");
+        const char* ty = r->col_types && r->col_types[i] && r->col_types[i][0] ? r->col_types[i] : "TEXT";
+        // testi senza lunghezza nota: TEXT; tipi sconosciuti (JSON, ...): TEXT
+        if (!strcasecmp(ty, "VARCHAR") || !strcasecmp(ty, "CHAR") || !known_type(ty)) ty = "TEXT";
+        snprintf(d->type, sizeof(d->type), "%s", ty);
+        d->nullable = true;
+    }
+    db_result_free(r);
+    QueryResult* cr = exec_create_table_impl(ctx, cn);
+    free(cn);
+    if (!cr || !cr->success) return cr;
+    db_result_free(cr);
+    ASTNode* ins = calloc(1, sizeof(ASTNode));
+    if (!ins) return result_error_msg("Out of memory");
+    ins->type = NODE_INSERT;
+    snprintf(ins->insert_stmt.table_name, sizeof(ins->insert_stmt.table_name), "%s", n->create_table.table_name);
+    ins->insert_stmt.select = q;
+    QueryResult* ir = exec_insert(ctx, ins);
+    ins->insert_stmt.select = NULL;
+    free(ins);
+    if (!ir || !ir->success) {                                   // niente tabella a metà
+        ASTNode* dn = calloc(1, sizeof(ASTNode));
+        if (dn) {
+            dn->type = NODE_DROP_TABLE;
+            snprintf(dn->drop_table.table_name, sizeof(dn->drop_table.table_name), "%s", n->create_table.table_name);
+            db_result_free(exec_drop_table(ctx, dn));
+            free(dn);
+        }
+    }
+    return ir;
+}
+
+// CREATE TABLE t LIKE s: la stessa struttura (colonne, chiavi, indici, CHECK), senza righe né chiavi esterne
+static QueryResult* exec_create_table_like(ExecCtx* ctx, ASTNode* n) {
+    Database* db = catalog_current_db(ctx->catalog);
+    char msg[300];
+    if (!catalog_get_table(ctx->catalog, db->name, n->create_table.like_table)) {
+        snprintf(msg, sizeof(msg), "Table '%.64s' not found", n->create_table.like_table);
+        return result_error_msg(msg);
+    }
+    char* sql = executor_create_statement(ctx->catalog, db->name, n->create_table.like_table, false);
+    if (!sql) return result_error_msg("Out of memory");
+    char* paren = strchr(sql, '(');
+    size_t need = strlen(sql) + 200;
+    char* text = paren ? malloc(need) : NULL;
+    if (!text) { free(sql); return result_error_msg("Out of memory"); }
+    snprintf(text, need, "CREATE TABLE %s`%s` %s", n->if_exists ? "IF NOT EXISTS " : "", n->create_table.table_name, paren);
+    free(sql);
+    TokenList* tk = lexer_tokenize(text);
+    ParseResult* pr = tk ? parser_parse(tk) : NULL;
+    QueryResult* r;
+    if (!pr || !pr->success || pr->count != 1) r = result_error_msg(pr ? pr->error : "Out of memory");
+    else r = exec_create_table(ctx, pr->statements[0]);
+    parse_result_free(pr);
+    lexer_free(tk);
+    free(text);
     return r;
 }
 
@@ -1645,6 +1730,14 @@ static const FuncDef FUNCS[] = {
     { "__UVAR", 1, 1 }, { "__SYSVAR", 1, 1 }, { "__UASSIGN", 2, 2 }, { "__BITNOT", 1, 1 }, { "__BITAND", 2, 2 },
     { "__BITOR", 2, 2 }, { "__BITXOR", 2, 2 }, { "__SHL", 2, 2 }, { "__SHR", 2, 2 }, { "__NSEQ", 2, 2 }, { "__XOR", 2, 2 },
     { "__PIPES", 2, 2 }, { "__ISTRUE", 1, 1 }, { "__ISFALSE", 1, 1 },
+    // JSON (modifica e ricerca), testo, date
+    { "JSON_SET", 3, 31 }, { "JSON_INSERT", 3, 31 }, { "JSON_REPLACE", 3, 31 }, { "JSON_REMOVE", 2, 32 },
+    { "JSON_ARRAY_APPEND", 3, 31 }, { "JSON_KEYS", 1, 2 }, { "JSON_CONTAINS", 2, 3 }, { "JSON_CONTAINS_PATH", 3, 32 },
+    { "JSON_SEARCH", 3, 3 }, { "JSON_PRETTY", 1, 1 }, { "JSON_DEPTH", 1, 1 }, { "JSON_MERGE_PATCH", 2, 32 },
+    { "JSON_QUOTE", 1, 1 }, { "JSON_STORAGE_SIZE", 1, 1 },
+    { "INITCAP", 1, 1 }, { "SPLIT_PART", 3, 3 }, { "TRANSLATE", 3, 3 }, { "CHR", 1, 1 }, { "CONV", 3, 3 },
+    { "SOUNDEX", 1, 1 }, { "OVERLAY", 3, 4 }, { "DATE_TRUNC", 2, 2 }, { "DATE_PART", 2, 2 }, { "STARTS_WITH", 2, 2 },
+    { "REGEXP_COUNT", 2, 2 }, { "MAKE_SET", 2, 32 }, { "EXPORT_SET", 3, 5 },
 };
 
 static const FuncDef* find_func(const char* name) {
@@ -1820,6 +1913,7 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
             static const struct { const char* n; int lo, hi; } WF[] = {
                 { "ROW_NUMBER", 0, 0 }, { "RANK", 0, 0 }, { "DENSE_RANK", 0, 0 }, { "NTILE", 1, 1 },
                 { "LAG", 1, 3 }, { "LEAD", 1, 3 }, { "FIRST_VALUE", 1, 1 }, { "LAST_VALUE", 1, 1 },
+                { "PERCENT_RANK", 0, 0 }, { "CUME_DIST", 0, 0 }, { "NTH_VALUE", 2, 2 },
                 { "COUNT", 0, 1 }, { "SUM", 1, 1 }, { "AVG", 1, 1 }, { "MIN", 1, 1 }, { "MAX", 1, 1 },
             };
             int k = -1;
@@ -1968,8 +2062,7 @@ static void uservar_get(const char* name, EvalVal* out) {
 }
 
 // variabili di sistema (@@x): i valori che il server MySQL di SegVault annuncia
-static const char* sysvar_value(const char* name) {
-    static const char* const V[][2] = {
+static const char* const SYSVARS[][2] = {
         { "version", "8.0.35-SegVault" }, { "version_comment", "SegVault" }, { "version_compile_os", "SegVault" },
         { "max_allowed_packet", "67108864" }, { "sql_mode", "" }, { "autocommit", "1" },
         { "character_set_client", "utf8mb4" }, { "character_set_connection", "utf8mb4" }, { "character_set_results", "utf8mb4" },
@@ -1981,8 +2074,12 @@ static const char* sysvar_value(const char* name) {
         { "default_storage_engine", "SegVault" }, { "storage_engine", "SegVault" }, { "sql_auto_is_null", "0" },
         { "sql_select_limit", "18446744073709551615" }, { "group_concat_max_len", "1024" }, { "max_sp_recursion_depth", "16" },
         { "hostname", "localhost" }, { "port", "3306" }, { "license", "MIT" }, { "warning_count", "0" }, { "error_count", "0" },
-    };
-    for (size_t i = 0; i < sizeof(V) / sizeof(V[0]); i++) if (!strcasecmp(V[i][0], name)) return V[i][1];
+        { "foreign_key_checks", "ON" }, { "unique_checks", "ON" }, { "sql_safe_updates", "OFF" }, { "innodb_strict_mode", "ON" },
+        { "explicit_defaults_for_timestamp", "ON" }, { "default_week_format", "0" }, { "div_precision_increment", "4" },
+        { NULL, NULL },
+};
+static const char* sysvar_value(const char* name) {
+    for (size_t i = 0; SYSVARS[i][0]; i++) if (!strcasecmp(SYSVARS[i][0], name)) return SYSVARS[i][1];
     return NULL;
 }
 
@@ -3308,6 +3405,353 @@ static void eval_group_concat(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     tb_result(c, out, &res);
 }
 
+// valore SQL come testo JSON: numeri così come sono, NULL -> null, oggetti / array JSON così come sono, testo tra virgolette
+static char* json_of(const EvalVal* v) {
+    if (v->null) return strdup("null");
+    const char* s = ev_s(v);
+    if (v->is_num) return strdup(s);
+    if ((*s == '{' || *s == '[') && sj_valid(s)) return strdup(s);
+    return sj_quote(s);
+}
+
+// funzioni JSON di modifica / ricerca e funzioni di testo e date di PostgreSQL / MySQL
+static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
+    const char* f = e->func;
+    bool jmod = !strcmp(f, "JSON_SET") || !strcmp(f, "JSON_INSERT") || !strcmp(f, "JSON_REPLACE") || !strcmp(f, "JSON_REMOVE") ||
+                !strcmp(f, "JSON_ARRAY_APPEND");
+    if (jmod) {
+        EvalVal d;
+        eval_expr(e->args[0], c, &d);
+        if (d.null) { ev_null(out); return true; }
+        char* doc = strdup(ev_s(&d));
+        int op = !strcmp(f, "JSON_SET") ? 0 : !strcmp(f, "JSON_INSERT") ? 1 : !strcmp(f, "JSON_REPLACE") ? 2 : !strcmp(f, "JSON_REMOVE") ? 3 : 4;
+        int step = op == 3 ? 1 : 2;
+        if (op != 3 && e->nargs % 2 == 0) { free(doc); ctx_error(c, "Wrong number of arguments for %s", f); ev_null(out); return true; }
+        for (int i = 1; doc && i < e->nargs; i += step) {
+            EvalVal pv, vv;
+            eval_expr(e->args[i], c, &pv);
+            if (pv.null) { free(doc); doc = NULL; break; }
+            char* val = NULL;
+            if (op != 3) { eval_expr(e->args[i + 1], c, &vv); val = json_of(&vv); }
+            char* nd = sj_modify(doc, ev_s(&pv), val ? val : "", op);
+            free(val);
+            free(doc);
+            doc = nd;
+            if (!doc) { ctx_error(c, "Invalid JSON document or path in %s", f); ev_null(out); return true; }
+        }
+        if (!doc) { ev_null(out); return true; }
+        ev_set_text(c, out, doc, strlen(doc));
+        free(doc);
+        return true;
+    }
+    if (!strncmp(f, "JSON_", 5)) {
+        bool known = !strcmp(f, "JSON_KEYS") || !strcmp(f, "JSON_CONTAINS") || !strcmp(f, "JSON_CONTAINS_PATH") || !strcmp(f, "JSON_SEARCH") ||
+                     !strcmp(f, "JSON_PRETTY") || !strcmp(f, "JSON_DEPTH") || !strcmp(f, "JSON_MERGE_PATCH") || !strcmp(f, "JSON_QUOTE") ||
+                     !strcmp(f, "JSON_STORAGE_SIZE");
+        if (!known) return false;
+        EvalVal d;
+        eval_expr(e->args[0], c, &d);
+        if (!strcmp(f, "JSON_QUOTE")) {
+            if (d.null) { ev_null(out); return true; }
+            char* q = sj_quote(ev_s(&d));
+            if (q) { ev_set_text(c, out, q, strlen(q)); free(q); } else ev_null(out);
+            return true;
+        }
+        if (d.null) { ev_null(out); return true; }
+        const char* doc = ev_s(&d);
+        if (!strcmp(f, "JSON_STORAGE_SIZE")) { ev_int(out, (int64_t)strlen(doc)); return true; }
+        if (!sj_valid(doc)) { ctx_error(c, "Invalid JSON text in argument 1 to function %s", f); ev_null(out); return true; }
+        char* docc = strdup(doc);                         // il testo può puntare a un buffer che le prossime valutazioni cambiano
+        if (!docc) { ev_null(out); return true; }
+        char* r = NULL;
+        if (!strcmp(f, "JSON_KEYS") || !strcmp(f, "JSON_DEPTH") || !strcmp(f, "JSON_PRETTY")) {
+            const char* v = docc; size_t vl = strlen(docc);
+            if (e->nargs > 1) {
+                EvalVal pv; eval_expr(e->args[1], c, &pv);
+                if (pv.null || !sj_extract(docc, ev_s(&pv), &v, &vl)) { free(docc); ev_null(out); return true; }
+            }
+            if (!strcmp(f, "JSON_DEPTH")) { ev_int(out, sj_depth(v)); free(docc); return true; }
+            if (!strcmp(f, "JSON_PRETTY")) r = sj_pretty(docc);
+            else { char* tmp = strndup(v, vl); r = tmp ? sj_keys(tmp, vl) : NULL; free(tmp); }
+        } else if (!strcmp(f, "JSON_CONTAINS")) {
+            EvalVal cv; eval_expr(e->args[1], c, &cv);
+            if (cv.null) { free(docc); ev_null(out); return true; }
+            char* cand = strdup(ev_s(&cv));
+            const char* v = docc; size_t vl = strlen(docc);
+            bool ok = cand && sj_valid(cand);
+            if (ok && e->nargs > 2) {
+                EvalVal pv; eval_expr(e->args[2], c, &pv);
+                if (pv.null || !sj_extract(docc, ev_s(&pv), &v, &vl)) { free(cand); free(docc); ev_null(out); return true; }
+            }
+            if (!ok) { free(cand); free(docc); ctx_error(c, "%s", "Invalid JSON text in argument 2 to function JSON_CONTAINS"); ev_null(out); return true; }
+            ev_int(out, sj_contains(v, vl, cand, strlen(cand)));
+            free(cand); free(docc);
+            return true;
+        } else if (!strcmp(f, "JSON_CONTAINS_PATH")) {
+            EvalVal mv; eval_expr(e->args[1], c, &mv);
+            bool all = !mv.null && !strcasecmp(ev_s(&mv), "all");
+            int hits = 0, n = 0;
+            for (int i = 2; i < e->nargs; i++) {
+                EvalVal pv; eval_expr(e->args[i], c, &pv);
+                const char* v; size_t vl;
+                n++;
+                if (!pv.null && sj_extract(docc, ev_s(&pv), &v, &vl)) hits++;
+            }
+            ev_int(out, all ? hits == n : hits > 0);
+            free(docc);
+            return true;
+        } else if (!strcmp(f, "JSON_SEARCH")) {
+            EvalVal mv, sv; eval_expr(e->args[1], c, &mv);
+            bool all = !mv.null && !strcasecmp(ev_s(&mv), "all");
+            eval_expr(e->args[2], c, &sv);
+            if (sv.null) { free(docc); ev_null(out); return true; }
+            char* pat = strdup(ev_s(&sv));
+            r = pat ? sj_search(docc, all, pat) : NULL;
+            free(pat);
+        } else {                                              // JSON_MERGE_PATCH(a, b, ...)
+            r = docc; docc = NULL;
+            for (int i = 1; r && i < e->nargs; i++) {
+                EvalVal pv; eval_expr(e->args[i], c, &pv);
+                if (pv.null) { free(r); r = NULL; break; }
+                char* nr = sj_merge_patch(r, ev_s(&pv));
+                free(r);
+                r = nr;
+            }
+        }
+        free(docc);
+        if (!r) { ev_null(out); return true; }
+        ev_set_text(c, out, r, strlen(r));
+        free(r);
+        return true;
+    }
+    static const char* const MORE[] = { "INITCAP", "SPLIT_PART", "TRANSLATE", "CHR", "CONV", "SOUNDEX", "OVERLAY", "DATE_TRUNC",
+                                        "DATE_PART", "STARTS_WITH", "REGEXP_COUNT", "MAKE_SET", "EXPORT_SET" };
+    bool mine = false;
+    for (size_t i = 0; i < sizeof(MORE) / sizeof(MORE[0]) && !mine; i++) mine = !strcmp(f, MORE[i]);
+    if (!mine) return false;
+    int na = e->nargs < 8 ? e->nargs : 8;
+    EvalVal a[8];
+    for (int i = 0; i < na; i++) eval_expr(e->args[i], c, &a[i]);
+    if (!strcmp(f, "MAKE_SET")) {                             // MAKE_SET(bit, s1, s2, ...): le stringhe dei bit accesi
+        if (a[0].null) { ev_null(out); return true; }
+        uint64_t bits = bit_operand(&a[0]);
+        TextBuf tb = {0};
+        int n = 0;
+        for (int i = 1; i < e->nargs && i <= 64; i++) {
+            if (!(bits >> (i - 1) & 1)) continue;
+            EvalVal v; eval_expr(e->args[i], c, &v);
+            if (v.null) continue;
+            if (n++) tb_put(&tb, ",", 1);
+            tb_put(&tb, ev_s(&v), strlen(ev_s(&v)));
+        }
+        if (!tb.d) { ev_set_text(c, out, "", 0); return true; }
+        tb_result(c, out, &tb);
+        return true;
+    }
+    for (int i = 0; i < na; i++) if (a[i].null) { ev_null(out); return true; }
+    char b[256];
+    if (!strcmp(f, "INITCAP")) {                              // iniziali maiuscole
+        const char* sv = ev_s(&a[0]);
+        size_t n = strlen(sv);
+        char* t = malloc(n + 1);
+        if (!t) { ev_null(out); return true; }
+        bool start = true;
+        for (size_t i = 0; i <= n; i++) {
+            unsigned char ch = (unsigned char)sv[i];
+            t[i] = (char)(ch >= 0x80 ? ch : start ? toupper(ch) : tolower(ch));
+            start = !(isalnum(ch) || ch >= 0x80);
+        }
+        ev_set_text(c, out, t, n);
+        free(t);
+        return true;
+    }
+    if (!strcmp(f, "SPLIT_PART")) {                           // n-esimo pezzo (da 1; negativo: dalla fine)
+        const char* sv = ev_s(&a[0]);
+        char* sc = strdup(sv);
+        char* dl = strdup(ev_s(&a[1]));
+        long n = (long)ev_as_num(&a[2]);
+        if (!sc || !dl || n == 0) { free(sc); free(dl); if (n == 0) ctx_error(c, "%s", "SPLIT_PART field position must not be zero"); ev_null(out); return true; }
+        size_t dlen = strlen(dl);
+        const char* parts[1024];
+        size_t lens[1024];
+        int np = 0;
+        const char* p = sc;
+        for (;;) {
+            const char* q = dlen ? strstr(p, dl) : NULL;
+            if (np < 1024) { parts[np] = p; lens[np] = q ? (size_t)(q - p) : strlen(p); np++; }
+            if (!q) break;
+            p = q + dlen;
+        }
+        long k = n > 0 ? n - 1 : np + n;
+        if (k >= 0 && k < np) ev_set_text(c, out, parts[k], lens[k]); else ev_set_text(c, out, "", 0);
+        free(sc); free(dl);
+        return true;
+    }
+    if (!strcmp(f, "TRANSLATE")) {                            // caratteri di from sostituiti da quelli di to (tolti se to è più corto)
+        char* sv = strdup(ev_s(&a[0]));
+        char* fr = strdup(ev_s(&a[1]));
+        char* to = strdup(ev_s(&a[2]));
+        if (!sv || !fr || !to) { free(sv); free(fr); free(to); ev_null(out); return true; }
+        size_t tl = strlen(to), k = 0;
+        for (size_t i = 0; sv[i]; i++) {
+            char* hit = strchr(fr, sv[i]);
+            if (!hit) { sv[k++] = sv[i]; continue; }
+            size_t pos = (size_t)(hit - fr);
+            if (pos < tl) sv[k++] = to[pos];
+        }
+        sv[k] = '\0';
+        ev_set_text(c, out, sv, k);
+        free(sv); free(fr); free(to);
+        return true;
+    }
+    if (!strcmp(f, "CHR")) {                                  // carattere Unicode del codice
+        long cp = (long)ev_as_num(&a[0]);
+        size_t k = 0;
+        if (cp < 0 || cp > 0x10FFFF) { ev_null(out); return true; }
+        if (cp < 0x80) b[k++] = (char)cp;
+        else if (cp < 0x800) { b[k++] = (char)(0xC0 | (cp >> 6)); b[k++] = (char)(0x80 | (cp & 0x3F)); }
+        else if (cp < 0x10000) { b[k++] = (char)(0xE0 | (cp >> 12)); b[k++] = (char)(0x80 | ((cp >> 6) & 0x3F)); b[k++] = (char)(0x80 | (cp & 0x3F)); }
+        else { b[k++] = (char)(0xF0 | (cp >> 18)); b[k++] = (char)(0x80 | ((cp >> 12) & 0x3F)); b[k++] = (char)(0x80 | ((cp >> 6) & 0x3F)); b[k++] = (char)(0x80 | (cp & 0x3F)); }
+        ev_set_text(c, out, b, k);
+        return true;
+    }
+    if (!strcmp(f, "CONV")) {                                 // CONV(n, da_base, a_base), basi 2..36
+        int fb = (int)ev_as_num(&a[1]), tbase = (int)ev_as_num(&a[2]);
+        if (fb < 0) fb = -fb;
+        bool neg_out = tbase < 0;
+        if (tbase < 0) tbase = -tbase;
+        if (fb < 2 || fb > 36 || tbase < 2 || tbase > 36) { ev_null(out); return true; }
+        const char* sv = ev_s(&a[0]);
+        bool neg = *sv == '-';
+        if (neg) sv++;
+        uint64_t v = 0;
+        for (; *sv; sv++) {
+            int d = isdigit((unsigned char)*sv) ? *sv - '0' : isalpha((unsigned char)*sv) ? toupper((unsigned char)*sv) - 'A' + 10 : 99;
+            if (d >= fb) break;
+            v = v * (uint64_t)fb + (uint64_t)d;
+        }
+        if (neg && !neg_out) v = (uint64_t)(-(int64_t)v);
+        char tmp[80];
+        int k = 0;
+        do { int d = (int)(v % (uint64_t)tbase); tmp[k++] = (char)(d < 10 ? '0' + d : 'A' + d - 10); v /= (uint64_t)tbase; } while (v && k < 79);
+        int o = 0;
+        if (neg && neg_out) b[o++] = '-';
+        while (k) b[o++] = tmp[--k];
+        ev_set_text(c, out, b, (size_t)o);
+        return true;
+    }
+    if (!strcmp(f, "SOUNDEX")) {
+        static const char* const CODE = "01230120022455012623010202";   // A..Z
+        const char* sv = ev_s(&a[0]);
+        int k = 0;
+        char last = 0;
+        for (; *sv && k < 64; sv++) {
+            if (!isalpha((unsigned char)*sv)) continue;
+            char u = (char)toupper((unsigned char)*sv);
+            char d = CODE[u - 'A'];
+            if (k == 0) { b[k++] = u; last = d; continue; }
+            if (d != '0' && d != last) b[k++] = d;
+            if (u != 'H' && u != 'W') last = d;
+        }
+        while (k > 0 && k < 4) b[k++] = '0';
+        ev_set_text(c, out, b, (size_t)k);
+        return true;
+    }
+    if (!strcmp(f, "OVERLAY")) {                              // OVERLAY(s PLACING r FROM n [FOR m])
+        const char* sv = ev_s(&a[0]);
+        size_t sl = strlen(sv);
+        char* sc = strdup(sv);
+        char* r = strdup(ev_s(&a[1]));
+        long from = (long)ev_as_num(&a[2]);
+        long len = na > 3 ? (long)ev_as_num(&a[3]) : (long)(r ? strlen(r) : 0);
+        if (!sc || !r || from < 1) { free(sc); free(r); ev_null(out); return true; }
+        size_t st = (size_t)(from - 1) < sl ? (size_t)(from - 1) : sl;
+        size_t en = len < 0 ? st : st + (size_t)len < sl ? st + (size_t)len : sl;
+        TextBuf tb = {0};
+        tb_put(&tb, sc, st); tb_put(&tb, r, strlen(r)); tb_put(&tb, sc + en, sl - en);
+        free(sc); free(r);
+        if (!tb.d) { ev_set_text(c, out, "", 0); return true; }
+        tb_result(c, out, &tb);
+        return true;
+    }
+    if (!strcmp(f, "STARTS_WITH")) {
+        const char* x = ev_s(&a[0]);
+        char* y = strdup(ev_s(&a[1]));
+        ev_int(out, y && !strncmp(x, y, strlen(y)));
+        free(y);
+        return true;
+    }
+    if (!strcmp(f, "REGEXP_COUNT")) {                         // occorrenze del modello
+        char* sv = strdup(ev_s(&a[0]));
+        char* pat = strdup(ev_s(&a[1]));
+        long n = 0;
+        char rerr[200];
+        SvRegex* re = sv && pat ? sv_regex_compile(pat, false, rerr, sizeof(rerr)) : NULL;
+        if (sv && pat && !re) { free(sv); free(pat); ctx_error(c, "%s", "Invalid regular expression"); ev_null(out); return true; }
+        size_t from = 0, so, eo, sl = sv ? strlen(sv) : 0;
+        while (re && from <= sl && sv_regex_search(re, sv, from, &so, &eo)) { n++; from = eo > so ? eo : so + 1; }
+        sv_regex_free(re);
+        free(sv); free(pat);
+        ev_int(out, n);
+        return true;
+    }
+    if (!strcmp(f, "EXPORT_SET")) {                           // EXPORT_SET(bit, on, off [, sep [, n]])
+        uint64_t bits = bit_operand(&a[0]);
+        char* on = strdup(ev_s(&a[1]));
+        char* off = strdup(ev_s(&a[2]));
+        char* sep = strdup(na > 3 ? ev_s(&a[3]) : ",");
+        int nb = na > 4 ? (int)ev_as_num(&a[4]) : 64;
+        if (nb < 0 || nb > 64) nb = 64;
+        TextBuf tb = {0};
+        for (int i = 0; on && off && sep && i < nb; i++) {
+            if (i) tb_put(&tb, sep, strlen(sep));
+            const char* w = (bits >> i & 1) ? on : off;
+            tb_put(&tb, w, strlen(w));
+        }
+        free(on); free(off); free(sep);
+        if (!tb.d) { ev_set_text(c, out, "", 0); return true; }
+        tb_result(c, out, &tb);
+        return true;
+    }
+    // DATE_TRUNC('month', d) (PostgreSQL) e DATE_PART('year', d) = EXTRACT(YEAR FROM d)
+    MyDT t;
+    char unit[32];
+    snprintf(unit, sizeof(unit), "%s", ev_s(&a[0]));
+    for (char* q = unit; *q; q++) *q = (char)toupper((unsigned char)*q);
+    if (!mydt_parse(ev_s(&a[1]), &t) || !t.has_date) { ev_null(out); return true; }
+    if (!strcmp(f, "DATE_PART")) {
+        long v;
+        if (!strcmp(unit, "YEAR")) v = t.y; else if (!strcmp(unit, "MONTH")) v = t.mo; else if (!strcmp(unit, "DAY")) v = t.d;
+        else if (!strcmp(unit, "HOUR")) v = t.h; else if (!strcmp(unit, "MINUTE")) v = t.mi; else if (!strcmp(unit, "SECOND")) v = t.s;
+        else if (!strcmp(unit, "QUARTER")) v = (t.mo - 1) / 3 + 1;
+        else if (!strcmp(unit, "DOW")) { struct tm tmv = { 0 }; tmv.tm_year = t.y - 1900; tmv.tm_mon = t.mo - 1; tmv.tm_mday = t.d; tmv.tm_hour = 12; mktime(&tmv); v = tmv.tm_wday; }
+        else if (!strcmp(unit, "DOY")) { struct tm tmv = { 0 }; tmv.tm_year = t.y - 1900; tmv.tm_mon = t.mo - 1; tmv.tm_mday = t.d; tmv.tm_hour = 12; mktime(&tmv); v = tmv.tm_yday + 1; }
+        else { ctx_error(c, "Unknown DATE_PART unit '%s'", unit); ev_null(out); return true; }
+        ev_int(out, v);
+        return true;
+    }
+    bool keep_time = true;
+    if (!strcmp(unit, "YEAR")) { t.mo = 1; t.d = 1; t.h = t.mi = t.s = 0; }
+    else if (!strcmp(unit, "QUARTER")) { t.mo = (t.mo - 1) / 3 * 3 + 1; t.d = 1; t.h = t.mi = t.s = 0; }
+    else if (!strcmp(unit, "MONTH")) { t.d = 1; t.h = t.mi = t.s = 0; }
+    else if (!strcmp(unit, "WEEK")) {                          // al lunedì
+        struct tm tmv = { 0 }; tmv.tm_year = t.y - 1900; tmv.tm_mon = t.mo - 1; tmv.tm_mday = t.d; tmv.tm_hour = 12; mktime(&tmv);
+        int back = (tmv.tm_wday + 6) % 7;
+        tmv.tm_mday -= back; mktime(&tmv);
+        t.y = tmv.tm_year + 1900; t.mo = tmv.tm_mon + 1; t.d = tmv.tm_mday; t.h = t.mi = t.s = 0;
+    }
+    else if (!strcmp(unit, "DAY")) { t.h = t.mi = t.s = 0; }
+    else if (!strcmp(unit, "HOUR")) { t.mi = t.s = 0; }
+    else if (!strcmp(unit, "MINUTE")) { t.s = 0; }
+    else if (!strcmp(unit, "SECOND")) {}
+    else { ctx_error(c, "Unknown DATE_TRUNC unit '%s'", unit); ev_null(out); return true; }
+    t.has_time = keep_time;
+    t.us = 0;
+    mydt_text(&t, true, b, sizeof(b));
+    ev_set_text(c, out, b, strlen(b));
+    return true;
+}
+
 static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     const char* f = e->func;
     EvalVal a[3];
@@ -3315,6 +3759,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
 
     if (e->subkind == SUBK_UDF) { rt_eval_function(e, c, out); return; }
     if (eval_internal(e, c, out)) return;
+    if (eval_more(e, c, out)) return;
 
     if (eval_mysql(e, c, out)) return;
 
@@ -3564,9 +4009,94 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     ev_null(out);
 }
 
+// aggregati statistici, bit a bit, booleani e JSON
+static bool eval_agg_extra(ASTExpr* e, EvalCtx* c, EvalVal* out) {
+    const char* f = e->func;
+    bool stat = !strncmp(f, "STD", 3) || !strncmp(f, "VAR", 3);
+    bool bit = !strncmp(f, "BIT_", 4);
+    bool boo = !strncmp(f, "BOOL_", 5) || !strcmp(f, "EVERY");
+    bool jarr = !strcmp(f, "JSON_ARRAYAGG"), jobj = !strcmp(f, "JSON_OBJECTAGG");
+    if (!stat && !bit && !boo && !jarr && !jobj) return false;
+    Tuple** saved = c->cur;
+    int64_t n = 0;
+    double mean = 0, m2 = 0;                                   // Welford: media e somma dei quadrati degli scarti
+    uint64_t acc = !strcmp(f, "BIT_AND") ? UINT64_MAX : 0;
+    int truth = -1;
+    TextBuf tb = {0};
+    if (jarr || jobj) tb_put(&tb, jarr ? "[" : "{", 1);
+    StrMap seen = {0};
+    for (int k = 0; k < c->ngrp && !c->err[0]; k++) {
+        c->cur = c->grp[k];
+        EvalVal v;
+        eval_expr(e->args[0], c, &v);
+        if (jarr || jobj) {
+            EvalVal val;
+            if (jobj) {
+                if (v.null) { ctx_error(c, "%s", "JSON_OBJECTAGG key is NULL"); break; }
+                eval_expr(e->args[1], c, &val);
+                char* q = sj_quote(ev_s(&v));
+                if (n) tb_put(&tb, ", ", 2);
+                if (q) { tb_put(&tb, q, strlen(q)); free(q); }
+                tb_put(&tb, ": ", 2);
+            } else {
+                ev_copy(&val, &v);
+                if (n) tb_put(&tb, ", ", 2);
+            }
+            if (val.null) tb_put(&tb, "null", 4);
+            else {
+                const char* sv = ev_s(&val);
+                if (val.is_num || (sj_valid(sv) && (*sv == '{' || *sv == '['))) tb_put(&tb, sv, strlen(sv));
+                else { char* q = sj_quote(sv); if (q) { tb_put(&tb, q, strlen(q)); free(q); } }
+            }
+            n++;
+            continue;
+        }
+        if (v.null) continue;
+        if (e->agg_distinct) {
+            char key[KEY_BUF];
+            if (v.is_num) snprintf(key, sizeof(key), "n%.17g", ev_as_num(&v));
+            else { key[0] = 's'; key_text(key + 1, sizeof(key) - 1, ev_s(&v)); }
+            SMSlot* sl = sm_slot(&seen, key, true);
+            if (!sl || sl->val >= 0) continue;
+            sl->val = 1;
+        }
+        n++;
+        if (stat) {
+            double x = ev_as_num(&v), d = x - mean;
+            mean += d / (double)n;
+            m2 += d * (x - mean);
+        } else if (bit) {
+            uint64_t x = bit_operand(&v);
+            if (!strcmp(f, "BIT_AND")) acc &= x; else if (!strcmp(f, "BIT_OR")) acc |= x; else acc ^= x;
+        } else {
+            int t = ev_truth(&v);
+            if (truth < 0) truth = t;
+            else if (!strcmp(f, "BOOL_OR")) truth = truth || t;
+            else truth = truth && t;
+        }
+    }
+    c->cur = saved;
+    sm_free(&seen);
+    if (jarr || jobj) {
+        tb_put(&tb, jarr ? "]" : "}", 1);
+        if (n == 0) { free(tb.d); ev_null(out); return true; }
+        tb_result(c, out, &tb);
+        return true;
+    }
+    if (bit) { ev_unsigned(c, out, n || strcmp(f, "BIT_AND") ? acc : UINT64_MAX); return true; }
+    if (boo) { if (truth < 0) ev_null(out); else ev_int(out, truth); return true; }
+    // varianza / deviazione: _POP (e STD, STDDEV, VARIANCE come MySQL) divide per n, _SAMP per n - 1
+    bool samp = strstr(f, "SAMP") != NULL;
+    if (n == 0 || (samp && n < 2)) { ev_null(out); return true; }
+    double var = m2 / (double)(samp ? n - 1 : n);
+    ev_num(out, !strncmp(f, "VAR", 3) ? var : sqrt(var));
+    return true;
+}
+
 static void eval_aggregate(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     if (!c->grp) { ctx_error(c, "%s", "Aggregate used outside of a group"); ev_null(out); return; }
     if (!strcmp(e->func, "GROUP_CONCAT")) { eval_group_concat(e, c, out); return; }
+    if (eval_agg_extra(e, c, out)) return;
     bool count_star = e->nargs == 0;
     if (count_star) { ev_int(out, c->ngrp); return; }
 
@@ -4230,7 +4760,10 @@ static const char* out_type_name(const SelectPlan* p, int j, const ORows* rows, 
     if (oc->src_type >= 0) return datatype_name((DataType)oc->src_type);
     if (e->type == EXPR_AGG && !strcmp(e->func, "COUNT")) return "INT";
     if (e->type == EXPR_AGG && !strcmp(e->func, "AVG")) return "FLOAT";
-    if (e->type == EXPR_AGG && strcmp(e->func, "SUM") && e->nargs == 1 && e->args[0]->type == EXPR_COLUMN &&
+    if (e->type == EXPR_AGG && (!strncmp(e->func, "STD", 3) || !strncmp(e->func, "VAR", 3))) return "FLOAT";
+    if (e->type == EXPR_AGG && (!strncmp(e->func, "BIT_", 4) || !strncmp(e->func, "BOOL_", 5) || !strcmp(e->func, "EVERY"))) return "BIGINT";
+    if (e->type == EXPR_AGG && !strncmp(e->func, "JSON_", 5)) return "JSON";
+    if (e->type == EXPR_AGG && (!strcmp(e->func, "MIN") || !strcmp(e->func, "MAX")) && e->nargs == 1 && e->args[0]->type == EXPR_COLUMN &&
         e->args[0]->bound > 0 && e->args[0]->outer == 0)        // MIN/MAX di una colonna
         return datatype_name(p->src[(e->args[0]->bound - 1) / 1024].ts->columns[(e->args[0]->bound - 1) % 1024].type);
     bool any = false, all_int = true, all_num = true, small = true;
@@ -4667,6 +5200,8 @@ static bool infoschema_open(ExecCtx* x, Source* s, const char* table, char* err,
         { "PARAMETERS", "SPECIFIC_CATALOG:s,SPECIFIC_SCHEMA:s,SPECIFIC_NAME:s,ORDINAL_POSITION:i,PARAMETER_MODE:s,PARAMETER_NAME:s,DATA_TYPE:s" },
         { "EVENTS", "EVENT_CATALOG:s,EVENT_SCHEMA:s,EVENT_NAME:s" },
         { "PARTITIONS", "TABLE_CATALOG:s,TABLE_SCHEMA:s,TABLE_NAME:s,PARTITION_NAME:s,TABLE_ROWS:i" },
+        { "SESSION_VARIABLES", "VARIABLE_NAME:s,VARIABLE_VALUE:s" },
+        { "GLOBAL_VARIABLES", "VARIABLE_NAME:s,VARIABLE_VALUE:s" },
     };
     int ti = -1;
     for (size_t i = 0; i < sizeof(T) / sizeof(T[0]); i++) if (!strcmp(up, T[i].name)) ti = (int)i;
@@ -4864,6 +5399,8 @@ static bool infoschema_open(ExecCtx* x, Source* s, const char* table, char* err,
             isb_s(&b, (i == 0 || i == 5 || i == 6 || i == 7 || i == 8) ? "Yes" : ""); isb_s(&b, "Yes"); isb_i(&b, 1); isb_s(&b, "PAD SPACE"); isb_end(&b);
         }
     }
+    if (!strcmp(T[ti].name, "SESSION_VARIABLES") || !strcmp(T[ti].name, "GLOBAL_VARIABLES"))
+        for (int i = 0; SYSVARS[i][0] && b.ok; i++) { isb_row(&b); isb_s(&b, SYSVARS[i][0]); isb_s(&b, SYSVARS[i][1]); isb_end(&b); }
     if (!b.ok) { snprintf(err, errn, "Out of memory while reading information_schema"); return false; }
     ts->num_rows = (uint64_t)s->n;
     s->loaded = true;
@@ -5685,7 +6222,7 @@ static const char* join_step(EvalCtx* ec, Combos* in, Combos* out, int k, JoinTy
 
 // ── ordinamento ──
 
-typedef struct { SortKey* keys; int nkeys; const bool* desc; } SortSpec;
+typedef struct { SortKey* keys; int nkeys; const bool* desc; const char* nulls; } SortSpec;
 static _Thread_local SortSpec g_sort;
 
 static int unit_cmp(const void* pa, const void* pb) {
@@ -5693,6 +6230,8 @@ static int unit_cmp(const void* pa, const void* pb) {
     const SortKey* a = &g_sort.keys[(size_t)ia * (size_t)g_sort.nkeys];
     const SortKey* b = &g_sort.keys[(size_t)ib * (size_t)g_sort.nkeys];
     for (int k = 0; k < g_sort.nkeys; k++) {
+        char nl = g_sort.nulls ? g_sort.nulls[k] : 0;
+        if (nl && a[k].null != b[k].null) return (a[k].null == (nl == 'F')) ? -1 : 1;   // NULLS FIRST / LAST
         int c = key_cmp(&a[k], &b[k]);
         if (c) return g_sort.desc[k] ? -c : c;
     }
@@ -5972,6 +6511,15 @@ static bool window_compute(SelectPlan* p, ArmState* st, EvalCtx* ec, ASTExpr* w,
                         else if (w->nargs > 2) oval_copy(o, ARG(r, 2));
                         else o->null = true;
                     } else if (!strcmp(f, "FIRST_VALUE")) oval_copy(o, ARG(start, 0));
+                    else if (!strcmp(f, "PERCENT_RANK")) { o->is_num = true; o->num = end - start > 1 ? (double)(g - start) / (double)(end - start - 1) : 0; }
+                    else if (!strcmp(f, "CUME_DIST"))    { o->is_num = true; o->num = (double)(ge - start) / (double)(end - start); }
+                    else if (!strcmp(f, "NTH_VALUE")) {      // n-esima riga della finestra (fino ai pari della riga corrente)
+                        const SortKey* nv = ARG(r, 1);
+                        int64_t nth = nv->is_num ? (int64_t)nv->num : 0;
+                        int last = ws->nord ? ge - 1 : end - 1;
+                        if (nth < 1) { snprintf(ec->err, sizeof(ec->err), "NTH_VALUE needs a positive row number"); ok = false; break; }
+                        if (start + nth - 1 <= last) oval_copy(o, ARG(start + nth - 1, 0)); else o->null = true;
+                    }
                     else oval_copy(o, ARG(ws->nord ? ge - 1 : end - 1, 0));      // LAST_VALUE
                 }
                 if (is_int) { o->is_num = o->is_int = true; o->inum = iv; o->num = (double)iv; }
@@ -6234,6 +6782,7 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
         g_sort.keys = st.keys;
         g_sort.nkeys = nkeys;
         g_sort.desc = n->select_stmt.order_desc;
+        g_sort.nulls = n->select_stmt.order_nulls;
         long want = apply_order && n->select_stmt.has_limit && !n->select_stmt.calc_found ? (long)n->select_stmt.offset + n->select_stmt.limit : -1;
         if (want >= 0 && want < nkeep / 4) {
             // ORDER BY ... LIMIT k: le prime k righe con un heap (O(n log k)), poi si ordinano solo quelle
@@ -9228,6 +9777,10 @@ char* executor_create_statement(Catalog* cat, const char* db, const char* table,
         char type[48];
         if ((c->type == SV_TYPE_VARCHAR || c->type == SV_TYPE_CHAR) && c->size > 0)
             snprintf(type, sizeof(type), "%s(%d)", datatype_name(c->type), c->size);
+        else if (c->type == SV_TYPE_DECIMAL && c->size > 0 && c->decimal_prec > 0)    // DECIMAL(p, s)
+            snprintf(type, sizeof(type), "DECIMAL(%d,%d)", c->size, c->decimal_prec - 1);
+        else if (c->type == SV_TYPE_DECIMAL && c->size > 0)
+            snprintf(type, sizeof(type), "DECIMAL(%d)", c->size);
         else
             snprintf(type, sizeof(type), "%s", datatype_name(c->type));
         bool pk_here = (inline_pk && inline_pk->cols[0] == i) || (!has_pk_cons && c->primary_key);
@@ -10277,7 +10830,21 @@ static QueryResult* executor_run_impl(ExecCtx* ctx, ASTNode* stmt) {
                 if (stmt->if_exists && cdb && !catalog_get_table(ctx->catalog, cdb->name, stmt->drop_table.table_name)) return result_ok_msg(0);
                 return result_error_msg("Only TEMPORARY tables created by the routine can be dropped inside a routine");
             }
-            return exec_drop_table(ctx, stmt);
+            if (stmt->drop_table.nmore == 0) return exec_drop_table(ctx, stmt);
+            // DROP TABLE a, b, c: una dopo l'altra (con IF EXISTS quelle che mancano si saltano)
+            QueryResult* r = exec_drop_table(ctx, stmt);
+            for (int k = 0; k < stmt->drop_table.nmore && r && r->success; k++) {
+                db_result_free(r);
+                ASTNode* dn = calloc(1, sizeof(ASTNode));
+                if (!dn) return result_error_msg("Out of memory");
+                dn->type = NODE_DROP_TABLE;
+                dn->if_exists = stmt->if_exists;
+                snprintf(dn->drop_table.table_name, sizeof(dn->drop_table.table_name), "%s", stmt->drop_table.more[k]);
+                if (stmt->if_exists && cdb && !catalog_get_table(ctx->catalog, cdb->name, dn->drop_table.table_name)) r = result_ok_msg(0);
+                else r = exec_drop_table(ctx, dn);
+                free(dn);
+            }
+            return r;
         }
         case NODE_ALTER_TABLE:  return exec_alter_table(ctx, stmt);
         case NODE_INSERT: {

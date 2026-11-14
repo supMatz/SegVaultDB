@@ -382,6 +382,9 @@ static bool name(Cur* c, char* out, size_t n) {          // nome: identificatore
     if (t->type != TOK_IDENTIFIER && t->type != TOK_STRING && !isalpha((unsigned char)t->text[0])) return false;
     snprintf(out, n, "%.63s", t->text);
     c->i++;
+    // 'utente'@'host' di MySQL: l'host si accetta e si ignora (il lexer legge @'host' come un nome solo)
+    const Token* h = tk(c);
+    if (h && !at_end(c) && h->type == TOK_IDENTIFIER && h->text && h->text[0] == '@' && h->text[1] != '@') c->i++;
     return true;
 }
 static bool valid_user_name(const char* s) {
