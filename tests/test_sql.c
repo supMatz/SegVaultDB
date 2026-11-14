@@ -1380,7 +1380,44 @@ int main(void) {
     t("CREATE TABLE idt (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, x INT)", "OK:0");
     t("CREATE TABLE idt2 (id INT IDENTITY(1, 1) PRIMARY KEY, x INT)", "OK:0");
     t("INSERT INTO idt (x) VALUES (5), (6) RETURNING id", "1;2");
-    t("CREATE TABLE calc (a INT, b INT GENERATED ALWAYS AS (a * 2))", "ERR:computed columns are not supported");
+    // colonne calcolate
+    t("CREATE TABLE calc (id INT PRIMARY KEY, prezzo DECIMAL(8,2), qta INT, totale DECIMAL(10,2) GENERATED ALWAYS AS (prezzo * qta) STORED, "
+      "nome VARCHAR(20), sigla VARCHAR(5) AS (UPPER(LEFT(nome, 3))))", "OK:0");
+    t("INSERT INTO calc (id, prezzo, qta, nome) VALUES (1, 2.50, 4, 'penna'), (2, 10, NULL, 'zaino')", "OK:2");
+    t("SELECT totale, sigla FROM calc ORDER BY id", "10.00|PEN;NULL|ZAI");
+    t("INSERT INTO calc (id, prezzo, qta, totale) VALUES (3, 1, 1, 5)", "ERR:generated column 'totale'");
+    t("UPDATE calc SET qta = 3 WHERE id = 2", "OK:1");
+    t("SELECT totale FROM calc WHERE id = 2", "30.00");
+    t("UPDATE calc SET totale = 1", "ERR:generated column 'totale'");
+    t("SELECT GENERATION_EXPRESSION FROM information_schema.COLUMNS WHERE TABLE_NAME = 'calc' AND COLUMN_NAME = 'sigla'", "UPPER(LEFT(nome, 3))");
+    t("ALTER TABLE calc ADD COLUMN iva DECIMAL(10,2) AS (totale * 0.22)", "OK:0");
+    t("SELECT iva FROM calc ORDER BY id", "2.20;6.60");
+    t("ALTER TABLE calc RENAME COLUMN qta TO quantita", "OK:0");
+    t("UPDATE calc SET quantita = 10 WHERE id = 1", "OK:1");
+    t("SELECT totale, iva FROM calc WHERE id = 1", "25.00|5.50");
+    t("ALTER TABLE calc DROP COLUMN prezzo", "ERR:used by generated column 'totale'");
+    t("CREATE TABLE calc2 (a INT, b INT AS (nonesiste + 1))", "ERR:Unknown column 'nonesiste'");
+    // LATERAL, APPLY, GENERATE_SERIES, JSON_TABLE
+    t("CREATE TABLE lrep (id INT PRIMARY KEY, nome VARCHAR(10))", "OK:0");
+    t("INSERT INTO lrep VALUES (1,'IT'),(2,'HR'),(3,'Vuoto')", "OK:3");
+    t("CREATE TABLE ldip (id INT PRIMARY KEY, rep INT, nome VARCHAR(10), stip INT)", "OK:0");
+    t("INSERT INTO ldip VALUES (1,1,'Ada',3000),(2,1,'Bruno',2500),(3,1,'Elena',2600),(4,2,'Carla',2800),(5,2,'Dario',2200)", "OK:5");
+    t("SELECT r.nome, t.nome FROM lrep r JOIN LATERAL (SELECT nome, stip FROM ldip d WHERE d.rep = r.id ORDER BY stip DESC LIMIT 2) t ON TRUE ORDER BY r.id, t.stip DESC",
+      "IT|Ada;IT|Elena;HR|Carla;HR|Dario");
+    t("SELECT r.nome, t.n FROM lrep r LEFT JOIN LATERAL (SELECT COUNT(*) AS n FROM ldip d WHERE d.rep = r.id) t ON TRUE ORDER BY r.id", "IT|3;HR|2;Vuoto|0");
+    t("SELECT r.nome, t.nome FROM lrep r OUTER APPLY (SELECT nome FROM ldip d WHERE d.rep = r.id AND stip > 2700) t ORDER BY r.id", "IT|Ada;HR|Carla;Vuoto|NULL");
+    t("SELECT r.nome FROM lrep r CROSS APPLY (SELECT 1 AS x FROM ldip d WHERE d.rep = r.id LIMIT 1) t ORDER BY r.id", "IT;HR");
+    t("SELECT r.nome, x.tot FROM lrep r, LATERAL (SELECT SUM(stip) AS tot FROM ldip WHERE ldip.rep = r.id) x WHERE x.tot > 5000", "IT|8100");
+    t("SELECT * FROM generate_series(1, 4)", "1;2;3;4");
+    t("SELECT g.n * 2 FROM GENERATE_SERIES(10, 1, -3) AS g(n)", "20;14;8;2");
+    t("SELECT r.nome, s.generate_series FROM lrep r CROSS JOIN LATERAL GENERATE_SERIES(1, r.id) s WHERE r.id < 3 ORDER BY r.id, 2", "IT|1;HR|1;HR|2");
+    t("SELECT * FROM generate_series(1, 2, 0)", "ERR:step cannot be zero");
+    t("SELECT * FROM JSON_TABLE('[{\"a\":1,\"b\":\"x\"},{\"a\":2,\"c\":true}]', '$[*]' COLUMNS (n FOR ORDINALITY, a INT PATH '$.a', b VARCHAR(10) PATH '$.b', hc INT EXISTS PATH '$.c')) AS jt",
+      "1|1|x|0;2|2|NULL|1");
+    t("CREATE TABLE lord (id INT, righe TEXT)", "OK:0");
+    t("INSERT INTO lord VALUES (1, '{\"items\":[{\"sku\":\"A\",\"q\":2},{\"sku\":\"B\",\"q\":1}]}'), (2, '{\"items\":[{\"sku\":\"C\",\"q\":5}]}')", "OK:2");
+    t("SELECT o.id, SUM(j.q) FROM lord o JOIN JSON_TABLE(o.righe, '$.items[*]' COLUMNS (q INT PATH '$.q')) j GROUP BY o.id ORDER BY o.id", "1|3;2|5");
+    t("SELECT o.id, j.sku FROM lord o, JSON_TABLE(o.righe, '$.items[*]' COLUMNS (sku VARCHAR(5) PATH '$.sku')) AS j WHERE j.sku <> 'B' ORDER BY j.sku", "1|A;2|C");
     // ALTER TABLE con più operazioni (migrazioni di Laravel / Doctrine), CHANGE, ADD / DROP INDEX
     t("create table `lu` (`id` bigint unsigned not null auto_increment primary key, `name` varchar(255) not null, `email` varchar(255) not null)", "OK:0");
     t("insert into lu (name, email) values ('Anna', 'a@x.it')", "OK:1");
@@ -1396,6 +1433,30 @@ int main(void) {
     t("CREATE TABLE lp (id INT PRIMARY KEY, uid BIGINT, CONSTRAINT lp_uid_fk FOREIGN KEY (uid) REFERENCES lu (id))", "OK:0");
     t("ALTER TABLE lp DROP FOREIGN KEY lp_uid_fk", "OK:0");
     t("INSERT INTO lp VALUES (1, 99)", "OK:1");
+    // sequenze
+    t("CREATE SEQUENCE fatt START WITH 100 INCREMENT BY 10", "OK:0");
+    t("SELECT CURRVAL('fatt')", "ERR:not yet defined in this session");
+    t("SELECT NEXTVAL('fatt'), NEXTVAL('fatt')", "100|110");
+    t("SELECT CURRVAL('fatt'), LASTVAL()", "110|110");
+    t("CREATE TABLE fseq (n BIGINT PRIMARY KEY, x VARCHAR(5))", "OK:0");
+    t("INSERT INTO fseq VALUES (NEXT VALUE FOR fatt, 'a'), (fatt.NEXTVAL, 'b')", "OK:2");
+    t("SELECT n FROM fseq ORDER BY n", "120;130");
+    t("SELECT SETVAL('fatt', 500)", "500");
+    t("SELECT nextval('fatt')", "510");
+    t("ALTER SEQUENCE fatt RESTART WITH 1", "OK:0");
+    t("SELECT nextval('fatt')", "1");
+    t("CREATE SEQUENCE giro MINVALUE 1 MAXVALUE 3 CYCLE", "OK:0");
+    t("SELECT nextval('giro'), nextval('giro'), nextval('giro'), nextval('giro')", "1|2|3|1");
+    t("CREATE SEQUENCE fine MAXVALUE 1", "OK:0");
+    t("SELECT nextval('fine')", "1");
+    t("SELECT nextval('fine')", "ERR:reached the limit");
+    t("CREATE SEQUENCE giu INCREMENT BY -1", "OK:0");
+    t("SELECT nextval('giu'), nextval('giu')", "-1|-2");
+    t("SELECT SEQUENCE_NAME FROM information_schema.SEQUENCES WHERE SEQUENCE_SCHEMA = 'rt' ORDER BY 1", "fatt;fine;giro;giu");
+    t("CREATE SEQUENCE fatt", "ERR:already exists");
+    t("DROP SEQUENCE giro", "OK:0");
+    t("DROP SEQUENCE giro", "ERR:does not exist");
+    t("DROP SEQUENCE IF EXISTS giro", "OK:0");
     t("SHOW FUNCTION STATUS", "#7");
     t("SHOW PROCEDURE STATUS LIKE 'p%'", "#2");
     t("SELECT `Type` FROM (SHOW FUNCTION STATUS) AS s LIMIT 1", "ERR:");
@@ -1416,6 +1477,7 @@ int main(void) {
     t("USE rt", "OK:0");                                                   // le routine restano dopo un riavvio
     t("SELECT fatt(6), giudizio(26)", "720|buono");
     t("SELECT @a", "NULL");                                                 // le @variabili no (sessione nuova)
+    t("SELECT nextval('fatt')", "11");                                     // le sequenze sì (incremento 10)
 
     db_shutdown();
     crash_recovery_test();

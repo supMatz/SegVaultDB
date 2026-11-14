@@ -19,6 +19,7 @@ typedef enum {
     NODE_TABLE_MAINT,  // CHECK / ANALYZE / OPTIMIZE / REPAIR TABLE t [, ...]       // BACKUP [DATABASE] TO 'cartella'
     NODE_VACUUM,       // recupera le pagine di overflow non più usate
     NODE_MERGE,        // MERGE INTO t USING s ON ... WHEN [NOT] MATCHED THEN ...
+    NODE_SEQUENCE,     // CREATE / ALTER / DROP SEQUENCE
     NODE_SET,          // SET @x = ..., SET NAMES ..., SET FOREIGN_KEY_CHECKS = 0, ... (variabili di MySQL)
 } StmtType;
 
@@ -166,6 +167,24 @@ typedef struct {
 
 #define SV_MAX_CONS_DEFS 16
 
+// funzione-tabella in FROM: JSON_TABLE(doc, 'percorso' COLUMNS (...)), GENERATE_SERIES(da, a [, passo])
+enum { TFC_PATH, TFC_ORDINALITY, TFC_EXISTS };
+typedef struct {
+    char      name[64];
+    int       kind;            // TFC_*
+    ColumnDef def;
+    char      path[256];
+} TFCol;
+typedef struct TableFunc {
+    char      func[32];        // JSON_TABLE, GENERATE_SERIES
+    ASTExpr*  args[4];
+    int       nargs;
+    TFCol*    cols;            // JSON_TABLE: COLUMNS (...)
+    int       ncols;
+    char      colnames[8][64]; // alias(colonne)
+    int       ncolnames;
+} TableFunc;
+
 typedef struct {
     ASTExpr*   condition;      // ON (NULL = prodotto cartesiano)
     JoinType   type;
@@ -176,6 +195,8 @@ typedef struct {
     char       using_cols[8][64];   // JOIN ... USING (colonne)
     int        nusing;
     bool       using_built;    // condizione ON già costruita da NATURAL / USING
+    bool       lateral;        // LATERAL (subquery) / CROSS APPLY / OUTER APPLY: ricalcolata per ogni riga a sinistra
+    TableFunc* tf;             // JOIN JSON_TABLE(...) / GENERATE_SERIES(...) (sempre laterale)
 } ASTJoin;
 
 // WITH nome AS (SELECT ...)
@@ -238,6 +259,7 @@ typedef struct ASTNode {
             ASTJoin    joins[8];
             int        num_joins;
             struct ASTNode* from_sub;  // FROM (SELECT ...) alias: tabella derivata
+            TableFunc* from_tf;        // FROM JSON_TABLE(...) / GENERATE_SERIES(...) alias
             // SELECT ... UNION [ALL] / INTERSECT / EXCEPT SELECT ...: catena dei rami.
             // Con set_next != NULL, ORDER BY e LIMIT di questo nodo valgono per l'intero risultato.
             struct ASTNode* set_next;
@@ -365,6 +387,13 @@ typedef struct ASTNode {
             char       name[64];
             bool       is_function;     // DROP FUNCTION (NODE_DROP_PROCEDURE)
         } drop_trigger;
+        // CREATE SEQUENCE s [START WITH n] [INCREMENT BY k] [MINVALUE m] [MAXVALUE x] [CYCLE], ALTER ... RESTART, DROP
+        struct {
+            char       name[64];
+            int        op;                  // 0 CREATE, 1 DROP, 2 ALTER
+            long long  start, inc, minv, maxv, restart_with;
+            bool       has_start, has_inc, has_min, has_max, cycle, has_cycle, restart, has_restart_with;
+        } seq;
         // MERGE: le parti come testo SQL (eseguite come INSERT / UPDATE / DELETE)
         struct {
             char       target[64], talias[64], salias[64];

@@ -779,6 +779,14 @@ static ASTExpr* parse_special_form(ParserState* ps) {
     if (t.type != TOK_IDENTIFIER || !t.text) return NULL;
     const char* w = t.text;
     bool call = next_is(ps, 1, TOK_LPAREN);
+    // NEXT VALUE FOR s (standard / SQL Server) = NEXTVAL('s')
+    if (!strcasecmp(w, "NEXT") && peek2_ident(ps, "VALUE") && next_is(ps, 2, TOK_FOR)) {
+        consume(ps); consume(ps); consume(ps);
+        Token sn = consume(ps);
+        if (sn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the sequence name after NEXT VALUE FOR", sn); return NULL; }
+        return json_call("NEXTVAL", mkstr(sn.text), NULL);
+    }
+
     static const char* const NOW_WORDS[] = { "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME", "LOCALTIME", "LOCALTIMESTAMP",
                                              "UTC_TIMESTAMP", "UTC_DATE", "UTC_TIME", "CURRENT_USER" };
     if (!call) {
@@ -1159,6 +1167,10 @@ static ASTExpr* parse_primary(ParserState* ps) {
                         parse_fail(ps, "Tables of different databases in one statement are not supported yet", t);
                     t = c;
                     c = col;
+                }
+                if (!strcasecmp(c.text, "NEXTVAL") || !strcasecmp(c.text, "CURRVAL")) {   // s.NEXTVAL (Oracle)
+                    ast_expr_free(e);
+                    return json_call(!strcasecmp(c.text, "NEXTVAL") ? "NEXTVAL" : "CURRVAL", mkstr(t.text), NULL);
                 }
                 copy_text(ps, e->table_name, sizeof(e->table_name), t.text);
                 copy_text(ps, e->col_name, sizeof(e->col_name), c.text);
@@ -1632,6 +1644,87 @@ static ASTNode* parse_derived(ParserState* ps, char* name, size_t cap) {
     return q;
 }
 
+static void tf_free(TableFunc* t);
+
+static bool strcasestr_ascii(const char* h, const char* nd) {
+    size_t n = strlen(nd);
+    for (; *h; h++) if (!strncasecmp(h, nd, n)) return true;
+    return false;
+}
+
+static bool tf_here(ParserState* ps) {
+    return (ident_is(ps, "JSON_TABLE") || ident_is(ps, "GENERATE_SERIES")) && next_is(ps, 1, TOK_LPAREN);
+}
+
+// JSON_TABLE(doc, 'percorso' COLUMNS (nome tipo PATH 'p' | nome FOR ORDINALITY | nome tipo EXISTS PATH 'p', ...))
+// GENERATE_SERIES(da, a [, passo]); poi [AS] alias [(colonne)]
+static TableFunc* parse_table_func(ParserState* ps, char* alias, size_t acap) {
+    TableFunc* t = calloc(1, sizeof(TableFunc));
+    if (!t) { parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
+    Token fn = consume(ps);
+    for (int i = 0; fn.text[i] && i < 31; i++) t->func[i] = (char)toupper((unsigned char)fn.text[i]);
+    consume(ps);                                          // '('
+    bool json = !strcmp(t->func, "JSON_TABLE");
+    do {
+        if (t->nargs >= 4) { parse_fail(ps, "Too many arguments", peek(ps)); break; }
+        ASTExpr* a = parse_expr(ps);
+        if (!a) break;
+        t->args[t->nargs++] = a;
+    } while (ps->result->success && !(json && ident_is(ps, "COLUMNS")) && match(ps, TOK_COMMA));
+    if (ps->result->success && json) {
+        if (t->nargs != 2 || !ident_is(ps, "COLUMNS") || !next_is(ps, 1, TOK_LPAREN)) { parse_fail(ps, "Expected JSON_TABLE(doc, 'path' COLUMNS (...))", peek(ps)); }
+        else {
+            consume(ps); consume(ps);
+            do {
+                TFCol* nc = realloc(t->cols, sizeof(TFCol) * (size_t)(t->ncols + 1));
+                if (!nc) { parse_fail(ps, "Out of memory", peek(ps)); break; }
+                t->cols = nc;
+                TFCol* c = &t->cols[t->ncols];
+                memset(c, 0, sizeof(*c));
+                Token cn = consume(ps);
+                if (cn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name in COLUMNS", cn); break; }
+                copy_text(ps, c->name, sizeof(c->name), cn.text);
+                if (match(ps, TOK_FOR)) {
+                    if (!ident_is(ps, "ORDINALITY")) { parse_fail(ps, "Expected FOR ORDINALITY", peek(ps)); break; }
+                    consume(ps);
+                    c->kind = TFC_ORDINALITY;
+                    snprintf(c->def.type, sizeof(c->def.type), "BIGINT");
+                } else {
+                    c->def.nullable = true;
+                    if (!parse_type_spec(ps, &c->def)) { if (ps->result->success) parse_fail(ps, "Expected the column type", peek(ps)); break; }
+                    if (match(ps, TOK_EXISTS)) c->kind = TFC_EXISTS;
+                    if (!ident_is(ps, "PATH")) { parse_fail(ps, "Expected PATH 'path' for the column", peek(ps)); break; }
+                    consume(ps);
+                    Token pt = consume(ps);
+                    if (pt.type != TOK_STRING) { parse_fail(ps, "Expected a quoted path", pt); break; }
+                    copy_text(ps, c->path, sizeof(c->path), pt.text);
+                    // DEFAULT x ON EMPTY / NULL ON ERROR ...: accettati (un percorso che manca dà NULL)
+                    while (peek(ps).type != TOK_COMMA && peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) consume(ps);
+                }
+                t->ncols++;
+            } while (ps->result->success && match(ps, TOK_COMMA));
+            if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' after COLUMNS", peek(ps));
+        }
+    }
+    if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' after the table function", peek(ps));
+    if (ps->result->success && !json && (t->nargs < 2 || t->nargs > 3)) parse_fail(ps, "GENERATE_SERIES(start, stop [, step])", fn);
+    if (!ps->result->success) { tf_free(t); return NULL; }
+    char a[64] = "";
+    parse_table_alias(ps, a, sizeof(a));
+    if (a[0] && match(ps, TOK_LPAREN)) {                  // alias(colonne)
+        do {
+            Token c = consume(ps);
+            if (c.type != TOK_IDENTIFIER || t->ncolnames >= 8) { parse_fail(ps, "Expected a column name", c); break; }
+            copy_text(ps, t->colnames[t->ncolnames++], 64, c.text);
+        } while (match(ps, TOK_COMMA));
+        if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')'", peek(ps));
+    }
+    if (!ps->result->success) { tf_free(t); return NULL; }
+    if (a[0]) copy_text(ps, alias, acap, a);
+    else { snprintf(alias, acap, "%s", json ? "json_table" : "generate_series"); for (char* q = alias; *q; q++) *q = (char)tolower((unsigned char)*q); }
+    return t;
+}
+
 // SELECT [DISTINCT] colonne [FROM ...] [WHERE] [GROUP BY] [HAVING]  (senza ORDER BY / LIMIT)
 // FROM con le sue sorgenti e i JOIN (dopo la parola FROM)
 static void parse_from_clause(ParserState* ps, ASTNode* n) {
@@ -1640,6 +1733,9 @@ static void parse_from_clause(ParserState* ps, ASTNode* n) {
     // fonte := tabella | vista | '(' SELECT ... ')'
     if (peek(ps).type == TOK_LPAREN && (query_starts(ps, 1) || next_is(ps, 1, TOK_VALUES))) {
         n->select_stmt.from_sub = parse_derived(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name));
+        memcpy(n->select_stmt.table_alias, n->select_stmt.table_name, sizeof(n->select_stmt.table_alias));
+    } else if (tf_here(ps)) {                              // FROM JSON_TABLE(...) / GENERATE_SERIES(...)
+        n->select_stmt.from_tf = parse_table_func(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name));
         memcpy(n->select_stmt.table_alias, n->select_stmt.table_name, sizeof(n->select_stmt.table_alias));
     } else {
         Token first = table_tok(ps);
@@ -1653,7 +1749,14 @@ static void parse_from_clause(ParserState* ps, ASTNode* n) {
         bool on_allowed = true;
         bool natural = false;
         if (ident_is(ps, "NATURAL")) { consume(ps); natural = true; }
+        bool apply = false;                               // CROSS APPLY / OUTER APPLY (SQL Server) = JOIN LATERAL ... ON TRUE
         if (!natural && match(ps, TOK_COMMA)) { jt = JOIN_CROSS; on_allowed = false; }
+        else if (!natural && (ident_is(ps, "CROSS") || ident_is(ps, "OUTER")) && peek2_ident(ps, "APPLY")) {
+            jt = ident_is(ps, "CROSS") ? JOIN_CROSS : JOIN_LEFT;
+            consume(ps); consume(ps);
+            on_allowed = false;
+            apply = true;
+        }
         else if (match(ps, TOK_JOIN))   jt = JOIN_INNER;
         else if (ident_is(ps, "INNER")) { consume(ps); expect(ps, TOK_JOIN); jt = JOIN_INNER; }
         else if (!natural && ident_is(ps, "CROSS")) { consume(ps); expect(ps, TOK_JOIN); jt = JOIN_CROSS; on_allowed = false; }
@@ -1666,10 +1769,23 @@ static void parse_from_clause(ParserState* ps, ASTNode* n) {
         ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
         memset(j, 0, sizeof(ASTJoin));
         j->type = jt;
-        if (peek(ps).type == TOK_LPAREN && (query_starts(ps, 1) || next_is(ps, 1, TOK_VALUES))) {
+        if (ident_is(ps, "LATERAL") || apply) {             // LATERAL (subquery): vede le tabelle a sinistra
+            if (ident_is(ps, "LATERAL")) consume(ps);
+            j->lateral = true;
+            if (jt == JOIN_RIGHT || jt == JOIN_FULL) { parse_fail(ps, "LATERAL works with JOIN, LEFT JOIN and CROSS JOIN", peek(ps)); break; }
+        }
+        if (tf_here(ps)) {                                  // JOIN JSON_TABLE(t.doc, ...) / GENERATE_SERIES(...): laterale
+            j->tf = parse_table_func(ps, j->table_name, sizeof(j->table_name));
+            memcpy(j->alias, j->table_name, sizeof(j->alias));
+            j->lateral = true;
+            if (!ps->result->success) break;
+        } else if (peek(ps).type == TOK_LPAREN && (query_starts(ps, 1) || next_is(ps, 1, TOK_VALUES))) {
             j->sub = parse_derived(ps, j->table_name, sizeof(j->table_name));
             memcpy(j->alias, j->table_name, sizeof(j->alias));
             if (!ps->result->success) break;
+        } else if (j->lateral) {
+            parse_fail(ps, "Expected a subquery or a table function after LATERAL", peek(ps));
+            break;
         } else {
             Token tt = table_tok(ps);
             if (tt.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a table name after JOIN", tt); break; }
@@ -1690,7 +1806,7 @@ static void parse_from_clause(ParserState* ps, ASTNode* n) {
             } while (match(ps, TOK_COMMA));
             if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' after the USING columns", peek(ps));
         }
-        else if (jt == JOIN_LEFT || jt == JOIN_RIGHT || jt == JOIN_FULL) parse_fail(ps, "LEFT, RIGHT and FULL JOIN need ON, USING or NATURAL", peek(ps));
+        else if ((jt == JOIN_LEFT || jt == JOIN_RIGHT || jt == JOIN_FULL) && !j->lateral) parse_fail(ps, "LEFT, RIGHT and FULL JOIN need ON, USING or NATURAL", peek(ps));
     }
 }
 
@@ -3205,6 +3321,60 @@ static void parse_merge(ParserState* ps, ASTNode* n) {
     if (ps->result->success && n->merge.nwhen == 0) parse_fail(ps, "Expected WHEN in MERGE", peek(ps));
 }
 
+// opzioni di CREATE / ALTER SEQUENCE
+static void parse_seq_options(ParserState* ps, ASTNode* n) {
+    while (ps->result->success && peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF) {
+        bool neg;
+        #define SEQ_NUM(dst) do { neg = match(ps, TOK_MINUS); Token v = consume(ps); \
+            if (v.type != TOK_INTEGER) { parse_fail(ps, "Expected a number", v); return; } dst = atoll(v.text) * (neg ? -1 : 1); } while (0)
+        if (match(ps, TOK_AS)) { ColumnDef d; memset(&d, 0, sizeof(d)); parse_type_spec(ps, &d); continue; }
+        if (ident_is(ps, "START")) { consume(ps); if (ident_is(ps, "WITH")) consume(ps); SEQ_NUM(n->seq.start); n->seq.has_start = true; continue; }
+        if (ident_is(ps, "INCREMENT")) { consume(ps); match(ps, TOK_BY); SEQ_NUM(n->seq.inc); n->seq.has_inc = true; continue; }
+        if (ident_is(ps, "MINVALUE")) { consume(ps); SEQ_NUM(n->seq.minv); n->seq.has_min = true; continue; }
+        if (ident_is(ps, "MAXVALUE")) { consume(ps); SEQ_NUM(n->seq.maxv); n->seq.has_max = true; continue; }
+        if (ident_is(ps, "NO") || ident_is(ps, "NOMINVALUE") || ident_is(ps, "NOMAXVALUE") || ident_is(ps, "NOCYCLE") || ident_is(ps, "NOCACHE")) {
+            bool no = ident_is(ps, "NO");
+            Token w = consume(ps);
+            if (no) w = consume(ps);
+            if (w.text && strcasestr_ascii(w.text, "CYCLE")) { n->seq.cycle = false; n->seq.has_cycle = true; }
+            continue;
+        }
+        if (ident_is(ps, "CYCLE")) { consume(ps); n->seq.cycle = true; n->seq.has_cycle = true; continue; }
+        if (ident_is(ps, "CACHE")) { consume(ps); consume(ps); continue; }
+        if (ident_is(ps, "ORDER") || peek(ps).type == TOK_ORDER || ident_is(ps, "NOORDER")) { consume(ps); continue; }
+        if (ident_is(ps, "OWNED")) { consume(ps); match(ps, TOK_BY); consume(ps); if (match(ps, TOK_DOT)) consume(ps); continue; }
+        if (ident_is(ps, "RESTART")) {
+            consume(ps);
+            n->seq.restart = true;
+            if (ident_is(ps, "WITH") || peek(ps).type == TOK_INTEGER || peek(ps).type == TOK_MINUS) {
+                if (ident_is(ps, "WITH")) consume(ps);
+                SEQ_NUM(n->seq.restart_with);
+                n->seq.has_restart_with = true;
+            }
+            continue;
+        }
+        #undef SEQ_NUM
+        parse_fail(ps, "Unexpected sequence option", peek(ps));
+        return;
+    }
+}
+
+static void parse_sequence(ParserState* ps, ASTNode* n, int op) {
+    n->type = NODE_SEQUENCE;
+    n->seq.op = op;
+    if (ident_is(ps, "IF")) {
+        consume(ps);
+        if (op == 0) match(ps, TOK_NOT);
+        if (!match(ps, TOK_EXISTS)) { parse_fail(ps, "Expected IF [NOT] EXISTS", peek(ps)); return; }
+        n->if_exists = true;
+    }
+    Token nm = consume(ps);
+    if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the sequence name", nm); return; }
+    if (peek(ps).type == TOK_DOT && next_is(ps, 1, TOK_IDENTIFIER)) { consume(ps); nm = consume(ps); }
+    copy_text(ps, n->seq.name, sizeof(n->seq.name), nm.text);
+    if (op != 1) parse_seq_options(ps, n);
+}
+
 // CALL nome(argomenti)
 static void parse_call_stmt(ParserState* ps, ASTNode* n) {
     consume(ps);
@@ -3313,7 +3483,9 @@ static bool tokens_text(ParserState* ps, int from, int to, char* out, size_t cap
         }
         size_t pl = strlen(piece);
         bool tight = t->type == TOK_DOT || t->type == TOK_RPAREN || t->type == TOK_COMMA || t->type == TOK_SEMICOLON ||
-                     (i > from && (ps->tokens->tokens[i - 1].type == TOK_DOT || ps->tokens->tokens[i - 1].type == TOK_LPAREN));
+                     (i > from && (ps->tokens->tokens[i - 1].type == TOK_DOT || ps->tokens->tokens[i - 1].type == TOK_LPAREN)) ||
+                     (i > from && t->type == TOK_LPAREN && (ps->tokens->tokens[i - 1].type == TOK_IDENTIFIER ||
+                                                             ps->tokens->tokens[i - 1].type == TOK_LEFT || ps->tokens->tokens[i - 1].type == TOK_RIGHT));   // f(x)
         if (di + pl + 2 >= cap) return false;
         if (di > 0 && !tight) out[di++] = ' ';
         memcpy(out + di, piece, pl);
@@ -3586,6 +3758,21 @@ static bool parse_default_value(ParserState* ps, char* out, size_t n) {
     return false;
 }
 
+// (espressione) [STORED | VIRTUAL | PERSISTENT] di una colonna calcolata: il testo in comment
+static bool parse_gen_column(ParserState* ps, ColumnDef* cd) {
+    consume(ps);                                          // '('
+    int st = ps->pos;
+    ASTExpr* e = parse_expr(ps);
+    if (!e) return false;
+    ast_expr_free(e);
+    int en = ps->pos;
+    if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')' after the expression of the generated column", peek(ps)); return false; }
+    if (!tokens_text(ps, st, en, cd->comment, sizeof(cd->comment))) { parse_fail(ps, "Generated column expression is too long (max 255 characters)", peek(ps)); return false; }
+    cd->flags |= COLF_GENERATED;
+    if (ident_is(ps, "STORED") || ident_is(ps, "VIRTUAL") || ident_is(ps, "PERSISTENT")) consume(ps);
+    return true;
+}
+
 static void parse_column_def(ParserState* ps, ASTNode* n) {
     if (n->create_table.num_columns >= 64) { parse_fail(ps, "Too many columns (max 64)", peek(ps)); return; }
     ColumnDef* cd = &n->create_table.columns[n->create_table.num_columns];
@@ -3642,10 +3829,18 @@ static void parse_column_def(ParserState* ps, ASTNode* n) {
             consume(ps);
             if (ident_is(ps, "ALWAYS")) consume(ps);
             else { consume(ps); if (ident_is(ps, "DEFAULT")) consume(ps); }
-            if (!match(ps, TOK_AS) || !ident_is(ps, "IDENTITY")) { parse_fail(ps, "Expected AS IDENTITY (computed columns are not supported)", peek(ps)); return; }
+            if (!match(ps, TOK_AS)) { parse_fail(ps, "Expected AS IDENTITY or AS (expression)", peek(ps)); return; }
+            if (peek(ps).type == TOK_LPAREN) {               // GENERATED ALWAYS AS (espressione) [STORED | VIRTUAL]
+                if (!parse_gen_column(ps, cd)) return;
+                continue;
+            }
+            if (!ident_is(ps, "IDENTITY")) { parse_fail(ps, "Expected AS IDENTITY or AS (expression)", peek(ps)); return; }
             consume(ps);
             if (match(ps, TOK_LPAREN)) { while (peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) consume(ps); match(ps, TOK_RPAREN); }
             cd->auto_increment = true;
+        } else if (peek(ps).type == TOK_AS && next_is(ps, 1, TOK_LPAREN)) {   // MySQL: col tipo AS (espressione) [STORED]
+            consume(ps);
+            if (!parse_gen_column(ps, cd)) return;
         } else if (ident_is(ps, "IDENTITY")) {                        // SQL Server: IDENTITY [(1, 1)]
             consume(ps);
             if (match(ps, TOK_LPAREN)) { while (peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) consume(ps); match(ps, TOK_RPAREN); }
@@ -3654,7 +3849,7 @@ static void parse_column_def(ParserState* ps, ASTNode* n) {
             consume(ps);
             Token cm = consume(ps);
             if (cm.type != TOK_STRING) { parse_fail(ps, "Expected a quoted comment", cm); return; }
-            if (cd->comment[0] != '\x01') copy_text(ps, cd->comment, sizeof(cd->comment), cm.text);
+            if (cd->comment[0] != '\x01' && !(cd->flags & COLF_GENERATED)) copy_text(ps, cd->comment, sizeof(cd->comment), cm.text);
         } else if (ident_is(ps, "COLLATE") || ident_is(ps, "CHARSET") || ident_is(ps, "CHARACTER")) {
             bool cs = ident_is(ps, "CHARACTER");
             consume(ps);
@@ -4345,6 +4540,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                 if (!match(ps, TOK_NOT) || !match(ps, TOK_EXISTS)) { parse_fail(ps, "Expected IF NOT EXISTS", peek(ps)); break; }
                 n->if_exists = true;
             }
+            if (sub.type == TOK_IDENTIFIER && sub.text && !strcasecmp(sub.text, "SEQUENCE")) { parse_sequence(ps, n, 0); return n; }
             if (sub.type == TOK_IDENTIFIER && sub.text && (!strcasecmp(sub.text, "PROCEDURE") || !strcasecmp(sub.text, "FUNCTION"))) {
                 return parse_create_procedure(ps, n, !strcasecmp(sub.text, "FUNCTION"));
             } else if (sub.type == TOK_DATABASE || (sub.type == TOK_IDENTIFIER && sub.text && !strcasecmp(sub.text, "SCHEMA"))) {
@@ -4404,6 +4600,7 @@ static ASTNode* parse_statement(ParserState* ps) {
         }
         case TOK_ALTER: {
             consume(ps);
+            if (ident_is(ps, "SEQUENCE")) { consume(ps); parse_sequence(ps, n, 2); break; }
             if (match(ps, TOK_VIEW)) {                            // ALTER VIEW v [(colonne)] AS SELECT ...
                 n->create_view.alter = true;
                 parse_view_def(ps, n);
@@ -4439,6 +4636,7 @@ static ASTNode* parse_statement(ParserState* ps) {
         }
         case TOK_DROP: {
             consume(ps);
+            if (ident_is(ps, "SEQUENCE")) { consume(ps); parse_sequence(ps, n, 1); break; }
             Token sub = consume(ps);
             bool temporary = false;
             if (sub.type == TOK_IDENTIFIER && sub.text && !strcasecmp(sub.text, "TEMPORARY") && peek(ps).type == TOK_TABLE) {
@@ -4738,6 +4936,13 @@ ASTExpr* parser_parse_expr(TokenList* tokens, char* err, size_t errn) {
     return e;
 }
 
+static void tf_free(TableFunc* t) {
+    if (!t) return;
+    for (int i = 0; i < t->nargs; i++) ast_expr_free(t->args[i]);
+    free(t->cols);
+    free(t);
+}
+
 static void free_node(ASTNode* n) {
     if (!n) return;
     free_node(n->chain);
@@ -4753,6 +4958,8 @@ static void free_node(ASTNode* n) {
                 free_node(n->select_stmt.joins[j].sub);
             }
             free_node(n->select_stmt.from_sub);
+            tf_free(n->select_stmt.from_tf);
+            for (int j = 0; j < n->select_stmt.num_joins; j++) tf_free(n->select_stmt.joins[j].tf);
             free_node(n->select_stmt.set_next);
             for (int j = 0; j < n->select_stmt.num_ctes; j++) free_node(n->select_stmt.ctes[j].node);
             free(n->select_stmt.ctes);

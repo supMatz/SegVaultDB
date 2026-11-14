@@ -49,6 +49,7 @@ typedef struct {
 
 #define COLF_UNSIGNED      0x01   // UNSIGNED: niente valori negativi
 #define COLF_ON_UPDATE_NOW 0x02   // ON UPDATE CURRENT_TIMESTAMP
+#define COLF_GENERATED     0x04   // GENERATED ALWAYS AS (espressione): l'espressione sta in comment
 
 // -- definizione indice --
 typedef struct {

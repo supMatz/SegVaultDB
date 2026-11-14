@@ -120,6 +120,11 @@ static bool db_init_impl(const char* data_directory) {
 
     // Inizializza i componenti
     g_db.catalog = catalog_load(g_db.cat_path);
+    {                                                     // sequenze (CREATE SEQUENCE)
+        char sp[600];
+        snprintf(sp, sizeof(sp), "%s" SV_PATH_SEP "sequences.txt", data_directory);
+        executor_set_seq_file(sp);
+    }
     g_db.bp      = bp_create(SV_BUFFER_POOL_CAP, g_db.db_fd);
     g_db.txm     = txm_create();
     g_db.wal     = wal_create(g_db.log_path);
@@ -1781,6 +1786,7 @@ QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char
         const Token* t = &tokens->tokens[i];
         if (t->type != TOK_IDENTIFIER || !t->text) continue;
         if (t->text[0] == '@') { ok = false; break; }
+        if (!strcasecmp(t->text, "NEXTVAL") || !strcasecmp(t->text, "SETVAL") || !strcasecmp(t->text, "NEXT")) { ok = false; break; }   // sequenze
         if (idx >= 0 && i + 1 < tokens->count && tokens->tokens[i + 1].type == TOK_LPAREN) {
             const Database* d = &g_db.catalog->databases[idx];
             for (int r = 0; r < d->num_routines && ok; r++)
@@ -2052,7 +2058,7 @@ char* db_get_objects_sql(const char* db_name, int what) {
 // Un backup è una cartella di dati completa (si apre direttamente con segvault o segvault-server):
 // dopo un checkpoint si copiano il file delle pagine, il catalogo, la lista delle pagine libere e
 // gli utenti; il log resta vuoto. Il lock esclusivo del motore ferma tutto durante la copia.
-static const char* const BK_FILES[4] = { "segvault.db", "segvault.cat", "segvault.free", "users.dat" };
+static const char* const BK_FILES[5] = { "segvault.db", "segvault.cat", "segvault.free", "users.dat", "sequences.txt" };
 
 static bool bk_copy(const char* from, const char* to, bool must_exist, char* err, size_t errn) {
     int in = sv_open(from, SV_O_RDONLY, 0);
@@ -2089,7 +2095,7 @@ static bool bk_has_data(const char* dir) {
 }
 
 static bool bk_copy_dir(const char* from, const char* to, char* err, size_t errn) {
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         char a[700], b[700];
         snprintf(a, sizeof(a), "%.600s" SV_PATH_SEP "%s", from, BK_FILES[i]);
         snprintf(b, sizeof(b), "%.600s" SV_PATH_SEP "%s", to, BK_FILES[i]);

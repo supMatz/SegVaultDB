@@ -574,6 +574,22 @@ CREATE TABLE esame_copia LIKE esame;                                          --
 RENAME TABLE esame_copia TO esame_2024;
 CREATE TEMPORARY TABLE t (...);   -- in una procedura: eliminata alla fine della CALL
 
+-- colonne calcolate (salvate e ricalcolate a ogni INSERT / UPDATE)
+CREATE TABLE riga (prezzo DECIMAL(8,2), qta INT,
+                   totale DECIMAL(10,2) GENERATED ALWAYS AS (prezzo * qta) STORED,
+                   sigla VARCHAR(5) AS (UPPER(LEFT(nome, 3))));
+id INT GENERATED ALWAYS AS IDENTITY   -- anche SERIAL, IDENTITY(1, 1), AUTO_INCREMENT
+
+-- sequenze (come PostgreSQL / Oracle / SQL Server; non transazionali, sopravvivono ai riavvii)
+CREATE SEQUENCE fattura START WITH 1000 INCREMENT BY 1 [MINVALUE m] [MAXVALUE x] [CYCLE];
+SELECT NEXTVAL('fattura'), CURRVAL('fattura'), LASTVAL();   SELECT SETVAL('fattura', 2000);
+INSERT INTO f VALUES (NEXT VALUE FOR fattura, ...);          -- anche fattura.NEXTVAL
+ALTER SEQUENCE fattura RESTART [WITH n];   DROP SEQUENCE [IF EXISTS] fattura;
+
+-- ALTER TABLE con più operazioni (come le migrazioni di Laravel / Doctrine)
+ALTER TABLE utente ADD voti INT DEFAULT 0, ADD INDEX utente_voti (voti), CHANGE bio descrizione TEXT,
+                   DROP FOREIGN KEY utente_gruppo_fk;
+
 ALTER TABLE esame RENAME TO esami;
 ALTER TABLE studente ADD [COLUMN] email VARCHAR(60) DEFAULT 'n/d';      -- le righe esistenti ricevono il DEFAULT
 ALTER TABLE studente RENAME COLUMN email TO posta;                       -- aggiorna anche CHECK, FK e trigger
@@ -651,6 +667,8 @@ LIMIT n [OFFSET m]   |   OFFSET m ROWS FETCH FIRST n ROWS ONLY;
 | Aggregati | `COUNT(*)`, `COUNT([DISTINCT] x)`, `SUM`, `AVG`, `MIN`, `MAX` (anche su espressioni), `GROUP_CONCAT(x ORDER BY y SEPARATOR ', ')`, `STRING_AGG(x, ', ' ORDER BY y)`, `LISTAGG(x, ', ') WITHIN GROUP (ORDER BY y)`, `STDDEV` / `STDDEV_POP` / `STDDEV_SAMP` / `VARIANCE` / `VAR_POP` / `VAR_SAMP`, `BIT_AND` / `BIT_OR` / `BIT_XOR`, `BOOL_AND` / `BOOL_OR` / `EVERY`, `JSON_ARRAYAGG`, `JSON_OBJECTAGG`; `COUNT(*) FILTER (WHERE ...)`; con `ROLLUP` / `CUBE` / `GROUPING SETS` i subtotali e `GROUPING(x)` |
 | Subquery | `x IN (SELECT ...)`, `NOT IN`, `EXISTS`, `NOT EXISTS`, `x > ALL (SELECT ...)`, `x = ANY / SOME (...)`, subquery scalari `(SELECT MAX(voto) FROM esame)` in `SELECT`, `WHERE`, `HAVING`, `SET`; correlate a qualunque profondità |
 | Insiemi | `UNION [ALL]`, `INTERSECT`, `EXCEPT` (`INTERSECT` lega più degli altri), `ORDER BY` / `LIMIT` sul risultato |
+| `LATERAL` | `FROM reparto r JOIN LATERAL (SELECT nome FROM dipendente d WHERE d.reparto = r.id ORDER BY stipendio DESC LIMIT 3) t ON TRUE` (i primi N di ogni gruppo), `LEFT JOIN LATERAL`, `, LATERAL (...)`, `CROSS APPLY` / `OUTER APPLY` di SQL Server: la subquery vede le tabelle alla sua sinistra |
+| Funzioni-tabella | `SELECT * FROM generate_series(1, 10 [, passo]) AS g(n)`; `JSON_TABLE(doc, '$.righe[*]' COLUMNS (n FOR ORDINALITY, sku VARCHAR(10) PATH '$.sku', q INT PATH '$.q', ha_note INT EXISTS PATH '$.note')) AS j`, anche su una colonna: `FROM ordine o, JSON_TABLE(o.dati, ...) j` |
 | Tabelle derivate | `FROM (SELECT ...) AS t`, `JOIN (SELECT ...) AS t ON ...`, nomi delle colonne `AS t(a, b)`, righe costanti `(VALUES (1, 'a'), (2, 'b')) AS v(n, s)`; `VALUES (...), (...)` e `TABLE t` come istruzioni; gli hint `USE / FORCE / IGNORE INDEX (...)` sono accettati |
 | `WITH` | `WITH medie (studente, media) AS (SELECT ...), migliori AS (SELECT ... FROM medie) SELECT ...` |
 | `WITH RECURSIVE` | `WITH RECURSIVE sotto AS (SELECT id FROM persona WHERE id = 1 UNION SELECT p.id FROM persona p JOIN sotto s ON p.capo = s.id) SELECT ...` — con `UNION` i cicli terminano; una ricorsione senza fine viene fermata dopo 1000 passi |
@@ -789,7 +807,7 @@ funzioni (Sakila) si importano per intero.
 
 ### Non supportato
 
-Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), `LATERAL`, `JSON_TABLE`, sequenze (`CREATE SEQUENCE`; si usano `AUTO_INCREMENT`, `SERIAL` o `GENERATED ... AS IDENTITY`), eventi pianificati (`CREATE EVENT`), tabelle di database diversi nella stessa istruzione (`shop.prodotto JOIN uni.esame`), colonne calcolate (`GENERATED ALWAYS AS (espressione)`).
+Frame `RANGE` con un intervallo di valori (`RANGE 5 PRECEDING`), eventi pianificati (`CREATE EVENT`), tabelle di database diversi nella stessa istruzione (`shop.prodotto JOIN uni.esame`), colonne calcolate `VIRTUAL` (si accettano e vengono salvate come `STORED`), `NESTED PATH` in `JSON_TABLE`.
 
 ---
 

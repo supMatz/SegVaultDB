@@ -40,9 +40,9 @@ static bool is_backup_name(const char* n) {
 }
 
 static void remove_backup(const char* path) {
-    static const char* const F[] = { "segvault.db", "segvault.cat", "segvault.free", "users.dat", "segvault.wal" };
+    static const char* const F[] = { "segvault.db", "segvault.cat", "segvault.free", "users.dat", "segvault.wal", "sequences.txt" };
     char f[800];
-    for (int i = 0; i < 5; i++) { snprintf(f, sizeof(f), "%.700s/%s", path, F[i]); remove(f); }
+    for (int i = 0; i < 6; i++) { snprintf(f, sizeof(f), "%.700s/%s", path, F[i]); remove(f); }
 #ifdef _WIN32
     _rmdir(path);
 #else

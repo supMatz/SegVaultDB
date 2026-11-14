@@ -99,10 +99,12 @@ static QueryResult* exec_create_db(ExecCtx* ctx, ASTNode* n) {
     return result_ok_msg(0);
 }
 
+void executor_drop_db_sequences(const char* db);
 static QueryResult* exec_drop_db(ExecCtx* ctx, ASTNode* n) {
     executor_invalidate_indexes();
     if (catalog_drop_db(ctx->catalog, n->drop_db.db_name) != SV_OK)
         return result_error_msg("Database not found");
+    executor_drop_db_sequences(n->drop_db.db_name);
     return result_ok_msg(0);
 }
 
@@ -175,6 +177,8 @@ static const Constraint* referenced_by(Database* db, const TableSchema* ts, cons
 static void rt_temp_created(const char* db, const char* table);
 static bool rt_is_temp(const char* db, const char* table);
 static QueryResult* exec_create_table_impl(ExecCtx* ctx, ASTNode* n);
+static const char* gen_compute(ExecCtx* ctx, TableSchema* ts, Tuple* t, char* msg, size_t mn);
+static bool has_generated(const TableSchema* ts);
 static QueryResult* exec_create_table_as(ExecCtx* ctx, ASTNode* n);
 static QueryResult* exec_create_table_like(ExecCtx* ctx, ASTNode* n);
 static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n);
@@ -383,6 +387,14 @@ static QueryResult* exec_create_table_impl(ExecCtx* ctx, ASTNode* n) {
         return result_error_msg(msg);
     }
 
+    if (has_generated(ts)) {                                     // colonne calcolate: espressioni valide sulle colonne
+        Tuple* probe = tuple_create(ts->num_columns);
+        for (int i = 0; probe && i < probe->num_values; i++) probe->values[i].is_null = true;
+        const char* gf = probe ? gen_compute(ctx, ts, probe, msg, sizeof(msg)) : "Out of memory";
+        if (probe) tuple_free(probe);
+        if (gf && strstr(gf, "cannot be NULL")) gf = NULL;    // su una riga vuota il valore può mancare
+        if (gf) { if (gf != msg) snprintf(msg, sizeof(msg), "%s", gf); free(ts); return result_error_msg(msg); }
+    }
     int rc = catalog_add_table(ctx->catalog, db->name, ts);
     free(ts);
     if (rc != SV_OK) return result_error_msg("Failed to create table");
@@ -518,6 +530,7 @@ static const char* rewrite_rows(ExecCtx* ctx, TableSchema* ts, TableSchema* ns, 
             else if (map[i] >= 0) value_copy(&nt->values[i], &t->values[map[i]], ns->columns[i].type);
             else column_set_from_text(&nt->values[i], &ns->columns[i], def);
         }
+        if (!fail && has_generated(ns)) fail = gen_compute(ctx, ns, nt, cmsg, cmsgn);   // colonne calcolate
         if (fail) { tuple_free(nt); tuple_free(t); break; }
         RID nr;
         if (heap_insert(nh, nt, ns, &nr) != SV_OK) fail = "Cannot write the new rows (disk full?)";
@@ -674,6 +687,9 @@ static QueryResult* alter_column(ExecCtx* ctx, Database* db, TableSchema* ts, AS
         for (int i = 0; i < db->num_triggers; i++)
             if (!strcasecmp(db->triggers[i].table_name, ts->name) && rename_ident_in_text(db->triggers[i].body, from, to, buf, SV_MAX_SQL_LEN))
                 snprintf(db->triggers[i].body, sizeof(db->triggers[i].body), "%s", buf);
+        for (int i = 0; i < ts->num_columns; i++)                // espressioni delle colonne calcolate
+            if ((ts->columns[i].flags & COLF_GENERATED) && rename_ident_in_text(ts->columns[i].comment, from, to, buf, SV_MAX_SQL_LEN))
+                snprintf(ts->columns[i].comment, sizeof(ts->columns[i].comment), "%s", buf);
         free(buf);
         for (int i = 0; i < ts->num_indexes; i++)
             if (!strcasecmp(ts->indexes[i].col_name, from)) snprintf(ts->indexes[i].col_name, sizeof(ts->indexes[i].col_name), "%s", to);
@@ -717,7 +733,17 @@ static QueryResult* alter_column(ExecCtx* ctx, Database* db, TableSchema* ts, AS
                 def = col->default_val;
                 if (check_value(col, def, msg, sizeof(msg))) fail = msg;
             }
-            if (!fail && !col->nullable && !def && ts->num_rows > 0) {
+            if (!fail && (col->flags & COLF_GENERATED)) {        // espressione controllata su una riga vuota
+                Tuple* probe = tuple_create(ns->num_columns + 1);
+                for (int i = 0; probe && i < probe->num_values; i++) probe->values[i].is_null = true;
+                ns->num_columns++;
+                const char* gf = probe ? gen_compute(ctx, ns, probe, msg, sizeof(msg)) : "Out of memory";
+                ns->num_columns--;
+                if (probe) tuple_free(probe);
+                if (gf && strstr(gf, "cannot be NULL")) gf = NULL;   // su una riga vuota il valore può mancare
+                if (gf) fail = gf;
+            }
+            if (!fail && !col->nullable && !def && ts->num_rows > 0 && !(col->flags & COLF_GENERATED)) {
                 snprintf(msg, sizeof(msg), "Column '%.64s' is NOT NULL: give it a DEFAULT for the existing rows", cd->name);
                 fail = msg;
             }
@@ -745,6 +771,11 @@ static QueryResult* alter_column(ExecCtx* ctx, Database* db, TableSchema* ts, AS
                         snprintf(msg, sizeof(msg), "Column '%.64s' is referenced by foreign key '%.64s' of table '%.64s'", name, c->name, db->tables[i].name);
                         fail = msg;
                     }
+            }
+        for (int i = 0; !fail && i < ts->num_columns; i++)
+            if (i != dropped && (ts->columns[i].flags & COLF_GENERATED) && ident_in_text(ts->columns[i].comment, name)) {
+                snprintf(msg, sizeof(msg), "Column '%.64s' is used by generated column '%.64s'", name, ts->columns[i].name);
+                fail = msg;
             }
         for (int i = 0; !fail && i < db->num_triggers; i++)
             if (!strcasecmp(db->triggers[i].table_name, ts->name) && ident_in_text(db->triggers[i].body, name)) {
@@ -1607,9 +1638,23 @@ typedef struct {
     bool         loaded;
     bool         arena_rows;               // righe nell'arena (non si liberano una per una)
     Arena        arena;
+    // sorgente laterale (LATERAL (subquery), JSON_TABLE, GENERATE_SERIES): righe ricalcolate per ogni
+    // combinazione delle sorgenti a sinistra, tenute in pool fino alla prossima esecuzione del piano
+    bool         lateral;
+    struct SelectPlan* lat_plan;
+    struct BindCtx* lat_bind;
+    const struct TableFunc* tf;
+    bool         lat_typed;                // tipi delle colonne della subquery già decisi dai valori
+    Tuple**      pool;
+    int          npool, cappool;
 } Source;
 
+static void plan_free(struct SelectPlan* p);
 static void source_free(Source* s) {
+    for (int i = 0; i < s->npool; i++) tuple_free(s->pool[i]);
+    free(s->pool);
+    if (s->lat_plan) plan_free(s->lat_plan);
+    free(s->lat_bind);
     for (int i = 0; !s->arena_rows && i < s->n; i++) tuple_free(s->rows[i]);
     arena_free(&s->arena);
     free(s->rows);
@@ -1754,6 +1799,7 @@ static const FuncDef FUNCS[] = {
     { "INITCAP", 1, 1 }, { "SPLIT_PART", 3, 3 }, { "TRANSLATE", 3, 3 }, { "CHR", 1, 1 }, { "CONV", 3, 3 },
     { "SOUNDEX", 1, 1 }, { "OVERLAY", 3, 4 }, { "DATE_TRUNC", 2, 2 }, { "DATE_PART", 2, 2 }, { "STARTS_WITH", 2, 2 },
     { "REGEXP_COUNT", 2, 2 }, { "MAKE_SET", 2, 32 }, { "EXPORT_SET", 3, 5 },
+    { "NEXTVAL", 1, 1 }, { "CURRVAL", 1, 1 }, { "SETVAL", 2, 3 }, { "LASTVAL", 0, 0 },
 };
 
 static const FuncDef* find_func(const char* name) {
@@ -2236,6 +2282,199 @@ static bool eval_internal(ASTExpr* e, EvalCtx* c, EvalVal* out) {
 }
 
 static void rt_eval_function(ASTExpr* e, EvalCtx* c, EvalVal* out);
+
+// ── sequenze (CREATE SEQUENCE, NEXTVAL / CURRVAL / SETVAL): come in PostgreSQL non sono transazionali;
+//    stato in un file di testo accanto al catalogo, riscritto a ogni cambio ──
+typedef struct { char db[64], name[64]; int64_t value, inc, minv, maxv, start; bool cycle, called; } Seq;
+static Seq*  g_seq;
+static int   g_nseq, g_capseq;
+static char  g_seq_path[1100];
+
+static void seq_save(void) {
+    if (!g_seq_path[0]) return;
+    char tmp[1200];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", g_seq_path);
+    FILE* f = fopen(tmp, "w");
+    if (!f) return;
+    for (int i = 0; i < g_nseq; i++) {
+        Seq* q = &g_seq[i];
+        fprintf(f, "%s %s %lld %lld %lld %lld %lld %d %d\n", q->db, q->name, (long long)q->value, (long long)q->inc,
+                (long long)q->minv, (long long)q->maxv, (long long)q->start, q->cycle, q->called);
+    }
+    fclose(f);
+    remove(g_seq_path);
+    rename(tmp, g_seq_path);
+}
+
+void executor_set_seq_file(const char* path) {
+    free(g_seq);
+    g_seq = NULL;
+    g_nseq = g_capseq = 0;
+    snprintf(g_seq_path, sizeof(g_seq_path), "%s", path ? path : "");
+    FILE* f = path ? fopen(path, "r") : NULL;
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        Seq q;
+        memset(&q, 0, sizeof(q));
+        long long v, inc, mn, mx, st;
+        int cy, ca;
+        if (sscanf(line, "%63s %63s %lld %lld %lld %lld %lld %d %d", q.db, q.name, &v, &inc, &mn, &mx, &st, &cy, &ca) != 9) continue;
+        q.value = v; q.inc = inc; q.minv = mn; q.maxv = mx; q.start = st; q.cycle = cy; q.called = ca;
+        if (g_nseq == g_capseq) {
+            int nc = g_capseq ? g_capseq * 2 : 16;
+            Seq* nv = realloc(g_seq, sizeof(Seq) * (size_t)nc);
+            if (!nv) break;
+            g_seq = nv; g_capseq = nc;
+        }
+        g_seq[g_nseq++] = q;
+    }
+    fclose(f);
+}
+
+static Seq* seq_find(const char* db, const char* name) {
+    for (int i = 0; i < g_nseq; i++) if (!strcasecmp(g_seq[i].db, db) && !strcasecmp(g_seq[i].name, name)) return &g_seq[i];
+    return NULL;
+}
+
+// "s" nel database corrente o "db.s"
+static Seq* seq_lookup(ExecCtx* x, const char* ref, char* err, size_t en) {
+    char db[64] = "", name[64];
+    const char* dot = strchr(ref, '.');
+    if (dot) { snprintf(db, sizeof(db), "%.*s", (int)(dot - ref) > 63 ? 63 : (int)(dot - ref), ref); snprintf(name, sizeof(name), "%.63s", dot + 1); }
+    else {
+        Database* d = x ? catalog_current_db(x->catalog) : NULL;
+        if (!d) { snprintf(err, en, "No database selected"); return NULL; }
+        snprintf(db, sizeof(db), "%s", d->name);
+        snprintf(name, sizeof(name), "%.63s", ref);
+    }
+    Seq* q = seq_find(db, name);
+    if (!q) snprintf(err, en, "Sequence '%.64s' does not exist", ref);
+    return q;
+}
+
+void executor_drop_db_sequences(const char* db) {
+    int k = 0;
+    for (int i = 0; i < g_nseq; i++) if (strcasecmp(g_seq[i].db, db)) g_seq[k++] = g_seq[i];
+    if (k != g_nseq) { g_nseq = k; seq_save(); }
+}
+
+static void seq_remember(const Seq* q) {                       // CURRVAL / LASTVAL della sessione
+    char key[160];
+    snprintf(key, sizeof(key), "\x01seq.%s.%s", q->db, q->name);
+    EvalVal v;
+    ev_int(&v, q->value);
+    uservar_set(key, &v);
+    uservar_set("\x01seq.last", &v);
+}
+
+// NEXTVAL / CURRVAL / SETVAL / LASTVAL
+static bool eval_sequence(ASTExpr* e, EvalCtx* c, EvalVal* out) {
+    const char* f = e->func;
+    if (strcmp(f, "NEXTVAL") && strcmp(f, "CURRVAL") && strcmp(f, "SETVAL") && strcmp(f, "LASTVAL")) return false;
+    if (!strcmp(f, "LASTVAL")) {
+        uservar_get("\x01seq.last", out);
+        if (out->null) ctx_error(c, "%s", "LASTVAL is not yet defined in this session");
+        return true;
+    }
+    EvalVal a;
+    eval_expr(e->args[0], c, &a);
+    if (a.null) { ev_null(out); return true; }
+    char ref[130], err[200];
+    snprintf(ref, sizeof(ref), "%.129s", ev_s(&a));
+    Seq* q = seq_lookup(c->x, ref, err, sizeof(err));
+    if (!q) { ctx_error(c, "%s", err); ev_null(out); return true; }
+    if (!strcmp(f, "CURRVAL")) {
+        char key[160];
+        snprintf(key, sizeof(key), "\x01seq.%s.%s", q->db, q->name);
+        uservar_get(key, out);
+        if (out->null) ctx_error(c, "currval of sequence '%s' is not yet defined in this session", q->name);
+        return true;
+    }
+    if (!strcmp(f, "SETVAL")) {
+        EvalVal v, called;
+        eval_expr(e->args[1], c, &v);
+        if (e->nargs > 2) eval_expr(e->args[2], c, &called); else ev_int(&called, 1);
+        if (v.null) { ev_null(out); return true; }
+        int64_t x = (int64_t)ev_as_num(&v);
+        if (x < q->minv || x > q->maxv) { ctx_error(c, "setval: value %.40s is out of bounds for the sequence", ev_s(&v)); ev_null(out); return true; }
+        q->value = x;
+        q->called = ev_truth(&called) == 1;
+        seq_save();
+        if (q->called) seq_remember(q);
+        ev_int(out, x);
+        return true;
+    }
+    int64_t next;                                              // NEXTVAL
+    if (!q->called) next = q->value;
+    else if (__builtin_add_overflow(q->value, q->inc, &next) || next > q->maxv || next < q->minv) {
+        if (!q->cycle) { ctx_error(c, "nextval: reached the limit of sequence '%s'", q->name); ev_null(out); return true; }
+        next = q->inc > 0 ? q->minv : q->maxv;
+    }
+    q->value = next;
+    q->called = true;
+    seq_save();
+    seq_remember(q);
+    ev_int(out, next);
+    return true;
+}
+
+static QueryResult* exec_sequence(ExecCtx* ctx, ASTNode* n) {
+    Database* db = catalog_current_db(ctx->catalog);
+    if (!db) return result_error_msg("No database selected");
+    char msg[200];
+    Seq* q = seq_find(db->name, n->seq.name);
+    if (n->seq.op == 1) {                                      // DROP
+        if (!q) {
+            if (n->if_exists) return result_ok_msg(0);
+            snprintf(msg, sizeof(msg), "Sequence '%.64s' does not exist", n->seq.name);
+            return result_error_msg(msg);
+        }
+        *q = g_seq[--g_nseq];
+        seq_save();
+        return result_ok_msg(0);
+    }
+    if (n->seq.op == 0) {                                      // CREATE
+        if (q) {
+            if (n->if_exists) return result_ok_msg(0);
+            snprintf(msg, sizeof(msg), "Sequence '%.64s' already exists", n->seq.name);
+            return result_error_msg(msg);
+        }
+        if (catalog_get_table(ctx->catalog, db->name, n->seq.name)) { snprintf(msg, sizeof(msg), "A table named '%.64s' exists", n->seq.name); return result_error_msg(msg); }
+        if (g_nseq == g_capseq) {
+            int nc = g_capseq ? g_capseq * 2 : 16;
+            Seq* nv = realloc(g_seq, sizeof(Seq) * (size_t)nc);
+            if (!nv) return result_error_msg("Out of memory");
+            g_seq = nv; g_capseq = nc;
+        }
+        q = &g_seq[g_nseq++];
+        memset(q, 0, sizeof(*q));
+        snprintf(q->db, sizeof(q->db), "%s", db->name);
+        snprintf(q->name, sizeof(q->name), "%s", n->seq.name);
+        q->inc = 1;
+        q->minv = 1;
+        q->maxv = INT64_MAX;
+    } else if (!q) {
+        snprintf(msg, sizeof(msg), "Sequence '%.64s' does not exist", n->seq.name);
+        return result_error_msg(msg);
+    }
+    Seq old = *q;
+    if (n->seq.has_inc) { if (n->seq.inc == 0) { if (n->seq.op == 0) g_nseq--; else *q = old; return result_error_msg("INCREMENT must not be zero"); } q->inc = n->seq.inc; }
+    if (n->seq.op == 0 && q->inc < 0) { q->minv = INT64_MIN; q->maxv = -1; }
+    if (n->seq.has_min) q->minv = n->seq.minv;
+    if (n->seq.has_max) q->maxv = n->seq.maxv;
+    if (n->seq.has_cycle) q->cycle = n->seq.cycle;
+    if (n->seq.has_start) q->start = n->seq.start;
+    else if (n->seq.op == 0) q->start = q->inc > 0 ? q->minv : q->maxv;
+    if (n->seq.op == 0) { q->value = q->start; q->called = false; }
+    if (n->seq.restart) { q->value = n->seq.has_restart_with ? n->seq.restart_with : q->start; q->called = false; }
+    if (q->minv > q->maxv || q->start < q->minv || q->start > q->maxv) {
+        if (n->seq.op == 0) g_nseq--; else *q = old;
+        return result_error_msg("START value must be between MINVALUE and MAXVALUE");
+    }
+    seq_save();
+    return result_ok_msg(0);
+}
 
 // buffer di testo che cresce (risultati delle funzioni di testo)
 typedef struct { char* d; size_t n, cap; bool err; } TextBuf;
@@ -3828,6 +4067,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
 
     if (e->subkind == SUBK_UDF) { rt_eval_function(e, c, out); return; }
     if (eval_internal(e, c, out)) return;
+    if (eval_sequence(e, c, out)) return;
     if (eval_more(e, c, out)) return;
 
     if (eval_mysql(e, c, out)) return;
@@ -5270,6 +5510,8 @@ static bool infoschema_open(ExecCtx* x, Source* s, const char* table, char* err,
         { "EVENTS", "EVENT_CATALOG:s,EVENT_SCHEMA:s,EVENT_NAME:s" },
         { "PARTITIONS", "TABLE_CATALOG:s,TABLE_SCHEMA:s,TABLE_NAME:s,PARTITION_NAME:s,TABLE_ROWS:i" },
         { "SESSION_VARIABLES", "VARIABLE_NAME:s,VARIABLE_VALUE:s" },
+        { "SEQUENCES", "SEQUENCE_CATALOG:s,SEQUENCE_SCHEMA:s,SEQUENCE_NAME:s,DATA_TYPE:s,START_VALUE:i,MINIMUM_VALUE:i,MAXIMUM_VALUE:i,"
+                       "INCREMENT:i,CYCLE_OPTION:s,CURRENT_VALUE:i" },
         { "GLOBAL_VARIABLES", "VARIABLE_NAME:s,VARIABLE_VALUE:s" },
     };
     int ti = -1;
@@ -5330,11 +5572,13 @@ static bool infoschema_open(ExecCtx* x, Source* s, const char* table, char* err,
                         if (is_text_col(col)) { isb_s(&b, "utf8mb4"); isb_s(&b, is_collation(tb)); } else { isb_null(&b); isb_null(&b); }
                         is_coltype(col, buf, sizeof(buf)); isb_s(&b, buf);
                         isb_s(&b, is_colkey(tb, c));
-                        snprintf(buf, sizeof(buf), "%s%s%s", col->auto_increment ? "auto_increment" : "",
+                        bool gen = (col->flags & COLF_GENERATED) != 0;
+                        snprintf(buf, sizeof(buf), "%s%s%s%s", col->auto_increment ? "auto_increment" : "",
                                  default_is_now(col->default_val) ? "DEFAULT_GENERATED" : "",
-                                 (col->flags & COLF_ON_UPDATE_NOW) ? (default_is_now(col->default_val) ? " on update CURRENT_TIMESTAMP" : "on update CURRENT_TIMESTAMP") : "");
+                                 (col->flags & COLF_ON_UPDATE_NOW) ? (default_is_now(col->default_val) ? " on update CURRENT_TIMESTAMP" : "on update CURRENT_TIMESTAMP") : "",
+                                 gen ? "STORED GENERATED" : "");
                         isb_s(&b, buf);
-                        isb_s(&b, "select,insert,update,references"); isb_s(&b, col->comment); isb_s(&b, ""); isb_null(&b);
+                        isb_s(&b, "select,insert,update,references"); isb_s(&b, gen ? "" : col->comment); isb_s(&b, gen ? col->comment : ""); isb_null(&b);
                         isb_end(&b);
                     }
                     break;
@@ -5468,6 +5712,15 @@ static bool infoschema_open(ExecCtx* x, Source* s, const char* table, char* err,
             isb_s(&b, (i == 0 || i == 5 || i == 6 || i == 7 || i == 8) ? "Yes" : ""); isb_s(&b, "Yes"); isb_i(&b, 1); isb_s(&b, "PAD SPACE"); isb_end(&b);
         }
     }
+    if (!strcmp(T[ti].name, "SEQUENCES"))
+        for (int i = 0; i < g_nseq && b.ok; i++) {
+            const Seq* q = &g_seq[i];
+            if (g_see_db && !g_see_db(q->db)) continue;
+            isb_row(&b); isb_s(&b, "def"); isb_s(&b, q->db); isb_s(&b, q->name); isb_s(&b, "bigint"); isb_i(&b, q->start);
+            isb_i(&b, q->minv); isb_i(&b, q->maxv); isb_i(&b, q->inc); isb_s(&b, q->cycle ? "YES" : "NO");
+            if (q->called) isb_i(&b, q->value); else isb_null(&b);
+            isb_end(&b);
+        }
     if (!strcmp(T[ti].name, "SESSION_VARIABLES") || !strcmp(T[ti].name, "GLOBAL_VARIABLES"))
         for (int i = 0; SYSVARS[i][0] && b.ok; i++) { isb_row(&b); isb_s(&b, SYSVARS[i][0]); isb_s(&b, SYSVARS[i][1]); isb_end(&b); }
     if (!b.ok) { snprintf(err, errn, "Out of memory while reading information_schema"); return false; }
@@ -5703,6 +5956,68 @@ static SelectPlan* plan_prepare(ExecCtx* x, ASTNode* n, int depth, BindCtx* oute
                                 char* err, size_t errn) {
     return plan_prepare_ex(x, n, depth, outer, ctes, err, errn, false);
 }
+static bool lateral_open(SelectPlan* p, int k, ASTNode* sub, const TableFunc* tf, const char* alias, BindCtx* outer,
+                         const CteScope* scope, char* err, size_t errn);
+
+// sorgente laterale k: (subquery) o funzione-tabella, preparata con le sorgenti 0..k-1 visibili
+static bool lateral_open(SelectPlan* p, int k, ASTNode* sub, const TableFunc* tf, const char* alias, BindCtx* outer,
+                         const CteScope* scope, char* err, size_t errn) {
+    char al[SV_MAX_NAME_LEN];
+    snprintf(al, sizeof(al), "%s", alias && alias[0] ? alias : tf ? "table_function" : "lateral");
+    Source* s = &p->src[k];
+    memset(s, 0, sizeof(*s));
+    memcpy(s->name, al, sizeof(s->name));
+    memcpy(s->table, al, sizeof(s->table));
+    s->lateral = true;
+    s->is_view = true;
+    s->loaded = true;
+    s->tf = tf;
+    TableSchema* ts = calloc(1, sizeof(TableSchema));
+    BindCtx* lb = calloc(1, sizeof(BindCtx));
+    if (!ts || !lb) { free(ts); free(lb); snprintf(err, errn, "Out of memory"); return false; }
+    s->own_ts = s->ts = ts;
+    s->lat_bind = lb;
+    snprintf(ts->name, sizeof(ts->name), "%s", s->name);
+    lb->src = p->src; lb->nsrc = k; lb->mode = BIND_ROW; lb->x = p->x; lb->outer = outer; lb->clause = "LATERAL";
+    lb->depth = p->depth + 1; lb->ctes = scope;
+    if (sub) {
+        char perr[300] = "";
+        s->lat_plan = plan_prepare(p->x, sub, p->depth + 1, lb, scope, perr, sizeof(perr));
+        if (!s->lat_plan) { snprintf(err, errn, "LATERAL '%.64s': %.200s", s->name, perr); return false; }
+        ts->num_columns = s->lat_plan->nout;
+        for (int i = 0; i < s->lat_plan->nout; i++) {
+            const char* cn = s->lat_plan->out[i].name;
+            const char* dot = strrchr(cn, '.');
+            snprintf(ts->columns[i].name, sizeof(ts->columns[i].name), "%.63s", dot ? dot + 1 : cn);
+            int st = s->lat_plan->out[i].src_type;
+            ts->columns[i].type = st >= 0 ? (DataType)st : SV_TYPE_TEXT;   // le altre: decise dai primi valori
+            ts->columns[i].nullable = true;
+        }
+        s->lat_typed = false;
+        return true;
+    }
+    for (int i = 0; i < tf->nargs; i++) bind_expr(tf->args[i], lb);
+    if (lb->err[0]) { snprintf(err, errn, "%.250s", lb->err); return false; }
+    if (!strcmp(tf->func, "JSON_TABLE")) {
+        if (tf->ncols > SV_MAX_COLUMNS) { snprintf(err, errn, "Too many JSON_TABLE columns"); return false; }
+        for (int i = 0; i < tf->ncols; i++) {
+            Column* c = &ts->columns[ts->num_columns++];
+            snprintf(c->name, sizeof(c->name), "%s", i < tf->ncolnames ? tf->colnames[i] : tf->cols[i].name);
+            if (tf->cols[i].kind == TFC_PATH && !known_type(tf->cols[i].def.type)) { snprintf(err, errn, "Unknown type '%.32s'", tf->cols[i].def.type); return false; }
+            c->type = tf->cols[i].kind == TFC_PATH ? parse_type(tf->cols[i].def.type) : SV_TYPE_BIGINT;
+            c->size = tf->cols[i].def.size;
+            if (c->type == SV_TYPE_DECIMAL) c->decimal_prec = tf->cols[i].def.has_scale ? tf->cols[i].def.scale + 1 : 0;
+            c->nullable = true;
+        }
+    } else {                                                   // GENERATE_SERIES: una colonna
+        Column* c = &ts->columns[ts->num_columns++];
+        snprintf(c->name, sizeof(c->name), "%s", tf->ncolnames ? tf->colnames[0] : "generate_series");
+        c->type = SV_TYPE_BIGINT;
+        c->nullable = true;
+    }
+    s->lat_typed = true;
+    return true;
+}
 
 // arm = true: solo questo ramo di UNION / INTERSECT / EXCEPT (i successivi li prepara il primo)
 static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* outer, const CteScope* ctes,
@@ -5725,14 +6040,19 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
 
     // 1. sorgenti (SELECT senza FROM: nessuna, il risultato ha una riga)
     if (n->select_stmt.table_name[0]) {
-        if (!source_open(x, db, &p->src[p->nsrc++], n->select_stmt.table_name, n->select_stmt.table_alias,
-                         n->select_stmt.from_sub, depth, scope, err, errn)) { plan_free(p); return NULL; }
+        bool ok = n->select_stmt.from_tf
+            ? lateral_open(p, p->nsrc, NULL, n->select_stmt.from_tf, n->select_stmt.table_alias, outer, scope, err, errn)
+            : source_open(x, db, &p->src[p->nsrc], n->select_stmt.table_name, n->select_stmt.table_alias,
+                          n->select_stmt.from_sub, depth, scope, err, errn);
+        p->nsrc++;
+        if (!ok) { plan_free(p); return NULL; }
     }
     for (int j = 0; j < n->select_stmt.num_joins; j++) {
         ASTJoin* jn = &n->select_stmt.joins[j];
-        if (!source_open(x, db, &p->src[p->nsrc++], jn->table_name, jn->alias, jn->sub, depth, scope, err, errn)) {
-            plan_free(p); return NULL;
-        }
+        bool ok = jn->lateral ? lateral_open(p, p->nsrc, jn->sub, jn->tf, jn->alias, outer, scope, err, errn)
+                              : source_open(x, db, &p->src[p->nsrc], jn->table_name, jn->alias, jn->sub, depth, scope, err, errn);
+        p->nsrc++;
+        if (!ok) { plan_free(p); return NULL; }
     }
     for (int a = 0; a < p->nsrc; a++)
         for (int b = 0; b < a; b++)
@@ -5949,6 +6269,9 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
         expr_refs(c, &m, &o, &op);
         bool safe = !op && m != 0;
         for (int s = 0; safe && s < p->nsrc; s++) if ((m >> s & 1u) && src_nullable(p, s)) safe = false;
+        bool lat = false;                                   // righe calcolate nel join: condizione dopo
+        for (int s = 0; s < p->nsrc; s++) if ((m >> s & 1u) && p->src[s].lateral) lat = true;
+        if (lat) { xv_push(&p->resid, c); continue; }
         if (safe && popcount_u(m) == 1) {
             int s = highest_bit(m);
             xv_push(o ? &p->pre_dyn[s] : &p->pre_static[s], c);
@@ -5974,7 +6297,7 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
             unsigned m = 0; bool o = false, op = false;
             expr_refs(c, &m, &o, &op);
             // condizione dell'ON solo sulla tabella unita: filtra le sue righe prima del join
-            bool pre = !op && m == (1u << k) && (j->type == JOIN_LEFT || !src_nullable(p, k));
+            bool pre = !op && m == (1u << k) && (j->type == JOIN_LEFT || !src_nullable(p, k)) && !p->src[k].lateral;
             xv_push(pre ? (o ? &p->pre_dyn[k] : &p->pre_static[k]) : &p->jcond[k], c);
         }
         free(on.v);
@@ -6287,6 +6610,188 @@ static const char* join_step(EvalCtx* ec, Combos* in, Combos* out, int k, JoinTy
     free(right_hit);
     ec->cur = NULL;
     return fail;
+}
+
+// ── sorgenti laterali ──
+
+static const char* strdup_static(const char* m) {             // messaggio che resta valido dopo la funzione
+    static _Thread_local char buf[300];
+    snprintf(buf, sizeof(buf), "%s", m);
+    return buf;
+}
+
+static bool pool_add(Source* S, Tuple* t) {
+    if (S->npool == S->cappool) {
+        int nc = S->cappool ? S->cappool * 2 : 64;
+        Tuple** nv = realloc(S->pool, sizeof(Tuple*) * (size_t)nc);
+        if (!nv) return false;
+        S->pool = nv; S->cappool = nc;
+    }
+    S->pool[S->npool++] = t;
+    return true;
+}
+
+static void pool_reset(Source* S) {
+    for (int i = 0; i < S->npool; i++) tuple_free(S->pool[i]);
+    S->npool = 0;
+}
+
+// valore di testo (NULL = SQL NULL) nella colonna c della tupla
+static void lat_set(Tuple* t, const TableSchema* ts, int c, const char* text) {
+    column_set_from_text(&t->values[c], &ts->columns[c], text);
+}
+
+// testo di un valore JSON (stringhe senza virgolette, null -> NULL); malloc'd o NULL
+static char* json_scalar_text(const char* v, size_t len, bool* is_null) {
+    *is_null = false;
+    if (len == 4 && !strncmp(v, "null", 4)) { *is_null = true; return NULL; }
+    return sj_unquote(v, len);
+}
+
+// righe della sorgente laterale k per la combinazione base (sorgenti 0..k-1); *rows: array malloc'd
+static const char* lateral_rows(SelectPlan* p, int k, Tuple** base, EvalCtx* outer, Tuple*** rows, int* nrows, char* err, size_t errn) {
+    Source* S = &p->src[k];
+    TableSchema* ts = S->ts;
+    *rows = NULL;
+    *nrows = 0;
+    int start = S->npool;
+    EvalCtx lec;
+    memset(&lec, 0, sizeof(lec));
+    lec.src = p->src; lec.nsrc = k; lec.cur = base; lec.x = p->x; lec.outer = outer;
+    if (S->lat_plan) {                                          // LATERAL (subquery)
+        ORows res = {0};
+        if (!query_exec(S->lat_plan, &lec, 0, &res)) { snprintf(err, errn, "LATERAL '%.64s': %.200s", S->name, S->lat_plan->err); orows_free(&res); return err; }
+        if (!S->lat_typed && res.nrows > 0) {                   // tipi delle colonne calcolate: dai primi valori
+            for (int c = 0; c < ts->num_columns; c++) {
+                if (S->lat_plan->out[c].src_type >= 0) continue;
+                DataType t = parse_type(out_type_name(S->lat_plan, c, &res, true));
+                ts->columns[c].type = t == SV_TYPE_INT ? SV_TYPE_BIGINT : t;
+            }
+            S->lat_typed = true;
+        }
+        for (int i = 0; i < res.nrows; i++) {
+            Tuple* t = tuple_create(ts->num_columns);
+            if (!t || !pool_add(S, t)) { tuple_free(t); orows_free(&res); return "Out of memory"; }
+            for (int c = 0; c < ts->num_columns; c++) {
+                const OVal* o = &orow(&res, i)[c];
+                if (o->null) { t->values[c].is_null = true; continue; }
+                EvalVal ev;
+                ev_from_oval(&ev, o);
+                lat_set(t, ts, c, ev_s(&ev));
+            }
+        }
+        orows_free(&res);
+    } else if (!strcmp(S->tf->func, "GENERATE_SERIES")) {
+        EvalVal a[3];
+        for (int i = 0; i < 3; i++) { if (i < S->tf->nargs) eval_expr(S->tf->args[i], &lec, &a[i]); else ev_int(&a[i], 1); }
+        if (lec.err[0]) { snprintf(err, errn, "%.250s", lec.err); return err; }
+        if (!a[0].null && !a[1].null && !a[2].null) {
+            int64_t from = (int64_t)ev_as_num(&a[0]), to = (int64_t)ev_as_num(&a[1]), step = (int64_t)ev_as_num(&a[2]);
+            if (step == 0) { snprintf(err, errn, "GENERATE_SERIES step cannot be zero"); return err; }
+            int64_t count = step > 0 ? (to >= from ? (to - from) / step + 1 : 0) : (from >= to ? (from - to) / -step + 1 : 0);
+            if (count > 10000000) { snprintf(err, errn, "GENERATE_SERIES produces too many rows (max 10 million)"); return err; }
+            for (int64_t i = 0, v = from; i < count; i++, v += step) {
+                Tuple* t = tuple_create(1);
+                if (!t || !pool_add(S, t)) { tuple_free(t); return "Out of memory"; }
+                t->values[0].bigint_val = v;
+            }
+        }
+    } else {                                                    // JSON_TABLE(doc, 'percorso' COLUMNS (...))
+        EvalVal dv, pv;
+        eval_expr(S->tf->args[0], &lec, &dv);
+        eval_expr(S->tf->args[1], &lec, &pv);
+        if (lec.err[0]) { snprintf(err, errn, "%.250s", lec.err); return err; }
+        if (!dv.null && !pv.null) {
+            char* doc = strdup(ev_s(&dv));
+            char* path = strdup(ev_s(&pv));
+            if (!doc || !path) { free(doc); free(path); return "Out of memory"; }
+            if (!sj_valid(doc)) { free(doc); free(path); snprintf(err, errn, "JSON_TABLE: the document is not valid JSON"); return err; }
+            // percorso delle righe: prefisso[*]resto (ogni elemento dell'array), oppure un valore solo
+            char* star = strstr(path, "[*]");
+            char prefix[512], rest[512] = "";
+            if (star) {
+                snprintf(prefix, sizeof(prefix), "%.*s", (int)(star - path), path);
+                snprintf(rest, sizeof(rest), "%s", star + 3);
+            } else snprintf(prefix, sizeof(prefix), "%s", path);
+            const char* arr; size_t al;
+            if (sj_extract(doc, prefix, &arr, &al)) {
+                char* arrc = malloc(al + 1);
+                if (!arrc) { free(doc); free(path); return "Out of memory"; }
+                memcpy(arrc, arr, al); arrc[al] = '\0';
+                long nel = star ? (*arrc == '[' ? sj_length(arrc, al) : 0) : 1;
+                for (long i = 0; i < nel && i < 10000000; i++) {
+                    const char* ev; size_t el;
+                    char ip[48];
+                    if (star) {
+                        snprintf(ip, sizeof(ip), "$[%ld]%s", i, rest);
+                        if (!sj_extract(arrc, ip, &ev, &el)) continue;
+                    } else { ev = arrc; el = al; }
+                    char* elem = malloc(el + 1);
+                    if (!elem) { free(arrc); free(doc); free(path); return "Out of memory"; }
+                    memcpy(elem, ev, el); elem[el] = '\0';
+                    Tuple* t = tuple_create(ts->num_columns);
+                    if (!t || !pool_add(S, t)) { tuple_free(t); free(elem); free(arrc); free(doc); free(path); return "Out of memory"; }
+                    for (int c = 0; c < S->tf->ncols; c++) {
+                        const TFCol* col = &S->tf->cols[c];
+                        char b[32];
+                        if (col->kind == TFC_ORDINALITY) { snprintf(b, sizeof(b), "%ld", i + 1); lat_set(t, ts, c, b); continue; }
+                        const char* vs; size_t vl;
+                        bool found = sj_extract(elem, col->path, &vs, &vl);
+                        if (col->kind == TFC_EXISTS) { lat_set(t, ts, c, found ? "1" : "0"); continue; }
+                        if (!found) { t->values[c].is_null = true; continue; }
+                        bool isnull;
+                        char* txt = json_scalar_text(vs, vl, &isnull);
+                        if (isnull) t->values[c].is_null = true;
+                        else {
+                            if (txt && (ts->columns[c].type == SV_TYPE_BOOL) && (!strcmp(txt, "true") || !strcmp(txt, "false"))) {
+                                lat_set(t, ts, c, txt[0] == 't' ? "1" : "0");
+                            } else lat_set(t, ts, c, txt ? txt : "");
+                        }
+                        free(txt);
+                    }
+                    free(elem);
+                }
+                free(arrc);
+            }
+            free(doc);
+            free(path);
+        }
+    }
+    int n = S->npool - start;
+    *rows = malloc(sizeof(Tuple*) * (size_t)(n ? n : 1));
+    if (!*rows) return "Out of memory";
+    for (int i = 0; i < n; i++) (*rows)[i] = S->pool[start + i];
+    *nrows = n;
+    return NULL;
+}
+
+// join con una sorgente laterale: le sue righe si calcolano per ogni combinazione a sinistra
+static const char* lateral_join_step(SelectPlan* p, EvalCtx* ec, Combos* in, Combos* out, int k, JoinType jt, ExprVec* conds) {
+    bool keep_left = jt == JOIN_LEFT;
+    char err[300];
+    for (int i = 0; i < in->n; i++) {
+        if ((i & 255) == 0 && sv_scan_cancelled()) return "Query cancelled";
+        Tuple** base = COMBO(in, i);
+        Tuple** rows = NULL;
+        int nr = 0;
+        const char* f = lateral_rows(p, k, base, ec->outer, &rows, &nr, err, sizeof(err));
+        if (f) { free(rows); return f == err ? strdup_static(f) : f; }
+        bool matched = false;
+        for (int r = 0; r < nr; r++) {
+            base = COMBO(in, i);
+            ec->cur = base;
+            base[k] = rows[r];
+            bool ok = xv_all_true(conds, ec);
+            base[k] = NULL;
+            if (!ok) continue;
+            matched = true;
+            if (!combos_push(out, base, k, rows[r])) { free(rows); return out->n >= MAX_JOIN_ROWS ? "The JOIN produces too many rows (over 10 million)" : "Out of memory"; }
+        }
+        free(rows);
+        if (!matched && keep_left && !combos_push(out, COMBO(in, i), k, NULL)) return "Out of memory";
+    }
+    ec->cur = NULL;
+    return NULL;
 }
 
 // ── ordinamento ──
@@ -6664,15 +7169,29 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
     }
 
     // 2. combinazioni (JOIN) e resto della WHERE
+    for (int s = 0; s < p->nsrc; s++) if (p->src[s].lateral) pool_reset(&p->src[s]);   // righe dell'esecuzione precedente
     if (p->nsrc == 0) {
         if (!combos_push(&st.combos, NULL, -1, NULL)) AFAIL("Out of memory");
     }
+    if (p->nsrc > 0 && p->src[0].lateral) {                    // FROM GENERATE_SERIES(...) / JSON_TABLE(...)
+        Tuple** lrows = NULL;
+        int lnr = 0;
+        char lerr[300];
+        Tuple* none[MAX_SOURCES] = {0};
+        const char* f = lateral_rows(p, 0, none, outer, &lrows, &lnr, lerr, sizeof(lerr));
+        if (f) { free(lrows); AFAIL("%s", f); }
+        for (int i = 0; i < lnr; i++)
+            if (!combos_push(&st.combos, NULL, 0, lrows[i])) { free(lrows); AFAIL("%s", st.combos.n >= MAX_JOIN_ROWS ? "Too many rows" : "Out of memory"); }
+        free(lrows);
+    } else
     for (int i = 0; p->nsrc > 0 && i < st.fn[0]; i++)
         if (!combos_push(&st.combos, NULL, 0, st.frows[0][i])) AFAIL("%s", st.combos.n >= MAX_JOIN_ROWS ? "Too many rows" : "Out of memory");
     for (int j = 0; j < n->select_stmt.num_joins; j++) {
         Combos next = { NULL, 0, 0, w };
-        const char* f = join_step(&ec, &st.combos, &next, j + 1, n->select_stmt.joins[j].type, &p->jcond[j + 1],
-                                  st.frows[j + 1], st.fn[j + 1]);
+        const char* f = p->src[j + 1].lateral
+            ? lateral_join_step(p, &ec, &st.combos, &next, j + 1, n->select_stmt.joins[j].type, &p->jcond[j + 1])
+            : join_step(&ec, &st.combos, &next, j + 1, n->select_stmt.joins[j].type, &p->jcond[j + 1],
+                        st.frows[j + 1], st.fn[j + 1]);
         combos_free(&st.combos);
         st.combos = next;
         p->st_join[j + 1] += next.n;
@@ -9348,6 +9867,53 @@ static const char* fire_cascaded(ExecCtx* ctx, Database* db, ChangeSet* cs, bool
     return NULL;
 }
 
+static bool has_generated(const TableSchema* ts) {
+    for (int i = 0; i < ts->num_columns; i++) if (ts->columns[i].flags & COLF_GENERATED) return true;
+    return false;
+}
+
+// colonne calcolate della riga t (in ordine: una può usare quelle prima); NULL o il messaggio
+static const char* gen_compute(ExecCtx* ctx, TableSchema* ts, Tuple* t, char* msg, size_t mn) {
+    Source s;
+    memset(&s, 0, sizeof(s));
+    snprintf(s.name, sizeof(s.name), "%s", ts->name);
+    snprintf(s.table, sizeof(s.table), "%s", ts->name);
+    s.ts = ts;
+    for (int i = 0; i < ts->num_columns; i++) {
+        Column* c = &ts->columns[i];
+        if (!(c->flags & COLF_GENERATED)) continue;
+        TokenList* tk = lexer_tokenize(c->comment);
+        char err[256] = "";
+        ASTExpr* e = tk ? parser_parse_expr(tk, err, sizeof(err)) : NULL;
+        if (!e) { if (tk) lexer_free(tk); snprintf(msg, mn, "Generated column '%.64s': %.200s", c->name, err[0] ? err : "out of memory"); return msg; }
+        BindCtx b;
+        memset(&b, 0, sizeof(b));
+        b.src = &s; b.nsrc = 1; b.mode = BIND_ROW; b.x = NULL; b.clause = "a generated column";
+        bind_expr(e, &b);
+        if (b.err[0]) { snprintf(msg, mn, "Generated column '%.64s': %.200s", c->name, b.err); ast_expr_free(e); lexer_free(tk); return msg; }
+        EvalCtx ec;
+        memset(&ec, 0, sizeof(ec));
+        Tuple* cur[1] = { t };
+        ec.src = &s; ec.nsrc = 1; ec.cur = cur; ec.x = ctx;
+        EvalVal v;
+        eval_expr(e, &ec, &v);
+        const char* fail = NULL;
+        if (ec.err[0]) { snprintf(msg, mn, "Generated column '%.64s': %.200s", c->name, ec.err); fail = msg; }
+        else {
+            const char* tx = v.null ? NULL : ev_s(&v);
+            char nb[64];
+            if (tx && v.is_num && !v.is_int && (c->type == SV_TYPE_INT || c->type == SV_TYPE_BIGINT)) { snprintf(nb, sizeof(nb), "%lld", (long long)llround(v.num)); tx = nb; }
+            if (!tx && !c->nullable) { snprintf(msg, mn, "Column '%.64s' cannot be NULL", c->name); fail = msg; }
+            else if (tx && check_value(c, tx, msg, mn)) fail = msg;
+            else column_set_from_text(&t->values[i], c, tx);
+        }
+        ast_expr_free(e);
+        lexer_free(tk);
+        if (fail) return fail;
+    }
+    return NULL;
+}
+
 static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
@@ -9473,6 +10039,15 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
         if (fail) break;
         for (int i = 0; i < nc; i++) {
             Column* c = &ts->columns[i];
+            if (c->flags & COLF_GENERATED) {                            // calcolata dopo
+                if (given[i] && text[i]) {
+                    snprintf(msg, sizeof(msg), "The value specified for generated column '%.64s' in table '%.64s' is not allowed", c->name, ts->name);
+                    fail = msg;
+                    break;
+                }
+                text[i] = NULL; direct[i] = false;
+                continue;
+            }
             if (!given[i] && (c->default_val[0] || c->has_default) && strcasecmp(c->default_val, "NULL") != 0) {
                 if (default_is_now(c->default_val)) { col_now_text(c->default_val, c->type, now_buf[i], sizeof(now_buf[0])); text[i] = now_buf[i]; }
                 else text[i] = c->default_val;
@@ -9510,6 +10085,7 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
             if (direct[i]) tuples[r]->values[i] = dv[i];
             else column_set_from_text(&tuples[r]->values[i], &ts->columns[i], text[i]);
         }
+        if (has_generated(ts)) { fail = gen_compute(ctx, ts, tuples[r], msg, sizeof(msg)); if (fail) break; }
     }
     // trigger BEFORE (possono cambiare NEW o rifiutare la riga), poi i vincoli: CHECK,
     // PRIMARY KEY / UNIQUE (anche fra le righe dello statement), FOREIGN KEY
@@ -9634,6 +10210,10 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
     for (int k = 0; k < n->update_stmt.num_sets; k++) {
         set_ci[k] = catalog_get_col_index(ts, n->update_stmt.set_cols[k]);
         if (set_ci[k] < 0) return unknown_column_error(n->update_stmt.set_cols[k], "SET");
+        if (ts->columns[set_ci[k]].flags & COLF_GENERATED) {
+            snprintf(msg, sizeof(msg), "The value specified for generated column '%.64s' in table '%.64s' is not allowed", ts->columns[set_ci[k]].name, ts->name);
+            return result_error_msg(msg);
+        }
     }
     Source s;
     memset(&s, 0, sizeof(s));
@@ -9683,6 +10263,7 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
             if (text && check_value(c, text, msg, sizeof(msg))) { fail = msg; break; }
             column_set_from_text(&nt[i]->values[ci], c, text);
         }
+        if (!fail && has_generated(ts)) fail = gen_compute(ctx, ts, nt[i], msg, sizeof(msg));
     }
     ec.cur = NULL;
 
@@ -9858,7 +10439,8 @@ char* executor_create_statement(Catalog* cat, const char* db, const char* table,
         bool pk_here = (inline_pk && inline_pk->cols[0] == i) || (!has_pk_cons && c->primary_key);
         tb_add(&b, "%s\n    %s %s%s%s%s", i ? "," : "", c->name, type, pk_here ? " PRIMARY KEY" : "",
                c->auto_increment ? " AUTO_INCREMENT" : "", (!c->nullable && !c->primary_key) ? " NOT NULL" : "");
-        if (c->default_val[0] || c->has_default) {
+        if (c->flags & COLF_GENERATED) tb_add(&b, " GENERATED ALWAYS AS (%s) STORED", c->comment);
+        else if (c->default_val[0] || c->has_default) {
             bool num = c->type == SV_TYPE_INT || c->type == SV_TYPE_BIGINT || c->type == SV_TYPE_FLOAT ||
                        c->type == SV_TYPE_DECIMAL || c->type == SV_TYPE_BOOL || !strcasecmp(c->default_val, "NULL");
             tb_add(&b, num ? " DEFAULT %s" : " DEFAULT '%s'", c->default_val);
@@ -11186,6 +11768,7 @@ static QueryResult* executor_run_impl(ExecCtx* ctx, ASTNode* stmt) {
         case NODE_DROP_PROCEDURE: return exec_drop_procedure(ctx, stmt);
         case NODE_CALL: return exec_call(ctx, stmt);
         case NODE_MERGE: return exec_merge(ctx, stmt);
+        case NODE_SEQUENCE: return exec_sequence(ctx, stmt);
         case NODE_CHECKPOINT:   return result_ok_msg(0);
         case NODE_VACUUM:       return result_ok_msg(0);
         case NODE_DROP_TRIGGER: return exec_drop_trigger(ctx, stmt);

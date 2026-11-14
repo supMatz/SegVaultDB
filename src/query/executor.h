@@ -40,6 +40,9 @@ bool        executor_prepare_store(const char* name, const char* sql);
 const char* executor_prepare_get(const char* name);
 bool        executor_prepare_drop(const char* name);
 char*       executor_uservar_literal(const char* name);      // @nome come letterale SQL (malloc'd)
+// sequenze (CREATE SEQUENCE): file di stato nella cartella dei dati (caricato qui)
+void        executor_set_seq_file(const char* path);
+void        executor_drop_db_sequences(const char* db);
 // assegnazioni di SET @a = espr, ... (NODE_SET)
 QueryResult* executor_set_session_vars(ExecCtx* ctx, ASTNode* stmt);
 
