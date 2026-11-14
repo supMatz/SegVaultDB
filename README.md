@@ -167,6 +167,63 @@ mentre il server gira.
 - **Rilascio** — `BACKUP TO`, backup pianificati, dump compatibile MySQL, server headless installabile
   come servizio (`segvault-server --install-service`).
 
+### Guida pratica
+
+**Primo avvio.** Windows (pacchetto zip): `get-php.cmd` una volta (scarica PHP nella cartella `php/`),
+poi `segvault.exe` o `start-server.cmd`; il sito d'esempio è `http://hello.localhost:8484`. Linux:
+`./start-server.sh` (serve `php-cgi` del sistema) o `./segvault`. Nell'app i servizi si accendono dal
+pannello del server; l'editor SQL resta usabile mentre il server gira.
+
+**Siti.** Ogni cartella di `www` è un sito: `www/blog` → `http://blog.localhost:8484` (anche
+`blog.test` e `api.blog.localhost`); per Laravel e Symfony la radice è `public/` da sola. Una
+cartella altrove: `--site docs=/percorso`. L'elenco dei siti è su `/.segvault/`.
+
+**PHP.** Senza `php.ini` le estensioni presenti si attivano da sole (mysqli, pdo_mysql, openssl,
+mbstring, curl, gd, intl, zip, opcache); *Edit php.ini* nel pannello lo crea e lo apre. I `.htaccess`
+valgono come in Apache, quindi i progetti presi da XAMPP o da un hosting girano senza modifiche.
+
+| App | Database |
+|---|---|
+| WordPress | copia WordPress in `www/wp`, apri `http://wp.localhost:8484`: host `127.0.0.1`, utente `root`, password vuota (o il token, con `-t`) |
+| Laravel | `.env`: `DB_CONNECTION=mysql`, `DB_HOST=127.0.0.1`, `DB_PORT=3306`, `DB_USERNAME=root` |
+| Symfony / Doctrine | `DATABASE_URL="mysql://root:@127.0.0.1:3306/app?serverVersion=8.0"` |
+| Node, Python, Java | qualsiasi driver MySQL (mysql2, PyMySQL, mysql-connector, JDBC) su `127.0.0.1:3306` |
+
+**Dev server JavaScript e Python.** Avvialo come sempre (`npm run dev`, `python manage.py runserver`)
+e mettilo dietro un nome: `segvault-server --site app=5173 data` → `http://app.localhost:8484`, con la
+ricarica a caldo (WebSocket). Nell'app: `site.app=http://127.0.0.1:5173` in `DATA/server.ini`. Script
+Perl, Python e Ruby classici (`.cgi`, `.pl`, `.py`, `.rb`): `--cgi`.
+
+**HTTPS.** Ogni sito risponde anche su `https://NOME.localhost:8443` (HTTP/2). Una volta sola:
+`segvault-server --trust-ca data` (o *Trust certificate* nel pannello) e i browser non mostrano più
+avvisi. Serve per cookie `Secure`, service worker, OAuth, webcam e microfono.
+
+**Posta.** Nessuna email esce dal computer; si leggono su `http://localhost:8484/.segvault/mail/`.
+
+| App | Configurazione |
+|---|---|
+| PHP `mail()`, WordPress | niente: ci arriva da sola |
+| Laravel | `MAIL_MAILER=smtp`, `MAIL_HOST=127.0.0.1`, `MAIL_PORT=1025` |
+| Symfony | `MAILER_DSN=smtp://127.0.0.1:1025` |
+| Nodemailer, Django | host `127.0.0.1`, porta `1025`, senza TLS |
+
+Nei test automatici (Playwright, Cypress, PHPUnit): `GET /.segvault/mail/api/messages/latest` o
+`GET /.segvault/mail/api/messages?to=utente@test.com` per leggere il link di conferma o di reset.
+
+**Debug.** Il registro del pannello mostra ogni richiesta e da quale servizio arriva, con i filtri
+*Web / PHP / API / MySQL / Mail*: con *MySQL* si vedono una per riga le query che l'app manda al
+database. Gli avvisi di PHP stanno accanto alla loro richiesta; il *Monitor* ha tempi, errori e stato
+del motore. Una porta occupata viene segnalata con il programma che la usa (es. `mysqld (pid 812)`);
+le porte si cambiano in *Settings › Server*.
+
+**Sempre acceso.** Con il server acceso, chiudere la finestra lascia SegVault nell'area di notifica;
+*Start with the computer* lo avvia all'accesso. Solo server: `segvault-server --install-service`
+seguito dalle opzioni abituali (`--uninstall-service` lo toglie), senza diritti di amministratore.
+
+**Limiti.** Le scritture di due transazioni sulla *stessa tabella* si mettono in fila (lock per
+tabella; le letture non aspettano mai). Una sola versione di PHP per tutti i siti. Nessuna versione
+nativa per macOS.
+
 Tutti i dettagli: [docs/API.md](docs/API.md) (siti, proxy, `.htaccess`, HTTPS, posta, servizi).
 
 ---
