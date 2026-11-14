@@ -9,7 +9,7 @@ accanto, al primo avvio (`./data`, oppure quella indicata sulla riga di comando)
 | Linux x86-64 | [`segvault`](linux-x86_64/segvault) | [`segvault-server`](linux-x86_64/segvault-server) (o [`segvault-server-static`](linux-x86_64/segvault-server-static), senza HTTPS) |
 
 Pacchetti completi (eseguibili, script di avvio, sito d'esempio, `get-php.cmd` per Windows):
-`SegVault-1.1.0-windows-x86_64.zip` e `SegVault-1.1.0-linux-x86_64.tar.gz` nelle
+`SegVault-1.1.1-windows-x86_64.zip` e `SegVault-1.1.1-linux-x86_64.tar.gz` nelle
 [release](https://github.com/supMatz/SegVaultDB/releases).
 
 - **Windows:** doppio clic su `segvault.exe` (se SmartScreen avvisa: *Ulteriori informazioni → Esegui

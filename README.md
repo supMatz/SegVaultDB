@@ -49,7 +49,7 @@ transazioni, trigger).
 | Caratteristica | Dettagli |
 |---|---|
 | **Linguaggio** | C11, zero dipendenze per il motore e per il server |
-| **Versione** | 1.1.0 |
+| **Versione** | 1.1.1 |
 | **Server di sviluppo** | Web + **PHP** (FastCGI, senza configurazione), un sito per cartella su `NOME.localhost`, **HTTPS + HTTP/2** con una CA locale, **reverse proxy** con WebSocket (Vite, Next.js, Django, Rails), `.htaccess` (`mod_rewrite`), **CGI** (Perl, Python, Ruby), **cattura delle email** (SMTP + pagina web + API), cruscotto, servizi accesi e spenti uno per uno, icona nell'area di notifica, servizio all'avvio |
 | **App desktop** | Win32 / GDI (Windows) · Xlib/X11 + Xft (Linux); all'avvio si sceglie **editor SQL** o **server API** |
 | **Server API** | `segvault-server` (o il pannello dell'app): HTTP/JSON, parametri `?` contro la SQL injection, sessioni con transazioni su più richieste, utenti e permessi (`GRANT`), token, CORS, limite di tempo, registro e monitor delle richieste, audit, backup pianificati; anche il **protocollo di rete MySQL** (PHP, Python, Java senza modifiche) |
@@ -71,7 +71,7 @@ transazioni, trigger).
 ## Download
 
 **Pacchetto completo** (eseguibili, script di avvio, sito d'esempio, README; su Windows `get-php.cmd`
-scarica PHP): `SegVault-1.1.0-windows-x86_64.zip` e `SegVault-1.1.0-linux-x86_64.tar.gz` nelle
+scarica PHP): `SegVault-1.1.1-windows-x86_64.zip` e `SegVault-1.1.1-linux-x86_64.tar.gz` nelle
 [release](https://github.com/supMatz/SegVaultDB/releases). Oppure **un solo file**, senza
 installazione (i font sono dentro l'eseguibile):
 
@@ -278,7 +278,7 @@ lo ferma e torna all'editor.
 ┌──────────────────────────────────────────────────────────────────────┐
 │ File  Edit  View  Query  Import  Export  Settings  Help   untitled.sql│
 ├──────────────────────────────────────────────────────────────────────┤
-│ ◆ SegVault v1.1.0 [▶ Run F5] [Run statement] │ [Commit] [Rollback] │ [Format]   ● Sky  ▤ db │
+│ ◆ SegVault v1.1.1 [▶ Run F5] [Run statement] │ [Commit] [Rollback] │ [Format]   ● Sky  ▤ db │
 ├────────────┬─────────────────────────────────────────────────────────┤
 │ EXPLORER ⟳ │  editor SQL (numeri di riga, highlighting, completamento)│
 │  ▸ uni     │                                                         │
@@ -286,7 +286,7 @@ lo ferma e torna all'editor.
 │            │  RESULTS ● Query OK            filtro    12 rows  History│
 │            │  griglia dei risultati (schede se più SELECT)           │
 ├────────────┴─────────────────────────────────────────────────────────┤
-│ ● SegVault engine 1.1.0  ▤ uni  script.sql         Ln 3, Col 7  F1 Shortcuts│
+│ ● SegVault engine 1.1.1  ▤ uni  script.sql         Ln 3, Col 7  F1 Shortcuts│
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -471,7 +471,7 @@ delle richieste al posto dei risultati.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ ◆ SegVault v1.1.0 [■ Stop server F5] [Copy address]  ● Running · port 8484 [Open SQL editor]│
+│ ◆ SegVault v1.1.1 [■ Stop server F5] [Copy address]  ● Running · port 8484 [Open SQL editor]│
 ├────────────────┬─────────────────────────────────────────────────────┤
 │ SERVER         │ REQUESTS ● 4 requests · up 1m   All Web PHP API MySQL Mail │
 │ ADDRESS        │ time     service client    method path / query     status ms │
@@ -490,7 +490,7 @@ delle richieste al posto dei risultati.
 │ START WITH THE COMPUTER                                              │
 │ TRY IT  curl … │                                                     │
 ├────────────────┴─────────────────────────────────────────────────────┤
-│ ● SegVault engine 1.1.0  API server running  this computer only    F5 Start / Stop│
+│ ● SegVault engine 1.1.1  API server running  this computer only    F5 Start / Stop│
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1398,7 +1398,7 @@ SegVaultDB/
 
 | Costante | Valore | Significato |
 |---|---|---|
-| `SV_VERSION_STR` | `"1.1.0"` | Versione |
+| `SV_VERSION_STR` | `"1.1.1"` | Versione |
 | `SV_PAGE_SIZE` | `4096` | Dimensione di una pagina su disco |
 | `SV_BUFFER_POOL_CAP` | `1024` | Pagine nel buffer pool |
 | `SV_MAX_DATABASES` | `64` | Database |
