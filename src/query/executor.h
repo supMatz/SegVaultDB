@@ -25,7 +25,18 @@ typedef struct {
     int         trig_depth;       // trigger annidati (un trigger che ne attiva altri)
     // permessi delle istruzioni di una procedura (utente che la chiama); NULL = tutto permesso
     bool      (*auth_hook)(const ASTNode* stmt, char* err, size_t errn);
+    // routine in esecuzione (variabili locali, cursori, handler): NULL fuori dalle routine
+    void*       routine;
+    bool        rt_notfound;      // l'ultima SELECT ... INTO non ha trovato righe (condizione NOT FOUND)
 } ExecCtx;
+
+// variabili di sessione (@x): ogni sessione ha le sue; db_api le scambia insieme al resto dello stato
+typedef struct UserVars UserVars;
+UserVars* executor_uservars(void);
+void      executor_set_uservars(UserVars* v);
+void      executor_uservars_free(UserVars* v);
+// assegnazioni di SET @a = espr, ... (NODE_SET)
+QueryResult* executor_set_session_vars(ExecCtx* ctx, ASTNode* stmt);
 
 QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt);
 

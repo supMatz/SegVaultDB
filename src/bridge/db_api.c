@@ -497,7 +497,7 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
     }
     if (stmt->type == NODE_SET) {                 // variabili di sessione di MySQL: accettate
         if (stmt->set_fk_checks >= 0) executor_set_fk_checks(stmt->set_fk_checks != 0);
-        result = result_ok(0);
+        result = stmt->set_n > 0 ? executor_set_session_vars(&g_db.exec_ctx, stmt) : result_ok(0);   // SET @x = ...
     } else if (stmt->type == NODE_BEGIN) {
         result = db_begin() ? result_ok(0) : result_error("Failed to begin transaction");
     } else if (stmt->type == NODE_COMMIT) {
@@ -571,6 +571,7 @@ typedef struct { char name[64]; off_t offset; uint64_t chg_seq; } SavepointRec;
 
 struct DbSession {
     bool         fk_off;            // SET FOREIGN_KEY_CHECKS = 0 in questa sessione
+    UserVars*    uvars;             // variabili @x della sessione
     int          cur_db;            // indice nel catalogo (-1 = nessuno)
     uint64_t     tx_id;
     SavepointRec sp[64];
@@ -842,11 +843,22 @@ static int stmt_lock_kind(const ASTNode* st) {
     }
 }
 
+// CALL di una procedura che crea tabelle TEMPORARY (anche in quelle che chiama): cambia lo schema
+static bool call_changes_schema(const ASTNode* st, int dbi) {
+    if (st->type != NODE_CALL || dbi < 0 || dbi >= g_db.catalog->num_databases) return false;
+    const Database* d = &g_db.catalog->databases[dbi];
+    for (int r = 0; r < d->num_routines; r++)
+        for (const char* p = d->routines[r].body; *p; p++)
+            if ((*p == 'T' || *p == 't') && !strncasecmp(p, "TEMPORARY", 9)) return true;
+    return false;
+}
+
 // lock di uno statement: le tabelle del suo testo, più il lock globale (S per tutti, X per lo schema)
 static void stmt_locks(const ASTNode* st, const TokenList* tl, LockSet* ls, int dbi) {
     ls->n = 0;
     ls->overflow = false;
     int kind = stmt_lock_kind(st);
+    if (kind == 2 && call_changes_schema(st, dbi)) kind = 3;
     if (kind == 0) return;
     if (kind != 3) ls_scan_tokens(ls, dbi, tl, kind == 2 ? LK_X : LK_S, 0);
     if (kind == 3 || ls->overflow) ls->n = 0;
@@ -1565,6 +1577,7 @@ static void session_save(DbSession* s) {
     s->cur_db = g_db.catalog ? g_db.catalog->current_db : -1;
     s->tx_id = g_db.exec_ctx.tx_id;
     s->fk_off = !executor_fk_checks();
+    s->uvars = executor_uservars();
     s->nsp = g_num_savepoints;
     memcpy(s->sp, g_savepoints, sizeof(s->sp));
     snprintf(s->user, sizeof(s->user), "%s", g_session_user);
@@ -1574,6 +1587,7 @@ static void session_load(const DbSession* s) {
     if (g_db.catalog) g_db.catalog->current_db = s->cur_db < g_db.catalog->num_databases ? s->cur_db : -1;
     g_db.exec_ctx.tx_id = s->tx_id;
     executor_set_fk_checks(!s->fk_off);
+    executor_set_uservars(s->uvars);
     g_num_savepoints = s->nsp;
     memcpy(g_savepoints, s->sp, sizeof(g_savepoints));
     snprintf(g_session_user, sizeof(g_session_user), "%s", s->user);
@@ -1625,6 +1639,10 @@ void db_session_end(DbSession* s) {
         db_session_leave(s);
     }
     lk_release_all(s);                          // anche i lock di letture senza transazione
+    db_lock();
+    if (g_active != s) executor_uservars_free(s->uvars);   // (se attiva, le libera session_save al prossimo cambio)
+    else { executor_set_uservars(NULL); executor_uservars_free(s->uvars); }
+    db_unlock();
     free(s);
 }
 
@@ -1653,7 +1671,19 @@ QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char
     }
     // solo una SELECT, in un database esistente, con un utente che esiste; il resto va per la via normale
     bool ok = parsed && parsed->success && parsed->count == 1 && parsed->statements[0]->type == NODE_SELECT &&
+              parsed->statements[0]->select_stmt.num_into == 0 &&
               (!dbname || !dbname[0] || idx >= 0) && (!user || !user[0] || auth_user_exists(user));
+    // @variabili (stato della sessione) e funzioni dell'utente (possono scrivere): via normale
+    for (int i = 0; ok && tokens && i < tokens->count; i++) {
+        const Token* t = &tokens->tokens[i];
+        if (t->type != TOK_IDENTIFIER || !t->text) continue;
+        if (t->text[0] == '@') { ok = false; break; }
+        if (idx >= 0 && i + 1 < tokens->count && tokens->tokens[i + 1].type == TOK_LPAREN) {
+            const Database* d = &g_db.catalog->databases[idx];
+            for (int r = 0; r < d->num_routines && ok; r++)
+                if (d->routines[r].is_function && !strcasecmp(d->routines[r].name, t->text)) ok = false;
+        }
+    }
     char err[300];
     bool infos = false;
     if (ok && parsed->statements[0]->qual_db[0]) {           // shop.prodotto: il database dello statement
@@ -1899,8 +1929,7 @@ static char* db_get_objects_sql_impl(const char* db_name, int what) {
         sb_cat(&out, &n, &cap, ";\n");
     }
     for (int i = 0; what == 2 && i < db->num_routines; i++) {
-        if (db->routines[i].is_function) continue;
-        snprintf(head, sizeof(head), "CREATE PROCEDURE %.64s", db->routines[i].name);
+        snprintf(head, sizeof(head), "CREATE %s %.64s", db->routines[i].is_function ? "FUNCTION" : "PROCEDURE", db->routines[i].name);
         sb_cat(&out, &n, &cap, head);
         sb_cat(&out, &n, &cap, db->routines[i].body);
         sb_cat(&out, &n, &cap, ";\n");
@@ -2037,6 +2066,7 @@ char* db_get_foreign_keys(const char* db_name, const char* table) {
 void db_shutdown(void) {
     db_lock();
     db_shutdown_impl();
+    executor_uservars_free(executor_uservars());          // @variabili della sessione predefinita
     db_unlock();
 }
 

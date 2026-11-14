@@ -331,6 +331,35 @@ TokenList* lexer_tokenize(const char* sql) {
             continue;
         }
 
+        // @variabile, @`variabile`, @'variabile' (di sessione) e @@[session. | global.]variabile (di sistema)
+        if (*lx.pos == '@') {
+            bool sys = lx.pos[1] == '@';
+            const char* p = lx.pos + (sys ? 2 : 1);
+            char name[128];
+            size_t nl = 0;
+            if (!sys && (*p == '`' || *p == '\'' || *p == '"')) {
+                char q = *p++;
+                while (*p && *p != q && nl < sizeof(name) - 1) name[nl++] = *p++;
+                if (*p == q) p++;
+            } else {
+                if (sys) {
+                    if (!strncasecmp(p, "session.", 8)) p += 8;
+                    else if (!strncasecmp(p, "global.", 7)) p += 7;
+                    else if (!strncasecmp(p, "local.", 6)) p += 6;
+                }
+                while ((isalnum((unsigned char)*p) || *p == '_' || *p == '$' || (!sys && *p == '.')) && nl < sizeof(name) - 1) name[nl++] = *p++;
+            }
+            name[nl] = '\0';
+            if (nl) {
+                lx.pos = p;
+                tok.type = TOK_IDENTIFIER; tok.line = lx.line; tok.col = lx.col; tok.ext = NULL;
+                snprintf(tok.text, sizeof(tok.text), "%s%s", sys ? "@@" : "@", name);
+                add_token(list, &tok);
+                lx.start = lx.pos;
+                continue;
+            }
+        }
+
         // Identifiers and keywords
         if (isalpha((unsigned char)*lx.pos) || *lx.pos == '_') {
             while (isalnum((unsigned char)*lx.pos) || *lx.pos == '_') lx.pos++;
@@ -360,10 +389,18 @@ TokenList* lexer_tokenize(const char* sql) {
             case '/': tt = TOK_SLASH; break;
             case '%': tt = TOK_PERCENT; break;
             case '=': tt = TOK_EQ; break;
-            case '!': if (*(lx.pos+1) == '=') { tt = TOK_NEQ; advance = 2; } break;
-            case '<': tt = *(lx.pos+1) == '=' ? (advance=2,TOK_LE)
-                         : *(lx.pos+1) == '>' ? (advance=2,TOK_NEQ) : TOK_LT; break;
-            case '>': tt = *(lx.pos+1) == '=' ? (advance=2,TOK_GE) : TOK_GT; break;
+            case '!': if (*(lx.pos+1) == '=') { tt = TOK_NEQ; advance = 2; } else tt = TOK_NOT; break;   // !x = NOT x
+            case '<': tt = (lx.pos[1] == '=' && lx.pos[2] == '>') ? (advance=3,TOK_NSEQ)
+                         : *(lx.pos+1) == '=' ? (advance=2,TOK_LE)
+                         : *(lx.pos+1) == '>' ? (advance=2,TOK_NEQ)
+                         : *(lx.pos+1) == '<' ? (advance=2,TOK_SHL) : TOK_LT; break;
+            case '>': tt = *(lx.pos+1) == '=' ? (advance=2,TOK_GE)
+                         : *(lx.pos+1) == '>' ? (advance=2,TOK_SHR) : TOK_GT; break;
+            case ':': tt = *(lx.pos+1) == '=' ? (advance=2,TOK_ASSIGN) : TOK_COLON; break;
+            case '|': tt = *(lx.pos+1) == '|' ? (advance=2,TOK_PIPES) : TOK_PIPE; break;
+            case '&': tt = *(lx.pos+1) == '&' ? (advance=2,TOK_AMPAMP) : TOK_AMP; break;
+            case '^': tt = TOK_CARET; break;
+            case '~': tt = TOK_TILDE; break;
         }
         if (tt != TOK_ERROR) {
             lx.pos += advance;

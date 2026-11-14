@@ -107,6 +107,7 @@ static QueryResult* exec_drop_db(ExecCtx* ctx, ASTNode* n) {
 }
 
 static const char* add_constraint(ExecCtx* ctx, Database* db, TableSchema* ts, ConstraintDef* d, char* msg, size_t mn);
+static QueryResult* exec_drop_table(ExecCtx* ctx, ASTNode* n);
 static const char* check_value(const Column* c, const char* v, char* msg, size_t n);
 
 // DEFAULT CURRENT_TIMESTAMP / NOW() / LOCALTIMESTAMP / CURRENT_DATE: valore calcolato a ogni INSERT
@@ -171,7 +172,30 @@ static void column_set_from_text(Value* v, const Column* c, const char* text) {
 }
 static const Constraint* referenced_by(Database* db, const TableSchema* ts, const TableSchema** child);
 
+static void rt_temp_created(const char* db, const char* table);
+static bool rt_is_temp(const char* db, const char* table);
+static QueryResult* exec_create_table_impl(ExecCtx* ctx, ASTNode* n);
+
+// CREATE [TEMPORARY] TABLE: una tabella TEMPORARY creata in una routine sparisce alla fine della CALL
+// più esterna (fuori dalle routine è una tabella normale, da eliminare con DROP)
 static QueryResult* exec_create_table(ExecCtx* ctx, ASTNode* n) {
+    Database* db = catalog_current_db(ctx->catalog);
+    if (!db) return result_error_msg("No database selected");
+    bool temp = n->create_table.temporary && ctx->routine;
+    if (temp && rt_is_temp(db->name, n->create_table.table_name) && catalog_get_table(ctx->catalog, db->name, n->create_table.table_name)) {
+        ASTNode* dn = calloc(1, sizeof(ASTNode));
+        if (!dn) return result_error_msg("Out of memory");
+        dn->type = NODE_DROP_TABLE;
+        snprintf(dn->drop_table.table_name, sizeof(dn->drop_table.table_name), "%s", n->create_table.table_name);
+        db_result_free(exec_drop_table(ctx, dn));
+        free(dn);
+    }
+    QueryResult* r = exec_create_table_impl(ctx, n);
+    if (temp && r && r->success) rt_temp_created(db->name, n->create_table.table_name);
+    return r;
+}
+
+static QueryResult* exec_create_table_impl(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
 
@@ -853,6 +877,9 @@ static CellType cell_type_of(DataType t) {
 //  Valori calcolati
 // ═════════════════════════════════════════════════════════════════
 
+#define SUBK_UDF 100      // EXPR_FUNC con subkind SUBK_UDF: funzione definita dall'utente (CREATE FUNCTION)
+static Tuple* rt_scope_row(void* routine, int s, const TableSchema** ts);   // riga s (NEW / OLD / variabili) della routine
+static _Thread_local int64_t g_last_insert_id;
 #define EV_STR_MAX 511   // come Cell.value: un testo più lungo non entrerebbe nel risultato
 
 typedef struct {
@@ -1552,6 +1579,7 @@ typedef struct BindCtx {
     char      err[256];
     ExecCtx*  x;                // NULL: subquery non ammesse
     struct BindCtx* outer;      // query esterna (per le subquery correlate)
+    bool      rt_scope;         // ambiente di una routine / trigger: i suoi valori non cambiano durante una query
     SelectPlan* plan;           // piano della query che si sta risolvendo
     int       depth;            // annidamento di viste e subquery
     const CteScope* ctes;
@@ -1613,6 +1641,10 @@ static const FuncDef FUNCS[] = {
     { "SESSION_USER", 0, 0 }, { "SYSTEM_USER", 0, 0 }, { "UUID", 0, 0 }, { "UUID_SHORT", 0, 0 }, { "SLEEP", 1, 1 },
     { "GET_LOCK", 2, 2 }, { "RELEASE_LOCK", 1, 1 }, { "IS_FREE_LOCK", 1, 1 }, { "IS_USED_LOCK", 1, 1 }, { "RELEASE_ALL_LOCKS", 0, 0 },
     { "ANY_VALUE", 1, 1 }, { "ISNULL", 1, 1 }, { "VALUES", 1, 1 },
+    // operatori e variabili (dal parser)
+    { "__UVAR", 1, 1 }, { "__SYSVAR", 1, 1 }, { "__UASSIGN", 2, 2 }, { "__BITNOT", 1, 1 }, { "__BITAND", 2, 2 },
+    { "__BITOR", 2, 2 }, { "__BITXOR", 2, 2 }, { "__SHL", 2, 2 }, { "__SHR", 2, 2 }, { "__NSEQ", 2, 2 }, { "__XOR", 2, 2 },
+    { "__PIPES", 2, 2 }, { "__ISTRUE", 1, 1 }, { "__ISFALSE", 1, 1 },
 };
 
 static const FuncDef* find_func(const char* name) {
@@ -1662,6 +1694,7 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
         case EXPR_COLUMN: {
             e->bound = 0;
             e->outer = 0;
+            e->rt_const = false;
             int s = 0, c = 0;
             int r = find_column(b, e->table_name, e->col_name, &s, &c);
             int rk, rc;
@@ -1693,6 +1726,10 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
                     if (r == 1) {
                         e->bound = s * 1024 + c + 1;
                         e->outer = level;
+                        // variabile della routine nella query principale di un'istruzione (ripianificata a ogni
+                        // esecuzione): una costante, così vale per gli indici. Nelle subquery (piani tenuti
+                        // nell'AST e riusati nei cicli) resta un riferimento correlato
+                        if (o->rt_scope && level == 1 && b->depth == 0) { e->rt_const = true; return; }
                         BindCtx* m = b;
                         for (int k = 0; k < level && m; k++, m = m->outer) if (m->plan) plan_mark_correlated(m->plan);
                         return;
@@ -1730,6 +1767,16 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
         case EXPR_FUNC: {
             const FuncDef* f = find_func(e->func);
             if (!f) {
+                // funzione definita dall'utente (CREATE FUNCTION) nel database corrente
+                Database* udb = b->x ? catalog_current_db(b->x->catalog) : NULL;
+                bool udf = false;
+                for (int i = 0; udb && i < udb->num_routines && !udf; i++)
+                    udf = udb->routines[i].is_function && !strcasecmp(udb->routines[i].name, e->func);
+                if (udf) {
+                    e->subkind = SUBK_UDF;
+                    for (int i = 0; i < e->nargs; i++) bind_expr(e->args[i], b);
+                    return;
+                }
                 snprintf(msg, sizeof(msg), "Unknown function '%.32s'", e->func);
                 bind_error(b, msg);
                 return;
@@ -1856,6 +1903,179 @@ static void ev_set_text(EvalCtx* c, EvalVal* out, const char* s, size_t n) {
     }
 }
 
+// ── variabili di sessione (@x) ───────────────────────────────────
+// Ogni sessione ha le sue (db_api le scambia con executor_set_uservars); i nomi non distinguono
+// maiuscole e minuscole, come in MySQL. Una variabile mai assegnata vale NULL.
+typedef struct { char name[64]; bool null, is_num, is_int; int64_t inum; double num; char* text; } UVar;   // text: anche dei DECIMAL
+struct UserVars { UVar* v; int n, cap; };
+static UserVars* g_uvars;
+
+UserVars* executor_uservars(void) { return g_uvars; }
+void executor_set_uservars(UserVars* v) { g_uvars = v; }
+void executor_uservars_free(UserVars* v) {
+    if (!v) return;
+    for (int i = 0; i < v->n; i++) free(v->v[i].text);
+    free(v->v);
+    free(v);
+    if (g_uvars == v) g_uvars = NULL;
+}
+
+static UVar* uservar_find(const char* name, bool create) {
+    if (!g_uvars) {
+        if (!create) return NULL;
+        g_uvars = calloc(1, sizeof(UserVars));
+        if (!g_uvars) return NULL;
+    }
+    for (int i = 0; i < g_uvars->n; i++) if (!strcasecmp(g_uvars->v[i].name, name)) return &g_uvars->v[i];
+    if (!create) return NULL;
+    if (g_uvars->n == g_uvars->cap) {
+        int nc = g_uvars->cap ? g_uvars->cap * 2 : 16;
+        UVar* nv = realloc(g_uvars->v, sizeof(UVar) * (size_t)nc);
+        if (!nv) return NULL;
+        g_uvars->v = nv;
+        g_uvars->cap = nc;
+    }
+    UVar* u = &g_uvars->v[g_uvars->n++];
+    memset(u, 0, sizeof(*u));
+    snprintf(u->name, sizeof(u->name), "%s", name);
+    u->null = true;
+    return u;
+}
+
+static void uservar_set(const char* name, const EvalVal* v) {
+    UVar* u = uservar_find(name, true);
+    if (!u) return;
+    char* nt = NULL;
+    // testo (anche di un numero DECIMAL, che tiene i suoi decimali: 115.00)
+    if (!v->null && (!v->is_num || (v->str && !v->is_int))) { nt = strdup(ev_s(v)); if (!nt) return; }
+    free(u->text);
+    u->text = nt;
+    u->null = v->null;
+    u->is_num = !v->null && v->is_num;
+    u->is_int = u->is_num && v->is_int;
+    u->inum = v->inum;
+    u->num = v->num;
+}
+
+static void uservar_get(const char* name, EvalVal* out) {
+    UVar* u = uservar_find(name, false);
+    if (!u || u->null) { ev_null(out); return; }
+    if (u->is_int) { ev_int(out, u->inum); return; }
+    if (u->is_num && !u->text) { ev_num(out, u->num); return; }
+    if (u->is_num) { out->null = false; out->is_num = true; out->is_int = false; out->num = u->num; out->ci = false; out->str = u->text; return; }
+    out->null = false; out->is_num = out->is_int = false; out->ci = false;
+    out->str = u->text ? u->text : "";
+}
+
+// variabili di sistema (@@x): i valori che il server MySQL di SegVault annuncia
+static const char* sysvar_value(const char* name) {
+    static const char* const V[][2] = {
+        { "version", "8.0.35-SegVault" }, { "version_comment", "SegVault" }, { "version_compile_os", "SegVault" },
+        { "max_allowed_packet", "67108864" }, { "sql_mode", "" }, { "autocommit", "1" },
+        { "character_set_client", "utf8mb4" }, { "character_set_connection", "utf8mb4" }, { "character_set_results", "utf8mb4" },
+        { "character_set_server", "utf8mb4" }, { "character_set_database", "utf8mb4" }, { "collation_connection", "utf8mb4_general_ci" },
+        { "collation_server", "utf8mb4_general_ci" }, { "collation_database", "utf8mb4_general_ci" }, { "wait_timeout", "28800" },
+        { "interactive_timeout", "28800" }, { "lower_case_table_names", "1" }, { "transaction_isolation", "SERIALIZABLE" },
+        { "tx_isolation", "SERIALIZABLE" }, { "transaction_read_only", "0" }, { "time_zone", "SYSTEM" }, { "system_time_zone", "UTC" },
+        { "auto_increment_increment", "1" }, { "auto_increment_offset", "1" }, { "max_connections", "64" },
+        { "default_storage_engine", "SegVault" }, { "storage_engine", "SegVault" }, { "sql_auto_is_null", "0" },
+        { "sql_select_limit", "18446744073709551615" }, { "group_concat_max_len", "1024" }, { "max_sp_recursion_depth", "16" },
+        { "hostname", "localhost" }, { "port", "3306" }, { "license", "MIT" }, { "warning_count", "0" }, { "error_count", "0" },
+    };
+    for (size_t i = 0; i < sizeof(V) / sizeof(V[0]); i++) if (!strcasecmp(V[i][0], name)) return V[i][1];
+    return NULL;
+}
+
+// operandi e risultati delle operazioni bit a bit: interi a 64 bit senza segno, come MySQL
+static uint64_t bit_operand(const EvalVal* v) {
+    if (v->is_int) return (uint64_t)v->inum;
+    double d = ev_as_num(v);
+    if (d < 0) return (uint64_t)(int64_t)llround(d);
+    return d >= 18446744073709551615.0 ? UINT64_MAX : (uint64_t)llround(d);
+}
+static void ev_unsigned(EvalCtx* c, EvalVal* out, uint64_t r) {
+    if (r <= (uint64_t)INT64_MAX) { ev_int(out, (int64_t)r); return; }
+    char b[24];
+    snprintf(b, sizeof(b), "%llu", (unsigned long long)r);
+    ev_set_text(c, out, b, strlen(b));
+    out->is_num = true;
+    out->num = (double)r;
+}
+
+// operatori di MySQL e variabili, scritti dal parser come funzioni interne "__..."
+static bool eval_internal(ASTExpr* e, EvalCtx* c, EvalVal* out) {
+    const char* f = e->func;
+    if (f[0] != '_' || f[1] != '_') return false;
+    if (!strcmp(f, "__UVAR"))   { uservar_get(e->args[0]->str_val, out); return true; }
+    if (!strcmp(f, "__SYSVAR")) {
+        if (!strcasecmp(e->args[0]->str_val, "foreign_key_checks")) { ev_int(out, executor_fk_checks()); return true; }
+        if (!strcasecmp(e->args[0]->str_val, "identity") || !strcasecmp(e->args[0]->str_val, "last_insert_id")) { ev_int(out, g_last_insert_id); return true; }
+        const char* v = sysvar_value(e->args[0]->str_val);
+        if (!v) { ctx_error(c, "Unknown system variable '%s'", e->args[0]->str_val); ev_null(out); return true; }
+        double d;
+        if (v[0] && text_is_number(v, &d) && strlen(v) < 18) ev_int(out, (int64_t)d);
+        else { out->null = false; out->is_num = out->is_int = false; out->ci = false; out->str = v; }
+        return true;
+    }
+    if (!strcmp(f, "__UASSIGN")) {
+        EvalVal v;
+        eval_expr(e->args[1], c, &v);
+        uservar_set(e->args[0]->str_val, &v);
+        uservar_get(e->args[0]->str_val, out);
+        return true;
+    }
+    EvalVal a, b;
+    eval_expr(e->args[0], c, &a);
+    if (!strcmp(f, "__ISTRUE") || !strcmp(f, "__ISFALSE")) {   // x IS TRUE / IS FALSE: mai NULL
+        int t = ev_truth(&a);
+        ev_int(out, f[4] == 'T' ? t == 1 : t == 0);
+        return true;
+    }
+    if (!strcmp(f, "__BITNOT")) { if (a.null) ev_null(out); else ev_unsigned(c, out, ~bit_operand(&a)); return true; }
+    eval_expr(e->args[1], c, &b);
+    if (!strcmp(f, "__NSEQ")) {                                // a <=> b: NULL <=> NULL è vero
+        if (a.null || b.null) ev_int(out, a.null && b.null);
+        else ev_int(out, ev_cmp(&a, &b) == 0);
+        return true;
+    }
+    if (!strcmp(f, "__PIPES")) {
+        if (executor_mysql_mode()) {                           // MySQL: || è OR
+            int x = ev_truth(&a), y = ev_truth(&b);
+            if (x == 1 || y == 1) ev_int(out, 1);
+            else if (x < 0 || y < 0) ev_null(out);
+            else ev_int(out, 0);
+            return true;
+        }
+        if (a.null || b.null) { ev_null(out); return true; }   // standard: concatenazione
+        const char* x = ev_s(&a);
+        size_t lx = strlen(x);
+        char* buf = malloc(lx + strlen(ev_s(&b)) + 1);
+        if (!buf) { ctx_error(c, "%s", "Out of memory"); ev_null(out); return true; }
+        memcpy(buf, x, lx);
+        strcpy(buf + lx, ev_s(&b));
+        ev_set_text(c, out, buf, strlen(buf));
+        free(buf);
+        return true;
+    }
+    if (!strcmp(f, "__XOR")) {
+        int x = ev_truth(&a), y = ev_truth(&b);
+        if (x < 0 || y < 0) ev_null(out); else ev_int(out, x != y);
+        return true;
+    }
+    if (a.null || b.null) { ev_null(out); return true; }
+    uint64_t x = bit_operand(&a), y = bit_operand(&b), r;
+    if (!strcmp(f, "__BITAND"))      r = x & y;
+    else if (!strcmp(f, "__BITOR"))  r = x | y;
+    else if (!strcmp(f, "__BITXOR")) r = x ^ y;
+    else if (!strcmp(f, "__SHL"))    r = y >= 64 ? 0 : x << y;
+    else if (!strcmp(f, "__SHR"))    r = y >= 64 ? 0 : x >> y;
+    else return false;
+    ev_unsigned(c, out, r);
+    return true;
+}
+
+static void rt_eval_function(ASTExpr* e, EvalCtx* c, EvalVal* out);
+
 // buffer di testo che cresce (risultati delle funzioni di testo)
 typedef struct { char* d; size_t n, cap; bool err; } TextBuf;
 static void tb_put(TextBuf* t, const char* s, size_t n) {
@@ -1961,7 +2181,6 @@ static double ft_score(const char* const* docs, int nd, char* q, bool boolean) {
 }
 
 // ultimo AUTO_INCREMENT generato da questo thread (LAST_INSERT_ID(); una connessione MySQL è un thread)
-static _Thread_local int64_t g_last_insert_id;
 
 
 // ═════════════════════════════════════════════════════════════════
@@ -3094,6 +3313,9 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     EvalVal a[3];
     int na = e->nargs < 3 ? e->nargs : 3;
 
+    if (e->subkind == SUBK_UDF) { rt_eval_function(e, c, out); return; }
+    if (eval_internal(e, c, out)) return;
+
     if (eval_mysql(e, c, out)) return;
 
     // MATCH(colonne) AGAINST('parole'): punteggio di pertinenza (0 = nessuna corrispondenza)
@@ -3411,6 +3633,14 @@ static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out) {
                 return;
             }
             if (e->bound == 0) { ctx_error(c, "Unresolved column '%s'", e->col_name); ev_null(out); return; }
+            if (e->rt_const) {                                   // variabile della routine in esecuzione
+                int s = (e->bound - 1) / 1024, col = (e->bound - 1) % 1024;
+                const TableSchema* rts = NULL;
+                Tuple* t = c->x ? rt_scope_row(c->x->routine, s, &rts) : NULL;
+                if (!t || !rts || col >= t->num_values || col >= rts->num_columns) { ev_null(out); return; }
+                ev_from_value(out, &t->values[col], rts->columns[col].type);
+                return;
+            }
             const EvalCtx* cc = c;
             for (int k = 0; k < e->outer && cc; k++) cc = cc->outer;   // colonna della query esterna
             int s = (e->bound - 1) / 1024, col = (e->bound - 1) % 1024;
@@ -4707,11 +4937,20 @@ static void collect_conj(ASTExpr* e, ExprVec* out) {
 
 // sorgenti della query usate dall'espressione; outer: usa colonne esterne; opaque: subquery,
 // alias o aggregati (la condizione resta dov'è)
+static bool expr_has_udf(const ASTExpr* e) {
+    if (!e) return false;
+    if (e->type == EXPR_FUNC && e->subkind == SUBK_UDF) return true;
+    if (expr_has_udf(e->left) || expr_has_udf(e->right)) return true;
+    for (int i = 0; i < e->nargs; i++) if (expr_has_udf(e->args[i])) return true;
+    return false;
+}
+
 static void expr_refs(const ASTExpr* e, unsigned* mask, bool* outer, bool* opaque) {
     if (!e) return;
     switch (e->type) {
         case EXPR_COLUMN:
             if (e->bound < 0) *opaque = true;
+            else if (e->rt_const) {}                          // variabile di routine: una costante
             else if (e->outer > 0) *outer = true;
             else if (e->bound > 0) *mask |= 1u << ((e->bound - 1) / 1024);
             return;
@@ -5092,11 +5331,14 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
     }
     p->grouped = has_agg || n->select_stmt.num_group > 0 || n->select_stmt.having;
 
-    // 4. dove applicare le condizioni
+    // 4. dove applicare le condizioni (quelle che chiamano funzioni dell'utente per ultime: costano
+    // un'esecuzione della funzione per riga, meglio dopo i filtri e i join che riducono le righe)
     ExprVec conj = {0};
     collect_conj(n->select_stmt.where, &conj);
+    ExprVec costly = {0};
     for (int i = 0; i < conj.n; i++) {
         ASTExpr* c = conj.v[i];
+        if (expr_has_udf(c)) { xv_push(&costly, c); continue; }
         unsigned m = 0; bool o = false, op = false;
         expr_refs(c, &m, &o, &op);
         bool safe = !op && m != 0;
@@ -5113,6 +5355,8 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
         }
         xv_push(&p->resid, c);
     }
+    for (int i = 0; i < costly.n; i++) xv_push(&p->resid, costly.v[i]);
+    free(costly.v);
     free(conj.v);
     for (int k = 1; k < p->nsrc; k++) {
         ASTJoin* j = &n->select_stmt.joins[k - 1];
@@ -7537,16 +7781,47 @@ static const Constraint* referenced_by(Database* db, const TableSchema* ts, cons
 // ═════════════════════════════════════════════════════════════════
 
 #define MAX_TRIGGER_DEPTH 16
+#define RT_MAX_HANDLERS   32
+#define RT_NOT_FOUND      "No data - zero rows fetched, selected, or processed"
 
-typedef struct {
-    Source  src[2];       // NEW, OLD
-    Tuple*  cur[2];
+enum { CTL_NONE, CTL_LEAVE, CTL_ITERATE, CTL_RETURN, CTL_EXIT };
+
+typedef struct { char name[64]; ASTNode* sql; QueryResult* res; int pos; bool open; } RtCursor;
+typedef struct { TrigStmt* h; int level; } RtHandler;
+
+// Ambiente di un trigger o di una routine. Le variabili locali (parametri e DECLARE) sono le colonne
+// di una riga virtuale (sorgente senza nome): le espressioni e le query del corpo le vedono come
+// NEW / OLD, con i tipi dichiarati.
+typedef struct TrigScope {
+    Source  src[3];       // NEW, OLD, variabili
+    Tuple*  cur[3];
     BindCtx b;
     EvalCtx e;
     bool    proc;         // corpo di una procedura: tiene l'ultimo risultato e controlla i permessi
+    bool    is_function;  // funzione: niente risultati, RETURN obbligatorio
     QueryResult* last;    // ultimo risultato con colonne (SELECT) della procedura
     int     affected;
+    TableSchema* vts;     // variabili
+    Tuple*  vrow;
+    RtCursor* curs;
+    int     ncurs;
+    RtHandler hs[RT_MAX_HANDLERS];
+    int     nh;
+    int     level;        // profondità dei blocchi BEGIN ... END
+    int     ctl;          // CTL_*: LEAVE / ITERATE / RETURN / uscita da un handler EXIT
+    char    ctl_label[64];
+    int     exit_level;
+    EvalVal ret;
+    bool    has_ret;
+    char    last_err[300];  // per RESIGNAL dentro un handler
 } TrigScope;
+
+static Tuple* rt_scope_row(void* routine, int s, const TableSchema** ts) {
+    TrigScope* sc = routine;
+    if (!sc || s < 0 || s > 2) return NULL;
+    *ts = sc->src[s].ts;
+    return sc->cur[s];
+}
 
 static void trig_scope_init(TrigScope* sc, ExecCtx* ctx, TableSchema* ts, Tuple* newt, Tuple* oldt) {
     memset(sc, 0, sizeof(*sc));
@@ -7558,91 +7833,394 @@ static void trig_scope_init(TrigScope* sc, ExecCtx* ctx, TableSchema* ts, Tuple*
     }
     sc->cur[0] = newt;
     sc->cur[1] = oldt;
-    sc->b.src = sc->src; sc->b.nsrc = 2; sc->b.mode = BIND_ROW; sc->b.x = ctx; sc->b.clause = "the trigger";
-    sc->e.src = sc->src; sc->e.nsrc = 2; sc->e.cur = sc->cur; sc->e.x = ctx;
+    sc->vts = calloc(1, sizeof(TableSchema));         // variabili: aggiunte da rt_add_var
+    sc->src[2].ts = sc->vts;
+    sc->src[2].name[0] = '\0';                         // non qualificabile: v, non x.v
+    sc->b.src = sc->src; sc->b.nsrc = sc->vts ? 3 : 2; sc->b.mode = BIND_ROW; sc->b.x = ctx; sc->b.clause = "the trigger";
+    sc->b.rt_scope = true;
+    sc->e.src = sc->src; sc->e.nsrc = sc->vts ? 3 : 2; sc->e.cur = sc->cur; sc->e.x = ctx;
+}
+
+static void trig_scope_free(TrigScope* sc) {
+    if (!sc) return;
+    if (sc->vrow) tuple_free(sc->vrow);
+    for (int i = 0; i < sc->ncurs; i++) db_result_free(sc->curs[i].res);
+    free(sc->curs);
+    free(sc->vts);
+    if (sc->last) db_result_free(sc->last);
+    sc->vrow = NULL; sc->curs = NULL; sc->vts = NULL; sc->last = NULL;
+}
+
+// una variabile in più (parametro o DECLARE); un nome già visto è la stessa variabile
+static bool rt_add_var(TrigScope* sc, const char* name, const ColumnDef* d, char* msg, size_t mn) {
+    if (!sc->vts) { snprintf(msg, mn, "Out of memory"); return false; }
+    if (catalog_get_col_index(sc->vts, name) >= 0) return true;
+    if (sc->vts->num_columns >= SV_MAX_COLUMNS) { snprintf(msg, mn, "Too many variables in a routine (max %d)", SV_MAX_COLUMNS); return false; }
+    if (d && d->type[0] && !known_type(d->type)) { snprintf(msg, mn, "Unknown type '%.32s' for variable '%.64s'", d->type, name); return false; }
+    Column* c = &sc->vts->columns[sc->vts->num_columns++];
+    memset(c, 0, sizeof(*c));
+    snprintf(c->name, sizeof(c->name), "%s", name);
+    c->type = d && d->type[0] ? parse_type(d->type) : SV_TYPE_TEXT;
+    c->size = d ? d->size : 0;
+    c->nullable = true;
+    if (d) snprintf(c->sqltype, sizeof(c->sqltype), "%s", d->sqltype);
+    if (c->type == SV_TYPE_DECIMAL && d) c->decimal_prec = d->has_scale ? d->scale + 1 : d->size > 0 ? 1 : 0;
+    return true;
+}
+
+// le DECLARE di tutto il corpo (anche dei blocchi annidati), prima di eseguire
+static bool rt_collect_vars(TrigScope* sc, TrigStmt** v, int n, char* msg, size_t mn) {
+    for (int i = 0; i < n; i++) {
+        TrigStmt* t = v[i];
+        if (t->kind == TS_DECLARE)
+            for (int k = 0; k < t->nnames; k++) if (!rt_add_var(sc, t->names[k], t->vdef, msg, mn)) return false;
+        if (!rt_collect_vars(sc, t->then_v, t->nthen, msg, mn) || !rt_collect_vars(sc, t->else_v, t->nelse, msg, mn)) return false;
+    }
+    return true;
+}
+
+// riga dei valori (tutti NULL) dopo aver raccolto le variabili
+static bool rt_vars_ready(TrigScope* sc) {
+    if (!sc->vts) return false;
+    sc->vrow = tuple_create(sc->vts->num_columns > 0 ? sc->vts->num_columns : 1);
+    if (!sc->vrow) return false;
+    for (int i = 0; i < sc->vrow->num_values; i++) sc->vrow->values[i].is_null = true;
+    sc->cur[2] = sc->vrow;
+    return true;
+}
+
+// valore di una variabile locale (testo NULL = SQL NULL)
+static bool rt_set_var(TrigScope* sc, const char* name, const EvalVal* v) {
+    int ci = sc && sc->vts ? catalog_get_col_index(sc->vts, name) : -1;
+    if (ci < 0 || !sc->vrow) return false;
+    Column* c = &sc->vts->columns[ci];
+    char nb[64];
+    const char* tx = v->null ? NULL : ev_s(v);
+    if (!v->null && v->is_num && !v->is_int && (c->type == SV_TYPE_INT || c->type == SV_TYPE_BIGINT)) {
+        snprintf(nb, sizeof(nb), "%lld", (long long)llround(v->num));   // intero: arrotondato come MySQL
+        tx = nb;
+    }
+    if (c->type == SV_TYPE_BOOL && tx && v->is_num) { snprintf(nb, sizeof(nb), "%d", v->num != 0); tx = nb; }
+    column_set_from_text(&sc->vrow->values[ci], c, tx);
+    return true;
+}
+
+static void uservar_set(const char* name, const EvalVal* v);
+
+// destinazione di SET / INTO / FETCH: @x, variabile locale, NEW.colonna
+static const char* rt_assign(ExecCtx* ctx, TrigScope* sc, TableSchema* ts, Tuple* newt, const char* name, const EvalVal* v,
+                             char* msg, size_t mn) {
+    (void)ctx;
+    if (name[0] == '@') { uservar_set(name + 1, v); return NULL; }
+    if (!strncasecmp(name, "NEW.", 4)) {
+        int ci = ts ? catalog_get_col_index(ts, name + 4) : -1;
+        if (ci < 0 || !newt) { snprintf(msg, mn, "Cannot set %.64s here", name); return msg; }
+        const char* tx = v->null ? NULL : ev_s(v);
+        if (tx && check_value(&ts->columns[ci], tx, msg, mn)) return msg;
+        column_set_from_text(&newt->values[ci], &ts->columns[ci], tx);
+        return NULL;
+    }
+    if (!rt_set_var(sc, name, v)) { snprintf(msg, mn, "Undeclared variable: %.64s", name); return msg; }
+    return NULL;
+}
+
+// CREATE / DROP TABLE nel corpo (non ammessi nei trigger e nelle funzioni)
+static bool trig_has_ddl(TrigStmt** v, int n) {
+    for (int i = 0; i < n; i++) {
+        if (v[i]->kind == TS_SQL && v[i]->sql && (v[i]->sql->type == NODE_CREATE_TABLE || v[i]->sql->type == NODE_DROP_TABLE)) return true;
+        if (trig_has_ddl(v[i]->then_v, v[i]->nthen) || trig_has_ddl(v[i]->else_v, v[i]->nelse)) return true;
+    }
+    return false;
 }
 
 static bool trig_has_set(TrigStmt** v, int n) {
     for (int i = 0; i < n; i++) {
         if (v[i]->kind == TS_SET) return true;
-        if (v[i]->kind == TS_IF && (trig_has_set(v[i]->then_v, v[i]->nthen) || trig_has_set(v[i]->else_v, v[i]->nelse))) return true;
+        if (v[i]->kind == TS_ASSIGN)
+            for (int k = 0; k < v[i]->nnames; k++) if (!strncasecmp(v[i]->names[k], "NEW.", 4)) return true;
+        if (trig_has_set(v[i]->then_v, v[i]->nthen) || trig_has_set(v[i]->else_v, v[i]->nelse)) return true;
     }
     return false;
 }
 
-// controlla le espressioni del corpo (WHEN, SET, IF, SIGNAL) contro NEW / OLD
+// controlla le espressioni del corpo (WHEN, SET, IF, cicli, RETURN, ...) contro NEW / OLD / variabili
 static const char* trig_bind_all(TrigScope* sc, TableSchema* ts, TrigStmt** v, int n, char* msg, size_t mn) {
     for (int i = 0; i < n; i++) {
         TrigStmt* t = v[i];
         sc->b.err[0] = '\0';
-        if (t->kind == TS_SET) {
-            if (catalog_get_col_index(ts, t->col) < 0) { snprintf(msg, mn, "Unknown column 'NEW.%.64s'", t->col); return msg; }
-            bind_expr(t->expr, &sc->b);
-        } else if (t->kind == TS_SIGNAL) {
-            bind_expr(t->expr, &sc->b);
-        } else if (t->kind == TS_IF) {
-            bind_expr(t->cond, &sc->b);
-            if (!sc->b.err[0] && trig_bind_all(sc, ts, t->then_v, t->nthen, msg, mn)) return msg;
-            if (!sc->b.err[0] && trig_bind_all(sc, ts, t->else_v, t->nelse, msg, mn)) return msg;
+        switch (t->kind) {
+            case TS_SET:
+                if (catalog_get_col_index(ts, t->col) < 0) { snprintf(msg, mn, "Unknown column 'NEW.%.64s'", t->col); return msg; }
+                bind_expr(t->expr, &sc->b);
+                break;
+            case TS_ASSIGN:
+                for (int k = 0; k < t->nnames; k++) {
+                    const char* nm = t->names[k];
+                    if (nm[0] != '@' && strncasecmp(nm, "NEW.", 4) && catalog_get_col_index(sc->vts, nm) < 0) {
+                        snprintf(msg, mn, "Undeclared variable: %.64s", nm);
+                        return msg;
+                    }
+                    if (!strncasecmp(nm, "NEW.", 4) && catalog_get_col_index(ts, nm + 4) < 0) { snprintf(msg, mn, "Unknown column '%.64s'", nm); return msg; }
+                    bind_expr(t->exprs[k], &sc->b);
+                }
+                break;
+            case TS_FETCH:
+                for (int k = 0; k < t->nnames; k++)
+                    if (t->names[k][0] != '@' && strncasecmp(t->names[k], "NEW.", 4) && catalog_get_col_index(sc->vts, t->names[k]) < 0) {
+                        snprintf(msg, mn, "Undeclared variable: %.64s", t->names[k]);
+                        return msg;
+                    }
+                break;
+            case TS_SIGNAL: case TS_RETURN: case TS_DECLARE:
+                bind_expr(t->expr, &sc->b);
+                break;
+            case TS_IF: case TS_WHILE: case TS_REPEAT:
+                bind_expr(t->cond, &sc->b);
+                break;
+            default: break;
         }
         if (sc->b.err[0]) { snprintf(msg, mn, "%.250s", sc->b.err); return msg; }
+        if (t->kind == TS_RETURN && !sc->is_function) { snprintf(msg, mn, "RETURN is only allowed in a FUNCTION"); return msg; }
+        if (trig_bind_all(sc, ts, t->then_v, t->nthen, msg, mn)) return msg;
+        if (trig_bind_all(sc, ts, t->else_v, t->nelse, msg, mn)) return msg;
     }
     return NULL;
 }
 
+static RtCursor* rt_cursor(TrigScope* sc, const char* name) {
+    for (int i = 0; i < sc->ncurs; i++) if (!strcasecmp(sc->curs[i].name, name)) return &sc->curs[i];
+    return NULL;
+}
+
+// handler per l'errore (o la condizione NOT FOUND), dal più interno; -1 se nessuno
+static int rt_find_handler(TrigScope* sc, const char* err) {
+    bool nf = strstr(err, RT_NOT_FOUND) != NULL;
+    for (int i = sc->nh - 1; i >= 0; i--) {
+        TrigStmt* h = sc->hs[i].h;
+        for (int k = 0; k < h->nconds; k++) {
+            const char* c = h->conds[k];
+            if (!strcmp(c, "NOTFOUND") ? nf : !strcmp(c, "SQLWARNING") ? false : !nf) return i;
+        }
+    }
+    return -1;
+}
+
 static const char* trig_run(ExecCtx* ctx, TrigScope* sc, TableSchema* ts, TrigStmt** v, int n, Tuple* newt,
-                            char* msg, size_t mn) {
-    for (int i = 0; i < n; i++) {
-        TrigStmt* t = v[i];
-        sc->e.err[0] = '\0';
-        switch (t->kind) {
-            case TS_SQL: {
-                if (sc->proc && ctx->auth_hook && !ctx->auth_hook(t->sql, msg, mn)) return msg;
-                QueryResult* r = executor_run(ctx, t->sql);
-                if (!r || !r->success) {
-                    snprintf(msg, mn, "%.280s", r ? r->error : "statement failed");
-                    db_result_free(r);
-                    return msg;
-                }
-                if (sc->proc) {
-                    sc->affected += r->rows_affected;
-                    if (r->num_cols > 0) {                       // il risultato di CALL è l'ultima SELECT
-                        if (sc->last) db_result_free(sc->last);
-                        sc->last = r;
-                        break;
-                    }
-                }
+                            char* msg, size_t mn);
+
+// un'istruzione
+static const char* rt_exec(ExecCtx* ctx, TrigScope* sc, TableSchema* ts, TrigStmt* t, Tuple* newt, char* msg, size_t mn) {
+    sc->e.err[0] = '\0';
+    switch (t->kind) {
+        case TS_NOOP: case TS_CURSOR: case TS_HANDLER: return NULL;   // registrati da trig_run
+        case TS_SQL: {
+            if (sc->proc && ctx->auth_hook && !ctx->auth_hook(t->sql, msg, mn)) return msg;
+            ctx->rt_notfound = false;
+            QueryResult* r = executor_run(ctx, t->sql);
+            if (!r || !r->success) {
+                snprintf(msg, mn, "%.280s", r ? r->error : "statement failed");
                 db_result_free(r);
-                break;
-            }
-            case TS_SET: {
-                int ci = catalog_get_col_index(ts, t->col);
-                if (ci < 0 || !newt) { snprintf(msg, mn, "Cannot set NEW.%.64s here", t->col); return msg; }
-                EvalVal v2;
-                eval_expr(t->expr, &sc->e, &v2);
-                if (sc->e.err[0]) { snprintf(msg, mn, "%.250s", sc->e.err); return msg; }
-                const char* tx = v2.null ? NULL : ev_s(&v2);     // v2 vive fino a value_set_from_text (che copia)
-                if (tx && check_value(&ts->columns[ci], tx, msg, mn)) return msg;
-                column_set_from_text(&newt->values[ci], &ts->columns[ci], tx);
-                break;
-            }
-            case TS_SIGNAL: {
-                EvalVal v2;
-                eval_expr(t->expr, &sc->e, &v2);
-                snprintf(msg, mn, "%.280s", v2.null ? "Error raised by a trigger" : ev_s(&v2));
                 return msg;
             }
-            case TS_IF: {
-                bool c = eval_cond(t->cond, &sc->e);
-                if (sc->e.err[0]) { snprintf(msg, mn, "%.250s", sc->e.err); return msg; }
-                const char* f = c ? trig_run(ctx, sc, ts, t->then_v, t->nthen, newt, msg, mn)
-                                  : trig_run(ctx, sc, ts, t->else_v, t->nelse, newt, msg, mn);
-                if (f) return f;
-                break;
+            if (sc->is_function && r->num_cols > 0) {
+                db_result_free(r);
+                snprintf(msg, mn, "Not allowed to return a result set from a function (use SELECT ... INTO)");
+                return msg;
             }
+            if (sc->proc) {
+                if (t->sql->type != NODE_SELECT) sc->affected += r->rows_affected;
+                if (r->num_cols > 0) {                       // il risultato di CALL è l'ultima SELECT
+                    if (sc->last) db_result_free(sc->last);
+                    sc->last = r;
+                    r = NULL;
+                }
+            }
+            db_result_free(r);
+            if (ctx->rt_notfound) { ctx->rt_notfound = false; snprintf(msg, mn, "%s", RT_NOT_FOUND); return msg; }
+            return NULL;
+        }
+        case TS_SET: {
+            int ci = catalog_get_col_index(ts, t->col);
+            if (ci < 0 || !newt) { snprintf(msg, mn, "Cannot set NEW.%.64s here", t->col); return msg; }
+            EvalVal v2;
+            eval_expr(t->expr, &sc->e, &v2);
+            if (sc->e.err[0]) { snprintf(msg, mn, "%.250s", sc->e.err); return msg; }
+            const char* tx = v2.null ? NULL : ev_s(&v2);     // v2 vive fino a value_set_from_text (che copia)
+            if (tx && check_value(&ts->columns[ci], tx, msg, mn)) return msg;
+            column_set_from_text(&newt->values[ci], &ts->columns[ci], tx);
+            return NULL;
+        }
+        case TS_ASSIGN:
+            for (int k = 0; k < t->nnames; k++) {
+                EvalVal v2;
+                eval_expr(t->exprs[k], &sc->e, &v2);
+                if (sc->e.err[0]) { snprintf(msg, mn, "%.250s", sc->e.err); return msg; }
+                const char* f = rt_assign(ctx, sc, ts, newt, t->names[k], &v2, msg, mn);
+                if (f) return f;
+            }
+            return NULL;
+        case TS_DECLARE: {
+            EvalVal v2;
+            if (t->expr) eval_expr(t->expr, &sc->e, &v2);
+            else ev_null(&v2);
+            if (sc->e.err[0]) { snprintf(msg, mn, "%.250s", sc->e.err); return msg; }
+            for (int k = 0; k < t->nnames; k++) rt_set_var(sc, t->names[k], &v2);
+            return NULL;
+        }
+        case TS_SIGNAL: {
+            if (!t->expr) {                                    // RESIGNAL
+                snprintf(msg, mn, "%.280s", sc->last_err[0] ? sc->last_err : "RESIGNAL outside of a handler");
+                return msg;
+            }
+            EvalVal v2;
+            eval_expr(t->expr, &sc->e, &v2);
+            snprintf(msg, mn, "%.280s", v2.null ? "Error raised by a trigger" : ev_s(&v2));
+            return msg;
+        }
+        case TS_RETURN: {
+            EvalVal v2;
+            eval_expr(t->expr, &sc->e, &v2);
+            if (sc->e.err[0]) { snprintf(msg, mn, "%.250s", sc->e.err); return msg; }
+            ev_copy(&sc->ret, &v2);
+            if (!sc->ret.null && !sc->ret.is_num && sc->ret.str && sc->ret.str != sc->ret.buf) {   // testo che non vive oltre: copia
+                size_t l = strlen(sc->ret.str);
+                if (l > EV_STR_MAX) l = EV_STR_MAX;
+                char tmp[EV_STR_MAX + 1];
+                memcpy(tmp, sc->ret.str, l); tmp[l] = '\0';
+                ev_text(&sc->ret, tmp, l);
+            }
+            sc->has_ret = true;
+            sc->ctl = CTL_RETURN;
+            return NULL;
+        }
+        case TS_IF: {
+            bool c = eval_cond(t->cond, &sc->e);
+            if (sc->e.err[0]) { snprintf(msg, mn, "%.250s", sc->e.err); return msg; }
+            return c ? trig_run(ctx, sc, ts, t->then_v, t->nthen, newt, msg, mn)
+                     : trig_run(ctx, sc, ts, t->else_v, t->nelse, newt, msg, mn);
+        }
+        case TS_BLOCK: {
+            sc->level++;
+            int my = sc->level;
+            const char* f = trig_run(ctx, sc, ts, t->then_v, t->nthen, newt, msg, mn);
+            sc->level--;
+            if (f) return f;
+            if (sc->ctl == CTL_LEAVE && t->label[0] && !strcasecmp(sc->ctl_label, t->label)) sc->ctl = CTL_NONE;
+            if (sc->ctl == CTL_EXIT && sc->exit_level == my) sc->ctl = CTL_NONE;
+            return NULL;
+        }
+        case TS_WHILE: case TS_REPEAT: case TS_LOOP: {
+            for (long long iter = 0;; iter++) {
+                if ((iter & 255) == 0 && sv_scan_cancelled()) { snprintf(msg, mn, "Query cancelled"); return msg; }
+                if (t->kind == TS_WHILE) {
+                    bool c = eval_cond(t->cond, &sc->e);
+                    if (sc->e.err[0]) { snprintf(msg, mn, "%.250s", sc->e.err); return msg; }
+                    if (!c) break;
+                }
+                const char* f = trig_run(ctx, sc, ts, t->then_v, t->nthen, newt, msg, mn);
+                if (f) return f;
+                if (sc->ctl == CTL_ITERATE && !strcasecmp(sc->ctl_label, t->label)) { sc->ctl = CTL_NONE; continue; }
+                if (sc->ctl == CTL_LEAVE && !strcasecmp(sc->ctl_label, t->label)) { sc->ctl = CTL_NONE; break; }
+                if (sc->ctl) break;                            // RETURN, uscita verso un'etichetta esterna
+                if (t->kind == TS_REPEAT) {
+                    bool c = eval_cond(t->cond, &sc->e);
+                    if (sc->e.err[0]) { snprintf(msg, mn, "%.250s", sc->e.err); return msg; }
+                    if (c) break;
+                }
+            }
+            return NULL;
+        }
+        case TS_LEAVE: case TS_ITERATE:
+            sc->ctl = t->kind == TS_LEAVE ? CTL_LEAVE : CTL_ITERATE;
+            snprintf(sc->ctl_label, sizeof(sc->ctl_label), "%s", t->label);
+            return NULL;
+        case TS_OPEN: {
+            RtCursor* c = rt_cursor(sc, t->label);
+            if (!c) { snprintf(msg, mn, "Undefined CURSOR: %.64s", t->label); return msg; }
+            if (c->open) { snprintf(msg, mn, "Cursor is already open: %.64s", t->label); return msg; }
+            if (sc->proc && ctx->auth_hook && !ctx->auth_hook(c->sql, msg, mn)) return msg;
+            QueryResult* r = executor_run(ctx, c->sql);
+            if (!r || !r->success) { snprintf(msg, mn, "%.280s", r ? r->error : "statement failed"); db_result_free(r); return msg; }
+            c->res = r; c->pos = 0; c->open = true;
+            return NULL;
+        }
+        case TS_FETCH: {
+            RtCursor* c = rt_cursor(sc, t->label);
+            if (!c) { snprintf(msg, mn, "Undefined CURSOR: %.64s", t->label); return msg; }
+            if (!c->open) { snprintf(msg, mn, "Cursor is not open: %.64s", t->label); return msg; }
+            if (t->nnames != c->res->num_cols) { snprintf(msg, mn, "Incorrect number of FETCH variables"); return msg; }
+            if (c->pos >= c->res->num_rows) { snprintf(msg, mn, "%s", RT_NOT_FOUND); return msg; }
+            for (int k = 0; k < t->nnames; k++) {
+                const Cell* cell = &c->res->rows[c->pos].cells[k];
+                EvalVal v2;
+                if (cell->is_null) ev_null(&v2);
+                else { v2.null = false; v2.is_num = v2.is_int = false; v2.ci = false; v2.str = cell->value ? cell->value : ""; }
+                const char* f = rt_assign(ctx, sc, ts, newt, t->names[k], &v2, msg, mn);
+                if (f) return f;
+            }
+            c->pos++;
+            return NULL;
+        }
+        case TS_CLOSE: {
+            RtCursor* c = rt_cursor(sc, t->label);
+            if (!c) { snprintf(msg, mn, "Undefined CURSOR: %.64s", t->label); return msg; }
+            if (!c->open) { snprintf(msg, mn, "Cursor is not open: %.64s", t->label); return msg; }
+            db_result_free(c->res);
+            c->res = NULL; c->open = false;
+            return NULL;
         }
     }
     return NULL;
+}
+
+// esegue una lista di istruzioni: dichiarazioni di cursori e handler, errori passati agli handler,
+// LEAVE / ITERATE / RETURN propagati con sc->ctl
+static const char* trig_run(ExecCtx* ctx, TrigScope* sc, TableSchema* ts, TrigStmt** v, int n, Tuple* newt,
+                            char* msg, size_t mn) {
+    int hs_base = sc->nh;
+    const char* fail = NULL;
+    for (int i = 0; i < n && !fail; i++) {
+        TrigStmt* t = v[i];
+        if (t->kind == TS_HANDLER) {
+            if (sc->nh >= RT_MAX_HANDLERS) { snprintf(msg, mn, "Too many handlers"); fail = msg; break; }
+            sc->hs[sc->nh].h = t;
+            sc->hs[sc->nh].level = sc->level;
+            sc->nh++;
+            continue;
+        }
+        if (t->kind == TS_CURSOR) {
+            RtCursor* c = rt_cursor(sc, t->label);
+            if (!c) {
+                RtCursor* nc = realloc(sc->curs, sizeof(RtCursor) * (size_t)(sc->ncurs + 1));
+                if (!nc) { snprintf(msg, mn, "Out of memory"); fail = msg; break; }
+                sc->curs = nc;
+                c = &sc->curs[sc->ncurs++];
+                memset(c, 0, sizeof(*c));
+                snprintf(c->name, sizeof(c->name), "%s", t->label);
+            }
+            c->sql = t->sql;
+            continue;
+        }
+        const char* f = rt_exec(ctx, sc, ts, t, newt, msg, mn);
+        if (f) {
+            int h = rt_find_handler(sc, f);
+            if (h < 0) { fail = f; break; }
+            RtHandler hd = sc->hs[h];
+            char saved[300];
+            snprintf(saved, sizeof(saved), "%s", sc->last_err);
+            snprintf(sc->last_err, sizeof(sc->last_err), "%.290s", f);
+            int nh_save = sc->nh;
+            sc->nh = h;                                        // dentro l'handler valgono solo quelli più esterni
+            const char* f2 = trig_run(ctx, sc, ts, hd.h->then_v, hd.h->nthen, newt, msg, mn);
+            sc->nh = nh_save;
+            snprintf(sc->last_err, sizeof(sc->last_err), "%s", saved);
+            if (f2) { fail = f2; break; }
+            if (hd.h->exit_handler && !sc->ctl) { sc->ctl = CTL_EXIT; sc->exit_level = hd.level; }
+        }
+        if (sc->ctl) break;
+    }
+    sc->nh = hs_base;
+    return fail;
 }
 
 // esegue i trigger della tabella per l'evento; NULL se tutto va bene, altrimenti il messaggio
@@ -7674,7 +8252,9 @@ static const char* fire_triggers(ExecCtx* ctx, Database* db, TableSchema* ts, co
             if (!fail && !sc) fail = "Out of memory";
             if (sc) {
                 trig_scope_init(sc, ctx, ts, row ? newt : NULL, row ? oldt : NULL);
-                bool go = true;
+                if (!rt_collect_vars(sc, prog->v, prog->n, msg, mn)) fail = msg;
+                else if (!rt_vars_ready(sc)) fail = "Out of memory";
+                bool go = !fail;
                 if (prog->when) {
                     bind_expr(prog->when, &sc->b);
                     if (sc->b.err[0]) { snprintf(msg, mn, "%.250s", sc->b.err); fail = msg; }
@@ -7685,14 +8265,18 @@ static const char* fire_triggers(ExecCtx* ctx, Database* db, TableSchema* ts, co
                 if (!fail && go) {
                     struct BindCtx* sb = ctx->trig_bind;
                     struct EvalCtx* se = ctx->trig_eval;
+                    void* sr = ctx->routine;
                     ctx->trig_bind = &sc->b;
                     ctx->trig_eval = &sc->e;
+                    ctx->routine = sc;
                     ctx->trig_depth++;
                     fail = trig_run(ctx, sc, ts, prog->v, prog->n, before ? newt : NULL, msg, mn);
                     ctx->trig_depth--;
                     ctx->trig_bind = sb;
                     ctx->trig_eval = se;
+                    ctx->routine = sr;
                 }
+                trig_scope_free(sc);
                 free(sc);
             }
         }
@@ -7726,6 +8310,7 @@ static QueryResult* exec_create_trigger(ExecCtx* ctx, ASTNode* n) {
     TrigProgram* prog = tk ? parser_parse_trigger(tk) : NULL;
     const char* fail = NULL;
     if (!prog || !prog->success) { snprintf(msg, sizeof(msg), "Invalid trigger: %.250s", prog ? prog->error : "out of memory"); fail = msg; }
+    if (!fail && trig_has_ddl(prog->v, prog->n)) fail = "A trigger cannot create or drop tables";
     if (!fail && trig_has_set(prog->v, prog->n) && (!n->create_trigger.before || !prog->for_each_row))
         fail = "SET NEW.column is only allowed in BEFORE ... FOR EACH ROW triggers";
     if (!fail && trig_has_set(prog->v, prog->n) && !strcasecmp(n->create_trigger.event, "DELETE"))
@@ -7737,8 +8322,10 @@ static QueryResult* exec_create_trigger(ExecCtx* ctx, ASTNode* n) {
         if (!sc) fail = "Out of memory";
         else {
             trig_scope_init(sc, ctx, ts, NULL, NULL);
-            if (prog->when) { bind_expr(prog->when, &sc->b); if (sc->b.err[0]) { snprintf(msg, sizeof(msg), "%.250s", sc->b.err); fail = msg; } }
+            if (!rt_collect_vars(sc, prog->v, prog->n, msg, sizeof(msg))) fail = msg;
+            if (!fail && prog->when) { bind_expr(prog->when, &sc->b); if (sc->b.err[0]) { snprintf(msg, sizeof(msg), "%.250s", sc->b.err); fail = msg; } }
             if (!fail) fail = trig_bind_all(sc, ts, prog->v, prog->n, msg, sizeof(msg));
+            trig_scope_free(sc);
             free(sc);
         }
     }
@@ -7756,110 +8343,190 @@ static QueryResult* exec_create_trigger(ExecCtx* ctx, ASTNode* n) {
 }
 
 // ═════════════════════════════════════════════════════════════════
-//  Stored procedure (come MySQL, parametri solo IN):
-//    CREATE PROCEDURE nome([IN] p tipo, ...) BEGIN istruzioni; END    CALL nome(valori)
-//  Il corpo è quello dei trigger (INSERT, UPDATE, DELETE, SELECT, CALL, IF, SIGNAL): i parametri
-//  diventano valori costanti nel testo; il risultato è quello dell'ultima SELECT.
+//  Stored procedure e funzioni (come MySQL):
+//    CREATE PROCEDURE nome([IN | OUT | INOUT] p tipo, ...) corpo        CALL nome(valori, @out, ...)
+//    CREATE FUNCTION nome(p tipo, ...) RETURNS tipo [DETERMINISTIC ...] corpo     SELECT nome(x)
+//  Il corpo è un'istruzione o BEGIN ... END con variabili, cicli, cursori e handler (vedi parser.h).
+//  I parametri e le DECLARE sono variabili tipizzate; il risultato di CALL è quello dell'ultima SELECT.
 // ═════════════════════════════════════════════════════════════════
-#define MAX_PROC_PARAMS 32
 
-// parametri del testo "(...)" della procedura: nomi in names; indice del primo token del corpo, -1 se non validi
-static int proc_params(TokenList* tk, char names[][64], int* np, char* msg, size_t mn) {
-    *np = 0;
-    Token* T = tk->tokens;
-    int n = tk->count, i = 1;
-    if (n < 2 || T[0].type != TOK_LPAREN) { snprintf(msg, mn, "Expected the parameter list"); return -1; }
-    if (T[i].type == TOK_RPAREN) return i + 1;
-    for (;;) {
-        if (T[i].type == TOK_IN) i++;
-        else if (T[i].type == TOK_IDENTIFIER && (!strcasecmp(T[i].text, "OUT") || !strcasecmp(T[i].text, "INOUT")) &&
-                 i + 1 < n && T[i + 1].type == TOK_IDENTIFIER) {
-            snprintf(msg, mn, "OUT and INOUT parameters are not supported: return values with a SELECT");
-            return -1;
-        }
-        if (T[i].type != TOK_IDENTIFIER) { snprintf(msg, mn, "Expected a parameter name near '%.40s'", T[i].text); return -1; }
-        if (*np >= MAX_PROC_PARAMS) { snprintf(msg, mn, "Too many parameters (max %d)", MAX_PROC_PARAMS); return -1; }
-        for (int k = 0; k < *np; k++)
-            if (!strcasecmp(names[k], T[i].text)) { snprintf(msg, mn, "Duplicate parameter '%.64s'", T[i].text); return -1; }
-        snprintf(names[*np], 64, "%s", T[i].text);
-        i++;
-        int d = 0, typed = 0;
-        for (; i < n - 1; i++, typed++) {                   // tipo: fino a ',' o ')' allo stesso livello
-            if (d == 0 && (T[i].type == TOK_COMMA || T[i].type == TOK_RPAREN)) break;
-            if (T[i].type == TOK_LPAREN) d++;
-            else if (T[i].type == TOK_RPAREN) d--;
-        }
-        if (!typed) { snprintf(msg, mn, "Expected the type of parameter '%.64s'", names[*np]); return -1; }
-        (*np)++;
-        if (T[i].type == TOK_COMMA) { i++; continue; }
-        if (T[i].type == TOK_RPAREN) return i + 1;
-        snprintf(msg, mn, "Expected ')' after the parameters");
-        return -1;
-    }
-}
+static TableSchema g_no_table;                 // NEW / OLD di una routine: nessuna colonna
 
-// sostituisce i parametri nel corpo con i valori (lit[k] tipo typ[k]) e lo analizza
-static TrigProgram* proc_program(TokenList* tk, int body, char names[][64], int np, char** lit, const TokenType* typ) {
-    for (int i = body; i < tk->count - 1; i++) {
-        Token* t = &tk->tokens[i];
-        if (t->type != TOK_IDENTIFIER) continue;
-        if (i > 0 && tk->tokens[i - 1].type == TOK_DOT) continue;
-        if (tk->tokens[i + 1].type == TOK_DOT || tk->tokens[i + 1].type == TOK_LPAREN) continue;
-        for (int k = 0; k < np; k++)
-            if (!strcasecmp(t->text, names[k])) { t->type = typ[k]; t->text = lit[k]; break; }
-    }
-    return parser_parse_procedure(tk, body);
-}
-
-static RoutineSchema* find_procedure(Database* db, const char* name) {
+static RoutineSchema* find_routine(Database* db, const char* name, bool is_function) {
     for (int i = 0; db && i < db->num_routines; i++)
-        if (!db->routines[i].is_function && !strcasecmp(db->routines[i].name, name)) return &db->routines[i];
+        if (db->routines[i].is_function == is_function && !strcasecmp(db->routines[i].name, name)) return &db->routines[i];
     return NULL;
+}
+
+static RoutineSchema* find_procedure(Database* db, const char* name) { return find_routine(db, name, false); }
+
+static bool trig_has_return(TrigStmt** v, int n) {
+    for (int i = 0; i < n; i++)
+        if (v[i]->kind == TS_RETURN || trig_has_return(v[i]->then_v, v[i]->nthen) || trig_has_return(v[i]->else_v, v[i]->nelse)) return true;
+    return false;
+}
+
+static RoutineDef* routine_parse(const RoutineSchema* rt, TokenList** tk_out, char* msg, size_t mn) {
+    TokenList* tk = lexer_tokenize(rt->body);
+    if (!tk) { snprintf(msg, mn, "Out of memory"); return NULL; }
+    RoutineDef* d = parser_parse_routine(tk, rt->is_function);
+    if (!d || !d->success) {
+        snprintf(msg, mn, "%s '%.64s' cannot be read: %.180s", rt->is_function ? "Function" : "Procedure", rt->name, d ? d->error : "out of memory");
+        routine_def_free(d);
+        lexer_free(tk);
+        return NULL;
+    }
+    *tk_out = tk;
+    return d;
+}
+
+// prepara l'ambiente (parametri con i valori, DECLARE) ed esegue il corpo. Ritorna NULL o l'errore;
+// sc resta da leggere (OUT, risultato, RETURN) e da liberare con trig_scope_free
+static const char* routine_run(ExecCtx* ctx, const RoutineSchema* rt, RoutineDef* d, const EvalVal* argv, TrigScope* sc,
+                               char* msg, size_t mn) {
+    trig_scope_init(sc, ctx, &g_no_table, NULL, NULL);       // sempre: chi chiama libera sc
+    if (ctx->trig_depth >= MAX_TRIGGER_DEPTH)
+        return rt->is_function ? "Functions are nested too deeply (a function keeps calling itself?)"
+                               : "Procedures are nested too deeply (a procedure keeps calling itself?)";
+    sc->proc = true;
+    sc->is_function = rt->is_function;
+    sc->b.clause = rt->is_function ? "the function" : "the procedure";
+    for (int k = 0; k < d->nparams; k++) if (!rt_add_var(sc, d->params[k].name, &d->params[k].def, msg, mn)) return msg;
+    if (!rt_collect_vars(sc, d->prog->v, d->prog->n, msg, mn)) return msg;
+    if (!rt_vars_ready(sc)) return "Out of memory";
+    for (int k = 0; k < d->nparams; k++)
+        if (d->params[k].mode != PARAM_OUT) rt_set_var(sc, d->params[k].name, &argv[k]);
+    const char* fail = trig_bind_all(sc, &g_no_table, d->prog->v, d->prog->n, msg, mn);
+    if (fail) return fail;
+    struct BindCtx* sb = ctx->trig_bind;
+    struct EvalCtx* se = ctx->trig_eval;
+    void* sr = ctx->routine;
+    ctx->trig_bind = &sc->b;
+    ctx->trig_eval = &sc->e;
+    ctx->routine = sc;
+    ctx->trig_depth++;
+    fail = trig_run(ctx, sc, &g_no_table, d->prog->v, d->prog->n, NULL, msg, mn);
+    ctx->trig_depth--;
+    ctx->trig_bind = sb;
+    ctx->trig_eval = se;
+    ctx->routine = sr;
+    if (!fail && rt->is_function && !sc->has_ret) { snprintf(msg, mn, "No RETURN found in function"); fail = msg; }
+    if (!fail && sc->ctl == CTL_LEAVE && sc->ctl_label[0]) {}   // LEAVE dell'etichetta del corpo
+    return fail;
+}
+
+// tabelle TEMPORARY create dentro le routine: eliminate alla fine della CALL più esterna
+static _Thread_local char (*g_rt_temps)[2][64];
+static _Thread_local int g_rt_ntemps;
+
+static QueryResult* exec_drop_table(ExecCtx* ctx, ASTNode* n);
+
+static void rt_temps_cleanup(ExecCtx* ctx) {
+    if (!g_rt_ntemps) return;
+    ASTNode* dn = calloc(1, sizeof(ASTNode));
+    int saved = ctx->catalog->current_db;
+    for (int i = 0; dn && i < g_rt_ntemps; i++) {
+        for (int d = 0; d < ctx->catalog->num_databases; d++)
+            if (!strcasecmp(ctx->catalog->databases[d].name, g_rt_temps[i][0])) { ctx->catalog->current_db = d; break; }
+        if (!catalog_get_table(ctx->catalog, g_rt_temps[i][0], g_rt_temps[i][1])) continue;
+        memset(dn, 0, sizeof(*dn));
+        dn->type = NODE_DROP_TABLE;
+        snprintf(dn->drop_table.table_name, sizeof(dn->drop_table.table_name), "%s", g_rt_temps[i][1]);
+        db_result_free(exec_drop_table(ctx, dn));
+    }
+    ctx->catalog->current_db = saved;
+    free(dn);
+    free(g_rt_temps);
+    g_rt_temps = NULL;
+    g_rt_ntemps = 0;
+}
+
+static void rt_temp_created(const char* db, const char* table) {
+    char (*nt)[2][64] = realloc(g_rt_temps, sizeof(*g_rt_temps) * (size_t)(g_rt_ntemps + 1));
+    if (!nt) return;
+    g_rt_temps = nt;
+    snprintf(g_rt_temps[g_rt_ntemps][0], 64, "%s", db);
+    snprintf(g_rt_temps[g_rt_ntemps][1], 64, "%s", table);
+    g_rt_ntemps++;
+}
+
+static bool rt_is_temp(const char* db, const char* table) {
+    for (int i = 0; i < g_rt_ntemps; i++)
+        if (!strcasecmp(g_rt_temps[i][0], db) && !strcasecmp(g_rt_temps[i][1], table)) return true;
+    return false;
 }
 
 static QueryResult* exec_create_procedure(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
+    bool is_function = n->create_trigger.before;
+    const char* what = is_function ? "Function" : "Procedure";
     char msg[300];
-    for (int i = 0; i < db->num_routines; i++)
-        if (!strcasecmp(db->routines[i].name, n->create_trigger.name)) {
-            snprintf(msg, sizeof(msg), "Procedure '%.64s' already exists", n->create_trigger.name);
-            return result_error_msg(msg);
-        }
-    if (db->num_routines >= 64) return result_error_msg("Too many procedures (max 64 per database)");
-    TokenList* tk = lexer_tokenize(n->create_trigger.body);
-    if (!tk) return result_error_msg("Out of memory");
-    char names[MAX_PROC_PARAMS][64];
-    int np = 0;
-    int body = proc_params(tk, names, &np, msg, sizeof(msg));
-    if (body >= 0) {                                       // controllo del corpo con parametri NULL
-        char* lit[MAX_PROC_PARAMS];
-        TokenType typ[MAX_PROC_PARAMS];
-        for (int k = 0; k < np; k++) { lit[k] = (char*)"NULL"; typ[k] = TOK_NULL; }
-        TrigProgram* prog = proc_program(tk, body, names, np, lit, typ);
-        if (!prog || !prog->success) { snprintf(msg, sizeof(msg), "Invalid procedure: %.250s", prog ? prog->error : "out of memory"); body = -1; }
-        trig_program_free(prog);
+    if (find_routine(db, n->create_trigger.name, is_function)) {
+        if (n->if_exists) return result_ok_msg(0);
+        snprintf(msg, sizeof(msg), "%s '%.64s' already exists", what, n->create_trigger.name);
+        return result_error_msg(msg);
     }
+    if (db->num_routines >= 64) return result_error_msg("Too many routines (max 64 per database)");
+    RoutineSchema tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    snprintf(tmp.name, sizeof(tmp.name), "%s", n->create_trigger.name);
+    tmp.is_function = is_function;
+    snprintf(tmp.body, sizeof(tmp.body), "%s", n->create_trigger.body);
+    TokenList* tk = NULL;
+    RoutineDef* d = routine_parse(&tmp, &tk, msg, sizeof(msg));
+    if (!d) return result_error_msg(msg);
+    const char* fail = NULL;
+    if (is_function && !trig_has_return(d->prog->v, d->prog->n)) fail = "No RETURN found in function";
+    if (!fail && is_function && trig_has_ddl(d->prog->v, d->prog->n)) fail = "A function cannot create or drop tables";
+    if (!fail && is_function && !known_type(d->ret.type)) { snprintf(msg, sizeof(msg), "Unknown type '%.32s' after RETURNS", d->ret.type); fail = msg; }
+    for (int k = 0; !fail && k < d->nparams; k++)
+        if (!known_type(d->params[k].def.type)) { snprintf(msg, sizeof(msg), "Unknown type '%.32s' for parameter '%.64s'", d->params[k].def.type, d->params[k].name); fail = msg; }
+    if (!fail) {                                         // variabili e dichiarazioni coerenti
+        TrigScope* sc = malloc(sizeof(TrigScope));
+        if (!sc) fail = "Out of memory";
+        else {
+            trig_scope_init(sc, ctx, &g_no_table, NULL, NULL);
+            for (int k = 0; !fail && k < d->nparams; k++) if (!rt_add_var(sc, d->params[k].name, &d->params[k].def, msg, sizeof(msg))) fail = msg;
+            if (!fail && !rt_collect_vars(sc, d->prog->v, d->prog->n, msg, sizeof(msg))) fail = msg;
+            trig_scope_free(sc);
+            free(sc);
+        }
+    }
+    char rtype[64] = "";
+    if (is_function) snprintf(rtype, sizeof(rtype), "%s", d->ret.sqltype[0] ? d->ret.sqltype : d->ret.type);
+    routine_def_free(d);
     lexer_free(tk);
-    if (body < 0) return result_error_msg(msg);
+    if (fail) {
+        if (fail != msg) snprintf(msg, sizeof(msg), "%s", fail);
+        char full[400];
+        snprintf(full, sizeof(full), "Invalid %s: %.300s", is_function ? "function" : "procedure", msg);
+        return result_error_msg(full);
+    }
     RoutineSchema* rt = &db->routines[db->num_routines++];
-    memset(rt, 0, sizeof(*rt));
-    snprintf(rt->name, sizeof(rt->name), "%s", n->create_trigger.name);
-    rt->is_function = false;
-    snprintf(rt->body, sizeof(rt->body), "%s", n->create_trigger.body);
+    *rt = tmp;
+    snprintf(rt->return_type, sizeof(rt->return_type), "%s", rtype);
     return result_ok_msg(0);
 }
 
 static QueryResult* exec_drop_procedure(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
-    RoutineSchema* rt = find_procedure(db, n->drop_trigger.name);
+    bool is_function = n->drop_trigger.is_function;
+    RoutineSchema* rt = find_routine(db, n->drop_trigger.name, is_function);
     char msg[200];
-    if (!rt) { snprintf(msg, sizeof(msg), "Procedure '%.64s' not found", n->drop_trigger.name); return result_error_msg(msg); }
+    if (!rt) { snprintf(msg, sizeof(msg), "%s '%.64s' not found", is_function ? "Function" : "Procedure", n->drop_trigger.name); return result_error_msg(msg); }
     int i = (int)(rt - db->routines);
     memmove(&db->routines[i], &db->routines[i + 1], sizeof(RoutineSchema) * (size_t)(db->num_routines - i - 1));
     db->num_routines--;
     return result_ok_msg(0);
+}
+
+// valore di un parametro / variabile della routine terminata
+static void rt_var_value(TrigScope* sc, const char* name, EvalVal* out) {
+    int ci = catalog_get_col_index(sc->vts, name);
+    if (ci < 0 || !sc->vrow) { ev_null(out); return; }
+    ev_from_value(out, &sc->vrow->values[ci], sc->vts->columns[ci].type);
 }
 
 static QueryResult* exec_call(ExecCtx* ctx, ASTNode* n) {
@@ -7867,24 +8534,27 @@ static QueryResult* exec_call(ExecCtx* ctx, ASTNode* n) {
     if (!db) return result_error_msg("No database selected");
     char msg[400], inner[300];
     RoutineSchema* rt = find_procedure(db, n->call.name);
-    if (!rt) { snprintf(msg, sizeof(msg), "Procedure '%.64s' not found", n->call.name); return result_error_msg(msg); }
-    if (ctx->trig_depth >= MAX_TRIGGER_DEPTH) return result_error_msg("Procedures are nested too deeply (a procedure keeps calling itself?)");
+    if (!rt) {
+        snprintf(msg, sizeof(msg), find_routine(db, n->call.name, true) ? "'%.64s' is a function: use SELECT %.64s(...)" : "Procedure '%.64s' not found",
+                 n->call.name, n->call.name);
+        return result_error_msg(msg);
+    }
+    bool outermost = ctx->trig_depth == 0;
     char pname[64];
     snprintf(pname, sizeof(pname), "%s", rt->name);
-    TokenList* tk = lexer_tokenize(rt->body);
-    if (!tk) return result_error_msg("Out of memory");
-    char names[MAX_PROC_PARAMS][64];
-    int np = 0;
+    TokenList* tk = NULL;
+    RoutineDef* d = routine_parse(rt, &tk, msg, sizeof(msg));
+    if (!d) return result_error_msg(msg);
     const char* fail = NULL;
-    int body = proc_params(tk, names, &np, inner, sizeof(inner));
-    if (body < 0) fail = inner;
-    if (!fail && np != n->call.nargs) {
-        snprintf(inner, sizeof(inner), "expects %d argument%s, got %d", np, np == 1 ? "" : "s", n->call.nargs);
+    if (d->nparams != n->call.nargs) {
+        snprintf(inner, sizeof(inner), "expects %d argument%s, got %d", d->nparams, d->nparams == 1 ? "" : "s", n->call.nargs);
         fail = inner;
     }
-    // argomenti: espressioni senza colonne, valutate una volta
-    char* lit[MAX_PROC_PARAMS] = {0};
-    TokenType typ[MAX_PROC_PARAMS];
+    // argomenti IN / INOUT: valutati una volta (vedono le variabili della routine che chiama); OUT e INOUT
+    // devono essere variabili (@x o locali)
+    EvalVal* av = calloc(32, sizeof(EvalVal));
+    if (!fail && !av) fail = "Out of memory";
+    TrigScope* caller = ctx->routine;
     if (!fail) {
         BindCtx b;
         memset(&b, 0, sizeof(b));
@@ -7892,58 +8562,132 @@ static QueryResult* exec_call(ExecCtx* ctx, ASTNode* n) {
         EvalCtx ec;
         memset(&ec, 0, sizeof(ec));
         ec.x = ctx; ec.outer = ctx->trig_eval;
-        for (int k = 0; k < np && !fail; k++) {
-            bind_expr(n->call.args[k], &b);
+        for (int k = 0; k < d->nparams && !fail; k++) {
+            ASTExpr* a = n->call.args[k];
+            if (d->params[k].mode != PARAM_IN) {
+                bool uv = a->type == EXPR_FUNC && !strcmp(a->func, "__UVAR");
+                bool lv = a->type == EXPR_COLUMN && !a->table_name[0] && caller && catalog_get_col_index(caller->vts, a->col_name) >= 0;
+                if (!uv && !lv) {
+                    snprintf(inner, sizeof(inner), "OUT or INOUT argument %d for routine %.64s is not a variable", k + 1, pname);
+                    fail = inner;
+                    break;
+                }
+            }
+            if (d->params[k].mode == PARAM_OUT) { ev_null(&av[k]); continue; }
+            bind_expr(a, &b);
             if (b.err[0]) { snprintf(inner, sizeof(inner), "%.250s", b.err); fail = inner; break; }
             EvalVal v;
-            eval_expr(n->call.args[k], &ec, &v);
+            eval_expr(a, &ec, &v);
             if (ec.err[0]) { snprintf(inner, sizeof(inner), "%.250s", ec.err); fail = inner; break; }
-            typ[k] = v.null ? TOK_NULL : v.is_int ? TOK_INTEGER : v.is_num ? TOK_FLOAT : TOK_STRING;
-            lit[k] = strdup(v.null ? "NULL" : ev_s(&v));
-            if (!lit[k]) fail = "Out of memory";
+            if (v.null) ev_null(&av[k]);
+            else if (v.is_num) ev_copy(&av[k], &v);
+            else { const char* sv = ev_s(&v); size_t l = strlen(sv); if (l > EV_STR_MAX) l = EV_STR_MAX; ev_text(&av[k], sv, l); }
         }
     }
-    TrigProgram* prog = NULL;
-    TableSchema* none = NULL;
     TrigScope* sc = NULL;
     if (!fail) {
-        prog = proc_program(tk, body, names, np, lit, typ);
-        if (!prog || !prog->success) { snprintf(inner, sizeof(inner), "%.250s", prog ? prog->error : "out of memory"); fail = inner; }
+        sc = calloc(1, sizeof(TrigScope));
+        if (!sc) fail = "Out of memory";
+        else fail = routine_run(ctx, rt, d, av, sc, inner, sizeof(inner));
     }
-    if (!fail) {
-        none = calloc(1, sizeof(TableSchema));            // nessuna riga NEW / OLD
-        sc = malloc(sizeof(TrigScope));
-        if (!none || !sc) fail = "Out of memory";
-    }
-    if (!fail) {
-        trig_scope_init(sc, ctx, none, NULL, NULL);
-        sc->proc = true;
-        fail = trig_bind_all(sc, none, prog->v, prog->n, inner, sizeof(inner));
-        if (!fail) {
-            struct BindCtx* sb = ctx->trig_bind;
-            struct EvalCtx* se = ctx->trig_eval;
-            ctx->trig_bind = NULL;
-            ctx->trig_eval = NULL;
-            ctx->trig_depth++;
-            fail = trig_run(ctx, sc, none, prog->v, prog->n, NULL, inner, sizeof(inner));
-            ctx->trig_depth--;
-            ctx->trig_bind = sb;
-            ctx->trig_eval = se;
-        }
+    // OUT / INOUT: i valori finali tornano alle variabili di chi chiama
+    for (int k = 0; !fail && sc && k < d->nparams; k++) {
+        if (d->params[k].mode == PARAM_IN) continue;
+        EvalVal v;
+        rt_var_value(sc, d->params[k].name, &v);
+        ASTExpr* a = n->call.args[k];
+        if (a->type == EXPR_FUNC) uservar_set(a->args[0]->str_val, &v);
+        else rt_set_var(caller, a->col_name, &v);
     }
     QueryResult* r;
     if (fail) {
-        if (!strncmp(fail, "Procedure '", 11)) snprintf(msg, sizeof(msg), "%s", fail);   // dalla procedura più interna
+        if (!strncmp(fail, "Procedure '", 11) || !strncmp(fail, "Function '", 10)) snprintf(msg, sizeof(msg), "%s", fail);   // dalla routine più interna
         else snprintf(msg, sizeof(msg), "Procedure '%.64s': %.300s", pname, fail);
         r = result_error_msg(msg);
-        if (sc && sc->last) db_result_free(sc->last);
-    } else r = sc->last ? sc->last : result_ok_msg(sc->affected);
-    free(sc);
-    free(none);
-    trig_program_free(prog);
-    lexer_free(tk);                                        // dopo il programma: i token puntano a lit
-    for (int k = 0; k < np; k++) free(lit[k]);
+    } else if (sc->last) { r = sc->last; sc->last = NULL; }
+    else r = result_ok_msg(sc->affected);
+    if (sc) { trig_scope_free(sc); free(sc); }
+    free(av);
+    routine_def_free(d);
+    lexer_free(tk);
+    if (outermost) rt_temps_cleanup(ctx);
     return r;
+}
+
+// funzione definita dall'utente in un'espressione: argomenti valutati nella riga corrente
+static void rt_eval_function(ASTExpr* e, EvalCtx* c, EvalVal* out) {
+    ExecCtx* ctx = c->x;
+    Database* db = ctx ? catalog_current_db(ctx->catalog) : NULL;
+    RoutineSchema* rt = find_routine(db, e->func, true);
+    char msg[300];
+    if (!rt) { ctx_error(c, "Function '%s' not found", e->func); ev_null(out); return; }
+    TokenList* tk = NULL;
+    RoutineDef* d = routine_parse(rt, &tk, msg, sizeof(msg));
+    if (!d) { ctx_error(c, "%.250s", msg); ev_null(out); return; }
+    if (d->nparams != e->nargs) {
+        snprintf(msg, sizeof(msg), "Function '%.64s' expects %d argument%s, got %d", rt->name, d->nparams, d->nparams == 1 ? "" : "s", e->nargs);
+        ctx_error(c, "%.250s", msg);
+        routine_def_free(d); lexer_free(tk); ev_null(out);
+        return;
+    }
+    EvalVal* av = calloc((size_t)(e->nargs > 0 ? e->nargs : 1), sizeof(EvalVal));
+    TrigScope* sc = av ? calloc(1, sizeof(TrigScope)) : NULL;
+    const char* fail = sc ? NULL : "Out of memory";
+    for (int k = 0; !fail && k < e->nargs; k++) {
+        EvalVal v;
+        eval_expr(e->args[k], c, &v);
+        if (c->err[0]) { fail = c->err; break; }
+        if (v.null) ev_null(&av[k]);
+        else if (v.is_num) ev_copy(&av[k], &v);
+        else { const char* sv = ev_s(&v); size_t l = strlen(sv); if (l > EV_STR_MAX) l = EV_STR_MAX; ev_text(&av[k], sv, l); }
+    }
+    char name[64];
+    snprintf(name, sizeof(name), "%s", rt->name);
+    bool ctx_err = fail != NULL;
+    if (!fail) {
+        // la funzione esegue le sue query con il proprio ambiente: lo stato della query che la usa si salva
+        bool nf = ctx->rt_notfound;
+        fail = routine_run(ctx, rt, d, av, sc, msg, sizeof(msg));
+        ctx->rt_notfound = nf;
+    }
+    if (fail) {
+        if (!ctx_err) {
+            if (!strncmp(fail, "Function '", 10) || !strncmp(fail, "Procedure '", 11)) ctx_error(c, "%.250s", fail);
+            else { char full[400]; snprintf(full, sizeof(full), "Function '%.64s': %.300s", name, fail); ctx_error(c, "%.250s", full); }
+        }
+        ev_null(out);
+    } else {
+        // RETURN convertito nel tipo dichiarato (RETURNS DECIMAL(5,2), INT, ...)
+        Column col;
+        memset(&col, 0, sizeof(col));
+        col.type = parse_type(d->ret.type);
+        col.size = d->ret.size;
+        if (col.type == SV_TYPE_DECIMAL) col.decimal_prec = d->ret.has_scale ? d->ret.scale + 1 : d->ret.size > 0 ? 1 : 0;
+        if (sc->ret.null) ev_null(out);
+        else {
+            EvalVal r = sc->ret;
+            if (r.is_num && !r.is_int && (col.type == SV_TYPE_INT || col.type == SV_TYPE_BIGINT)) ev_int(out, llround(r.num));
+            else if (r.is_num && (col.type == SV_TYPE_INT || col.type == SV_TYPE_BIGINT || col.type == SV_TYPE_FLOAT)) ev_copy(out, &r);
+            else {
+                Value tv;
+                memset(&tv, 0, sizeof(tv));
+                column_set_from_text(&tv, &col, ev_s(&sc->ret));
+                EvalVal tmp;
+                ev_from_value(&tmp, &tv, col.type);
+                if (tmp.null) ev_null(out);
+                else if (tmp.str && tmp.str != tmp.buf) {          // testo nella Value temporanea: copiato
+                    const char* tx = tmp.str;
+                    ev_set_text(c, out, tx, strlen(tx));
+                    out->is_num = tmp.is_num; out->is_int = tmp.is_int; out->num = tmp.num; out->inum = tmp.inum;
+                } else ev_copy(out, &tmp);
+                if (tv.owns_str) free(tv.str_val);
+            }
+        }
+    }
+    if (sc) { trig_scope_free(sc); free(sc); }
+    free(av);
+    routine_def_free(d);
+    lexer_free(tk);
 }
 
 static QueryResult* exec_drop_trigger(ExecCtx* ctx, ASTNode* n) {
@@ -9437,6 +10181,70 @@ static QueryResult* exec_insert_mysql(ExecCtx* ctx, ASTNode* n) {
     return ok;
 }
 
+// SELECT ... INTO v1, @v2: una riga al massimo; nessuna riga = condizione NOT FOUND (le variabili restano come sono)
+static QueryResult* exec_select_into(ExecCtx* ctx, ASTNode* n) {
+    int ni = n->select_stmt.num_into;
+    n->select_stmt.num_into = 0;
+    QueryResult* r = run_select(ctx, n, 0, false);
+    n->select_stmt.num_into = ni;
+    if (!r || !r->success) return r;
+    char msg[300];
+    if (r->num_cols != ni) {
+        db_result_free(r);
+        return result_error_msg("The used SELECT statements have a different number of columns than INTO variables");
+    }
+    if (r->num_rows > 1) { db_result_free(r); return result_error_msg("Result consisted of more than one row"); }
+    if (r->num_rows == 0) {
+        db_result_free(r);
+        ctx->rt_notfound = true;
+        return result_ok_msg(0);
+    }
+    TrigScope* sc = ctx->routine;
+    for (int k = 0; k < ni; k++) {
+        const Cell* cell = &r->rows[0].cells[k];
+        EvalVal v;
+        if (cell->is_null) ev_null(&v);
+        else {
+            v.null = false; v.ci = false; v.is_num = v.is_int = false;
+            v.str = cell->value ? cell->value : "";
+            double d;
+            const char* ct = r->col_types ? r->col_types[k] : NULL;   // colonne numeriche: valori numerici (per @x)
+            if (ct && (strstr(ct, "INT") || strstr(ct, "FLOAT") || strstr(ct, "DOUBLE") || strstr(ct, "DECIMAL")) && text_is_number(v.str, &d)) {
+                if (strchr(v.str, '.') || strchr(v.str, 'e') || strchr(v.str, 'E')) ev_num(&v, d);
+                else ev_int(&v, strtoll(cell->value, NULL, 10));
+            }
+        }
+        const char* name = n->select_stmt.into[k];
+        if (name[0] == '@') { uservar_set(name + 1, &v); continue; }
+        if (!sc || !rt_set_var(sc, name, &v)) {
+            snprintf(msg, sizeof(msg), "Undeclared variable: %.64s", name);
+            db_result_free(r);
+            return result_error_msg(msg);
+        }
+    }
+    db_result_free(r);
+    return result_ok_msg(1);
+}
+
+// SET @a = espr, @b := espr (variabili di sessione)
+QueryResult* executor_set_session_vars(ExecCtx* ctx, ASTNode* stmt) {
+    for (int k = 0; k < stmt->set_n; k++) {
+        BindCtx b;
+        memset(&b, 0, sizeof(b));
+        b.mode = BIND_ROW; b.clause = "SET"; b.x = ctx; b.outer = ctx->trig_bind;
+        bind_expr(stmt->set_exprs[k], &b);
+        if (b.err[0]) return result_error_msg(b.err);
+        EvalCtx ec;
+        memset(&ec, 0, sizeof(ec));
+        ec.x = ctx; ec.outer = ctx->trig_eval;
+        EvalVal v;
+        eval_expr(stmt->set_exprs[k], &ec, &v);
+        if (ec.err[0]) return result_error_msg(ec.err);
+        uservar_set(stmt->set_names[k], &v);
+    }
+    return result_ok_msg(0);
+}
+
 QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt) {
     g_run_depth++;
     g_select_total = -1;
@@ -9462,7 +10270,15 @@ static QueryResult* executor_run_impl(ExecCtx* ctx, ASTNode* stmt) {
         case NODE_CREATE_DB:    return exec_create_db(ctx, stmt);
         case NODE_DROP_DB:      return exec_drop_db(ctx, stmt);
         case NODE_CREATE_TABLE: return exec_create_table(ctx, stmt);
-        case NODE_DROP_TABLE:   return exec_drop_table(ctx, stmt);
+        case NODE_DROP_TABLE: {
+            // in una routine si eliminano solo le tabelle TEMPORARY che le routine hanno creato
+            Database* cdb = catalog_current_db(ctx->catalog);
+            if (ctx->routine && !(cdb && rt_is_temp(cdb->name, stmt->drop_table.table_name))) {
+                if (stmt->if_exists && cdb && !catalog_get_table(ctx->catalog, cdb->name, stmt->drop_table.table_name)) return result_ok_msg(0);
+                return result_error_msg("Only TEMPORARY tables created by the routine can be dropped inside a routine");
+            }
+            return exec_drop_table(ctx, stmt);
+        }
         case NODE_ALTER_TABLE:  return exec_alter_table(ctx, stmt);
         case NODE_INSERT: {
             if (stmt->insert_stmt.mode != INS_NORMAL || stmt->insert_stmt.num_dup > 0) return exec_insert_mysql(ctx, stmt);
@@ -9470,7 +10286,7 @@ static QueryResult* executor_run_impl(ExecCtx* ctx, ASTNode* stmt) {
             dup_clear();           // il conflitto registrato serve solo a exec_insert_mysql: niente resti nel thread
             return r;
         }
-        case NODE_SELECT:       return run_select(ctx, stmt, 0, false);
+        case NODE_SELECT:       return stmt->select_stmt.num_into ? exec_select_into(ctx, stmt) : run_select(ctx, stmt, 0, false);
         case NODE_UPDATE:       return stmt->update_stmt.multi_from ? exec_dml_multi(ctx, stmt) : exec_update(ctx, stmt);
         case NODE_DELETE:       return stmt->delete_stmt.multi_from ? exec_dml_multi(ctx, stmt) : exec_delete(ctx, stmt);
         case NODE_USE:          return exec_use(ctx, stmt);

@@ -46,7 +46,10 @@ static const char* token_name(TokenType tt) {
         "'('", "')'", "'='", "'!='", "'<'", "'>'", "'<='", "'>='", "'+'", "'-'",
         "'/'", "'%'", "end of statement", "invalid token",
     };
+    static const char* const MORE[] = { "':'", "':='", "'||'", "'&&'", "'|'", "'&'", "'^'", "'~'", "'<<'", "'>>'", "'<=>'" };
     _Static_assert(sizeof(NAMES) / sizeof(NAMES[0]) == TOK_ERROR + 1, "token_name non allineato a TokenType");
+    _Static_assert(sizeof(MORE) / sizeof(MORE[0]) == TOK_NSEQ - TOK_ERROR, "token_name non allineato a TokenType");
+    if (tt > TOK_ERROR && tt <= TOK_NSEQ) return MORE[tt - TOK_ERROR - 1];
     return (tt >= 0 && tt <= TOK_ERROR) ? NAMES[tt] : "?";
 }
 
@@ -136,6 +139,8 @@ static ASTNode* parse_query(ParserState* ps);
 static void free_node(ASTNode* n);
 void ast_node_free(ASTNode* n) { free_node(n); }
 static void parse_column_ref(ParserState* ps, ASTExpr* e);
+static bool parse_type_spec(ParserState* ps, ColumnDef* cd);
+static bool parse_target(ParserState* ps, char* out, size_t n);
 
 static void parse_fail(ParserState* ps, const char* msg, Token at);
 
@@ -282,6 +287,38 @@ static void fmt_rec(const ASTExpr* e, char* out, size_t n, size_t* len, bool top
             fmt_put(out, n, len, e->col_name);
             break;
         case EXPR_AGG: case EXPR_FUNC: case EXPR_WINDOW:
+            // variabili e operatori scritti come funzioni interne: di nuovo nella forma SQL (rileggibile)
+            if (e->type == EXPR_FUNC && e->func[0] == '_' && e->func[1] == '_' && e->nargs >= 1) {
+                static const char* const OPS[][2] = {
+                    { "__BITAND", " & " }, { "__BITOR", " | " }, { "__BITXOR", " ^ " }, { "__SHL", " << " }, { "__SHR", " >> " },
+                    { "__NSEQ", " <=> " }, { "__XOR", " XOR " }, { "__PIPES", " || " } };
+                const char* f = e->func;
+                if ((!strcmp(f, "__UVAR") || !strcmp(f, "__SYSVAR") || !strcmp(f, "__UASSIGN")) && e->args[0]->type == EXPR_STRING) {
+                    if (!top && f[2] == 'U' && f[3] == 'A') fmt_put(out, n, len, "(");
+                    fmt_put(out, n, len, !strcmp(f, "__SYSVAR") ? "@@" : "@");
+                    fmt_put(out, n, len, e->args[0]->str_val ? e->args[0]->str_val : "");
+                    if (!strcmp(f, "__UASSIGN") && e->nargs == 2) { fmt_put(out, n, len, " := "); fmt_rec(e->args[1], out, n, len, false); if (!top) fmt_put(out, n, len, ")"); }
+                    break;
+                }
+                if (!strcmp(f, "__BITNOT")) { fmt_put(out, n, len, "~"); fmt_rec(e->args[0], out, n, len, false); break; }
+                if (!strcmp(f, "__ISTRUE") || !strcmp(f, "__ISFALSE")) {
+                    fmt_rec(e->args[0], out, n, len, false);
+                    fmt_put(out, n, len, f[4] == 'T' ? " IS TRUE" : " IS FALSE");
+                    break;
+                }
+                bool done = false;
+                for (size_t k = 0; k < sizeof(OPS) / sizeof(OPS[0]) && e->nargs == 2; k++)
+                    if (!strcmp(f, OPS[k][0])) {
+                        if (!top) fmt_put(out, n, len, "(");
+                        fmt_rec(e->args[0], out, n, len, false);
+                        fmt_put(out, n, len, OPS[k][1]);
+                        fmt_rec(e->args[1], out, n, len, false);
+                        if (!top) fmt_put(out, n, len, ")");
+                        done = true;
+                        break;
+                    }
+                if (done) break;
+            }
             fmt_put(out, n, len, e->func);
             fmt_put(out, n, len, "(");
             if (e->agg_distinct) fmt_put(out, n, len, "DISTINCT ");
@@ -444,6 +481,8 @@ static ASTExpr* mkfunc2(const char* name, ASTExpr* a, ASTExpr* b);
 static bool is_interval(const ASTExpr* e);
 static bool peek2_ident(ParserState* ps, const char* w);
 static ASTExpr* parse_match(ParserState* ps);
+static ASTExpr* op_call(ParserState* ps, const char* name, ASTExpr* a, ASTExpr* b);
+static ASTExpr* json_call(const char* name, ASTExpr* a, ASTExpr* b);
 
 
 static bool ident_is(ParserState* ps, const char* word);
@@ -963,6 +1002,15 @@ static ASTExpr* parse_primary(ParserState* ps) {
             if (next_is(ps, 1, TOK_LPAREN)) return parse_call(ps);
             break;
         case TOK_IDENTIFIER: case TOK_LEFT: case TOK_RIGHT:   // LEFT(...)/RIGHT(...) sono funzioni
+            if (t.type == TOK_IDENTIFIER && t.text[0] == '@') {
+                // @x: variabile di sessione (@x := espr la assegna e vale il nuovo valore); @@x: di sistema
+                consume(ps);
+                bool sys = t.text[1] == '@';
+                ASTExpr* nm = new_expr(EXPR_STRING);
+                if (!nm || !(nm->str_val = strdup(t.text + (sys ? 2 : 1)))) { ast_expr_free(nm); parse_fail(ps, "Out of memory", t); return NULL; }
+                if (!sys && match(ps, TOK_ASSIGN)) return op_call(ps, "__UASSIGN", nm, parse_expr(ps));
+                return depth_check(ps, json_call(sys ? "__SYSVAR" : "__UVAR", nm, NULL));
+            }
             if (t.type == TOK_IDENTIFIER && next_is(ps, 1, TOK_LPAREN) && !strcasecmp(t.text, "MATCH")) return parse_match(ps);
             if (t.type == TOK_IDENTIFIER) {
                 ASTExpr* sp = parse_special_form(ps);
@@ -1059,6 +1107,7 @@ static ASTExpr* parse_unary(ParserState* ps) {
     ASTExpr* e;
     if (match(ps, TOK_MINUS))     e = new_unary(OP_NEG, parse_unary(ps));
     else if (match(ps, TOK_PLUS)) e = parse_unary(ps);
+    else if (match(ps, TOK_TILDE)) e = op_call(ps, "__BITNOT", parse_unary(ps), NULL);   // ~x
     else                          e = parse_primary(ps);
     ps->depth--;
     return depth_check(ps, e);
@@ -1068,6 +1117,7 @@ static ASTExpr* parse_multiplicative(ParserState* ps) {
     ASTExpr* e = parse_unary(ps);
     while (e && ps->result->success) {
         OpType op;
+        if (match(ps, TOK_CARET)) { e = op_call(ps, "__BITXOR", e, parse_unary(ps)); continue; }   // a ^ b
         if (match(ps, TOK_STAR))       op = OP_MUL;
         else if (match(ps, TOK_SLASH)) op = OP_DIV;
         else if (match(ps, TOK_PERCENT)) op = OP_MOD;
@@ -1114,14 +1164,19 @@ static bool adjacent(ParserState* ps, int ahead) {           // token ahead subi
 static ASTExpr* parse_additive(ParserState* ps) {
     ASTExpr* e = parse_multiplicative(ps);
     while (e && ps->result->success) {
-        if (peek(ps).type == TOK_MINUS && next_is(ps, 1, TOK_GT) && adjacent(ps, 1)) {
-            consume(ps); consume(ps);
-            bool unquote = peek(ps).type == TOK_GT && adjacent(ps, 0);
-            if (unquote) consume(ps);
+        if (peek(ps).type == TOK_MINUS && (next_is(ps, 1, TOK_GT) || next_is(ps, 1, TOK_SHR)) && adjacent(ps, 1)) {
+            consume(ps);
+            bool unquote = peek(ps).type == TOK_SHR;           // ->> (il lexer legge >> come un token solo)
+            consume(ps);
+            if (!unquote && peek(ps).type == TOK_GT && adjacent(ps, 0)) { unquote = true; consume(ps); }
             ASTExpr* path = parse_multiplicative(ps);
             if (!path) { ast_expr_free(e); return NULL; }
             e = json_call("JSON_EXTRACT", e, path);
             if (e && unquote) e = json_call("JSON_UNQUOTE", e, NULL);
+            continue;
+        }
+        if (match(ps, TOK_PIPES)) {                    // a || b: concatenazione (standard); OR in modalità MySQL
+            e = op_call(ps, "__PIPES", e, parse_multiplicative(ps));
             continue;
         }
         OpType op;
@@ -1137,21 +1192,64 @@ static ASTExpr* parse_additive(ParserState* ps) {
     return e;
 }
 
+// funzione interna con uno o due argomenti (operatori di MySQL: bit a bit, <=>, XOR, ||, IS TRUE)
+static ASTExpr* op_call(ParserState* ps, const char* name, ASTExpr* a, ASTExpr* b) {
+    if (!a || (b == NULL && strcmp(name, "__BITNOT") && strcmp(name, "__ISTRUE") && strcmp(name, "__ISFALSE"))) {
+        ast_expr_free(a); ast_expr_free(b);
+        return NULL;
+    }
+    return depth_check(ps, json_call(name, a, b));
+}
+
+// a | b, a & b, a << b, a >> b (MySQL): sopra + e -, sotto i confronti
+static ASTExpr* parse_shift(ParserState* ps) {
+    ASTExpr* e = parse_additive(ps);
+    while (e && ps->result->success) {
+        if (match(ps, TOK_SHL)) e = op_call(ps, "__SHL", e, parse_additive(ps));
+        else if (match(ps, TOK_SHR)) e = op_call(ps, "__SHR", e, parse_additive(ps));
+        else break;
+    }
+    return e;
+}
+static ASTExpr* parse_bitand(ParserState* ps) {
+    ASTExpr* e = parse_shift(ps);
+    while (e && ps->result->success && match(ps, TOK_AMP)) e = op_call(ps, "__BITAND", e, parse_shift(ps));
+    return e;
+}
+static ASTExpr* parse_bitor(ParserState* ps) {
+    ASTExpr* e = parse_bitand(ps);
+    while (e && ps->result->success && match(ps, TOK_PIPE)) e = op_call(ps, "__BITOR", e, parse_bitand(ps));
+    return e;
+}
+
 static ASTExpr* parse_predicate(ParserState* ps) {
-    ASTExpr* left = parse_additive(ps);
+    ASTExpr* left = parse_bitor(ps);
     if (!left) return NULL;
 
     if (match(ps, TOK_IS)) {
         bool neg = match(ps, TOK_NOT);
-        if (!match(ps, TOK_NULL)) { parse_fail(ps, "Expected NULL after IS", peek(ps)); ast_expr_free(left); return NULL; }
+        // IS [NOT] TRUE / FALSE (il lexer li legge come 1 / 0) / UNKNOWN / DISTINCT FROM x
+        if (peek(ps).type == TOK_INTEGER && (!strcmp(peek(ps).text, "1") || !strcmp(peek(ps).text, "0"))) {
+            bool t = !strcmp(consume(ps).text, "1");
+            ASTExpr* f = op_call(ps, t ? "__ISTRUE" : "__ISFALSE", left, NULL);
+            return neg && f ? new_unary(OP_NOT, f) : f;
+        }
+        if (ident_is(ps, "UNKNOWN")) { consume(ps); return new_unary(neg ? OP_IS_NOT_NULL : OP_IS_NULL, left); }
+        if (match(ps, TOK_DISTINCT)) {
+            if (!match(ps, TOK_FROM)) { parse_fail(ps, "Expected FROM after IS DISTINCT", peek(ps)); ast_expr_free(left); return NULL; }
+            ASTExpr* f = op_call(ps, "__NSEQ", left, parse_bitor(ps));
+            return !neg && f ? new_unary(OP_NOT, f) : f;
+        }
+        if (!match(ps, TOK_NULL)) { parse_fail(ps, "Expected NULL, TRUE, FALSE, UNKNOWN or DISTINCT FROM after IS", peek(ps)); ast_expr_free(left); return NULL; }
         return new_unary(neg ? OP_IS_NOT_NULL : OP_IS_NULL, left);
     }
+    if (match(ps, TOK_NSEQ)) return op_call(ps, "__NSEQ", left, parse_bitor(ps));     // a <=> b
     bool neg = match(ps, TOK_NOT);
     if (match(ps, TOK_LIKE)) {
-        ASTExpr* pat = parse_additive(ps);
+        ASTExpr* pat = parse_bitor(ps);
         if (pat && ident_is(ps, "ESCAPE")) {      // a LIKE p ESCAPE 'c'
             consume(ps);
-            ASTExpr* esc = parse_additive(ps);
+            ASTExpr* esc = parse_bitor(ps);
             if (esc && esc->type == EXPR_STRING && esc->str_val && strlen(esc->str_val) != 1) {
                 parse_fail(ps, "ESCAPE needs a single character", peek(ps));
                 ast_expr_free(left); ast_expr_free(pat); ast_expr_free(esc);
@@ -1163,7 +1261,7 @@ static ASTExpr* parse_predicate(ParserState* ps) {
     }
     if (ident_is(ps, "REGEXP") || ident_is(ps, "RLIKE")) {        // x [NOT] REGEXP p
         consume(ps);
-        ASTExpr* pat = parse_additive(ps);
+        ASTExpr* pat = parse_bitor(ps);
         ASTExpr* f = new_expr(EXPR_FUNC);
         if (!pat || !f) { ast_expr_free(pat); ast_expr_free(f); ast_expr_free(left); return NULL; }
         snprintf(f->func, sizeof(f->func), "REGEXP_LIKE");
@@ -1175,9 +1273,9 @@ static ASTExpr* parse_predicate(ParserState* ps) {
     }
     if (match(ps, TOK_BETWEEN)) {
         // x BETWEEN a AND b  ->  x >= a AND x <= b   (NOT: x < a OR x > b)
-        ASTExpr* lo = parse_additive(ps);
+        ASTExpr* lo = parse_bitor(ps);
         if (!match(ps, TOK_AND)) { parse_fail(ps, "Expected AND in BETWEEN", peek(ps)); ast_expr_free(left); ast_expr_free(lo); return NULL; }
-        ASTExpr* hi = parse_additive(ps);
+        ASTExpr* hi = parse_bitor(ps);
         ASTExpr* left2 = ast_expr_clone(left);
         if (neg) return new_binary(OP_OR, new_binary(OP_LT, left, lo), new_binary(OP_GT, left2, hi));
         return new_binary(OP_AND, new_binary(OP_GE, left, lo), new_binary(OP_LE, left2, hi));
@@ -1217,7 +1315,7 @@ static ASTExpr* parse_predicate(ParserState* ps) {
         if (!query_starts(ps, 1)) { parse_fail(ps, "ANY / ALL need a subquery", peek(ps)); ast_expr_free(left); return NULL; }
         return parse_subquery(ps, quant_all ? SUBQ_ALL : SUBQ_ANY, op, left);
     }
-    return new_binary(op, left, parse_additive(ps));
+    return new_binary(op, left, parse_bitor(ps));
 }
 
 static ASTExpr* parse_not(ParserState* ps) {
@@ -1236,23 +1334,30 @@ static ASTExpr* parse_not(ParserState* ps) {
 
 static ASTExpr* parse_and(ParserState* ps) {
     ASTExpr* first = parse_not(ps);                   // caso comune: un solo termine, nessuna lista
-    if (!first || !ps->result->success || peek(ps).type != TOK_AND) {
+    if (!first || !ps->result->success || (peek(ps).type != TOK_AND && peek(ps).type != TOK_AMPAMP)) {
         if (!ps->result->success) { ast_expr_free(first); return NULL; }
         return first;
     }
     ExprList terms = {0};
     if (!elist_push(&terms, first)) { ast_expr_free(first); return NULL; }
-    match(ps, TOK_AND);
+    if (!match(ps, TOK_AND)) match(ps, TOK_AMPAMP);
     do {
         ASTExpr* e = parse_not(ps);
         if (!e || !elist_push(&terms, e)) { ast_expr_free(e); elist_free(&terms); return NULL; }
-    } while (ps->result->success && match(ps, TOK_AND));
+    } while (ps->result->success && (match(ps, TOK_AND) || match(ps, TOK_AMPAMP)));
     if (!ps->result->success) { elist_free(&terms); return NULL; }
     return depth_check(ps, elist_combine(&terms, OP_AND));
 }
 
+// a XOR b (MySQL): fra AND e OR
+static ASTExpr* parse_xor(ParserState* ps) {
+    ASTExpr* e = parse_and(ps);
+    while (e && ps->result->success && ident_is(ps, "XOR")) { consume(ps); e = op_call(ps, "__XOR", e, parse_and(ps)); }
+    return e;
+}
+
 static ASTExpr* parse_expr(ParserState* ps) {
-    ASTExpr* first = parse_and(ps);                   // caso comune: un solo termine, nessuna lista
+    ASTExpr* first = parse_xor(ps);                   // caso comune: un solo termine, nessuna lista
     if (!first || !ps->result->success || peek(ps).type != TOK_OR) {
         if (!ps->result->success) { ast_expr_free(first); return NULL; }
         return first;
@@ -1261,7 +1366,7 @@ static ASTExpr* parse_expr(ParserState* ps) {
     if (!elist_push(&terms, first)) { ast_expr_free(first); return NULL; }
     match(ps, TOK_OR);
     do {
-        ASTExpr* e = parse_and(ps);
+        ASTExpr* e = parse_xor(ps);
         if (!e || !elist_push(&terms, e)) { ast_expr_free(e); elist_free(&terms); return NULL; }
     } while (ps->result->success && match(ps, TOK_OR));
     if (!ps->result->success) { elist_free(&terms); return NULL; }
@@ -1377,6 +1482,18 @@ static void parse_from_clause(ParserState* ps, ASTNode* n) {
     }
 }
 
+// SELECT ... INTO v1, @v2 (dopo l'elenco o in fondo alla query); INTO OUTFILE / DUMPFILE non ci sono
+static void parse_select_into(ParserState* ps, ASTNode* n) {
+    if (!ps->result->success || peek(ps).type != TOK_INTO) return;
+    consume(ps);
+    if (ident_is(ps, "OUTFILE") || ident_is(ps, "DUMPFILE")) { parse_fail(ps, "SELECT ... INTO OUTFILE is not supported: use Export", peek(ps)); return; }
+    do {
+        if (n->select_stmt.num_into >= 16) { parse_fail(ps, "Too many INTO variables (max 16)", peek(ps)); return; }
+        if (!parse_target(ps, n->select_stmt.into[n->select_stmt.num_into], 64)) return;
+        n->select_stmt.num_into++;
+    } while (match(ps, TOK_COMMA));
+}
+
 static ASTNode* parse_select_core(ParserState* ps) {
     ASTNode* n = calloc(1, sizeof(ASTNode));
     if (!n) return NULL;
@@ -1417,6 +1534,7 @@ static ASTNode* parse_select_core(ParserState* ps) {
         if (!e) { if (ps->result->success) parse_fail(ps, "Out of memory", peek(ps)); break; }
         n->select_stmt.columns[n->select_stmt.num_cols++] = e;
     } while (ps->result->success && match(ps, TOK_COMMA));
+    parse_select_into(ps, n);
 
     if (!ps->result->success) return n;
     // senza FROM (SELECT 1, SELECT NOW()): nessuna tabella
@@ -1555,6 +1673,7 @@ static ASTNode* parse_query(ParserState* ps) {
         tail = arm;
     }
     parse_order_limit(ps, head);
+    if (ps->result->success && peek(ps).type == TOK_INTO && head->select_stmt.num_into == 0) parse_select_into(ps, head);
     return head;
 }
 
@@ -1879,6 +1998,11 @@ static void trig_stmt_free(TrigStmt* t) {
     free_node(t->sql);
     ast_expr_free(t->expr);
     ast_expr_free(t->cond);
+    for (int i = 0; t->exprs && i < t->nnames; i++) ast_expr_free(t->exprs[i]);
+    free(t->exprs);
+    free(t->names);
+    free(t->vdef);
+    free(t->conds);
     trig_stmts_free(t->then_v, t->nthen);
     trig_stmts_free(t->else_v, t->nelse);
     free(t);
@@ -1913,7 +2037,7 @@ static void parse_trig_list(ParserState* ps, TrigStmt*** v, int* n) {
     while (ps->result->success) {
         Token t = peek(ps);
         if (t.type == TOK_EOF) { parse_fail(ps, "Expected END to close the trigger body", t); return; }
-        if (t.type == TOK_END || t.type == TOK_ELSE || ident_is(ps, "ELSEIF")) return;
+        if (t.type == TOK_END || t.type == TOK_ELSE || ident_is(ps, "ELSEIF") || ident_is(ps, "UNTIL") || t.type == TOK_WHEN) return;
         if (t.type == TOK_SEMICOLON) { consume(ps); continue; }
         TrigStmt* st = parse_trig_stmt(ps);
         if (!st) return;
@@ -1951,10 +2075,295 @@ static TrigStmt* parse_trig_if(ParserState* ps) {
     return t;
 }
 
-static TrigStmt* parse_trig_stmt(ParserState* ps) {
-    if (ident_is(ps, "IF")) { consume(ps); return parse_trig_if(ps); }
+static TrigStmt* trig_new(ParserState* ps, TrigStmtKind k) {
     TrigStmt* t = calloc(1, sizeof(TrigStmt));
     if (!t) { parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
+    t->kind = k;
+    return t;
+}
+
+static bool trig_add_name(ParserState* ps, TrigStmt* t, const char* name) {
+    char (*nn)[64] = realloc(t->names, sizeof(*t->names) * (size_t)(t->nnames + 1));
+    if (!nn) { parse_fail(ps, "Out of memory", peek(ps)); return false; }
+    t->names = nn;
+    copy_text(ps, t->names[t->nnames++], 64, name);
+    return true;
+}
+
+// nome di una variabile (anche @x) o NEW.colonna come destinazione di SET / INTO / FETCH
+static bool parse_target(ParserState* ps, char* out, size_t n) {
+    Token v = consume(ps);
+    if (v.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a variable name", v); return false; }
+    if ((!strcasecmp(v.text, "NEW") || !strcasecmp(v.text, "OLD")) && peek(ps).type == TOK_DOT) {
+        consume(ps);
+        Token c = consume(ps);
+        if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name after NEW.", c); return false; }
+        snprintf(out, n, "%s.%s", v.text, c.text);
+        return true;
+    }
+    snprintf(out, n, "%s", v.text);
+    return true;
+}
+
+// END WHILE / END LOOP / END REPEAT [etichetta]
+static bool parse_end_of(ParserState* ps, const char* word, const char* label) {
+    if (!match(ps, TOK_END) || !word_is(ps, word)) {
+        char m[64];
+        snprintf(m, sizeof(m), "Expected END %s", word);
+        parse_fail(ps, m, peek(ps));
+        return false;
+    }
+    consume(ps);
+    if (peek(ps).type == TOK_IDENTIFIER && label[0] && !strcasecmp(peek(ps).text, label)) consume(ps);
+    return true;
+}
+
+// corpo di un ciclo / blocco fino alla parola di chiusura
+static TrigStmt* parse_trig_body(ParserState* ps, TrigStmtKind k, const char* label) {
+    TrigStmt* t = trig_new(ps, k);
+    if (!t) return NULL;
+    snprintf(t->label, sizeof(t->label), "%s", label);
+    if (k == TS_WHILE) {
+        t->cond = parse_expr(ps);
+        if (!t->cond || !ident_is(ps, "DO")) { if (ps->result->success) parse_fail(ps, "Expected DO after the WHILE condition", peek(ps)); trig_stmt_free(t); return NULL; }
+        consume(ps);
+    }
+    parse_trig_list(ps, &t->then_v, &t->nthen);
+    if (!ps->result->success) { trig_stmt_free(t); return NULL; }
+    bool ok = true;
+    if (k == TS_BLOCK) {
+        if (!match(ps, TOK_END)) { parse_fail(ps, "Expected END to close BEGIN", peek(ps)); ok = false; }
+        else if (peek(ps).type == TOK_IDENTIFIER && label[0] && !strcasecmp(peek(ps).text, label)) consume(ps);
+    } else if (k == TS_WHILE) ok = parse_end_of(ps, "WHILE", label);
+    else if (k == TS_LOOP) ok = parse_end_of(ps, "LOOP", label);
+    else if (k == TS_REPEAT) {
+        if (!ident_is(ps, "UNTIL")) { parse_fail(ps, "Expected UNTIL in REPEAT", peek(ps)); ok = false; }
+        else {
+            consume(ps);
+            t->cond = parse_expr(ps);
+            ok = t->cond && parse_end_of(ps, "REPEAT", label);
+        }
+    }
+    if (!ok) { trig_stmt_free(t); return NULL; }
+    return t;
+}
+
+// CASE [x] WHEN v THEN istruzioni ... [ELSE istruzioni] END CASE  ->  IF x = v THEN ... ELSE IF ...
+static TrigStmt* parse_trig_case(ParserState* ps) {
+    ASTExpr* subject = NULL;
+    if (peek(ps).type != TOK_WHEN) { subject = parse_expr(ps); if (!subject) return NULL; }
+    TrigStmt* head = NULL;
+    TrigStmt* tail = NULL;
+    while (ps->result->success && match(ps, TOK_WHEN)) {
+        ASTExpr* v = parse_expr(ps);
+        if (!v) break;
+        if (!match(ps, TOK_THEN)) { parse_fail(ps, "Expected THEN in CASE", peek(ps)); ast_expr_free(v); break; }
+        TrigStmt* t = trig_new(ps, TS_IF);
+        if (!t) { ast_expr_free(v); break; }
+        t->cond = subject ? new_binary(OP_EQ, ast_expr_clone(subject), v) : v;
+        parse_trig_list(ps, &t->then_v, &t->nthen);
+        if (!head) head = t;
+        else if (!trig_push(ps, &tail->else_v, &tail->nelse, t)) break;
+        tail = t;
+    }
+    if (ps->result->success && !head) parse_fail(ps, "Expected WHEN in CASE", peek(ps));
+    if (ps->result->success && match(ps, TOK_ELSE)) parse_trig_list(ps, &tail->else_v, &tail->nelse);
+    if (ps->result->success && (!match(ps, TOK_END) || peek(ps).type != TOK_CASE)) parse_fail(ps, "Expected END CASE", peek(ps));
+    else if (ps->result->success) consume(ps);
+    ast_expr_free(subject);
+    if (!ps->result->success) { trig_stmt_free(head); return NULL; }
+    return head;
+}
+
+// DECLARE ...
+static TrigStmt* parse_trig_declare(ParserState* ps) {
+    // DECLARE {CONTINUE | EXIT | UNDO} HANDLER FOR condizioni istruzione
+    if ((ident_is(ps, "CONTINUE") || ident_is(ps, "EXIT") || ident_is(ps, "UNDO")) && next_is(ps, 1, TOK_IDENTIFIER) &&
+        !strcasecmp(ps->tokens->tokens[ps->pos + 1].text, "HANDLER")) {
+        TrigStmt* t = trig_new(ps, TS_HANDLER);
+        if (!t) return NULL;
+        t->exit_handler = !ident_is(ps, "CONTINUE");
+        consume(ps); consume(ps);
+        if (!match(ps, TOK_FOR)) { parse_fail(ps, "Expected FOR after HANDLER", peek(ps)); trig_stmt_free(t); return NULL; }
+        do {
+            char c[16] = "";
+            if (match(ps, TOK_NOT)) {
+                if (!ident_is(ps, "FOUND")) { parse_fail(ps, "Expected NOT FOUND", peek(ps)); trig_stmt_free(t); return NULL; }
+                consume(ps);
+                snprintf(c, sizeof(c), "NOTFOUND");
+            } else if (ident_is(ps, "SQLSTATE")) {
+                consume(ps);
+                if (ident_is(ps, "VALUE")) consume(ps);
+                Token v = consume(ps);
+                snprintf(c, sizeof(c), "%.5s", v.text ? v.text : "");
+                if (!strcmp(c, "02000")) snprintf(c, sizeof(c), "NOTFOUND");
+            } else {
+                Token v = consume(ps);                     // SQLEXCEPTION, SQLWARNING, numero, nome di una CONDITION
+                if (v.type == TOK_INTEGER) snprintf(c, sizeof(c), "%.15s", v.text);
+                else if (v.text && (!strcasecmp(v.text, "SQLEXCEPTION") || !strcasecmp(v.text, "SQLWARNING")))
+                    snprintf(c, sizeof(c), "%.15s", v.text), c[0] = 'S';
+                else snprintf(c, sizeof(c), "SQLEXCEPTION");
+                for (char* q = c; *q; q++) *q = (char)toupper((unsigned char)*q);
+                if (!strcmp(c, "1329")) snprintf(c, sizeof(c), "NOTFOUND");
+            }
+            char (*nc)[16] = realloc(t->conds, sizeof(*t->conds) * (size_t)(t->nconds + 1));
+            if (!nc) { parse_fail(ps, "Out of memory", peek(ps)); trig_stmt_free(t); return NULL; }
+            t->conds = nc;
+            snprintf(t->conds[t->nconds++], 16, "%s", c);
+        } while (match(ps, TOK_COMMA));
+        TrigStmt* body = parse_trig_stmt(ps);
+        if (!body || !trig_push(ps, &t->then_v, &t->nthen, body)) { trig_stmt_free(t); return NULL; }
+        return t;
+    }
+    Token nm = consume(ps);
+    if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a name after DECLARE", nm); return NULL; }
+    // DECLARE c CURSOR FOR select
+    if (ident_is(ps, "CURSOR")) {
+        consume(ps);
+        if (!match(ps, TOK_FOR) || !query_starts(ps, 0)) { parse_fail(ps, "Expected FOR SELECT after CURSOR", peek(ps)); return NULL; }
+        TrigStmt* t = trig_new(ps, TS_CURSOR);
+        if (!t) return NULL;
+        copy_text(ps, t->label, sizeof(t->label), nm.text);
+        t->sql = parse_select(ps);
+        if (!t->sql || !ps->result->success) { trig_stmt_free(t); return NULL; }
+        return t;
+    }
+    // DECLARE nome CONDITION FOR ...: un nome per un errore (gli handler lo trattano come SQLEXCEPTION)
+    if (ident_is(ps, "CONDITION")) {
+        while (peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF && peek(ps).type != TOK_END) consume(ps);
+        return trig_new(ps, TS_NOOP);
+    }
+    // DECLARE v1 [, v2 ...] tipo [DEFAULT espr]
+    TrigStmt* t = trig_new(ps, TS_DECLARE);
+    if (!t) return NULL;
+    if (!trig_add_name(ps, t, nm.text)) { trig_stmt_free(t); return NULL; }
+    while (match(ps, TOK_COMMA)) {
+        Token v = consume(ps);
+        if (v.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a variable name", v); trig_stmt_free(t); return NULL; }
+        if (!trig_add_name(ps, t, v.text)) { trig_stmt_free(t); return NULL; }
+    }
+    t->vdef = calloc(1, sizeof(ColumnDef));
+    if (!t->vdef) { parse_fail(ps, "Out of memory", peek(ps)); trig_stmt_free(t); return NULL; }
+    t->vdef->nullable = true;
+    if (!parse_type_spec(ps, t->vdef)) { if (ps->result->success) parse_fail(ps, "Expected the type of the variable", peek(ps)); trig_stmt_free(t); return NULL; }
+    // attributi del tipo che MySQL accetta anche qui (CHARACTER SET, COLLATE)
+    for (int g = 0; g < 8; g++) {
+        if (ident_is(ps, "CHARACTER") || ident_is(ps, "CHARSET") || ident_is(ps, "COLLATE")) {
+            if (ident_is(ps, "CHARACTER")) consume(ps);
+            consume(ps);
+            if (peek(ps).type == TOK_SET) consume(ps);
+            consume(ps);
+        } else break;
+    }
+    if (ident_is(ps, "DEFAULT")) {
+        consume(ps);
+        t->expr = parse_expr(ps);
+        if (!t->expr) { trig_stmt_free(t); return NULL; }
+    }
+    return t;
+}
+
+static TrigStmt* parse_trig_stmt(ParserState* ps) {
+    // etichetta: nome: BEGIN | WHILE | REPEAT | LOOP
+    char label[64] = "";
+    if (peek(ps).type == TOK_IDENTIFIER && next_is(ps, 1, TOK_COLON)) {
+        copy_text(ps, label, sizeof(label), consume(ps).text);
+        consume(ps);
+    }
+    if (peek(ps).type == TOK_BEGIN) {
+        consume(ps);
+        if (ident_is(ps, "WORK") || peek(ps).type == TOK_TRANSACTION) { parse_fail(ps, "Transactions cannot be started inside a routine", peek(ps)); return NULL; }
+        return parse_trig_body(ps, TS_BLOCK, label);
+    }
+    if (ident_is(ps, "WHILE"))  { consume(ps); return parse_trig_body(ps, TS_WHILE, label); }
+    if (ident_is(ps, "REPEAT") && !next_is(ps, 1, TOK_LPAREN)) { consume(ps); return parse_trig_body(ps, TS_REPEAT, label); }
+    if (ident_is(ps, "LOOP"))   { consume(ps); return parse_trig_body(ps, TS_LOOP, label); }
+    if (label[0]) { parse_fail(ps, "A label must be followed by BEGIN, WHILE, REPEAT or LOOP", peek(ps)); return NULL; }
+    if (ident_is(ps, "IF") && !next_is(ps, 1, TOK_LPAREN)) { consume(ps); return parse_trig_if(ps); }
+    if (ident_is(ps, "IF") && next_is(ps, 1, TOK_LPAREN)) {
+        // IF (cond) THEN ...: la condizione fra parentesi è un'espressione come un'altra
+        int save = ps->pos;
+        consume(ps);
+        TrigStmt* r = parse_trig_if(ps);
+        if (r || !ps->result->success) return r;
+        ps->pos = save;
+    }
+    if (peek(ps).type == TOK_CASE) { consume(ps); return parse_trig_case(ps); }
+    if (ident_is(ps, "DECLARE")) { consume(ps); return parse_trig_declare(ps); }
+    if (ident_is(ps, "LEAVE") || ident_is(ps, "ITERATE")) {
+        TrigStmt* t = trig_new(ps, ident_is(ps, "LEAVE") ? TS_LEAVE : TS_ITERATE);
+        if (!t) return NULL;
+        consume(ps);
+        Token l = consume(ps);
+        if (l.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a label", l); trig_stmt_free(t); return NULL; }
+        copy_text(ps, t->label, sizeof(t->label), l.text);
+        return t;
+    }
+    if (ident_is(ps, "RETURN")) {
+        consume(ps);
+        TrigStmt* t = trig_new(ps, TS_RETURN);
+        if (!t) return NULL;
+        t->expr = parse_expr(ps);
+        if (!t->expr) { trig_stmt_free(t); return NULL; }
+        return t;
+    }
+    if (ident_is(ps, "OPEN") || ident_is(ps, "CLOSE")) {
+        TrigStmt* t = trig_new(ps, ident_is(ps, "OPEN") ? TS_OPEN : TS_CLOSE);
+        if (!t) return NULL;
+        consume(ps);
+        Token c = consume(ps);
+        if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a cursor name", c); trig_stmt_free(t); return NULL; }
+        copy_text(ps, t->label, sizeof(t->label), c.text);
+        return t;
+    }
+    if (ident_is(ps, "FETCH")) {                         // FETCH [[NEXT] FROM] c INTO v1, v2
+        consume(ps);
+        if (ident_is(ps, "NEXT")) consume(ps);
+        match(ps, TOK_FROM);
+        TrigStmt* t = trig_new(ps, TS_FETCH);
+        if (!t) return NULL;
+        Token c = consume(ps);
+        if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a cursor name", c); trig_stmt_free(t); return NULL; }
+        copy_text(ps, t->label, sizeof(t->label), c.text);
+        if (!match(ps, TOK_INTO)) { parse_fail(ps, "Expected INTO after FETCH", peek(ps)); trig_stmt_free(t); return NULL; }
+        do {
+            char nm[64];
+            if (!parse_target(ps, nm, sizeof(nm)) || !trig_add_name(ps, t, nm)) { trig_stmt_free(t); return NULL; }
+        } while (match(ps, TOK_COMMA));
+        return t;
+    }
+    if (ident_is(ps, "RESIGNAL")) {                      // RESIGNAL: ripropone l'errore che l'handler ha intercettato
+        consume(ps);
+        TrigStmt* t = trig_new(ps, TS_SIGNAL);
+        while (peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF && peek(ps).type != TOK_END) consume(ps);
+        return t;
+    }
+    TrigStmt* t = calloc(1, sizeof(TrigStmt));
+    if (!t) { parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
+    if (peek(ps).type == TOK_SET) {
+        // SET v = espr [, @x = espr, NEW.c = espr ...]
+        consume(ps);
+        t->kind = TS_ASSIGN;
+        do {
+            char nm[64];
+            if (!parse_target(ps, nm, sizeof(nm)) || !trig_add_name(ps, t, nm)) { trig_stmt_free(t); return NULL; }
+            if (!match(ps, TOK_EQ) && !match(ps, TOK_ASSIGN)) { parse_fail(ps, "Expected '=' in SET", peek(ps)); trig_stmt_free(t); return NULL; }
+            ASTExpr** ne = realloc(t->exprs, sizeof(ASTExpr*) * (size_t)t->nnames);
+            if (!ne) { parse_fail(ps, "Out of memory", peek(ps)); trig_stmt_free(t); return NULL; }
+            t->exprs = ne;
+            t->exprs[t->nnames - 1] = parse_expr(ps);
+            if (!t->exprs[t->nnames - 1]) { trig_stmt_free(t); return NULL; }
+        } while (match(ps, TOK_COMMA));
+        if (t->nnames == 1 && !strncasecmp(t->names[0], "NEW.", 4)) {      // SET NEW.c = x: la forma dei trigger
+            t->kind = TS_SET;
+            snprintf(t->col, sizeof(t->col), "%s", t->names[0] + 4);
+            t->expr = t->exprs[0];
+            free(t->exprs); t->exprs = NULL;
+            free(t->names); t->names = NULL;
+            t->nnames = 0;
+        }
+        return t;
+    }
     if (peek(ps).type == TOK_SET) {                     // SET NEW.colonna = espressione
         consume(ps);
         Token q = consume(ps);
@@ -1966,7 +2375,7 @@ static TrigStmt* parse_trig_stmt(ParserState* ps) {
         Token c = consume(ps);
         if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name after NEW.", c); free(t); return NULL; }
         copy_text(ps, t->col, sizeof(t->col), c.text);
-        if (!match(ps, TOK_EQ)) { parse_fail(ps, "Expected '=' in SET", peek(ps)); free(t); return NULL; }
+        if (!match(ps, TOK_EQ) && !match(ps, TOK_ASSIGN)) { parse_fail(ps, "Expected '=' in SET", peek(ps)); free(t); return NULL; }
         t->kind = TS_SET;
         t->expr = parse_expr(ps);
         if (!t->expr) { free(t); return NULL; }
@@ -1997,8 +2406,14 @@ static TrigStmt* parse_trig_stmt(ParserState* ps) {
         return t;
     }
     Token k = peek(ps);
-    if (k.type != TOK_INSERT && k.type != TOK_UPDATE && k.type != TOK_DELETE && !query_starts(ps, 0) && !ident_is(ps, "CALL")) {
-        parse_fail(ps, "A trigger or procedure can contain INSERT, UPDATE, DELETE, SELECT, CALL, SET NEW.column, SIGNAL and IF", k);
+    // CREATE / DROP TEMPORARY TABLE, e DROP TABLE (solo delle tabelle TEMPORARY: controllato all'esecuzione)
+    bool temp_ddl = ((k.type == TOK_CREATE || k.type == TOK_DROP) && next_is(ps, 1, TOK_IDENTIFIER) &&
+                     !strcasecmp(ps->tokens->tokens[ps->pos + 1].text, "TEMPORARY")) ||
+                    (k.type == TOK_DROP && next_is(ps, 1, TOK_TABLE));
+    if (k.type != TOK_INSERT && k.type != TOK_UPDATE && k.type != TOK_DELETE && !query_starts(ps, 0) && !ident_is(ps, "CALL") &&
+        !ident_is(ps, "REPLACE") && !temp_ddl && k.type != TOK_TRUNCATE) {
+        parse_fail(ps, "A routine can contain SELECT [INTO], INSERT, UPDATE, DELETE, CALL, DECLARE, SET, IF, CASE, WHILE, "
+                       "REPEAT, LOOP, LEAVE, ITERATE, RETURN, cursors, handlers, SIGNAL and CREATE / DROP TEMPORARY TABLE", k);
         free(t);
         return NULL;
     }
@@ -2093,34 +2508,100 @@ TrigProgram* parser_parse_procedure(TokenList* tokens, int start) {
     return p;
 }
 
-// CREATE PROCEDURE nome ([IN] p tipo, ...) corpo: salvato come testo "(parametri) corpo"
-static ASTNode* parse_create_procedure(ParserState* ps, ASTNode* n) {
+// (parametri) [RETURNS tipo] caratteristiche corpo  — da ps->pos (sul '(')
+static void parse_routine_def(ParserState* ps, RoutineDef* d) {
+    if (!expect(ps, TOK_LPAREN)) return;
+    if (!match(ps, TOK_RPAREN)) {
+        do {
+            if (d->nparams >= 32) { parse_fail(ps, "Too many parameters (max 32)", peek(ps)); return; }
+            RoutineParam* p = &d->params[d->nparams];
+            memset(p, 0, sizeof(*p));
+            p->mode = PARAM_IN;
+            if (match(ps, TOK_IN)) p->mode = PARAM_IN;
+            else if (ident_is(ps, "OUT") && next_is(ps, 1, TOK_IDENTIFIER)) { consume(ps); p->mode = PARAM_OUT; }
+            else if (ident_is(ps, "INOUT") && next_is(ps, 1, TOK_IDENTIFIER)) { consume(ps); p->mode = PARAM_INOUT; }
+            if (d->is_function && p->mode != PARAM_IN) { parse_fail(ps, "Function parameters are IN only", peek(ps)); return; }
+            Token nm = consume(ps);
+            if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a parameter name", nm); return; }
+            copy_text(ps, p->name, sizeof(p->name), nm.text);
+            for (int k = 0; k < d->nparams; k++)
+                if (!strcasecmp(d->params[k].name, p->name)) { parse_fail(ps, "Duplicate parameter", nm); return; }
+            p->def.nullable = true;
+            if (!parse_type_spec(ps, &p->def)) { if (ps->result->success) parse_fail(ps, "Expected the type of the parameter", peek(ps)); return; }
+            while (ident_is(ps, "CHARACTER") || ident_is(ps, "CHARSET") || ident_is(ps, "COLLATE")) {
+                if (ident_is(ps, "CHARACTER")) consume(ps);
+                consume(ps);
+                if (peek(ps).type == TOK_SET) consume(ps);
+                consume(ps);
+            }
+            d->nparams++;
+        } while (match(ps, TOK_COMMA));
+        if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')' after the parameters", peek(ps)); return; }
+    }
+    if (d->is_function) {
+        if (!ident_is(ps, "RETURNS")) { parse_fail(ps, "Expected RETURNS after the parameters of a function", peek(ps)); return; }
+        consume(ps);
+        d->ret.nullable = true;
+        if (!parse_type_spec(ps, &d->ret)) { if (ps->result->success) parse_fail(ps, "Expected the type after RETURNS", peek(ps)); return; }
+        while (ident_is(ps, "CHARACTER") || ident_is(ps, "CHARSET") || ident_is(ps, "COLLATE")) {
+            if (ident_is(ps, "CHARACTER")) consume(ps);
+            consume(ps);
+            if (peek(ps).type == TOK_SET) consume(ps);
+            consume(ps);
+        }
+    }
+    d->prog = calloc(1, sizeof(TrigProgram));
+    if (!d->prog) { parse_fail(ps, "Out of memory", peek(ps)); return; }
+    skip_routine_traits(ps);
+    TrigStmt* st = parse_trig_stmt(ps);                 // BEGIN ... END è un blocco come gli altri
+    if (st) trig_push(ps, &d->prog->v, &d->prog->n, st);
+}
+
+void routine_def_free(RoutineDef* d) {
+    if (!d) return;
+    trig_program_free(d->prog);
+    free(d);
+}
+
+RoutineDef* parser_parse_routine(TokenList* tokens, bool is_function) {
+    RoutineDef* d = calloc(1, sizeof(RoutineDef));
+    if (!d) return NULL;
+    d->is_function = is_function;
+    ParseResult r;
+    memset(&r, 0, sizeof(r));
+    r.success = true;
+    ParserState ps = { tokens, 0, &r, 0, "", false };
+    parse_routine_def(&ps, d);
+    match(&ps, TOK_SEMICOLON);
+    if (r.success && peek(&ps).type != TOK_EOF) parse_fail(&ps, "Unexpected text after the routine body", peek(&ps));
+    d->success = r.success;
+    snprintf(d->error, sizeof(d->error), "%s", r.error);
+    return d;
+}
+
+// CREATE PROCEDURE nome (parametri) corpo | CREATE FUNCTION nome (parametri) RETURNS tipo corpo:
+// salvato come testo "(parametri) [RETURNS tipo] corpo"; is_function in create_trigger.before
+static ASTNode* parse_create_procedure(ParserState* ps, ASTNode* n, bool is_function) {
     n->type = NODE_CREATE_PROCEDURE;
+    n->create_trigger.before = is_function;
     Token nm = consume(ps);
-    if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the procedure name", nm); return n; }
+    if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, is_function ? "Expected the function name" : "Expected the procedure name", nm); return n; }
+    if (peek(ps).type == TOK_DOT && next_is(ps, 1, TOK_IDENTIFIER)) { consume(ps); nm = consume(ps); }   // db.nome
     copy_text(ps, n->create_trigger.name, sizeof(n->create_trigger.name), nm.text);
     int start = ps->pos;
-    if (!expect(ps, TOK_LPAREN)) return n;
-    for (int d = 1; d > 0; ) {                              // parametri: controllati all'esecuzione di CREATE
-        Token t = consume(ps);
-        if (t.type == TOK_EOF) { parse_fail(ps, "Expected ')' after the parameters", t); return n; }
-        if (t.type == TOK_LPAREN) d++;
-        else if (t.type == TOK_RPAREN) d--;
+    RoutineDef* d = calloc(1, sizeof(RoutineDef));
+    if (!d) { parse_fail(ps, "Out of memory", peek(ps)); return n; }
+    d->is_function = is_function;
+    parse_routine_def(ps, d);
+    if (ps->result->success && is_function) {
+        char rt[64];
+        snprintf(rt, sizeof(rt), "%s", d->ret.sqltype[0] ? d->ret.sqltype : d->ret.type);
+        snprintf(n->create_trigger.event, sizeof(n->create_trigger.event), "%.15s", rt);
     }
-    TrigProgram* prog = calloc(1, sizeof(TrigProgram));
-    if (!prog) { parse_fail(ps, "Out of memory", peek(ps)); return n; }
-    skip_routine_traits(ps);
-    if (match(ps, TOK_BEGIN)) {
-        parse_trig_list(ps, &prog->v, &prog->n);
-        if (ps->result->success && !match(ps, TOK_END)) parse_fail(ps, "Expected END to close the procedure body", peek(ps));
-    } else {
-        TrigStmt* st = parse_trig_stmt(ps);
-        if (st) trig_push(ps, &prog->v, &prog->n, st);
-    }
-    trig_program_free(prog);
+    routine_def_free(d);
     if (!ps->result->success) return n;
     if (!tokens_text(ps, start, ps->pos, n->create_trigger.body, sizeof(n->create_trigger.body)))
-        parse_fail(ps, "Procedure is too long", peek(ps));
+        parse_fail(ps, "Routine is too long", peek(ps));
     return n;
 }
 
@@ -2869,6 +3350,34 @@ static ASTNode* parse_show_mysql(ParserState* ps) {
         snprintf(create, sizeof(create), "CREATE DATABASE `%s` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci */", db);
         sql_quote(cq, sizeof(cq), create);
         snprintf(sql, sizeof(sql), "SELECT SCHEMA_NAME AS `Database`, %s AS `Create Database` FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s", cq, schema);
+    } else if (!full && (ident_is(ps, "PROCEDURE") || ident_is(ps, "FUNCTION")) && peek2_ident(ps, "STATUS")) {
+        // SHOW PROCEDURE | FUNCTION STATUS [LIKE 'x' | WHERE ...] (phpMyAdmin, Workbench, DBeaver)
+        bool fn = ident_is(ps, "FUNCTION");
+        consume(ps); consume(ps);
+        if (!show_filter(ps, "ROUTINE_NAME", like, sizeof(like), where, sizeof(where))) return NULL;
+        snprintf(sql, sizeof(sql),
+                 "SELECT * FROM (SELECT ROUTINE_SCHEMA AS `Db`, ROUTINE_NAME AS `Name`, ROUTINE_TYPE AS `Type`, DEFINER AS `Definer`, "
+                 "LAST_ALTERED AS `Modified`, CREATED AS `Created`, SECURITY_TYPE AS `Security_type`, ROUTINE_COMMENT AS `Comment`, "
+                 "'utf8mb4' AS `character_set_client`, 'utf8mb4_general_ci' AS `collation_connection`, "
+                 "'utf8mb4_general_ci' AS `Database Collation` FROM information_schema.ROUTINES WHERE ROUTINE_TYPE = '%s'%s) AS r",
+                 fn ? "FUNCTION" : "PROCEDURE", like);
+        if (where[0]) { size_t l = strlen(sql); snprintf(sql + l, sizeof(sql) - l, " WHERE %s", where); }
+    } else if (!full && peek(ps).type == TOK_CREATE && (peek2_ident(ps, "PROCEDURE") || peek2_ident(ps, "FUNCTION"))) {
+        // SHOW CREATE PROCEDURE | FUNCTION nome
+        consume(ps);
+        bool fn = ident_is(ps, "FUNCTION");
+        consume(ps);
+        Token d = consume(ps);
+        if (d.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the routine name", d); return NULL; }
+        char nm[64], nq[200];
+        copy_text(ps, nm, sizeof(nm), d.text);
+        if (peek(ps).type == TOK_DOT && next_is(ps, 1, TOK_IDENTIFIER)) { consume(ps); copy_text(ps, nm, sizeof(nm), consume(ps).text); }
+        sql_quote(nq, sizeof(nq), nm);
+        snprintf(sql, sizeof(sql),
+                 "SELECT ROUTINE_NAME AS `%s`, '' AS `sql_mode`, CONCAT('CREATE %s `', ROUTINE_NAME, '`', ROUTINE_DEFINITION) AS `Create %s`, "
+                 "'utf8mb4' AS `character_set_client`, 'utf8mb4_general_ci' AS `collation_connection`, 'utf8mb4_general_ci' AS `Database Collation` "
+                 "FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_TYPE = '%s' AND ROUTINE_NAME = %s",
+                 fn ? "Function" : "Procedure", fn ? "FUNCTION" : "PROCEDURE", fn ? "Function" : "Procedure", fn ? "FUNCTION" : "PROCEDURE", nq);
     } else if (!full && ident_is(ps, "ENGINES")) {
         consume(ps);
         snprintf(sql, sizeof(sql), "SELECT ENGINE AS `Engine`, SUPPORT AS `Support`, COMMENT AS `Comment`, TRANSACTIONS AS `Transactions`, "
@@ -2970,12 +3479,18 @@ static ASTNode* parse_statement(ParserState* ps) {
         case TOK_CREATE: {
             consume(ps);
             Token sub = consume(ps);
+            bool temporary = false;                             // CREATE TEMPORARY TABLE
+            if (sub.type == TOK_IDENTIFIER && sub.text && !strcasecmp(sub.text, "TEMPORARY") && peek(ps).type == TOK_TABLE) {
+                temporary = true;
+                sub = consume(ps);
+            }
             bool or_replace = false;                            // CREATE OR REPLACE VIEW
             if (sub.type == TOK_OR && ident_is(ps, "REPLACE")) { consume(ps); or_replace = true; sub = consume(ps); }
             // opzioni MySQL delle viste (nei dump): ALGORITHM = x, DEFINER = `u`@`h`, SQL SECURITY x
             for (int g = 0; g < 4 && view_option(sub); g++) {
                 while (peek(ps).type != TOK_VIEW && peek(ps).type != TOK_TRIGGER && peek(ps).type != TOK_EOF &&
-                       peek(ps).type != TOK_SEMICOLON && !ident_is(ps, "PROCEDURE") && !view_option(peek(ps))) consume(ps);
+                       peek(ps).type != TOK_SEMICOLON && !ident_is(ps, "PROCEDURE") && !ident_is(ps, "FUNCTION") &&
+                       !view_option(peek(ps))) consume(ps);
                 sub = consume(ps);
             }
             if (or_replace && sub.type != TOK_VIEW) { parse_fail(ps, "OR REPLACE is only supported for views", sub); break; }
@@ -2989,8 +3504,8 @@ static ASTNode* parse_statement(ParserState* ps) {
                 if (!match(ps, TOK_NOT) || !match(ps, TOK_EXISTS)) { parse_fail(ps, "Expected IF NOT EXISTS", peek(ps)); break; }
                 n->if_exists = true;
             }
-            if (sub.type == TOK_IDENTIFIER && sub.text && !strcasecmp(sub.text, "PROCEDURE")) {
-                return parse_create_procedure(ps, n);
+            if (sub.type == TOK_IDENTIFIER && sub.text && (!strcasecmp(sub.text, "PROCEDURE") || !strcasecmp(sub.text, "FUNCTION"))) {
+                return parse_create_procedure(ps, n, !strcasecmp(sub.text, "FUNCTION"));
             } else if (sub.type == TOK_DATABASE || (sub.type == TOK_IDENTIFIER && sub.text && !strcasecmp(sub.text, "SCHEMA"))) {
                 n->type = NODE_CREATE_DB;                        // CREATE SCHEMA è un sinonimo (MySQL)
                 Token dn = consume(ps);
@@ -3001,6 +3516,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                 return parse_create_trigger(ps, n);
             } else if (sub.type == TOK_TABLE) {
                 parse_create_table(ps, n);
+                if (n->type == NODE_CREATE_TABLE) n->create_table.temporary = temporary;
             } else if (sub.type == TOK_INDEX) {
                 // CREATE [UNIQUE] INDEX nome ON t (c1 [ASC|DESC] [, c2 ...]) [USING BTREE|HASH]
                 n->type = NODE_CREATE_INDEX;
@@ -3144,6 +3660,11 @@ static ASTNode* parse_statement(ParserState* ps) {
         case TOK_DROP: {
             consume(ps);
             Token sub = consume(ps);
+            bool temporary = false;
+            if (sub.type == TOK_IDENTIFIER && sub.text && !strcasecmp(sub.text, "TEMPORARY") && peek(ps).type == TOK_TABLE) {
+                temporary = true;
+                sub = consume(ps);
+            }
             if (ident_is(ps, "IF")) {                            // DROP ... IF EXISTS
                 consume(ps);
                 if (!match(ps, TOK_EXISTS)) { parse_fail(ps, "Expected IF EXISTS", peek(ps)); break; }
@@ -3155,6 +3676,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                 copy_text(ps, n->drop_db.db_name, sizeof(n->drop_db.db_name), dn.text);
             } else if (sub.type == TOK_TABLE) {
                 n->type = NODE_DROP_TABLE;
+                n->drop_table.temporary = temporary;
                 Token tn = table_tok(ps);
                 copy_text(ps, n->drop_table.table_name, sizeof(n->drop_table.table_name), tn.text);
             } else if (sub.type == TOK_VIEW) {
@@ -3168,10 +3690,12 @@ static ASTNode* parse_statement(ParserState* ps) {
                 expect(ps, TOK_ON);
                 Token tn = table_tok(ps);
                 copy_text(ps, n->drop_index.table_name, sizeof(n->drop_index.table_name), tn.text);
-            } else if (sub.type == TOK_IDENTIFIER && sub.text && !strcasecmp(sub.text, "PROCEDURE")) {
+            } else if (sub.type == TOK_IDENTIFIER && sub.text && (!strcasecmp(sub.text, "PROCEDURE") || !strcasecmp(sub.text, "FUNCTION"))) {
                 n->type = NODE_DROP_PROCEDURE;
+                n->drop_trigger.is_function = !strcasecmp(sub.text, "FUNCTION");
                 Token pn = consume(ps);
-                if (pn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the procedure name", pn); break; }
+                if (pn.type == TOK_IDENTIFIER && peek(ps).type == TOK_DOT && next_is(ps, 1, TOK_IDENTIFIER)) { consume(ps); pn = consume(ps); }
+                if (pn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the routine name", pn); break; }
                 copy_text(ps, n->drop_trigger.name, sizeof(n->drop_trigger.name), pn.text);
             } else if (sub.type == TOK_TRIGGER) {
                 n->type = NODE_DROP_TRIGGER;
@@ -3187,6 +3711,23 @@ static ASTNode* parse_statement(ParserState* ps) {
             n->type = NODE_SET;
             n->set_fk_checks = -1;
             while (peek(ps).type != TOK_EOF && peek(ps).type != TOK_SEMICOLON) {
+                // @x = espr / @x := espr: variabile di sessione (l'espressione può contenere virgole fra parentesi)
+                if (peek(ps).type == TOK_IDENTIFIER && peek(ps).text[0] == '@' && peek(ps).text[1] != '@' &&
+                    (next_is(ps, 1, TOK_EQ) || next_is(ps, 1, TOK_ASSIGN))) {
+                    Token v = consume(ps);
+                    consume(ps);
+                    ASTExpr* x = parse_expr(ps);
+                    if (!x) break;
+                    char (*nn)[64] = realloc(n->set_names, sizeof(*n->set_names) * (size_t)(n->set_n + 1));
+                    ASTExpr** ne = nn ? realloc(n->set_exprs, sizeof(ASTExpr*) * (size_t)(n->set_n + 1)) : NULL;
+                    if (nn) n->set_names = nn;
+                    if (ne) n->set_exprs = ne;
+                    if (!nn || !ne) { ast_expr_free(x); parse_fail(ps, "Out of memory", v); break; }
+                    snprintf(n->set_names[n->set_n], 64, "%s", v.text + 1);
+                    n->set_exprs[n->set_n++] = x;
+                    if (!match(ps, TOK_COMMA)) break;
+                    continue;
+                }
                 Token t = consume(ps);
                 if (t.type != TOK_IDENTIFIER || !t.text || strcasecmp(t.text, "FOREIGN_KEY_CHECKS")) continue;
                 // il valore dopo '=' (anche @VAR: il ripristino a fine dump, che riaccende i controlli)
@@ -3431,6 +3972,11 @@ static void free_node(ASTNode* n) {
             break;
         case NODE_CALL:
             for (int j = 0; j < n->call.nargs; j++) ast_expr_free(n->call.args[j]);
+            break;
+        case NODE_SET:
+            for (int j = 0; j < n->set_n; j++) ast_expr_free(n->set_exprs[j]);
+            free(n->set_exprs);
+            free(n->set_names);
             break;
         default:
             break;

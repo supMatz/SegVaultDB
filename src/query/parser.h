@@ -94,6 +94,7 @@ typedef struct ASTExpr {
     //   > 0  sorgente * 1024 + colonna + 1      < 0  alias della SELECT numero -(bound + 1)
     int      bound;
     int      outer;           // EXPR_COLUMN: 0 = colonna di questa query, k = della query esterna di k livelli
+    bool     rt_const;        // EXPR_COLUMN: variabile di una routine / NEW / OLD: costante per tutta la query
     int      depth;           // profondità dell'albero (limitata: valutazione e liberazione sono ricorsive)
     SubQuery* subq;           // EXPR_SUBQUERY
     int      subkind;         // EXPR_SUBQUERY: SUBQ_*
@@ -188,6 +189,10 @@ typedef struct ASTNode {
     char     qual_db[64];      // database dei nomi qualificati (shop.prodotto); "" = quello corrente
     bool     qual_mixed;       // anche tabelle senza database: valide solo se il corrente è qual_db
     int      set_fk_checks;    // NODE_SET: FOREIGN_KEY_CHECKS = 0 / 1 (-1 = non nominato)
+    // NODE_SET: assegnazioni di variabili di sessione (SET @a = 1, @b := 2)
+    char   (*set_names)[64];
+    struct ASTExpr** set_exprs;
+    int      set_n;
     union {
         struct {
             ASTExpr*   columns[64];
@@ -205,6 +210,9 @@ typedef struct ASTNode {
             bool       has_limit;      // LIMIT presente (LIMIT 0 = nessuna riga)
             bool       distinct;
             bool       calc_found;     // SQL_CALC_FOUND_ROWS: FOUND_ROWS() = righe senza LIMIT
+            // SELECT ... INTO v1, @v2: i valori dell'unica riga vanno nelle variabili (routine o sessione)
+            char       into[16][64];
+            int        num_into;
             ASTExpr*   group_exprs[SV_MAX_GROUP];
             int        num_group;
             ASTExpr*   having;
@@ -273,6 +281,7 @@ typedef struct ASTNode {
             char       comment[256];          // COMMENT = '...'
             char       collation[40];         // [DEFAULT] COLLATE x / CHARSET x
             long long  auto_increment;        // AUTO_INCREMENT = n
+            bool       temporary;             // CREATE TEMPORARY TABLE
         } create_table;
         struct {
             char       table_name[64];
@@ -292,6 +301,7 @@ typedef struct ASTNode {
         } alter_table;
         struct {
             char       table_name[64];
+            bool       temporary;             // DROP TEMPORARY TABLE
         } drop_table;
         struct {
             char       index_name[64];
@@ -329,6 +339,7 @@ typedef struct ASTNode {
         } create_trigger;
         struct {
             char       name[64];
+            bool       is_function;     // DROP FUNCTION (NODE_DROP_PROCEDURE)
         } drop_trigger;
         struct {
             char       name[64];
@@ -372,18 +383,40 @@ void        parse_result_free(ParseResult* r);
 //              | SET NEW.colonna = espressione          (solo BEFORE ... FOR EACH ROW)
 //              | SIGNAL [SQLSTATE '45000'] [SET MESSAGE_TEXT =] 'messaggio'   (annulla lo statement)
 //              | IF condizione THEN istruzioni {ELSEIF condizione THEN istruzioni} [ELSE istruzioni] END IF
-typedef enum { TS_SQL, TS_SET, TS_SIGNAL, TS_IF } TrigStmtKind;
+// Procedure e funzioni (linguaggio delle stored routine di MySQL / SQL/PSM) aggiungono:
+//   [etichetta:] BEGIN ... END [etichetta]          blocco annidato
+//   DECLARE v1 [, v2] tipo [DEFAULT espr]          variabili locali
+//   DECLARE c CURSOR FOR select                     cursori: OPEN c / FETCH c INTO v, ... / CLOSE c
+//   DECLARE {CONTINUE | EXIT} HANDLER FOR {NOT FOUND | SQLEXCEPTION | SQLWARNING | SQLSTATE 'x' | n} istruzione
+//   DECLARE nome CONDITION FOR ...                  (accettata)
+//   SET v = espr [, @x = espr, NEW.c = espr]       assegnazioni
+//   SELECT ... INTO v1, v2 ...                      (nel nodo SELECT)
+//   RETURN espr                                     (funzioni)
+//   [e:] WHILE c DO ... END WHILE [e]  |  [e:] REPEAT ... UNTIL c END REPEAT [e]  |  [e:] LOOP ... END LOOP [e]
+//   LEAVE e  |  ITERATE e
+//   CASE [x] WHEN v THEN ... [ELSE ...] END CASE    (diventa una catena di IF)
+typedef enum { TS_SQL, TS_SET, TS_SIGNAL, TS_IF,
+               TS_DECLARE, TS_ASSIGN, TS_RETURN, TS_BLOCK, TS_WHILE, TS_REPEAT, TS_LOOP, TS_LEAVE, TS_ITERATE,
+               TS_HANDLER, TS_CURSOR, TS_OPEN, TS_FETCH, TS_CLOSE, TS_NOOP } TrigStmtKind;
 
 typedef struct TrigStmt {
     TrigStmtKind      kind;
-    ASTNode*          sql;          // TS_SQL
+    ASTNode*          sql;          // TS_SQL; TS_CURSOR: la SELECT
     char              col[64];      // TS_SET: colonna di NEW
-    ASTExpr*          expr;         // TS_SET: valore; TS_SIGNAL: messaggio
-    ASTExpr*          cond;         // TS_IF
-    struct TrigStmt** then_v;
+    ASTExpr*          expr;         // TS_SET / TS_RETURN / DEFAULT di TS_DECLARE: valore; TS_SIGNAL: messaggio (NULL = RESIGNAL)
+    ASTExpr*          cond;         // TS_IF / TS_WHILE / TS_REPEAT (UNTIL)
+    struct TrigStmt** then_v;       // TS_IF: THEN; blocchi e cicli: corpo; TS_HANDLER: l'istruzione
     int               nthen;
     struct TrigStmt** else_v;       // ELSEIF diventa un IF dentro l'ELSE
     int               nelse;
+    char              label[64];    // etichetta di blocco / ciclo; LEAVE / ITERATE: destinazione; cursore
+    char            (*names)[64];   // TS_DECLARE: variabili; TS_ASSIGN / TS_FETCH: destinazioni
+    int               nnames;
+    struct ASTExpr**  exprs;        // TS_ASSIGN: un valore per destinazione
+    ColumnDef*        vdef;         // TS_DECLARE: tipo
+    bool              exit_handler; // TS_HANDLER: EXIT (altrimenti CONTINUE)
+    char            (*conds)[16];   // TS_HANDLER: "NOTFOUND", "SQLEXCEPTION", "SQLWARNING", SQLSTATE o numero
+    int               nconds;
 } TrigStmt;
 
 typedef struct {
@@ -396,6 +429,28 @@ typedef struct {
     TrigStmt** v;
     int        n;
 } TrigProgram;
+
+// parametro di una routine: IN / OUT / INOUT nome tipo
+enum { PARAM_IN, PARAM_OUT, PARAM_INOUT };
+typedef struct {
+    char      name[64];
+    int       mode;
+    ColumnDef def;
+} RoutineParam;
+
+// definizione completa (testo salvato nel catalogo: "(parametri) [RETURNS tipo] caratteristiche corpo")
+typedef struct {
+    bool         success;
+    char         error[256];
+    RoutineParam params[32];
+    int          nparams;
+    bool         is_function;
+    ColumnDef    ret;               // RETURNS
+    TrigProgram* prog;
+} RoutineDef;
+
+RoutineDef* parser_parse_routine(TokenList* tokens, bool is_function);
+void        routine_def_free(RoutineDef* d);
 
 TrigProgram* parser_parse_trigger(TokenList* tokens);
 // corpo di una procedura dal token start: BEGIN ... END oppure una sola istruzione

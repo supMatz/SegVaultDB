@@ -275,8 +275,12 @@ int main(void) {
     t("SELECT COUNT(*) FROM conto", "3");
     t("CREATE PROCEDURE ricorsiva() CALL ricorsiva()", "OK:0");
     t("CALL ricorsiva()", "ERR:nested too deeply");
-    t("CREATE PROCEDURE cattiva(OUT x INT) SELECT 1", "ERR:OUT and INOUT");
-    t("CREATE PROCEDURE cattiva(x INT) BEGIN DROP TABLE conto; END", "ERR:");
+    t("CREATE PROCEDURE cattiva(OUT x INT) SELECT 1", "OK:0");                // parametri OUT e INOUT ammessi
+    t("DROP PROCEDURE cattiva", "OK:0");
+    t("CREATE PROCEDURE cattiva(x INT) BEGIN DROP TABLE conto; END", "OK:0");     // DROP solo delle tabelle TEMPORARY:
+    t("CALL cattiva(1)", "ERR:Only TEMPORARY tables");                            // controllato all'esecuzione
+    t("SELECT COUNT(*) FROM conto", "#1");
+    t("DROP PROCEDURE cattiva", "OK:0");
     t("CREATE PROCEDURE cattiva(x INT, x INT) SELECT 1", "ERR:Duplicate parameter");
     t("DROP PROCEDURE ricorsiva", "OK:0");
     t("DROP PROCEDURE ricorsiva", "ERR:not found");
@@ -1151,7 +1155,7 @@ int main(void) {
     t("CREATE TRIGGER bad AFTER INSERT ON r FOR EACH ROW SET NEW.x = 1", "ERR:only allowed in BEFORE");
     t("CREATE TRIGGER bad BEFORE INSERT ON nope FOR EACH ROW SIGNAL 'x'", "ERR:Table 'nope' not found");
     t("CREATE TRIGGER bad BEFORE INSERT ON r FOR EACH ROW WHEN (NEW.y > 0) SIGNAL 'x'", "ERR:Unknown column 'y'");
-    t("CREATE TRIGGER bad BEFORE INSERT ON r FOR EACH ROW DROP TABLE r", "ERR:can contain INSERT");
+    t("CREATE TRIGGER bad BEFORE INSERT ON r FOR EACH ROW DROP TABLE r", "ERR:cannot create or drop tables");
     t("CREATE TRIGGER storico AFTER INSERT ON r FOR EACH ROW SIGNAL 'x'", "ERR:already exists");
     // i trigger scattano anche per le modifiche a cascata delle chiavi esterne
     t("CREATE TABLE pa (id INT PRIMARY KEY)", "OK:0");
@@ -1180,6 +1184,113 @@ int main(void) {
         db_result_free_multi(rs, nr);
     }
     t("DROP TRIGGER t1", "OK:0");
+    // ── linguaggio delle stored routine: variabili, cicli, cursori, handler, funzioni ──
+    t("CREATE DATABASE rt", "OK:0");
+    t("USE rt", "OK:0");
+    t("CREATE TABLE prod (id INT PRIMARY KEY, nome VARCHAR(20), prezzo DECIMAL(6,2), qta INT)", "OK:0");
+    t("INSERT INTO prod VALUES (1, 'penna', 1.50, 10), (2, 'quaderno', 3.20, 0), (3, 'zaino', 25.00, 2)", "OK:3");
+    // funzioni: DECLARE, SET, WHILE, RETURN, tipi del risultato
+    t("CREATE FUNCTION fatt(n INT) RETURNS BIGINT DETERMINISTIC BEGIN DECLARE r BIGINT DEFAULT 1; DECLARE i INT DEFAULT 2; "
+      "WHILE i <= n DO SET r = r * i; SET i = i + 1; END WHILE; RETURN r; END", "OK:0");
+    t("SELECT fatt(0), fatt(5), fatt(20)", "1|120|2432902008176640000");
+    t("CREATE FUNCTION iva(p DECIMAL(6,2)) RETURNS DECIMAL(6,2) RETURN p * 1.22", "OK:0");
+    t("SELECT nome, iva(prezzo) FROM prod WHERE iva(prezzo) > 1 ORDER BY id", "penna|1.83;quaderno|3.90;zaino|30.50");
+    t("SELECT nome FROM prod WHERE iva(prezzo) > 2 ORDER BY id", "quaderno;zaino");
+    t("SELECT fatt(3) + iva(10)", "18.2");
+    t("CREATE FUNCTION giudizio(v INT) RETURNS VARCHAR(20) BEGIN "
+      "CASE WHEN v >= 28 THEN RETURN 'ottimo'; WHEN v >= 24 THEN RETURN 'buono'; ELSE RETURN 'sufficiente'; END CASE; END", "OK:0");
+    t("SELECT giudizio(30), giudizio(25), giudizio(18)", "ottimo|buono|sufficiente");
+    t("CREATE FUNCTION segno(x INT) RETURNS INT BEGIN IF x > 0 THEN RETURN 1; ELSEIF x < 0 THEN RETURN -1; END IF; RETURN 0; END", "OK:0");
+    t("SELECT segno(-4), segno(0), segno(9)", "-1|0|1");
+    t("CREATE FUNCTION nullo() RETURNS INT RETURN NULL", "OK:0");
+    t("SELECT nullo() IS NULL", "1");
+    // REPEAT, LOOP con etichette, LEAVE e ITERATE
+    t("CREATE FUNCTION dispari(n INT) RETURNS INT BEGIN DECLARE i, s INT DEFAULT 0; "
+      "ciclo: LOOP SET i = i + 1; IF i > n THEN LEAVE ciclo; END IF; IF i % 2 = 0 THEN ITERATE ciclo; END IF; SET s = s + i; END LOOP ciclo; "
+      "RETURN s; END", "OK:0");
+    t("SELECT dispari(10)", "25");
+    t("CREATE FUNCTION cifre(n BIGINT) RETURNS INT BEGIN DECLARE c INT DEFAULT 0; REPEAT SET c = c + 1; SET n = n DIV 10; UNTIL n = 0 END REPEAT; RETURN c; END", "OK:0");
+    t("SELECT cifre(7), cifre(12345)", "1|5");
+    // errori delle funzioni
+    t("CREATE FUNCTION senza() RETURNS INT BEGIN DECLARE x INT; END", "ERR:No RETURN found");
+    t("CREATE FUNCTION tabella() RETURNS INT BEGIN SELECT * FROM prod; RETURN 1; END", "OK:0");
+    t("SELECT tabella()", "ERR:Not allowed to return a result set");
+    t("SELECT fatt(1, 2)", "ERR:expects 1 argument");
+    t("CREATE FUNCTION giro(n INT) RETURNS INT RETURN giro(n + 1)", "OK:0");
+    t("SELECT giro(1)", "ERR:nested too deeply");
+    t("CREATE FUNCTION indefinita() RETURNS INT BEGIN SET y = 1; RETURN 1; END", "OK:0");
+    t("SELECT indefinita()", "ERR:Undeclared variable: y");
+    t("DROP FUNCTION tabella", "OK:0");
+    t("DROP FUNCTION giro", "OK:0");
+    t("DROP FUNCTION indefinita", "OK:0");
+    t("DROP FUNCTION nessuna", "ERR:Function 'nessuna' not found");
+    t("DROP FUNCTION IF EXISTS nessuna", "OK:0");
+    // procedure: SELECT ... INTO, OUT / INOUT, @variabili, CALL annidate con variabili locali
+    t("CREATE PROCEDURE scorte(IN pid INT, OUT n INT, INOUT tot DECIMAL(8,2)) BEGIN "
+      "SELECT qta INTO n FROM prod WHERE id = pid; SET tot = tot + (SELECT prezzo * qta FROM prod WHERE id = pid); END", "OK:0");
+    t("SET @tot = 100", "OK:0");
+    t("CALL scorte(1, @n, @tot)", "OK:0");
+    t("SELECT @n, @tot", "10|115.00");
+    t("CALL scorte(3, @n, 5)", "ERR:OUT or INOUT argument 3");
+    t("CREATE PROCEDURE totale(OUT somma DECIMAL(8,2)) BEGIN DECLARE n INT; DECLARE t DECIMAL(8,2) DEFAULT 0; "
+      "CALL scorte(1, n, t); CALL scorte(3, n, t); SET somma = t; END", "OK:0");
+    t("CALL totale(@s)", "OK:0");
+    t("SELECT @s", "65.00");
+    // cursore con handler NOT FOUND (lo schema classico)
+    t("CREATE PROCEDURE elenco(OUT testo VARCHAR(200)) BEGIN DECLARE fine INT DEFAULT 0; DECLARE v VARCHAR(20); "
+      "DECLARE c CURSOR FOR SELECT nome FROM prod WHERE qta > 0 ORDER BY nome; DECLARE CONTINUE HANDLER FOR NOT FOUND SET fine = 1; "
+      "SET testo = ''; OPEN c; leggi: LOOP FETCH c INTO v; IF fine THEN LEAVE leggi; END IF; SET testo = CONCAT(testo, v, ';'); END LOOP; CLOSE c; END", "OK:0");
+    t("CALL elenco(@e)", "OK:0");
+    t("SELECT @e", "penna;zaino;");
+    t("CREATE PROCEDURE fetch_oltre() BEGIN DECLARE v INT; DECLARE c CURSOR FOR SELECT id FROM prod WHERE id = 1; OPEN c; FETCH c INTO v; FETCH c INTO v; END", "OK:0");
+    t("CALL fetch_oltre()", "ERR:No data");
+    // handler: CONTINUE per un errore, EXIT, SELECT ... INTO senza righe (NOT FOUND)
+    t("CREATE PROCEDURE prova_dup(OUT esito VARCHAR(30)) BEGIN DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET esito = 'errore gestito'; "
+      "SET esito = 'ok'; INSERT INTO prod VALUES (1, 'doppio', 1, 1); END", "OK:0");
+    t("CALL prova_dup(@x)", "OK:0");
+    t("SELECT @x", "errore gestito");
+    t("CREATE PROCEDURE prova_exit(OUT esito INT) BEGIN SET esito = 1; BEGIN DECLARE EXIT HANDLER FOR SQLSTATE '23000' SET esito = esito + 10; "
+      "INSERT INTO prod VALUES (1, 'doppio', 1, 1); SET esito = 1000; END; SET esito = esito + 100; END", "OK:0");
+    t("CALL prova_exit(@x)", "OK:0");
+    t("SELECT @x", "111");
+    t("CREATE PROCEDURE cerca(IN pid INT, OUT q INT) BEGIN DECLARE EXIT HANDLER FOR NOT FOUND SET q = -1; SELECT qta INTO q FROM prod WHERE id = pid; END", "OK:0");
+    t("CALL cerca(3, @q)", "OK:0");
+    t("SELECT @q", "2");
+    t("CALL cerca(99, @q)", "OK:0");
+    t("SELECT @q", "-1");
+    t("CREATE PROCEDURE rilancia() BEGIN DECLARE EXIT HANDLER FOR SQLEXCEPTION RESIGNAL; SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fermato'; END", "OK:0");
+    t("CALL rilancia()", "ERR:fermato");
+    // tabelle TEMPORARY: create nella procedura, sparite alla fine della CALL
+    t("CREATE PROCEDURE riassunto() BEGIN CREATE TEMPORARY TABLE tmp_p (id INT PRIMARY KEY); "
+      "INSERT INTO tmp_p SELECT id FROM prod WHERE qta > 0; SELECT COUNT(*) AS n FROM tmp_p; END", "OK:0");
+    t("CALL riassunto()", "2");
+    t("CALL riassunto()", "2");                                              // ricreata senza errori
+    t("SELECT * FROM tmp_p", "ERR:");
+    // variabili di sessione e operatori
+    t("SET @a = 2, @b := @a * 10", "OK:0");
+    t("SELECT @a, @b, @mai_assegnata", "2|20|NULL");
+    t("SELECT @c := 7, @c + 1", "7|8");
+    t("SELECT id INTO @primo FROM prod ORDER BY id LIMIT 1", "OK:1");
+    t("SELECT @primo", "1");
+    t("SELECT nome FROM prod WHERE id > @primo ORDER BY id", "quaderno;zaino");
+    t("SELECT @@version LIKE '8.0%', @@autocommit", "1|1");
+    t("SELECT 12 & 10, 12 | 3, 6 ^ 3, ~0, 1 << 10, 1024 >> 3", "8|15|5|18446744073709551615|1024|128");
+    t("SELECT NULL <=> NULL, 1 <=> NULL, 2 <=> 2, 1 XOR 1, 1 XOR 0", "1|0|1|0|1");
+    t("SELECT 'ab' || 'cd', NULL || 'x'", "abcd|NULL");
+    t("SELECT 1 && 0, !0, 5 IS TRUE, 0 IS NOT TRUE, NULL IS UNKNOWN", "0|1|1|1|1");
+    t("SELECT 1 IS DISTINCT FROM NULL, NULL IS NOT DISTINCT FROM NULL", "1|1");
+    t("SELECT id FROM prod WHERE qta & 2 ORDER BY id", "1;3");
+    // trigger con variabili locali
+    t("CREATE TABLE storico (id INT, nota VARCHAR(40))", "OK:0");
+    t("CREATE TRIGGER prod_ins AFTER INSERT ON prod FOR EACH ROW BEGIN DECLARE n INT; "
+      "SELECT COUNT(*) INTO n FROM prod; INSERT INTO storico VALUES (NEW.id, CONCAT('prodotti: ', n)); END", "OK:0");
+    t("INSERT INTO prod VALUES (4, 'gomma', 0.50, 7)", "OK:1");
+    t("SELECT nota FROM storico", "prodotti: 4");
+    t("DROP TRIGGER prod_ins", "OK:0");
+    t("SHOW FUNCTION STATUS", "#7");
+    t("SHOW PROCEDURE STATUS LIKE 'p%'", "#2");
+    t("SELECT `Type` FROM (SHOW FUNCTION STATUS) AS s LIMIT 1", "ERR:");
+    t("SHOW CREATE FUNCTION segno", "#1");
     t("USE vinc", "OK:0");
     // i vincoli restano dopo un riavvio
     db_shutdown();
@@ -1193,6 +1304,9 @@ int main(void) {
     t("USE vinc", "OK:0");
     t("DELETE FROM studente WHERE matricola = 2", "OK:1");
     t("SELECT COUNT(*) FROM esame", "0");
+    t("USE rt", "OK:0");                                                   // le routine restano dopo un riavvio
+    t("SELECT fatt(6), giudizio(26)", "720|buono");
+    t("SELECT @a", "NULL");                                                 // le @variabili no (sessione nuova)
 
     db_shutdown();
     crash_recovery_test();

@@ -23,7 +23,21 @@ typedef enum {
     TOK_LPAREN, TOK_RPAREN, TOK_EQ, TOK_NEQ, TOK_LT,
     TOK_GT, TOK_LE, TOK_GE, TOK_PLUS, TOK_MINUS,
     TOK_SLASH, TOK_PERCENT, TOK_EOF, TOK_ERROR,
+    // aggiunti dopo TOK_ERROR (i nomi dei token stanno in un'altra tabella del parser)
+    TOK_COLON,      // ':' (etichette: ciclo: LOOP ... END LOOP ciclo)
+    TOK_ASSIGN,     // ':='
+    TOK_PIPES,      // '||' (concatenazione dello standard; OR in modalità MySQL)
+    TOK_AMPAMP,     // '&&' (AND di MySQL)
+    TOK_PIPE,       // '|'  OR bit a bit
+    TOK_AMP,        // '&'  AND bit a bit
+    TOK_CARET,      // '^'  XOR bit a bit
+    TOK_TILDE,      // '~'  NOT bit a bit
+    TOK_SHL,        // '<<'
+    TOK_SHR,        // '>>'
+    TOK_NSEQ,       // '<=>' uguaglianza che tratta NULL come un valore
 } TokenType;
+// @nome (variabile di sessione) e @@nome (variabile di sistema, senza session. / global.) sono
+// TOK_IDENTIFIER con il testo "@nome" / "@@nome"
 
 // token leggero (si copia per valore nel parser): il testo sta nel pool della TokenList
 typedef struct {
