@@ -169,19 +169,25 @@ typedef struct {
 #define SV_MAX_CONS_DEFS 16
 
 // funzione-tabella in FROM: JSON_TABLE(doc, 'percorso' COLUMNS (...)), GENERATE_SERIES(da, a [, passo])
-enum { TFC_PATH, TFC_ORDINALITY, TFC_EXISTS };
+enum { TFC_PATH, TFC_ORDINALITY, TFC_EXISTS, TFC_NESTED };
+enum { TFE_NULL, TFE_DEFAULT, TFE_ERROR };     // ON EMPTY / ON ERROR
 typedef struct {
     char      name[64];
     int       kind;            // TFC_*
     ColumnDef def;
     char      path[256];
+    int       out;             // indice della colonna prodotta (non per TFC_NESTED)
+    int       nend;            // TFC_NESTED: le sue colonne sono le voci fino a nend (esclusa)
+    int       on_empty, on_error;            // TFE_*
+    char      def_empty[256], def_error[256];
 } TFCol;
 typedef struct TableFunc {
     char      func[32];        // JSON_TABLE, GENERATE_SERIES
     ASTExpr*  args[4];
     int       nargs;
-    TFCol*    cols;            // JSON_TABLE: COLUMNS (...)
+    TFCol*    cols;            // JSON_TABLE: COLUMNS (...), con le NESTED PATH appiattite
     int       ncols;
+    int       nout;            // colonne prodotte
     char      colnames[8][64]; // alias(colonne)
     int       ncolnames;
 } TableFunc;

@@ -6010,14 +6010,16 @@ static bool lateral_open(SelectPlan* p, int k, ASTNode* sub, const TableFunc* tf
     for (int i = 0; i < tf->nargs; i++) bind_expr(tf->args[i], lb);
     if (lb->err[0]) { snprintf(err, errn, "%.250s", lb->err); return false; }
     if (!strcmp(tf->func, "JSON_TABLE")) {
-        if (tf->ncols > SV_MAX_COLUMNS) { snprintf(err, errn, "Too many JSON_TABLE columns"); return false; }
+        if (tf->nout > SV_MAX_COLUMNS) { snprintf(err, errn, "Too many JSON_TABLE columns"); return false; }
         for (int i = 0; i < tf->ncols; i++) {
+            const TFCol* tc = &tf->cols[i];
+            if (tc->kind == TFC_NESTED) continue;
             Column* c = &ts->columns[ts->num_columns++];
-            snprintf(c->name, sizeof(c->name), "%s", i < tf->ncolnames ? tf->colnames[i] : tf->cols[i].name);
-            if (tf->cols[i].kind == TFC_PATH && !known_type(tf->cols[i].def.type)) { snprintf(err, errn, "Unknown type '%.32s'", tf->cols[i].def.type); return false; }
-            c->type = tf->cols[i].kind == TFC_PATH ? parse_type(tf->cols[i].def.type) : SV_TYPE_BIGINT;
-            c->size = tf->cols[i].def.size;
-            if (c->type == SV_TYPE_DECIMAL) c->decimal_prec = tf->cols[i].def.has_scale ? tf->cols[i].def.scale + 1 : 0;
+            snprintf(c->name, sizeof(c->name), "%s", tc->out < tf->ncolnames ? tf->colnames[tc->out] : tc->name);
+            if (tc->kind == TFC_PATH && !known_type(tc->def.type)) { snprintf(err, errn, "Unknown type '%.32s'", tc->def.type); return false; }
+            c->type = tc->kind == TFC_PATH ? parse_type(tc->def.type) : SV_TYPE_BIGINT;
+            c->size = tc->def.size;
+            if (c->type == SV_TYPE_DECIMAL) c->decimal_prec = tc->def.has_scale ? tc->def.scale + 1 : 0;
             c->nullable = true;
         }
     } else {                                                   // GENERATE_SERIES: una colonna
@@ -6659,6 +6661,154 @@ static char* json_scalar_text(const char* v, size_t len, bool* is_null) {
     return sj_unquote(v, len);
 }
 
+// JSON_TABLE: elementi indicati da un percorso (prefisso[*]resto: ogni elemento dell'array; senza [*]: il
+// valore, se c'è). Array malloc'd di testi malloc'd; *n = -1 se manca la memoria
+static char** jt_elems(const char* doc, const char* path, long* n) {
+    *n = 0;
+    const char* star = strstr(path, "[*]");
+    char prefix[512], rest[512] = "";
+    if (star) {
+        snprintf(prefix, sizeof(prefix), "%.*s", (int)(star - path), path);
+        snprintf(rest, sizeof(rest), "%s", star + 3);
+    } else snprintf(prefix, sizeof(prefix), "%s", path);
+    const char* arr; size_t al;
+    if (!sj_extract(doc, prefix, &arr, &al)) return NULL;
+    long nel = star ? (*arr == '[' ? sj_length(arr, al) : 0) : 1;
+    if (nel > 10000000) nel = 10000000;
+    char** out = malloc(sizeof(char*) * (size_t)(nel ? nel : 1));
+    char* arrc = malloc(al + 1);
+    if (!out || !arrc) { free(out); free(arrc); *n = -1; return NULL; }
+    memcpy(arrc, arr, al); arrc[al] = '\0';
+    long k = 0;
+    for (long i = 0; i < nel; i++) {
+        const char* ev = arrc; size_t el = al;
+        if (star) {
+            char ip[600];
+            snprintf(ip, sizeof(ip), "$[%ld]%s", i, rest);
+            if (!sj_extract(arrc, ip, &ev, &el)) continue;
+        }
+        char* e = malloc(el + 1);
+        if (!e) { for (long j = 0; j < k; j++) free(out[j]); free(out); free(arrc); *n = -1; return NULL; }
+        memcpy(e, ev, el); e[el] = '\0';
+        out[k++] = e;
+    }
+    free(arrc);
+    *n = k;
+    return out;
+}
+
+static void jt_free_elems(char** el, long n) {
+    for (long i = 0; i < n; i++) free(el[i]);
+    free(el);
+}
+
+typedef struct {
+    Source*      S;
+    TableSchema* ts;
+    char**       vals;          // testo di ogni colonna prodotta (NULL = SQL NULL)
+    char*        err;
+    size_t       errn;
+} JtGen;
+
+// azzera le colonne prodotte dalle voci [a, b)
+static void jt_clear(JtGen* g, int a, int b) {
+    for (int i = a; i < b; i++) {
+        const TFCol* c = &g->S->tf->cols[i];
+        if (c->kind != TFC_NESTED) { free(g->vals[c->out]); g->vals[c->out] = NULL; }
+    }
+}
+
+static const char* jt_emit(JtGen* g) {
+    Tuple* t = tuple_create(g->ts->num_columns);
+    if (!t || !pool_add(g->S, t)) { tuple_free(t); return "Out of memory"; }
+    for (int c = 0; c < g->ts->num_columns; c++) {
+        if (!g->vals[c]) t->values[c].is_null = true;
+        else lat_set(t, g->ts, c, g->vals[c]);
+    }
+    return NULL;
+}
+
+// il testo è accettabile per il tipo della colonna? (numeri e booleani)
+static bool jt_fits(DataType ty, const char* v, bool composite) {
+    if (composite) return ty == SV_TYPE_TEXT || ty == SV_TYPE_VARCHAR || ty == SV_TYPE_CHAR || ty == SV_TYPE_BLOB;
+    if (ty == SV_TYPE_INT || ty == SV_TYPE_BIGINT || ty == SV_TYPE_FLOAT || ty == SV_TYPE_DECIMAL) {
+        char* e; strtod(v, &e);
+        while (*e == ' ') e++;
+        return e != v && !*e;
+    }
+    if (ty == SV_TYPE_BOOL) return !strcmp(v, "true") || !strcmp(v, "false") || !strcmp(v, "0") || !strcmp(v, "1");
+    return true;
+}
+
+// valore di una colonna PATH per l'elemento elem, con ON EMPTY / ON ERROR
+static const char* jt_value(JtGen* g, const TFCol* c, const char* elem) {
+    char** dst = &g->vals[c->out];
+    const char* vs; size_t vl;
+    if (!sj_extract(elem, c->path, &vs, &vl)) {
+        if (c->on_empty == TFE_ERROR) { snprintf(g->err, g->errn, "Missing value for JSON_TABLE column '%.64s'", c->name); return g->err; }
+        if (c->on_empty == TFE_DEFAULT && !(*dst = strdup(c->def_empty))) return "Out of memory";
+        return NULL;
+    }
+    bool isnull;
+    char* txt = json_scalar_text(vs, vl, &isnull);
+    if (isnull) return NULL;
+    if (!txt) return "Out of memory";
+    DataType ty = g->ts->columns[c->out].type;
+    if (!jt_fits(ty, txt, *vs == '{' || *vs == '[')) {
+        free(txt);
+        if (c->on_error == TFE_ERROR) { snprintf(g->err, g->errn, "Can't store the value of JSON_TABLE column '%.64s'", c->name); return g->err; }
+        if (c->on_error == TFE_DEFAULT && !(*dst = strdup(c->def_error))) return "Out of memory";
+        return NULL;
+    }
+    if (ty == SV_TYPE_BOOL && (!strcmp(txt, "true") || !strcmp(txt, "false"))) { txt[0] = txt[0] == 't' ? '1' : '0'; txt[1] = '\0'; }
+    *dst = txt;
+    return NULL;
+}
+
+// righe delle voci [a, b) per l'elemento elem (ord: la sua posizione, per FOR ORDINALITY). I NESTED PATH
+// fratelli si uniscono (le righe di uno hanno NULL nelle colonne degli altri); se nessuno ha elementi
+// resta una riga con NULL
+static const char* jt_gen(JtGen* g, int a, int b, const char* elem, long ord) {
+    const TFCol* cols = g->S->tf->cols;
+    bool nested = false;
+    for (int i = a; i < b; i++) {
+        const TFCol* c = &cols[i];
+        if (c->kind == TFC_NESTED) { nested = true; i = c->nend - 1; continue; }
+        char** dst = &g->vals[c->out];
+        free(*dst); *dst = NULL;
+        if (c->kind == TFC_ORDINALITY) {
+            char nb[32]; snprintf(nb, sizeof(nb), "%ld", ord);
+            if (!(*dst = strdup(nb))) return "Out of memory";
+        } else if (c->kind == TFC_EXISTS) {
+            const char* vs; size_t vl;
+            if (!(*dst = strdup(sj_extract(elem, c->path, &vs, &vl) ? "1" : "0"))) return "Out of memory";
+        } else {
+            const char* f = jt_value(g, c, elem);
+            if (f) return f;
+        }
+    }
+    if (!nested) return jt_emit(g);
+    long total = 0;
+    for (int i = a; i < b; i++) {
+        const TFCol* c = &cols[i];
+        if (c->kind != TFC_NESTED) continue;
+        long n;
+        char** el = jt_elems(elem, c->path, &n);
+        if (n < 0) return "Out of memory";
+        const char* f = NULL;
+        for (long j = 0; !f && j < n; j++) {
+            if (g->S->npool > 10000000) f = "JSON_TABLE produces too many rows (max 10 million)";
+            else f = jt_gen(g, i + 1, c->nend, el[j], j + 1);
+            jt_clear(g, i + 1, c->nend);
+        }
+        jt_free_elems(el, n);
+        if (f) return f;
+        total += n;
+        i = c->nend - 1;
+    }
+    return total ? NULL : jt_emit(g);
+}
+
 // righe della sorgente laterale k per la combinazione base (sorgenti 0..k-1); *rows: array malloc'd
 static const char* lateral_rows(SelectPlan* p, int k, Tuple** base, EvalCtx* outer, Tuple*** rows, int* nrows, char* err, size_t errn) {
     Source* S = &p->src[k];
@@ -6717,53 +6867,19 @@ static const char* lateral_rows(SelectPlan* p, int k, Tuple** base, EvalCtx* out
             char* path = strdup(ev_s(&pv));
             if (!doc || !path) { free(doc); free(path); return "Out of memory"; }
             if (!sj_valid(doc)) { free(doc); free(path); snprintf(err, errn, "JSON_TABLE: the document is not valid JSON"); return err; }
-            // percorso delle righe: prefisso[*]resto (ogni elemento dell'array), oppure un valore solo
-            char* star = strstr(path, "[*]");
-            char prefix[512], rest[512] = "";
-            if (star) {
-                snprintf(prefix, sizeof(prefix), "%.*s", (int)(star - path), path);
-                snprintf(rest, sizeof(rest), "%s", star + 3);
-            } else snprintf(prefix, sizeof(prefix), "%s", path);
-            const char* arr; size_t al;
-            if (sj_extract(doc, prefix, &arr, &al)) {
-                char* arrc = malloc(al + 1);
-                if (!arrc) { free(doc); free(path); return "Out of memory"; }
-                memcpy(arrc, arr, al); arrc[al] = '\0';
-                long nel = star ? (*arrc == '[' ? sj_length(arrc, al) : 0) : 1;
-                for (long i = 0; i < nel && i < 10000000; i++) {
-                    const char* ev; size_t el;
-                    char ip[48];
-                    if (star) {
-                        snprintf(ip, sizeof(ip), "$[%ld]%s", i, rest);
-                        if (!sj_extract(arrc, ip, &ev, &el)) continue;
-                    } else { ev = arrc; el = al; }
-                    char* elem = malloc(el + 1);
-                    if (!elem) { free(arrc); free(doc); free(path); return "Out of memory"; }
-                    memcpy(elem, ev, el); elem[el] = '\0';
-                    Tuple* t = tuple_create(ts->num_columns);
-                    if (!t || !pool_add(S, t)) { tuple_free(t); free(elem); free(arrc); free(doc); free(path); return "Out of memory"; }
-                    for (int c = 0; c < S->tf->ncols; c++) {
-                        const TFCol* col = &S->tf->cols[c];
-                        char b[32];
-                        if (col->kind == TFC_ORDINALITY) { snprintf(b, sizeof(b), "%ld", i + 1); lat_set(t, ts, c, b); continue; }
-                        const char* vs; size_t vl;
-                        bool found = sj_extract(elem, col->path, &vs, &vl);
-                        if (col->kind == TFC_EXISTS) { lat_set(t, ts, c, found ? "1" : "0"); continue; }
-                        if (!found) { t->values[c].is_null = true; continue; }
-                        bool isnull;
-                        char* txt = json_scalar_text(vs, vl, &isnull);
-                        if (isnull) t->values[c].is_null = true;
-                        else {
-                            if (txt && (ts->columns[c].type == SV_TYPE_BOOL) && (!strcmp(txt, "true") || !strcmp(txt, "false"))) {
-                                lat_set(t, ts, c, txt[0] == 't' ? "1" : "0");
-                            } else lat_set(t, ts, c, txt ? txt : "");
-                        }
-                        free(txt);
-                    }
-                    free(elem);
-                }
-                free(arrc);
+            JtGen g = { S, ts, NULL, err, errn };
+            g.vals = calloc((size_t)(S->tf->nout ? S->tf->nout : 1), sizeof(char*));
+            const char* f = g.vals ? NULL : "Out of memory";
+            long nel = 0;
+            char** el = f ? NULL : jt_elems(doc, path, &nel);
+            if (!f && nel < 0) f = "Out of memory";
+            for (long i = 0; !f && i < nel; i++) {
+                jt_clear(&g, 0, S->tf->ncols);
+                f = jt_gen(&g, 0, S->tf->ncols, el[i], i + 1);
             }
+            jt_free_elems(el, nel);
+            if (g.vals) { jt_clear(&g, 0, S->tf->ncols); free(g.vals); }
+            if (f) { free(doc); free(path); return f; }
             free(doc);
             free(path);
         }

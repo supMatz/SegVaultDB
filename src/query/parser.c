@@ -1696,6 +1696,76 @@ static bool tf_here(ParserState* ps) {
     return (ident_is(ps, "JSON_TABLE") || ident_is(ps, "GENERATE_SERIES")) && next_is(ps, 1, TOK_LPAREN);
 }
 
+// [NULL | ERROR | DEFAULT 'valore'] ON EMPTY, poi lo stesso ON ERROR (in qualunque ordine)
+static void parse_tf_on(ParserState* ps, TFCol* c) {
+    for (int k = 0; k < 2 && ps->result->success; k++) {
+        int mode; char v[256] = "";
+        if (match(ps, TOK_NULL)) mode = TFE_NULL;
+        else if (ident_is(ps, "ERROR") && next_is(ps, 1, TOK_ON)) { consume(ps); mode = TFE_ERROR; }
+        else if (ident_is(ps, "DEFAULT")) {
+            consume(ps);
+            Token d = consume(ps);
+            bool neg = false;
+            if (d.type == TOK_MINUS) { neg = true; d = consume(ps); }
+            if (d.type != TOK_STRING && d.type != TOK_INTEGER && d.type != TOK_FLOAT) { parse_fail(ps, "Expected a constant after DEFAULT", d); return; }
+            snprintf(v, sizeof(v), "%s%s", neg ? "-" : "", d.text);
+            mode = TFE_DEFAULT;
+        } else return;
+        if (!match(ps, TOK_ON)) { parse_fail(ps, "Expected ON EMPTY or ON ERROR", peek(ps)); return; }
+        if (ident_is(ps, "EMPTY")) { c->on_empty = mode; snprintf(c->def_empty, sizeof(c->def_empty), "%s", v); }
+        else if (ident_is(ps, "ERROR")) { c->on_error = mode; snprintf(c->def_error, sizeof(c->def_error), "%s", v); }
+        else { parse_fail(ps, "Expected ON EMPTY or ON ERROR", peek(ps)); return; }
+        consume(ps);
+    }
+}
+
+// COLUMNS ( ... ) dopo la '(': colonne e NESTED [PATH] 'p' COLUMNS (...), appiattite in t->cols
+static void parse_tf_columns(ParserState* ps, TableFunc* t, int depth) {
+    if (depth > 16) { parse_fail(ps, "NESTED PATH nested too deeply", peek(ps)); return; }
+    do {
+        TFCol* nc = realloc(t->cols, sizeof(TFCol) * (size_t)(t->ncols + 1));
+        if (!nc) { parse_fail(ps, "Out of memory", peek(ps)); return; }
+        t->cols = nc;
+        int ci = t->ncols++;
+        TFCol* c = &t->cols[ci];
+        memset(c, 0, sizeof(*c));
+        if (ident_is(ps, "NESTED")) {
+            consume(ps);
+            if (ident_is(ps, "PATH")) consume(ps);
+            Token pt = consume(ps);
+            if (pt.type != TOK_STRING) { parse_fail(ps, "Expected a quoted path after NESTED PATH", pt); return; }
+            c->kind = TFC_NESTED;
+            copy_text(ps, c->path, sizeof(c->path), pt.text);
+            if (!ident_is(ps, "COLUMNS") || !next_is(ps, 1, TOK_LPAREN)) { parse_fail(ps, "Expected COLUMNS (...) after NESTED PATH", peek(ps)); return; }
+            consume(ps); consume(ps);
+            parse_tf_columns(ps, t, depth + 1);
+            t->cols[ci].nend = t->ncols;                  // t->cols può essere stato spostato
+            continue;
+        }
+        Token cn = consume(ps);
+        if (cn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name in COLUMNS", cn); return; }
+        copy_text(ps, c->name, sizeof(c->name), cn.text);
+        c->out = t->nout++;
+        if (match(ps, TOK_FOR)) {
+            if (!ident_is(ps, "ORDINALITY")) { parse_fail(ps, "Expected FOR ORDINALITY", peek(ps)); return; }
+            consume(ps);
+            c->kind = TFC_ORDINALITY;
+            snprintf(c->def.type, sizeof(c->def.type), "BIGINT");
+        } else {
+            c->def.nullable = true;
+            if (!parse_type_spec(ps, &c->def)) { if (ps->result->success) parse_fail(ps, "Expected the column type", peek(ps)); return; }
+            if (match(ps, TOK_EXISTS)) c->kind = TFC_EXISTS;
+            if (!ident_is(ps, "PATH")) { parse_fail(ps, "Expected PATH 'path' for the column", peek(ps)); return; }
+            consume(ps);
+            Token pt = consume(ps);
+            if (pt.type != TOK_STRING) { parse_fail(ps, "Expected a quoted path", pt); return; }
+            copy_text(ps, c->path, sizeof(c->path), pt.text);
+            if (c->kind == TFC_PATH) parse_tf_on(ps, c);
+        }
+    } while (ps->result->success && match(ps, TOK_COMMA));
+    if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' after COLUMNS", peek(ps));
+}
+
 // JSON_TABLE(doc, 'percorso' COLUMNS (nome tipo PATH 'p' | nome FOR ORDINALITY | nome tipo EXISTS PATH 'p', ...))
 // GENERATE_SERIES(da, a [, passo]); poi [AS] alias [(colonne)]
 static TableFunc* parse_table_func(ParserState* ps, char* alias, size_t acap) {
@@ -1714,36 +1784,8 @@ static TableFunc* parse_table_func(ParserState* ps, char* alias, size_t acap) {
     if (ps->result->success && json) {
         if (t->nargs != 2 || !ident_is(ps, "COLUMNS") || !next_is(ps, 1, TOK_LPAREN)) { parse_fail(ps, "Expected JSON_TABLE(doc, 'path' COLUMNS (...))", peek(ps)); }
         else {
-            consume(ps); consume(ps);
-            do {
-                TFCol* nc = realloc(t->cols, sizeof(TFCol) * (size_t)(t->ncols + 1));
-                if (!nc) { parse_fail(ps, "Out of memory", peek(ps)); break; }
-                t->cols = nc;
-                TFCol* c = &t->cols[t->ncols];
-                memset(c, 0, sizeof(*c));
-                Token cn = consume(ps);
-                if (cn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name in COLUMNS", cn); break; }
-                copy_text(ps, c->name, sizeof(c->name), cn.text);
-                if (match(ps, TOK_FOR)) {
-                    if (!ident_is(ps, "ORDINALITY")) { parse_fail(ps, "Expected FOR ORDINALITY", peek(ps)); break; }
-                    consume(ps);
-                    c->kind = TFC_ORDINALITY;
-                    snprintf(c->def.type, sizeof(c->def.type), "BIGINT");
-                } else {
-                    c->def.nullable = true;
-                    if (!parse_type_spec(ps, &c->def)) { if (ps->result->success) parse_fail(ps, "Expected the column type", peek(ps)); break; }
-                    if (match(ps, TOK_EXISTS)) c->kind = TFC_EXISTS;
-                    if (!ident_is(ps, "PATH")) { parse_fail(ps, "Expected PATH 'path' for the column", peek(ps)); break; }
-                    consume(ps);
-                    Token pt = consume(ps);
-                    if (pt.type != TOK_STRING) { parse_fail(ps, "Expected a quoted path", pt); break; }
-                    copy_text(ps, c->path, sizeof(c->path), pt.text);
-                    // DEFAULT x ON EMPTY / NULL ON ERROR ...: accettati (un percorso che manca dà NULL)
-                    while (peek(ps).type != TOK_COMMA && peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) consume(ps);
-                }
-                t->ncols++;
-            } while (ps->result->success && match(ps, TOK_COMMA));
-            if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' after COLUMNS", peek(ps));
+            consume(ps); consume(ps);                       // COLUMNS (
+            parse_tf_columns(ps, t, 0);
         }
     }
     if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' after the table function", peek(ps));

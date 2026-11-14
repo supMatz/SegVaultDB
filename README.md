@@ -668,7 +668,7 @@ LIMIT n [OFFSET m]   |   OFFSET m ROWS FETCH FIRST n ROWS ONLY;
 | Subquery | `x IN (SELECT ...)`, `NOT IN`, `EXISTS`, `NOT EXISTS`, `x > ALL (SELECT ...)`, `x = ANY / SOME (...)`, subquery scalari `(SELECT MAX(voto) FROM esame)` in `SELECT`, `WHERE`, `HAVING`, `SET`; correlate a qualunque profondità |
 | Insiemi | `UNION [ALL]`, `INTERSECT`, `EXCEPT` (`INTERSECT` lega più degli altri), `ORDER BY` / `LIMIT` sul risultato |
 | `LATERAL` | `FROM reparto r JOIN LATERAL (SELECT nome FROM dipendente d WHERE d.reparto = r.id ORDER BY stipendio DESC LIMIT 3) t ON TRUE` (i primi N di ogni gruppo), `LEFT JOIN LATERAL`, `, LATERAL (...)`, `CROSS APPLY` / `OUTER APPLY` di SQL Server: la subquery vede le tabelle alla sua sinistra |
-| Funzioni-tabella | `SELECT * FROM generate_series(1, 10 [, passo]) AS g(n)`; `JSON_TABLE(doc, '$.righe[*]' COLUMNS (n FOR ORDINALITY, sku VARCHAR(10) PATH '$.sku', q INT PATH '$.q', ha_note INT EXISTS PATH '$.note')) AS j`, anche su una colonna: `FROM ordine o, JSON_TABLE(o.dati, ...) j` |
+| Funzioni-tabella | `SELECT * FROM generate_series(1, 10 [, passo]) AS g(n)`; `JSON_TABLE(doc, '$.righe[*]' COLUMNS (n FOR ORDINALITY, sku VARCHAR(10) PATH '$.sku', q INT PATH '$.q', ha_note INT EXISTS PATH '$.note')) AS j`, anche su una colonna: `FROM ordine o, JSON_TABLE(o.dati, ...) j`; `NESTED [PATH] '$.tel[*]' COLUMNS (...)` per gli array dentro gli elementi (più livelli; i NESTED fratelli danno righe separate; un elemento senza righe annidate resta con NULL); `q INT PATH '$.q' DEFAULT '0' ON EMPTY NULL ON ERROR` (anche `ERROR ON EMPTY` / `ERROR ON ERROR`: un valore assente, o un oggetto / testo dove serve un numero) |
 | Tabelle derivate | `FROM (SELECT ...) AS t`, `JOIN (SELECT ...) AS t ON ...`, nomi delle colonne `AS t(a, b)`, righe costanti `(VALUES (1, 'a'), (2, 'b')) AS v(n, s)`; `VALUES (...), (...)` e `TABLE t` come istruzioni; gli hint `USE / FORCE / IGNORE INDEX (...)` sono accettati |
 | `WITH` | `WITH medie (studente, media) AS (SELECT ...), migliori AS (SELECT ... FROM medie) SELECT ...` |
 | `WITH RECURSIVE` | `WITH RECURSIVE sotto AS (SELECT id FROM persona WHERE id = 1 UNION SELECT p.id FROM persona p JOIN sotto s ON p.capo = s.id) SELECT ...` — con `UNION` i cicli terminano; una ricorsione senza fine viene fermata dopo 1000 passi |
@@ -807,7 +807,7 @@ funzioni (Sakila) si importano per intero.
 
 ### Non supportato
 
-Eventi pianificati (`CREATE EVENT`), colonne calcolate `VIRTUAL` (si accettano e vengono salvate come `STORED`), `NESTED PATH` in `JSON_TABLE`, frame `RANGE` con `INTERVAL` di mesi o anni (giorni, ore, minuti, secondi e settimane sì).
+Eventi pianificati (`CREATE EVENT`), colonne calcolate `VIRTUAL` (si accettano e vengono salvate come `STORED`), frame `RANGE` con `INTERVAL` di mesi o anni (giorni, ore, minuti, secondi e settimane sì).
 
 ---
 

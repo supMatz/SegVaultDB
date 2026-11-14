@@ -1420,6 +1420,18 @@ int main(void) {
     t("INSERT INTO lord VALUES (1, '{\"items\":[{\"sku\":\"A\",\"q\":2},{\"sku\":\"B\",\"q\":1}]}'), (2, '{\"items\":[{\"sku\":\"C\",\"q\":5}]}')", "OK:2");
     t("SELECT o.id, SUM(j.q) FROM lord o JOIN JSON_TABLE(o.righe, '$.items[*]' COLUMNS (q INT PATH '$.q')) j GROUP BY o.id ORDER BY o.id", "1|3;2|5");
     t("SELECT o.id, j.sku FROM lord o, JSON_TABLE(o.righe, '$.items[*]' COLUMNS (sku VARCHAR(5) PATH '$.sku')) AS j WHERE j.sku <> 'B' ORDER BY j.sku", "1|A;2|C");
+    // JSON_TABLE: NESTED PATH (anche più livelli e fratelli), ON EMPTY / ON ERROR
+    t("SELECT * FROM JSON_TABLE('[{\"a\":\"x\",\"b\":[{\"c\":\"c1\",\"l\":[1,2]},{\"c\":\"c2\",\"l\":[]}]},{\"a\":\"y\",\"b\":[]}]', '$[*]' COLUMNS (top FOR ORDINALITY, a VARCHAR(10) PATH '$.a', NESTED PATH '$.b[*]' COLUMNS (c VARCHAR(10) PATH '$.c', o FOR ORDINALITY, NESTED PATH '$.l[*]' COLUMNS (l INT PATH '$')))) jt",
+      "1|x|c1|1|1;1|x|c1|1|2;1|x|c2|2|NULL;2|y|NULL|NULL|NULL");
+    t("SELECT * FROM JSON_TABLE('{\"n\":\"bob\",\"tel\":[\"1\",\"2\"],\"mail\":[\"m\"]}', '$' COLUMNS (n TEXT PATH '$.n', NESTED PATH '$.tel[*]' COLUMNS (tel TEXT PATH '$'), NESTED '$.mail[*]' COLUMNS (mail TEXT PATH '$'))) j",
+      "bob|1|NULL;bob|2|NULL;bob|NULL|m");
+    t("SELECT o.id, j.sku FROM lord o, JSON_TABLE(o.righe, '$' COLUMNS (NESTED PATH '$.items[*]' COLUMNS (sku VARCHAR(5) PATH '$.sku'))) j ORDER BY 1, 2", "1|A;1|B;2|C");
+    t("SELECT * FROM JSON_TABLE('[{\"x\":\"abc\"},{\"y\":1},{\"x\":5}]', '$[*]' COLUMNS (x INT PATH '$.x' DEFAULT '-1' ON EMPTY DEFAULT '0' ON ERROR, y INT PATH '$.y' DEFAULT -9 ON EMPTY)) j",
+      "0|-9;-1|1;5|-9");
+    t("SELECT * FROM JSON_TABLE('[{\"y\":1}]', '$[*]' COLUMNS (x INT PATH '$.x' ERROR ON EMPTY)) j", "ERR:Missing value for JSON_TABLE column 'x'");
+    t("SELECT * FROM JSON_TABLE('[{\"x\":[1]}]', '$[*]' COLUMNS (x INT PATH '$.x' NULL ON EMPTY ERROR ON ERROR)) j", "ERR:Can't store the value");
+    t("SELECT * FROM JSON_TABLE('[{\"x\":{\"k\":1}}]', '$[*]' COLUMNS (x INT PATH '$.x', xs TEXT PATH '$.x')) j", "NULL|{\"k\":1}");
+    t("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (NESTED PATH '$' COLUMNS (v INT PATH '$')) j", "ERR:");
     // ALTER TABLE con più operazioni (migrazioni di Laravel / Doctrine), CHANGE, ADD / DROP INDEX
     t("create table `lu` (`id` bigint unsigned not null auto_increment primary key, `name` varchar(255) not null, `email` varchar(255) not null)", "OK:0");
     t("insert into lu (name, email) values ('Anna', 'a@x.it')", "OK:1");
