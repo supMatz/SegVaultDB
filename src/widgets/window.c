@@ -149,6 +149,9 @@ static void update_session(AppWindow* app) {
     const char* db = db_current_database();
     label_set_text(app->lbl_db_name, db && db[0] ? db : "no database");
     sync_tree_db(app);
+    // Designer aperto: il diagramma segue il database in uso (click nell'albero, USE, import)
+    if (app->schema && app->page == PAGE_DESIGNER && db && db[0] && strcmp(db, schema_view_db(app->schema)) != 0)
+        schema_view_show_db(app->schema, db, NULL);
     SessionInfo* s = db_session_info();
     app->in_transaction = s ? s->in_transaction : false;
     if (s) db_session_free(s);
@@ -3058,11 +3061,12 @@ static void set_page(AppWindow* app, int page) {
     if (page == PAGE_DESIGNER) {
         textbox_focus(app->editor, false);
         app->editor->popup_open = false;
-        if (!schema_view_db(app->schema)[0]) {
+        // il diagramma parte dal database in uso (lo stesso dell'albero e dell'indicatore in alto)
+        const char* d = app->job ? NULL : db_current_database();
+        if (d && d[0] && strcmp(d, schema_view_db(app->schema)) != 0) schema_view_show_db(app->schema, d, NULL);
+        else if (!schema_view_db(app->schema)[0]) {
             TreeNode* sel = app->tree->selected;
-            const char* d = sel ? find_db_name(sel) : NULL;
-            if (!d && !app->job) d = db_current_database();
-            schema_view_show_db(app->schema, d, NULL);
+            schema_view_show_db(app->schema, sel ? find_db_name(sel) : NULL, NULL);
         }
         schema_view_invalidate(app->schema);
     } else textbox_focus(app->editor, true);
@@ -3092,8 +3096,27 @@ static int exec_statements(const char* sql, int* total, char* err, size_t errn) 
     return done;
 }
 
+// database scelto nel menu a tendina del Designer -> diventa quello in uso (indicatore in alto a destra,
+// albero, editor). Un nome che non esiste ancora (database nuovo) viene provato una volta sola
+static void schema_sync_db(AppWindow* app) {
+    static char tried[128];
+    const char* sdb = schema_view_db(app->schema);
+    if (!sdb[0] || app->job) return;
+    const char* cur = db_current_database();
+    if (cur && !strcmp(cur, sdb)) { tried[0] = '\0'; return; }
+    if (!strcmp(tried, sdb)) return;
+    char name[128], msg[200];
+    snprintf(name, sizeof(name), "%s", sdb);
+    snprintf(tried, sizeof(tried), "%s", name);
+    if (use_database(app, name)) {
+        snprintf(msg, sizeof(msg), "Using database %s", name);
+        set_status(app, STATUS_OK, msg, "");
+    }
+}
+
 static void schema_action(AppWindow* app, SchemaViewAction a) {
     SchemaView* sv = app->schema;
+    if (app->page == PAGE_DESIGNER) schema_sync_db(app);
     switch (a) {
         case SCV_NEW_TABLE:
             if (busy_guard(app)) break;
