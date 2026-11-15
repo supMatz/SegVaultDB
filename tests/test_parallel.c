@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <time.h>
 
 static int g_tests, g_fail;
@@ -52,6 +53,62 @@ static void* writer(void* arg) {
     return NULL;
 }
 
+// ── letture miste in parallelo (P0.3): funzioni finestra, UNION … ORDER BY DESC, primo uso di un
+// indice per intervallo. Ogni risultato è confrontato con quello calcolato da un thread solo.
+static const char* MIX_Q[] = {
+    "SELECT id, ROW_NUMBER() OVER (ORDER BY v DESC, id), SUM(v) OVER (PARTITION BY k ORDER BY id) FROM big WHERE id < 400 ORDER BY id",
+    "SELECT id, RANK() OVER (PARTITION BY k % 7 ORDER BY v) FROM big WHERE id < 300 ORDER BY id",
+    "SELECT id FROM big WHERE id < 150 UNION SELECT id + 5000 FROM big WHERE id < 150 ORDER BY 1 DESC LIMIT 120",
+    "SELECT k, v FROM big WHERE id < 80 UNION ALL SELECT v, k FROM big WHERE id < 80 ORDER BY 1 DESC, 2",
+    "SELECT COUNT(*), SUM(v) FROM rg WHERE k BETWEEN 100 AND 700",
+    "SELECT COUNT(*), MIN(k) FROM rg WHERE v > 2000 AND v < 9000",
+    "SELECT COUNT(*) FROM rg WHERE k < 300",
+    "SELECT COUNT(*) FROM rg WHERE v >= 5000 AND v < 10000",
+};
+#define MIX_NQ ((int)(sizeof(MIX_Q) / sizeof(MIX_Q[0])))
+#define MIX_THREADS 8
+#define MIX_ROUNDS 12
+static char* g_mix_expect[MIX_NQ];
+static pthread_barrier_t g_mix_bar;
+static atomic_int g_mix_bad, g_mix_refused;
+
+static char* result_text(const QueryResult* r) {
+    if (!r) return strdup("(null)");
+    if (!r->success) return strdup(r->error);
+    size_t cap = 64, len = 0;
+    char* s = malloc(cap);
+    s[0] = '\0';
+    for (int i = 0; i < r->num_rows; i++)
+        for (int c = 0; c < r->rows[i].num_cells; c++) {
+            const char* v = r->rows[i].cells[c].value ? r->rows[i].cells[c].value : "NULL";
+            size_t need = len + strlen(v) + 2;
+            if (need > cap) { while (need > cap) cap *= 2; s = realloc(s, cap); }
+            len += (size_t)sprintf(s + len, "%s%c", v, c + 1 == r->rows[i].num_cells ? '\n' : '|');
+        }
+    return s;
+}
+
+static void* mix_reader(void* arg) {
+    int me = (int)(intptr_t)arg;
+    for (int round = 0; round < MIX_ROUNDS; round++) {
+        pthread_barrier_wait(&g_mix_bar);         // tutti insieme: il primo uso dell'indice è in gara
+        for (int k = 0; k < MIX_NQ; k++) {
+            int q = (me + k) % MIX_NQ;
+            bool refused;
+            QueryResult* r = db_execute_readonly(MIX_Q[q], "p", NULL, 0, &refused);
+            if (refused) atomic_fetch_add(&g_mix_refused, 1);
+            else {
+                char* got = result_text(r);
+                if (strcmp(got, g_mix_expect[q])) atomic_fetch_add(&g_mix_bad, 1);
+                free(got);
+            }
+            db_result_free(r);
+        }
+        pthread_barrier_wait(&g_mix_bar);         // il thread principale rende di nuovo da ordinare gli indici
+    }
+    return NULL;
+}
+
 int main(void) {
     if (system("rm -rf /tmp/sv_par_test && mkdir -p /tmp/sv_par_test") != 0) return 1;
     if (!db_init("/tmp/sv_par_test")) return 1;
@@ -88,6 +145,36 @@ int main(void) {
     CHECK(c && c->success && !strcmp(c->rows[0].cells[0].value, "80"), "all writes applied");
     db_result_free(c);
     printf("parallel phase: %.0f ms, up to %d reads at once\n", el, atomic_load(&g_max_inside));
+
+    // letture miste in parallelo (P0.3)
+    run("USE p");
+    run("CREATE TABLE rg (id INT PRIMARY KEY, k INT, v INT)");
+    run("CREATE INDEX rg_k ON rg (k)");
+    run("CREATE INDEX rg_v ON rg (v)");
+    run("BEGIN");
+    for (int i = 0; i < 2000; i++) { char q[96]; snprintf(q, sizeof(q), "INSERT INTO rg VALUES (%d, %d, %d)", i, (i * 37) % 1000, (i * 7919) % 10000); run(q); }
+    run("COMMIT");
+    for (int q = 0; q < MIX_NQ; q++) {
+        QueryResult* e = db_execute_readonly(MIX_Q[q], "p", NULL, 0, &refused);
+        CHECK(!refused && e && e->success && e->num_rows > 0, "mixed query %d alone: %s", q, e ? e->error : "refused");
+        g_mix_expect[q] = result_text(e);
+        db_result_free(e);
+    }
+    pthread_barrier_init(&g_mix_bar, NULL, MIX_THREADS + 1);
+    pthread_t mth[MIX_THREADS];
+    for (int i = 0; i < MIX_THREADS; i++) pthread_create(&mth[i], NULL, mix_reader, (void*)(intptr_t)i);
+    for (int round = 0; round < MIX_ROUNDS; round++) {
+        char q[128];                              // chiavi nuove fuori da ogni intervallo: l'ordine va rifatto
+        snprintf(q, sizeof(q), "INSERT INTO rg VALUES (%d, %d, %d)", 100000 + round, 5000 + round, 50000 + round);
+        run(q);
+        pthread_barrier_wait(&g_mix_bar);
+        pthread_barrier_wait(&g_mix_bar);
+    }
+    for (int i = 0; i < MIX_THREADS; i++) pthread_join(mth[i], NULL);
+    pthread_barrier_destroy(&g_mix_bar);
+    CHECK(atomic_load(&g_mix_bad) == 0, "mixed parallel reads match the single-thread results: %d differ", atomic_load(&g_mix_bad));
+    CHECK(atomic_load(&g_mix_refused) == 0, "mixed parallel reads not refused: %d", atomic_load(&g_mix_refused));
+    for (int q = 0; q < MIX_NQ; q++) free(g_mix_expect[q]);
 
     // limite di tempo per thread
     r = db_execute_readonly("SELECT COUNT(*) FROM big a, big b, big c WHERE a.v + b.v = c.v", "p", NULL, 150, &refused);

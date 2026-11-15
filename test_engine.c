@@ -17,7 +17,7 @@ static void test_sql(const char* label, const char* sql, int expect_rows) {
         if (r->num_rows == expect_rows) { printf("OK (%d rows)\n", r->num_rows); passed++; }
         else { printf("FAIL: expected %d rows, got %d\n", expect_rows, r->num_rows); }
     } else {
-        printf("OK (affected=%d, rows=%d)\n", r->rows_affected, r->num_rows);
+        printf("OK (affected=%lld, rows=%d)\n", r->rows_affected, r->num_rows);
         passed++;
     }
     if (r->num_rows > 0 && r->num_rows <= 5) {
@@ -80,7 +80,7 @@ static void test_csv(const char* label, const char* csv, const char* table, int 
     free(sql);
 }
 
-int main() {
+int main(void) {
     if (system("rm -rf /tmp/svtest && mkdir -p /tmp/svtest") != 0) { printf("FAIL: setup\n"); return 1; }
     if (!db_init("/tmp/svtest")) { printf("FAIL: db_init\n"); return 1; }
 

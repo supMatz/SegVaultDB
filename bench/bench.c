@@ -18,7 +18,7 @@ static void run(const char* label, const char* sql) {
     QueryResult* r = db_execute(sql);
     double t = now_ms() - t0;
     if (!r || !r->success) { printf("%-44s ERRORE: %s\n", label, r ? r->error : "null"); db_result_free(r); exit(1); }
-    printf("%-44s %9.2f ms  (%d righe)\n", label, t, r->num_cols ? r->num_rows : r->rows_affected);
+    printf("%-44s %9.2f ms  (%lld righe)\n", label, t, r->num_cols ? (long long)r->num_rows : r->rows_affected);
     db_result_free(r);
 }
 
@@ -82,6 +82,18 @@ int main(int argc, char** argv) {
     run("UNION", "SELECT citta FROM studente UNION SELECT nome FROM corso");
     run("UPDATE con filtro", "UPDATE esame SET voto = voto + 0 WHERE corso = 3");
     run("DELETE con filtro", "DELETE FROM esame WHERE corso = 49");
+    // ROLLBACK: costa quanto la transazione, non quanto il database (P1.2): 1000 x (BEGIN; INSERT 10 righe; ROLLBACK)
+    db_result_free(db_execute("CREATE TABLE prova (id INT PRIMARY KEY, x INT)"));
+    run("prima di ROLLBACK: indice di esame costruito", "SELECT COUNT(*) FROM studente WHERE matricola = 7");
+    t0 = now_ms();
+    for (int k = 0; k < 1000; k++) {
+        db_result_free(db_execute("BEGIN"));
+        size_t len = (size_t)sprintf(buf, "INSERT INTO prova VALUES ");
+        for (int j = 0; j < 10; j++) len += (size_t)sprintf(buf + len, "%s(%d, %d)", j ? "," : "", k * 10 + j, j);
+        db_result_free(db_execute(buf));
+        db_result_free(db_execute("ROLLBACK"));
+    }
+    printf("%-44s %9.3f ms  (ogni volta, su %d righe)\n", "BEGIN; INSERT 10 righe; ROLLBACK", (now_ms() - t0) / 1000, n + ns + 50);
     db_shutdown();
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);

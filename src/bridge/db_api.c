@@ -5,6 +5,7 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
        tramite l'API definita in db_api.h.
 */
 #include "db_api.h"
+#include "../table/binesc.h"
 #include "auth.h"
 #include "../catalog/schema.h"
 #include "../storage/buffer_pool.h"
@@ -57,7 +58,7 @@ static void db_mutex_init(void) { sv_rw_init(&g_db_rw); lk_init(); executor_set_
 static void db_lock(void)       { if (g_lock_depth++ == 0) sv_rw_wr(&g_db_rw); }
 static void db_unlock(void)     { if (--g_lock_depth == 0) sv_rw_wrunlock(&g_db_rw); }
 
-static char g_init_error[256];
+static char g_init_error[400];
 const char* db_init_error(void) { return g_init_error; }
 
 // ── Forward declarations ─────────────────────────────────────────
@@ -92,7 +93,63 @@ static double get_time_ms(void) { return sv_get_time_ms(); }
 
 // ── API principale ───────────────────────────────────────────────
 
-static void wal_before_page_write(void* w) { wal_write_buffer((WAL*)w); }
+static bool wal_before_page_write(void* w) { return wal_write_buffer((WAL*)w) == SV_OK; }
+static void wal_on_link(void* w, uint32_t prev, uint32_t page) {
+    wal_write((WAL*)w, LOG_LINK, 0, page, (SVRID){ page, 0 }, (const uint8_t*)&prev, 4, NULL, 0);
+}
+
+// ── errore di I/O: il motore si ferma ───────────────────────────
+// Dopo una scrittura o un fsync non riuscito sul log o sul file dei dati non c'è più modo di sapere
+// che cosa è su disco: ogni statement viene rifiutato con lo stesso messaggio finché non si riavvia
+// (il recupero all'avvio rimette il database nell'ultimo stato confermato).
+static char g_io_msg[300];
+
+// ── durabilità delle conferme (SET synchronous = OFF | NORMAL | FULL) ──
+//  FULL:   ogni scrittura confermata (anche in autocommit) è su disco prima della risposta.
+//  NORMAL: COMMIT esplicito su disco subito; le scritture in autocommit al più entro SYNC_NORMAL_MS (al
+//          prossimo statement o a db_sync_tick): un'interruzione di corrente può perdere quegli ultimi ms.
+//  OFF:    nessun fsync del log (solo checkpoint e arresto): sopravvive al crash del processo, non alla corrente.
+#define SYNC_NORMAL_MS 100
+static int    g_sync_mode = 1;
+static double g_last_sync;
+
+static const char* const SYNC_NAMES[] = { "OFF", "NORMAL", "FULL" };
+
+// ── cache delle pagine: 1/8 della RAM, fra 4 MB e 512 MB (prima: 4 MB fissi, ogni lavoro più grande
+// rileggeva continuamente il disco). --cache-size / SET GLOBAL cache_size = MB ──
+static long g_cache_mb;                     // 0 = automatica
+#ifdef _WIN32
+typedef struct { unsigned long len, load; unsigned long long total, avail, tpf, apf, tv, av, aev; } SvMemStatus;
+__declspec(dllimport) int __stdcall GlobalMemoryStatusEx(SvMemStatus*);
+#endif
+static long auto_cache_mb(void) {
+    unsigned long long ram = 0;
+#ifdef _WIN32
+    SvMemStatus ms;
+    memset(&ms, 0, sizeof(ms));
+    ms.len = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) ram = ms.total;
+#else
+    long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && psz > 0) ram = (unsigned long long)pages * (unsigned long long)psz;
+#endif
+    long mb = ram ? (long)(ram / 8 / (1024 * 1024)) : 4;
+    return mb < 4 ? 4 : mb > 512 ? 512 : mb;
+}
+static int cache_frames(long mb) { long f = mb * 1024 * 1024 / SV_PAGE_SIZE; return f < 16 ? 16 : f > (1 << 20) ? (1 << 20) : (int)f; }
+static uint64_t g_engine_gen;       // aumenta a ogni db_init: le transazioni di prima sono finite
+
+static bool io_failed(void) {
+    return g_db.initialized && ((g_db.wal && g_db.wal->failed) || (g_db.bp && g_db.bp->io_error));
+}
+
+static const char* io_failed_msg(void) {
+    if (!g_io_msg[0])
+        snprintf(g_io_msg, sizeof(g_io_msg), "SegVault stopped writing after an I/O error on the %s (disk full or failing?): "
+                 "fix the disk and restart; the last committed state is recovered at startup",
+                 g_db.wal && g_db.wal->failed ? "transaction log" : "data file");
+    return g_io_msg;
+}
 
 static bool db_init_impl(const char* data_directory) {
     if (g_db.initialized) return true;
@@ -103,7 +160,10 @@ static bool db_init_impl(const char* data_directory) {
     snprintf(g_db.log_path, sizeof(g_db.log_path), "%s" SV_PATH_SEP "segvault.wal", data_directory);
 
     // Apri il file del database e bloccalo: un'altra istanza sulla stessa cartella lo corromperebbe
-    g_db.db_fd = sv_open(g_db.db_path, SV_O_RDWR | SV_O_CREAT, 0644);
+    g_db.db_fd = sv_open(g_db.db_path, SV_O_RDWR | SV_O_CREAT, 0600);
+#ifndef _WIN32
+    if (g_db.db_fd >= 0) fchmod(g_db.db_fd, 0600);       // anche un file creato da una versione precedente (0644)
+#endif
     if (g_db.db_fd < 0) {
         snprintf(g_init_error, sizeof(g_init_error), "cannot open %.200s", g_db.db_path);
         return false;
@@ -115,8 +175,16 @@ static bool db_init_impl(const char* data_directory) {
         return false;
     }
 
-    // recovery dopo un arresto anomalo (con il lock già preso)
-    wal_recovery(g_db.log_path, g_db.db_path, g_db.cat_path);
+    // recovery dopo un arresto anomalo (con il lock già preso); se non riesce il motore non parte:
+    // il log resta com'è e nessuna scrittura nuova può peggiorare le cose
+    {
+        char rerr[200] = "";
+        if (wal_recovery(g_db.log_path, g_db.db_path, g_db.cat_path, rerr, sizeof(rerr)) != SV_OK) {
+            snprintf(g_init_error, sizeof(g_init_error), "crash recovery failed: %.200s", rerr[0] ? rerr : "I/O error");
+            sv_close(g_db.db_fd);
+            return false;
+        }
+    }
 
     // Inizializza i componenti
     g_db.catalog = catalog_load(g_db.cat_path);
@@ -125,22 +193,43 @@ static bool db_init_impl(const char* data_directory) {
         snprintf(sp, sizeof(sp), "%s" SV_PATH_SEP "sequences.txt", data_directory);
         executor_set_seq_file(sp);
     }
-    g_db.bp      = bp_create(SV_BUFFER_POOL_CAP, g_db.db_fd);
+    g_db.bp      = bp_create(cache_frames(g_cache_mb > 0 ? g_cache_mb : auto_cache_mb()), g_db.db_fd);
     g_db.txm     = txm_create();
     g_db.wal     = wal_create(g_db.log_path);
 
-    if (g_db.bp && g_db.wal) {                     // prima di scrivere una pagina, il log
-        g_db.bp->before_write = wal_before_page_write;
-        g_db.bp->before_write_ctx = g_db.wal;
+    if (!g_db.catalog || !g_db.bp || !g_db.txm || !g_db.wal) {
+        snprintf(g_init_error, sizeof(g_init_error), "%s", !g_db.catalog ? (catalog_load_error()[0] ? catalog_load_error() : "cannot load the catalog")
+                 : !g_db.wal ? "cannot open the transaction log" : "out of memory");
+        if (g_db.bp) { bp_destroy(g_db.bp); g_db.bp = NULL; }
+        if (g_db.wal) { wal_destroy(g_db.wal); g_db.wal = NULL; }
+        free(g_db.txm); g_db.txm = NULL;
+        free(g_db.catalog); g_db.catalog = NULL;
+        sv_close(g_db.db_fd);
+        return false;
     }
+    g_db.bp->before_write = wal_before_page_write;    // prima di scrivere una pagina, il log
+    g_db.bp->before_write_ctx = g_db.wal;
+    g_db.bp->on_link = wal_on_link;
+    g_db.bp->on_link_ctx = g_db.wal;
+    g_io_msg[0] = '\0';
 
     g_db.exec_ctx.catalog = g_db.catalog;
     g_db.exec_ctx.bp      = g_db.bp;
     g_db.exec_ctx.wal     = g_db.wal;
     g_db.exec_ctx.tx_id   = 0;
+    g_engine_gen++;
 
     g_db.initialized = true;
-    auth_init(data_directory);
+    if (!auth_init(data_directory)) {          // utenti illeggibili: mai "nessun utente" (= tutti root)
+        snprintf(g_init_error, sizeof(g_init_error), "%s", auth_init_error());
+        g_db.initialized = false;
+        bp_destroy(g_db.bp); g_db.bp = NULL;
+        wal_destroy(g_db.wal); g_db.wal = NULL;
+        txm_destroy(g_db.txm); g_db.txm = NULL;
+        catalog_free(g_db.catalog); g_db.catalog = NULL;
+        sv_close(g_db.db_fd);
+        return false;
+    }
     free_list_load();
     return true;
 }
@@ -148,7 +237,7 @@ static bool db_init_impl(const char* data_directory) {
 // ── annullamento ─────────────────────────────────────────────────
 
 static atomic_int g_cancel_requested = 0;
-static atomic_int g_read_running = 0;   // una SELECT è in esecuzione: si può interrompere
+static atomic_int g_read_running = 0;   // uno statement è in esecuzione: si può interrompere
 
 void db_request_cancel(void) {
     atomic_store(&g_cancel_requested, 1);
@@ -169,8 +258,9 @@ bool db_cancel_requested(void) { return atomic_load(&g_cancel_requested) != 0; }
 #define SV_WAL_CHECKPOINT_BYTES (16L << 20)
 
 static bool do_checkpoint(void) {
-    if (!g_db.initialized || g_open_tx > 0) return false;     // il log serve ancora alle transazioni aperte
-    bp_flush_all(g_db.bp);
+    if (!g_db.initialized || g_open_tx > 0 || io_failed()) return false;   // il log serve ancora
+    // il log si svuota solo con tutte le pagine e il catalogo davvero su disco
+    if (wal_flush(g_db.wal) != SV_OK || bp_flush_all(g_db.bp) != SV_OK) return false;
     if (catalog_save(g_db.catalog, g_db.cat_path) != SV_OK) return false;
     return wal_truncate(g_db.wal) == SV_OK;
 }
@@ -186,7 +276,7 @@ static void free_list_save(void) {
     n = bp_free_list(g_db.bp, ids, n);
     char p[600];
     free_list_path(p, sizeof(p));
-    FILE* f = fopen(p, "w");
+    FILE* f = sv_fopen_private(p, "w");
     if (f) { for (int i = 0; i < n; i++) fprintf(f, "%u\n", ids[i]); fclose(f); }
     free(ids);
 }
@@ -206,10 +296,13 @@ static bool do_checkpoint(void);
 static bool do_vacuum(int* freed) {
     *freed = 0;
     if (!do_checkpoint()) return false;                 // log vuoto: nessun record nomina le pagine
-    long end = sv_lseek(g_db.db_fd, 0, SEEK_END);
+    int64_t end = sv_lseek(g_db.db_fd, 0, SEEK_END);
     uint32_t npages = end > 0 ? (uint32_t)(end / SV_PAGE_SIZE) : 0;
+    heap_damage_clear();
     uint8_t* used = calloc((size_t)npages / 8 + 1, 1);
-    if (!used) return false;
+    uint8_t* heapu = calloc((size_t)npages / 8 + 1, 1);       // pagine raggiungibili dalla catena di una tabella
+    if (!used || !heapu) { free(used); free(heapu); return false; }
+    heap_pages_bitmap = heapu;
     for (int d = 0; d < g_db.catalog->num_databases; d++) {
         Database* db = &g_db.catalog->databases[d];
         for (int t = 0; t < db->num_tables; t++) {
@@ -218,12 +311,25 @@ static bool do_vacuum(int* freed) {
             free(hf);
         }
     }
+    heap_pages_bitmap = NULL;
+    // una catena interrotta (pagina danneggiata) farebbe sembrare libere le pagine dopo: niente VACUUM
+    if (heap_damage(NULL, 0)) {
+        heap_damage_clear();
+        free(used);
+        free(heapu);
+        fprintf(stderr, "[SegVault] VACUUM skipped: a table has a damaged page (run CHECK TABLE)\n");
+        return false;
+    }
     // l'elenco si ricostruisce da capo: tutte le pagine libere (anche quelle di VACUUM precedenti)
     g_db.bp->nfree = 0;
     for (uint32_t id = 1; id < npages; id++) {
         Page* p = bp_fetch(g_db.bp, id);
         if (!p) continue;
         bool overflow_unused = (p->flags & PAGE_FLAG_OVERFLOW) && !(used[id / 8] & (1u << (id % 8)));
+        // pagina di heap che nessuna tabella raggiunge più (tabella eliminata o troncata): anche lei riusabile
+        bool heap_unused = !(p->flags & (PAGE_FLAG_OVERFLOW | PAGE_FLAG_FREE)) && (p->flags & PAGE_FLAG_CHAINED) &&
+                           !(heapu[id / 8] & (1u << (id % 8)));
+        overflow_unused = overflow_unused || heap_unused;
         bool was_free = (p->flags & PAGE_FLAG_FREE) != 0;
         if (overflow_unused) {
             p->flags = PAGE_FLAG_FREE;                  // anche il "successivo" della catena azzerato
@@ -234,17 +340,29 @@ static bool do_vacuum(int* freed) {
         if (overflow_unused || was_free) bp_add_free(g_db.bp, id);
     }
     free(used);
+    free(heapu);
+    atomic_store(&g_sv_abandoned_pages, 0);
     bp_flush_all(g_db.bp);
     sv_fsync(g_db.db_fd);
     free_list_save();
     return true;
 }
 
+// VACUUM automatico: con più di 4 MB abbandonati (catene di righe grandi sostituite, tabelle eliminate) e
+// nessuna transazione aperta. Prima lo spazio restava perso fino a un VACUUM a mano
+#define SV_AUTO_VACUUM_PAGES 1024
+static bool do_vacuum(int* freed);
+
 static void maybe_checkpoint(void) {
-    if (g_db.initialized && g_open_tx == 0 && wal_size(g_db.wal) > SV_WAL_CHECKPOINT_BYTES) do_checkpoint();
+    if (!g_db.initialized || g_open_tx != 0) return;
+    if (atomic_load(&g_sv_abandoned_pages) > SV_AUTO_VACUUM_PAGES) { int fr = 0; do_vacuum(&fr); return; }
+    if (wal_size(g_db.wal) > SV_WAL_CHECKPOINT_BYTES) do_checkpoint();
 }
 
 static int g_num_savepoints;
+static int64_t g_tx_start;      // transazione attiva: posizione del suo BEGIN nel log
+static bool g_tx_ddl;           // ... e se ha cambiato lo schema (o eseguito procedure)
+static bool g_chg_lost;         // una modifica non è stata registrata (memoria): ROLLBACK invalida tutto
 
 // utente della sessione ("" = root, tutto permesso: la GUI). Lo imposta il server per ogni richiesta
 static char g_session_user[64];
@@ -264,7 +382,9 @@ static QueryResult* exec_atomic(ASTNode* stmt) {
     // INSERT IGNORE / REPLACE / ON DUPLICATE KEY UPDATE: più passi (INSERT, DELETE, UPDATE) per uno statement
     bool mysql_insert = (stmt->type == NODE_INSERT && (stmt->insert_stmt.mode != INS_NORMAL || stmt->insert_stmt.num_dup > 0)) ||
                         (stmt->type == NODE_UPDATE && stmt->update_stmt.multi_from) ||
-                        (stmt->type == NODE_DELETE && stmt->delete_stmt.multi_from);
+                        (stmt->type == NODE_DELETE && stmt->delete_stmt.multi_from) ||
+                        (dml && stmt->returning) ||          // RETURNING si calcola dopo la scrittura: se fallisce, niente righe
+                        stmt->type == NODE_MERGE;            // MERGE: più statement interni
     if (stmt->type != NODE_CALL && !mysql_insert && (!dml || !db || db->num_triggers == 0)) return executor_run(&g_db.exec_ctx, stmt);
     if (!g_db.exec_ctx.tx_id) {
         if (!db_begin()) return executor_run(&g_db.exec_ctx, stmt);
@@ -303,6 +423,8 @@ static int qual_db_index(const ASTNode* stmt, int cur, char* err, size_t errn) {
 }
 
 static QueryResult* exec_one_in(ASTNode* stmt);
+static void tx_end(bool committed);
+static char g_tx_err[400];
 static _Thread_local char g_see_user[64];
 static bool see_db_of_session(const char* db) { return auth_can_see_db(g_see_user[0] ? g_see_user : g_session_user, db); }
 static bool db_backup_impl(const char* dir, char* err, size_t errn);
@@ -362,7 +484,9 @@ static long long maint_count(const char* sql, char* err, size_t en) {
     ParseResult* pr = tk ? parser_parse(tk) : NULL;
     long long v = -1;
     if (pr && pr->success && pr->count == 1) {
+        g_db.exec_ctx.priv_off++;                         // query interna: i permessi li ha già controllati auth_check
         QueryResult* r = executor_run(&g_db.exec_ctx, pr->statements[0]);
+        g_db.exec_ctx.priv_off--;
         if (r && r->success && r->num_rows > 0 && r->num_cols > 0 && !r->rows[0].cells[0].is_null) v = atoll(r->rows[0].cells[0].value);
         else if (r && r->success) v = 0;
         else snprintf(err, en, "%.250s", r ? r->error : "out of memory");
@@ -495,7 +619,17 @@ static bool proc_auth(const ASTNode* st, char* err, size_t errn) {
 // esegue uno statement già analizzato (transazioni e CHECKPOINT gestiti qui)
 static QueryResult* exec_one_in(ASTNode* stmt) {
     QueryResult* result = NULL;
+    // dopo un errore di I/O: nessuno statement (nemmeno le letture, che vedrebbero pagine non salvate);
+    // ROLLBACK libera comunque la transazione in memoria
+    if (io_failed()) {
+        if ((stmt->type == NODE_ROLLBACK || stmt->type == NODE_COMMIT) && g_db.exec_ctx.tx_id) { snprintf(g_tx_err, sizeof(g_tx_err), "%s", io_failed_msg()); tx_end(false); }
+        return result_error(io_failed_msg());
+    }
     g_db.exec_ctx.auth_hook = g_session_user[0] ? proc_auth : NULL;
+    // permessi sulle tabelle, controllati dall'executor dove le apre (con information_schema
+    // g_session_user è vuoto: l'utente vero è in g_see_user)
+    g_db.exec_ctx.user = g_session_user[0] ? g_session_user : g_see_user[0] ? g_see_user : NULL;
+    g_db.exec_ctx.priv_off = 0;
     if (g_session_user[0]) {         // permessi dell'utente della sessione
         char err[300];
         if (!auth_check(g_session_user, stmt, cur_db_name(), err, sizeof(err))) return result_error(err);
@@ -504,15 +638,35 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
             if (!auth_check(g_session_user, stmt, stmt->qual_dbs[i], err, sizeof(err))) return result_error(err);
     }
     if (stmt->type == NODE_SET) {                 // variabili di sessione di MySQL: accettate
-        if (stmt->set_fk_checks >= 0) executor_set_fk_checks(stmt->set_fk_checks != 0);
+        // prima le assegnazioni (SET @OLD_FOREIGN_KEY_CHECKS = @@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS = 0
+        // dei dump: @OLD deve avere il valore di prima), poi il flag
         result = stmt->set_n > 0 ? executor_set_session_vars(&g_db.exec_ctx, stmt) : result_ok(0);   // SET @x = ...
+        if (stmt->set_cache_mb != -1 && result && result->success) {          // SET GLOBAL cache_size = MB
+            const char* why = NULL;
+            if (stmt->set_cache_mb < 1 || stmt->set_cache_mb > 65536) why = "cache_size is a number of megabytes (1 to 65536)";
+            else if (g_session_user[0] && !auth_is_admin(g_session_user)) why = "Access denied: only administrators can change cache_size";
+            else if (g_open_tx > 0) why = "cache_size cannot change while a transaction is open";
+            else if (!bp_resize(g_db.bp, cache_frames(stmt->set_cache_mb))) why = "cannot resize the page cache now";
+            else { g_cache_mb = stmt->set_cache_mb; executor_invalidate_indexes(); }
+            if (why) { db_result_free(result); result = result_error(why); }
+        }
+        if (stmt->set_sync == -2 && result && result->success) {
+            db_result_free(result);
+            result = result_error("synchronous must be OFF, NORMAL or FULL");
+        } else if (stmt->set_sync >= 0 && result && result->success) {
+            if (g_session_user[0] && !auth_is_admin(g_session_user)) {   // vale per tutti: solo un amministratore
+                db_result_free(result);
+                result = result_error("Access denied: only administrators can change synchronous");
+            } else g_sync_mode = stmt->set_sync;
+        }
+        if (stmt->set_fk_checks >= 0 && result && result->success) executor_set_fk_checks(stmt->set_fk_checks != 0);
     } else if (stmt->type == NODE_BEGIN) {
         result = db_begin() ? result_ok(0) : result_error("Failed to begin transaction");
     } else if (stmt->type == NODE_COMMIT) {
         // senza transazione aperta è un OK, come in MySQL (i dump finiscono spesso con COMMIT)
-        result = !g_db.exec_ctx.tx_id || db_commit() ? result_ok(0) : result_error("Failed to commit");
+        result = !g_db.exec_ctx.tx_id || db_commit() ? result_ok(0) : result_error(g_tx_err[0] ? g_tx_err : "Failed to commit");
     } else if (stmt->type == NODE_ROLLBACK && stmt->rollback_to.name[0] == 0) {
-        result = !g_db.exec_ctx.tx_id || db_rollback() ? result_ok(0) : result_error("Failed to rollback");
+        result = !g_db.exec_ctx.tx_id || db_rollback() ? result_ok(0) : result_error(g_tx_err[0] ? g_tx_err : "Failed to rollback");
     } else if (stmt->type == NODE_TABLE_MAINT) {
         result = exec_table_maint(stmt);
     } else if (stmt->type == NODE_BACKUP) {
@@ -529,20 +683,42 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
     } else if (stmt->type == NODE_SAVEPOINT) {
         result = db_savepoint(stmt->savepoint.name) ? result_ok(0) : result_error("Failed to set savepoint");
     } else if (stmt->type == NODE_ROLLBACK_TO) {
-        result = db_rollback_to(stmt->rollback_to.name) ? result_ok(0) : result_error("Failed to rollback to savepoint");
+        result = db_rollback_to(stmt->rollback_to.name) ? result_ok(0) : result_error(io_failed() ? io_failed_msg() : "Failed to rollback to savepoint");
     } else if (stmt->type == NODE_SELECT) {
         // sola lettura: interrompibile a metà
         atomic_store(&g_read_running, 1);
         if (atomic_load(&g_cancel_requested)) atomic_store(&g_sv_scan_cancel, 1);
         result = atomic_load(&g_sv_scan_cancel) ? NULL : executor_run(&g_db.exec_ctx, stmt);
         atomic_store(&g_read_running, 0);
-        if (atomic_load(&g_sv_scan_cancel)) {   // risultato parziale: scartato
+        if (atomic_load(&g_sv_scan_cancel) || sv_scan_cancelled()) {   // risultato parziale: scartato
             if (result) db_result_free(result);
             result = result_error("Query cancelled");
             atomic_store(&g_sv_scan_cancel, 0);
         }
     } else {
+        // interrompibile anche una scrittura (--timeout, KILL QUERY): si ferma nella fase di lettura, prima di
+        // scrivere (la scansione annullata fa fallire lo statement)
+        atomic_store(&g_read_running, 1);
+        if (atomic_load(&g_cancel_requested)) atomic_store(&g_sv_scan_cancel, 1);
         result = exec_atomic(stmt);
+        atomic_store(&g_read_running, 0);
+    }
+    // DDL (o procedure, che possono contenerne) dentro una transazione: il suo ROLLBACK invalida tutta la cache
+    if (g_db.exec_ctx.tx_id && stmt->type != NODE_SELECT && stmt->type != NODE_INSERT && stmt->type != NODE_UPDATE &&
+        stmt->type != NODE_DELETE && stmt->type != NODE_MERGE && stmt->type != NODE_SET && stmt->type != NODE_SHOW &&
+        stmt->type != NODE_DESCRIBE && stmt->type != NODE_EXPLAIN && stmt->type != NODE_SAVEPOINT &&
+        stmt->type != NODE_ROLLBACK_TO && stmt->type != NODE_BEGIN && stmt->type != NODE_USE) g_tx_ddl = true;
+    // scrittura in autocommit: su disco secondo synchronous
+    if (result && result->success && !g_db.exec_ctx.tx_id && g_db.wal && g_db.wal->unsynced && !io_failed() &&
+        stmt->type != NODE_SELECT && stmt->type != NODE_SHOW && stmt->type != NODE_DESCRIBE && stmt->type != NODE_EXPLAIN) {
+        double now = get_time_ms();
+        if (g_sync_mode == 2 || (g_sync_mode == 1 && now - g_last_sync >= SYNC_NORMAL_MS)) {
+            if (wal_flush(g_db.wal) == SV_OK) g_last_sync = now;
+        } else if (g_sync_mode >= 1) wal_write_buffer(g_db.wal);
+    }
+    if (io_failed() && result && result->success) {   // lo statement ha incontrato l'errore: non è salvato
+        db_result_free(result);
+        result = result_error(io_failed_msg());
     }
 
     // SHOW DATABASES: un utente vede solo i database in cui ha qualche permesso
@@ -575,7 +751,7 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
 }
 
 
-typedef struct { char name[64]; off_t offset; uint64_t chg_seq; } SavepointRec;
+typedef struct { char name[64]; int64_t offset; uint64_t chg_seq; } SavepointRec;
 
 struct DbSession {
     bool         fk_off;            // SET FOREIGN_KEY_CHECKS = 0 in questa sessione
@@ -585,7 +761,11 @@ struct DbSession {
     SavepointRec sp[64];
     int          nsp;
     char         user[64];
+    uint64_t     gen;               // avvio del motore a cui appartiene tx_id (dopo un riavvio non vale più)
+    int64_t      tx_start;          // posizione del BEGIN nel log (l'annullamento parte da lì)
+    bool         tx_ddl;            // la transazione ha cambiato lo schema: ROLLBACK invalida tutto
 };
+
 
 
 // ── letture della versione confermata (MVCC) ────────────────────
@@ -593,13 +773,39 @@ struct DbSession {
 // finisce. Una SELECT che troverebbe una tabella in scrittura altrui non aspetta: legge la versione
 // confermata (heap_snapshot), ricostruita da queste voci. Le scritture restano serializzate dai lock.
 
+// (database, tabella) delle modifiche: un id piccolo invece di due nomi copiati in ogni voce (184 -> 56 byte
+// per riga modificata); l'elenco degli id si svuota quando non ci sono più modifiche in sospeso
+typedef struct { char db[64], table[64]; } ChgTable;
+static ChgTable* g_ctab;
+static int       g_nctab, g_capctab;
+static int       g_ctab_last = -1;
+
+// id della tabella; create: aggiunto se manca. -1 = non c'è (o memoria esaurita)
+static int ctab_id(const char* db, const char* table, bool create) {
+    if (g_ctab_last >= 0 && g_ctab_last < g_nctab && !strcasecmp(g_ctab[g_ctab_last].table, table) && !strcasecmp(g_ctab[g_ctab_last].db, db))
+        return g_ctab_last;
+    for (int i = 0; i < g_nctab; i++)
+        if (!strcasecmp(g_ctab[i].table, table) && !strcasecmp(g_ctab[i].db, db)) return g_ctab_last = i;
+    if (!create || g_nctab >= 65535) return -1;
+    if (g_nctab == g_capctab) {
+        int nc = g_capctab ? g_capctab * 2 : 16;
+        ChgTable* nv = realloc(g_ctab, sizeof(ChgTable) * (size_t)nc);
+        if (!nv) return -1;
+        g_ctab = nv;
+        g_capctab = nc;
+    }
+    snprintf(g_ctab[g_nctab].db, sizeof(g_ctab[0].db), "%s", db);
+    snprintf(g_ctab[g_nctab].table, sizeof(g_ctab[0].table), "%s", table);
+    return g_ctab_last = g_nctab++;
+}
+
 typedef struct {
     uint64_t tx, seq;
-    char     db[64], table[64];
+    uint8_t* old;
+    uint32_t ol;
+    uint16_t tid;                  // ctab_id
     uint8_t  type;                 // LOG_INSERT / LOG_DELETE / LOG_UPDATE / LOG_UPDATE_MOVE; 0 = non registrata (memoria)
     RID      rid, nrid;
-    uint8_t* old;
-    size_t   ol;
 } TxChange;
 
 static TxChange* g_chg;
@@ -610,7 +816,7 @@ static void chg_hook(uint64_t tx, const char* db, const char* table, uint8_t typ
     if (g_nchg == g_capchg) {
         int nc = g_capchg ? g_capchg * 2 : 256;
         TxChange* nv = realloc(g_chg, sizeof(TxChange) * (size_t)nc);
-        if (!nv) { if (g_nchg) g_chg[g_nchg - 1].type = 0; return; }     // la transazione non si potrà leggere confermata
+        if (!nv) { if (g_nchg) g_chg[g_nchg - 1].type = 0; g_chg_lost = true; return; }   // la transazione non si potrà leggere confermata
         g_chg = nv;
         g_capchg = nc;
     }
@@ -618,15 +824,16 @@ static void chg_hook(uint64_t tx, const char* db, const char* table, uint8_t typ
     memset(c, 0, sizeof(*c));
     c->tx = tx;
     c->seq = ++g_chg_seq;
-    snprintf(c->db, sizeof(c->db), "%s", db);
-    snprintf(c->table, sizeof(c->table), "%s", table);
-    c->type = type;
+    int tid = ctab_id(db, table, true);
+    c->tid = (uint16_t)(tid < 0 ? 0 : tid);
+    c->type = tid < 0 ? 0 : type;
+    if (tid < 0) g_chg_lost = true;
     c->rid = rid;
     c->nrid = nrid;
     if (old && ol) {
         c->old = malloc(ol);
-        if (c->old) { memcpy(c->old, old, ol); c->ol = ol; }
-        else c->type = 0;
+        if (c->old) { memcpy(c->old, old, ol); c->ol = (uint32_t)ol; }
+        else { c->type = 0; g_chg_lost = true; }
     }
     g_nchg++;
 }
@@ -639,14 +846,51 @@ static void chg_drop(uint64_t tx, uint64_t after) {
         g_chg[k++] = g_chg[i];
     }
     g_nchg = k;
+    if (g_nchg == 0) { g_nctab = 0; g_ctab_last = -1; }   // nessuna modifica in sospeso: id da capo
 }
 
-typedef struct { RID rid; const uint8_t* old; size_t ol; bool fresh; } SnapRow;
+typedef struct { RID rid; const uint8_t* old; size_t ol; bool fresh, dead; } SnapRow;
 
 static int snaprow_cmp(const void* a, const void* b) {
     const SnapRow* x = a; const SnapRow* y = b;
     if (x->rid.page_id != y->rid.page_id) return x->rid.page_id < y->rid.page_id ? -1 : 1;
     return x->rid.slot_id < y->rid.slot_id ? -1 : x->rid.slot_id > y->rid.slot_id;
+}
+
+// RID -> posizione in SnapRow (indirizzamento aperto; -1 libero): la ricostruzione della versione confermata
+// era quadratica (ricerca lineare per ogni modifica), con 100 000 righe modificate ~5·10^9 confronti
+typedef struct { int* h; size_t cap; } RidMap;
+static size_t rid_hash(RID r, size_t cap) {
+    uint64_t k = ((uint64_t)r.page_id << 16 | r.slot_id) * 0x9E3779B97F4A7C15ULL;
+    return (size_t)(k >> 20) & (cap - 1);
+}
+static bool ridmap_grow(RidMap* mp, const SnapRow* m, int n) {
+    size_t nc = mp->cap ? mp->cap * 2 : 256;
+    while (nc < (size_t)n * 2 + 2) nc *= 2;
+    int* nh = malloc(sizeof(int) * nc);
+    if (!nh) return false;
+    for (size_t i = 0; i < nc; i++) nh[i] = -1;
+    for (int k = 0; k < n; k++) {
+        if (m[k].dead) continue;
+        size_t p = rid_hash(m[k].rid, nc);
+        while (nh[p] >= 0) p = (p + 1) & (nc - 1);
+        nh[p] = k;
+    }
+    free(mp->h);
+    mp->h = nh;
+    mp->cap = nc;
+    return true;
+}
+// voce viva con quel RID, o -1; slot: dove inserirla (se manca)
+static int ridmap_find(const RidMap* mp, const SnapRow* m, RID r, size_t* slot) {
+    size_t p = rid_hash(r, mp->cap);
+    while (mp->h[p] >= 0) {
+        const SnapRow* e = &m[mp->h[p]];
+        if (!e->dead && e->rid.page_id == r.page_id && e->rid.slot_id == r.slot_id) { *slot = p; return mp->h[p]; }
+        p = (p + 1) & (mp->cap - 1);
+    }
+    *slot = p;
+    return -1;
 }
 
 static HeapSnapshot g_snaps[16];
@@ -671,51 +915,67 @@ static bool snapshot_build(uint64_t tx, int dbi, const char* table, HeapSnapshot
     memset(out, 0, sizeof(*out));
     out->root = ts->root_page_id;
     int cap = 0, n = 0, ecap = 0;
-    SnapRow* m = NULL;              // posizione attuale -> origine (riga confermata o nuova)
-    for (int i = 0; i < g_nchg; i++) {
+    SnapRow* m = NULL;              // posizione attuale -> origine (riga confermata o nuova); dead = sostituita
+    RidMap mp = { NULL, 0 };
+    int tid = ctab_id(d->name, table, false);
+    bool fail = false;
+    for (int i = 0; tid >= 0 && i < g_nchg && !fail; i++) {
         const TxChange* c = &g_chg[i];
-        if (c->tx != tx || strcasecmp(c->db, d->name) || strcasecmp(c->table, table)) continue;
-        if (!c->type) { free(m); return false; }
-        if (n + 1 > cap) {
+        if (c->tx != tx || c->tid != (uint16_t)tid) continue;
+        if (!c->type) { fail = true; break; }
+        if (n + 2 > cap) {
             cap = cap ? cap * 2 : 64;
             SnapRow* nm = realloc(m, sizeof(SnapRow) * (size_t)cap);
-            if (!nm) { free(m); return false; }
+            if (!nm) { fail = true; break; }
             m = nm;
         }
-        int at = -1;
+        if ((size_t)(n + 2) * 2 > mp.cap && !ridmap_grow(&mp, m, n)) { fail = true; break; }
+        size_t slot;
         RID key = c->rid;
-        for (int k = 0; k < n; k++) if (m[k].rid.page_id == key.page_id && m[k].rid.slot_id == key.slot_id) { at = k; break; }
-        SnapRow origin = { key, c->old, c->ol, false };
+        int at = ridmap_find(&mp, m, key, &slot);
+        SnapRow origin = { key, c->old, c->ol, false, false };
         if (at >= 0) origin = m[at];
         switch (c->type) {
         case LOG_INSERT:
-            if (at >= 0) m[at] = (SnapRow){ key, NULL, 0, true };
-            else m[n++] = (SnapRow){ key, NULL, 0, true };
+            if (at >= 0) m[at] = (SnapRow){ key, NULL, 0, true, false };
+            else { m[n] = (SnapRow){ key, NULL, 0, true, false }; mp.h[slot] = n++; }
             break;
         case LOG_UPDATE:
-            if (at < 0) m[n++] = origin;                         // prima modifica: la versione confermata è la vecchia
+            if (at < 0) { m[n] = origin; mp.h[slot] = n++; }        // prima modifica: la versione confermata è la vecchia
             break;
-        case LOG_UPDATE_MOVE:
-            if (at >= 0) m[at] = m[--n];                         // la vecchia posizione non c'è più
+        case LOG_UPDATE_MOVE: {
+            if (at >= 0) m[at].dead = true;                        // la vecchia posizione non c'è più
             origin.rid = c->nrid;
-            m[n++] = origin;
+            origin.dead = false;
+            size_t s2;
+            int at2 = ridmap_find(&mp, m, origin.rid, &s2);
+            if (at2 >= 0) m[at2] = origin;
+            else { m[n] = origin; mp.h[s2] = n++; }
             break;
+        }
         case LOG_DELETE:
-            if (at >= 0) m[at] = m[--n];
-            if (!origin.fresh && origin.old) {                   // riga confermata cancellata: torna in fondo
+            if (at >= 0) m[at].dead = true;
+            if (!origin.fresh && origin.old) {                     // riga confermata cancellata: torna in fondo
                 if (out->nextra + 1 > ecap) {
                     ecap = ecap ? ecap * 2 : 16;
                     uint8_t** ne = realloc(out->extra, sizeof(uint8_t*) * (size_t)ecap);
                     size_t* nl = realloc(out->extra_len, sizeof(size_t) * (size_t)ecap);
                     if (ne) out->extra = ne;
                     if (nl) out->extra_len = nl;
-                    if (!ne || !nl) { free(m); return false; }
+                    if (!ne || !nl) { fail = true; break; }
                 }
                 out->extra[out->nextra] = (uint8_t*)origin.old;
                 out->extra_len[out->nextra++] = origin.ol;
             }
             break;
         }
+    }
+    free(mp.h);
+    if (fail) { free(m); return false; }
+    {   // via le voci sostituite
+        int k = 0;
+        for (int i = 0; i < n; i++) if (!m[i].dead) m[k++] = m[i];
+        n = k;
     }
     if (n) qsort(m, (size_t)n, sizeof(SnapRow), snaprow_cmp);
     out->hide = malloc(sizeof(RID) * (size_t)(n + 1));
@@ -1201,6 +1461,8 @@ static bool db_begin_impl(void) {
     g_db.exec_ctx.tx_id = tx->tx_id;
     g_num_savepoints = 0;
     g_open_tx++;
+    g_tx_start = wal_size(g_db.wal);              // il primo record della transazione (BEGIN) è qui
+    g_tx_ddl = false;
     wal_write(g_db.wal, LOG_BEGIN, tx->tx_id, 0,
               (SVRID){0,0}, NULL, 0, NULL, 0);
     return true;
@@ -1208,40 +1470,102 @@ static bool db_begin_impl(void) {
 
 static const void* lock_owner(void);
 
-static bool db_commit_impl(void) {
-    if (!g_db.initialized || !g_db.exec_ctx.tx_id) return false;
-    wal_write(g_db.wal, LOG_COMMIT, g_db.exec_ctx.tx_id, 0,
-              (SVRID){0,0}, NULL, 0, NULL, 0);
-    wal_flush(g_db.wal); // DEVE essere su disco prima del commit
-    txm_commit(g_db.txm, g_db.exec_ctx.tx_id);
+// dopo l'annullamento delle modifiche di tx (quelle dopo la sequenza after): via dalla cache solo le pagine
+// riscritte e, delle tabelle toccate, gli indici in memoria e la mappa dello spazio libero. Con DDL nella
+// transazione o modifiche non registrate si invalida tutto, come prima
+static void invalidate_after_undo(uint64_t tx, uint64_t after, const uint32_t* pages, int npages, bool undo_ok) {
+    if (!undo_ok || g_tx_ddl || g_chg_lost || !pages) {
+        bp_remove_all(g_db.bp);
+        executor_invalidate_indexes();
+        return;
+    }
+    for (int i = 0; i < npages; i++) bp_remove_page(g_db.bp, pages[i]);
+    uint8_t* seen = calloc((size_t)g_nctab + 1, 1);           // una volta per tabella
+    if (!seen) { bp_remove_all(g_db.bp); executor_invalidate_indexes(); return; }
+    for (int i = 0; i < g_nchg; i++) {
+        const TxChange* c = &g_chg[i];
+        if (c->tx != tx || c->seq <= after) continue;
+        if (c->tid >= g_nctab || seen[c->tid]) continue;
+        seen[c->tid] = 1;
+        const ChgTable* ct = &g_ctab[c->tid];
+        TableSchema* ts = catalog_get_table(g_db.catalog, ct->db, ct->table);
+        if (ts) executor_invalidate_table(g_db.bp, ct->db, ct->table, ts->root_page_id);
+        else { executor_invalidate_indexes(); break; }
+    }
+    free(seen);
+}
+
+// fine della transazione in memoria (dopo COMMIT, ROLLBACK, o un errore che li ha interrotti)
+static void tx_end(bool committed) {
+    if (committed) txm_commit(g_db.txm, g_db.exec_ctx.tx_id);
+    else txm_abort(g_db.txm, g_db.exec_ctx.tx_id);
     chg_drop(g_db.exec_ctx.tx_id, 0);
     g_db.exec_ctx.tx_id = 0;
     g_num_savepoints = 0;
     if (g_open_tx > 0) g_open_tx--;
+    if (g_open_tx == 0) g_chg_lost = false;
     lk_release_all(lock_owner());          // fine della transazione: i lock delle tabelle si liberano
+}
+
+static char g_tx_err[400];               // perché l'ultimo COMMIT / ROLLBACK non è riuscito
+
+static bool db_commit_impl(void) {
+    if (!g_db.initialized || !g_db.exec_ctx.tx_id) return false;
+    g_tx_err[0] = '\0';
+    if (io_failed()) {                     // nessuna garanzia: il recupero all'avvio la annullerà
+        snprintf(g_tx_err, sizeof(g_tx_err), "%s", io_failed_msg());
+        tx_end(false);
+        return false;
+    }
+    if (g_sync_mode == 0) {                // synchronous = OFF: il COMMIT resta nel log, senza fsync
+        bool w = wal_write(g_db.wal, LOG_COMMIT, g_db.exec_ctx.tx_id, 0, (SVRID){0,0}, NULL, 0, NULL, 0) == SV_OK &&
+                 wal_write_buffer(g_db.wal) == SV_OK;
+        if (!w) { snprintf(g_tx_err, sizeof(g_tx_err), "COMMIT failed, the transaction was not saved: %.300s", io_failed_msg()); tx_end(false); return false; }
+        tx_end(true);
+        return true;
+    }
+    // il record COMMIT deve essere su disco prima di rispondere OK. Se la scrittura o l'fsync falliscono
+    // il log torna alla lunghezza di prima, così il COMMIT non può arrivare su disco più tardi: la
+    // transazione non c'è (il recupero all'avvio la annulla) e la risposta lo dice
+    int64_t before = -1;
+    bool ok = wal_write_buffer(g_db.wal) == SV_OK;
+    if (ok) before = sv_lseek(g_db.wal->fd, 0, SEEK_END);
+    ok = ok && wal_write(g_db.wal, LOG_COMMIT, g_db.exec_ctx.tx_id, 0, (SVRID){0,0}, NULL, 0, NULL, 0) == SV_OK &&
+         wal_flush(g_db.wal) == SV_OK;
+    if (!ok) {
+        g_db.wal->failed = true;
+        g_db.wal->blen = 0;
+        if (before >= 0 && sv_ftruncate(g_db.wal->fd, before) != 0) {}
+        snprintf(g_tx_err, sizeof(g_tx_err), "COMMIT failed, the transaction was not saved: %.300s", io_failed_msg());
+        tx_end(false);
+        return false;
+    }
+    tx_end(true);
     return true;
 }
 
+// ROLLBACK: l'annullamento va su disco (CLR nel log, pagine, fsync) prima del record ABORT, che dice
+// al recupero "annullamento completo": un arresto a metà lascia una transazione che il recupero finisce
 static bool db_rollback_impl(void) {
     if (!g_db.initialized || !g_db.exec_ctx.tx_id) return false;
-    // Scrivi LOG_ABORT prima dell'undo per segnare la transazione
-    wal_write(g_db.wal, LOG_ABORT, g_db.exec_ctx.tx_id, 0,
-              (SVRID){0,0}, NULL, 0, NULL, 0);
-    // Flush WAL + buffer pool prima di leggere dal disco
-    wal_flush(g_db.wal);
-    bp_flush_all(g_db.bp);
-    // Applica le before-image dal WAL per annullare
-    wal_undo_tx(g_db.log_path, g_db.db_path, g_db.exec_ctx.tx_id);
-    // Invalida tutte le pagine in cache per forzare la rilettura dal disco
-    bp_remove_all(g_db.bp);
-    txm_abort(g_db.txm, g_db.exec_ctx.tx_id);
-    chg_drop(g_db.exec_ctx.tx_id, 0);
-    g_db.exec_ctx.tx_id = 0;
-    g_num_savepoints = 0;
-    if (g_open_tx > 0) g_open_tx--;
-    executor_invalidate_indexes();   // le righe sono tornate indietro (e possono aver cambiato posizione)
-    lk_release_all(lock_owner());
-    return true;
+    g_tx_err[0] = '\0';
+    // il log si legge dal BEGIN della transazione, non dall'inizio (O(transazione), non O(log))
+    uint32_t* pages = NULL;
+    int npages = 0;
+    bool undone = !io_failed() &&
+                  wal_flush(g_db.wal) == SV_OK &&          // il log da leggere, tutto nel file
+                  bp_flush_all(g_db.bp) == SV_OK &&        // l'annullamento legge le pagine dal file
+                  wal_undo_tx_from(g_db.wal, g_db.db_path, g_db.exec_ctx.tx_id, g_tx_start, &pages, &npages) == SV_OK;
+    bool ok = undone &&
+              wal_write(g_db.wal, LOG_ABORT, g_db.exec_ctx.tx_id, 0, (SVRID){0,0}, NULL, 0, NULL, 0) == SV_OK &&
+              wal_flush(g_db.wal) == SV_OK;
+    if (!ok && !io_failed()) g_db.wal->failed = true;     // (annullamento non riuscito: stato non più certo)
+    if (!ok) snprintf(g_tx_err, sizeof(g_tx_err), "ROLLBACK failed: %.300s", io_failed_msg());
+    // via dalla cache quello che l'annullamento ha cambiato sul file (solo quello)
+    invalidate_after_undo(g_db.exec_ctx.tx_id, 0, pages, npages, undone);
+    free(pages);
+    tx_end(false);
+    return ok;
 }
 
 // Simple savepoint tracking: store name and file offset
@@ -1263,13 +1587,14 @@ static bool db_savepoint_impl(const char* name) {
     // per annullare uno statement con trigger fallito)
     if (g_num_savepoints >= 64) return false;
     // Write LOG_SAVEPOINT to WAL
-    wal_write(g_db.wal, LOG_SAVEPOINT, g_db.exec_ctx.tx_id, 0,
-              (SVRID){0,0}, (const uint8_t*)name, strlen(name) + 1, NULL, 0);
-    wal_flush(g_db.wal);
+    // nel buffer, senza fsync (niente deve essere su disco prima del COMMIT); la posizione è la fine
+    // del record: file + buffer
+    if (io_failed() || wal_write(g_db.wal, LOG_SAVEPOINT, g_db.exec_ctx.tx_id, 0,
+                                 (SVRID){0,0}, (const uint8_t*)name, (uint32_t)strlen(name) + 1, NULL, 0) != SV_OK) return false;
 
     // Record offset
     snprintf(g_savepoints[g_num_savepoints].name, sizeof(g_savepoints[g_num_savepoints].name), "%s", name);
-    g_savepoints[g_num_savepoints].offset = sv_lseek(g_db.wal->fd, 0, SEEK_CUR);
+    g_savepoints[g_num_savepoints].offset = wal_size(g_db.wal);
     g_savepoints[g_num_savepoints].chg_seq = g_chg_seq;
     g_num_savepoints++;
     return true;
@@ -1283,23 +1608,26 @@ static bool db_rollback_to_impl(const char* name) {
     }
     if (sp_idx < 0) return false;
 
-    wal_flush(g_db.wal);
-    bp_flush_all(g_db.bp);
-
-    // annulla le voci della transazione scritte dopo il savepoint (stesso undo del ROLLBACK)
-    off_t sp_off = g_savepoints[sp_idx].offset;
-    chg_drop(g_db.exec_ctx.tx_id, g_savepoints[sp_idx].chg_seq);
-    wal_undo_tx_from(g_db.log_path, g_db.db_path, g_db.exec_ctx.tx_id, (long)sp_off);
-
+    if (io_failed()) return false;
+    int64_t sp_off = g_savepoints[sp_idx].offset;
+    // annulla le voci della transazione scritte dopo il savepoint (stesso undo del ROLLBACK, con i CLR);
     // il log non si accorcia (dopo il savepoint ci sono anche le voci delle altre transazioni): una
     // voce ROLLBACK_TO dice a ROLLBACK e al recupero che quelle voci sono già state annullate
     int64_t sp64 = (int64_t)sp_off;
-    wal_write(g_db.wal, LOG_ROLLBACK_TO, g_db.exec_ctx.tx_id, 0, (SVRID){0,0}, (const uint8_t*)&sp64, 8, NULL, 0);
-    wal_flush(g_db.wal);
+    uint32_t* pages = NULL;
+    int npages = 0;
+    bool undone = wal_flush(g_db.wal) == SV_OK && bp_flush_all(g_db.bp) == SV_OK &&
+                  wal_undo_tx_from(g_db.wal, g_db.db_path, g_db.exec_ctx.tx_id, sp_off, &pages, &npages) == SV_OK;
+    bool ok = undone &&
+              wal_write(g_db.wal, LOG_ROLLBACK_TO, g_db.exec_ctx.tx_id, 0, (SVRID){0,0}, (const uint8_t*)&sp64, 8, NULL, 0) == SV_OK;
+    invalidate_after_undo(g_db.exec_ctx.tx_id, g_savepoints[sp_idx].chg_seq, pages, npages, undone);
+    free(pages);
+    if (!ok) {
+        if (!io_failed()) g_db.wal->failed = true;
+        return false;
+    }
+    chg_drop(g_db.exec_ctx.tx_id, g_savepoints[sp_idx].chg_seq);
     g_num_savepoints = sp_idx + 1;      // il savepoint resta (come in SQL): ci si può tornare ancora
-
-    bp_remove_all(g_db.bp);
-    executor_invalidate_indexes();
     return true;
 }
 
@@ -1483,16 +1811,36 @@ static void db_shutdown_impl(void) {
     g_session_user[0] = '\0';
     // una transazione lasciata aperta viene annullata (le sue pagine sono già nel buffer)
     if (g_db.exec_ctx.tx_id) db_rollback();
-    bp_flush_all(g_db.bp);
-    catalog_save(g_db.catalog, g_db.cat_path);
-    sv_fsync(g_db.db_fd);
-    free_list_save();
-    wal_flush(g_db.wal);
+    // Checkpoint finale (log eliminato) solo se tutto è confermato e su disco. Con transazioni ancora
+    // aperte in altre sessioni (un thread fermo a metà di una scrittura) le loro pagine possono
+    // arrivare sul file: il log resta, e il prossimo avvio le annulla con il recupero. Dopo un errore
+    // di I/O non si scrive più niente (le pagine senza il loro log violerebbero la regola del WAL).
+    bool clean = false;
+    if (!io_failed()) {
+        bool flushed = wal_flush(g_db.wal) == SV_OK && bp_flush_all(g_db.bp) == SV_OK;
+        bool cat = catalog_save(g_db.catalog, g_db.cat_path) == SV_OK;
+        if (flushed) free_list_save();
+        clean = flushed && cat && g_open_tx == 0;
+        if (!clean) fprintf(stderr, "[SegVault] %s: the transaction log is kept, the next start recovers from it\n",
+                            g_open_tx > 0 ? "transactions still open at shutdown" : "the data could not be written to disk");
+    }
     g_db.bp->before_write = NULL;          // il log sta per essere chiuso
+    g_db.bp->on_link = NULL;
+    if (io_failed()) g_db.bp->io_error = true;   // bp_destroy non scrive più pagine
+    if (!io_failed()) wal_write_buffer(g_db.wal);
+    else g_db.wal->blen = 0;
     wal_destroy(g_db.wal);
     // checkpoint: tutte le modifiche sono su disco, il log non serve più.
     // Al prossimo avvio il recovery lavora solo dopo un arresto anomalo.
-    remove(g_db.log_path);
+    if (clean) remove(g_db.log_path);
+    // le transazioni delle altre sessioni finiscono qui (il recupero al prossimo avvio le annulla):
+    // niente contatori, modifiche in sospeso o lock che sopravvivono al riavvio
+    g_open_tx = 0;
+    for (int i = 0; i < g_nchg; i++) free(g_chg[i].old);
+    g_nchg = 0;
+    g_nctab = 0;
+    g_ctab_last = -1;
+    lk_reset();
     bp_destroy(g_db.bp);
     txm_destroy(g_db.txm);
     catalog_free(g_db.catalog);
@@ -1687,6 +2035,9 @@ static const void* lock_owner(void) { return g_active ? (const void*)g_active : 
 static void session_save(DbSession* s) {
     s->cur_db = g_db.catalog ? g_db.catalog->current_db : -1;
     s->tx_id = g_db.exec_ctx.tx_id;
+    s->gen = g_engine_gen;
+    s->tx_start = g_tx_start;
+    s->tx_ddl = g_tx_ddl;
     s->fk_off = !executor_fk_checks();
     s->uvars = executor_uservars();
     s->nsp = g_num_savepoints;
@@ -1696,10 +2047,13 @@ static void session_save(DbSession* s) {
 
 static void session_load(const DbSession* s) {
     if (g_db.catalog) g_db.catalog->current_db = s->cur_db < g_db.catalog->num_databases ? s->cur_db : -1;
-    g_db.exec_ctx.tx_id = s->tx_id;
+    bool same = s->gen == g_engine_gen;      // una transazione di prima del riavvio è già stata annullata
+    g_db.exec_ctx.tx_id = same ? s->tx_id : 0;
+    g_tx_start = same ? s->tx_start : 0;
+    g_tx_ddl = same && s->tx_ddl;
     executor_set_fk_checks(!s->fk_off);
     executor_set_uservars(s->uvars);
-    g_num_savepoints = s->nsp;
+    g_num_savepoints = same ? s->nsp : 0;
     memcpy(g_savepoints, s->sp, sizeof(g_savepoints));
     snprintf(g_session_user, sizeof(g_session_user), "%s", s->user);
 }
@@ -1792,8 +2146,8 @@ QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char
         if (!strcasecmp(t->text, "NEXTVAL") || !strcasecmp(t->text, "SETVAL") || !strcasecmp(t->text, "NEXT")) { ok = false; break; }   // sequenze
         if (idx >= 0 && i + 1 < tokens->count && tokens->tokens[i + 1].type == TOK_LPAREN) {
             const Database* d = &g_db.catalog->databases[idx];
-            for (int r = 0; r < d->num_routines && ok; r++)
-                if (d->routines[r].is_function && !strcasecmp(d->routines[r].name, t->text)) ok = false;
+            for (int ri = 0; ri < d->num_routines && ok; ri++)
+                if (d->routines[ri].is_function && !strcasecmp(d->routines[ri].name, t->text)) ok = false;
         }
     }
     char err[300];
@@ -1826,6 +2180,9 @@ QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char
             sv_scan_set_deadline(timeout_ms > 0 ? t0 + timeout_ms : 0);
             ExecCtx ctx = g_db.exec_ctx;              // copia: nessuna transazione, niente stato condiviso
             ctx.tx_id = 0;
+            ctx.user = user && user[0] ? user : NULL;  // permessi di chi legge (non della sessione attiva)
+            ctx.priv_off = 0;
+            ctx.auth_hook = NULL;
             r = executor_run(&ctx, parsed->statements[0]);
             bool late = timeout_ms > 0 && get_time_ms() > t0 + timeout_ms && (!r || !r->success);
             sv_scan_set_deadline(0);
@@ -1883,11 +2240,29 @@ bool db_set_user(const char* name) {
 
 const char* db_session_user(void) { return g_session_user; }
 
+// l'hash della password (20 000 giri di SHA-256) si calcola fuori dal lock del motore: un'ondata di
+// login sbagliati non ferma più le query di tutti
 bool db_login(const char* name, const char* password) {
+    if (!name || !name[0]) return false;
+    char salt[33], hash[65];
     db_lock();
-    bool ok = name && name[0] && auth_login(name, password);
+    bool found = auth_user_secret(name, salt, hash);
+    db_unlock();
+    bool ok = found && auth_password_matches(salt, hash, password);
+    memset(hash, 0, sizeof(hash));
+    if (!ok) return false;
+    db_lock();                                    // password cambiata o utente eliminato nel frattempo?
+    char s2[33], h2[65];
+    ok = auth_user_secret(name, s2, h2) && !strcmp(s2, salt) && auth_password_matches(s2, h2, password);
     db_unlock();
     return ok;
+}
+
+unsigned long db_users_version(void) {
+    db_lock();
+    unsigned long v = auth_users_version();
+    db_unlock();
+    return v;
 }
 
 int db_login_native(const char* user, const uint8_t scramble[20], const uint8_t* resp, size_t rlen) {
@@ -1903,6 +2278,85 @@ bool db_user_can_see(const char* user, const char* db, const char* table) {
     bool r = table ? auth_privs(user, db, table) != 0 : auth_can_see_db(user, db);
     db_unlock();
     return r;
+}
+
+bool db_endpoint_runas(const char* db, const char* definer, char* user_out, size_t un, bool* may_public,
+                       char* err, size_t errn) {
+    user_out[0] = '\0';
+    *may_public = true;
+    db_lock();
+    bool ok = true;
+    if (auth_user_count() == 0) {}                     // nessun utente: tutti hanno tutti i permessi
+    else if (definer && definer[0]) {                  // salvato da un utente: i suoi permessi
+        if (!auth_user_exists(definer)) {
+            snprintf(err, errn, "the user who saved this endpoint ('%.63s') no longer exists", definer);
+            ok = false;
+        } else {
+            snprintf(user_out, un, "%s", definer);
+            *may_public = auth_is_admin(definer);
+        }
+    } else if (definer) {}                             // "" = salvato da root (token, GUI)
+    // senza autore registrato (tabella di prima della 1.3): tutti i permessi solo se nessun utente
+    // che non sia amministratore può averla scritta
+    else if (!auth_only_admins(db, AUTH_ENDPOINTS_TABLE, AUTH_INSERT | AUTH_UPDATE | AUTH_ALTER | AUTH_DROP)) {
+        snprintf(err, errn, AUTH_ENDPOINTS_TABLE " in '%.63s' can be changed by users who are not administrators, and this "
+                 "endpoint has no author: an administrator must run ALTER TABLE " AUTH_ENDPOINTS_TABLE
+                 " ADD COLUMN definer VARCHAR(64) and save the endpoint again", db);
+        ok = false;
+    }
+    db_unlock();
+    return ok;
+}
+
+size_t db_value_bytes(const char* v, char* out) { return v ? sv_bin_decode(v, strlen(v), out) : 0; }
+
+void db_set_cache_size(long mb) { g_cache_mb = mb > 0 ? mb : 0; }
+long db_cache_size(void) { return g_db.bp ? (long)((long long)g_db.bp->capacity * SV_PAGE_SIZE / (1024 * 1024)) : g_cache_mb; }
+
+bool db_set_synchronous(const char* mode) {
+    for (int i = 0; i < 3; i++)
+        if (mode && !strcasecmp(mode, SYNC_NAMES[i])) { db_lock(); g_sync_mode = i; db_unlock(); return true; }
+    return false;
+}
+
+const char* db_synchronous(void) { return SYNC_NAMES[g_sync_mode]; }
+
+void db_set_thread_cancel(atomic_int* flag) { sv_scan_set_cancel(flag); }
+
+// colonne di una SELECT senza eseguirla (PREPARE del protocollo MySQL): niente righe lette, nessun lock,
+// nessun effetto (NEXTVAL, funzioni dell'utente, FOR UPDATE). NULL se non è una SELECT sola
+QueryResult* db_describe(const char* sql) {
+    if (!g_db.initialized || !sql) return NULL;
+    TokenList* tk = lexer_tokenize(sql);
+    ParseResult* pr = tk ? parser_parse(tk) : NULL;
+    QueryResult* r = NULL;
+    if (pr && !pr->success) r = result_error(pr->error);
+    else if (pr && pr->count == 1 && pr->statements[0]->type == NODE_SELECT && pr->statements[0]->select_stmt.num_into == 0) {
+        db_lock();
+        char err[300];
+        if (g_session_user[0] && !auth_check(g_session_user, pr->statements[0], cur_db_name(), err, sizeof(err))) r = result_error(err);
+        else {
+            g_db.exec_ctx.user = g_session_user[0] ? g_session_user : NULL;
+            g_db.exec_ctx.priv_off = 0;
+            executor_set_describe(true);
+            r = executor_run(&g_db.exec_ctx, pr->statements[0]);
+            executor_set_describe(false);
+        }
+        db_unlock();
+    }
+    if (pr) parse_result_free(pr);
+    if (tk) lexer_free(tk);
+    return r;
+}
+
+void db_sync_tick(void) {
+    if (!g_db.initialized || g_lock_depth) return;
+    if (!sv_rw_trywr(&g_db_rw)) return;              // il motore è occupato: lo statement successivo farà il sync
+    g_lock_depth = 1;
+    double now = get_time_ms();
+    if (g_db.initialized && g_sync_mode >= 1 && g_db.wal && g_db.wal->unsynced && !g_db.exec_ctx.tx_id && !io_failed() &&
+        now - g_last_sync >= SYNC_NORMAL_MS && wal_flush(g_db.wal) == SV_OK) g_last_sync = now;
+    db_unlock();
 }
 
 bool db_has_users(void) {
@@ -2070,7 +2524,7 @@ static bool bk_copy(const char* from, const char* to, bool must_exist, char* err
         snprintf(err, errn, "cannot read %.400s", from);
         return false;
     }
-    int out = sv_open(to, SV_O_WRONLY | SV_O_CREAT | SV_O_TRUNC, 0644);
+    int out = sv_open(to, SV_O_WRONLY | SV_O_CREAT | SV_O_TRUNC, 0600);
     if (out < 0) { sv_close(in); snprintf(err, errn, "cannot write %.400s", to); return false; }
     char* buf = malloc(1 << 20);
     bool ok = buf != NULL;

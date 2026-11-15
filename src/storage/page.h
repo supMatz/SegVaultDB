@@ -60,6 +60,10 @@ void    page_free(Page* p);
 int     page_write(Page* p, int fd);
 Page* page_read(uint32_t id, int fd);
 
+// La pagina letta dal disco è coerente? (page_id giusto, slot dentro la pagina, spazio libero
+// plausibile): una pagina danneggiata non viene mai usata, la lettura fallisce
+bool    page_validate(const Page* p, uint32_t id);
+
 // Inserisce dati nel payload, aggiorna la slot directory
 // Ritorna lo slot_id assegnato, o SV_FULL se non c'è spazio
 int     page_insert(Page* p, const void* data, uint16_t len);
@@ -69,6 +73,15 @@ const void* page_get_slot(Page* p, uint16_t slot_id, uint16_t* out_len);
 
 // Marca uno slot come eliminato (len = 0)
 int     page_delete_slot(Page* p, uint16_t slot_id);
+
+// Lo slot eliminato slot_id è l'ultimo della pagina: esce dalla directory (4 byte di nuovo liberi). Solo per
+// l'annullamento di un inserimento (e il suo CLR nel recupero): così annullare non consuma spazio della pagina
+void    page_pop_slot(Page* p, uint16_t slot_id);
+
+// Rimette una riga in uno slot eliminato, allo stesso slot_id (annullamento di una cancellazione:
+// il RID non cambia e lo spazio basta sempre, perché la riga c'era). SV_OK, SV_DUPLICATE se lo slot è
+// già vivo, SV_FULL, SV_NOT_FOUND
+int     page_revive_slot(Page* p, uint16_t slot_id, const void* data, uint16_t len);
 
 // Spazio utilizzabile per un inserimento: libero + recuperabile compattando
 uint16_t page_usable_space(const Page* p);

@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
                         printf("\n");
                     }
                     if (q->num_rows > 12) printf("  ... (%d rows)\n", q->num_rows);
-                } else printf("  OK (%d)\n", q->rows_affected);
+                } else printf("  OK (%lld)\n", q->rows_affected);
             }
             db_result_free(q);
             free(stmt);

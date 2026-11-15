@@ -60,6 +60,12 @@ const uint8_t* heap_scan_next_raw(HeapScan* scan, RID* out_rid, size_t* out_len)
 // scarta le free-space map (da chiamare quando le pagine cambiano fuori da heap.c: ROLLBACK)
 void heap_cache_clear(void);
 // VACUUM: segna nella bitmap le pagine di overflow usate dalle righe della tabella
+#include <stdatomic.h>
+// pagine abbandonate dall'ultimo VACUUM (catene di overflow di righe eliminate o sostituite, tabelle
+// eliminate): fanno partire un VACUUM automatico
+extern atomic_int g_sv_abandoned_pages;
+// se non NULL, heap_mark_overflow vi segna anche le pagine della catena della tabella (VACUUM)
+extern uint8_t* heap_pages_bitmap;
 void heap_mark_overflow(HeapFile* hf, uint8_t* bitmap, uint32_t nbits);
 void heap_cache_forget(BufferPool* bp, uint32_t root_page_id);
 
@@ -71,6 +77,14 @@ extern atomic_int g_sv_scan_cancel;
 void sv_scan_set_deadline(double deadline_ms);
 // la lettura in corso va interrotta? (annullamento globale o scadenza del thread)
 bool sv_scan_cancelled(void);
+// flag di annullamento della connessione di questo thread (KILL QUERY id): le scansioni lo guardano anche
+void sv_scan_set_cancel(atomic_int* flag);
 void heap_scan_close(HeapScan* scan);
+
+// Una scansione di questo thread ha trovato una pagina illeggibile o danneggiata, una catena di overflow
+// rotta o una riga che non si decodifica: lo statement deve fallire, mai finire con meno righe.
+// heap_damage: true se è successo dall'ultimo heap_damage_clear (messaggio in msg)
+void heap_damage_clear(void);
+bool heap_damage(char* msg, size_t n);
 
 #endif

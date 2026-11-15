@@ -192,7 +192,10 @@ int heap_insert(HeapFile* hf, Tuple* t, TableSchema* schema, RID* out_rid) {
     size_t tuple_len;
     uint8_t* data = tuple_serialize(t, schema, &tuple_len);
     if (!data) return SV_ERR;
-    if (tuple_len > OV_INLINE_MAX) {            // riga grande: in pagine di overflow, nello slot lo stub
+    // riga grande: in pagine di overflow, nello slot lo stub. Anche una riga che per caso (o ad arte) ha la
+    // forma di uno stub va in overflow: così uno slot con la forma di uno stub è sempre uno stub vero, e
+    // una riga costruita non può puntare alla catena di un'altra tabella (P1.12)
+    if (tuple_len > OV_INLINE_MAX || ov_is_stub(data, tuple_len, NULL, NULL)) {
         uint8_t* stub = malloc(OV_STUB_LEN);
         int rc = stub ? ov_store_bp(hf->bp, data, tuple_len, stub) : SV_ERR;
         free(data);
@@ -255,12 +258,13 @@ int heap_insert(HeapFile* hf, Tuple* t, TableSchema* schema, RID* out_rid) {
     if (!p) { bp_unpin(hf->bp, new_pid, false); free(data); return SV_ERR; }
     p->flags |= PAGE_FLAG_CHAINED;
     page_set_next(p, 0);
+    // nel log prima dei collegamenti: se la pagina o il puntatore non arrivano su disco (caduta di
+    // corrente prima di un checkpoint), il recupero li ricrea (LOG_LINK)
+    if (hf->bp->on_link) hf->bp->on_link(hf->bp->on_link_ctx, hf->root_page_id ? hf->last_page_id : 0, new_pid);
 
-    // i collegamenti della catena vanno subito su disco (prima la pagina nuova, poi il
-    // puntatore): il WAL ricostruisce le righe, non i collegamenti, e dopo un crash le
-    // pagine non collegate sarebbero irraggiungibili
+    // la pagina nuova e il collegamento restano nella cache come le altre: il record LOG_LINK (scritto sopra)
+    // li fa ricreare dal recupero se non arrivano su disco (prima: due scritture di pagina in più ogni volta)
     bp_unpin(hf->bp, new_pid, true);
-    bp_flush_page(hf->bp, new_pid);
     p = bp_fetch(hf->bp, new_pid);
     if (!p) { bp_unpin(hf->bp, new_pid, false); free(data); return SV_ERR; }
     if (hf->root_page_id == 0) {
@@ -271,7 +275,6 @@ int heap_insert(HeapFile* hf, Tuple* t, TableSchema* schema, RID* out_rid) {
             page_set_next(last, new_pid);
             last->flags |= PAGE_FLAG_CHAINED;
             bp_unpin(hf->bp, hf->last_page_id, true);
-            bp_flush_page(hf->bp, hf->last_page_id);
         }
     }
     hf->last_page_id = new_pid;
@@ -363,8 +366,13 @@ int heap_delete(HeapFile* hf, RID rid) {
     Page* p = bp_fetch(hf->bp, rid.page_id);
     if (!p) return SV_NOT_FOUND;
     uint16_t len = 0;
-    page_get_slot(p, rid.slot_id, &len);
+    const void* old = page_get_slot(p, rid.slot_id, &len);
+    uint32_t ovtotal = 0;
+    bool stub = old && ov_is_stub(old, len, &ovtotal, NULL);
     int rc = page_delete_slot(p, rid.slot_id);
+    // una riga grande eliminata (o sostituita da un UPDATE): la sua catena di overflow non serve più;
+    // il conteggio fa partire un VACUUM automatico al prossimo checkpoint (vedi db_api.c)
+    if (rc == SV_OK && stub) atomic_fetch_add(&g_sv_abandoned_pages, (int)(ovtotal / (SV_PAGE_SIZE - 16) + 1));
     if (rc == SV_OK && hf->meta) {
         // lo spazio della riga torna utilizzabile (con la compattazione della pagina)
         int64_t idx = meta_index(hf->meta, rid.page_id);
@@ -400,18 +408,41 @@ HeapScan* heap_scan_open(HeapFile* hf, TableSchema* schema) {
 }
 
 atomic_int g_sv_scan_cancel = 0;
+atomic_int g_sv_abandoned_pages = 0;
 static _Thread_local double g_scan_deadline;
 static _Thread_local unsigned g_scan_ticks;
 
 void sv_scan_set_deadline(double deadline_ms) { g_scan_deadline = deadline_ms; g_scan_ticks = 0; }
 
+static _Thread_local atomic_int* t_cancel;          // annullamento di questa connessione (KILL QUERY)
+void sv_scan_set_cancel(atomic_int* flag) { t_cancel = flag; }
+
 bool sv_scan_cancelled(void) {
     if (atomic_load(&g_sv_scan_cancel)) return true;
+    if (t_cancel && atomic_load(t_cancel)) return true;
     if (g_scan_deadline > 0 && (++g_scan_ticks & 255) == 0 && sv_get_time_ms() > g_scan_deadline) {
         g_scan_ticks = 255;                  // da qui in poi si controlla ogni volta
         return true;
     }
     return false;
+}
+
+static _Thread_local struct { bool set; uint32_t page; const char* what; } t_damage;
+
+static void damage(uint32_t page, const char* what) {
+    if (t_damage.set) return;                    // il primo danno trovato
+    t_damage.set = true;
+    t_damage.page = page;
+    t_damage.what = what;
+}
+
+void heap_damage_clear(void) { t_damage.set = false; }
+
+bool heap_damage(char* msg, size_t n) {
+    if (!t_damage.set) return false;
+    if (msg && n) snprintf(msg, n, "Page %u of the data file is %s: the statement was stopped (run CHECK TABLE)",
+                           t_damage.page, t_damage.what);
+    return true;
 }
 
 static void scan_release(HeapScan* scan) {
@@ -426,7 +457,7 @@ const uint8_t* heap_scan_next_raw(HeapScan* scan, RID* out_rid, size_t* out_len)
         if (!scan->page || scan->page->page_id != scan->current_page) {
             scan_release(scan);
             scan->page = bp_fetch(scan->hf->bp, scan->current_page);
-            if (!scan->page) break;
+            if (!scan->page) { damage(scan->current_page, "damaged or unreadable"); break; }
         }
         Page* p = scan->page;
         while (scan->current_slot < p->num_slots) {
@@ -449,7 +480,7 @@ const uint8_t* heap_scan_next_raw(HeapScan* scan, RID* out_rid, size_t* out_len)
                     free(scan->ovbuf);
                     size_t n = 0;
                     scan->ovbuf = ov_load_bp(scan->hf->bp, data, len, &n);
-                    if (!scan->ovbuf) continue;                 // catena illeggibile: riga saltata
+                    if (!scan->ovbuf) { damage(scan->current_page, "pointing to a damaged overflow chain"); continue; }
                     if (out_len) *out_len = n;
                     return scan->ovbuf;
                 }
@@ -480,7 +511,7 @@ Tuple* heap_scan_next(HeapScan* scan, RID* out_rid) {
     const uint8_t* data;
     while ((data = heap_scan_next_raw(scan, &rid, &len)) != NULL) {
         Tuple* t = tuple_deserialize(data, len, scan->schema);
-        if (!t) continue;                     // riga illeggibile: saltata come prima
+        if (!t) { damage(rid.page_id, "holding a row that cannot be decoded"); continue; }
         t->rid = rid;
         if (out_rid) *out_rid = rid;
         return t;
@@ -495,11 +526,14 @@ void heap_scan_close(HeapScan* scan) {
     free(scan);
 }
 
+uint8_t* heap_pages_bitmap;
+
 void heap_mark_overflow(HeapFile* hf, uint8_t* bitmap, uint32_t nbits) {
     uint32_t pid = hf ? hf->root_page_id : 0, count = 0;
     while (pid && count++ < HEAP_MAX_CHAIN) {
         Page* p = bp_fetch(hf->bp, pid);
-        if (!p) break;
+        if (!p) { damage(pid, "damaged or unreadable"); break; }   // catena interrotta: VACUUM non libera niente
+        if (heap_pages_bitmap && pid < nbits) heap_pages_bitmap[pid / 8] |= (uint8_t)(1u << (pid % 8));   // pagina della tabella
         for (uint16_t s = 0; s < p->num_slots; s++) {
             uint16_t len;
             const void* d = page_get_slot(p, s, &len);

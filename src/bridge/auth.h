@@ -28,7 +28,8 @@ SCOPO: utenti e permessi del motore (come gli account di MySQL).
 
 struct ASTNode;
 
-void auth_init(const char* data_dir);     // legge users.dat (se c'è)
+bool auth_init(const char* data_dir);     // legge users.dat (se c'è); false = file danneggiato (non toccato)
+const char* auth_init_error(void);
 void auth_shutdown(void);
 
 // istruzione di gestione degli utenti? (tokens = TokenList del solo statement). Se sì la esegue,
@@ -41,6 +42,14 @@ bool auth_check(const char* user, const struct ASTNode* stmt, const char* cur_db
 bool     auth_login(const char* user, const char* password);
 bool     auth_user_exists(const char* user);
 bool     auth_is_admin(const char* user);
+// login in due tempi: sale e hash copiati (sotto il lock del motore), poi l'hash lento calcolato fuori
+bool     auth_user_secret(const char* user, char salt[33], char hash[65]);
+bool     auth_password_matches(const char* salt, const char* hash, const char* password);
+unsigned long auth_users_version(void);   // cambia a ogni CREATE / ALTER / DROP USER, GRANT, REVOKE
+// nessun utente non amministratore ha uno dei permessi privs su db.table?
+bool     auth_only_admins(const char* db, const char* table, unsigned privs);
+// tabella degli endpoint salvati dell'API HTTP (vedi server.c)
+#define AUTH_ENDPOINTS_TABLE "api_endpoints"
 unsigned auth_privs(const char* user, const char* db, const char* table);   // permessi effettivi
 void auth_sha1(const void* data, size_t n, uint8_t out[20]);
 // login col protocollo MySQL (mysql_native_password): 1 = giusto, 0 = sbagliato,

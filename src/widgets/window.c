@@ -2110,7 +2110,7 @@ static bool draft_save(AppWindow* app) {
         if (app->draft_set[c] && !app->draft_null[c]) keys[k] = grid_edit_literal(&app->gedit, c, app->draft_vals[c]);
         else if (c == T->auto_col && res->last_insert_id > 0) {
             char num[24];
-            snprintf(num, sizeof(num), "%d", res->last_insert_id);
+            snprintf(num, sizeof(num), "%lld", res->last_insert_id);
             keys[k] = strdup(num);
         }
         if (!keys[k]) have = false;

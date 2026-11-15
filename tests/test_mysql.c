@@ -26,7 +26,7 @@ static void t(const char* sql, const char* expect) {
     char got[8192];
     if (!r) snprintf(got, sizeof(got), "ERR:(null result)");
     else if (!r->success) snprintf(got, sizeof(got), "ERR:%s", r->error);
-    else if (r->num_cols == 0) snprintf(got, sizeof(got), "OK:%d", r->rows_affected);
+    else if (r->num_cols == 0) snprintf(got, sizeof(got), "OK:%lld", r->rows_affected);
     else if (expect[0] == '#') snprintf(got, sizeof(got), "#%d", r->num_rows);
     else render(r, got, sizeof(got));
     bool ok = !strncmp(expect, "ERR:", 4) ? (!strncmp(got, "ERR:", 4) && strstr(got + 4, expect + 4)) : !strcmp(got, expect);

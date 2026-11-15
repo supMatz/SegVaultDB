@@ -50,7 +50,7 @@ enum { F_DATA = 0, F_HEADERS = 1, F_PRIORITY = 2, F_RST = 3, F_SETTINGS = 4, F_P
        F_WINDOW = 8, F_CONT = 9 };
 enum { FL_END_STREAM = 0x1, FL_ACK = 0x1, FL_END_HEADERS = 0x4, FL_PADDED = 0x8, FL_PRIORITY = 0x20 };
 enum { E_NO_ERROR = 0, E_PROTOCOL = 1, E_INTERNAL = 2, E_FLOW = 3, E_STREAM_CLOSED = 5, E_FRAME_SIZE = 6,
-       E_REFUSED = 7, E_CANCEL = 8, E_COMPRESSION = 9 };
+       E_REFUSED = 7, E_CANCEL = 8, E_COMPRESSION = 9, E_CALM = 11 /* ENHANCE_YOUR_CALM */ };
 
 #define MAX_FRAME        16384          // frame accettati e mandati (il valore iniziale del protocollo)
 #define MAX_STREAMS      64             // stream aperti insieme per connessione
@@ -266,8 +266,10 @@ static bool hpack_decode(DynTable* d, size_t max_table, const uint8_t* p, size_t
         if (ok) {
             if (k == cap) { cap *= 2; Hdr* nv = realloc(v, sizeof(Hdr) * (size_t)cap); if (!nv) { ok = false; } else v = nv; }
             if (ok && k < 512) {
-                snprintf(v[k].name, sizeof(v[k].name), "%s", nm);
-                for (char* c = v[k].name; *c; c++) *c = (char)tolower((unsigned char)*c);
+                // il nome resta com'è: HTTP/2 vuole nomi in minuscolo e uno in maiuscolo rende la richiesta
+                // malformata (open_stream la rifiuta); troppo lungo = non valido, mai troncato
+                if (strlen(nm) >= sizeof(v[k].name)) snprintf(v[k].name, sizeof(v[k].name), "\x01");
+                else snprintf(v[k].name, sizeof(v[k].name), "%s", nm);
                 v[k].value = strdup(val ? val : "");
                 k++;
             }
@@ -361,6 +363,10 @@ typedef struct {
     bool         hend_stream;
     bool         in_headers;
     bool         goaway;
+    // frame di controllo del client (RST_STREAM, PING, SETTINGS) nell'ultimo secondo: oltre il limite la
+    // connessione si chiude (attacco "rapid reset": aprire e annullare stream senza fine costa al server)
+    double       ctl_t0;
+    int          ctl_n;
 } Conn2;
 
 static bool send_frame(Conn2* c, int type, int flags, uint32_t id, const void* payload, size_t n) {
@@ -438,22 +444,44 @@ static bool valid_field(const char* s) {
     return true;
 }
 
+// nome di un campo HTTP/2: token di RFC 9110 in minuscolo (nient'altro va copiato in una richiesta HTTP/1.1)
+static bool valid_name(const char* n) {
+    if (!*n) return false;
+    for (const char* c = n; *c; c++) {
+        unsigned char u = (unsigned char)*c;
+        bool tch = (u >= 'a' && u <= 'z') || (u >= '0' && u <= '9') || strchr("!#$%&'*+-.^_`|~", u);
+        if (!tch || !u) return false;
+    }
+    return true;
+}
+
 // HEADERS completo: nuovo stream con la sua richiesta HTTP/1.1 verso il server interno
 static bool open_stream(Conn2* c, uint32_t id, const uint8_t* block, size_t n, bool end_stream) {
     Hdr* h = NULL;
     int nh = 0;
     if (!hpack_decode(&c->dec, 4096, block, n, &h, &nh)) { send_goaway(c, E_COMPRESSION); return false; }
     const char *method = NULL, *path = NULL, *authority = NULL, *scheme = NULL;
-    bool has_len = false, bad = false;
-    for (int i = 0; i < nh; i++) {
+    bool has_len = false, bad = false, regular = false;
+    // RFC 9113 §8.2-8.3: pseudo-intestazioni note, una volta sola e prima delle altre; nomi validi in
+    // minuscolo; niente campi della connessione; "te" solo "trailers"
+    for (int i = 0; i < nh && !bad; i++) {
+        const char* nm = h[i].name;
         if (!valid_field(h[i].value)) bad = true;
-        if (!strcmp(h[i].name, ":method")) method = h[i].value;
-        else if (!strcmp(h[i].name, ":path")) path = h[i].value;
-        else if (!strcmp(h[i].name, ":authority")) authority = h[i].value;
-        else if (!strcmp(h[i].name, ":scheme")) scheme = h[i].value;
-        else if (!strcmp(h[i].name, "content-length")) has_len = true;
-        else if (!strcmp(h[i].name, "host") && !authority) authority = h[i].value;
+        if (nm[0] == ':') {
+            const char** slot = !strcmp(nm, ":method") ? &method : !strcmp(nm, ":path") ? &path :
+                                !strcmp(nm, ":authority") ? &authority : !strcmp(nm, ":scheme") ? &scheme : NULL;
+            if (!slot || *slot || regular) bad = true;
+            else *slot = h[i].value;
+            continue;
+        }
+        regular = true;
+        if (!valid_name(nm)) bad = true;
+        else if (!strcmp(nm, "connection") || !strcmp(nm, "keep-alive") || !strcmp(nm, "proxy-connection") ||
+                 !strcmp(nm, "transfer-encoding") || !strcmp(nm, "upgrade")) bad = true;
+        else if (!strcmp(nm, "te") && strcmp(h[i].value, "trailers")) bad = true;
+        else if (!strcmp(nm, "content-length")) has_len = true;
     }
+    for (int i = 0; i < nh && !authority; i++) if (!strcmp(h[i].name, "host")) authority = h[i].value;
     (void)scheme;
     if (!method || !path || !path[0] || bad || !strcmp(method, "CONNECT")) {
         hdrs_free(h, nh);
@@ -720,9 +748,17 @@ static bool handle_settings(Conn2* c, const uint8_t* p, size_t n, int flags) {
     return true;
 }
 
+static double now_ms2(void);
+#define MAX_CTL_PER_SEC 200
+
 // un frame completo; false = la connessione si chiude
 static bool handle_frame(Conn2* c, int type, int flags, uint32_t id, const uint8_t* p, size_t n) {
     if (c->in_headers && (type != F_CONT || id != c->hstream)) { send_goaway(c, E_PROTOCOL); return false; }
+    if (type == F_RST || (type == F_PING && !(flags & FL_ACK)) || (type == F_SETTINGS && !(flags & FL_ACK))) {
+        double t = now_ms2();
+        if (t - c->ctl_t0 > 1000) { c->ctl_t0 = t; c->ctl_n = 0; }
+        if (++c->ctl_n > MAX_CTL_PER_SEC) { send_goaway(c, E_CALM); return false; }
+    }
     switch (type) {
     case F_DATA: {
         Stream* s = find_stream(c, id);

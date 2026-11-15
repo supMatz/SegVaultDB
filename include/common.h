@@ -16,9 +16,9 @@ SCOPO: Header incluso da TUTTI i moduli del progetto.
 
 // versioni
 #define SV_VERSION_MAJOR 1
-#define SV_VERSION_MINOR 2
+#define SV_VERSION_MINOR 3
 #define SV_VERSION_PATCH 0
-#define SV_VERSION_STR  "1.2.0"
+#define SV_VERSION_STR  "1.3.0"
 #define SV_DOCS_URL     "https://github.com/supMatz/SegVaultDB/blob/main/README.md"   // Help > Online documentation
 #define SV_NAME         "SegVault"
 
@@ -54,26 +54,28 @@ SCOPO: Header incluso da TUTTI i moduli del progetto.
     return NULL; \
 } while (0)
 
-// controlla se un puntatore è NULL
-#define SV_CHECK_NULL(msg) do { \
-    fprintf(stderr, "[ERROR] %s:%d: NULL pointer\n", __FILE__, __LINE__, msg); \
-    return SV_ERR; \
+// controlla se un puntatore è NULL: se sì, messaggio e return SV_ERR
+#define SV_CHECK_NULL(ptr, msg) do { \
+    if ((ptr) == NULL) { \
+        fprintf(stderr, "[ERROR] %s:%d: NULL pointer: %s\n", __FILE__, __LINE__, msg); \
+        return SV_ERR; \
+    } \
 } while (0)
 
 // -- macro di debug -- attivate solo con -DDEBUG come parametro di compilazione
 
 #ifdef DEBUG
     #define SV_DEBUG(fmt, ...) \
-        fprintf(stderr, "[DEBUG] %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__) \
+        fprintf(stderr, "[DEBUG] %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__)
 #else
-    #define SV_DEBUG(fmt, ...) // no-op in release
+    #define SV_DEBUG(fmt, ...) do { } while (0)   // no-op in release
 #endif
 
 // macro di utilities
 #define SV_MIN(a,b) ((a) < (b) ? (a) : (b))
 #define SV_MAX(a,b) ((a) > (b) ? (a) : (b))
 #define SV_CLAMP(v, lo, hi) (SV_MIN(SV_MAX((v), (lo)), (hi))) // se v < lo => v = lo; se v > hi => v = hi; mantiene v in un range di valori passati
-#define SV_ARRAY_LEN(arr) (sizeof(arr) / sizeof(arr[0]));
+#define SV_ARRAY_LEN(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 #define SV_ALLOC(type) ((type*)calloc(1, sizeof(type))) // alloca e azzera — simile a calloc ma per tipo singolo
 #define SV_ALLOC_N(type, n) ((type*)calloc((n), sizeof(type))) // alloca array e azzera

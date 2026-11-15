@@ -10,6 +10,7 @@ SCOPO: L'unico punto di contatto tra GUI e DB engine.
 #define DB_API_H
 
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,8 +45,8 @@ typedef struct {
 // Riempie una riga: alloca in un solo blocco le ncols celle e i loro testi.
 // vals[i] == NULL -> cella NULL; types == NULL -> tutte CELL_TYPE_STRING.
 static inline bool db_row_set(Row* row, int ncols, const char* const* vals, const CellType* types) {
-    size_t lens[ncols > 0 ? ncols : 1], total = 0;
-    for (int i = 0; i < ncols; i++) { lens[i] = strlen(vals[i] ? vals[i] : "NULL"); total += lens[i] + 1; }
+    size_t total = 0;
+    for (int i = 0; i < ncols; i++) total += strlen(vals[i] ? vals[i] : "NULL") + 1;
     char* block = (char*)malloc(sizeof(Cell) * (size_t)(ncols > 0 ? ncols : 1) + total);
     row->cells = (Cell*)block;
     row->num_cells = block ? ncols : 0;
@@ -53,9 +54,10 @@ static inline bool db_row_set(Row* row, int ncols, const char* const* vals, cons
     char* p = block + sizeof(Cell) * (size_t)(ncols > 0 ? ncols : 1);
     for (int i = 0; i < ncols; i++) {
         Cell* c = &row->cells[i];
-        memcpy(p, vals[i] ? vals[i] : "NULL", lens[i] + 1);
+        size_t len = strlen(vals[i] ? vals[i] : "NULL");
+        memcpy(p, vals[i] ? vals[i] : "NULL", len + 1);
         c->value = p;
-        p += lens[i] + 1;
+        p += len + 1;
         c->is_null = vals[i] == NULL;
         c->type = c->is_null ? CELL_TYPE_NULL : types ? types[i] : CELL_TYPE_STRING;
     }
@@ -81,8 +83,8 @@ typedef struct {
     int num_rows;
 
     // metadata per DML (INSERT/UPDATE/DELETE)
-    int rows_affected;
-    int last_insert_id; // id dell'ultima riga inserita (campo AUTO_INCREMENT)
+    long long rows_affected;
+    long long last_insert_id; // id dell'ultima riga inserita (campo AUTO_INCREMENT); 64 bit: oltre 2^31 non si tronca
 
     // esecuzione query
     double exec_time_ms; // tempo di esecuzione della query
@@ -328,6 +330,30 @@ bool        db_login(const char* name, const char* password);   // credenziali g
 int         db_login_native(const char* user, const uint8_t scramble[20], const uint8_t* resp, size_t rlen);
 bool        db_user_can_see(const char* user, const char* db, const char* table);
 bool        db_has_users(void);
+// durabilità delle conferme: "OFF", "NORMAL" (predefinito), "FULL" (anche SET [GLOBAL] synchronous = ...).
+// db_sync_tick: da chiamare periodicamente (il server lo fa) perché in NORMAL le ultime scritture in
+// autocommit arrivino su disco entro 100 ms anche senza statement successivi
+bool        db_set_synchronous(const char* mode);
+// cache delle pagine in MB: da chiamare prima di db_init (0 = automatica: 1/8 della RAM, 4-512 MB);
+// a motore avviato SET GLOBAL cache_size = MB. db_cache_size: quella in uso
+void        db_set_cache_size(long mb);
+long        db_cache_size(void);
+const char* db_synchronous(void);
+void        db_sync_tick(void);
+// flag di annullamento della connessione di questo thread (KILL QUERY): != 0 ferma lo statement in corso
+void        db_set_thread_cancel(atomic_int* flag);
+// colonne di una SELECT senza eseguirla (nessuna riga, nessun effetto): NULL se sql non è una SELECT sola
+QueryResult* db_describe(const char* sql);
+// Cell.value è testo; un valore binario ha i byte 0x00 e 0xC0 nella forma interna C0 80 / C0 81
+// (src/table/binesc.h). db_value_bytes scrive in out (strlen(v) byte bastano) i byte veri e ne dà il numero
+size_t      db_value_bytes(const char* v, char* out);
+unsigned long db_users_version(void);   // cambia a ogni modifica di utenti o permessi (cache dei login)
+// endpoint salvato dell'API (riga di api_endpoints nel database db): con quali permessi gira.
+// definer = valore della colonna definer (NULL se la colonna manca o è NULL). true: user_out è
+// l'utente ("" = tutti i permessi) e *may_public dice se access = 'public' vale (con gli utenti attivi
+// solo per un amministratore); false: rifiutato, motivo in err
+bool        db_endpoint_runas(const char* db, const char* definer, char* user_out, size_t un, bool* may_public,
+                              char* err, size_t errn);
 int         db_list_users(DbUserInfo* out, int max);
 unsigned    db_user_grant(const char* user, const char* db, const char* table);   // permessi dati proprio lì
 int         db_user_table_grants(const char* user, char (*db)[64], char (*table)[64], unsigned* privs, int max);

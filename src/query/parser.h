@@ -234,6 +234,8 @@ typedef struct ASTNode {
     char     qual_dbs[8][64];
     int      nqual_dbs;
     int      set_fk_checks;    // NODE_SET: FOREIGN_KEY_CHECKS = 0 / 1 (-1 = non nominato)
+    int      set_sync;         // NODE_SET: synchronous = OFF 0 / NORMAL 1 / FULL 2 (-1 = non nominato, -2 = valore sbagliato)
+    long     set_cache_mb;     // NODE_SET: cache_size = MB (-1 = non nominato, -2 = valore sbagliato)
     // ALTER TABLE t op1, op2, ...: le operazioni dopo la prima (ALTER, CREATE / DROP INDEX), eseguite in ordine
     struct ASTNode* chain;
     // INSERT / UPDATE / DELETE ... RETURNING espr [AS nome], ... | * (PostgreSQL)

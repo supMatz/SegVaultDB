@@ -28,7 +28,15 @@ typedef struct {
     // routine in esecuzione (variabili locali, cursori, handler): NULL fuori dalle routine
     void*       routine;
     bool        rt_notfound;      // l'ultima SELECT ... INTO non ha trovato righe (condizione NOT FOUND)
+    // permessi sulle tabelle: ogni tabella letta o scritta si controlla qui, dove l'executor la apre
+    // (NULL o "" = tutto permesso). priv_off > 0 dentro il corpo di una vista: i permessi del corpo
+    // sono stati controllati per chi l'ha creata (CREATE VIEW esegue la definizione)
+    const char* user;
+    int         priv_off;
 } ExecCtx;
+
+// l'utente ha il permesso priv (AUTH_*) sulla tabella db.table? Altrimenti scrive l'errore in err
+bool executor_priv_ok(const ExecCtx* x, const char* db, const char* table, unsigned priv, char* err, size_t errn);
 
 // variabili di sessione (@x): ogni sessione ha le sue; db_api le scambia insieme al resto dello stato
 typedef struct UserVars UserVars;
@@ -50,6 +58,8 @@ QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt);
 
 // scarta gli indici in memoria (da chiamare dopo ROLLBACK o modifiche alle pagine fuori dall'executor)
 void executor_invalidate_indexes(void);
+// solo quella tabella (indici in memoria e mappa dello spazio libero): dopo un ROLLBACK che l'ha toccata
+void executor_invalidate_table(BufferPool* bp, const char* db, const char* table, uint32_t root_page_id);
 
 // information_schema: lo statement (di questo thread) legge le tabelle virtuali del catalogo;
 // see (NULL = tutto) dice quali database mostrare all'utente
@@ -59,6 +69,9 @@ void executor_set_db_filter(bool (*see)(const char* db));
 // modalità MySQL (connessioni del protocollo MySQL): le regole permissive di MySQL al posto di quelle
 // dello standard, es. SELECT DISTINCT ... ORDER BY una colonna non selezionata
 void executor_set_mysql_mode(bool on);
+// descrizione (PREPARE): le tabelle sembrano vuote, una SELECT senza FROM non produce righe, NEXTVAL / SETVAL e le
+// funzioni dell'utente non fanno niente. Il risultato ha le colonne giuste e nessuna riga
+void executor_set_describe(bool on);
 bool executor_mysql_mode(void);
 
 // CREATE TABLE della tabella (with_fk: con le chiavi esterne) e ALTER TABLE per le sue chiavi

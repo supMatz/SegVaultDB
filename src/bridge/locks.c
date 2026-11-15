@@ -190,6 +190,14 @@ void lk_cancel_wait(const void* owner) {
     sv_rw_wrunlock(&g_mx);
 }
 
+void lk_reset(void) {
+    sv_rw_wr(&g_mx);
+    for (int i = 0; i < g_ne; i++) free(g_e[i].h);
+    g_ne = 0;
+    g_nw = 0;
+    sv_rw_wrunlock(&g_mx);
+}
+
 void lk_release_all(const void* owner) {
     sv_rw_wr(&g_mx);
     for (int i = 0; i < g_ne; ) {

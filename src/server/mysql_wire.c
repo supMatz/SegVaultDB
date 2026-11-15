@@ -1,4 +1,5 @@
 #include "mysql_wire.h"
+#include "../table/binesc.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,21 +41,59 @@ void mw_lenenc(MwOut* o, uint64_t v) {
 void mw_lenstr(MwOut* o, const char* s, size_t n) { mw_lenenc(o, n); mw_bytes(o, s, n); }
 static void mw_lenz(MwOut* o, const char* s) { mw_lenstr(o, s ? s : "", s ? strlen(s) : 0); }
 
+// valore di una cella: i byte veri (0x00 compresi) con la loro lunghezza (forma interna: binesc.h)
+static void mw_cell(MwOut* o, const char* s) {
+    size_t n = s ? strlen(s) : 0;
+    if (!n || !sv_bin_has(s, n)) { mw_lenstr(o, s ? s : "", n); return; }
+    char* d = malloc(n);
+    if (!d) { o->oom = true; return; }
+    size_t dl = sv_bin_decode(s, n, d);
+    mw_lenstr(o, d, dl);
+    free(d);
+}
+
 void mw_begin(MwOut* o) {
     o->start = o->n;
     uint8_t h[4] = { 0, 0, 0, o->seq++ };
     mw_bytes(o, h, 4);
 }
 
-// un pacchetto più lungo di 16 MB - 1 andrebbe spezzato: qui non succede (righe e testi più piccoli)
+#define MW_MAX_PAYLOAD 0xffffffu
+
+static void put_hdr(uint8_t* h, size_t len, uint8_t seq) {
+    h[0] = (uint8_t)len; h[1] = (uint8_t)(len >> 8); h[2] = (uint8_t)(len >> 16); h[3] = seq;
+}
+
+// Un contenuto di 16 MB - 1 o più va in più pacchetti: i primi lunghi esattamente 0xFFFFFF, l'ultimo con il
+// resto (anche 0 byte se il totale è un multiplo), ognuno con il suo numero di sequenza. Prima la lunghezza
+// veniva solo limitata a 0xFFFFFF: con un valore di 16 MB il client perdeva il filo dei pacchetti
 void mw_end(MwOut* o) {
     if (o->oom) return;
     size_t len = o->n - o->start - 4;
-    if (len > 0xffffff) len = 0xffffff;
-    o->p[o->start] = (uint8_t)len;
-    o->p[o->start + 1] = (uint8_t)(len >> 8);
-    o->p[o->start + 2] = (uint8_t)(len >> 16);
+    if (len < MW_MAX_PAYLOAD) { put_hdr(o->p + o->start, len, o->p[o->start + 3]); return; }
+    size_t nfull = len / MW_MAX_PAYLOAD;                  // pacchetti pieni; poi uno con il resto
+    uint8_t zero[64] = {0};
+    for (size_t add = 4 * nfull; add > 0; ) {             // spazio per le intestazioni in più
+        size_t k = add < sizeof(zero) ? add : sizeof(zero);
+        mw_bytes(o, zero, k);
+        if (o->oom) return;
+        add -= k;
+    }
+    uint8_t* base = o->p + o->start;
+    uint8_t first_seq = base[3];
+    for (size_t k = nfull; k >= 1; k--) {                 // dall'ultimo pezzo: le zone si sovrappongono
+        size_t clen = k == nfull ? len - nfull * MW_MAX_PAYLOAD : MW_MAX_PAYLOAD;
+        memmove(base + k * (MW_MAX_PAYLOAD + 4) + 4, base + 4 + k * MW_MAX_PAYLOAD, clen);
+    }
+    for (size_t k = 0; k <= nfull; k++) {
+        size_t clen = k == nfull ? len - nfull * MW_MAX_PAYLOAD : MW_MAX_PAYLOAD;
+        put_hdr(base + k * (MW_MAX_PAYLOAD + 4), clen, k == 0 ? first_seq : o->seq++);
+    }
 }
+
+// LIKE semplice: % e _ , senza distinzione maiuscole/minuscole. Iterativo (un solo punto di ritorno
+// sull'ultimo %): niente tempo esponenziale con pattern come '%a%a%a%a%b'
+static bool like(const char* s, const char* pat);
 
 // ── pacchetti del server ─────────────────────────────────────────
 
@@ -202,7 +241,7 @@ void mw_resultset(MwOut* o, const QueryResult* r, const char* db, unsigned statu
         for (int c = 0; c < r->num_cols; c++) {
             const Cell* cell = &r->rows[i].cells[c];
             if (cell->is_null) mw_u8(o, 0xfb);
-            else mw_lenz(o, cell->value);
+            else mw_cell(o, cell->value);
         }
         mw_end(o);
     }
@@ -262,6 +301,11 @@ bool mw_parse_login(const uint8_t* p, size_t n, MwLogin* out) {
 // ── istruzioni dei driver ────────────────────────────────────────
 
 typedef struct { const char* name; const char* value; } Var;
+static char g_have_ssl[12] = "DISABLED", g_max_conn[16] = "64";   // dalla configurazione (mw_set_config)
+void mw_set_config(bool ssl, int max_connections) {
+    snprintf(g_have_ssl, sizeof(g_have_ssl), "%s", ssl ? "YES" : "DISABLED");
+    snprintf(g_max_conn, sizeof(g_max_conn), "%d", max_connections);
+}
 static const Var VARS[] = {
     { "version", "8.0.35-SegVault" }, { "version_comment", "SegVault" }, { "version_compile_os", "SegVault" },
     { "max_allowed_packet", "67108864" }, { "sql_mode", "" }, { "autocommit", "1" },
@@ -273,9 +317,9 @@ static const Var VARS[] = {
     { "transaction_isolation", "SERIALIZABLE" }, { "tx_isolation", "SERIALIZABLE" }, { "transaction_read_only", "0" },
     { "tx_read_only", "0" }, { "time_zone", "SYSTEM" }, { "system_time_zone", "UTC" }, { "license", "MIT" },
     { "auto_increment_increment", "1" }, { "auto_increment_offset", "1" }, { "net_buffer_length", "16384" },
-    { "query_cache_size", "0" }, { "query_cache_type", "OFF" }, { "performance_schema", "0" }, { "have_ssl", "DISABLED" },
+    { "query_cache_size", "0" }, { "query_cache_type", "OFF" }, { "performance_schema", "0" }, { "have_ssl", g_have_ssl }, { "have_openssl", g_have_ssl },
     { "default_storage_engine", "SegVault" }, { "storage_engine", "SegVault" }, { "sql_auto_is_null", "0" },
-    { "sql_select_limit", "18446744073709551615" }, { "max_connections", "64" }, { "innodb_version", "" },
+    { "sql_select_limit", "18446744073709551615" }, { "max_connections", g_max_conn }, { "innodb_version", "" },
 };
 #define NVARS (int)(sizeof(VARS) / sizeof(VARS[0]))
 
@@ -300,13 +344,17 @@ static bool word(const char** pp, const char* w) {
     return true;
 }
 
-// LIKE semplice: % e _ , senza distinzione maiuscole/minuscole
 static bool like(const char* s, const char* pat) {
-    if (!*pat) return !*s;
-    if (*pat == '%') { for (;; s++) { if (like(s, pat + 1)) return true; if (!*s) return false; } }
-    if (!*s) return false;
-    if (*pat == '_' || tolower((unsigned char)*pat) == tolower((unsigned char)*s)) return like(s + 1, pat + 1);
-    return false;
+    const char *star = NULL, *back = NULL;
+    while (*s) {
+        if (*pat == '%') { star = ++pat; back = s; continue; }
+        if (*pat && (*pat == '_' || tolower((unsigned char)*pat) == tolower((unsigned char)*s))) { pat++; s++; continue; }
+        if (!star) return false;
+        pat = star;
+        s = ++back;
+    }
+    while (*pat == '%') pat++;
+    return !*pat;
 }
 
 static void text_header(MwOut* o, int ncols, const char* const* names) {
@@ -354,10 +402,16 @@ void mw_name_values(MwOut* o, const char* const* names, const char* const* value
 
 bool mw_client_noise(MwOut* o, const char* sql, unsigned status) {
     const char* p = skip_ws(sql);
-    // SET NAMES / SET autocommit / SET sql_mode / SET SESSION ...: accettati senza effetto
+    // SET NAMES / SET sql_mode / SET SESSION ...: accettati senza effetto. Vanno al motore, che li
+    // applica: le variabili dell'utente (SET @x = ...) e FOREIGN_KEY_CHECKS / UNIQUE_CHECKS (la prima
+    // riga di ogni mysqldump), oltre a SET PASSWORD
     if (word(&p, "SET")) {
         const char* q = p;
         if (word(&q, "PASSWORD")) return false;
+        for (const char* c = p; *c; c++) {
+            if (*c == '@' && c[1] != '@') return false;                  // @variabile dell'utente
+            if ((*c == 'f' || *c == 'F') && !strncasecmp(c, "foreign_key_checks", 18)) return false;
+        }
         mw_ok(o, 0, 0, status, NULL);
         return true;
     }
@@ -583,7 +637,7 @@ void mw_resultset_binary(MwOut* o, const QueryResult* r, const char* db, unsigne
                 case MT_LONGLONG: put_le(o, (uint64_t)cell_int(v), 8); break;
                 case MT_DOUBLE: { double d = strtod(v, NULL); uint64_t b; memcpy(&b, &d, 8); put_le(o, b, 8); break; }
                 case MT_DATE: case MT_DATETIME: put_datetime(o, v); break;
-                default:          mw_lenz(o, v); break;
+                default:          mw_cell(o, v); break;
             }
         }
         mw_end(o);
@@ -611,14 +665,16 @@ static void sb_add(Sb* b, const char* s, size_t n) {
 }
 static void sb_str(Sb* b, const char* s) { sb_add(b, s, strlen(s)); }
 
+// byte arbitrari, anche 0x00 e 0xC0: nella forma interna del motore (binesc.h), che il lexer copia così com'è
 static bool sb_quoted(Sb* b, const uint8_t* s, size_t n) {
-    if (memchr(s, 0, n)) return false;
     sb_add(b, "'", 1);
     size_t st = 0;
     for (size_t i = 0; i < n; i++) {
-        if (s[i] != '\'' && s[i] != '\\') continue;
+        if (s[i] != '\'' && s[i] != '\\' && s[i] != 0 && s[i] != SV_BIN_ESC) continue;
         sb_add(b, (const char*)s + st, i - st);
-        sb_add(b, s[i] == '\'' ? "''" : "\\\\", 2);
+        char e2[2];
+        if (s[i] == 0 || s[i] == SV_BIN_ESC) sb_add(b, e2, sv_bin_put(s[i], e2));
+        else sb_add(b, s[i] == '\'' ? "''" : "\\\\", 2);
         st = i + 1;
     }
     sb_add(b, (const char*)s + st, n - st);

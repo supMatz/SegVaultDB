@@ -74,9 +74,9 @@ int main(void) {
     sql = grid_edit_insert_sql(&ge, vals, nulls, set, err, sizeof(err));
     CHECK(sql && !strcmp(sql, "INSERT INTO `p` (`nome`, `prezzo`) VALUES ('burro', 3)"), "insert sql: %s", sql ? sql : err);
     QueryResult* ins = db_execute(sql);
-    CHECK(ins && ins->success && ins->last_insert_id == 3, "insert id: %d", ins ? ins->last_insert_id : -1);
-    char idtxt[16];
-    snprintf(idtxt, sizeof(idtxt), "%d", ins ? ins->last_insert_id : 0);
+    CHECK(ins && ins->success && ins->last_insert_id == 3, "insert id: %lld", ins ? ins->last_insert_id : -1LL);
+    char idtxt[24];
+    snprintf(idtxt, sizeof(idtxt), "%lld", ins ? ins->last_insert_id : 0LL);
     const char* key[1] = { idtxt };
     char* fetch = grid_edit_fetch_sql(&ge, 0, key);
     QueryResult* fr = db_execute(fetch);
@@ -138,6 +138,19 @@ int main(void) {
     CHECK(!strcmp(scalar("SELECT COUNT(DISTINCT s) FROM esc"), "1") && !strcmp(r->rows[0].cells[0].value, "a\\b'c\\n"),
           "literal roundtrip: %s -> %s", r->rows[0].cells[0].value, lit);
     free(lit); free(lit2);
+    db_result_free(r);
+
+    // P0.8: un valore binario (con 0x00 e 0xC0) esportato come X'...' dei byte veri e reinserito identico
+    run("CREATE TABLE binx (b BLOB)");
+    run("INSERT INTO binx VALUES (X'6100C062FF')");
+    r = q("SELECT b FROM binx");
+    lit = grid_edit_cell_literal(&r->rows[0].cells[0]);
+    CHECK(lit && !strcmp(lit, "X'6100C062FF'"), "binary literal: %s", lit ? lit : "null");
+    snprintf(insq, sizeof(insq), "INSERT INTO binx VALUES (%s)", lit ? lit : "NULL");
+    run(insq);
+    CHECK(!strcmp(scalar("SELECT COUNT(DISTINCT b) FROM binx"), "1") && !strcmp(scalar("SELECT HEX(b) FROM binx LIMIT 1"), "6100C062FF"),
+          "binary literal round-trip");
+    free(lit);
     db_result_free(r);
 
     db_shutdown();

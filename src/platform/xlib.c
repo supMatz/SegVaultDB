@@ -19,6 +19,7 @@ SCOPO: Stessa interfaccia di win32.c ma usa Xlib (Linux/X11).
 #include <X11/extensions/Xrender.h>
 #include <sys/select.h>
 #include <unistd.h>      // readlink
+#include <sys/syscall.h>  // close_range
 #include <sys/stat.h>
 #include <sys/wait.h>    // waitpid (platform_open_url)
 #include <fcntl.h>
@@ -850,6 +851,18 @@ void platform_set_cursor(PlatformWindow* win, CursorKind kind) {
 
 // -- appunti --
 
+// figlio di fork prima di exec: niente descrittori ereditati oltre 0-2. Il browser aperto da "apri nel browser"
+// teneva il lock del file dei dati e i socket in ascolto: dopo l'uscita il riavvio diceva "cartella in uso" /
+// "porta occupata" finché il browser restava aperto
+static void close_inherited_fds(void) {
+#ifdef SYS_close_range
+    if (syscall(SYS_close_range, 3u, ~0u, 0u) == 0) return;
+#endif
+    long mx = sysconf(_SC_OPEN_MAX);
+    if (mx < 0 || mx > 65536) mx = 65536;
+    for (int fd = 3; fd < mx; fd++) close(fd);
+}
+
 bool platform_open_url(const char* url) {
     // solo pagine web (o il server locale di SegVault), mai comandi o file
     if (!url || (strncmp(url, "https://", 8) && strncmp(url, "http://127.0.0.1:", 17) && strncmp(url, "http://localhost:", 17)))
@@ -861,6 +874,7 @@ bool platform_open_url(const char* url) {
     if (pid == 0) {
         setsid();
         if (fork() == 0) {
+            close_inherited_fds();
             execlp("xdg-open", "xdg-open", url, (char*)NULL);
             _exit(127);
         }
@@ -880,6 +894,7 @@ bool platform_open_file(const char* path) {
     if (pid == 0) {
         setsid();
         if (fork() == 0) {
+            close_inherited_fds();
             execlp("xdg-open", "xdg-open", path, (char*)NULL);
             _exit(127);
         }
@@ -918,6 +933,7 @@ static int run_chooser(char* const* argv, char* out, size_t outsz) {
         int nul = open("/dev/null", O_WRONLY);
         if (nul >= 0) dup2(nul, 2);
         close(fd[0]); close(fd[1]);
+        close_inherited_fds();
         execv(argv[0], argv);
         _exit(127);
     }

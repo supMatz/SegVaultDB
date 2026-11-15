@@ -5,6 +5,7 @@
 #include "db_api.h"
 #include "../query/lexer.h"
 #include "../query/parser.h"
+#include "platform_compat.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -139,7 +140,7 @@ static void password_hash(const char* salt_hex, const char* pw, char out[65]) {
     hex(d, 32, out);
 }
 
-static void random_salt(char out[33]) {
+static bool random_salt(char out[33]) {
     uint8_t r[16];
     bool ok = false;
 #ifdef _WIN32
@@ -153,8 +154,10 @@ static void random_salt(char out[33]) {
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd >= 0) { ok = read(fd, r, sizeof(r)) == (ssize_t)sizeof(r); close(fd); }
 #endif
-    if (!ok) { uint64_t t = (uint64_t)time(NULL) ^ (uint64_t)(uintptr_t)out; for (int i = 0; i < 16; i++) { t = t * 6364136223846793005ULL + 1; r[i] = (uint8_t)(t >> 56); } }
+    // senza byte casuali veri niente sale (uno derivato dall'orologio sarebbe prevedibile): l'utente non si crea
+    if (!ok) return false;
     hex(r, 16, out);
+    return true;
 }
 
 // ── archivio degli utenti ───────────────────────────────────────
@@ -172,11 +175,13 @@ static User* find_user(const char* name) {
     return NULL;
 }
 
+static unsigned long g_users_version;
 static bool save_users(void) {
+    g_users_version++;                    // anche se il salvataggio fallisce: gli utenti in memoria sono cambiati
     if (!g_path[0]) return false;
     char tmp[620];
     snprintf(tmp, sizeof(tmp), "%s.tmp", g_path);
-    FILE* f = fopen(tmp, "w");
+    FILE* f = sv_fopen_private(tmp, "w");          // gli hash delle password: solo il proprietario
     if (!f) return false;
     fprintf(f, "# SegVault users: do not edit by hand while the database is running\n");
     for (int i = 0; i < g_nusers; i++) {
@@ -184,12 +189,12 @@ static bool save_users(void) {
         fprintf(f, "user %s %s %s %d %s\n", u->name, u->salt, u->hash, u->admin ? 1 : 0, u->native[0] ? u->native : "-");
         for (int k = 0; k < u->ng; k++) fprintf(f, "grant %s %s %s %u\n", u->name, u->g[k].db, u->g[k].table, u->g[k].privs);
     }
-    bool ok = fclose(f) == 0;
-#ifdef _WIN32
-    if (ok) { remove(g_path); ok = rename(tmp, g_path) == 0; }
-#else
-    if (ok) ok = rename(tmp, g_path) == 0;
-#endif
+    // ultima riga: il numero di utenti. Un file troncato si riconosce (senza utenti tutti sarebbero root)
+    fprintf(f, "end %d\n", g_nusers);
+    bool ok = fflush(f) == 0 && sv_fsync(fileno(f)) == 0;
+    ok = fclose(f) == 0 && ok;
+    if (ok) ok = sv_replace_file(tmp, g_path) == 0;
+    if (!ok) remove(tmp);
     return ok;
 }
 
@@ -203,13 +208,31 @@ static User* add_user(const char* name) {
     return u;
 }
 
-void auth_init(const char* data_dir) {
+static char g_auth_err[300];
+const char* auth_init_error(void) { return g_auth_err; }
+
+bool auth_init(const char* data_dir) {
     auth_shutdown();
+    g_auth_err[0] = '\0';
     snprintf(g_path, sizeof(g_path), "%.570s/users.dat", data_dir ? data_dir : ".");
     FILE* f = fopen(g_path, "r");
-    if (!f) return;
+    if (!f) {
+        // salvataggio interrotto fra il file temporaneo (completo, con fsync) e la sostituzione
+        char tmp[620];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", g_path);
+        FILE* t = fopen(tmp, "r");
+        if (!t) return true;                     // nessun utente
+        fclose(t);
+        if (sv_replace_file(tmp, g_path) != 0) { snprintf(g_auth_err, sizeof(g_auth_err), "cannot rename %.200s", tmp); return false; }
+        f = fopen(g_path, "r");
+        if (!f) return true;
+    }
     char line[512];
+    int end_count = -1;
+    bool after_end = false;
     while (fgets(line, sizeof(line), f)) {
+        if (end_count >= 0) { if (line[0] != '\n' && line[0] != '#') after_end = true; continue; }
+        if (sscanf(line, "end %d", &end_count) == 1) continue;
         char a[64], b[64], c[80], d[80];
         int adm;
         unsigned pr;
@@ -234,7 +257,15 @@ void auth_init(const char* data_dir) {
         }
         (void)d;
     }
+    bool rd_err = ferror(f) != 0;
     fclose(f);
+    // con la riga "end" (dalla 1.3) il file deve essere completo; senza, è di una versione precedente
+    if (rd_err || after_end || (end_count >= 0 && end_count != g_nusers)) {
+        snprintf(g_auth_err, sizeof(g_auth_err), "the users file %.200s is damaged or truncated: it was left unchanged", g_path);
+        auth_shutdown();
+        return false;
+    }
+    return true;
 }
 
 void auth_shutdown(void) {
@@ -263,15 +294,29 @@ int auth_login_native(const char* user, const uint8_t scramble[20], const uint8_
 }
 
 bool auth_login(const char* user, const char* password) {
+    char salt[33], hash[65];
+    return auth_user_secret(user, salt, hash) && auth_password_matches(salt, hash, password);
+}
+
+bool auth_user_secret(const char* user, char salt[33], char hash[65]) {
     User* u = find_user(user);
-    if (!u || !password) return false;
+    if (!u) return false;
+    memcpy(salt, u->salt, 33);
+    memcpy(hash, u->hash, 65);
+    return true;
+}
+
+bool auth_password_matches(const char* salt, const char* hash, const char* password) {
+    if (!password) return false;
     char h[65];
-    password_hash(u->salt, password, h);
+    password_hash(salt, password, h);
     // confronto a tempo costante
     unsigned diff = 0;
-    for (int i = 0; i < 64; i++) diff |= (unsigned)(h[i] ^ u->hash[i]);
+    for (int i = 0; i < 64; i++) diff |= (unsigned)(h[i] ^ hash[i]);
     return diff == 0 && h[0];
 }
+
+unsigned long auth_users_version(void) { return g_users_version; }   // cambia a ogni modifica degli utenti
 
 unsigned auth_privs(const char* user, const char* db, const char* table) {
     if (!user || !user[0]) return AUTH_ALL;
@@ -545,9 +590,11 @@ bool auth_statement(const void* tokens, const char* session_user, const char* cu
         if (strlen(pw) < 4) { *out = res_err("The password needs at least 4 characters%s", ""); return true; }
         if (is_create && us) { *out = if_not_exists ? res_new(0, NULL) : res_err("User '%.63s' already exists", u); return true; }
         if (is_alter && !us) { *out = res_err("User '%.63s' does not exist", u); return true; }
+        char salt[33];
+        if (!random_salt(salt)) { *out = res_err("Cannot get random bytes from the system for the password salt%s", ""); return true; }
         if (!us) us = add_user(u);
         if (!us) { *out = res_err("Out of memory%s", ""); return true; }
-        random_salt(us->salt);
+        memcpy(us->salt, salt, sizeof(us->salt));
         password_hash(us->salt, pw, us->hash);
         uint8_t s1[20], s2[20];
         auth_sha1(pw, strlen(pw), s1);
@@ -620,68 +667,41 @@ static void need(Chk* k, unsigned priv, const char* table) {
     k->ok = false;
 }
 
-static void walk_node(Chk* k, const ASTNode* n);
-
-static void walk_expr(Chk* k, const ASTExpr* e) {
-    if (!e || !k->ok) return;
-    if (e->type == EXPR_SUBQUERY && e->subq) walk_node(k, e->subq->node);
-    walk_expr(k, e->left);
-    walk_expr(k, e->right);
-    for (int i = 0; i < e->nargs; i++) walk_expr(k, e->args[i]);
+bool auth_only_admins(const char* db, const char* table, unsigned privs) {
+    for (int i = 0; i < g_nusers; i++)
+        if (!g_users[i].admin && (auth_privs(g_users[i].name, db, table) & privs)) return false;
+    return true;
 }
 
-static void walk_select(Chk* k, const ASTNode* n) {
-    for (const ASTNode* b = n; b && k->ok; b = b->select_stmt.set_next) {
-        for (int i = 0; i < b->select_stmt.num_ctes && k->nctes < 16; i++)
-            snprintf(k->ctes[k->nctes++], 64, "%s", b->select_stmt.ctes[i].name);
-        for (int i = 0; i < b->select_stmt.num_ctes; i++) walk_node(k, b->select_stmt.ctes[i].node);
-        if (b->select_stmt.from_sub) walk_node(k, b->select_stmt.from_sub);
-        else need(k, AUTH_SELECT, b->select_stmt.table_name);
-        for (int j = 0; j < b->select_stmt.num_joins; j++) {
-            if (b->select_stmt.joins[j].sub) walk_node(k, b->select_stmt.joins[j].sub);
-            else need(k, AUTH_SELECT, b->select_stmt.joins[j].table_name);
-            walk_expr(k, b->select_stmt.joins[j].condition);
-        }
-        for (int i = 0; i < b->select_stmt.num_cols; i++) walk_expr(k, b->select_stmt.columns[i]);
-        walk_expr(k, b->select_stmt.where);
-        walk_expr(k, b->select_stmt.having);
-        for (int i = 0; i < b->select_stmt.num_group; i++) walk_expr(k, b->select_stmt.group_exprs[i]);
-        for (int i = 0; i < b->select_stmt.num_order; i++) walk_expr(k, b->select_stmt.order_exprs[i]);
-    }
-}
-
-static void walk_node(Chk* k, const ASTNode* n) {
-    if (!n || !k->ok) return;
-    switch (n->type) {
-        case NODE_SELECT: walk_select(k, n); break;
-        case NODE_INSERT:
-            need(k, AUTH_INSERT, n->insert_stmt.table_name);
-            for (int i = 0; i < n->insert_stmt.num_rows * n->insert_stmt.num_values; i++) walk_expr(k, n->insert_stmt.values[i]);
-            walk_node(k, n->insert_stmt.select);
-            break;
-        case NODE_UPDATE:
-            need(k, AUTH_UPDATE, n->update_stmt.table_name);
-            for (int i = 0; i < n->update_stmt.num_sets; i++) walk_expr(k, n->update_stmt.set_exprs[i]);
-            walk_expr(k, n->update_stmt.where);
-            break;
-        case NODE_DELETE:
-            need(k, AUTH_DELETE, n->delete_stmt.table_name);
-            walk_expr(k, n->delete_stmt.where);
-            break;
-        case NODE_EXPLAIN: walk_node(k, (const ASTNode*)n->explain.stmt); break;
-        default: break;
-    }
-}
+// la tabella degli endpoint salvati: il suo autore (colonna definer) lo scrive il motore a ogni
+// scrittura; cambiarne la struttura (aggiungere o rinominare colonne, riempirla con CREATE ... AS
+// SELECT, rinominarci un'altra tabella) permetterebbe di scegliere l'autore, quindi solo gli amministratori
+static bool is_endpoints_table(const char* t) { return t && !strcasecmp(t, AUTH_ENDPOINTS_TABLE); }
 
 bool auth_check(const char* user, const ASTNode* stmt, const char* cur_db, char* err, size_t errn) {
     if (!user || !user[0] || !stmt) return true;
     User* u = find_user(user);
     if (!u) { snprintf(err, errn, "User '%.63s' no longer exists", user); return false; }
     if (u->admin) return true;
+    bool ep = false;
+    if (stmt->type == NODE_CREATE_TABLE && is_endpoints_table(stmt->create_table.table_name)) {
+        ep = stmt->create_table.as_select != NULL;
+        // una chiave esterna con ON UPDATE CASCADE / SET DEFAULT cambierebbe definer senza passare dal motore
+        for (int i = 0; i < stmt->create_table.num_cons && !ep; i++) ep = stmt->create_table.cons[i].kind == CONS_FOREIGN;
+    }
+    if (stmt->type == NODE_ALTER_TABLE)
+        for (const ASTNode* a = stmt; a && !ep; a = a->chain)
+            ep = a->type == NODE_ALTER_TABLE && (is_endpoints_table(a->alter_table.table_name) || is_endpoints_table(a->alter_table.new_name));
+    if (ep) {
+        snprintf(err, errn, "Access denied for user '%.63s': only administrators can change the structure of " AUTH_ENDPOINTS_TABLE, user);
+        return false;
+    }
     Chk k = { user, cur_db, {{0}}, 0, err, errn, true };
     switch (stmt->type) {
-        case NODE_SELECT: case NODE_INSERT: case NODE_UPDATE: case NODE_DELETE: case NODE_EXPLAIN:
-            walk_node(&k, stmt);
+        case NODE_SELECT: case NODE_INSERT: case NODE_UPDATE: case NODE_DELETE: case NODE_EXPLAIN: case NODE_MERGE:
+            // le tabelle lette e scritte si controllano nell'executor, dove vengono aperte
+            // (executor_priv_ok): così nessuna forma dello statement (CTE, subquery in SET, RETURNING,
+            // ON DUPLICATE KEY UPDATE, JOIN di UPDATE / DELETE, finestre, trigger...) sfugge al controllo
             break;
         case NODE_BEGIN: case NODE_COMMIT: case NODE_ROLLBACK: case NODE_SAVEPOINT: case NODE_ROLLBACK_TO: case NODE_SET:
             break;

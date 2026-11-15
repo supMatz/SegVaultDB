@@ -151,6 +151,8 @@ typedef struct {
 
 Catalog* catalog_create(void);
 Catalog* catalog_load(const char* path);
+// perché l'ultimo catalog_load ha restituito NULL (file danneggiato, di una versione più nuova, memoria)
+const char* catalog_load_error(void);
 int catalog_save(Catalog* c, const char* path);
 void catalog_free(Catalog* c);
 

@@ -49,9 +49,16 @@ typedef struct {
     uint32_t* free_ids;    // pagine liberate da VACUUM (flag PAGE_FLAG_FREE su disco), riusate per prime
     int       nfree, free_cap;
     BufferStats stats;
-    // chiamata prima di scrivere una pagina su disco (regola del WAL: prima il log)
-    void      (*before_write)(void* ctx);
+    // chiamata prima di scrivere una pagina su disco (regola del WAL: prima il log); false = il log
+    // non è stato scritto, quindi nemmeno la pagina può esserlo
+    bool      (*before_write)(void* ctx);
     void*     before_write_ctx;
+    // pagina nuova di una tabella collegata dopo prev (0 = prima pagina): il WAL la registra (LOG_LINK)
+    void      (*on_link)(void* ctx, uint32_t prev, uint32_t page);
+    void*     on_link_ctx;
+    // una scrittura o un fsync del file dei dati non è riuscito: le pagine non scritte restano in
+    // memoria (mai scartate), il motore smette di accettare modifiche
+    bool      io_error;
     SvRwLock  latch;       // usato come mutex: più thread leggono in parallelo
 } BufferPool;
 
@@ -72,7 +79,8 @@ int bp_new_page(BufferPool* bp, uint32_t* out_page_id);
 // scrive su disco una pagina specifica (se dirty)
 int bp_flush_page(BufferPool* bp, uint32_t page_id);
 
-// scrive su disco tutte le pagine dirty (in ordine di page_id: scrittura sequenziale)
+// scrive su disco tutte le pagine dirty (in ordine di page_id: scrittura sequenziale) e fa fsync;
+// SV_OK solo se tutto è arrivato su disco
 int bp_flush_all(BufferPool* bp);
 
 // Rimuove una pagina dalla cache (forza la rilettura dal disco)
@@ -80,6 +88,10 @@ void bp_remove_page(BufferPool* bp, uint32_t page_id);
 
 // Rimuove tutte le pagine dalla cache (scrivendo prima quelle modificate)
 void bp_remove_all(BufferPool* bp);
+
+// nuova capacità (pagine): scrive le pagine modificate e svuota la cache; false se una pagina è in uso
+// (pinnata) o manca memoria (la cache resta com'era)
+bool bp_resize(BufferPool* bp, int capacity);
 
 // dealloca il buffer pool (fa flush prima di liberare)
 void bp_destroy(BufferPool* bp);

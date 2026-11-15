@@ -1,4 +1,5 @@
 #include "result_export.h"
+#include "../table/binesc.h"
 #include "grid_edit.h"
 #include "export_bin.h"
 #include <stdio.h>
@@ -66,7 +67,27 @@ char* export_sql_literal(const Cell* c) {
     return grid_edit_cell_literal(c);    // stesso quoting della griglia: '' e \\ (il lexer tratta \ come escape)
 }
 
+// byte veri di un valore in forma interna (binesc.h): per CSV, JSON, Markdown, HTML
+static char* decoded(const char* v, size_t* n) {
+    size_t l = strlen(v);
+    char* d = malloc(l + 1);
+    if (!d) { *n = 0; return NULL; }
+    *n = sv_bin_decode(v, l, d);
+    d[*n] = '\0';
+    return d;
+}
+
 static void csv_field(Buf* b, const char* v, char delim) {
+    if (sv_bin_has(v, strlen(v))) {                            // binario: i byte veri, tra virgolette
+        size_t n;
+        char* d = decoded(v, &n);
+        if (!d) return;
+        putc_(b, '"');
+        for (size_t i = 0; i < n; i++) { if (d[i] == '"') putc_(b, '"'); putc_(b, d[i]); }
+        putc_(b, '"');
+        free(d);
+        return;
+    }
     bool quote = strchr(v, delim) || strpbrk(v, "\"\n\r") || v[0] == ' ' || (v[0] && v[strlen(v) - 1] == ' ');
     if (!quote) { puts_(b, v); return; }
     putc_(b, '"');
@@ -74,10 +95,14 @@ static void csv_field(Buf* b, const char* v, char delim) {
     putc_(b, '"');
 }
 
-static void json_string(Buf* b, const char* s) {
+static void json_string(Buf* b, const char* s0) {
+    size_t n;
+    char* d = sv_bin_has(s0, strlen(s0)) ? decoded(s0, &n) : NULL;
+    const char* s = d ? d : s0;
+    size_t len = d ? n : strlen(s0);
     putc_(b, '"');
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
         switch (c) {
             case '"':  puts_(b, "\\\""); break;
             case '\\': puts_(b, "\\\\"); break;
@@ -90,6 +115,7 @@ static void json_string(Buf* b, const char* s) {
         }
     }
     putc_(b, '"');
+    free(d);
 }
 
 static void html_text(Buf* b, const char* s) {

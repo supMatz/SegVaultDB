@@ -1,6 +1,7 @@
 #include "executor.h"
 #include "../platform_lock.h"
 #include "../table/overflow.h"
+#include "../table/binesc.h"
 #include "sqljson.h"
 #include "regex.h"
 #include "../bridge/auth.h"
@@ -10,6 +11,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include <stdatomic.h>
 #include <math.h>
 #include <stdint.h>
 #include <strings.h>
@@ -133,6 +135,8 @@ static void col_now_text(const char* fn, DataType t, char* out, size_t n) {
 
 // numero decimale arrotondato a scale cifre (metà lontano da zero, come MySQL), senza passare dal double
 static bool decimal_round(const char* in, int scale, char* out, size_t n) {
+    // (scala dalla definizione della colonna: DECIMAL(10, 200) riempiva fp[80] oltre la fine; MySQL arriva a 30)
+    if (scale < 0 || scale > 60) return false;
     while (isspace((unsigned char)*in)) in++;
     bool neg = *in == '-';
     if (*in == '-' || *in == '+') in++;
@@ -261,6 +265,7 @@ static QueryResult* exec_create_table_as(ExecCtx* ctx, ASTNode* n) {
 static QueryResult* exec_create_table_like(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     char msg[300];
+    if (!executor_priv_ok(ctx, db->name, n->create_table.like_table, AUTH_SELECT, msg, sizeof(msg))) return result_error_msg(msg);
     if (!catalog_get_table(ctx->catalog, db->name, n->create_table.like_table)) {
         snprintf(msg, sizeof(msg), "Table '%.64s' not found", n->create_table.like_table);
         return result_error_msg(msg);
@@ -446,9 +451,21 @@ static QueryResult* exec_drop_table(ExecCtx* ctx, ASTNode* n) {
         return result_error_msg(msg);
     }
     mi_invalidate_table(db->name, n->drop_table.table_name);
-    if (dts) heap_cache_forget(ctx->bp, dts->root_page_id);
+    int npages = 0;
+    if (dts) {                                   // le pagine della tabella diventano spazio abbandonato (VACUUM automatico)
+        heap_cache_forget(ctx->bp, dts->root_page_id);
+        for (uint32_t pid = dts->root_page_id, guard = 0; pid && guard < (1u << 24); guard++) {
+            Page* pg = bp_fetch(ctx->bp, pid);
+            if (!pg) break;
+            uint32_t nx = page_next(pg);
+            bp_unpin(ctx->bp, pid, false);
+            npages++;
+            pid = nx;
+        }
+    }
     if (catalog_drop_table(ctx->catalog, db->name, n->drop_table.table_name) != SV_OK)
         return result_error_msg("Table not found");
+    atomic_fetch_add(&g_sv_abandoned_pages, npages);
     return result_ok_msg(0);
 }
 
@@ -997,6 +1014,9 @@ static CellType cell_type_of(DataType t) {
 
 // righe scritte da INSERT / UPDATE / DELETE ... RETURNING (solo quelle dello statement, non dei trigger)
 typedef struct { bool on; int depth; char table[SV_MAX_NAME_LEN]; Tuple** v; int n, cap; } RetCapture;
+// descrizione di una SELECT (PREPARE del protocollo MySQL): colonne senza leggere righe né valutare funzioni
+static _Thread_local bool g_describe;
+void executor_set_describe(bool on) { g_describe = on; }
 static _Thread_local RetCapture g_cap;
 static Tuple* tuple_clone(const Tuple* t, const TableSchema* ts);
 static void cap_add(const ExecCtx* ctx, const TableSchema* ts, const Tuple* t) {
@@ -1244,13 +1264,23 @@ static uint64_t kmix64(uint64_t x) {
     return x ^ (x >> 31);
 }
 
+// al primo uso, anche da più letture in parallelo: il seme si pubblica una volta sola, completo
+static atomic_int g_key_seed_ready;
+static SvRwLock g_key_seed_lock = SV_RWLOCK_INIT;
+
 static void key_seed_init(void) {
-    if (g_key_seed[0]) return;
-    uint64_t s = (uint64_t)time(NULL) ^ ((uint64_t)(uintptr_t)&g_key_seed << 13) ^ ((uint64_t)clock() << 32);
-    FILE* f = fopen("/dev/urandom", "rb");
-    if (f) { if (fread(g_key_seed, 1, sizeof(g_key_seed), f) != sizeof(g_key_seed)) g_key_seed[0] = 0; fclose(f); }
-    g_key_seed[0] = kmix64(g_key_seed[0] ^ s) | 1;
-    g_key_seed[1] = kmix64(g_key_seed[1] ^ s ^ 0x9E3779B97F4A7C15ULL) | 1;
+    if (atomic_load_explicit(&g_key_seed_ready, memory_order_acquire)) return;
+    sv_rw_wr(&g_key_seed_lock);
+    if (!atomic_load_explicit(&g_key_seed_ready, memory_order_relaxed)) {
+        uint64_t seed[2] = { 0, 0 };
+        uint64_t s = (uint64_t)time(NULL) ^ ((uint64_t)(uintptr_t)&g_key_seed << 13) ^ ((uint64_t)clock() << 32);
+        FILE* f = fopen("/dev/urandom", "rb");
+        if (f) { if (fread(seed, 1, sizeof(seed), f) != sizeof(seed)) seed[0] = seed[1] = 0; fclose(f); }
+        g_key_seed[0] = kmix64(seed[0] ^ s) | 1;
+        g_key_seed[1] = kmix64(seed[1] ^ s ^ 0x9E3779B97F4A7C15ULL) | 1;
+        atomic_store_explicit(&g_key_seed_ready, 1, memory_order_release);
+    }
+    sv_rw_wrunlock(&g_key_seed_lock);
 }
 
 static uint64_t key_hash(const char* s, size_t n, uint64_t seed) {
@@ -1300,6 +1330,8 @@ typedef struct MemIndex {
     struct MemIndex* next;
 } MemIndex;
 
+// Protezione: la lista si legge / allunga con g_mi_lock; gli indici cambiano (insert / delete / free)
+// solo con il motore in esclusiva (db_lock), quando nessuna lettura parallela è in corso.
 static MemIndex* g_mem_indexes;
 
 static void mi_free(MemIndex* ix) {
@@ -1319,6 +1351,12 @@ void executor_invalidate_indexes(void) {
         mi_free(g_mem_indexes);
         g_mem_indexes = nx;
     }
+}
+
+static void mi_invalidate_table(const char* db, const char* table);
+void executor_invalidate_table(BufferPool* bp, const char* db, const char* table, uint32_t root_page_id) {
+    mi_invalidate_table(db, table);
+    heap_cache_forget(bp, root_page_id);
 }
 
 static void mi_invalidate_table(const char* db, const char* table) {
@@ -1427,7 +1465,7 @@ static const RidList* mi_lookup(MemIndex* ix, const char* key) {
 //  ricerca binaria. I RID trovati vengono poi ordinati per pagina, così ogni pagina
 //  della tabella viene letta una volta sola e nell'ordine del file.
 
-static const MemIndex* g_ord_ix;
+static _Thread_local const MemIndex* g_ord_ix;
 
 static int ord_cmp(const void* a, const void* b) {
     int x = *(const int*)a, y = *(const int*)b;
@@ -1435,6 +1473,7 @@ static int ord_cmp(const void* a, const void* b) {
     return strcmp(g_ord_ix->lkeys[x], g_ord_ix->lkeys[y]);
 }
 
+// (chiamata con g_mi_lock in scrittura: più letture parallele possono arrivare qui insieme)
 static bool mi_ordered(MemIndex* ix, bool numeric) {
     if (ix->ord_ok) return true;
     free(ix->ord);
@@ -1475,10 +1514,21 @@ static int rid_cmp(const void* a, const void* b) {
 
 // RID delle righe con chiave in [lo, hi] (estremo NULL = illimitato), in ordine fisico.
 // Gli estremi sono sempre inclusi: chi chiama riapplica le condizioni esatte.
+static SvRwLock g_mi_lock;
+static bool mi_range_locked(MemIndex* ix, bool numeric, const EvalVal* lo, const EvalVal* hi, RID** out, int* nout);
+
 static bool mi_range(MemIndex* ix, bool numeric, const EvalVal* lo, const EvalVal* hi, RID** out, int* nout) {
     *out = NULL;
     *nout = 0;
     if (!numeric && ix->has_long) return false;                 // testi lunghi: l'ordine delle chiavi non vale
+    // la vista ordinata si costruisce al primo uso: con più letture in parallelo, una alla volta
+    sv_rw_wr(&g_mi_lock);
+    bool ok = mi_range_locked(ix, numeric, lo, hi, out, nout);
+    sv_rw_wrunlock(&g_mi_lock);
+    return ok;
+}
+
+static bool mi_range_locked(MemIndex* ix, bool numeric, const EvalVal* lo, const EvalVal* hi, RID** out, int* nout) {
     if (!mi_ordered(ix, numeric)) return false;
     int a = 0, b = ix->nord;
     if (lo) {                                   // prima chiave >= lo
@@ -1568,7 +1618,7 @@ static MemIndex* mi_get_cols_locked(ExecCtx* ctx, const char* db, TableSchema* t
     }
     if (scan) heap_scan_close(scan);
     free(hf);
-    if (!ok || sv_scan_cancelled()) { mi_free(ix); return NULL; }   // incompleto: scartato
+    if (!ok || sv_scan_cancelled() || heap_damage(NULL, 0)) { mi_free(ix); return NULL; }   // incompleto: scartato
     ix->next = g_mem_indexes;
     g_mem_indexes = ix;
     return ix;
@@ -2071,6 +2121,8 @@ static void ev_set_text(EvalCtx* c, EvalVal* out, const char* s, size_t n) {
 typedef struct { char name[64]; bool null, is_num, is_int; int64_t inum; double num; char* text; } UVar;   // text: anche dei DECIMAL
 typedef struct { char name[64]; char* sql; } UPrep;
 struct UserVars { UVar* v; int n, cap; UPrep* prep; int nprep; };
+// Protezione: stato della sessione attiva, cambiato da db_api sotto db_lock; le letture parallele
+// (db_execute_readonly) rifiutano le @variabili, quindi non lo toccano.
 static UserVars* g_uvars;
 
 UserVars* executor_uservars(void) { return g_uvars; }
@@ -2222,6 +2274,11 @@ static bool eval_internal(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     if (!strcmp(f, "__UVAR"))   { uservar_get(e->args[0]->str_val, out); return true; }
     if (!strcmp(f, "__SYSVAR")) {
         if (!strcasecmp(e->args[0]->str_val, "foreign_key_checks")) { ev_int(out, executor_fk_checks()); return true; }
+        if (!strcasecmp(e->args[0]->str_val, "cache_size")) { ev_int(out, db_cache_size()); return true; }
+        if (!strcasecmp(e->args[0]->str_val, "synchronous")) {
+            out->null = false; out->is_num = out->is_int = false; out->ci = false; out->str = db_synchronous();
+            return true;
+        }
         if (!strcasecmp(e->args[0]->str_val, "identity") || !strcasecmp(e->args[0]->str_val, "last_insert_id")) { ev_int(out, g_last_insert_id); return true; }
         const char* v = sysvar_value(e->args[0]->str_val);
         if (!v) { ctx_error(c, "Unknown system variable '%s'", e->args[0]->str_val); ev_null(out); return true; }
@@ -2292,6 +2349,7 @@ static void rt_eval_function(ASTExpr* e, EvalCtx* c, EvalVal* out);
 // ── sequenze (CREATE SEQUENCE, NEXTVAL / CURRVAL / SETVAL): come in PostgreSQL non sono transazionali;
 //    stato in un file di testo accanto al catalogo, riscritto a ogni cambio ──
 typedef struct { char db[64], name[64]; int64_t value, inc, minv, maxv, start; bool cycle, called; } Seq;
+// Protezione: solo con il motore in esclusiva; db_execute_readonly rifiuta NEXTVAL / SETVAL.
 static Seq*  g_seq;
 static int   g_nseq, g_capseq;
 static char  g_seq_path[1100];
@@ -2300,7 +2358,7 @@ static void seq_save(void) {
     if (!g_seq_path[0]) return;
     char tmp[1200];
     snprintf(tmp, sizeof(tmp), "%s.tmp", g_seq_path);
-    FILE* f = fopen(tmp, "w");
+    FILE* f = sv_fopen_private(tmp, "w");
     if (!f) return;
     for (int i = 0; i < g_nseq; i++) {
         Seq* q = &g_seq[i];
@@ -2378,6 +2436,7 @@ static void seq_remember(const Seq* q) {                       // CURRVAL / LAST
 static bool eval_sequence(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     const char* f = e->func;
     if (strcmp(f, "NEXTVAL") && strcmp(f, "CURRVAL") && strcmp(f, "SETVAL") && strcmp(f, "LASTVAL")) return false;
+    if (g_describe) { ev_null(out); return true; }      // PREPARE: solo la forma del risultato, nessun effetto
     if (!strcmp(f, "LASTVAL")) {
         uservar_get("\x01seq.last", out);
         if (out->null) ctx_error(c, "%s", "LASTVAL is not yet defined in this session");
@@ -3189,8 +3248,8 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         return true;
     }
     if (!strcmp(f, "ASCII") || !strcmp(f, "ORD")) { ev_int(out, (unsigned char)S(0)[0]); return true; }
-    if (!strcmp(f, "CHAR")) {
-        for (int i = 0; i < na; i++) if (!a[i].null) { long long v = I(i); char ch = (char)(v & 0xff); tb_put(&tb, &ch, 1); }
+    if (!strcmp(f, "CHAR")) {                                   // byte veri, anche CHAR(0) (binesc.h)
+        for (int i = 0; i < na; i++) if (!a[i].null) { long long v = I(i); char e2[2]; tb_put(&tb, e2, sv_bin_put((uint8_t)(v & 0xff), e2)); }
         tb_result(c, out, &tb);
         return true;
     }
@@ -3198,7 +3257,12 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         if (a[0].is_num) { snprintf(b, sizeof(b), "%llX", (unsigned long long)I(0)); ev_set_text(c, out, b, strlen(b)); return true; }
         const char* s = S(0);
         static const char H[] = "0123456789ABCDEF";
-        for (const char* p = s; *p; p++) { char h[2] = { H[(unsigned char)*p >> 4], H[(unsigned char)*p & 15] }; tb_put(&tb, h, 2); }
+        for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
+            unsigned char by = *p;
+            if (by == SV_BIN_ESC && (p[1] == 0x80 || p[1] == 0x81)) { by = p[1] == 0x80 ? 0 : SV_BIN_ESC; p++; }   // byte vero
+            char h[2] = { H[by >> 4], H[by & 15] };
+            tb_put(&tb, h, 2);
+        }
         tb_result(c, out, &tb);
         return true;
     }
@@ -3210,35 +3274,52 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             int hi = isdigit((unsigned char)s[i]) ? s[i] - '0' : isxdigit((unsigned char)s[i]) ? (tolower((unsigned char)s[i]) - 'a' + 10) : -1;
             int lo = isdigit((unsigned char)s[i + 1]) ? s[i + 1] - '0' : isxdigit((unsigned char)s[i + 1]) ? (tolower((unsigned char)s[i + 1]) - 'a' + 10) : -1;
             if (hi < 0 || lo < 0) { free(tb.d); ev_null(out); return true; }
-            char ch = (char)(hi * 16 + lo);
-            tb_put(&tb, &ch, 1);
+            char e2[2];
+            tb_put(&tb, e2, sv_bin_put((uint8_t)(hi * 16 + lo), e2));
         }
         tb_result(c, out, &tb);
         return true;
     }
     if (!strcmp(f, "MD5") || !strcmp(f, "SHA1") || !strcmp(f, "SHA") || !strcmp(f, "SHA2")) {
-        const char* s = S(0);
+        const char* s0 = S(0);
+        size_t sl0 = strlen(s0);
+        char* s = malloc(sl0 + 1);                              // i byte veri (binesc.h)
+        if (!s) { ev_null(out); return true; }
+        size_t sl = sv_bin_decode(s0, sl0, s);
         uint8_t h[32];
         size_t hl;
-        if (f[0] == 'M') { md5_bytes((const uint8_t*)s, strlen(s), h); hl = 16; }
+        if (f[0] == 'M') { md5_bytes((const uint8_t*)s, sl, h); hl = 16; }
         else if (!strcmp(f, "SHA2")) {
             long long bits = I(1);
-            if (bits != 256 && bits != 0) { ev_null(out); return true; }
-            auth_sha256(s, strlen(s), h); hl = 32;
-        } else { auth_sha1(s, strlen(s), h); hl = 20; }
+            if (bits != 256 && bits != 0) { free(s); ev_null(out); return true; }
+            auth_sha256(s, sl, h); hl = 32;
+        } else { auth_sha1(s, sl, h); hl = 20; }
+        free(s);
         hex_into(&tb, h, hl);
         tb_result(c, out, &tb);
         return true;
     }
-    if (!strcmp(f, "CRC32")) { const char* s = S(0); ev_int(out, crc32_bytes((const uint8_t*)s, strlen(s))); return true; }
+    if (!strcmp(f, "CRC32")) {
+        const char* s0 = S(0);
+        size_t l0 = strlen(s0);
+        char* s = malloc(l0 + 1);
+        if (!s) { ev_null(out); return true; }
+        ev_int(out, crc32_bytes((const uint8_t*)s, sv_bin_decode(s0, l0, s)));
+        free(s);
+        return true;
+    }
     if (!strcmp(f, "TO_BASE64")) {
-        const unsigned char* s = (const unsigned char*)S(0);
-        size_t l = strlen((const char*)s);
+        const char* s0 = S(0);
+        size_t l0 = strlen(s0);
+        unsigned char* s = malloc(l0 + 1);
+        if (!s) { ev_null(out); return true; }
+        size_t l = sv_bin_decode(s0, l0, (char*)s);
         for (size_t i = 0; i < l; i += 3) {
             uint32_t v = (uint32_t)s[i] << 16 | (i + 1 < l ? (uint32_t)s[i + 1] << 8 : 0) | (i + 2 < l ? s[i + 2] : 0);
             char q[4] = { B64[v >> 18], B64[(v >> 12) & 63], i + 1 < l ? B64[(v >> 6) & 63] : '=', i + 2 < l ? B64[v & 63] : '=' };
             tb_put(&tb, q, 4);
         }
+        free(s);
         tb_result(c, out, &tb);
         return true;
     }
@@ -3252,7 +3333,7 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             if (!k || !*p) { free(tb.d); ev_null(out); return true; }
             acc = acc << 6 | (uint32_t)(k - B64);
             bits += 6;
-            if (bits >= 8) { bits -= 8; char ch = (char)((acc >> bits) & 0xff); tb_put(&tb, &ch, 1); }
+            if (bits >= 8) { bits -= 8; char e2[2]; tb_put(&tb, e2, sv_bin_put((uint8_t)((acc >> bits) & 0xff), e2)); }
         }
         tb_result(c, out, &tb);
         return true;
@@ -3277,8 +3358,8 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         tb_result(c, out, &tb);
         return true;
     }
-    if (!strcmp(f, "BIT_LENGTH")) { ev_int(out, (int64_t)strlen(S(0)) * 8); return true; }
-    if (!strcmp(f, "OCTET_LENGTH")) { ev_int(out, (int64_t)strlen(S(0))); return true; }
+    if (!strcmp(f, "BIT_LENGTH")) { ev_int(out, (int64_t)sv_bin_len(S(0)) * 8); return true; }
+    if (!strcmp(f, "OCTET_LENGTH")) { ev_int(out, (int64_t)sv_bin_len(S(0))); return true; }
     if (!strcmp(f, "CHARSET")) { ev_set_text(c, out, "utf8mb4", 7); return true; }
     if (!strcmp(f, "COLLATION")) { ev_set_text(c, out, "utf8mb4_general_ci", 18); return true; }
     if (!strcmp(f, "BIN") || !strcmp(f, "OCT")) {
@@ -4071,7 +4152,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     EvalVal a[3];
     int na = e->nargs < 3 ? e->nargs : 3;
 
-    if (e->subkind == SUBK_UDF) { rt_eval_function(e, c, out); return; }
+    if (e->subkind == SUBK_UDF) { if (g_describe) { ev_null(out); return; } rt_eval_function(e, c, out); return; }
     if (eval_internal(e, c, out)) return;
     if (eval_sequence(e, c, out)) return;
     if (eval_more(e, c, out)) return;
@@ -4196,7 +4277,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         free(buf);
         return;
     }
-    if (!strcmp(f, "LENGTH"))        { ev_int(out, (int64_t)strlen(ev_s(&a[0]))); return; }
+    if (!strcmp(f, "LENGTH"))        { ev_int(out, (int64_t)sv_bin_len(ev_s(&a[0]))); return; }   // byte veri
     if (!strncmp(f, "JSON_", 5)) {
         const char* doc = ev_s(&a[0]);
         if (!strcmp(f, "JSON_VALID")) { ev_int(out, sj_valid(doc)); return; }
@@ -4692,6 +4773,7 @@ static bool find_index_eq(ASTExpr* w, TableSchema* ts, int* out_ci, char* key, s
 static bool source_load(ExecCtx* ctx, const char* db, Source* s, ASTExpr* where_for_index, char* plan, size_t plann) {
     if (s->loaded) return true;
     s->loaded = true;
+    if (g_describe) return true;                               // descrizione: tabella vuota, niente letto
     HeapFile* hf = heap_open(ctx->bp, s->ts->root_page_id, s->ts->num_pages);
     if (!hf) return false;
     int cap = 0, ci = -1;
@@ -4718,6 +4800,9 @@ static bool source_load(ExecCtx* ctx, const char* db, Source* s, ASTExpr* where_
         if (!source_push(s, t, rid, &cap)) { tuple_free(t); ok = false; }
     heap_scan_close(scan);
     free(hf);
+    // annullata a metà (KILL QUERY, limite di tempo): mai righe in meno, la lettura fallisce
+    // (un UPDATE / DELETE si ferma così prima di scrivere)
+    if (ok && sv_scan_cancelled()) ok = false;
     return ok;
 }
 
@@ -5473,6 +5558,18 @@ static const char* is_fk_rule(int a) {
 
 static const char* is_collation(const TableSchema* ts) { return ts->collation[0] ? ts->collation : "utf8mb4_general_ci"; }
 
+bool executor_priv_ok(const ExecCtx* x, const char* db, const char* table, unsigned priv, char* err, size_t errn) {
+    if (!x || !x->user || !x->user[0] || x->priv_off > 0) return true;
+    if (auth_privs(x->user, db, table) & priv) return true;
+    snprintf(err, errn, "Access denied for user '%.63s': %s on %.63s.%.63s", x->user, auth_priv_name(priv), db ? db : "", table);
+    return false;
+}
+
+// qualche permesso sulla tabella (DESCRIBE, SHOW CREATE, information_schema la mostrano)
+static bool priv_any(const ExecCtx* x, const char* db, const char* table) {
+    return !x || !x->user || !x->user[0] || x->priv_off > 0 || auth_privs(x->user, db, table) != 0;
+}
+
 static bool infoschema_open(ExecCtx* x, Source* s, const char* table, char* err, size_t errn) {
     Catalog* cat = x->catalog;
     char up[SV_MAX_NAME_LEN];
@@ -5540,6 +5637,7 @@ static bool infoschema_open(ExecCtx* x, Source* s, const char* table, char* err,
         }
         for (int t = 0; t < db->num_tables && b.ok; t++) {
             TableSchema* tb = &db->tables[t];
+            if (!priv_any(x, sch, tb->name)) continue;              // solo le tabelle su cui l'utente ha permessi
             switch (ti) {
                 case 1: {                                            // TABLES
                     isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, tb->name); isb_s(&b, "BASE TABLE");
@@ -5670,6 +5768,7 @@ static bool infoschema_open(ExecCtx* x, Source* s, const char* table, char* err,
         }
         if (ti == 1)                                                 // TABLES: anche le viste
             for (int v = 0; v < db->num_views && b.ok; v++) {
+                if (!priv_any(x, sch, db->views[v].name)) continue;
                 isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, db->views[v].name); isb_s(&b, "VIEW");
                 isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b);
                 isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b); isb_null(&b);
@@ -5677,6 +5776,7 @@ static bool infoschema_open(ExecCtx* x, Source* s, const char* table, char* err,
             }
         if (ti == 8)                                                 // VIEWS
             for (int v = 0; v < db->num_views && b.ok; v++) {
+                if (!priv_any(x, sch, db->views[v].name)) continue;
                 isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, db->views[v].name); isb_s(&b, db->views[v].definition);
                 isb_s(&b, "NONE"); isb_s(&b, "NO"); isb_s(&b, "root@localhost"); isb_s(&b, "DEFINER"); isb_s(&b, "utf8mb4");
                 isb_s(&b, "utf8mb4_general_ci"); isb_end(&b);
@@ -5684,6 +5784,7 @@ static bool infoschema_open(ExecCtx* x, Source* s, const char* table, char* err,
         if (ti == 9)                                                 // TRIGGERS
             for (int g = 0; g < db->num_triggers && b.ok; g++) {
                 const TriggerSchema* tg = &db->triggers[g];
+                if (!priv_any(x, sch, tg->table_name)) continue;
                 isb_row(&b); isb_s(&b, "def"); isb_s(&b, sch); isb_s(&b, tg->name); isb_s(&b, tg->event); isb_s(&b, "def");
                 isb_s(&b, sch); isb_s(&b, tg->table_name); isb_i(&b, g + 1); isb_null(&b); isb_s(&b, tg->body); isb_s(&b, "ROW");
                 isb_s(&b, tg->before ? "BEFORE" : "AFTER"); isb_null(&b); isb_s(&b, ""); isb_s(&b, "root@localhost"); isb_end(&b);
@@ -5779,10 +5880,14 @@ static bool source_open(ExecCtx* x, Database* db, Source* s, const char* table, 
     if (g_infoschema) return infoschema_open(x, s, table, err, errn);
     if (!db) { snprintf(err, errn, "No database selected"); return false; }
     s->ts = catalog_get_table(x->catalog, db->name, table);
-    if (s->ts) return true;
+    if (s->ts) {
+        if (!executor_priv_ok(x, db->name, s->ts->name, AUTH_SELECT, err, errn)) { s->ts = NULL; return false; }
+        return true;
+    }
 
     ViewSchema* view = catalog_get_view(x->catalog, db->name, table);
     if (!view) { snprintf(err, errn, "Table or view '%.64s' not found", table); return false; }
+    if (!executor_priv_ok(x, db->name, view->name, AUTH_SELECT, err, errn)) return false;
     TokenList* tk = lexer_tokenize(view->definition);
     ParseResult* pr = tk ? parser_parse(tk) : NULL;
     if (!pr || !pr->success || pr->count != 1 || pr->statements[0]->type != NODE_SELECT) {
@@ -5791,7 +5896,9 @@ static bool source_open(ExecCtx* x, Database* db, Source* s, const char* table, 
         lexer_free(tk);
         return false;
     }
+    x->priv_off++;                                  // il corpo: con i permessi controllati a CREATE VIEW
     bool ok = source_materialize(x, s, pr->statements[0], depth, NULL, "View", err, errn);
+    x->priv_off--;
     parse_result_free(pr);
     lexer_free(tk);
     return ok;
@@ -6989,7 +7096,8 @@ static void arm_set_unit(SelectPlan* p, ArmState* st, EvalCtx* ec, int u) {
 // della partizione alla riga corrente compresi i suoi pari (righe con le stesse chiavi), come il
 // RANGE predefinito di SQL; senza ORDER BY è l'intera partizione.
 
-static struct { const SortKey* keys; int K, npart; const bool* desc; } g_wsort;
+// (_Thread_local: qsort gira nel thread che ordina, e più SELECT in parallelo ordinano insieme)
+static _Thread_local struct { const SortKey* keys; int K, npart; const bool* desc; } g_wsort;
 
 static int wsort_cmp(const void* a, const void* b) {
     int ia = *(const int*)a, ib = *(const int*)b;
@@ -7351,10 +7459,11 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
 
     // 2. combinazioni (JOIN) e resto della WHERE
     for (int s = 0; s < p->nsrc; s++) if (p->src[s].lateral) pool_reset(&p->src[s]);   // righe dell'esecuzione precedente
-    if (p->nsrc == 0) {
+    if (p->nsrc == 0 && !g_describe) {                         // (descrizione: nessuna riga, niente da valutare)
         if (!combos_push(&st.combos, NULL, -1, NULL)) AFAIL("Out of memory");
     }
-    if (p->nsrc > 0 && p->src[0].lateral) {                    // FROM GENERATE_SERIES(...) / JSON_TABLE(...)
+    if (g_describe) {}
+    else if (p->nsrc > 0 && p->src[0].lateral) {               // FROM GENERATE_SERIES(...) / JSON_TABLE(...)
         Tuple** lrows = NULL;
         int lnr = 0;
         char lerr[300];
@@ -7489,10 +7598,10 @@ static bool arm_exec(SelectPlan* p, EvalCtx* outer, int stop_after, bool apply_o
     if (p->nwins) {
         int total = nunits_total;
         st.nwinv = total;
-        for (int w = 0; w < p->nwins; w++) {
-            st.winv[w] = calloc((size_t)(total ? total : 1), sizeof(SortKey));
-            if (!st.winv[w]) AFAIL("Out of memory");
-            if (!window_compute(p, &st, &ec, p->wins[w], st.units, nunits, st.winv[w])) AFAIL("%s", ec.err[0] ? ec.err : "Out of memory");
+        for (int wi = 0; wi < p->nwins; wi++) {
+            st.winv[wi] = calloc((size_t)(total ? total : 1), sizeof(SortKey));
+            if (!st.winv[wi]) AFAIL("Out of memory");
+            if (!window_compute(p, &st, &ec, p->wins[wi], st.units, nunits, st.winv[wi])) AFAIL("%s", ec.err[0] ? ec.err : "Out of memory");
         }
         ec.win = st.winv;
     }
@@ -7663,7 +7772,7 @@ static bool set_combine(ORows* a, ORows* b, int op, bool all, ORows* out) {
 static _Thread_local const OVal* g_cmp_rows_base;
 static _Thread_local int g_cmp_ncols, g_cmp_nkeys;
 static _Thread_local const int* g_cmp_cols;
-static const bool* g_cmp_desc;
+static _Thread_local const bool* g_cmp_desc;
 
 static int compound_cmp(const void* pa, const void* pb) {
     int ia = *(const int*)pa, ib = *(const int*)pb;
@@ -8296,10 +8405,12 @@ static int pk_column(const TableSchema* ts) {
 
 static void rid_key(RID r, char* buf, size_t n) { snprintf(buf, n, "%u:%u", r.page_id, (unsigned)r.slot_id); }
 
+// Protezione: scritto e letto solo con il motore in esclusiva (le letture parallele non scrivono).
 static bool g_fk_checks = true;
 void executor_set_fk_checks(bool on) { g_fk_checks = on; }
 bool executor_fk_checks(void) { return g_fk_checks; }
 
+// impostato una volta da db_init, poi solo letto
 static ExecChangeHook g_change_hook;
 void executor_set_change_hook(ExecChangeHook hook) { g_change_hook = hook; }
 
@@ -10048,6 +10159,15 @@ static const char* fire_cascaded(ExecCtx* ctx, Database* db, ChangeSet* cs, bool
     return NULL;
 }
 
+// api_endpoints.definer: chi ha scritto la riga, sempre l'utente della sessione ("" = root / token /
+// nessun utente), dopo i trigger BEFORE: il server esegue l'endpoint con i suoi permessi (P0.2)
+static void definer_force(const ExecCtx* ctx, TableSchema* ts, Tuple* t) {
+    if (strcasecmp(ts->name, AUTH_ENDPOINTS_TABLE)) return;
+    int ci = catalog_get_col_index(ts, "definer");
+    if (ci < 0 || ci >= t->num_values) return;
+    column_set_from_text(&t->values[ci], &ts->columns[ci], ctx->user ? ctx->user : "");
+}
+
 static bool has_generated(const TableSchema* ts) {
     for (int i = 0; i < ts->num_columns; i++) if (ts->columns[i].flags & COLF_GENERATED) return true;
     return false;
@@ -10105,6 +10225,7 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
         return result_error_msg("Table not found");
     }
     char msg[300];
+    if (!executor_priv_ok(ctx, db->name, ts->name, AUTH_INSERT, msg, sizeof(msg))) return result_error_msg(msg);
     int nc = ts->num_columns;
 
     // colonne indicate
@@ -10273,6 +10394,7 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     if (!fail) fail = fire_triggers(ctx, db, ts, "INSERT", true, false, NULL, NULL, NULL, 0, msg, sizeof(msg));
     for (int r = 0; r < nrows && !fail; r++)
         fail = fire_triggers(ctx, db, ts, "INSERT", true, true, NULL, tuples[r], NULL, 0, msg, sizeof(msg));
+    for (int r = 0; r < nrows && !fail; r++) definer_force(ctx, ts, tuples[r]);
     for (int r = 0; r < nrows && !fail; r++)                      // un trigger può aver tolto un valore obbligatorio
         for (int c = 0; c < nc && !fail; c++)
             if (tuples[r]->values[c].is_null && (!ts->columns[c].nullable || ts->columns[c].primary_key)) {
@@ -10318,7 +10440,7 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
         return result_error_msg(msg);
     }
     QueryResult* ok = result_ok_msg(done);
-    if (ok && last_generated > 0 && last_generated <= INT32_MAX) ok->last_insert_id = (int)last_generated;
+    if (ok && last_generated > 0) ok->last_insert_id = (long long)last_generated;
     if (last_generated > 0) g_last_insert_id = last_generated;
     return ok;
 }
@@ -10359,7 +10481,11 @@ static const char* select_matches(ExecCtx* ctx, Database* db, Source* s, ASTExpr
         }
     }
     free(conj.v);
-    if (!source_load(ctx, db->name, s, where, NULL, 0)) return "Failed to read the table";
+    if (!source_load(ctx, db->name, s, where, NULL, 0)) return sv_scan_cancelled() ? "Query cancelled" : "Failed to read the table";
+    {   // righe mancanti per una pagina danneggiata: niente UPDATE / DELETE a metà
+        static _Thread_local char dm[200];
+        if (heap_damage(dm, sizeof(dm))) return dm;
+    }
     int* idx = malloc(sizeof(int) * (size_t)(s->n ? s->n : 1));
     if (!idx) return "Out of memory";
     int n = 0;
@@ -10387,6 +10513,7 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
         return result_error_msg("Table not found");
     }
     char msg[300];
+    if (!executor_priv_ok(ctx, db->name, ts->name, AUTH_UPDATE, msg, sizeof(msg))) return result_error_msg(msg);
     int set_ci[SV_MAX_SETS];
     for (int k = 0; k < n->update_stmt.num_sets; k++) {
         set_ci[k] = catalog_get_col_index(ts, n->update_stmt.set_cols[k]);
@@ -10454,6 +10581,7 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
     if (!fail) fail = fire_triggers(ctx, db, ts, "UPDATE", true, false, NULL, NULL, set_ci, n->update_stmt.num_sets, msg, sizeof(msg));
     for (int i = 0; i < nm && !fail; i++)
         fail = fire_triggers(ctx, db, ts, "UPDATE", true, true, s.rows[idx[i]], nt[i], set_ci, n->update_stmt.num_sets, msg, sizeof(msg));
+    for (int i = 0; i < nm && !fail; i++) definer_force(ctx, ts, nt[i]);
     if (!fail) {
         ChangeSet cs;
         memset(&cs, 0, sizeof(cs));
@@ -10466,7 +10594,9 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
         if (!fail) fail = cs_cascade(&cs, msg, sizeof(msg));
         if (!fail) fail = fire_cascaded(ctx, db, &cs, true, msg, sizeof(msg));
         if (!fail) fail = cs_validate(&cs, msg, sizeof(msg));
-        if (!fail) affected = cs_apply(&cs, msg, sizeof(msg), &fail);
+        if (!fail && heap_damage(msg, sizeof(msg))) fail = msg;
+        if (!fail && heap_damage(msg, sizeof(msg))) fail = msg;
+    if (!fail) affected = cs_apply(&cs, msg, sizeof(msg), &fail);
         for (int i = 0; i < cs.n && !fail; i++)
             if (cs.v[i].direct)
                 fail = fire_triggers(ctx, db, ts, "UPDATE", false, true, cs.v[i].old, cs.v[i].nt, set_ci, n->update_stmt.num_sets, msg, sizeof(msg));
@@ -10490,6 +10620,10 @@ static QueryResult* exec_delete(ExecCtx* ctx, ASTNode* n) {
     if (!ts) {
         if (catalog_get_view(ctx->catalog, db->name, n->delete_stmt.table_name)) return result_error_msg("Cannot DELETE from a view");
         return result_error_msg("Table not found");
+    }
+    {
+        char pm[300];
+        if (!executor_priv_ok(ctx, db->name, ts->name, AUTH_DELETE, pm, sizeof(pm))) return result_error_msg(pm);
     }
     Source s;
     memset(&s, 0, sizeof(s));
@@ -10697,12 +10831,12 @@ static QueryResult* exec_show_extra(ExecCtx* ctx, ASTNode* n) {
         BufferStats* st = &ctx->bp->stats;
         int mi = 0;
         for (MemIndex* ix = g_mem_indexes; ix; ix = ix->next) mi++;
-        long pages = sv_lseek(ctx->bp->db_fd, 0, SEEK_END) / SV_PAGE_SIZE;
+        long long pages = (long long)(sv_lseek(ctx->bp->db_fd, 0, SEEK_END) / SV_PAGE_SIZE);
         struct { const char* k; char v[64]; } rows[16];
         int nr = 0;
         #define STAT(name, ...) do { rows[nr].k = name; snprintf(rows[nr].v, sizeof(rows[nr].v), __VA_ARGS__); nr++; } while (0)
         STAT("page_size", "%d bytes", SV_PAGE_SIZE);
-        STAT("database_pages", "%ld", pages);
+        STAT("database_pages", "%lld", pages);
         STAT("buffer_pool_frames", "%d (%d in use)", ctx->bp->capacity, ctx->bp->num_used);
         STAT("buffer_pool_policy", "CLOCK (second chance)");
         STAT("buffer_requests", "%llu", (unsigned long long)st->requests);
@@ -10712,7 +10846,7 @@ static QueryResult* exec_show_extra(ExecCtx* ctx, ASTNode* n) {
         STAT("buffer_evictions", "%llu", (unsigned long long)st->evictions);
         STAT("pages_written", "%llu", (unsigned long long)st->dirty_writes);
         STAT("pages_allocated", "%llu", (unsigned long long)st->new_pages);
-        STAT("wal_size", "%ld bytes", ctx->wal ? wal_size(ctx->wal) : 0L);
+        STAT("wal_size", "%lld bytes", ctx->wal ? (long long)wal_size(ctx->wal) : 0LL);
         STAT("wal_records", "%llu", ctx->wal ? (unsigned long long)ctx->wal->sequence : 0ULL);
         STAT("checkpoints", "%llu", ctx->wal ? (unsigned long long)ctx->wal->checkpoints : 0ULL);
         STAT("in_memory_indexes", "%d", mi);
@@ -10733,6 +10867,7 @@ static QueryResult* exec_show_extra(ExecCtx* ctx, ASTNode* n) {
         for (int i = 0; i < db->num_triggers; i++) {
             TriggerSchema* tg = &db->triggers[i];
             if (n->select_stmt.table_alias[0] && strcasecmp(n->select_stmt.table_alias, tg->table_name)) continue;
+            if (!priv_any(ctx, db->name, tg->table_name)) continue;
             const char* v[5] = { tg->name, tg->before ? "BEFORE" : "AFTER", tg->event, tg->table_name, tg->body };
             if (!text_row(r, &cap, v)) { db_result_free(r); return result_error_msg("Out of memory"); }
         }
@@ -10741,6 +10876,7 @@ static QueryResult* exec_show_extra(ExecCtx* ctx, ASTNode* n) {
     if (!strcmp(kind, "CREATE VIEW")) {
         ViewSchema* vs = catalog_get_view(ctx->catalog, db->name, n->select_stmt.table_alias);
         if (!vs) { snprintf(a, sizeof(a), "View '%.64s' not found", n->select_stmt.table_alias); return result_error_msg(a); }
+        if (!priv_any(ctx, db->name, vs->name)) { snprintf(a, sizeof(a), "Access denied for user '%.63s' to view '%.64s'", ctx->user, vs->name); return result_error_msg(a); }
         static const char* const NAMES[] = { "View", "Create View" };
         QueryResult* r = text_result(2, NAMES);
         size_t dl = strlen(vs->definition) + 100;
@@ -10753,6 +10889,7 @@ static QueryResult* exec_show_extra(ExecCtx* ctx, ASTNode* n) {
     }
     TableSchema* ts = catalog_get_table(ctx->catalog, db->name, n->select_stmt.table_alias);
     if (!ts) { snprintf(a, sizeof(a), "Table '%.64s' not found", n->select_stmt.table_alias); return result_error_msg(a); }
+    if (!priv_any(ctx, db->name, ts->name)) { snprintf(a, sizeof(a), "Access denied for user '%.63s' to table '%.64s'", ctx->user, ts->name); return result_error_msg(a); }
     if (!strcmp(kind, "CREATE")) {
         static const char* const NAMES[] = { "Table", "Create Table" };
         QueryResult* r = text_result(2, NAMES);
@@ -10869,6 +11006,7 @@ static QueryResult* exec_show(ExecCtx* ctx, ASTNode* n) {
             bool view = i >= db->num_tables;
             const char* v[2] = { view ? db->views[i - db->num_tables].name : db->tables[i].name, view ? "VIEW" : "BASE TABLE" };
             if (n->select_stmt.has_show_like && !like_match_esc(v[0], n->select_stmt.show_like, '\\')) continue;
+            if (!priv_any(ctx, db->name, v[0])) continue;              // come MySQL: solo le tabelle con qualche permesso
             if (!text_row(r, &cap, v)) { db_result_free(r); r = NULL; }
         }
         return r ? r : result_error_msg("Out of memory");
@@ -10912,6 +11050,11 @@ static QueryResult* exec_describe(ExecCtx* ctx, ASTNode* n) {
 
     const char* tname = n->select_stmt.table_name;
     if (!tname[0]) return result_error_msg("No table specified");
+    if (!priv_any(ctx, db->name, tname)) {
+        char pm[300];
+        snprintf(pm, sizeof(pm), "Access denied for user '%.63s' to table '%.64s'", ctx->user, tname);
+        return result_error_msg(pm);
+    }
 
     int num_cols;
     ColumnInfo* cols = db_list_columns(db->name, tname, &num_cols);
@@ -11303,6 +11446,7 @@ static QueryResult* exec_dml_multi(ExecCtx* ctx, ASTNode* n) {
         snprintf(tg[i].table, sizeof(tg[i].table), "%s", al[a][1]);
         TableSchema* ts = catalog_get_table(ctx->catalog, db->name, tg[i].table);
         if (!ts) { snprintf(msg, sizeof(msg), "Table '%.64s' not found", tg[i].table); return result_error_msg(msg); }
+        if (!executor_priv_ok(ctx, db->name, ts->name, del ? AUTH_DELETE : AUTH_UPDATE, msg, sizeof(msg))) return result_error_msg(msg);
         for (int k = 0; k < ts->num_constraints && !tg[i].nid; k++)
             if (ts->constraints[k].kind == CONS_PRIMARY)
                 for (int j = 0; j < ts->constraints[k].ncols; j++) tg[i].idcols[tg[i].nid++] = ts->constraints[k].cols[j];
@@ -11482,6 +11626,13 @@ static QueryResult* exec_insert_mysql(ExecCtx* ctx, ASTNode* n) {
     if (!db) return result_error_msg("No database selected");
     TableSchema* ts = catalog_get_table(ctx->catalog, db->name, n->insert_stmt.table_name);
     if (!ts) return exec_insert(ctx, n);                         // il messaggio giusto lo dà exec_insert
+    {   // REPLACE cancella le righe in conflitto, ON DUPLICATE KEY UPDATE le aggiorna
+        char pm[300];
+        if (!executor_priv_ok(ctx, db->name, ts->name, AUTH_INSERT, pm, sizeof(pm)) ||
+            (n->insert_stmt.mode == INS_REPLACE && !executor_priv_ok(ctx, db->name, ts->name, AUTH_DELETE, pm, sizeof(pm))) ||
+            (n->insert_stmt.num_dup > 0 && !executor_priv_ok(ctx, db->name, ts->name, AUTH_UPDATE, pm, sizeof(pm))))
+            return result_error_msg(pm);
+    }
     char tsname[SV_MAX_NAME_LEN];
     snprintf(tsname, sizeof(tsname), "%s", ts->name);
     // righe: i VALUES, o il risultato della SELECT trasformato in letterali
@@ -11565,7 +11716,7 @@ static QueryResult* exec_insert_mysql(ExecCtx* ctx, ASTNode* n) {
     if (owned) { for (int i = 0; i < nrows * nv; i++) ast_expr_free(owned[i]); free(owned); }
     if (fail) return fail;
     QueryResult* ok = result_ok_msg((int)affected);
-    if (ok && last_id > 0 && last_id <= INT32_MAX) ok->last_insert_id = (int)last_id;
+    if (ok && last_id > 0) ok->last_insert_id = (long long)last_id;
     return ok;
 }
 
@@ -11860,11 +12011,17 @@ static QueryResult* exec_returning(ExecCtx* ctx, ASTNode* stmt) {
 }
 
 QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt) {
+    if (g_run_depth == 0) heap_damage_clear();
     g_run_depth++;
     g_select_total = -1;
     QueryResult* r = stmt->nret > 0 ? exec_returning(ctx, stmt) : executor_run_impl(ctx, stmt);
     if (--g_run_depth == 0) {
         arena_free(&g_text_arena);
+        char dm[200];
+        if (heap_damage(dm, sizeof(dm)) && (!r || r->success)) {   // pagina danneggiata: mai un risultato parziale
+            if (r) db_result_free(r);
+            r = result_error_msg(dm);
+        }
         // FOUND_ROWS() e ROW_COUNT() riguardano lo statement di primo livello (come in MySQL)
         if (r && r->success && stmt->type == NODE_SELECT)
             g_found_rows = stmt->select_stmt.calc_found && g_select_total >= 0 ? g_select_total : r->num_rows;
@@ -11917,7 +12074,7 @@ static QueryResult* executor_run_impl(ExecCtx* ctx, ASTNode* stmt) {
                   : c->type == NODE_ALTER_TABLE ? exec_alter_table(ctx, c) : executor_run_impl(ctx, c);
                 if (r && r->success) affected += r->rows_affected;
             }
-            if (r && r->success && stmt->chain) r->rows_affected = (int)affected;
+            if (r && r->success && stmt->chain) r->rows_affected = affected;
             return r;
         }
         case NODE_INSERT: {

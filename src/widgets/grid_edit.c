@@ -1,4 +1,5 @@
 #include "grid_edit.h"
+#include "../table/binesc.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -174,6 +175,18 @@ char* grid_edit_cell_literal(const Cell* c) {
     GBuf b = {0};
     if (c->is_null) gb_str(&b, "NULL");
     else if ((c->type == CELL_TYPE_INT || c->type == CELL_TYPE_FLOAT) && is_num_text(c->value)) gb_str(&b, c->value);
+    else if (sv_bin_has(c->value, strlen(c->value))) {        // byte binari (anche 0x00): X'...' dei byte veri,
+        size_t n = strlen(c->value);                           // valido per SegVault e per MySQL (dump, export)
+        char* d = malloc(n ? n : 1);
+        if (d) {
+            static const char H[] = "0123456789ABCDEF";
+            size_t dl = sv_bin_decode(c->value, n, d);
+            gb_str(&b, "X'");
+            for (size_t i = 0; i < dl; i++) { char h[2] = { H[(unsigned char)d[i] >> 4], H[(unsigned char)d[i] & 15] }; gb_add(&b, h, 2); }
+            gb_str(&b, "'");
+            free(d);
+        } else gb_quoted(&b, c->value);
+    }
     else gb_quoted(&b, c->value);
     return gb_done(&b);
 }

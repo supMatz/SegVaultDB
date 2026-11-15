@@ -3031,11 +3031,14 @@ static TrigStmt* parse_trig_stmt(ParserState* ps) {
         t->kind = TS_ASSIGN;
         do {
             char nm[64];
-            if (!parse_target(ps, nm, sizeof(nm)) || !trig_add_name(ps, t, nm)) { trig_stmt_free(t); return NULL; }
-            if (!match(ps, TOK_EQ) && !match(ps, TOK_ASSIGN)) { parse_fail(ps, "Expected '=' in SET", peek(ps)); trig_stmt_free(t); return NULL; }
-            ASTExpr** ne = realloc(t->exprs, sizeof(ASTExpr*) * (size_t)t->nnames);
+            // prima lo spazio per l'espressione (NULL), poi il nome: se il SET è incompleto trig_stmt_free
+            // libera exprs[0 .. nnames-1] senza leggere oltre l'array (trovato dal fuzzer)
+            ASTExpr** ne = realloc(t->exprs, sizeof(ASTExpr*) * (size_t)(t->nnames + 1));
             if (!ne) { parse_fail(ps, "Out of memory", peek(ps)); trig_stmt_free(t); return NULL; }
             t->exprs = ne;
+            t->exprs[t->nnames] = NULL;
+            if (!parse_target(ps, nm, sizeof(nm)) || !trig_add_name(ps, t, nm)) { trig_stmt_free(t); return NULL; }
+            if (!match(ps, TOK_EQ) && !match(ps, TOK_ASSIGN)) { parse_fail(ps, "Expected '=' in SET", peek(ps)); trig_stmt_free(t); return NULL; }
             t->exprs[t->nnames - 1] = parse_expr(ps);
             if (!t->exprs[t->nnames - 1]) { trig_stmt_free(t); return NULL; }
         } while (match(ps, TOK_COMMA));
@@ -3754,6 +3757,8 @@ static bool parse_type_spec(ParserState* ps, ColumnDef* cd) {
                 if (sc.type != TOK_INTEGER) { parse_fail(ps, "Expected the number of decimal digits", sc); return false; }
                 cd->scale = atoi(sc.text);
                 cd->has_scale = true;
+                if (cd->scale > 30 || cd->scale < 0) { parse_fail(ps, "Too big scale specified (the maximum is 30, as in MySQL)", sc); return false; }
+                if (cd->scale > cd->size && cd->size > 0) { parse_fail(ps, "The scale cannot be larger than the precision", sc); return false; }
                 snprintf(sql + strlen(sql), sizeof(sql) - strlen(sql), "(%d,%d)", cd->size, cd->scale);
             } else snprintf(sql + strlen(sql), sizeof(sql) - strlen(sql), "(%d)", cd->size);
             if (!expect(ps, TOK_RPAREN)) return false;
@@ -4526,6 +4531,8 @@ static ASTNode* parse_statement(ParserState* ps) {
         ((ident_is(ps, "LOCK") || ident_is(ps, "UNLOCK")) && (peek2_ident(ps, "TABLES") || peek2_ident(ps, "TABLE")))) {
         n->type = NODE_SET;
         n->set_fk_checks = -1;
+        n->set_sync = -1;
+        n->set_cache_mb = -1;
         while (peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF) consume(ps);
         return n;
     }
@@ -4779,6 +4786,8 @@ static ASTNode* parse_statement(ParserState* ps) {
             consume(ps);
             n->type = NODE_SET;
             n->set_fk_checks = -1;
+            n->set_sync = -1;
+            n->set_cache_mb = -1;
             while (peek(ps).type != TOK_EOF && peek(ps).type != TOK_SEMICOLON) {
                 // @x = espr / @x := espr: variabile di sessione (l'espressione può contenere virgole fra parentesi)
                 if (peek(ps).type == TOK_IDENTIFIER && peek(ps).text[0] == '@' && peek(ps).text[1] != '@' &&
@@ -4797,8 +4806,28 @@ static ASTNode* parse_statement(ParserState* ps) {
                     if (!match(ps, TOK_COMMA)) break;
                     continue;
                 }
-                Token t = consume(ps);
-                if (t.type != TOK_IDENTIFIER || !t.text || strcasecmp(t.text, "FOREIGN_KEY_CHECKS")) continue;
+                Token tk2 = consume(ps);
+                // synchronous = OFF | NORMAL | FULL (anche @@[global.]synchronous): quando le conferme vanno su disco
+                if (tk2.type == TOK_IDENTIFIER && tk2.text) {
+                    const char* nm = tk2.text;
+                    while (*nm == '@') nm++;
+                    if (!strncasecmp(nm, "global.", 7)) nm += 7;
+                    else if (!strncasecmp(nm, "session.", 8)) nm += 8;
+                    if (!strcasecmp(nm, "cache_size") && match(ps, TOK_EQ)) {   // MB della cache delle pagine
+                        Token v = consume(ps);
+                        long mb = v.type == TOK_INTEGER ? atol(v.text) : -2;
+                        n->set_cache_mb = mb >= 1 ? mb : -2;
+                        continue;
+                    }
+                    if (!strcasecmp(nm, "synchronous") && match(ps, TOK_EQ)) {
+                        Token v = consume(ps);
+                        const char* vt = v.text ? v.text : "";
+                        n->set_sync = !strcasecmp(vt, "OFF") || !strcmp(vt, "0") ? 0 : !strcasecmp(vt, "NORMAL") || !strcmp(vt, "1") ? 1 :
+                                      !strcasecmp(vt, "FULL") || !strcmp(vt, "2") ? 2 : -2;
+                        continue;
+                    }
+                }
+                if (tk2.type != TOK_IDENTIFIER || !tk2.text || strcasecmp(tk2.text, "FOREIGN_KEY_CHECKS")) continue;
                 // il valore dopo '=' (anche @VAR: il ripristino a fine dump, che riaccende i controlli)
                 if (match(ps, TOK_EQ)) {
                     Token v = consume(ps);

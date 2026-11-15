@@ -18,6 +18,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #include "../widgets/png_write.h"
 #include "../bridge/db_api.h"
 #include "../bridge/auth.h"
+#include "../table/binesc.h"
 #include "../widgets/sql_text.h"
 #include "../../include/common.h"
 
@@ -58,6 +59,8 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
   #include <sys/socket.h>
   #include <time.h>
   #include <unistd.h>
+  #include <fcntl.h>
+  #include <sys/un.h>
   typedef int sock_t;
   #define BAD_SOCK (-1)
   #define sock_close close
@@ -74,12 +77,15 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #define API_PREFIX      "/api/v1"     // prefisso predefinito (vedi SvServerConfig.api_prefix)
 #define MAX_HEADER      (16 * 1024)
 #define IDLE_TIMEOUT_MS 15000          // connessione keep-alive inattiva
+#define HEADER_DEADLINE_MS 10000        // intestazione completa entro 10 s dal primo byte
 #define MAX_PARAMS      1024
 
 // sessione di un client: stato del motore che resta tra le richieste (vedi db_session_*)
 #define SV_MAX_SESSIONS   256
 #define SESSION_IDLE_MS   (5 * 60 * 1000)   // una sessione inattiva si chiude
 #define TX_IDLE_MS        (30 * 1000)       // una transazione ferma si annulla (non blocca gli altri)
+#define MYSQL_TX_IDLE_MS  (10 * 60 * 1000)  // protocollo MySQL: transazione aperta e connessione muta per 10 minuti
+                                            // = connessione chiusa e transazione annullata (i lock si liberano)
 #define SESSION_WAIT_MS   10000             // attesa massima di una richiesta per una transazione altrui
 // un sito con nome (vedi SvSite): cartella oppure backend del reverse proxy
 typedef struct {
@@ -110,6 +116,8 @@ struct SvServer {
     sock_t         listen_fd;
     int            port;
     sock_t         mysql_fd;            // protocollo MySQL (BAD_SOCK = spento)
+    sock_t         mysql_unix_fd;       // lo stesso su un socket Unix (cfg.mysql_socket)
+    sock_t         listen6_fd;          // HTTP anche su IPv6 ([::1] o [::]): "localhost" si risolve spesso in ::1
     sock_t         mail_fd;             // SMTP della cattura delle email (BAD_SOCK = spenta)
     int            mail_port;
     MailStore*     mail;
@@ -131,6 +139,7 @@ struct SvServer {
     char           tls_info[300];
     int            mysql_port;
     uint32_t       mysql_ids;           // id delle connessioni MySQL
+    struct MyProc* procs;               // per slot di conns[]: connessioni MySQL (SHOW PROCESSLIST, KILL)
     atomic_int     stop;                // chiesto da un altro thread o da un gestore di segnale
     sv_mutex       conn_mx;             // conns[] e active
     sock_t*        conns;               // socket aperti (per chiuderli allo stop)
@@ -164,16 +173,16 @@ typedef struct {
 
 typedef struct {
     char   method[16];
-    char   uri[4096];                   // destinazione grezza, come arrivata (REQUEST_URI)
-    char   path[2048];                  // decodificato (%xx)
-    char   query[2048];                 // grezzo, dopo '?'
+    char   uri[8192];                   // destinazione grezza, come arrivata (REQUEST_URI); più lunga: 414
+    char   path[4096];                  // decodificato (%xx)
+    char   query[8192];                 // grezzo, dopo '?'
     bool   http10;
     bool   keep_alive;
     bool   has_length;
     bool   chunked;
     size_t content_length;
-    char   content_type[128];
-    char   auth[512];
+    char   content_type[256];
+    char   auth[4096];                  // token lunghi (JWT, OAuth): mai troncati, oltre si risponde 431
     char   user[64];                    // utente autenticato (Basic) o "" (root: token o nessun login)
     char   session[80];                 // header X-SegVault-Session
     char   origin[256];
@@ -249,6 +258,7 @@ static const char* status_text(int st) {
         case 410: return "Gone";
         case 411: return "Length Required";
         case 413: return "Payload Too Large";
+        case 414: return "URI Too Long";
         case 415: return "Unsupported Media Type";
         case 416: return "Range Not Satisfiable";
         case 422: return "Unprocessable Content";
@@ -349,12 +359,38 @@ static bool send_response(SvServer* s, sock_t fd, const Request* rq, Response* r
 }
 
 // testo su una riga, accorciato (per il registro)
+// testo di una riga di registro (stderr, registro delle richieste, audit): spazi compressi, byte di controllo
+// come \xNN (un percorso con %1b[2J non pulisce più il terminale, uno con %0a non inventa righe), e le
+// password nascoste: la stringa dopo IDENTIFIED [WITH ...] BY o PASSWORD diventa '***'
 static void one_line(char* out, size_t outsz, const char* s) {
     size_t k = 0;
-    bool sp = false;
-    for (; *s && k + 4 < outsz; s++) {
-        if (isspace((unsigned char)*s)) { if (k && !sp) out[k++] = ' '; sp = true; }
-        else { out[k++] = *s; sp = false; }
+    bool sp = false, redact = false;
+    for (; *s && k + 8 < outsz; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (isalpha(c) && (k == 0 || !isalnum((unsigned char)s[-1]))) {
+            if (!strncasecmp(s, "IDENTIFIED", 10) && !isalnum((unsigned char)s[10])) redact = true;
+            else if (!strncasecmp(s, "PASSWORD", 8) && !isalnum((unsigned char)s[8])) redact = true;
+        }
+        if (c == ';') redact = false;
+        if (redact && (c == '\'' || c == '"')) {
+            out[k++] = (char)c;
+            memcpy(out + k, "***", 3);
+            k += 3;
+            const char* e = s + 1;                        // fine della stringa ('' e \' dentro)
+            while (*e) {
+                if (*e == '\\' && e[1]) { e += 2; continue; }
+                if (*e == (char)c) { if (e[1] == (char)c) { e += 2; continue; } break; }
+                e++;
+            }
+            if (*e) out[k++] = (char)c;
+            s = *e ? e : e - 1;
+            redact = false;
+            sp = false;
+            continue;
+        }
+        if (isspace(c)) { if (k && !sp) out[k++] = ' '; sp = true; }
+        else if (c < 0x20 || c == 0x7f) { k += (size_t)snprintf(out + k, outsz - k, "\\x%02x", c); sp = false; }
+        else { out[k++] = (char)c; sp = false; }
     }
     if (*s) { memcpy(out + k, "...", 3); k += 3; }
     out[k] = '\0';
@@ -438,11 +474,12 @@ static bool append_literal(JsonBuf* o, const JsonVal* v, char* err, size_t errsz
             else jb_raw(o, v->num_text, strlen(v->num_text));
             return true;
         case JSON_STRING:
-            if (memchr(v->str, '\0', v->len)) { snprintf(err, errsz, "params[%d]: strings cannot contain NUL characters", idx); return false; }
             jb_lit(o, "'");
-            for (size_t i = 0; i < v->len; i++) {
+            for (size_t i = 0; i < v->len; i++) {            // "\u0000": il byte 0 vero, in forma interna (binesc.h)
+                char e2[2];
                 if (v->str[i] == '\'') jb_lit(o, "''");
                 else if (v->str[i] == '\\') jb_lit(o, "\\\\");
+                else if (v->str[i] == '\0' || (unsigned char)v->str[i] == SV_BIN_ESC) jb_raw(o, e2, sv_bin_put((uint8_t)v->str[i], e2));
                 else jb_raw(o, &v->str[i], 1);
             }
             jb_lit(o, "'");
@@ -548,7 +585,12 @@ static void cell_json(JsonBuf* b, const Cell* c) {
             break;
         default: break;
     }
-    jb_str(b, c->value);
+    size_t n = strlen(c->value);
+    if (sv_bin_has(c->value, n)) {                         // byte veri: 0x00 diventa \u0000
+        char* d = malloc(n);
+        if (d) { size_t dl = sv_bin_decode(c->value, n, d); jb_strn(b, d, dl); free(d); return; }
+    }
+    jb_strn(b, c->value, n);
 }
 
 static void result_json(JsonBuf* b, const QueryResult* r, bool objects) {
@@ -576,8 +618,8 @@ static void result_json(JsonBuf* b, const QueryResult* r, bool objects) {
         }
         jb_printf(b, "],\"row_count\":%d", r->num_rows);
     } else {
-        jb_printf(b, "\"rows_affected\":%d", r->rows_affected);
-        if (r->last_insert_id > 0) jb_printf(b, ",\"last_insert_id\":%d", r->last_insert_id);
+        jb_printf(b, "\"rows_affected\":%lld", r->rows_affected);
+        if (r->last_insert_id > 0) jb_printf(b, ",\"last_insert_id\":%lld", r->last_insert_id);
     }
     jb_printf(b, ",\"time_ms\":%.3f}", r->exec_time_ms);
 }
@@ -743,7 +785,7 @@ static void audit_stmt(SvServer* s, const Response* rs, const char* user, const 
     one_line(text, sizeof(text), p);
     const char* db = db_current_database();
     if (r && r->success)
-        fprintf(s->audit, "%s  %s  %s  %s  ok %d rows  %s\n", when, rs->client[0] ? rs->client : "-", user && user[0] ? user : "root",
+        fprintf(s->audit, "%s  %s  %s  %s  ok %lld rows  %s\n", when, rs->client[0] ? rs->client : "-", user && user[0] ? user : "root",
                 db && db[0] ? db : "-", r->rows_affected, text);
     else {
         char e[200];
@@ -956,7 +998,7 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
 static bool read_query_request(SvServer* s, Request* rq, Response* rs, JsonVal** root, const char** sql,
                                char* dbname, size_t dbn, const JsonVal** params, bool* want_tx, bool* objects) {
     char err[512];
-    char ct[128];
+    char ct[256];
     snprintf(ct, sizeof(ct), "%s", rq->content_type);
     for (char* p = ct; *p; p++) *p = (char)tolower((unsigned char)*p);
     if (!strncmp(ct, "text/plain", 10) || !strncmp(ct, "application/sql", 15)) {
@@ -1028,9 +1070,10 @@ static void handle_query(SvServer* s, Request* rq, Response* rs) {
 
 // 1 = trovato, 0 = non esiste (o manca la tabella), -1 = errore (database inesistente, ...)
 static int endpoint_lookup(SvServer* s, const char* db, const char* name, char** sql_out, bool* is_public,
-                           char* err, size_t errn) {
+                           char* runas, size_t runas_n, char* err, size_t errn) {
     *sql_out = NULL;
     *is_public = false;
+    runas[0] = '\0';
     DbSession* es = engine_enter(s);
     char prev[128] = "";
     const char* cur = db_current_database();
@@ -1042,14 +1085,26 @@ static int endpoint_lookup(SvServer* s, const char* db, const char* name, char**
     if (!r || !r->success) snprintf(err, errn, "database '%.63s' not found", db);
     else {
         db_result_free(r);
-        snprintf(q, sizeof(q), "SELECT `sql`, `access` FROM " ENDPOINTS_TABLE " WHERE `name` = '%.63s'", name);
+        // definer (dalla 1.3): chi ha salvato la riga, scritto dal motore; le tabelle di prima non l'hanno
+        snprintf(q, sizeof(q), "SELECT `sql`, `access`, `definer` FROM " ENDPOINTS_TABLE " WHERE `name` = '%.63s'", name);
         r = db_execute(q);
+        if (!r || !r->success) {
+            db_result_free(r);
+            snprintf(q, sizeof(q), "SELECT `sql`, `access`, NULL FROM " ENDPOINTS_TABLE " WHERE `name` = '%.63s'", name);
+            r = db_execute(q);
+        }
         if (!r || !r->success) found = 0;                       // nessuna tabella api_endpoints
         else if (r->num_rows == 0) found = 0;
         else {
-            found = 1;
-            *sql_out = strdup(r->rows[0].cells[0].is_null ? "" : r->rows[0].cells[0].value);
-            *is_public = !r->rows[0].cells[1].is_null && !strcasecmp(r->rows[0].cells[1].value, "public");
+            const Cell* c = r->rows[0].cells;
+            bool pub = !c[1].is_null && !strcasecmp(c[1].value, "public"), may_public = false;
+            // con i permessi di chi l'ha salvato, mai più di quelli
+            if (!db_endpoint_runas(db, c[2].is_null ? NULL : c[2].value, runas, runas_n, &may_public, err, errn)) found = -2;
+            else {
+                found = 1;
+                *sql_out = strdup(c[0].is_null ? "" : c[0].value);
+                *is_public = pub && may_public;               // pubblico solo se salvato da un amministratore
+            }
         }
     }
     db_result_free(r);
@@ -1097,7 +1152,8 @@ static JsonVal* query_params_json(const char* q) {
     return v;
 }
 
-static void handle_endpoint(SvServer* s, Request* rq, Response* rs, const char* name, const char* db, const char* sql) {
+static void handle_endpoint(SvServer* s, Request* rq, Response* rs, const char* name, const char* db, const char* sql,
+                            const char* runas) {
     char err[512];
     JsonVal* params = NULL;
     bool objects = true;
@@ -1116,7 +1172,7 @@ static void handle_endpoint(SvServer* s, Request* rq, Response* rs, const char* 
     if (!script) { json_error(rs, 400, "endpoint '%s': %s", name, err); return; }
     char label[200];
     snprintf(label, sizeof(label), "endpoint %.60s: %.120s", name, sql);
-    run_script(s, rs, script, label, db, true, objects, NULL, NULL);   // sempre atomico; con i permessi di chi l'ha salvato
+    run_script(s, rs, script, label, db, true, objects, runas[0] ? runas : NULL, NULL);   // sempre atomico; con i permessi di chi l'ha salvato
 }
 
 static void handle_endpoint_list(SvServer* s, Request* rq, Response* rs, const char* db) {
@@ -1614,12 +1670,12 @@ static void cgi_vars(SvServer* s, Request* rq, const char* script, const char* i
                 }
                 nm[5 + nl] = '\0';
                 used += 5 + nl + 1;
-                const char* v = c + 1;
-                while (*v == ' ' || *v == '\t') v++;
-                size_t vl = (size_t)(line + l - v);
-                while (vl > 0 && (v[vl - 1] == ' ' || v[vl - 1] == '\t')) vl--;
+                const char* hv = c + 1;
+                while (*hv == ' ' || *hv == '\t') hv++;
+                size_t vl = (size_t)(line + l - hv);
+                while (vl > 0 && (hv[vl - 1] == ' ' || hv[vl - 1] == '\t')) vl--;
                 char* vv = names + used;
-                memcpy(vv, v, vl);
+                memcpy(vv, hv, vl);
                 vv[vl] = '\0';
                 used += vl + 1;
                 bool dup = false;
@@ -2075,6 +2131,43 @@ static void dashboard(SvServer* s, Response* rs) {
     rs->extra_headers = "Cache-Control: no-store\r\n";
 }
 
+// Windows apre lo stesso file con nomi diversi: "a.php." e "a.php " (punti e spazi finali tolti),
+// "HTACCE~1" (nome corto 8.3 di .htaccess), caratteri jolly. Un segmento così non è mai valido: altrimenti
+// /wp-config.php. non sarebbe PHP per il router ma aprirebbe wp-config.php, e /ENV~1 aprirebbe .env
+static bool win_alias_segment(const char* p) {
+#ifdef _WIN32
+    const bool win = true;
+#else
+    const bool win = false;
+#endif
+    for (const char* q = p; *q; ) {
+        while (*q == '/') q++;
+        const char* e = q;
+        while (*e && *e != '/') e++;
+        if (e > q) {
+            char last = e[-1];
+            if (win && (last == '.' || last == ' ')) return true;
+            for (const char* c = q; c < e; c++) {
+                if (win && (*c == '<' || *c == '>' || *c == '|' || *c == '"' || *c == '*' || *c == '?')) return true;
+                if (win && *c == '~' && c + 1 < e && c[1] >= '0' && c[1] <= '9') return true;
+            }
+        }
+        q = e;
+    }
+    return false;
+}
+
+// file che non si mostrano mai come testo (sorgenti eseguibili da PHP o inclusi, segreti)
+static bool never_serve(const char* p) {
+    const char* slash = strrchr(p, '/');
+    const char* name = slash ? slash + 1 : p;
+    const char* dot = strrchr(name, '.');
+    if (!dot) return false;
+    static const char* const EXT[] = { ".phtml", ".phar", ".php3", ".php4", ".php5", ".php7", ".php8", ".phps", ".inc" };
+    for (size_t i = 0; i < sizeof(EXT) / sizeof(EXT[0]); i++) if (!strcasecmp(dot, EXT[i])) return true;
+    return false;
+}
+
 // sito web (static_dir): file statici, script .php, cartelle con index.php / index.html,
 // e il "front controller" (un percorso che non esiste va a /index.php: URL di WordPress e Laravel)
 static void handle_web(SvServer* s, Request* rq, Response* rs) {
@@ -2085,12 +2178,13 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
         // file nascosti e ".." no; /.well-known/ sì (certificati ACME, security.txt, ...)
         if (*q == '/' && q[1] == '.' && !(q == p && !strncmp(q, "/.well-known/", 13))) { web_not_found(rq, rs); return; }
     }
+    if (win_alias_segment(p)) { web_not_found(rq, rs); return; }
     // .htaccess del sito (mod_rewrite, Require all denied, Options -Indexes), come Apache
     if (!rq->rw_done && !s->cfg.no_htaccess) {
         rq->rw_done = true;
         RwRequest rr = { rq->root, rq->path, rq->query, rq->method, rq->host, rq->headers, rq->client, NULL,
                          rq->https ? rq->https_port : s->port, rq->https };
-        char the_request[4200];
+        char the_request[8300];
         snprintf(the_request, sizeof(the_request), "%s %s HTTP/1.%d", rq->method, rq->uri, rq->http10 ? 0 : 1);
         rr.the_request = the_request;
         RwResult* rw = malloc(sizeof(RwResult));
@@ -2220,6 +2314,7 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
         json_error(rs, 405, "use GET");
         return;
     }
+    if (never_serve(full)) { json_error(rs, 403, "this file type is never served as text"); return; }
     serve_file(s, rq, rs, full);
 }
 
@@ -2284,7 +2379,9 @@ static size_t b64_decode(const char* in, char* out, size_t cap) {
 // entro un minuto, un utente eliminato subito (la query controlla che esista)
 #define LOGIN_CACHE 16
 #define LOGIN_TTL_MS (60 * 1000)
-static struct { uint8_t key[32]; char user[64]; double until; } g_login_cache[LOGIN_CACHE];
+// ver: versione degli utenti quando il login è entrato in cache; una modifica qualsiasi (ALTER USER, DROP USER,
+// GRANT...) invalida tutte le voci, così una password cambiata non vale più nemmeno per un minuto
+static struct { uint8_t key[32]; char user[64]; double until; unsigned long ver; } g_login_cache[LOGIN_CACHE];
 
 static bool basic_login(SvServer* s, const char* b64, char* user, size_t un) {
     char dec[400];
@@ -2296,10 +2393,12 @@ static bool basic_login(SvServer* s, const char* b64, char* user, size_t un) {
     *colon = ':';
     auth_sha256(dec, strlen(dec), key);
     *colon = '\0';
+    unsigned long uver = db_users_version();
     double now = now_ms();
     mx_lock(&s->conn_mx);
     for (int i = 0; i < LOGIN_CACHE; i++)
-        if (g_login_cache[i].until > now && !memcmp(g_login_cache[i].key, key, 32) && !strcmp(g_login_cache[i].user, dec)) {
+        if (g_login_cache[i].until > now && g_login_cache[i].ver == uver && !memcmp(g_login_cache[i].key, key, 32) &&
+            !strcmp(g_login_cache[i].user, dec)) {
             snprintf(user, un, "%s", dec);
             mx_unlock(&s->conn_mx);
             return true;
@@ -2318,6 +2417,7 @@ static bool basic_login(SvServer* s, const char* b64, char* user, size_t un) {
     memcpy(g_login_cache[slot].key, key, 32);
     snprintf(g_login_cache[slot].user, sizeof(g_login_cache[slot].user), "%s", dec);
     g_login_cache[slot].until = now + LOGIN_TTL_MS;
+    g_login_cache[slot].ver = uver;
     mx_unlock(&s->conn_mx);
     return true;
 }
@@ -2344,7 +2444,7 @@ static void route(SvServer* s, Request* rq, Response* rs) {
     bool ep = api && !strncmp(sub, "/endpoints/", 11) && sub[11];
     bool ep_public = false;
     char* ep_sql = NULL;
-    char ep_db[128] = "";
+    char ep_db[128] = "", ep_user[64] = "";
     if (api && !strncmp(sub, "/endpoints", 10) && (sub[10] == '\0' || sub[10] == '/')) {
         query_param(rq->query, "database", ep_db, sizeof(ep_db));
         if (!ep_db[0] && s->default_db) snprintf(ep_db, sizeof(ep_db), "%s", s->default_db);
@@ -2353,8 +2453,9 @@ static void route(SvServer* s, Request* rq, Response* rs) {
     if (ep) {
         const char* name = sub + 11;
         if (!valid_ident(name)) { json_error(rs, 404, "endpoint not found"); return; }
-        char err[200];
-        int f = endpoint_lookup(s, ep_db, name, &ep_sql, &ep_public, err, sizeof(err));
+        char err[400];
+        int f = endpoint_lookup(s, ep_db, name, &ep_sql, &ep_public, ep_user, sizeof(ep_user), err, sizeof(err));
+        if (f == -2) { json_error(rs, 403, "endpoint '%s': %s", name, err); return; }
         if (f < 0) { json_error(rs, 404, "%s", err); return; }
         if (f == 0) { json_error(rs, 404, "endpoint '%s' not found in database '%s'", name, ep_db); return; }
     }
@@ -2416,7 +2517,7 @@ static void route(SvServer* s, Request* rq, Response* rs) {
         if (ep) {
             if (strcmp(rq->method, "GET") && strcmp(rq->method, "POST")) { free(ep_sql); json_error(rs, 405, "use GET or POST"); return; }
             if (ep_public) rs->extra_headers = "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n";
-            handle_endpoint(s, rq, rs, sub + 11, ep_db, ep_sql);
+            handle_endpoint(s, rq, rs, sub + 11, ep_db, ep_sql, ep_user);
             free(ep_sql);
             return;
         }
@@ -2478,13 +2579,28 @@ static void set_timeout(sock_t fd, int ms) {
 #endif
 }
 
-static void header_value(const char* line, char* out, size_t outsz) {
+// valore di un'intestazione senza spazi intorno; false se non entra in out (troncato: la richiesta va
+// rifiutata con 431, mai usata con un valore tagliato)
+static bool header_value(const char* line, char* out, size_t outsz) {
     while (*line == ' ' || *line == '\t') line++;
     size_t l = strlen(line);
     while (l > 0 && (line[l - 1] == ' ' || line[l - 1] == '\t')) l--;
-    if (l >= outsz) l = outsz - 1;
+    bool fits = l < outsz;
+    if (!fits) l = outsz - 1;
     memcpy(out, line, l);
     out[l] = '\0';
+    return fits;
+}
+
+// nome di un'intestazione: token di RFC 9110 (niente spazi: "Transfer-Encoding : chunked" è un'altra cosa
+// per ogni proxy, la via del request smuggling)
+static bool header_name_ok(const char* n) {
+    if (!*n) return false;
+    for (; *n; n++) {
+        unsigned char c = (unsigned char)*n;
+        if (!(isalnum(c) || strchr("!#$%&'*+-.^_`|~", c))) return false;
+    }
+    return true;
 }
 
 // Accept-Encoding: "gzip, deflate, br" / "gzip;q=0.5" / "*;q=0.1" / "gzip;q=0" (= rifiutato)
@@ -2509,14 +2625,24 @@ static int parse_head(SvServer* s, char* head, Request* rq) {
     char* line_end = strstr(head, "\r\n");
     if (!line_end) return 400;
     *line_end = '\0';
-    char target[4096], version[16];
-    if (sscanf(head, "%15s %4095s %15s", rq->method, target, version) != 3) return 400;
+    // destinazione oltre 8 KB: 414 (prima veniva tagliata a 4095 byte, la query string a 2047)
+    {
+        const char* sp1 = strchr(head, ' ');
+        const char* t0 = sp1 ? sp1 + 1 : NULL;
+        while (t0 && *t0 == ' ') t0++;
+        size_t tl = t0 ? strcspn(t0, " ") : 0;
+        if (tl >= sizeof(rq->uri)) return 414;
+    }
+    static _Thread_local char target[8192];
+    char version[16];
+    if (sscanf(head, "%15s %8191s %15s", rq->method, target, version) != 3) return 400;
     if (strncmp(version, "HTTP/1.", 7)) return 400;
     rq->http10 = !strcmp(version, "HTTP/1.0");
     rq->keep_alive = !rq->http10;
     snprintf(rq->uri, sizeof(rq->uri), "%s", target);
     char* qm = strchr(target, '?');
     if (qm) { *qm = '\0'; snprintf(rq->query, sizeof(rq->query), "%s", qm + 1); }
+    if (strlen(target) >= sizeof(rq->path)) return 414;
     if (target[0] != '/' || url_decode(target, strlen(target), rq->path, sizeof(rq->path), false) < 0) return 400;
 
     char* p = line_end + 2;
@@ -2525,8 +2651,10 @@ static int parse_head(SvServer* s, char* head, Request* rq) {
         if (!e) break;
         *e = '\0';
         char* colon = strchr(p, ':');
-        if (colon) {
+        if (!colon) return 400;                                  // riga senza ':'
+        {
             *colon = '\0';
+            if (!header_name_ok(p)) return 400;
             const char* v = colon + 1;
             char val[512];
             header_value(v, val, sizeof(val));
@@ -2554,13 +2682,13 @@ static int parse_head(SvServer* s, char* head, Request* rq) {
                     t += tl;
                 }
             }
-            else if (!strcasecmp(p, "Content-Type"))  header_value(v, rq->content_type, sizeof(rq->content_type));
-            else if (!strcasecmp(p, "Authorization")) header_value(v, rq->auth, sizeof(rq->auth));
-            else if (!strcasecmp(p, "X-SegVault-Session")) header_value(v, rq->session, sizeof(rq->session));
-            else if (!strcasecmp(p, "Origin"))        header_value(v, rq->origin, sizeof(rq->origin));
-            else if (!strcasecmp(p, "Host"))          header_value(v, rq->host, sizeof(rq->host));
-            else if (!strcasecmp(p, "Range"))         header_value(v, rq->range, sizeof(rq->range));
-            else if (!strcasecmp(p, "If-None-Match")) header_value(v, rq->if_none_match, sizeof(rq->if_none_match));
+            else if (!strcasecmp(p, "Content-Type"))  { if (!header_value(v, rq->content_type, sizeof(rq->content_type))) return 431; }
+            else if (!strcasecmp(p, "Authorization")) { if (!header_value(v, rq->auth, sizeof(rq->auth))) return 431; }
+            else if (!strcasecmp(p, "X-SegVault-Session")) { if (!header_value(v, rq->session, sizeof(rq->session))) return 431; }
+            else if (!strcasecmp(p, "Origin"))        { if (!header_value(v, rq->origin, sizeof(rq->origin))) return 431; }
+            else if (!strcasecmp(p, "Host"))          { if (!header_value(v, rq->host, sizeof(rq->host))) return 431; }
+            else if (!strcasecmp(p, "Range"))         { if (!header_value(v, rq->range, sizeof(rq->range))) return 431; }
+            else if (!strcasecmp(p, "If-None-Match")) header_value(v, rq->if_none_match, sizeof(rq->if_none_match));   // solo cache: tagliato = nessuna corrispondenza
             else if (!strcasecmp(p, "If-Modified-Since")) header_value(v, rq->if_modified_since, sizeof(rq->if_modified_since));
             else if (!strcasecmp(p, "Accept-Encoding")) rq->accept_gzip = accepts_gzip(val);
         }
@@ -2578,12 +2706,15 @@ typedef struct {
 } InBuf;
 
 // legge finché in buf c'è almeno need byte; false su chiusura/timeout
+// il buffer cresce con i dati arrivati (al massimo raddoppiando), non subito fino a need: 64 richieste che
+// dichiarano 16 MB senza mandarli non riservano più 1 GB
 static bool fill(sock_t fd, InBuf* in, size_t need, atomic_int* stop) {
     while (in->len < need) {
         if (*stop) return false;
-        if (in->cap < need + 1) {
-            size_t nc = in->cap ? in->cap : 8192;
-            while (nc < need + 1) nc *= 2;
+        if (in->cap < in->len + 4097) {                    // almeno 4 KB liberi, al massimo 1 MB oltre i dati
+            size_t nc = in->cap ? in->cap * 2 : 8192;
+            if (nc > in->len + 1 + (1u << 20)) nc = in->len + 1 + (1u << 20);
+            if (nc < in->len + 4097) nc = in->len + 4097;
             char* nd = realloc(in->data, nc);
             if (!nd) return false;
             in->data = nd;
@@ -2712,8 +2843,12 @@ static void proxy_log(SvServer* s, Conn* c, Request* rq, int status, double t0, 
     Response lr = { .status = status, .svc = "proxy" };
     snprintf(lr.detail, sizeof(lr.detail), "%s", detail);
     double ms = now_ms() - t0;
-    if (!s->cfg.quiet)
-        fprintf(stderr, "[segvault-server] %s %s %s%s -> %d (proxy, %.1f ms)\n", c->client, rq->method, rq->host, rq->uri, status, ms);
+    if (!s->cfg.quiet) {
+        char lh[200], lu[300];
+        one_line(lh, sizeof(lh), rq->host);
+        one_line(lu, sizeof(lu), rq->uri);
+        fprintf(stderr, "[segvault-server] %s %s %s%s -> %d (proxy, %.1f ms)\n", c->client, rq->method, lh, lu, status, ms);
+    }
     log_request(s, c->client, rq, &lr, ms);
 }
 
@@ -2794,17 +2929,22 @@ static bool proxy_request(SvServer* s, Conn* c, InBuf* in, Request* rq, size_t u
 
 // risponde a una richiesta della connessione; false = connessione da chiudere
 static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
-    // intestazione: fino a \r\n\r\n
+    // intestazione: fino a \r\n\r\n, entro HEADER_DEADLINE_MS dal primo byte (un client che manda un byte
+    // ogni 14 s non tiene più occupato un posto per sempre: slowloris)
     char* hend = NULL;
+    double hfirst = in->len ? now_ms() : 0;
     while (!(hend = in->data ? strstr(in->data, "\r\n\r\n") : NULL)) {
-        if (in->len >= MAX_HEADER) {
+        bool late = hfirst > 0 && now_ms() - hfirst > HEADER_DEADLINE_MS;
+        if (in->len >= MAX_HEADER || late) {
             Response rs = { .close = true };
-            json_error(&rs, 431, "request headers too large");
+            if (late) json_error(&rs, 408, "request headers not received in time");
+            else json_error(&rs, 431, "request headers too large");
             send_response(s, c->fd, NULL, &rs);
             free(rs.body.data);
             return false;
         }
         if (!fill(c->fd, in, in->len + 1, &s->stop)) return false;
+        if (!hfirst) hfirst = now_ms();
     }
     size_t head_len = (size_t)(hend - in->data) + 4;
     double t0 = now_ms();
@@ -2829,7 +2969,9 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
         rs.close = true;
         json_error(&rs, perr, "%s", perr == 413 ? "request body too large" :
                                     perr == 411 ? "a Content-Length header (or a chunked body) is required" :
-                                    perr == 501 ? "unsupported Transfer-Encoding (only chunked)" : "malformed request");
+                                    perr == 501 ? "unsupported Transfer-Encoding (only chunked)" :
+                                    perr == 414 ? "request target longer than 8 KB" :
+                                    perr == 431 ? "a request header is too long" : "malformed request");
         send_response(s, c->fd, &rq, &rs);
         free(rs.body.data);
         free(rq.headers);
@@ -2884,9 +3026,12 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
     rq.body = NULL;
     bool sent = rs.streamed ? true : send_response(s, c->fd, &rq, &rs);
     double ms = now_ms() - t0;
-    if (!s->cfg.quiet)
+    if (!s->cfg.quiet) {
+        char lp[300];
+        one_line(lp, sizeof(lp), rq.path);                // il percorso decodificato: niente byte di controllo
         fprintf(stderr, "[segvault-server] %s %s %s -> %d (%llu bytes, %.1f ms)\n",
-                c->client, rq.method, rq.path, rs.status, (unsigned long long)rs.body.len, ms);
+                c->client, rq.method, lp, rs.status, (unsigned long long)rs.body.len, ms);
+    }
     if (strcmp(rq.method, "OPTIONS")) log_request(s, c->client, &rq, &rs, ms);
     free(rs.body.data);
     free(rs.own_headers);
@@ -3056,6 +3201,133 @@ static unsigned my_status(bool autocommit) {
     return (in_transaction() ? MW_STATUS_IN_TRANS : 0) | (autocommit ? MW_STATUS_AUTOCOMMIT : 0);
 }
 
+// ── SHOW PROCESSLIST / KILL ──────────────────────────────────────
+// Ogni connessione MySQL ha la sua voce (sotto conn_mx); cancel è il suo flag di annullamento, guardato dalle
+// scansioni del motore del suo thread (sv_scan_set_cancel). Si gestiscono senza entrare nel motore: la
+// connessione da fermare può essere proprio quella che lo sta usando.
+typedef struct MyProc {
+    bool       used, busy, kill_conn;
+    uint32_t   id;
+    char       user[64], host[64], db[64];
+    double     since;                   // inizio del comando in corso (o della connessione)
+    char       info[200];               // istruzione in corso
+    atomic_int cancel;
+} MyProc;
+
+static void proc_begin(SvServer* s, Conn* c, const char* sql) {
+    if (!s->procs) return;
+    MyProc* p = &s->procs[c->slot];
+    mx_lock(&s->conn_mx);
+    p->busy = true;
+    p->since = now_ms();
+    one_line(p->info, sizeof(p->info), sql ? sql : "");
+    const char* cd = db_current_database();
+    snprintf(p->db, sizeof(p->db), "%s", cd ? cd : "");
+    atomic_store(&p->cancel, 0);
+    mx_unlock(&s->conn_mx);
+}
+
+static void proc_end(SvServer* s, Conn* c) {
+    if (!s->procs) return;
+    mx_lock(&s->conn_mx);
+    s->procs[c->slot].busy = false;
+    s->procs[c->slot].info[0] = '\0';
+    s->procs[c->slot].since = now_ms();
+    mx_unlock(&s->conn_mx);
+}
+
+// KILL [QUERY | CONNECTION] id: amministratori (o root) su tutte, gli altri solo sulle proprie
+static void my_kill(SvServer* s, Conn* c, MwOut* o, const char* user, uint32_t id, bool query_only) {
+    bool admin = !user || !user[0] || auth_is_admin(user);
+    int found = -1;
+    bool allowed = false;
+    mx_lock(&s->conn_mx);
+    for (int i = 0; s->procs && i < s->cfg.max_clients; i++)
+        if (s->procs[i].used && s->procs[i].id == id) {
+            found = i;
+            allowed = admin || !strcmp(s->procs[i].user, user ? user : "");
+            if (allowed) {
+                atomic_store(&s->procs[i].cancel, 1);
+                if (!query_only) { s->procs[i].kill_conn = true; if (s->conns[i] != BAD_SOCK) shutdown(s->conns[i], 2); }
+            }
+        }
+    mx_unlock(&s->conn_mx);
+    (void)c;
+    if (found < 0) { char m[80]; snprintf(m, sizeof(m), "Unknown thread id: %u", id); mw_err(o, 1094, "HY000", m); }
+    else if (!allowed) { char m[120]; snprintf(m, sizeof(m), "You are not owner of thread %u", id); mw_err(o, 1095, "HY000", m); }
+    else mw_ok(o, 0, 0, MW_STATUS_AUTOCOMMIT, NULL);
+}
+
+static void my_processlist(SvServer* s, MwOut* o, const char* user) {
+    bool admin = !user || !user[0] || auth_is_admin(user);
+    static const char* const N[] = { "Id", "User", "Host", "db", "Command", "Time", "State", "Info" };
+    QueryResult r;
+    memset(&r, 0, sizeof(r));
+    r.success = true;
+    r.num_cols = 8;
+    r.col_names = (char**)N;
+    Row rows[256];
+    char buf[256][8][210];
+    const char* vals[8];
+    int n = 0;
+    double now = now_ms();
+    mx_lock(&s->conn_mx);
+    for (int i = 0; s->procs && i < s->cfg.max_clients && n < 256; i++) {
+        MyProc* p = &s->procs[i];
+        if (!p->used || (!admin && strcmp(p->user, user))) continue;
+        snprintf(buf[n][0], 210, "%u", p->id);
+        snprintf(buf[n][1], 210, "%s", p->user[0] ? p->user : "root");
+        snprintf(buf[n][2], 210, "%s", p->host);
+        snprintf(buf[n][3], 210, "%s", p->db);
+        snprintf(buf[n][4], 210, "%s", p->busy ? "Query" : "Sleep");
+        snprintf(buf[n][5], 210, "%.0f", (now - p->since) / 1000.0);
+        snprintf(buf[n][6], 210, "%s", p->busy ? (atomic_load(&p->cancel) ? "killed" : "executing") : "");
+        snprintf(buf[n][7], 210, "%s", p->busy ? p->info : "");
+        n++;
+    }
+    mx_unlock(&s->conn_mx);
+    for (int i = 0; i < n; i++) {
+        for (int k = 0; k < 8; k++) vals[k] = buf[i][k];
+        memset(&rows[i], 0, sizeof(rows[i]));
+        db_row_set(&rows[i], 8, vals, NULL);
+    }
+    r.rows = rows;
+    r.num_rows = n;
+    mw_resultset(o, &r, "", MW_STATUS_AUTOCOMMIT);
+    for (int i = 0; i < n; i++) free(rows[i].cells);
+}
+
+// "KILL ...", "SHOW [FULL] PROCESSLIST": true se gestita (risposta in o)
+static bool my_admin_cmd(SvServer* s, Conn* c, MwOut* o, const char* sql, const char* user) {
+    const char* p = sql;
+    while (isspace((unsigned char)*p)) p++;
+    if (!strncasecmp(p, "KILL", 4) && isspace((unsigned char)p[4])) {
+        p += 4;
+        while (isspace((unsigned char)*p)) p++;
+        bool q = false;
+        if (!strncasecmp(p, "QUERY", 5) && isspace((unsigned char)p[5])) { q = true; p += 5; }
+        else if (!strncasecmp(p, "CONNECTION", 10) && isspace((unsigned char)p[10])) p += 10;
+        while (isspace((unsigned char)*p)) p++;
+        char* end;
+        unsigned long id = strtoul(p, &end, 10);
+        while (*end == ' ' || *end == ';') end++;
+        if (end == p || *end) { mw_err(o, 1064, "42000", "Expected KILL [QUERY | CONNECTION] id"); return true; }
+        my_kill(s, c, o, user, (uint32_t)id, q);
+        return true;
+    }
+    if (!strncasecmp(p, "SHOW", 4) && isspace((unsigned char)p[4])) {
+        p += 4;
+        while (isspace((unsigned char)*p)) p++;
+        if (!strncasecmp(p, "FULL", 4) && isspace((unsigned char)p[4])) { p += 4; while (isspace((unsigned char)*p)) p++; }
+        if (!strncasecmp(p, "PROCESSLIST", 11)) {
+            const char* e = p + 11;
+            while (*e == ' ' || *e == ';') e++;
+            if (!*e) { my_processlist(s, o, user); return true; }
+        }
+    }
+    return false;
+}
+
 // COM_QUERY: le istruzioni una dopo l'altra; ogni risultato è un resultset o un OK
 // (binary: risposta a COM_STMT_EXECUTE, righe in formato binario).
 // *autocommit è quello della connessione: con SET autocommit = 0 la prima istruzione che
@@ -3127,7 +3399,7 @@ static void my_query(SvServer* s, Conn* c, MwOut* o, char* sql, const char* user
             char det[160];
             if (!r || !r->success) snprintf(det, sizeof(det), "%.150s", r ? r->error : "out of memory");
             else if (r->num_cols > 0) snprintf(det, sizeof(det), "%d row%s", r->num_rows, r->num_rows == 1 ? "" : "s");
-            else snprintf(det, sizeof(det), "%d affected", r->rows_affected > 0 ? r->rows_affected : 0);
+            else snprintf(det, sizeof(det), "%lld affected", r->rows_affected > 0 ? r->rows_affected : 0);
             log_entry(s, c->client, "mysql", "SQL", one, det, user, r && r->success ? 200 : 500, now_ms() - q0,
                       r && r->success ? r->num_rows : 0);
         }
@@ -3236,8 +3508,10 @@ static void my_prepare(MyStmts* ss, MwOut* o, const char* sql) {
     QueryResult* meta = NULL;
     if (stmt_reads_only(sql)) {
         // i '?' come NULL: stessa forma del risultato, quasi sempre senza righe da leggere
+        // solo la descrizione: prima la SELECT veniva eseguita (due volte per ogni EXECUTE, e NEXTVAL, le
+        // funzioni dell'utente e FOR UPDATE avevano effetto già al PREPARE)
         char* text = mw_with_nulls(sql);
-        if (text && !mw_client_noise(&(MwOut){0}, text, 0)) meta = db_execute(text);
+        if (text && !mw_client_noise(&(MwOut){0}, text, 0)) meta = db_describe(text);
         free(text);
         if (meta && !meta->success) {                      // errore vero (tabella o colonna sbagliata): come MySQL
             my_error(o, meta->error);
@@ -3358,6 +3632,20 @@ static void serve_mysql(Conn* c) {
         }
     }
     MyStmts stmts = { .autocommit = true };
+    if (s->procs) {                                        // voce di SHOW PROCESSLIST, flag di KILL QUERY
+        mx_lock(&s->conn_mx);
+        MyProc* pr = &s->procs[c->slot];
+        memset(pr->user, 0, sizeof(pr->user));
+        pr->used = true; pr->busy = false; pr->kill_conn = false;
+        pr->id = id;
+        snprintf(pr->user, sizeof(pr->user), "%s", user);
+        snprintf(pr->host, sizeof(pr->host), "%s:%d", c->client, c->client_port);
+        pr->since = now_ms();
+        pr->info[0] = pr->db[0] = '\0';
+        atomic_store(&pr->cancel, 0);
+        mx_unlock(&s->conn_mx);
+        db_set_thread_cancel(&pr->cancel);
+    }
     if (ok) mw_ok(&o, 0, 0, MW_STATUS_AUTOCOMMIT, NULL);
     else if (!o.n) mw_err(&o, 1205, "HY000", "Lock wait timeout exceeded");
     if (!my_send(c, &o) || !ok) goto done;
@@ -3377,8 +3665,67 @@ static void serve_mysql(Conn* c) {
             MyStmt* st = pk.n >= 5 ? stmt_find(&stmts, (uint32_t)pk.p[1] | (uint32_t)pk.p[2] << 8 | (uint32_t)pk.p[3] << 16 | (uint32_t)pk.p[4] << 24) : NULL;
             if (!st) mw_err(&o, 1243, "HY000", "Unknown prepared statement handler given to mysqld_stmt_reset");
             else { stmt_clear_ld(st); mw_ok(&o, 0, 0, my_status(stmts.autocommit), NULL); }
+        } else if (cmd == MW_COM_STATISTICS) {              // una riga di testo, come mysqladmin status
+            SvStats stt;
+            sv_server_stats(s, &stt);
+            char line[200];
+            int ll = snprintf(line, sizeof(line), "Uptime: %.0f  Threads: %d  Questions: %lld  Slow queries: 0  Opens: 0  Open tables: 0",
+                              stt.uptime_s, stt.connections, stt.requests);
+            mw_begin(&o);
+            mw_bytes(&o, line, (size_t)ll);
+            mw_end(&o);
+        } else if (cmd == MW_COM_SET_OPTION) {              // multi-statements on / off: sempre ammessi
+            mw_eof(&o, my_status(stmts.autocommit));
+        } else if (cmd == MW_COM_CHANGE_USER) {             // nuovo utente sulla stessa connessione (pool di JDBC)
+            size_t pos = 1;
+            MwLogin nl;
+            memset(&nl, 0, sizeof(nl));
+            while (pos < pk.n && pk.p[pos] && pos - 1 < sizeof(nl.user) - 1) { nl.user[pos - 1] = (char)pk.p[pos]; pos++; }
+            while (pos < pk.n && pk.p[pos]) pos++;
+            pos++;
+            size_t al = pos < pk.n ? pk.p[pos++] : 0;
+            const uint8_t* ar = pk.p + pos;
+            if (pos + al > pk.n) al = 0;
+            pos += al;
+            size_t dk = 0;
+            while (pos < pk.n && pk.p[pos] && dk < sizeof(nl.db) - 1) nl.db[dk++] = (char)pk.p[pos++];
+            char nu[64];
+            int lr2 = my_login(s, &nl, ar, al, scramble, nu, sizeof(nu));
+            if (lr2 != 1) {
+                mw_err(&o, 1045, "28000", "Access denied for the new user");
+                my_send(c, &o);
+                free(pk.p);
+                break;                                     // come MySQL: la connessione si chiude
+            }
+            bool chg_ok = true;
+            if (!my_enter(s, ds)) chg_ok = false;
+            else {
+                if (db_session_in_transaction(ds)) db_rollback();   // lo stato della sessione riparte da capo
+                stmts_free(&stmts);
+                stmts.autocommit = true;
+                if (nl.db[0]) {
+                    db_set_user(nu);
+                    char use[96];
+                    snprintf(use, sizeof(use), "USE `%.63s`", nl.db);
+                    QueryResult* r = db_execute(use);
+                    if (!r || !r->success) { my_error(&o, r ? r->error : "out of memory"); chg_ok = false; }
+                    db_result_free(r);
+                    db_set_user(NULL);
+                }
+                my_leave(s, ds);
+            }
+            if (chg_ok) {
+                snprintf(user, sizeof(user), "%s", nu);
+                if (s->procs) { mx_lock(&s->conn_mx); snprintf(s->procs[c->slot].user, sizeof(s->procs[c->slot].user), "%s", nu); mx_unlock(&s->conn_mx); }
+                mw_ok(&o, 0, 0, MW_STATUS_AUTOCOMMIT, NULL);
+            } else if (!o.n) mw_err(&o, 1205, "HY000", "Lock wait timeout exceeded");
+        } else if (cmd == MW_COM_PROCESS_KILL && pk.n >= 5) {     // COM_PROCESS_KILL id: come KILL CONNECTION id
+            my_kill(s, c, &o, user, (uint32_t)pk.p[1] | (uint32_t)pk.p[2] << 8 | (uint32_t)pk.p[3] << 16 | (uint32_t)pk.p[4] << 24, false);
+        } else if (cmd == MW_COM_QUERY && pk.n >= 1 && (pk.p[pk.n] = 0, my_admin_cmd(s, c, &o, (char*)pk.p + 1, user))) {
+            // KILL / SHOW PROCESSLIST: risposta già in o (senza entrare nel motore)
         } else if (cmd == MW_COM_QUERY || cmd == MW_COM_INIT_DB || cmd == MW_COM_RESET_CONNECTION ||
                    cmd == MW_COM_STMT_PREPARE || cmd == MW_COM_STMT_EXECUTE) {
+            proc_begin(s, c, cmd == MW_COM_QUERY ? (pk.p[pk.n] = 0, (char*)pk.p + 1) : cmd == MW_COM_STMT_EXECUTE ? "(prepared statement)" : "");
             if (!my_enter(s, ds)) mw_err(&o, 1205, "HY000", "Lock wait timeout exceeded: another session has an open transaction");
             else {
                 if (!db_set_user(user)) mw_err(&o, 1045, "28000", "The user no longer exists");
@@ -3407,11 +3754,15 @@ static void serve_mysql(Conn* c) {
                 db_set_user(NULL);
                 my_leave(s, ds);
             }
+            proc_end(s, c);
         } else mw_err(&o, 1047, "08S01", "Unknown command");
         free(pk.p);
         if (o.n && !my_send(c, &o)) break;
+        // transazione aperta: la connessione muta per MYSQL_TX_IDLE_MS si chiude e la transazione si annulla
+        set_timeout(c->fd, db_session_in_transaction(ds) ? MYSQL_TX_IDLE_MS : 8 * 3600 * 1000);
     }
 done:
+    if (s->procs) { mx_lock(&s->conn_mx); s->procs[c->slot].used = false; mx_unlock(&s->conn_mx); db_set_thread_cancel(NULL); }
     stmts_free(&stmts);
     mx_lock(&s->exec_mx);
     db_session_end(ds);                                    // una transazione lasciata aperta viene annullata
@@ -3691,7 +4042,23 @@ static bool svc_mysql_start(SvServer* s, char* err, size_t errsz) {
     sock_t fd = listen_tcp(s->cfg.bind_addr, s->cfg.mysql_port, &port);
     if (fd == BAD_SOCK) { svc_port_error(s, s->cfg.mysql_port, "MySQL", err, errsz); return false; }
     s->mysql_port = port;
+    mw_set_config(s->tls != NULL, s->cfg.max_clients);
     svc_publish(s, &s->mysql_fd, fd);
+#ifndef _WIN32
+    if (s->cfg.mysql_socket && s->cfg.mysql_socket[0] && s->mysql_unix_fd == BAD_SOCK) {   // socket Unix (solo il proprietario)
+        struct sockaddr_un ua;
+        memset(&ua, 0, sizeof(ua));
+        ua.sun_family = AF_UNIX;
+        if (strlen(s->cfg.mysql_socket) < sizeof(ua.sun_path)) {
+            snprintf(ua.sun_path, sizeof(ua.sun_path), "%s", s->cfg.mysql_socket);
+            unlink(ua.sun_path);
+            sock_t uf = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (uf != BAD_SOCK && bind(uf, (struct sockaddr*)&ua, sizeof(ua)) == 0 && chmod(ua.sun_path, 0600) == 0 && listen(uf, 64) == 0)
+                svc_publish(s, &s->mysql_unix_fd, uf);
+            else if (uf != BAD_SOCK) sock_close(uf);
+        }
+    }
+#endif
     return true;
 }
 
@@ -3724,6 +4091,14 @@ static bool svc_php_start(SvServer* s, char* err, size_t errsz) {
         }
 #endif
     }
+#ifndef _WIN32
+    if (s->cfg.mysql_socket && s->cfg.mysql_socket[0] && n_ini + 2 <= 36) {   // mysqli('localhost') / PDO senza host
+        snprintf(ini_buf[34], sizeof(ini_buf[34]), "mysqli.default_socket=%s", s->cfg.mysql_socket);
+        snprintf(ini_buf[35], sizeof(ini_buf[35]), "pdo_mysql.default_socket=%s", s->cfg.mysql_socket);
+        ini[n_ini++] = ini_buf[34];
+        ini[n_ini++] = ini_buf[35];
+    }
+#endif
     char perr[300];
     FcgiPool* pool = s->php_fcgi_addr ? fcgi_pool_external(s->php_fcgi_addr, perr, sizeof(perr))
                                       : fcgi_pool_spawn(s->php_cgi_path, s->cfg.php_workers, ini, n_ini, perr, sizeof(perr));
@@ -3777,7 +4152,11 @@ bool sv_server_service(SvServer* s, SvService svc, bool on, char* err, size_t er
         if (!on) { svc_php_stop(s); return true; }
         return svc_php_start(s, err, errsz);
     case SV_SVC_MYSQL:
-        if (!on) { svc_unpublish(s, &s->mysql_fd, CK_MYSQL); return true; }
+        if (!on) {
+            svc_unpublish(s, &s->mysql_unix_fd, CK_MYSQL);
+            svc_unpublish(s, &s->mysql_fd, CK_MYSQL);
+            return true;
+        }
         return svc_mysql_start(s, err, errsz);
     case SV_SVC_MAIL: {
         bool ok = true;
@@ -3823,6 +4202,8 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
     s->mysql_fd = BAD_SOCK;
     s->mail_fd = BAD_SOCK;
     s->https_fd = BAD_SOCK;
+    s->mysql_unix_fd = BAD_SOCK;
+    s->listen6_fd = BAD_SOCK;
     s->cfg = *cfg;
     if (!s->cfg.bind_addr) s->cfg.bind_addr = "127.0.0.1";
     if (!s->cfg.max_body) s->cfg.max_body = 16u << 20;
@@ -3837,6 +4218,7 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
     }
     s->conns = malloc(sizeof(sock_t) * (size_t)s->cfg.max_clients);
     s->conn_kind = calloc((size_t)s->cfg.max_clients, 1);
+    s->procs = calloc((size_t)s->cfg.max_clients, sizeof(MyProc));
     s->listen_fd = BAD_SOCK;
     s->mysql_fd = BAD_SOCK;
     mx_init(&s->conn_mx);
@@ -3855,7 +4237,15 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
     s->started_ms = now_ms();
     if (s->default_db && !valid_ident(s->default_db)) { snprintf(err, errsz, "invalid default database name"); sv_server_free(s); return NULL; }
     if (cfg->audit_file && cfg->audit_file[0]) {
+#ifndef _WIN32
+        {   // le query (con i valori): solo il proprietario
+            int afd = open(cfg->audit_file, O_WRONLY | O_CREAT | O_APPEND, 0600);
+            s->audit = afd >= 0 ? fdopen(afd, "a") : NULL;
+            if (afd >= 0 && !s->audit) close(afd);
+        }
+#else
         s->audit = fopen(cfg->audit_file, "a");
+#endif
         if (!s->audit) { snprintf(err, errsz, "cannot open the audit log %.200s: %s", cfg->audit_file, strerror(errno)); sv_server_free(s); return NULL; }
     }
     s->cfg.audit_file = NULL;                              // il file è già aperto: la stringa non serve più
@@ -3949,6 +4339,24 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
     socklen_t al = sizeof(addr);
     getsockname(s->listen_fd, (struct sockaddr*)&addr, &al);
     s->port = ntohs(addr.sin_port);
+    // la stessa porta su IPv6 (solo v6: il socket IPv4 resta com'è). Senza IPv6 nel sistema: niente, come prima
+    if (!strcmp(s->cfg.bind_addr, "127.0.0.1") || !strcmp(s->cfg.bind_addr, "0.0.0.0")) {
+        struct sockaddr_in6 a6;
+        memset(&a6, 0, sizeof(a6));
+        a6.sin6_family = AF_INET6;
+        a6.sin6_port = htons((unsigned short)s->port);
+        if (!strcmp(s->cfg.bind_addr, "127.0.0.1")) a6.sin6_addr = in6addr_loopback;
+        sock_t f6 = socket(AF_INET6, SOCK_STREAM, 0);
+        if (f6 != BAD_SOCK) {
+            int on = 1;
+            setsockopt(f6, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&on, sizeof(on));
+#ifndef _WIN32
+            setsockopt(f6, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+#endif
+            if (bind(f6, (struct sockaddr*)&a6, sizeof(a6)) == 0 && listen(f6, 64) == 0) s->listen6_fd = f6;
+            else sock_close(f6);
+        }
+    }
     if (cfg->mysql && !svc_mysql_start(s, err, errsz)) { sv_server_free(s); return NULL; }
     return s;
 }
@@ -3981,9 +4389,11 @@ void sv_server_run(SvServer* s) {
         mx_lock(&s->svc_mx);
         for (int i = 0; i < s->n_to_close; i++) sock_close(s->to_close[i]);
         s->n_to_close = 0;
-        sock_t mysql_fd = s->mysql_fd, mail_fd = s->mail_fd, https_fd = s->https_fd;
+        sock_t mysql_fd = s->mysql_fd, mail_fd = s->mail_fd, https_fd = s->https_fd, myu_fd = s->mysql_unix_fd, l6_fd = s->listen6_fd;
         mx_unlock(&s->svc_mx);
         if (mysql_fd != BAD_SOCK) { FD_SET(mysql_fd, &rd); if (mysql_fd > top) top = mysql_fd; }
+        if (myu_fd != BAD_SOCK) { FD_SET(myu_fd, &rd); if (myu_fd > top) top = myu_fd; }
+        if (l6_fd != BAD_SOCK) { FD_SET(l6_fd, &rd); if (l6_fd > top) top = l6_fd; }
         if (mail_fd != BAD_SOCK) { FD_SET(mail_fd, &rd); if (mail_fd > top) top = mail_fd; }
         if (https_fd != BAD_SOCK) { FD_SET(https_fd, &rd); if (https_fd > top) top = https_fd; }
         struct timeval tv = { 0, 200000 };           // si ricontrolla stop 5 volte al secondo
@@ -3996,16 +4406,20 @@ void sv_server_run(SvServer* s) {
             db_request_cancel();
         }
         mx_unlock(&s->conn_mx);
+        db_sync_tick();                              // synchronous = NORMAL: le scritture in autocommit su disco entro 100 ms
         if (r <= 0) continue;
-        struct sockaddr_in peer;
+        struct sockaddr_storage peer;
         socklen_t pl = sizeof(peer);
-        bool is_mysql = mysql_fd != BAD_SOCK && FD_ISSET(mysql_fd, &rd);
+        bool is_myu = myu_fd != BAD_SOCK && FD_ISSET(myu_fd, &rd);
+        bool is_mysql = is_myu || (mysql_fd != BAD_SOCK && FD_ISSET(mysql_fd, &rd));
         bool is_smtp = !is_mysql && mail_fd != BAD_SOCK && FD_ISSET(mail_fd, &rd);
         bool is_tls = !is_mysql && !is_smtp && https_fd != BAD_SOCK && FD_ISSET(https_fd, &rd);
-        sock_t fd = accept(is_mysql ? mysql_fd : is_smtp ? mail_fd : is_tls ? https_fd : s->listen_fd, (struct sockaddr*)&peer, &pl);
+        bool is_v6 = !is_mysql && !is_smtp && !is_tls && l6_fd != BAD_SOCK && FD_ISSET(l6_fd, &rd);
+        sock_t fd = accept(is_myu ? myu_fd : is_mysql ? mysql_fd : is_smtp ? mail_fd : is_tls ? https_fd : is_v6 ? l6_fd : s->listen_fd,
+                           (struct sockaddr*)&peer, &pl);
         if (fd == BAD_SOCK) continue;
         int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+        if (!is_myu) setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
         mx_lock(&s->conn_mx);
         int slot = -1;
         for (int i = 0; i < s->cfg.max_clients && slot < 0; i++) if (s->conns[i] == BAD_SOCK) slot = i;
@@ -4037,9 +4451,17 @@ void sv_server_run(SvServer* s) {
         Conn* c = malloc(sizeof(Conn));
         if (c) {
             c->s = s; c->fd = fd; c->slot = slot; c->mysql = is_mysql; c->smtp = is_smtp; c->tls = is_tls; c->https = false; c->mytls = NULL;
-            const unsigned char* ip = (const unsigned char*)&peer.sin_addr.s_addr;
-            snprintf(c->client, sizeof(c->client), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-            c->client_port = ntohs(peer.sin_port);
+            if (is_myu) { snprintf(c->client, sizeof(c->client), "127.0.0.1"); c->client_port = 0; }   // socket Unix: locale
+            else if (peer.ss_family == AF_INET6) {
+                const struct sockaddr_in6* p6 = (const struct sockaddr_in6*)&peer;
+                if (!inet_ntop(AF_INET6, &p6->sin6_addr, c->client, sizeof(c->client))) snprintf(c->client, sizeof(c->client), "::");
+                c->client_port = ntohs(p6->sin6_port);
+            } else {
+                const struct sockaddr_in* p4 = (const struct sockaddr_in*)&peer;
+                const unsigned char* ip = (const unsigned char*)&p4->sin_addr.s_addr;
+                snprintf(c->client, sizeof(c->client), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+                c->client_port = ntohs(p4->sin_port);
+            }
         }
         if (!c || !spawn(c)) {
             mx_lock(&s->conn_mx);
@@ -4056,6 +4478,8 @@ void sv_server_free(SvServer* s) {
     if (!s) return;
     s->stop = 1;
     if (s->listen_fd != BAD_SOCK) sock_close(s->listen_fd);
+    if (s->listen6_fd != BAD_SOCK) sock_close(s->listen6_fd);
+    if (s->mysql_unix_fd != BAD_SOCK) { sock_close(s->mysql_unix_fd); if (s->cfg.mysql_socket) unlink(s->cfg.mysql_socket); }
     if (s->mysql_fd != BAD_SOCK) sock_close(s->mysql_fd);
     if (s->mail_fd != BAD_SOCK) sock_close(s->mail_fd);
     if (s->https_fd != BAD_SOCK) sock_close(s->https_fd);
@@ -4069,7 +4493,11 @@ void sv_server_free(SvServer* s) {
                 if (s->conns[i] != BAD_SOCK) shutdown(s->conns[i], 2);   // SHUT_RDWR / SD_BOTH
         mx_unlock(&s->conn_mx);
         if (active == 0) break;
-        if (tries > 500) return;   // un thread non risponde: meglio non liberare ciò che usa ancora
+        if (tries == 500 && !s->cfg.quiet) fprintf(stderr, "[segvault-server] waiting for %d connection(s) to finish...\n", active);
+        // un thread fermo in uno statement lungo: dopo 30 s non si libera ciò che usa ancora. Il motore resta
+        // coerente: db_shutdown aspetta lo statement, tiene il log se una transazione è aperta (il prossimo
+        // avvio la annulla) e da lì in poi ogni chiamata al motore risponde con un errore
+        if (tries > 3000) return;
         sleep_ms(10);
     }
     for (int i = 0; i < SV_MAX_SESSIONS; i++)            // le transazioni rimaste aperte si annullano
@@ -4092,6 +4520,7 @@ void sv_server_free(SvServer* s) {
     free(s->cert_dir);
     free(s->self_exe_path);
     free(s->conn_kind);
+    free(s->procs);
     mail_store_free(s->mail);
     tls_free(s->tls);
     if (s->audit) fclose(s->audit);

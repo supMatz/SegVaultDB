@@ -52,6 +52,10 @@ SCOPO: protocollo di rete di MySQL (client/server protocol 4.1) per segvault-ser
 #define MW_COM_STMT_CLOSE  0x19
 #define MW_COM_STMT_RESET  0x1a
 #define MW_COM_RESET_CONNECTION 0x1f
+#define MW_COM_PROCESS_KILL 0x0c
+#define MW_COM_STATISTICS  0x09
+#define MW_COM_CHANGE_USER 0x11
+#define MW_COM_SET_OPTION  0x1b
 
 // pacchetti in uscita: header (3 byte di lunghezza + numero di sequenza) e contenuto
 typedef struct {
@@ -77,6 +81,8 @@ void mw_ok(MwOut* o, uint64_t affected, uint64_t insert_id, unsigned status, con
 void mw_err(MwOut* o, unsigned code, const char* sqlstate, const char* msg);
 void mw_eof(MwOut* o, unsigned status);
 void mw_auth_switch(MwOut* o, const uint8_t scramble[20]);
+// variabili che rispecchiano la configurazione del server (have_ssl, max_connections)
+void mw_set_config(bool ssl, int max_connections);
 // risultato in formato testo: colonne, EOF, righe, EOF (status: con MORE_RESULTS se ne seguono altri)
 void mw_resultset(MwOut* o, const QueryResult* r, const char* db, unsigned status);
 

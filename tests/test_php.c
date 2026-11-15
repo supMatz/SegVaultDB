@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
@@ -114,6 +115,17 @@ static int fake_listen(int port) {
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons((unsigned short)port) };
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(fd, (struct sockaddr*)&a, sizeof(a)) || listen(fd, 16)) return -1;
+    return fd;
+}
+// php-cgi -b /percorso/socket: socket Unix (SegVault lo usa su POSIX, in una cartella 0700)
+static int fake_listen_unix(const char* path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    snprintf(a.sun_path, sizeof(a.sun_path), "%s", path);
+    unlink(path);
+    if (fd < 0 || bind(fd, (struct sockaddr*)&a, sizeof(a)) || listen(fd, 16)) return -1;
     return fd;
 }
 static void fake_loop(int lfd) {
@@ -277,7 +289,12 @@ static void stop(SvServer* s, pthread_t th) { sv_server_stop(s); pthread_join(th
 int main(int argc, char** argv) {
     if (argc == 3 && !strcmp(argv[1], "-b")) {          // modalità "php-cgi -b 127.0.0.1:PORTA"
         const char* c = strrchr(argv[2], ':');
-        int lfd = fake_listen(c ? atoi(c + 1) : 0);
+        int lfd = argv[2][0] == '/' ? fake_listen_unix(argv[2]) : fake_listen(c ? atoi(c + 1) : 0);
+        if (argv[2][0] == '/') {                         // chi ha avviato il processo lo annota per il test
+            const char* rec = getenv("SV_FAKE_PHP_BIND");
+            FILE* f = rec ? fopen(rec, "a") : NULL;
+            if (f) { fprintf(f, "%s\n", argv[2]); fclose(f); }
+        }
         if (lfd < 0) return 1;
         fake_loop(lfd);
         return 0;
@@ -334,14 +351,49 @@ int main(int argc, char** argv) {
     // ── php-cgi avviati da SegVault (qui: questo eseguibile) ──
     {
         SvServerConfig cfg = { .port = 0, .static_dir = www, .quiet = true, .php_cgi = self, .php_workers = 3, .timeout_ms = 1000 };
+        remove("/tmp/sv_php_bind.txt");
+        setenv("SV_FAKE_PHP_BIND", "/tmp/sv_php_bind.txt", 1);
         SvServer* s = start(&cfg, &th);
         int port = sv_server_port(s);
         CHECK(strstr(sv_server_php(s), "x3"), "describe: %s", sv_server_php(s));
+        {   // P2.10: php-cgi ascolta su un socket Unix in una cartella 0700, non su una porta TCP
+            FILE* bf = fopen("/tmp/sv_php_bind.txt", "r");
+            char bp[300] = "";
+            if (bf) { if (!fgets(bp, sizeof(bp), bf)) bp[0] = 0; fclose(bf); }
+            char* slash = strrchr(bp, '/');
+            struct stat ds;
+            if (slash) *slash = '\0';
+            CHECK(bp[0] == '/' && stat(bp, &ds) == 0 && S_ISDIR(ds.st_mode) && (ds.st_mode & 0777) == 0700,
+                  "php-cgi bound to a Unix socket in a 0700 folder: '%s'", bp);
+            remove("/tmp/sv_php_bind.txt");
+        }
 
         r = req(port, "GET", "/echo.php?x=1&y=%20", "X-Test: abc\r\nProxy: http://evil\r\nUser-Agent: t/1\r\n", NULL);
         CHECK(r.status == 200 && hdr(&r, "Content-Type: text/plain"), "echo: %d %s", r.status, r.head);
         CHECK(has(&r, "REQUEST_METHOD=GET\n") && has(&r, "QUERY_STRING=x=1&y=%20\n") && has(&r, "REQUEST_URI=/echo.php?x=1&y=%20\n"),
               "method / query / uri: %s", r.body);
+        {   // P2.3: query string di 6 KB intera a PHP; oltre 8 KB 414; nome d'intestazione con uno spazio 400
+            static char big[9300], want_q[7000];
+            char qs[6200];
+            for (int i = 0; i < 6000; i++) qs[i] = (char)('a' + i % 26);
+            qs[6000] = '\0';
+            int bl = snprintf(big, sizeof(big), "GET /echo.php?%s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", qs);
+            Resp lr = raw(port, big, (size_t)bl);
+            snprintf(want_q, sizeof(want_q), "QUERY_STRING=%s\n", qs);
+            CHECK(lr.status == 200 && has(&lr, want_q), "6 KB query string reaches PHP intact: %d", lr.status);
+            free(lr.head); free(lr.body);
+            char huge[9000];
+            memset(huge, 'q', sizeof(huge) - 1);
+            huge[sizeof(huge) - 1] = '\0';
+            bl = snprintf(big, sizeof(big), "GET /echo.php?%s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", huge);
+            lr = raw(port, big, (size_t)bl);
+            CHECK(lr.status == 414, "request target over 8 KB: %d", lr.status);
+            free(lr.head); free(lr.body);
+            const char* sm = "POST /echo.php HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nTransfer-Encoding : chunked\r\nConnection: close\r\n\r\nabcd";
+            lr = raw(port, sm, strlen(sm));
+            CHECK(lr.status == 400, "header name with a space refused: %d", lr.status);
+            free(lr.head); free(lr.body);
+        }
         char want[4200];
         snprintf(want, sizeof(want), "SCRIPT_FILENAME=%s/echo.php\n", real_www);
         CHECK(has(&r, "SCRIPT_NAME=/echo.php\n") && has(&r, want), "script: %s", r.body);

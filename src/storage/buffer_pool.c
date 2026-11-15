@@ -44,16 +44,31 @@ static void hash_remove(BufferPool* bp, int idx) {
     bp->frames[idx].hnext = -1;
 }
 
-// libera il frame (scrivendo la pagina se modificata)
-static void before_write(BufferPool* bp) {
-    if (bp->before_write) bp->before_write(bp->before_write_ctx);
+static bool before_write(BufferPool* bp) {
+    if (bp->before_write && !bp->before_write(bp->before_write_ctx)) { bp->io_error = true; return false; }
+    return true;
 }
 
-static void frame_release(BufferPool* bp, int idx) {
+// scrive una pagina modificata; un errore resta (io_error) e la pagina resta sporca in memoria
+static bool write_dirty(BufferPool* bp, Frame* f) {
+    if (!f->dirty) return true;
+    if (!before_write(bp)) return false;
+    if (page_write(f->page, bp->db_fd) != SV_OK) {
+        if (!bp->io_error) fprintf(stderr, "[SegVault] cannot write page %u of the data file\n", f->page->page_id);
+        bp->io_error = true;
+        return false;
+    }
+    f->dirty = false;
+    bp->stats.dirty_writes++;
+    return true;
+}
+
+// libera il frame (scrivendo la pagina se modificata); false se la scrittura non è riuscita: il
+// frame resta com'è (una pagina sporca non si scarta mai, le letture successive la vedrebbero vecchia)
+static bool frame_release(BufferPool* bp, int idx) {
     Frame* f = &bp->frames[idx];
-    if (!f->page) return;
-    if (f->dirty) before_write(bp);
-    if (f->dirty && page_write(f->page, bp->db_fd) == SV_OK) bp->stats.dirty_writes++;
+    if (!f->page) return true;
+    if (!write_dirty(bp, f)) return false;
     hash_remove(bp, idx);
     page_free(f->page);
     f->page      = NULL;
@@ -61,6 +76,7 @@ static void frame_release(BufferPool* bp, int idx) {
     f->ref       = false;
     f->pin_count = 0;
     bp->num_used--;
+    return true;
 }
 
 // Trova un frame da usare: uno libero, oppure la vittima scelta da CLOCK
@@ -78,7 +94,7 @@ static int bp_evict(BufferPool* bp) {
         Frame* f = &bp->frames[i];
         if (f->pin_count > 0) continue;            // in uso: non sostituibile
         if (f->ref) { f->ref = false; continue; }  // seconda possibilità
-        frame_release(bp, i);
+        if (!frame_release(bp, i)) continue;       // non scrivibile: resta in memoria
         bp->stats.evictions++;
         return i;
     }
@@ -115,6 +131,11 @@ static Page* bp_fetch_nl(BufferPool* bp, uint32_t page_id) {
 
     Page* p = page_read(page_id, bp->db_fd);
     if (!p) return NULL;
+    if (!page_validate(p, page_id)) {                    // danneggiata: la lettura fallisce
+        if (page_id) fprintf(stderr, "[SegVault] page %u of the data file is damaged\n", page_id);
+        page_free(p);
+        return NULL;
+    }
     bp->stats.misses++;
     frame_install(bp, idx, p);
     return p;
@@ -155,20 +176,26 @@ static int bp_new_page_nl(BufferPool* bp, uint32_t* out_page_id) {
         if (idx < 0) { bp->free_ids[bp->nfree++] = reuse; return SV_ERR; }
         Page* p = page_create(reuse);
         if (!p) return SV_ERR;
-        page_write(p, bp->db_fd);                         // il flag FREE sparisce subito dal disco
+        if (page_write(p, bp->db_fd) != SV_OK) {          // il flag FREE sparisce subito dal disco
+            page_free(p);
+            bp->free_ids[bp->nfree++] = reuse;
+            bp->io_error = true;
+            return SV_IO_ERROR;
+        }
         bp->stats.new_pages++;
         frame_install(bp, idx, p);
         if (out_page_id) *out_page_id = reuse;
         return SV_OK;
     }
-    long end = sv_lseek(bp->db_fd, 0, SEEK_END);
+    int64_t end = sv_lseek(bp->db_fd, 0, SEEK_END);
     uint32_t new_id = end > 0 ? (uint32_t)((end + SV_PAGE_SIZE - 1) / SV_PAGE_SIZE) : 0;
     if (new_id == 0) {
         // la pagina 0 è riservata: 0 indica "fine catena" nelle pagine di heap
         Page* zero = page_create(0);
         if (!zero) return SV_ERR;
-        page_write(zero, bp->db_fd);
+        int zr = page_write(zero, bp->db_fd);
         page_free(zero);
+        if (zr != SV_OK) { bp->io_error = true; return SV_IO_ERROR; }
         new_id = 1;
     }
     if (bp->next_new_id > new_id) new_id = bp->next_new_id;
@@ -181,7 +208,7 @@ static int bp_new_page_nl(BufferPool* bp, uint32_t* out_page_id) {
     if (!p) return SV_ERR;
 
     // Scrivi immediatamente sul disco per "registrare" la pagina
-    page_write(p, bp->db_fd);
+    if (page_write(p, bp->db_fd) != SV_OK) { page_free(p); bp->io_error = true; return SV_IO_ERROR; }
     bp->next_new_id = new_id + 1;
     bp->stats.new_pages++;
     frame_install(bp, idx, p);
@@ -193,11 +220,7 @@ static int bp_new_page_nl(BufferPool* bp, uint32_t* out_page_id) {
 static int bp_flush_page_nl(BufferPool* bp, uint32_t page_id) {
     int idx = bp_find(bp, page_id);
     if (idx < 0) return SV_NOT_FOUND;
-    if (!bp->frames[idx].dirty) return SV_OK;
-    before_write(bp);
-    int r = page_write(bp->frames[idx].page, bp->db_fd);
-    if (r == SV_OK) { bp->frames[idx].dirty = false; bp->stats.dirty_writes++; }
-    return r;
+    return write_dirty(bp, &bp->frames[idx]) ? SV_OK : SV_IO_ERROR;
 }
 
 // ordine di page_id per il flush (il buffer pool è usato sotto il mutex del motore)
@@ -208,28 +231,29 @@ static int cmp_frame_page(const void* a, const void* b) {
 }
 
 static int bp_flush_all_nl(BufferPool* bp) {
-    before_write(bp);
+    if (!before_write(bp)) return SV_IO_ERROR;
     int* dirty = malloc(sizeof(int) * (size_t)bp->capacity);
     int n = 0;
+    bool ok = true;
     for (int i = 0; i < bp->capacity; i++) {
         if (!bp->frames[i].page || !bp->frames[i].dirty) continue;
         if (dirty) dirty[n++] = i;
-        else if (page_write(bp->frames[i].page, bp->db_fd) == SV_OK) {   // senza memoria: in ordine di frame
-            bp->frames[i].dirty = false;
-            bp->stats.dirty_writes++;
-        }
+        else if (!write_dirty(bp, &bp->frames[i])) ok = false;   // senza memoria: in ordine di frame
     }
     if (dirty) {
         g_sort_bp = bp;
         qsort(dirty, (size_t)n, sizeof(int), cmp_frame_page);   // scrittura sequenziale sul file
-        for (int k = 0; k < n; k++) {
-            Frame* f = &bp->frames[dirty[k]];
-            if (page_write(f->page, bp->db_fd) == SV_OK) { f->dirty = false; bp->stats.dirty_writes++; }
-        }
+        for (int k = 0; k < n; k++) if (!write_dirty(bp, &bp->frames[dirty[k]])) ok = false;
         free(dirty);
     }
-    sv_fsync(bp->db_fd);
-    return SV_OK;
+    // un fsync fallito non si ritenta: il kernel può aver già scartato le pagine che non ha scritto
+    if (bp->io_error) ok = false;
+    else if (sv_fsync(bp->db_fd) != 0) {
+        fprintf(stderr, "[SegVault] cannot sync the data file to disk\n");
+        bp->io_error = true;
+        ok = false;
+    }
+    return ok ? SV_OK : SV_IO_ERROR;
 }
 
 static void bp_remove_page_nl(BufferPool* bp, uint32_t page_id) {
@@ -243,9 +267,35 @@ static void bp_remove_all_nl(BufferPool* bp) {
     for (int i = 0; i < bp->capacity; i++) frame_release(bp, i);
 }
 
+bool bp_resize(BufferPool* bp, int capacity) {
+    if (capacity < 4) capacity = 4;
+    sv_rw_wr(&bp->latch);
+    bool ok = true;
+    for (int i = 0; i < bp->capacity && ok; i++) if (bp->frames[i].page && bp->frames[i].pin_count > 0) ok = false;
+    if (ok) ok = bp_flush_all_nl(bp) == SV_OK;
+    int nb = 1;
+    while (nb < capacity * 2) nb <<= 1;
+    Frame* nf = ok ? SV_ALLOC_N(Frame, capacity) : NULL;
+    int* nbk = nf ? malloc(sizeof(int) * (size_t)nb) : NULL;
+    if (!nf || !nbk) { free(nf); free(nbk); sv_rw_wrunlock(&bp->latch); return false; }
+    for (int i = 0; i < bp->capacity; i++) if (bp->frames[i].page) page_free(bp->frames[i].page);
+    free(bp->frames);
+    free(bp->buckets);
+    for (int i = 0; i < nb; i++) nbk[i] = -1;
+    for (int i = 0; i < capacity; i++) nf[i].hnext = -1;
+    bp->frames = nf;
+    bp->buckets = nbk;
+    bp->nbuckets = nb;
+    bp->capacity = capacity;
+    bp->num_used = 0;
+    bp->hand = 0;
+    sv_rw_wrunlock(&bp->latch);
+    return true;
+}
+
 void bp_destroy(BufferPool* bp) {
     if (!bp) return;
-    bp_flush_all_nl(bp);
+    if (!bp->io_error) bp_flush_all_nl(bp);         // dopo un errore di I/O: niente pagine senza log
     for (int i = 0; i < bp->capacity; i++)
         if (bp->frames[i].page) page_free(bp->frames[i].page);
     free(bp->frames);

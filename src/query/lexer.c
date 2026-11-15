@@ -1,4 +1,5 @@
 #include "lexer.h"
+#include "../table/binesc.h"
 #include <ctype.h>
 #include <string.h>
 #include <strings.h>
@@ -222,6 +223,11 @@ TokenList* lexer_tokenize(const char* sql) {
                         case 'n': ch = '\n'; break;
                         case 't': ch = '\t'; break;
                         case 'r': ch = '\r'; break;
+                        case 'Z': ch = 0x1A; break;                // Ctrl-Z (mysqldump)
+                        case '0':                                 // byte 0: forma interna C0 80 (binesc.h)
+                            if (!overflow && !oom) SPUT((char)SV_BIN_ESC);
+                            ch = (char)0x80;
+                            break;
                         case '\\': case '\'': case '"': ch = e; break;
                         default:                              // escape sconosciuto: resta com'è
                             if (!overflow && !oom) SPUT('\\');
@@ -232,6 +238,8 @@ TokenList* lexer_tokenize(const char* sql) {
                     if (ch == '\n') lx.line++;
                     lx.pos++;
                 }
+                // (un byte C0 grezzo resta com'è: i valori in forma interna rimessi in un testo SQL dai
+                // percorsi interni, come UPDATE con JOIN o MERGE, tornano identici)
                 if (!overflow && !oom) SPUT(ch);
             }
             #undef SPUT
@@ -269,20 +277,20 @@ TokenList* lexer_tokenize(const char* sql) {
             if (hxq && *e != '\'') hxq = false;
             if ((hx0 && !isalnum((unsigned char)*e) && *e != '_') || hxq) {
                 size_t nd = (size_t)(e - h);
-                size_t need = nd + 4;
+                size_t need = nd + 4;                    // (i byte codificati occupano al più 2 per 2 cifre)
                 if (need > LEX_MAX_STRING) need = LEX_MAX_STRING;
                 if (need > scap) { char* nb = realloc(sbuf, need); if (nb) { sbuf = nb; scap = need; } }
                 tok.type = TOK_STRING; tok.line = lx.line; tok.col = lx.col; tok.ext = NULL;
                 size_t n = 0;
                 bool text = sbuf && nd % 2 == 0;
-                for (size_t i = 0; text && i + 1 < nd && n + 1 < scap; i += 2) {
+                // i byte veri, anche 0x00 e di controllo (prima un valore binario restava il testo "0x...":
+                // un BLOB di un dump --hex-blob diventava la sua scrittura esadecimale)
+                for (size_t i = 0; text && i + 1 < nd && n + 2 < scap; i += 2) {
                     int hi = isdigit((unsigned char)h[i]) ? h[i] - '0' : (tolower((unsigned char)h[i]) - 'a' + 10);
                     int lo = isdigit((unsigned char)h[i + 1]) ? h[i + 1] - '0' : (tolower((unsigned char)h[i + 1]) - 'a' + 10);
-                    unsigned char b = (unsigned char)(hi * 16 + lo);
-                    if (b == 0 || (b < 0x20 && b != '\t' && b != '\n' && b != '\r') || b == 0x7f) text = false;
-                    sbuf[n++] = (char)b;
+                    n += sv_bin_put((uint8_t)(hi * 16 + lo), sbuf + n);
                 }
-                if (!text && sbuf) {                         // binario: si tiene la forma esadecimale
+                if (!text && sbuf) {                         // numero dispari di cifre: la forma esadecimale
                     n = 0;
                     if (n + 2 < scap) { sbuf[n++] = '0'; sbuf[n++] = 'x'; }
                     for (size_t i = 0; i < nd && n + 1 < scap; i++) sbuf[n++] = h[i];

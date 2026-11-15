@@ -241,6 +241,8 @@ int main(void) {
     snprintf(p, sizeof(p), "%s/blog", www); mkdir(p, 0755);
     snprintf(p, sizeof(p), "%s/blog/index.html", www); put(p, "<h1>blog home</h1>");
     snprintf(p, sizeof(p), "%s/blog/style.css", www); put(p, "body{color:red}");
+    snprintf(p, sizeof(p), "%s/blog/conf.inc", www); put(p, "<?php $pw = 'inc-secret';");
+    snprintf(p, sizeof(p), "%s/blog/page.phtml", www); put(p, "<?php $pw = 'phtml-secret';");
     snprintf(p, sizeof(p), "%s/lara", www); mkdir(p, 0755);
     snprintf(p, sizeof(p), "%s/lara/artisan", www); put(p, "#!/usr/bin/env php");
     snprintf(p, sizeof(p), "%s/lara/.env", www); put(p, "DB_PASSWORD=segreta");
@@ -269,12 +271,33 @@ int main(void) {
     int port = sv_server_port(s);
     Resp r;
 
+    // P2.4: intestazione mandata a gocce oltre i 10 s: 408 e connessione chiusa (slowloris)
+    {
+        int fd = connect_to(port);
+        const char* parts[] = { "GET / HTTP/1.1\r\n", "Host: blog.loc", "alhost\r\nX-A: 1" };
+        for (int i = 0; i < 3 && fd >= 0; i++) {
+            if (send(fd, parts[i], strlen(parts[i]), MSG_NOSIGNAL) < 0) break;
+            if (i < 2) sleep(6);
+        }
+        char buf[512] = "";
+        ssize_t n = fd >= 0 ? recv(fd, buf, sizeof(buf) - 1, 0) : -1;
+        if (n > 0) buf[n] = '\0';
+        CHECK(n > 0 && strstr(buf, " 408 "), "slow request headers cut at the deadline: %s", buf);
+        if (fd >= 0) close(fd);
+    }
+
     // ── siti automatici ──
     r = get(port, "blog.localhost", "/");
     CHECK(r.status == 200 && has(&r, "blog home"), "blog.localhost: %d %s", r.status, r.body);
     free(r.body);
     r = get(port, "BLOG.localhost:8080", "/style.css");
     CHECK(r.status == 200 && has(&r, "color:red"), "host case and port: %d", r.status);
+    free(r.body);
+    r = get(port, "blog.localhost", "/conf.inc");
+    CHECK(r.status == 403 && !has(&r, "inc-secret"), ".inc never served as text: %d", r.status);
+    free(r.body);
+    r = get(port, "blog.localhost", "/page.PHTML");
+    CHECK(r.status != 200 && !has(&r, "phtml-secret"), ".phtml never served as text: %d", r.status);
     free(r.body);
     r = get(port, "api.blog.localhost", "/");
     CHECK(r.status == 200 && has(&r, "blog home"), "subdomain of a site: %d", r.status);

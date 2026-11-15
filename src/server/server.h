@@ -37,6 +37,8 @@ typedef struct {
                               // o il token; ogni query gira con i permessi dell'utente (vedi auth.h)
     bool        mysql;        // ascolta anche col protocollo di rete MySQL (driver mysqli, PDO, JDBC, client mysql)
     int         mysql_port;   // porta MySQL (0 = libera scelta dal sistema; vedi sv_server_mysql_port)
+    const char* mysql_socket; // POSIX: anche un socket Unix per MySQL (PHP lo usa con 'localhost': mysqli /
+                              // pdo_mysql default_socket); NULL = nessuno
     const char* audit_file;   // se non NULL: ogni istruzione che non è una lettura viene aggiunta a questo
                               // file (ora, client, utente, database, esito, testo)
     // PHP nella cartella del sito (static_dir), via FastCGI (vedi fastcgi.h); senza, un .php non viene servito

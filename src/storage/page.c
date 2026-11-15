@@ -16,7 +16,7 @@ Page* page_create(uint32_t id) {
 void page_free(Page* p) { free(p); }
 
 int page_write(Page* p, int fd) {
-    off_t offset = (off_t)p->page_id * SV_PAGE_SIZE;
+    int64_t offset = (int64_t)p->page_id * SV_PAGE_SIZE;
     ssize_t written = sv_pwrite(fd, p, SV_PAGE_SIZE, offset);
     return (written == SV_PAGE_SIZE) ? SV_OK : SV_IO_ERROR;
 }
@@ -24,10 +24,23 @@ int page_write(Page* p, int fd) {
 Page* page_read(uint32_t id, int fd) {
     Page* p = (Page*)malloc(sizeof(Page));
     if (!p) return NULL;
-    off_t offset = (off_t)id * SV_PAGE_SIZE;
+    int64_t offset = (int64_t)id * SV_PAGE_SIZE;
     ssize_t n = sv_pread(fd, p, SV_PAGE_SIZE, offset);
     if (n != SV_PAGE_SIZE) { free(p); return NULL; }
     return p;
+}
+
+bool page_validate(const Page* p, uint32_t id) {
+    if (p->page_id != id) return false;                  // pagina mai scritta, o di un altro posto
+    if (p->num_slots > SV_MAX_SLOTS) return false;
+    uint32_t dir = (uint32_t)p->num_slots * SV_SLOT_ENTRY_SIZE, size = (uint32_t)sizeof(p->data);
+    if (dir > size || p->free_space > size - dir) return false;
+    const SlotEntry* e = (const SlotEntry*)p->data;
+    for (uint16_t i = 0; i < p->num_slots; i++) {
+        if (e[i].length == 0) continue;
+        if (e[i].offset < dir || (uint32_t)e[i].offset + e[i].length > size) return false;
+    }
+    return true;
 }
 
 uint16_t page_usable_space(const Page* p) {
@@ -74,11 +87,47 @@ int page_insert(Page* p, const void* data, uint16_t len) {
     return p->num_slots - 1; // Ritorna slot_id
 }
 
+void page_pop_slot(Page* p, uint16_t slot_id) {
+    if (p->num_slots == 0 || slot_id != p->num_slots - 1) return;
+    SlotEntry* entry = (SlotEntry*)(p->data) + slot_id;
+    if (entry->length != 0) return;
+    p->num_slots--;
+    p->free_space = (uint16_t)(p->free_space + SV_SLOT_ENTRY_SIZE);
+    p->flags |= PAGE_FLAG_DIRTY;
+}
+
+int page_revive_slot(Page* p, uint16_t slot_id, const void* data, uint16_t len) {
+    if (slot_id >= p->num_slots || len == 0) return SV_NOT_FOUND;
+    SlotEntry* entry = (SlotEntry*)(p->data) + slot_id;
+    if (entry->length != 0) return SV_DUPLICATE;                 // già viva
+    if (p->free_space < len) {
+        // lo slot esiste già: serve solo lo spazio della riga (compattando, se basta)
+        uint32_t live = 0;
+        const SlotEntry* e = (const SlotEntry*)p->data;
+        for (uint16_t i = 0; i < p->num_slots; i++) live += e[i].length;
+        uint32_t total = (uint32_t)sizeof(p->data) - (uint32_t)p->num_slots * SV_SLOT_ENTRY_SIZE;
+        if (live + len > total) return SV_FULL;
+        page_compact(p);
+        if (p->free_space < len) return SV_FULL;
+    }
+    uint16_t slot_dir_size = p->num_slots * SV_SLOT_ENTRY_SIZE;
+    uint16_t used_tuple_space = (uint16_t)(sizeof(p->data) - p->free_space - slot_dir_size);
+    uint16_t off = (uint16_t)(sizeof(p->data) - used_tuple_space - len);
+    memcpy(p->data + off, data, len);
+    entry = (SlotEntry*)(p->data) + slot_id;
+    entry->offset = off;
+    entry->length = len;
+    p->free_space = (uint16_t)(p->free_space - len);
+    p->flags |= PAGE_FLAG_DIRTY;
+    return SV_OK;
+}
+
 const void* page_get_slot(Page* p, uint16_t slot_id,
                            uint16_t* out_len) {
-    if (slot_id >= p->num_slots) return NULL;
+    if (slot_id >= p->num_slots || slot_id >= SV_MAX_SLOTS) return NULL;
     SlotEntry* entry = (SlotEntry*)(p->data) + slot_id;
     if (entry->length == 0) return NULL; // Slot eliminato
+    if ((uint32_t)entry->offset + entry->length > sizeof(p->data)) return NULL;   // danneggiato
     if (out_len) *out_len = entry->length;
     return p->data + entry->offset;
 }
@@ -97,10 +146,14 @@ void page_compact(Page* p) {
     // Raccoglie tutte le tuple valide e le ricopia compattate
     uint8_t temp[SV_PAGE_SIZE];
     uint16_t write_pos = sizeof(p->data); // Parte dalla fine
+    uint16_t nslots = p->num_slots <= SV_MAX_SLOTS ? p->num_slots : SV_MAX_SLOTS;
+    uint32_t dir = (uint32_t)nslots * SV_SLOT_ENTRY_SIZE;
 
-    for (uint16_t i = 0; i < p->num_slots; i++) {
+    for (uint16_t i = 0; i < nslots; i++) {
         SlotEntry* entry = (SlotEntry*)(p->data) + i;
         if (entry->length == 0) continue; // Slot eliminato: salta
+        // pagina danneggiata (page_validate la rifiuta alla lettura): niente scritture fuori da temp
+        if ((uint32_t)entry->offset + entry->length > sizeof(p->data) || entry->length > write_pos - dir) { entry->length = 0; continue; }
         write_pos -= entry->length;
         memcpy(temp + write_pos, p->data + entry->offset, entry->length);
         entry->offset = write_pos; // Aggiorna l'offset nella slot directory
@@ -109,8 +162,7 @@ void page_compact(Page* p) {
     memcpy(p->data + write_pos, temp + write_pos,
            sizeof(p->data) - write_pos);
     // Ricalcola free_space
-    uint16_t slot_dir_size = p->num_slots * SV_SLOT_ENTRY_SIZE;
-    p->free_space = write_pos - slot_dir_size;
+    p->free_space = (uint16_t)(write_pos - dir);
     p->flags |= PAGE_FLAG_DIRTY;
 }
 

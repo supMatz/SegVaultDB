@@ -124,7 +124,8 @@ int main(void) {
     QueryResult* v = db_execute("VACUUM");
     int freed = v && v->success ? v->rows_affected : -1;
     db_result_free(v);
-    CHECK(freed > 1000, "vacuum freed pages: %d", freed);
+    // (i 3 aggiornamenti da 2 MB superano la soglia del VACUUM automatico: gran parte è già libera)
+    CHECK(freed > 0, "vacuum freed pages: %d", freed);
     FILE* fd = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
     long before = 0, after = 0;
     if (fd) { fseek(fd, 0, SEEK_END); before = ftell(fd); fclose(fd); }
@@ -142,6 +143,66 @@ int main(void) {
     CHECK(v && v->success, "second vacuum");
     db_result_free(v);
     CHECK(insert_text(80, 500000, 'n', "after") && text_ok(80, 500000, 'n'), "insert after vacuum");
+
+    // P1.5: lo spazio abbandonato torna riusabile senza VACUUM a mano (VACUUM automatico al superare 4 MB)
+    {
+        ok("CREATE TABLE grow (id INT PRIMARY KEY, body TEXT)");
+        char* q = malloc(120000);
+        int n = snprintf(q, 120000, "INSERT INTO grow VALUES (1, '");
+        memset(q + n, 'g', 100000); n += 100000;
+        snprintf(q + n, 120000 - (size_t)n, "')");
+        ok(q);
+        free(q);
+        long g_before = 0, g_after = 0;
+        FILE* fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+        if (fd2) { fseek(fd2, 0, SEEK_END); g_before = ftell(fd2); fclose(fd2); }
+        for (int i = 0; i < 200; i++) ok("UPDATE grow SET body = CONCAT(SUBSTR(body, 2), 'h') WHERE id = 1");
+        fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+        if (fd2) { fseek(fd2, 0, SEEK_END); g_after = ftell(fd2); fclose(fd2); }
+        // 200 riscritture da 100 KB = 20 MB se nulla tornasse riusabile
+        CHECK(g_after - g_before < (8L << 20), "200 updates of a 100 KB row: file %ld -> %ld (< +8 MB)", g_before, g_after);
+        CHECK(num("SELECT LENGTH(body) FROM grow WHERE id = 1") == 100000, "large row intact");
+        for (int k = 0; k < 20; k++) {
+            ok("CREATE TABLE cyc (id INT PRIMARY KEY, pad VARCHAR(300))");
+            char ins[64000];
+            int l = snprintf(ins, sizeof(ins), "INSERT INTO cyc VALUES ");
+            for (int i = 0; i < 150; i++) l += snprintf(ins + l, sizeof(ins) - (size_t)l, "%s(%d, '%0250d')", i ? "," : "", i, i);
+            ok(ins);
+            ok("DROP TABLE cyc");
+        }
+        fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+        long cyc = 0;
+        if (fd2) { fseek(fd2, 0, SEEK_END); cyc = ftell(fd2); fclose(fd2); }
+        CHECK(cyc - g_after < (6L << 20), "20 x (CREATE, 150 rows, DROP): file %ld -> %ld", g_after, cyc);
+        ok("DROP TABLE grow");
+    }
+
+    // P1.12: una riga la cui forma serializzata è esattamente uno stub valido (8 colonne NULL, poi i byte
+    // "SVOVF1", lunghezza, prima pagina, pagine, FNV-1a) torna indietro com'è, mai come puntatore a una catena
+    {
+        uint8_t stubb[24] = { 0xFF, 0x00, 'S', 'V', 'O', 'V', 'F', '1' };
+        uint32_t total = 10, first = 2, npages = 1;
+        memcpy(stubb + 8, &total, 4); memcpy(stubb + 12, &first, 4); memcpy(stubb + 16, &npages, 4);
+        uint32_t h = 2166136261u;
+        for (int i = 0; i < 20; i++) { h ^= stubb[i]; h *= 16777619u; }
+        memcpy(stubb + 20, &h, 4);
+        int32_t c8, c9, c10, c11, c14;                 // INT, INT, INT, INT, BOOL, BOOL, INT = i 22 byte dopo la bitmap
+        memcpy(&c8, stubb + 2, 4); memcpy(&c9, stubb + 6, 4); memcpy(&c10, stubb + 10, 4); memcpy(&c11, stubb + 14, 4); memcpy(&c14, stubb + 20, 4);
+        CHECK(stubb[18] <= 1 && stubb[19] <= 1, "forged layout uses boolean bytes 0/1");
+        ok("CREATE TABLE forge (a1 INT, a2 INT, a3 INT, a4 INT, a5 INT, a6 INT, a7 INT, a8 INT, "
+           "c8 INT, c9 INT, c10 INT, c11 INT, b12 BOOLEAN, b13 BOOLEAN, c14 INT)");
+        char q[600];
+        snprintf(q, sizeof(q), "INSERT INTO forge VALUES (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, %d, %d, %d, %d, %s, %s, %d)",
+                 c8, c9, c10, c11, stubb[18] ? "TRUE" : "FALSE", stubb[19] ? "TRUE" : "FALSE", c14);
+        CHECK(ok(q), "insert the stub-shaped row: %s", g_err);
+        snprintf(q, sizeof(q), "SELECT COUNT(*) FROM forge WHERE c8 = %d AND c9 = %d AND c10 = %d AND c11 = %d AND c14 = %d AND a1 IS NULL",
+                 c8, c9, c10, c11, c14);
+        CHECK(num(q) == 1, "stub-shaped row read back verbatim: %lld", num(q));
+        db_shutdown();
+        CHECK(db_init(dir), "reopen");
+        ok("USE o");
+        CHECK(num(q) == 1, "stub-shaped row verbatim after restart: %lld", num(q));
+    }
     db_shutdown();
     if (system("rm -rf /tmp/sv_ovf_test")) {}
     if (g_fail) { printf("overflow tests: %d of %d FAILED\n", g_fail, g_tests); return 1; }

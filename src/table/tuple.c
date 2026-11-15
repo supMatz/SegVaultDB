@@ -88,8 +88,8 @@ uint8_t* tuple_serialize(Tuple* t, TableSchema* s, size_t* out_len) {
             case SV_TYPE_BOOL:
                 buf[pos++] = v->bool_val ? 1 : 0; break;
             default: {   // testo: VARCHAR, CHAR, TEXT, DATE, DATETIME, DECIMAL, BLOB
-                const char* s = v->str_val ? v->str_val : "";
-                size_t full = strlen(s);
+                const char* txt = v->str_val ? v->str_val : "";
+                size_t full = strlen(txt);
                 uint32_t slen = (uint32_t)(full > SV_MAX_TEXT_BYTES ? SV_MAX_TEXT_BYTES : full);
                 if (slen >= 0xFFFF) {                 // testo lungo: 0xFFFF poi la lunghezza a 32 bit
                     uint16_t esc = 0xFFFF;
@@ -99,7 +99,7 @@ uint8_t* tuple_serialize(Tuple* t, TableSchema* s, size_t* out_len) {
                     uint16_t s16 = (uint16_t)slen;
                     memcpy(buf + pos, &s16, 2); pos += 2;
                 }
-                memcpy(buf + pos, s, slen);  pos += slen;
+                memcpy(buf + pos, txt, slen);  pos += slen;
                 break;
             }
         }

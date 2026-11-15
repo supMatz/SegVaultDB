@@ -31,7 +31,7 @@ static void t(const char* sql, const char* expect) {
     char got[8192];
     if (!r) snprintf(got, sizeof(got), "ERR:(null result)");
     else if (!r->success) snprintf(got, sizeof(got), "ERR:%s", r->error);
-    else if (r->num_cols == 0) snprintf(got, sizeof(got), "OK:%d", r->rows_affected);
+    else if (r->num_cols == 0) snprintf(got, sizeof(got), "OK:%lld", r->rows_affected);
     else if (expect[0] == '#') snprintf(got, sizeof(got), "#%d", r->num_rows);
     else render(r, got, sizeof(got));
     bool ok;
@@ -1510,6 +1510,13 @@ int main(void) {
     t("SELECT fatt(6), giudizio(26)", "720|buono");
     t("SELECT @a", "NULL");                                                 // le @variabili no (sessione nuova)
     t("SELECT nextval('fatt')", "11");                                     // le sequenze sì (incremento 10)
+
+    // trovati dal fuzzer (P3.3): SET incompleto in una routine (lettura oltre l'array), scala DECIMAL enorme
+    t("CREATE PROCEDURE fz() BEGIN DECLARE a INT; SET a = 1, b END", "ERR:Expected '=' in SET");
+    t("CREATE TABLE fzd (x DECIMAL(10,200))", "ERR:Too big scale");
+    t("CREATE TABLE fzd (x DECIMAL(12,4))", "OK:0");
+    t("INSERT INTO fzd VALUES (1.23456)", "OK:1");
+    t("SELECT x FROM fzd", "1.2346");
 
     db_shutdown();
     crash_recovery_test();

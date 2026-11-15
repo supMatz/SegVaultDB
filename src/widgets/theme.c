@@ -150,7 +150,7 @@ static void polyline(PlatformWindow* win, const float* pts, int n, float t, Colo
 }
 
 static void arc(PlatformWindow* win, float cx, float cy, float r, float a0, float a1, float t, Color c) {
-    const int SEG = 14;
+    enum { SEG = 14 };
     float pts[(SEG + 1) * 2];
     for (int i = 0; i <= SEG; i++) {
         float a = a0 + (a1 - a0) * i / SEG;

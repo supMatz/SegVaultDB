@@ -74,6 +74,7 @@ typedef struct {
     HANDLE proc;
 #else
     pid_t  pid;
+    char   sock[108];            // socket Unix del processo, in una cartella 0700 (niente porta TCP aperta a tutti)
 #endif
 } FcgiWorker;
 
@@ -98,6 +99,7 @@ struct FcgiPool {
 #else
     char**      envp;            // ambiente dei figli (preparato prima di fork)
     int         max_fd;
+    char        sockdir[64];     // cartella privata (mkdtemp, 0700) con i socket dei processi
     // PR_SET_PDEATHSIG vale per il *thread* che fa fork: un php-cgi avviato dal thread di una connessione
     // morirebbe con quella. Tutti i processi nascono quindi da un thread che vive quanto il gruppo.
     pthread_t       spawner;
@@ -238,12 +240,31 @@ static void worker_kill(FcgiWorker* w) {
 #endif
 }
 
+// connessione a un processo del gruppo: socket Unix privato (POSIX) o porta di 127.0.0.1 (Windows)
+static sock_t worker_connect(FcgiWorker* w) {
+#ifndef _WIN32
+    if (w->sock[0]) return connect_unix(w->sock);
+#endif
+    return connect_tcp("127.0.0.1", w->port);
+}
+
 static bool worker_start(FcgiPool* p, FcgiWorker* w, char* err, size_t errsz) {
     worker_kill(w);
-    w->port = free_port();
-    if (!w->port) { snprintf(err, errsz, "no free port for php-cgi"); return false; }
-    char bind_arg[32];
-    snprintf(bind_arg, sizeof(bind_arg), "127.0.0.1:%d", w->port);
+    char bind_arg[128];
+#ifndef _WIN32
+    // php-cgi -b PERCORSO ascolta su un socket Unix: dentro una cartella 0700 lo raggiunge solo questo
+    // utente (sulla porta TCP di 127.0.0.1 qualsiasi utente locale poteva eseguire PHP come SegVault)
+    if (p->sockdir[0]) {
+        snprintf(w->sock, sizeof(w->sock), "%s/w%d.sock", p->sockdir, (int)(w - p->w));
+        unlink(w->sock);
+        snprintf(bind_arg, sizeof(bind_arg), "%s", w->sock);
+    } else
+#endif
+    {
+        w->port = free_port();
+        if (!w->port) { snprintf(err, errsz, "no free port for php-cgi"); return false; }
+        snprintf(bind_arg, sizeof(bind_arg), "127.0.0.1:%d", w->port);
+    }
 #ifdef _WIN32
     char cmd[4400];
     snprintf(cmd, sizeof(cmd), "\"%s\"%s -b %s", p->exe, p->cmd_ini ? p->cmd_ini : "", bind_arg);
@@ -436,6 +457,14 @@ FcgiPool* fcgi_pool_spawn(const char* php_cgi, int workers, const char* const* i
     }
     p->n = workers;
     p->w = calloc((size_t)workers, sizeof(FcgiWorker));
+#ifndef _WIN32
+    {
+        const char* td = getenv("TMPDIR");
+        if (!td || !td[0] || strlen(td) > 30) td = "/tmp";
+        snprintf(p->sockdir, sizeof(p->sockdir), "%s/segvault-php-XXXXXX", td);
+        if (!mkdtemp(p->sockdir)) p->sockdir[0] = '\0';   // senza cartella privata: porta TCP come prima
+    }
+#endif
     mx_init(&p->mx);
     snprintf(p->desc, sizeof(p->desc), "php-cgi x%d (%.500s)", workers, php_cgi);
     if (!p->exe || !p->w) { snprintf(err, errsz, "out of memory"); fcgi_pool_free(p); return NULL; }
@@ -488,7 +517,7 @@ FcgiPool* fcgi_pool_spawn(const char* php_cgi, int workers, const char* const* i
     // il primo processo deve accettare connessioni: altrimenti php-cgi non è un php-cgi (o manca una libreria)
     double t0 = now_ms();
     for (;;) {
-        sock_t fd = connect_tcp("127.0.0.1", p->w[0].port);
+        sock_t fd = worker_connect(&p->w[0]);
         if (fd != BAD_SOCK) { sock_close(fd); break; }
         if (!worker_alive(&p->w[0])) {
             snprintf(err, errsz, "%.300s exited right after starting (is it php-cgi, not php?)", php_cgi);
@@ -551,6 +580,8 @@ void fcgi_pool_free(FcgiPool* p) {
         pthread_cond_destroy(&p->sp_cv);
     }
     free(p->envp);
+    for (int i = 0; p->w && i < p->n; i++) if (p->w[i].sock[0]) unlink(p->w[i].sock);
+    if (p->sockdir[0]) rmdir(p->sockdir);
 #endif
     mx_destroy(&p->mx);
     free(p->w);
@@ -607,7 +638,7 @@ int fcgi_request(FcgiPool* p, const FcgiParam* params, int nparams, const char* 
             restarted = true;
             c0 = now_ms();
         }
-        fd = connect_tcp("127.0.0.1", w->port);
+        fd = worker_connect(w);
         if (fd != BAD_SOCK || now_ms() - c0 > START_WAIT_MS) break;
         sleep_ms(10);
     }

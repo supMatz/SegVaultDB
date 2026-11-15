@@ -6,12 +6,15 @@ SCOPO: lock lettori/scrittori portabile per il motore (SRWLOCK su Windows, pthre
 #ifndef SV_PLATFORM_LOCK_H
 #define SV_PLATFORM_LOCK_H
 
+#include <stdbool.h>
+
 #ifdef _WIN32
   #if !defined(_WINDOWS_)
     __declspec(dllimport) void __stdcall AcquireSRWLockExclusive(void** lock);
     __declspec(dllimport) void __stdcall ReleaseSRWLockExclusive(void** lock);
     __declspec(dllimport) void __stdcall AcquireSRWLockShared(void** lock);
     __declspec(dllimport) void __stdcall ReleaseSRWLockShared(void** lock);
+    __declspec(dllimport) unsigned char __stdcall TryAcquireSRWLockExclusive(void** lock);
     typedef struct { void* srw; } SvRwLock;           // SRWLOCK: un puntatore, inizializzato a zero
     #define SV_RW_LOCKP(l) (&(l)->srw)
   #else
@@ -24,6 +27,7 @@ SCOPO: lock lettori/scrittori portabile per il motore (SRWLOCK su Windows, pthre
   static inline void sv_rw_rdunlock(SvRwLock* l) { ReleaseSRWLockShared(SV_RW_LOCKP(l)); }
   static inline void sv_rw_wr(SvRwLock* l)       { AcquireSRWLockExclusive(SV_RW_LOCKP(l)); }
   static inline void sv_rw_wrunlock(SvRwLock* l) { ReleaseSRWLockExclusive(SV_RW_LOCKP(l)); }
+  static inline bool sv_rw_trywr(SvRwLock* l)     { return TryAcquireSRWLockExclusive(SV_RW_LOCKP(l)) != 0; }
 #else
   #include <pthread.h>
   typedef struct { pthread_rwlock_t rw; } SvRwLock;
@@ -42,6 +46,7 @@ SCOPO: lock lettori/scrittori portabile per il motore (SRWLOCK su Windows, pthre
   static inline void sv_rw_rdunlock(SvRwLock* l) { pthread_rwlock_unlock(&l->rw); }
   static inline void sv_rw_wr(SvRwLock* l)       { pthread_rwlock_wrlock(&l->rw); }
   static inline void sv_rw_wrunlock(SvRwLock* l) { pthread_rwlock_unlock(&l->rw); }
+  static inline bool sv_rw_trywr(SvRwLock* l)     { return pthread_rwlock_trywrlock(&l->rw) == 0; }
 #endif
 
 #endif

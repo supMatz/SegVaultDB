@@ -117,7 +117,7 @@ uint8_t* ov_load_fd(int db_fd, const uint8_t* stub, size_t stub_len, size_t* n) 
 
 int ov_store_fd(int db_fd, const uint8_t* data, size_t n, uint8_t* stub) {
     if (n > OV_MAX_ROW) return SV_FULL;
-    long end = sv_lseek(db_fd, 0, SEEK_END);
+    int64_t end = sv_lseek(db_fd, 0, SEEK_END);
     uint32_t base = end > 0 ? (uint32_t)((end + SV_PAGE_SIZE - 1) / SV_PAGE_SIZE) : 0;
     if (base == 0) {                                  // la pagina 0 è riservata
         Page* z = page_create(0);
@@ -142,10 +142,18 @@ int ov_store_fd(int db_fd, const uint8_t* data, size_t n, uint8_t* stub) {
 
 int ov_slot_put(int db_fd, void* page, const uint8_t* data, size_t n) {
     Page* p = page;
-    if (n <= OV_INLINE_MAX) return page_insert(p, data, (uint16_t)n);
+    if (n <= OV_INLINE_MAX && !ov_is_stub(data, n, NULL, NULL)) return page_insert(p, data, (uint16_t)n);
     uint8_t stub[OV_STUB_LEN];
     if (ov_store_fd(db_fd, data, n, stub) != SV_OK) return -1;
     return page_insert(p, stub, OV_STUB_LEN);
+}
+
+int ov_slot_revive(int db_fd, void* page, uint16_t slot, const uint8_t* data, size_t n) {
+    Page* p = page;
+    if (n <= OV_INLINE_MAX && !ov_is_stub(data, n, NULL, NULL)) return page_revive_slot(p, slot, data, (uint16_t)n);
+    uint8_t stub[OV_STUB_LEN];
+    if (ov_store_fd(db_fd, data, n, stub) != SV_OK) return SV_IO_ERROR;
+    return page_revive_slot(p, slot, stub, OV_STUB_LEN);
 }
 
 bool ov_slot_equals(int db_fd, const uint8_t* cur, size_t cur_len, const uint8_t* data, size_t n) {

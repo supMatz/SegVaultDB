@@ -132,12 +132,66 @@ int main(void) {
     CHECK(denied("SELECT * FROM prodotto WHERE EXISTS (SELECT 1 FROM ordine)"), "exists");
     CHECK(denied("EXPLAIN SELECT * FROM segreto"), "explain");
     CHECK(denied("UPDATE prodotto SET prezzo = 0"), "bob cannot update");
+    // lo schema delle tabelle senza permessi resta nascosto (DESCRIBE, SHOW, information_schema)
+    CHECK(denied("DESCRIBE segreto") && denied("SHOW CREATE TABLE segreto") && rows("SHOW COLUMNS FROM segreto") <= 0,
+          "DESCRIBE / SHOW CREATE / SHOW COLUMNS of a hidden table: %s", g_err);
+    CHECK(rows("SELECT * FROM information_schema.columns WHERE table_name = 'segreto'") == 0 &&
+          rows("SELECT * FROM information_schema.tables WHERE table_name = 'prodotto'") == 1, "information_schema lists only allowed tables");
+    CHECK(has_row("SHOW TABLES", "prodotto") && !has_row("SHOW TABLES", "segreto"), "SHOW TABLES lists only allowed tables");
     // procedure: ogni istruzione con i permessi di chi chiama; nomi db.tabella controllati su quel database
     CHECK(rows("CALL leggi()") == 1, "bob calls a reading procedure: %s", g_err);
     CHECK(denied("CALL azzera()") && rows("SELECT * FROM prodotto WHERE prezzo = 0") == 0, "procedure cannot update for bob");
     CHECK(denied("CALL spia()"), "procedure cannot read a hidden table");
     CHECK(denied("CREATE PROCEDURE p2() SELECT 1") && denied("DROP PROCEDURE leggi"), "no procedure DDL");
     CHECK(rows("SELECT * FROM shop.prodotto") == 2 && denied("SELECT * FROM hr.stipendio") && denied("SELECT * FROM shop.segreto"), "qualified names");
+
+    // ── P0.1: ogni forma dello statement passa dal controllo (eve: tutto su mine e mine2, niente su segreto) ──
+    db_set_user(NULL);
+    ok("USE shop");
+    ok("CREATE TABLE mine (id INT PRIMARY KEY, x VARCHAR(20))");
+    ok("CREATE TABLE mine2 (id INT PRIMARY KEY, x VARCHAR(20))");
+    ok("INSERT INTO mine VALUES (1, 'a'), (2, 'b')");
+    ok("INSERT INTO mine2 VALUES (1, 'c')");
+    ok("CREATE VIEW v_seg AS SELECT * FROM segreto");
+    ok("CREATE VIEW v_seg2 AS SELECT * FROM v_seg");
+    CHECK(ok("CREATE USER eve IDENTIFIED BY 'eve-pass'") && ok("GRANT SELECT, INSERT, UPDATE, DELETE, ALTER ON shop.mine TO eve") &&
+          ok("GRANT SELECT, INSERT, UPDATE, DELETE ON shop.mine2 TO eve") && ok("GRANT CREATE ON shop.* TO eve"), "eve: %s", g_err);
+    db_set_user("eve");
+    ok("USE shop");
+    CHECK(rows("SELECT * FROM mine") == 2, "eve reads mine: %s", g_err);
+    CHECK(denied("WITH segreto AS (SELECT * FROM segreto) SELECT * FROM segreto"), "CTE named like the hidden table: %s", g_err);
+    CHECK(denied("SELECT * FROM mine WHERE id IN (WITH s AS (SELECT id FROM segreto) SELECT id FROM s)"), "CTE in a subquery");
+    CHECK(denied("SET @x = (SELECT x FROM segreto LIMIT 1)"), "SET @x = (SELECT ...): %s", g_err);
+    CHECK(denied("INSERT INTO mine VALUES (10, 'z') RETURNING (SELECT x FROM segreto LIMIT 1)") && rows("SELECT * FROM mine WHERE id = 10") == 0,
+          "INSERT ... RETURNING (SELECT ...): %s", g_err);
+    CHECK(denied("UPDATE mine m JOIN segreto s ON s.id = m.id SET m.x = s.x") && rows("SELECT * FROM mine WHERE x = 'shh'") == 0,
+          "UPDATE ... JOIN hidden table: %s", g_err);
+    CHECK(denied("DELETE mine, segreto FROM mine JOIN segreto ON segreto.id = mine.id"), "multi-table DELETE of a hidden table: %s", g_err);
+    CHECK(denied("INSERT INTO mine VALUES (1, 'a') ON DUPLICATE KEY UPDATE x = (SELECT x FROM segreto LIMIT 1)"), "ON DUPLICATE KEY UPDATE (SELECT ...): %s", g_err);
+    CHECK(denied("SELECT id, ROW_NUMBER() OVER (ORDER BY (SELECT x FROM segreto LIMIT 1)) FROM mine"), "subquery in a window: %s", g_err);
+    CHECK(denied("CREATE TABLE copia AS SELECT * FROM segreto") && denied("SELECT * FROM copia") == false, "CTAS from a hidden table: %s", g_err);
+    CHECK(denied("SELECT * FROM mine m, LATERAL (SELECT x FROM segreto s WHERE s.id = m.id) l"), "LATERAL: %s", g_err);
+    CHECK(denied("MERGE INTO mine USING segreto s ON mine.id = s.id WHEN MATCHED THEN UPDATE SET x = s.x"), "MERGE USING hidden table: %s", g_err);
+    CHECK(denied("SELECT * FROM v_seg2") && denied("CREATE VIEW ev AS SELECT * FROM v_seg"), "nested views: %s", g_err);
+    // un trigger su una tabella propria non scrive con i permessi di qualcun altro
+    CHECK(ok("CREATE TRIGGER tg_pwn AFTER UPDATE ON mine FOR EACH ROW UPDATE segreto SET x = 'pwned'"), "trigger created: %s", g_err);
+    CHECK(denied("UPDATE mine SET x = 'q' WHERE id = 1"), "trigger body checked: %s", g_err);
+    // niente rifiuti sbagliati: funzioni di tabella e alias
+    CHECK(rows("SELECT jt.a FROM mine, JSON_TABLE('[{\"a\":1}]', '$[*]' COLUMNS (a INT PATH '$.a')) jt") == 2, "JSON_TABLE alias: %s", g_err);
+    CHECK(rows("SELECT * FROM GENERATE_SERIES(1, 3) g") == 3, "GENERATE_SERIES: %s", g_err);
+    CHECK(rows("SELECT * FROM (VALUES (1), (2)) v") == 2, "VALUES: %s", g_err);
+    CHECK(ok("DELETE m FROM mine2 m JOIN mine s ON s.id = m.id WHERE m.id = 99"), "aliased multi-table DELETE: %s", g_err);
+    db_set_user(NULL);
+    ok("USE shop");
+    CHECK(rows("SELECT * FROM segreto WHERE x = 'shh'") == 1, "hidden table untouched");
+    CHECK(rows("SELECT * FROM copia") == -1, "CTAS table not created");
+    ok("DROP TRIGGER tg_pwn");
+    ok("GRANT SELECT ON shop.v_seg2 TO eve");
+    db_set_user("eve");
+    ok("USE shop");
+    CHECK(rows("SELECT * FROM v_seg2") == 1, "a granted view reads with its creator's rights: %s", g_err);
+    db_set_user(NULL);
+    ok("USE shop");
 
     // ── capo: amministratore ──
     db_set_user("capo");

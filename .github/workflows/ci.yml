@@ -39,6 +39,14 @@ jobs:
       - name: No compiler warnings (Windows)
         run: "! grep -E 'warning:' build-win.log"
 
+      - name: Windows-only code under wine (64-bit offsets, MoveFileEx, engine)
+        run: |
+          sudo apt-get install -y --no-install-recommends wine64 || sudo apt-get install -y --no-install-recommends wine
+          make test-win
+
+      - name: Debug build compiles (-DDEBUG)
+        run: gcc -std=c11 -D_GNU_SOURCE -DDEBUG -fsyntax-only -Iinclude -Isrc -Isrc/catalog -Isrc/storage -Isrc/table -Isrc/index -Isrc/query -Isrc/tx -Isrc/bridge src/tx/wal.c src/bridge/db_api.c src/query/executor.c
+
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
         with:
@@ -47,3 +55,32 @@ jobs:
             segvault.exe
             segvault-server.exe
             assets/
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential php-cgi
+      - name: ThreadSanitizer (parallel reads, PHP)
+        run: make test-tsan
+      - name: Durability under AddressSanitizer + UBSan (fault injection, crash points)
+        run: |
+          make test_durability CFLAGS="-std=c11 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer"
+          ./test_durability
+      - name: HTTP/2 frames under AddressSanitizer
+        run: |
+          make test_h2 CFLAGS="-std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined"
+          ./test_h2
+
+  analyze:
+    runs-on: ubuntu-latest
+    continue-on-error: true          # informativo: non blocca le pull request
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cppcheck
+      - name: cppcheck (engine and server)
+        run: cppcheck --enable=warning,portability --inline-suppr --quiet -Iinclude -Isrc src/storage src/table src/tx src/bridge src/catalog src/server

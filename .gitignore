@@ -65,6 +65,9 @@ test_backup
 test_backup_asan
 test_export
 test_export_asan
+test_durability
+test_durability_asan
+test_h2
 
 # eseguibili pronti da scaricare (make dist): nel repository
 !/bin/
@@ -74,3 +77,6 @@ test_mysql
 build-dist/
 bin/SegVault-*.zip
 bin/SegVault-*.tar.gz
+*_tsan
+test_win.exe
+fuzz_sv

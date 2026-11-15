@@ -70,7 +70,7 @@ Tutti sotto `/api/v1`. Le risposte sono JSON con `"ok": true|false`.
 
 | Metodo | Percorso | Risposta |
 |---|---|---|
-| `GET` | `/health` | `{"ok":true,"server":"SegVault","version":"1.2.0"}` (senza token) |
+| `GET` | `/health` | `{"ok":true,"server":"SegVault","version":"1.3.0"}` (senza token) |
 | `GET` | `/status` | uptime, richieste, errori, righe inviate, connessioni aperte, `busy`, `timeout_ms` |
 | `POST` | `/query` | esegue SQL (sotto) |
 | `GET` | `/databases` | `{"ok":true,"databases":["shop", ...]}` |
@@ -153,9 +153,10 @@ CREATE TABLE api_endpoints (
     name        VARCHAR(60) PRIMARY KEY,
     sql         TEXT NOT NULL,                        -- uno o più statement con parametri :nome
     access      VARCHAR(10) NOT NULL DEFAULT 'token', -- 'public' o 'token'
-    description VARCHAR(200)
+    description VARCHAR(200),
+    definer     VARCHAR(64)                           -- chi l'ha salvato: lo scrive SegVault (dalla 1.3)
 );
-INSERT INTO api_endpoints VALUES
+INSERT INTO api_endpoints (name, sql, access, description) VALUES
   ('prodotti_economici', 'SELECT id, nome, prezzo FROM prodotto WHERE prezzo < :max ORDER BY prezzo', 'public', 'Listino'),
   ('nuovo_ordine', 'INSERT INTO ordine (prodotto, quantita, giorno) VALUES (:prodotto, :quantita, CURDATE())', 'token', NULL);
 ```
@@ -175,6 +176,14 @@ curl 'http://127.0.0.1:8484/api/v1/endpoints?database=shop'        # elenco (ric
 - `access = 'public'`: chiamabile **senza token e da qualsiasi sito** (la risposta ha
   `Access-Control-Allow-Origin: *`): è il modo di dare dati a una pagina pubblica esponendo solo
   quelle query, non tutto il database. `'token'`: come il resto dell'API.
+- **Permessi (con gli utenti, `--users`).** Un endpoint gira con i permessi di chi l'ha salvato, mai di
+  più: la colonna `definer` la riempie SegVault con l'utente della sessione a ogni `INSERT` / `UPDATE`
+  (un valore scritto nello statement viene sostituito; vuoto = root, cioè token o app). `public` vale
+  solo per gli endpoint salvati da un amministratore; quelli degli altri utenti chiedono il login.
+  Solo un amministratore può cambiare la struttura di `api_endpoints` (`ALTER`, `RENAME`,
+  `CREATE ... AS SELECT`, chiavi esterne). Una tabella di prima della 1.3, senza `definer`, funziona
+  come prima se solo gli amministratori possono scriverla; altrimenti i suoi endpoint sono rifiutati
+  (403) finché un amministratore non aggiunge la colonna e li salva di nuovo.
 
 ## Parametri `?` (niente SQL injection)
 

@@ -133,6 +133,9 @@ static void usage(const char* argv0) {
            "                        \"auto\" generates a random token and prints it\n"
            "  -d, --database NAME   database used when a request does not name one\n"
            "      --cors ORIGIN     allow browser calls from ORIGIN (e.g. http://localhost:5173, or *)\n"
+           "      --cache-size MB   page cache (default: 1/8 of the RAM, 4-512 MB)\n"
+           "      --synchronous M   when commits reach the disk: FULL (every write, also autocommit),\n"
+           "                        NORMAL (default: COMMIT at once, autocommit within 100 ms), OFF (checkpoints)\n"
            "      --users           require a user and password (Authorization: Basic); each query\n"
            "                        runs with that user's privileges (CREATE USER / GRANT in SQL)\n"
            "      --static DIR      also serve the files in DIR (a web site, like XAMPP's htdocs) outside /api\n"
@@ -146,6 +149,8 @@ static void usage(const char* argv0) {
            "      --max-body MB     largest request body (default 16)\n"
            "      --timeout S       stop a request that runs longer than S seconds (default 30, 0 = never)\n"
            "      --no-auth         allow listening on a non-local address without a token\n"
+           "      --mysql-socket P  MySQL also on the Unix socket P (default: DATA_DIR/mysql.sock; PHP's\n"
+           "                        mysqli('localhost') and PDO use it)\n"
            "      --mysql-port N    also speak the MySQL protocol on port N (3306 is MySQL's): PHP mysqli / PDO,\n"
            "                        JDBC, Python and the mysql client connect unchanged (users: CREATE USER)\n"
            "      --audit FILE      append every statement that changes data or schema to FILE\n"
@@ -190,6 +195,7 @@ int main(int argc, char** argv) {
     char auto_token[65];
     const char* data_dir = "./data";
     bool no_auth = false;
+    const char* sync_mode = NULL;
     const char* php_arg = NULL;
     bool trust_ca = false, background = false;
     // servizio dell'utente: stessa riga di comando, senza questa opzione
@@ -228,9 +234,12 @@ int main(int argc, char** argv) {
         else if (ARG("--timeout", "--timeout")) cfg.timeout_ms = atoi(argv[++i]) * 1000;
         else if (!strcmp(a, "--no-auth")) no_auth = true;
         else if (!strcmp(a, "--users")) cfg.require_login = true;
+        else if (ARG("--synchronous", "--synchronous")) sync_mode = argv[++i];
+        else if (ARG("--cache-size", "--cache-size")) db_set_cache_size(atol(argv[++i]));
         else if (ARG("--backup-dir", "--backup-dir")) g_bk_dir = argv[++i];
         else if (ARG("--audit", "--audit")) cfg.audit_file = argv[++i];
         else if (ARG("--mysql-port", "--mysql-port")) { cfg.mysql = true; cfg.mysql_port = atoi(argv[++i]); }
+        else if (ARG("--mysql-socket", "--mysql-socket")) cfg.mysql_socket = argv[++i];
         else if (ARG("--backup-every", "--backup-every")) g_bk_every = atoi(argv[++i]);
         else if (ARG("--backup-keep", "--backup-keep")) g_bk_keep = atoi(argv[++i]);
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) cfg.quiet = true;
@@ -304,7 +313,7 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
                 _mkdir(part);
 #else
-                mkdir(part, 0755);
+                mkdir(part, c ? 0755 : 0700);   // la cartella dei dati: solo il proprietario
 #endif
                 *q = c;
                 if (!c) break;
@@ -327,6 +336,13 @@ int main(int argc, char** argv) {
         snprintf(logp, sizeof(logp), "%s/segvault-server.log", data_dir);
         sv_service_background(logp);
     }
+#ifndef _WIN32
+    static char mysql_sock_buf[1200];                    // MySQL anche su <dati>/mysql.sock: mysqli('localhost') di PHP
+    if (cfg.mysql && !cfg.mysql_socket) {
+        snprintf(mysql_sock_buf, sizeof(mysql_sock_buf), "%s/mysql.sock", data_dir);
+        if (strlen(mysql_sock_buf) < 100) cfg.mysql_socket = mysql_sock_buf;
+    }
+#endif
     static char mail_dir_buf[1200];
     if (cfg.mail && !cfg.mail_dir) {
         snprintf(mail_dir_buf, sizeof(mail_dir_buf), "%s/mail", data_dir);
@@ -334,6 +350,11 @@ int main(int argc, char** argv) {
     }
     if (!db_init(data_dir)) {
         fprintf(stderr, "cannot open the data directory '%s': %s\n", data_dir, db_init_error());
+        return 1;
+    }
+    if (sync_mode && !db_set_synchronous(sync_mode)) {
+        fprintf(stderr, "--synchronous must be OFF, NORMAL or FULL\n");
+        db_shutdown();
         return 1;
     }
 

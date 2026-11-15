@@ -17,7 +17,11 @@ else
 endif
 
 CC       = gcc
-CFLAGS   = -std=c11 -D_GNU_SOURCE -D_FORTIFY_SOURCE=2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -g -O2
+CFLAGS   = -std=c11 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -D_FORTIFY_SOURCE=2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+           -Wshadow -Wformat=2 -Wno-format-nonliteral -Wstrict-prototypes -g -O2
+# solo per gli eseguibili Linux (MinGW non li supporta tutti): canary sullo stack, PIE, RELRO completo
+HARDEN_CFLAGS  = -fstack-protector-strong -fPIE
+HARDEN_LDFLAGS = -pie -Wl,-z,relro,-z,now
 DEPFLAGS = -MMD -MP   # file .d: un header modificato ricompila chi lo include
 BASE_INCLUDES = -Iinclude -Isrc -Isrc/platform -Isrc/widgets -Isrc/catalog -Isrc/storage -Isrc/table -Isrc/index -Isrc/query -Isrc/tx -Isrc/bridge
 INCLUDES = $(XFT_CFLAGS) -Iinclude -Isrc -Isrc/platform -Isrc/widgets -Isrc/catalog -Isrc/storage -Isrc/table -Isrc/index -Isrc/query -Isrc/tx -Isrc/bridge
@@ -82,7 +86,7 @@ ENGINE_SRCS = \
 FULL_SRCS = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) $(NET_SRCS) $(ENGINE_SRCS)
 FULL_OBJS = $(FULL_SRCS:.c=.o)
 
-.PHONY: all full clean test test-asan test-tsan windows bench server lib dist
+.PHONY: all full clean test test-asan test-tsan test-win fuzz windows bench server lib dist
 
 all: full server
 
@@ -93,12 +97,12 @@ SERVER_OBJS = $(patsubst %.c,build-server/%.o,$(SERVER_SRCS))
 server: segvault-server
 
 segvault-server: $(SERVER_OBJS)
-	$(CC) $(CFLAGS) -o $@ $(SERVER_OBJS) -lm -pthread -ldl
+	$(CC) $(CFLAGS) $(HARDEN_LDFLAGS) -o $@ $(SERVER_OBJS) -lm -pthread -ldl
 	@echo "=== Server build: segvault-server ==="
 
 build-server/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(DEPFLAGS) $(BASE_INCLUDES) -c $< -o $@
+	$(CC) $(CFLAGS) $(HARDEN_CFLAGS) $(DEPFLAGS) $(BASE_INCLUDES) -c $< -o $@
 
 # ── libreria statica del motore, per incorporarlo in un'app C/C++ (come SQLite): libsegvault.a ──
 LIB_OBJS = $(patsubst %.c,build-server/%.o,$(ENGINE_SRCS))
@@ -110,7 +114,7 @@ libsegvault.a: $(LIB_OBJS)
 	@echo "=== Library: libsegvault.a (header: src/bridge/db_api.h) ==="
 
 full: $(FULL_OBJS)
-	$(CC) $(CFLAGS) -o $(OUT) $(FULL_OBJS) $(LIBS)
+	$(CC) $(CFLAGS) $(HARDEN_LDFLAGS) -o $(OUT) $(FULL_OBJS) $(LIBS)
 	@echo "=== Full build: $(OUT) ==="
 
 BTREE_TEST_SRCS = tests/test_btree.c src/index/btree.c src/storage/buffer_pool.c src/storage/page.c \
@@ -120,7 +124,7 @@ SQL_TEST_SRCS = tests/test_sql.c $(ENGINE_SRCS)
 
 EXAMPLES_TEST_SRCS = tests/test_examples.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
-test: test_engine test_btree test_sql test_mysql test_examples test_server test_web test_mail test_tls test_php test_grid_edit test_table_design test_schema_model test_db_tools test_png test_auth test_sessions test_parallel test_mysql_import test_overflow test_backup test_export
+test: test_engine test_btree test_sql test_mysql test_examples test_server test_web test_mail test_tls test_php test_grid_edit test_table_design test_schema_model test_db_tools test_png test_auth test_sessions test_parallel test_mysql_import test_overflow test_backup test_export test_durability test_h2
 	./test_btree
 	./test_engine
 	./test_sql
@@ -143,24 +147,26 @@ test: test_engine test_btree test_sql test_mysql test_examples test_server test_
 	./test_overflow
 	./test_backup
 	./test_export
+	./test_durability
+	./test_h2
 
 TEST_DESIGN_SRCS = tests/test_table_design.c src/widgets/table_design.c $(ENGINE_SRCS)
 
 # designer di tabelle: CREATE / ALTER generati ed eseguiti sul motore
-test_table_design: $(TEST_DESIGN_SRCS) src/widgets/table_design.h
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_table_design $(TEST_DESIGN_SRCS) -lm -pthread
+test_table_design: $(TEST_DESIGN_SRCS) src/widgets/table_design.h libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_table_design $(filter-out $(ENGINE_SRCS),$(TEST_DESIGN_SRCS)) libsegvault.a -lm -pthread
 
 TEST_SCHEMA_SRCS = tests/test_schema_model.c src/widgets/schema_model.c $(ENGINE_SRCS)
 
 # diagramma dello schema: relazioni, posizioni, layout e SQL delle azioni
-test_schema_model: $(TEST_SCHEMA_SRCS) src/widgets/schema_model.h
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_schema_model $(TEST_SCHEMA_SRCS) -lm -pthread
+test_schema_model: $(TEST_SCHEMA_SRCS) src/widgets/schema_model.h libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_schema_model $(filter-out $(ENGINE_SRCS),$(TEST_SCHEMA_SRCS)) libsegvault.a -lm -pthread
 
 TEST_TOOLS_SRCS = tests/test_db_tools.c src/widgets/db_tools.c $(ENGINE_SRCS)
 
 # ricerca in tutto il database e panoramica delle tabelle
-test_db_tools: $(TEST_TOOLS_SRCS) src/widgets/db_tools.h
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_db_tools $(TEST_TOOLS_SRCS) -lm -pthread
+test_db_tools: $(TEST_TOOLS_SRCS) src/widgets/db_tools.h libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_db_tools $(filter-out $(ENGINE_SRCS),$(TEST_TOOLS_SRCS)) libsegvault.a -lm -pthread
 
 # encoder PNG (esportazione del diagramma)
 test_png: tests/test_png.c src/widgets/png_write.c src/widgets/png_write.h
@@ -169,20 +175,20 @@ test_png: tests/test_png.c src/widgets/png_write.c src/widgets/png_write.h
 TEST_AUTH_SRCS = tests/test_auth.c $(ENGINE_SRCS)
 
 # utenti e permessi
-test_auth: $(TEST_AUTH_SRCS) src/bridge/auth.h
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_auth $(TEST_AUTH_SRCS) -lm -pthread
+test_auth: $(TEST_AUTH_SRCS) src/bridge/auth.h libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_auth $(filter-out $(ENGINE_SRCS),$(TEST_AUTH_SRCS)) libsegvault.a -lm -pthread
 
 TEST_SESS_SRCS = tests/test_sessions.c $(ENGINE_SRCS)
 
 # sessioni: stato separato e proprietario unico delle transazioni
-test_sessions: $(TEST_SESS_SRCS)
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_sessions $(TEST_SESS_SRCS) -lm -pthread
+test_sessions: $(TEST_SESS_SRCS) libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_sessions $(filter-out $(ENGINE_SRCS),$(TEST_SESS_SRCS)) libsegvault.a -lm -pthread
 
 TEST_PAR_SRCS = tests/test_parallel.c $(ENGINE_SRCS)
 
 # letture in parallelo (anche con ThreadSanitizer: make test-tsan)
-test_parallel: $(TEST_PAR_SRCS)
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_parallel $(TEST_PAR_SRCS) -lm -pthread
+test_parallel: $(TEST_PAR_SRCS) libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_parallel $(filter-out $(ENGINE_SRCS),$(TEST_PAR_SRCS)) libsegvault.a -lm -pthread
 
 test-tsan: $(TEST_PAR_SRCS)
 	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=thread -I. $(BASE_INCLUDES) -o test_parallel_tsan $(TEST_PAR_SRCS) -lm -pthread
@@ -193,71 +199,95 @@ test-tsan: $(TEST_PAR_SRCS)
 TEST_MY_SRCS = tests/test_mysql_import.c src/widgets/mysql_import.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
 # import dei dump di MySQL
-test_mysql_import: $(TEST_MY_SRCS) src/widgets/mysql_import.h
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_mysql_import $(TEST_MY_SRCS) -lm -pthread
+test_mysql_import: $(TEST_MY_SRCS) src/widgets/mysql_import.h libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_mysql_import $(filter-out $(ENGINE_SRCS),$(TEST_MY_SRCS)) libsegvault.a -lm -pthread
 
 TEST_OVF_SRCS = tests/test_overflow.c $(ENGINE_SRCS)
 TEST_BK_SRCS = tests/test_backup.c $(ENGINE_SRCS)
+TEST_H2_SRCS = tests/test_h2.c src/server/h2.c src/server/json.c
+
+# HTTP/2 a livello di frame: intestazioni malformate, rapid reset, fiume di PING
+test_h2: $(TEST_H2_SRCS) src/server/h2.h
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_h2 $(TEST_H2_SRCS) -lm -pthread
+
+# codice solo Windows (offset a 64 bit, MoveFileEx, motore): cross-compilato, eseguito con wine (o su Windows)
+test-win: tests/test_win.c $(ENGINE_SRCS)
+	$(WIN_CC) -std=c11 -D_GNU_SOURCE -O1 -I. $(BASE_INCLUDES) -o test_win.exe tests/test_win.c $(ENGINE_SRCS) -static -lws2_32
+	cd /tmp && WINEDEBUG=-all DISPLAY= wine $(CURDIR)/test_win.exe
+
+# fuzzer mutazionale sotto ASan + UBSan: make fuzz [FUZZ_TARGET=sql|json|login|page|catalog|exec|all] [FUZZ_SECS=60]
+FUZZ_TARGET ?= all
+FUZZ_SECS ?= 60
+fuzz: tests/fuzz/fuzz.c $(ENGINE_SRCS) src/server/json.c src/server/mysql_wire.c
+	$(CC) -std=c11 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -I. $(BASE_INCLUDES) -o fuzz_sv tests/fuzz/fuzz.c src/server/json.c src/server/mysql_wire.c $(ENGINE_SRCS) -lm -pthread
+	./fuzz_sv $(FUZZ_TARGET) $(FUZZ_SECS)
+
+TEST_DUR_SRCS = tests/test_durability.c $(ENGINE_SRCS)
+
+# durabilità: errori di scrittura / fsync iniettati e arresti a metà di ROLLBACK e recupero
+test_durability: $(TEST_DUR_SRCS) src/platform_compat.h src/tx/wal.h
+	$(CC) $(CFLAGS) -DSV_FAULT_INJECTION -I. $(BASE_INCLUDES) -o test_durability $(TEST_DUR_SRCS) -lm -pthread
+
 TEST_EXP_SRCS = tests/test_export.c src/widgets/export_bin.c $(ENGINE_SRCS)
 
-test_export: $(TEST_EXP_SRCS)
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_export $(TEST_EXP_SRCS) -lm -pthread
+test_export: $(TEST_EXP_SRCS) libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_export $(filter-out $(ENGINE_SRCS),$(TEST_EXP_SRCS)) libsegvault.a -lm -pthread
 
 
-test_backup: $(TEST_BK_SRCS)
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_backup $(TEST_BK_SRCS) -lm -pthread
+test_backup: $(TEST_BK_SRCS) libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_backup $(filter-out $(ENGINE_SRCS),$(TEST_BK_SRCS)) libsegvault.a -lm -pthread
 
 
 # righe grandi (pagine di overflow), anche dopo ROLLBACK, riavvio e crash
-test_overflow: $(TEST_OVF_SRCS)
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_overflow $(TEST_OVF_SRCS) -lm -pthread
+test_overflow: $(TEST_OVF_SRCS) libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_overflow $(filter-out $(ENGINE_SRCS),$(TEST_OVF_SRCS)) libsegvault.a -lm -pthread
 
 TEST_GRID_SRCS = tests/test_grid_edit.c src/widgets/grid_edit.c $(ENGINE_SRCS)
 
 # modifica dei dati nella griglia: SQL generato ed eseguito sul motore
-test_grid_edit: $(TEST_GRID_SRCS) src/widgets/grid_edit.h
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_grid_edit $(TEST_GRID_SRCS) -lm -pthread
+test_grid_edit: $(TEST_GRID_SRCS) src/widgets/grid_edit.h libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_grid_edit $(filter-out $(ENGINE_SRCS),$(TEST_GRID_SRCS)) libsegvault.a -lm -pthread
 
 TEST_SERVER_SRCS = tests/test_server.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c src/server/mail.c src/server/rewrite.c src/server/cgi.c src/server/tls.c src/server/h2.c src/widgets/png_write.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
 # il server HTTP: richieste reali su un socket locale
-test_server: $(TEST_SERVER_SRCS) src/server/server.h src/server/json.h
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_server $(TEST_SERVER_SRCS) -lm -pthread -ldl
+test_server: $(TEST_SERVER_SRCS) src/server/server.h src/server/json.h libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_server $(filter-out $(ENGINE_SRCS),$(TEST_SERVER_SRCS)) libsegvault.a -lm -pthread -ldl
 
 TEST_WEB_SRCS = tests/test_web.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c src/server/mail.c src/server/rewrite.c src/server/cgi.c src/server/tls.c src/server/h2.c src/widgets/png_write.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
 # siti per nome, cruscotto, elenco dei file, reverse proxy (anche WebSocket)
-test_web: $(TEST_WEB_SRCS) src/server/server.h src/server/proxy.h
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_web $(TEST_WEB_SRCS) -lm -pthread -ldl
+test_web: $(TEST_WEB_SRCS) src/server/server.h src/server/proxy.h libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_web $(filter-out $(ENGINE_SRCS),$(TEST_WEB_SRCS)) libsegvault.a -lm -pthread -ldl
 
 TEST_MAIL_SRCS = tests/test_mail.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c src/server/mail.c src/server/rewrite.c src/server/cgi.c src/server/tls.c src/server/h2.c src/widgets/png_write.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
 # cattura delle email: SMTP, MIME, pagine e API, sendmail, mail() di PHP
-test_mail: $(TEST_MAIL_SRCS) src/server/server.h src/server/mail.h
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_mail $(TEST_MAIL_SRCS) -lm -pthread -ldl
+test_mail: $(TEST_MAIL_SRCS) src/server/server.h src/server/mail.h libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_mail $(filter-out $(ENGINE_SRCS),$(TEST_MAIL_SRCS)) libsegvault.a -lm -pthread -ldl
 
 TEST_TLS_SRCS = tests/test_tls.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c src/server/mail.c src/server/rewrite.c src/server/cgi.c src/server/tls.c src/server/h2.c src/widgets/png_write.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
 # HTTPS e HTTP/2 (client: curl; saltato senza curl o OpenSSL)
-test_tls: $(TEST_TLS_SRCS) src/server/server.h src/server/tls.h src/server/h2.h
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_tls $(TEST_TLS_SRCS) -lm -pthread -ldl
+test_tls: $(TEST_TLS_SRCS) src/server/server.h src/server/tls.h src/server/h2.h libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_tls $(filter-out $(ENGINE_SRCS),$(TEST_TLS_SRCS)) libsegvault.a -lm -pthread -ldl
 
 TEST_PHP_SRCS = tests/test_php.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c src/server/mail.c src/server/rewrite.c src/server/cgi.c src/server/tls.c src/server/h2.c src/widgets/png_write.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
 # PHP via FastCGI: il test fa anche da php-cgi finto (e prova quello vero se è installato)
-test_php: $(TEST_PHP_SRCS) src/server/server.h src/server/fastcgi.h src/server/json.h
-	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_php $(TEST_PHP_SRCS) -lm -pthread -ldl
+test_php: $(TEST_PHP_SRCS) src/server/server.h src/server/fastcgi.h src/server/json.h libsegvault.a
+	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_php $(filter-out $(ENGINE_SRCS),$(TEST_PHP_SRCS)) libsegvault.a -lm -pthread -ldl
 
 # gli script di examples/ eseguiti come nell'editor
-test_examples: $(EXAMPLES_TEST_SRCS) $(wildcard examples/*.sql)
-	$(CC) $(CFLAGS) -I. $(INCLUDES) -o test_examples $(EXAMPLES_TEST_SRCS) -lm -pthread
+test_examples: $(EXAMPLES_TEST_SRCS) $(wildcard examples/*.sql) libsegvault.a
+	$(CC) $(CFLAGS) -I. $(INCLUDES) -o test_examples $(filter-out $(ENGINE_SRCS),$(EXAMPLES_TEST_SRCS)) libsegvault.a -lm -pthread
 
 # compatibilità con il dialetto di MySQL (applicazioni PHP: WordPress, Laravel, ...)
-test_mysql: tests/test_mysql.c $(ENGINE_SRCS)
-	$(CC) $(CFLAGS) -I. $(INCLUDES) -o test_mysql tests/test_mysql.c $(ENGINE_SRCS) -lm -pthread
+test_mysql: tests/test_mysql.c libsegvault.a
+	$(CC) $(CFLAGS) -I. $(INCLUDES) -o test_mysql tests/test_mysql.c libsegvault.a -lm -pthread
 
-test_sql: $(SQL_TEST_SRCS)
-	$(CC) $(CFLAGS) -I. $(INCLUDES) -o test_sql $(SQL_TEST_SRCS) -lm -pthread
+test_sql: $(SQL_TEST_SRCS) libsegvault.a
+	$(CC) $(CFLAGS) -I. $(INCLUDES) -o test_sql $(filter-out $(ENGINE_SRCS),$(SQL_TEST_SRCS)) libsegvault.a -lm -pthread
 
 test_btree: $(BTREE_TEST_SRCS)
 	$(CC) $(CFLAGS) -I. $(INCLUDES) -o test_btree $(BTREE_TEST_SRCS) -lm
@@ -320,11 +350,11 @@ test-asan: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
 		-I. $(BASE_INCLUDES) -o test_export_asan $(TEST_EXP_SRCS) -lm -pthread
 	ASAN_OPTIONS=detect_leaks=1 ./test_export_asan
 
-test_engine: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
-	$(CC) $(CFLAGS) $(INCLUDES) -o test_engine test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c -lm -pthread
+test_engine: test_engine.c src/widgets/csv_import.c libsegvault.a
+	$(CC) $(CFLAGS) $(INCLUDES) -o test_engine test_engine.c src/widgets/csv_import.c libsegvault.a -lm -pthread
 
 %.o: %.c
-	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(CFLAGS) $(HARDEN_CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 
 # ── Cross-compilazione Windows da Linux (MinGW-w64) ──
 #   make windows  ->  segvault.exe (statico: basta copiarlo con la cartella assets/)
@@ -345,7 +375,7 @@ build-win/%.o: %.c
 
 clean:
 	$(RM) $(FULL_OBJS) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql test_examples test_examples_asan
-	$(RM) segvault-server segvault-server.exe libsegvault.a test_server test_server_asan test_web test_mail test_tls test_mysql test_php test_php_asan test_php_tsan test_grid_edit test_grid_edit_asan test_table_design test_table_design_asan test_schema_model test_schema_model_asan test_db_tools test_db_tools_asan test_png test_png_asan test_auth test_auth_asan test_sessions test_sessions_asan test_parallel test_parallel_asan test_parallel_tsan test_mysql_import test_mysql_import_asan test_overflow test_overflow_asan test_backup test_backup_asan test_export test_export_asan
+	$(RM) segvault-server segvault-server.exe libsegvault.a test_server test_server_asan test_web test_mail test_tls test_mysql test_php test_php_asan test_php_tsan test_grid_edit test_grid_edit_asan test_table_design test_table_design_asan test_schema_model test_schema_model_asan test_db_tools test_db_tools_asan test_png test_png_asan test_auth test_auth_asan test_sessions test_sessions_asan test_parallel test_parallel_asan test_parallel_tsan test_sessions_tsan test_mysql_import test_mysql_import_asan test_overflow test_overflow_asan test_backup test_backup_asan test_export test_export_asan test_durability test_h2 test_win.exe fuzz_sv
 	$(RM) -r obj build-win build-server build-dist
 
 -include $(FULL_OBJS:.o=.d) $(WIN_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(WIN_SERVER_OBJS:.o=.d)

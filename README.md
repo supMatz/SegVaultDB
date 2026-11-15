@@ -8,6 +8,9 @@
 
 ---
 
+> 🇬🇧 English: [README.en.md](README.en.md) · formats and limits: [docs/FORMATS.md](docs/FORMATS.md) ·
+> security model: [SECURITY.md](SECURITY.md) · changes: [CHANGELOG.md](CHANGELOG.md)
+
 ## 📋 Indice
 
 - [Panoramica](#panoramica)
@@ -49,7 +52,7 @@ transazioni, trigger).
 | Caratteristica | Dettagli |
 |---|---|
 | **Linguaggio** | C11, zero dipendenze per il motore e per il server |
-| **Versione** | 1.2.0 |
+| **Versione** | 1.3.0 |
 | **Server di sviluppo** | Web + **PHP** (FastCGI, senza configurazione), un sito per cartella su `NOME.localhost`, **HTTPS + HTTP/2** con una CA locale, **reverse proxy** con WebSocket (Vite, Next.js, Django, Rails), `.htaccess` (`mod_rewrite`), **CGI** (Perl, Python, Ruby), **cattura delle email** (SMTP + pagina web + API), cruscotto, servizi accesi e spenti uno per uno, icona nell'area di notifica, servizio all'avvio |
 | **App desktop** | Win32 / GDI (Windows) · Xlib/X11 + Xft (Linux); all'avvio si sceglie **editor SQL** o **server API** |
 | **Server API** | `segvault-server` (o il pannello dell'app): HTTP/JSON, parametri `?` contro la SQL injection, sessioni con transazioni su più richieste, utenti e permessi (`GRANT`), token, CORS, limite di tempo, registro e monitor delle richieste, audit, backup pianificati; anche il **protocollo di rete MySQL** (PHP, Python, Java senza modifiche) |
@@ -57,7 +60,7 @@ transazioni, trigger).
 | **SQL** | Lexer e parser a discesa ricorsiva scritti a mano; subquery anche correlate, `UNION` / `INTERSECT` / `EXCEPT`, `WITH [RECURSIVE]`, funzioni finestra con frame, `FULL` / `NATURAL` / `USING` join, `CASE`, viste, vincoli, trigger, `ALTER TABLE ... COLUMN` |
 | **Vincoli** | `PRIMARY KEY` (anche composta), `UNIQUE`, `NOT NULL`, `CHECK`, `FOREIGN KEY` con `ON DELETE` / `ON UPDATE` `CASCADE`, `SET NULL`, `SET DEFAULT`, `RESTRICT` |
 | **Storage** | Heap file a pagine da 4 KB con slot directory e free-space map; indici in memoria (anche su più colonne): tabella hash per le uguaglianze, chiavi ordinate per gli intervalli |
-| **Buffer pool** | 1024 frame, tabella hash per la ricerca, sostituzione **CLOCK**; statistiche con `SHOW STATUS` |
+| **Buffer pool** | 1/8 della RAM (4-512 MB, `--cache-size` / `SET GLOBAL cache_size`), tabella hash per la ricerca, sostituzione **CLOCK**; statistiche con `SHOW STATUS` |
 | **Ottimizzatore** | Pushdown delle selezioni, hash join (anche per `FROM a, b WHERE a.x = b.y`), accesso con indice per uguaglianza o per intervallo (scelto solo se conviene), subquery decorrelate per chiave; `EXPLAIN` con stime alla System R e `EXPLAIN ANALYZE` con le righe reali |
 | **Transazioni** | Write-Ahead Log con undo/redo, `BEGIN` (o `START TRANSACTION`) / `COMMIT` / `ROLLBACK`, `SAVEPOINT` (`ROLLBACK TO [SAVEPOINT]`), recovery dopo un crash (anche con più transazioni aperte), `CHECKPOINT` (anche automatico) |
 | **Concorrenza** | Più transazioni aperte insieme (sessioni HTTP, connessioni MySQL, editor): lock di tabella S / X a due fasi, deadlock riconosciuti (errore MySQL 1213), timeout (1205); **le letture non aspettano mai le scritture** (MVCC: versione confermata) |
@@ -71,7 +74,7 @@ transazioni, trigger).
 ## Download
 
 **Pacchetto completo** (eseguibili, script di avvio, sito d'esempio, README; su Windows `get-php.cmd`
-scarica PHP): `SegVault-1.2.0-windows-x86_64.zip` e `SegVault-1.2.0-linux-x86_64.tar.gz` nelle
+scarica PHP): `SegVault-1.3.0-windows-x86_64.zip` e `SegVault-1.3.0-linux-x86_64.tar.gz` nelle
 [release](https://github.com/supMatz/SegVaultDB/releases). Oppure **un solo file**, senza
 installazione (i font sono dentro l'eseguibile):
 
@@ -278,7 +281,7 @@ lo ferma e torna all'editor.
 ┌──────────────────────────────────────────────────────────────────────┐
 │ File  Edit  View  Query  Import  Export  Settings  Help   untitled.sql│
 ├──────────────────────────────────────────────────────────────────────┤
-│ ◆ SegVault v1.2.0 [▶ Run F5] [Run statement] │ [Commit] [Rollback] │ [Format]   ● Sky  ▤ db │
+│ ◆ SegVault v1.3.0 [▶ Run F5] [Run statement] │ [Commit] [Rollback] │ [Format]   ● Sky  ▤ db │
 ├────────────┬─────────────────────────────────────────────────────────┤
 │ EXPLORER ⟳ │  editor SQL (numeri di riga, highlighting, completamento)│
 │  ▸ uni     │                                                         │
@@ -286,7 +289,7 @@ lo ferma e torna all'editor.
 │            │  RESULTS ● Query OK            filtro    12 rows  History│
 │            │  griglia dei risultati (schede se più SELECT)           │
 ├────────────┴─────────────────────────────────────────────────────────┤
-│ ● SegVault engine 1.2.0  ▤ uni  script.sql         Ln 3, Col 7  F1 Shortcuts│
+│ ● SegVault engine 1.3.0  ▤ uni  script.sql         Ln 3, Col 7  F1 Shortcuts│
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -471,7 +474,7 @@ delle richieste al posto dei risultati.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ ◆ SegVault v1.2.0 [■ Stop server F5] [Copy address]  ● Running · port 8484 [Open SQL editor]│
+│ ◆ SegVault v1.3.0 [■ Stop server F5] [Copy address]  ● Running · port 8484 [Open SQL editor]│
 ├────────────────┬─────────────────────────────────────────────────────┤
 │ SERVER         │ REQUESTS ● 4 requests · up 1m   All Web PHP API MySQL Mail │
 │ ADDRESS        │ time     service client    method path / query     status ms │
@@ -490,7 +493,7 @@ delle richieste al posto dei risultati.
 │ START WITH THE COMPUTER                                              │
 │ TRY IT  curl … │                                                     │
 ├────────────────┴─────────────────────────────────────────────────────┤
-│ ● SegVault engine 1.2.0  API server running  this computer only    F5 Start / Stop│
+│ ● SegVault engine 1.3.0  API server running  this computer only    F5 Start / Stop│
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -940,9 +943,10 @@ curl -s http://127.0.0.1:8484/api/v1/query -H 'Content-Type: application/json' -
 
 ```sql
 CREATE TABLE api_endpoints (name VARCHAR(60) PRIMARY KEY, sql TEXT NOT NULL,
-                            access VARCHAR(10) NOT NULL DEFAULT 'token', description VARCHAR(200));
-INSERT INTO api_endpoints VALUES
-  ('prodotti_economici', 'SELECT id, nome, prezzo FROM prodotto WHERE prezzo < :max ORDER BY prezzo', 'public', NULL);
+                            access VARCHAR(10) NOT NULL DEFAULT 'token', description VARCHAR(200),
+                            definer VARCHAR(64));   -- chi l'ha salvato: lo scrive SegVault
+INSERT INTO api_endpoints (name, sql, access) VALUES
+  ('prodotti_economici', 'SELECT id, nome, prezzo FROM prodotto WHERE prezzo < :max ORDER BY prezzo', 'public');
 ```
 
 ```js
@@ -953,7 +957,8 @@ const { results } = await r.json();          // results[0].rows = [{ id, nome, p
 
 I parametri `:nome` vengono dalla query string o da un JSON nel corpo (`POST`) e sono legati in modo
 sicuro; lo script è atomico; `public` = chiamabile senza token da qualsiasi sito, `token` = come il
-resto dell'API. Dettagli in [`docs/API.md`](docs/API.md#endpoint-salvati-unapi-senza-scrivere-backend).
+resto dell'API; con gli utenti un endpoint ha i permessi di chi l'ha salvato (`definer`) e `public`
+vale solo se l'ha salvato un amministratore. Dettagli in [`docs/API.md`](docs/API.md#endpoint-salvati-unapi-senza-scrivere-backend).
 Gli endpoint si creano e modificano con l'SQL o direttamente nella griglia dell'app.
 
 Regole da ricordare, valide per tutti i linguaggi:
@@ -1361,6 +1366,19 @@ make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitize
 | `test_server` (115) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici, utenti e permessi, audit, protocollo MySQL (login, permessi, errori, più istruzioni, transazioni) |
 | `test_export` (9) | Export XLSX (zip con CRC giusti, parti XML complete, numeri, testo con caratteri speciali, NULL) e PDF (xref, pagine, testo WinAnsi) |
 | `test_backup` (29) | `BACKUP TO`, apertura della copia, ripristino sui dati in uso (con i dati precedenti conservati), righe grandi, viste, procedure e utenti |
+| `test_durability` | Guasti iniettati (`write`, `pwrite`, `fsync`, `pread` che falliscono o fermano il processo): `COMMIT` con fsync fallito, log pieno, arresto a ogni scrittura di un `ROLLBACK` e del recupero, recupero di un log grande con poca memoria, pagine danneggiate, catalogo e utenti troncati, `synchronous` |
+| `test_h2` | HTTP/2 a livello di frame: intestazioni malformate, *rapid reset*, PING a raffica |
+
+**Quando una conferma è su disco** (`SET GLOBAL synchronous = ...`, o `--synchronous` del server):
+
+| Modalità | `COMMIT` esplicito | Statement in autocommit | Dopo un crash del processo | Dopo una caduta di corrente |
+|---|---|---|---|---|
+| `FULL` | fsync prima di rispondere | fsync prima di rispondere | niente perso | niente perso |
+| `NORMAL` (predefinita) | fsync prima di rispondere | fsync entro 100 ms | niente perso | si possono perdere gli ultimi 100 ms di autocommit |
+| `OFF` | nessun fsync | nessun fsync | niente perso | si perde quanto non ancora scritto da un checkpoint |
+
+Un errore di disco (disco pieno, `fsync` fallito) non viene mai confermato: lo statement riceve l'errore e il motore
+smette di accettare modifiche fino al riavvio, quando il recupero riporta l'ultimo stato confermato.
 
 La CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) compila su Ubuntu con `-D_FORTIFY_SOURCE=2` e fallisce a qualunque warning, esegue `make test` e `make test-asan`, e compila per Windows con MinGW-w64. Durante lo sviluppo il motore è stato anche verificato con un fuzzer di SQL mutato e uno di richieste HTTP malformate (sotto ASan), con un confronto dei risultati contro SQLite su centinaia di migliaia di query e modifiche casuali, e con arresti forzati (`kill -9`) durante scritture concorrenti senza perdere nessuna scrittura confermata.
 
@@ -1457,7 +1475,7 @@ SegVaultDB/
 
 | Costante | Valore | Significato |
 |---|---|---|
-| `SV_VERSION_STR` | `"1.2.0"` | Versione |
+| `SV_VERSION_STR` | `"1.3.0"` | Versione |
 | `SV_PAGE_SIZE` | `4096` | Dimensione di una pagina su disco |
 | `SV_BUFFER_POOL_CAP` | `1024` | Pagine nel buffer pool |
 | `SV_MAX_DATABASES` | `64` | Database |
@@ -1591,6 +1609,14 @@ handler, `OUT` / `INOUT`), `@variabili` e operatori di MySQL, `PREPARE` / `EXECU
 `JSON_TABLE` con `NESTED PATH`, `GENERATE_SERIES`, `ROLLUP` / `CUBE` / `GROUPING SETS`, query su più database,
 frame `RANGE` per valore, `RETURNING`, `ON CONFLICT`, `MERGE`, colonne calcolate, sequenze, `ALTER TABLE` con
 più operazioni, molte nuove funzioni (aggregati statistici, finestra, JSON, testo, date).
+
+Fatto nella 1.3 (correzioni dell'audit del codice, dettagli in [TODO.md](TODO.md)): permessi controllati su
+ogni tabella letta o scritta (CTE, subquery in `SET`, `RETURNING`, `JOIN` di `UPDATE` / `DELETE`, trigger,
+viste, `information_schema`), endpoint salvati con i permessi di chi li ha salvati, `ROLLBACK` e recupero
+che si possono interrompere senza perdere o duplicare righe, errori di disco riportati (mai un `COMMIT` "OK"
+non salvato), pagine danneggiate e cataloghi illeggibili rifiutati invece di dare risultati parziali o un
+database vuoto, letture parallele senza race, file dei dati del solo proprietario, PHP su socket privato,
+HTTP/2 e richieste HTTP più robusti.
 
 Prossimi passi:
 

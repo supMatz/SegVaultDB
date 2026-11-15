@@ -31,6 +31,7 @@ int  lk_acquire(const void* owner, const LkReq* req, int n);
 bool lk_try(const void* owner, const LkReq* req, int n);
 void lk_cancel_wait(const void* owner);   // non aspetta più
 void lk_release_all(const void* owner);
+void lk_reset(void);                       // arresto del motore: nessun lock resta (di nessuna sessione)
 int  lk_count(const void* owner);         // lock tenuti (diagnostica, test)
 // proprietario che tiene un lock in conflitto con req (per i messaggi), NULL se nessuno
 const void* lk_blocker(const void* owner, const LkReq* req, int n);

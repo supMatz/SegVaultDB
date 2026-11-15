@@ -37,6 +37,8 @@ void ov_mark_bp(BufferPool* bp, const uint8_t* stub, size_t stub_len, uint8_t* b
 
 // per il WAL: inserisce la riga nella pagina (con uno stub se è grande); slot o < 0
 int  ov_slot_put(int db_fd, void* page, const uint8_t* data, size_t n);
+// per il WAL: rimette la riga nello slot eliminato slot (con uno stub se è grande); risultato di page_revive_slot
+int  ov_slot_revive(int db_fd, void* page, uint16_t slot, const uint8_t* data, size_t n);
 // il contenuto dello slot (anche uno stub) è proprio data?
 bool ov_slot_equals(int db_fd, const uint8_t* cur, size_t cur_len, const uint8_t* data, size_t n);
 

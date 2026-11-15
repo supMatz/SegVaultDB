@@ -1,6 +1,7 @@
 // Test del server HTTP/JSON: richieste reali su socket locali.
 //   make test_server && ./test_server
 #include "src/server/server.h"
+#include "src/server/mysql_wire.h"
 #include "src/server/json.h"
 #include "src/bridge/db_api.h"
 #include "src/bridge/auth.h"
@@ -13,6 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -33,7 +36,7 @@ static int connect_to(int port) {
 }
 
 // ── client MySQL minimo (protocollo 4.1, mysql_native_password) ──
-typedef struct { int fd; uint8_t seq; } My;
+typedef struct { int fd; uint8_t seq; uint8_t scr[20]; } My;
 
 static bool my_rd(My* m, uint8_t** out, size_t* n) {
     uint8_t h[4];
@@ -65,6 +68,7 @@ static bool my_connect(My* m, int port, const char* user, const char* pw, const 
     memcpy(scr, p + pos, 8);
     pos += 8 + 1 + 2 + 1 + 2 + 2 + 1 + 10;
     memcpy(scr + 8, p + pos, 12);
+    memcpy(m->scr, scr, 20);
     free(p);
     uint8_t a[20], b[20], buf[40], x[20], tokn[20];
     auth_sha1(pw, strlen(pw), a);
@@ -88,6 +92,30 @@ static bool my_connect(My* m, int port, const char* user, const char* pw, const 
     if (!ok && p[0] == 0xff && n > 9) snprintf(err, en, "%u %s", (unsigned)(p[1] | p[2] << 8), (char*)p + 9);
     free(p);
     return ok;
+}
+
+// COM_CHANGE_USER: "OK" o "ERR:codice"
+static void my_change_user(My* m, const char* user, const char* pw, const char* db, char* out, size_t on) {
+    uint8_t a[20], b[20], buf[40], x[20], tokn[20];
+    auth_sha1(pw, strlen(pw), a);
+    auth_sha1(a, 20, b);
+    memcpy(buf, m->scr, 20); memcpy(buf + 20, b, 20);
+    auth_sha1(buf, 40, x);
+    for (int i = 0; i < 20; i++) tokn[i] = a[i] ^ x[i];
+    uint8_t q[300];
+    size_t k = 0;
+    q[k++] = 0x11;
+    memcpy(q + k, user, strlen(user) + 1); k += strlen(user) + 1;
+    q[k++] = 20; memcpy(q + k, tokn, 20); k += 20;
+    memcpy(q + k, db, strlen(db) + 1); k += strlen(db) + 1;
+    q[k++] = 45; q[k++] = 0;
+    memcpy(q + k, "mysql_native_password", 22); k += 22;
+    m->seq = 0;
+    uint8_t* p; size_t n;
+    if (!my_wr(m, q, k) || !my_rd(m, &p, &n)) { snprintf(out, on, "io"); return; }
+    if (p[0] == 0) snprintf(out, on, "OK");
+    else snprintf(out, on, "ERR:%u", (unsigned)(p[1] | p[2] << 8));
+    free(p);
 }
 
 static uint64_t my_lenenc(const uint8_t* p, size_t* pos) {
@@ -167,6 +195,28 @@ static uint32_t my_prepare(My* m, const char* sql, int* np, int* nc, char* out, 
     int skip = (*np ? *np + 1 : 0) + (*nc ? *nc + 1 : 0);   // definizioni + EOF
     for (int i = 0; i < skip; i++) { if (!my_rd(m, &p, &n)) return 0; free(p); }
     return id;
+}
+
+// EXECUTE con un solo parametro di byte arbitrari (anche 0x00): solo l'esito OK / ERR
+static void my_execute_bytes(My* m, uint32_t id, const uint8_t* v, size_t vl, char* out, size_t on) {
+    uint8_t q[1024];
+    size_t k = 0;
+    q[k++] = 0x17;
+    for (int i = 0; i < 4; i++) q[k++] = (uint8_t)(id >> (8 * i));
+    q[k++] = 0;
+    q[k++] = 1; q[k++] = 0; q[k++] = 0; q[k++] = 0;
+    q[k++] = 0;                                            // bitmap dei NULL
+    q[k++] = 1;
+    q[k++] = 0xfc; q[k++] = 0;                             // tipo BLOB
+    q[k++] = 0xfc; q[k++] = (uint8_t)vl; q[k++] = (uint8_t)(vl >> 8);
+    memcpy(q + k, v, vl);
+    k += vl;
+    m->seq = 0;
+    uint8_t* p; size_t n;
+    if (!my_wr(m, q, k) || !my_rd(m, &p, &n)) { snprintf(out, on, "io"); return; }
+    if (p[0] == 0) snprintf(out, on, "OK");
+    else snprintf(out, on, "ERR:%u %s", (unsigned)(p[1] | p[2] << 8), (char*)p + 9);
+    free(p);
 }
 
 // EXECUTE con parametri di testo (NULL = valore NULL) o un intero (vals[i] che inizia con '#');
@@ -357,7 +407,39 @@ static void* writer(void* arg) {
 typedef struct { My* m; const char* sql; char out[512]; } CcArg;
 static void* cc_thread(void* p) { CcArg* a = p; char o[512]; my_query(a->m, a->sql, o, sizeof(o)); snprintf(a->out, sizeof(a->out), "%s", o); return NULL; }
 
+// P2.8: pacchetti MySQL di 16 MB e più spezzati (0xFFFFFF + resto, sequenze consecutive)
+static void check_packet_split(void) {
+    size_t sizes[] = { 100, 0xFFFFFE, 0xFFFFFF, 0xFFFFFF + 10, 2 * 0xFFFFFF, 2 * 0xFFFFFF + 3 };
+    for (size_t t = 0; t < sizeof(sizes) / sizeof(sizes[0]); t++) {
+        size_t len = sizes[t];
+        MwOut o = {0};
+        o.seq = 5;
+        uint8_t* payload = malloc(len);
+        for (size_t i = 0; i < len; i++) payload[i] = (uint8_t)(i * 7 + i / 251);
+        mw_begin(&o);
+        mw_bytes(&o, payload, len);
+        mw_end(&o);
+        // ricomposizione come un client
+        size_t pos = 0, got = 0;
+        uint8_t seq = 5;
+        bool ok = !o.oom;
+        for (;;) {
+            if (pos + 4 > o.n) { ok = false; break; }
+            size_t pl = o.p[pos] | (size_t)o.p[pos + 1] << 8 | (size_t)o.p[pos + 2] << 16;
+            if (o.p[pos + 3] != seq++) ok = false;
+            if (pos + 4 + pl > o.n || memcmp(o.p + pos + 4, payload + got, pl)) { ok = false; break; }
+            got += pl;
+            pos += 4 + pl;
+            if (pl < 0xFFFFFF) break;                         // l'ultimo pacchetto è più corto
+        }
+        CHECK(ok && got == len && pos == o.n && o.seq == seq, "packet of %zu bytes split and reassembled", len);
+        free(payload);
+        free(o.p);
+    }
+}
+
 int main(void) {
+    check_packet_split();
     signal(SIGPIPE, SIG_IGN);
     char dir[] = "/tmp/svserverXXXXXX";
     if (!mkdtemp(dir)) return 1;
@@ -426,9 +508,15 @@ int main(void) {
     c = cell_at(&r, 0, 0, 0);
     CHECK(resp_ok(&r) && c && c->number == 0, "injection is a plain string: %s", r.body);
     resp_free(&r);
-    {
+    {   // la voce si scrive dopo la risposta: si aspetta che arrivi (sotto carico può tardare un attimo)
         SvLogEntry last;
-        CHECK(sv_server_recent(s, &last, 1) == 1 && strstr(last.detail, "nome = ?") && !strstr(last.detail, "DROP"),
+        int got = 0;
+        for (int w = 0; w < 200; w++) {
+            got = sv_server_recent(s, &last, 1);
+            if (got == 1 && strstr(last.detail, "nome = ?")) break;
+            usleep(5000);
+        }
+        CHECK(got == 1 && strstr(last.detail, "nome = ?") && !strstr(last.detail, "DROP"),
               "log shows the SQL with '?', not the parameter values: %s", last.detail);
     }
     r = query(port, "{\"database\":\"t\",\"sql\":\"SELECT '?' -- ?\\n, id - ? /* ? */ FROM p WHERE id = 1\",\"params\":[-5]}");
@@ -508,6 +596,23 @@ int main(void) {
         const JsonVal* li2 = rs1 && rs1->count == 3 ? json_get(&rs1->items[2], "last_insert_id") : NULL;
         CHECK(li1 && li1->number == 2 && li2 && li2->number == 3, "last_insert_id: %s", r.body);
     }
+    resp_free(&r);
+    // P0.8: byte 0x00 attraverso l'API HTTP (parametro "\u0000" e risultato "\u0000")
+    r = query(port, "{\"database\":\"t\",\"sql\":\"CREATE TABLE binh (id INT PRIMARY KEY, b BLOB); "
+                    "INSERT INTO binh VALUES (1, ?); SELECT LENGTH(b), HEX(b), b FROM binh\",\"params\":[\"a\\u0000b\\u0000\"]}");
+    {
+        const JsonVal* rs1 = json_get(r.json, "results");
+        const JsonVal* rows = rs1 && rs1->count == 3 ? json_get(&rs1->items[2], "rows") : NULL;
+        const JsonVal* row = rows && rows->count == 1 ? &rows->items[0] : NULL;
+        const JsonVal* bl = row && row->type == JSON_ARRAY && row->count == 3 ? &row->items[2] : NULL;
+        CHECK(resp_ok(&r) && strstr(r.body, "[4,\"61006200\",\"a\\u0000b\\u0000\"]") && bl && bl->type == JSON_STRING && bl->len == 4 &&
+              !memcmp(bl->str, "a\0b\0", 4), "NUL bytes through the HTTP API: %s", r.body);
+    }
+    resp_free(&r);
+    // P2.12: id oltre 2^31 restituito intero (prima: troncato a 32 bit, o assente)
+    r = query(port, "{\"database\":\"t\",\"sql\":\"CREATE TABLE gen64 (id BIGINT PRIMARY KEY AUTO_INCREMENT, v INT) AUTO_INCREMENT = 3000000000; "
+                    "INSERT INTO gen64 (v) VALUES (1)\"}");
+    CHECK(resp_ok(&r) && strstr(r.body, "\"last_insert_id\":3000000000"), "64-bit last_insert_id: %s", r.body);
     resp_free(&r);
     r = request(port, "GET", "/api/v1/databases/t/tables/gen", NULL, NULL);
     CHECK(r.body && strstr(r.body, "\"default\":\"7\""), "column default: %s", r.body);
@@ -718,9 +823,9 @@ int main(void) {
         int n = sv_server_recent(s, log, 3);
         CHECK(n == 3 && !strcmp(log[0].path, "/api/v1/status") && strstr(log[1].detail, "SELECT COUNT(*) FROM p")
               && !strcmp(log[0].client, "127.0.0.1") && log[0].seq == log[1].seq + 1, "recent log: %d %s %s", n, log[0].path, log[1].detail);
-        SvStats st;
-        sv_server_stats(s, &st);
-        CHECK(st.requests >= 30 && st.errors >= 10 && st.rows_sent > 0, "stats: %lld %lld %lld", st.requests, st.errors, st.rows_sent);
+        SvStats svst;
+        sv_server_stats(s, &svst);
+        CHECK(svst.requests >= 30 && svst.errors >= 10 && svst.rows_sent > 0, "stats: %lld %lld %lld", svst.requests, svst.errors, svst.rows_sent);
     }
 
     // ── token e database di default (secondo server) ──
@@ -799,9 +904,9 @@ int main(void) {
         // il database resta impostato nella sessione; chiusa con una transazione aperta = rollback
         r = request(port2, "POST", "/api/v1/query", hdr, "{\"sql\":\"BEGIN; DELETE FROM conc\"}");
         resp_free(&r);
-        char path[128];
-        snprintf(path, sizeof(path), "/api/v1/sessions/%s", id);
-        r = request(port2, "DELETE", path, "Authorization: Bearer s3cret\r\n", NULL);
+        char epath[128];
+        snprintf(epath, sizeof(epath), "/api/v1/sessions/%s", id);
+        r = request(port2, "DELETE", epath, "Authorization: Bearer s3cret\r\n", NULL);
         CHECK(r.status == 200, "delete session: %d %s", r.status, r.body);
         resp_free(&r);
         r = request(port2, "POST", "/api/v1/query", "Content-Type: application/json\r\nAuthorization: Bearer s3cret\r\n",
@@ -873,6 +978,56 @@ int main(void) {
         r = request(port3, "POST", "/api/v1/query", hdr, "{\"sql\":\"SELECT COUNT(*) FROM conc\"}");
         CHECK(resp_ok(&r), "token = full access: %s", r.body);
         resp_free(&r);
+        // P2.6: una password cambiata non vale più subito, anche con il login in cache
+        q = db_execute("ALTER USER boss IDENTIFIED BY 'boss-new-pass'"); db_result_free(q);
+        snprintf(hdr, sizeof(hdr), "%sAuthorization: Basic Ym9zczpib3NzLXBhc3M=\r\n", J);
+        r = request(port3, "POST", "/api/v1/query", hdr, "{\"sql\":\"SELECT 1\"}");
+        CHECK(r.status == 401, "old password refused right after ALTER USER (cached login dropped): %d %s", r.status, r.body);
+        resp_free(&r);
+        q = db_execute("ALTER USER boss IDENTIFIED BY 'boss-pass'"); db_result_free(q);
+        // P2.7: nel registro di audit niente password e niente byte di controllo
+        snprintf(hdr, sizeof(hdr), "%sAuthorization: Bearer tok3\r\n", J);
+        r = request(port3, "POST", "/api/v1/query", hdr,
+                    "{\"sql\":\"CREATE USER zed IDENTIFIED BY 'zed-s3cret''pw'; DROP USER zed; INSERT INTO p (id, nome) VALUES (77, 'a\\u001b[2Jb'); DELETE FROM p WHERE id = 77\"}");
+        CHECK(resp_ok(&r), "statements for the audit check: %s", r.body);
+        resp_free(&r);
+        // P0.2: un endpoint gira con i permessi di chi l'ha salvato (definer, scritto dal motore), mai come root
+        q = db_execute("CREATE USER eva IDENTIFIED BY 'eva-pass'"); db_result_free(q);
+        q = db_execute("GRANT ALL ON t2.* TO eva"); db_result_free(q);
+        snprintf(hdr, sizeof(hdr), "%sAuthorization: Basic ZXZhOmV2YS1wYXNz\r\n", J);
+        r = request(port3, "POST", "/api/v1/query", hdr,
+                    "{\"database\":\"t2\",\"sql\":\"CREATE TABLE api_endpoints (name VARCHAR(60) PRIMARY KEY, sql TEXT NOT NULL, "
+                    "access VARCHAR(10) NOT NULL DEFAULT 'token', description VARCHAR(200), definer VARCHAR(64)); "
+                    "INSERT INTO api_endpoints VALUES ('spia', 'SELECT COUNT(*) FROM t.conc', 'public', '', 'boss')\"}");
+        CHECK(resp_ok(&r), "eva saves an endpoint: %s", r.body);
+        resp_free(&r);
+        q = db_execute("SELECT definer FROM t2.api_endpoints");
+        CHECK(q && q->success && q->num_rows == 1 && !strcmp(q->rows[0].cells[0].value, "eva"), "definer written by the engine: %s",
+              q && q->success && q->num_rows ? q->rows[0].cells[0].value : "?");
+        db_result_free(q);
+        r = request(port3, "GET", "/api/v1/endpoints/spia?database=t2", NULL, NULL);
+        CHECK(r.status == 401, "'public' saved by a non-administrator still needs a login: %d %s", r.status, r.body);
+        resp_free(&r);
+        r = request(port3, "GET", "/api/v1/endpoints/spia?database=t2", hdr, NULL);
+        CHECK(!resp_ok(&r) && strstr(r.body, "Access denied"), "endpoint runs with the definer's rights: %d %s", r.status, r.body);
+        resp_free(&r);
+        r = request(port3, "POST", "/api/v1/query", hdr, "{\"database\":\"t2\",\"sql\":\"ALTER TABLE api_endpoints ADD COLUMN x INT\"}");
+        CHECK(!resp_ok(&r) && strstr(r.body, "only administrators"), "structure of api_endpoints: admins only: %s", r.body);
+        resp_free(&r);
+        // tabella senza definer scrivibile da chi non è amministratore: l'endpoint è rifiutato
+        r = request(port3, "POST", "/api/v1/query", hdr,
+                    "{\"database\":\"t2\",\"sql\":\"DROP TABLE api_endpoints; CREATE TABLE api_endpoints (name VARCHAR(60) PRIMARY KEY, "
+                    "sql TEXT NOT NULL, access VARCHAR(10)); INSERT INTO api_endpoints VALUES ('spia', 'SELECT COUNT(*) FROM t.conc', 'public')\"}");
+        CHECK(resp_ok(&r), "legacy table: %s", r.body);
+        resp_free(&r);
+        r = request(port3, "GET", "/api/v1/endpoints/spia?database=t2", hdr, NULL);
+        CHECK(r.status == 403 && strstr(r.body, "no author"), "legacy endpoint writable by a non-administrator refused: %d %s", r.status, r.body);
+        resp_free(&r);
+        // la tabella di prima (t, scrivibile solo dagli amministratori): funziona come prima, anche pubblica
+        r = request(port3, "GET", "/api/v1/endpoints/economici?database=t&max=2", NULL, NULL);
+        CHECK(resp_ok(&r), "legacy endpoint of an admin-only table still works: %d %s", r.status, r.body);
+        resp_free(&r);
+        snprintf(hdr, sizeof(hdr), "%sAuthorization: Basic YW5uYTphbm5hLXBhc3M=\r\n", J);
         // utente eliminato: subito fuori, anche con il login in cache
         q = db_execute("DROP USER anna"); db_result_free(q);
         snprintf(hdr, sizeof(hdr), "%sAuthorization: Basic YW5uYTphbm5hLXBhc3M=\r\n", J);
@@ -887,7 +1042,10 @@ int main(void) {
         audit[an] = '\0';
         if (af) fclose(af);
         CHECK(strstr(audit, "127.0.0.1  anna  t  ERROR Access denied") && strstr(audit, "DELETE FROM p"), "audit: denied delete logged: %s", audit);
-        CHECK(!strstr(audit, "SELECT"), "audit: reads not logged: %s", audit);
+        CHECK(!strstr(audit, "  SELECT "), "audit: reads not logged: %s", audit);
+        CHECK(strstr(audit, "CREATE USER zed IDENTIFIED BY '***'") && !strstr(audit, "s3cret") && !strstr(audit, "''pw"),
+              "audit: password redacted: %s", audit);
+        CHECK(!strchr(audit, 0x1b) && strstr(audit, "a\\x1b[2Jb"), "audit: control bytes escaped");
         remove("/tmp/sv_audit_test.log");
     }
 
@@ -896,11 +1054,42 @@ int main(void) {
         QueryResult* q;
         q = db_execute("CREATE USER mia IDENTIFIED BY 'mia-pass'"); db_result_free(q);
         q = db_execute("GRANT SELECT, INSERT ON t.* TO mia"); db_result_free(q);
-        SvServerConfig cfg4 = { .port = 0, .token = "tok4", .quiet = true, .require_login = true, .mysql = true, .mysql_port = 0 };
+        SvServerConfig cfg4 = { .port = 0, .token = "tok4", .quiet = true, .require_login = true, .mysql = true, .mysql_port = 0,
+                                .mysql_socket = "/tmp/sv_test_mysql.sock" };
         SvServer* s4 = sv_server_start(&cfg4, err, sizeof(err));
         int mp = s4 ? sv_server_mysql_port(s4) : 0;
         pthread_t th4;
         if (s4) pthread_create(&th4, NULL, run_server, s4);
+        {   // P2.13: MySQL anche sul socket Unix (handshake del protocollo 10), e HTTP su [::1]
+            int uf = socket(AF_UNIX, SOCK_STREAM, 0);
+            struct sockaddr_un ua;
+            memset(&ua, 0, sizeof(ua));
+            ua.sun_family = AF_UNIX;
+            snprintf(ua.sun_path, sizeof(ua.sun_path), "/tmp/sv_test_mysql.sock");
+            uint8_t hs[64] = {0};
+            struct timeval tvu = { 3, 0 };
+            setsockopt(uf, SOL_SOCKET, SO_RCVTIMEO, &tvu, sizeof(tvu));
+            bool okc = uf >= 0 && connect(uf, (struct sockaddr*)&ua, sizeof(ua)) == 0;
+            ssize_t gn = okc ? recv(uf, hs, sizeof(hs), 0) : -1;
+            struct stat sst;
+            CHECK(okc && gn > 5 && hs[4] == 10 && stat("/tmp/sv_test_mysql.sock", &sst) == 0 && (sst.st_mode & 077) == 0,
+                  "MySQL handshake over the Unix socket (owner-only): %zd", gn);
+            if (uf >= 0) close(uf);
+            int f6 = socket(AF_INET6, SOCK_STREAM, 0);
+            struct sockaddr_in6 a6;
+            memset(&a6, 0, sizeof(a6));
+            a6.sin6_family = AF_INET6;
+            a6.sin6_port = htons((uint16_t)sv_server_port(s4));
+            a6.sin6_addr = in6addr_loopback;
+            setsockopt(f6, SOL_SOCKET, SO_RCVTIMEO, &tvu, sizeof(tvu));
+            char b6[512] = "";
+            if (f6 >= 0 && connect(f6, (struct sockaddr*)&a6, sizeof(a6)) == 0) {
+                const char* rq6 = "GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+                if (send(f6, rq6, strlen(rq6), 0) > 0) { ssize_t g6 = recv(f6, b6, sizeof(b6) - 1, 0); if (g6 > 0) b6[g6] = 0; }
+                CHECK(strstr(b6, " 200 ") && strstr(b6, "SegVault"), "HTTP over IPv6 [::1]: %.60s", b6);
+            } else printf("(IPv6 loopback not available: skipped)\n");
+            if (f6 >= 0) close(f6);
+        }
         CHECK(mp > 0, "mysql port: %s", err);
         My m;
         char e[300], out[4096];
@@ -959,6 +1148,79 @@ int main(void) {
         CHECK(strstr(out, "ERR:1243"), "closed statement: %s", out);
         my_query(&m, "DELETE FROM p WHERE id = 40", out, sizeof(out));
 
+        // P2.8: COM_STATISTICS, COM_SET_OPTION, COM_CHANGE_USER
+        {
+            uint8_t q1 = 0x09;
+            m.seq = 0;
+            uint8_t* p; size_t n;
+            bool g = my_wr(&m, &q1, 1) && my_rd(&m, &p, &n);
+            CHECK(g && n > 7 && !memcmp(p, "Uptime:", 7), "COM_STATISTICS: %.40s", g ? (char*)p : "io");
+            if (g) free(p);
+            uint8_t q2[3] = { 0x1b, 1, 0 };
+            m.seq = 0;
+            g = my_wr(&m, q2, 3) && my_rd(&m, &p, &n);
+            CHECK(g && p[0] == 0xfe, "COM_SET_OPTION answered with EOF");
+            if (g) free(p);
+            my_query(&m, "SET @keep = 5", out, sizeof(out));
+            my_change_user(&m, "root", "tok4", "t", out, sizeof(out));
+            CHECK(!strcmp(out, "OK"), "COM_CHANGE_USER to root: %s", out);
+            my_query(&m, "SELECT COUNT(*) FROM p", out, sizeof(out));
+            CHECK(!strstr(out, "ERR"), "queries after COM_CHANGE_USER: %s", out);
+            my_query(&m, "SHOW VARIABLES LIKE 'max_connections'", out, sizeof(out));
+            CHECK(strstr(out, "max_connections"), "max_connections reflects the configuration: %s", out);
+        }
+        // P2.1: SET @v e FOREIGN_KEY_CHECKS arrivano al motore (prima erano confermati e scartati)
+        my_query(&m, "SET @v = 41; SELECT @v + 1", out, sizeof(out));
+        CHECK(strstr(out, " / 42"), "user variable over the MySQL protocol: %s", out);
+        my_query(&m, "SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0; "
+                     "CREATE TABLE fk_child (id INT PRIMARY KEY, par INT, FOREIGN KEY (par) REFERENCES fk_par(id)); "
+                     "INSERT INTO fk_child VALUES (1, 7); "
+                     "CREATE TABLE fk_par (id INT PRIMARY KEY); INSERT INTO fk_par VALUES (7); "
+                     "SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS; SELECT @OLD_FOREIGN_KEY_CHECKS", out, sizeof(out));
+        CHECK(!strstr(out, "ERR") && strstr(out, " / 1"), "dump with tables in foreign-key order loads: %s", out);
+        my_query(&m, "INSERT INTO fk_child VALUES (2, 99)", out, sizeof(out));
+        CHECK(strstr(out, "ERR"), "foreign keys checked again after the dump: %s", out);
+        my_query(&m, "DROP TABLE fk_child; DROP TABLE fk_par", out, sizeof(out));
+
+        // P0.8: i 256 valori di byte, anche 0x00 e 0xC0, interi attraverso il protocollo MySQL
+        {
+            char hexall[600] = "", sql[800];
+            uint8_t all[256];
+            for (int i = 0; i < 256; i++) { all[i] = (uint8_t)i; snprintf(hexall + 2 * i, 3, "%02X", i); }
+            my_query(&m, "CREATE TABLE binm (id INT PRIMARY KEY, b BLOB)", out, sizeof(out));
+            snprintf(sql, sizeof(sql), "INSERT INTO binm VALUES (1, X'%s')", hexall);
+            my_query(&m, sql, out, sizeof(out));
+            my_query(&m, "SELECT LENGTH(b), HEX(b) = UNHEX('00') OR 1, HEX(b) FROM binm WHERE id = 1", out, sizeof(out));
+            char want[700];
+            snprintf(want, sizeof(want), "256|1|%s", hexall);
+            CHECK(!strcmp(out, want), "X'' literal with all 256 bytes: %.80s", out);
+            int bnp = 0, bnc = 0;
+            uint32_t pid = my_prepare(&m, "INSERT INTO binm VALUES (2, ?)", &bnp, &bnc, out, sizeof(out));
+            CHECK(pid && bnp == 1, "prepare binary insert: %s", out);
+            my_execute_bytes(&m, pid, all, 256, out, sizeof(out));
+            CHECK(!strcmp(out, "OK"), "prepared statement with a binary parameter containing NUL: %s", out);
+            my_query(&m, "SELECT LENGTH(b), HEX(b) FROM binm WHERE id = 2", out, sizeof(out));
+            snprintf(want, sizeof(want), "256|%s", hexall);
+            CHECK(!strcmp(out, want), "binary parameter stored byte-exact: %.80s", out);
+            // il risultato di testo: i byte veri (letti a mano: 256 byte, il primo è 0x00)
+            uint8_t q3[64] = { 3 };
+            const char* sel = "SELECT b FROM binm WHERE id = 1";
+            memcpy(q3 + 1, sel, strlen(sel));
+            m.seq = 0;
+            uint8_t* p; size_t n;
+            bool okb = my_wr(&m, q3, 1 + strlen(sel));
+            for (int i = 0; okb && i < 3; i++) { okb = my_rd(&m, &p, &n); if (okb) free(p); }   // colonne, definizione, EOF
+            okb = okb && my_rd(&m, &p, &n);
+            size_t pos = 0;
+            uint64_t vl = okb ? my_lenenc(p, &pos) : 0;
+            CHECK(okb && vl == 256 && !memcmp(p + pos, all, 256), "text result carries the real bytes: %llu", (unsigned long long)vl);
+            if (okb) free(p);
+            for (int i = 0; i < 1; i++) { if (my_rd(&m, &p, &n)) free(p); }                      // EOF finale
+            my_query(&m, "SELECT LENGTH(UNHEX('410042')), LENGTH(CONCAT('a', CHAR(0), 'b')), LENGTH('x\\0y'), HEX('\\0')", out, sizeof(out));
+            CHECK(!strcmp(out, "3|3|3|00"), "NUL bytes in functions and escapes: %s", out);
+            my_query(&m, "DROP TABLE binm", out, sizeof(out));
+        }
+
         // autocommit = 0: le modifiche restano in sospeso fino a COMMIT / ROLLBACK
         my_query(&m, "COMMIT", out, sizeof(out));
         CHECK(!strcmp(out, "OK:0"), "COMMIT with nothing to commit: %s", out);
@@ -976,6 +1238,43 @@ int main(void) {
         my_query(&m, "CREATE TABLE q (id INT PRIMARY KEY, v INT); INSERT INTO q VALUES (1, 0)", out, sizeof(out));
         My m2;
         CHECK(my_connect(&m2, mp, "root", "tok4", "t", e, sizeof(e)), "second connection: %s", e);
+        // P2.9: SHOW PROCESSLIST e KILL QUERY da un'altra connessione, anche su una scrittura (che non scrive niente)
+        {
+            my_query(&m, "CREATE TABLE kq (id INT PRIMARY KEY, v INT)", out, sizeof(out));
+            for (int b = 0; b < 1500; b += 250) {            // (my_query ha un buffer di 4 KB)
+                char insb[4000];
+                int l = snprintf(insb, sizeof(insb), "INSERT INTO kq VALUES ");
+                for (int i = b; i < b + 250; i++) l += snprintf(insb + l, sizeof(insb) - (size_t)l, "%s(%d, %d)", i > b ? "," : "", i, i);
+                my_query(&m, insb, out, sizeof(out));
+            }
+            const char* longq[2] = { "SELECT COUNT(*) FROM kq a, kq b, kq c WHERE a.v + b.v = c.v + 7777777",
+                                     "DELETE FROM kq WHERE id IN (SELECT a.id FROM kq a, kq b, kq c WHERE a.v + b.v + c.v = -1) OR id >= 0" };
+            for (int t = 0; t < 2; t++) {
+                CcArg ka = { &m, longq[t], "" };
+                pthread_t kt;
+                pthread_create(&kt, NULL, cc_thread, &ka);
+                usleep(300000);
+                char pl[4096];
+                my_query(&m2, "SHOW PROCESSLIST", pl, sizeof(pl));
+                const char* hit = strstr(pl, "kq a, kq b");
+                CHECK(hit != NULL && strstr(pl, "Query"), "SHOW PROCESSLIST shows the running statement: %.200s", pl);
+                // l'id: inizio della riga che contiene l'istruzione
+                const char* row = hit;
+                while (row > pl && row[-1] != '/' && row[-1] != '\n') row--;
+                while (*row == ' ') row++;
+                char kill[64];
+                snprintf(kill, sizeof(kill), "KILL QUERY %ld", strtol(row, NULL, 10));
+                my_query(&m2, kill, out, sizeof(out));
+                CHECK(!strcmp(out, "OK:0"), "%s: %s", kill, out);
+                pthread_join(kt, NULL);
+                CHECK(strstr(ka.out, "ERR") && strstr(ka.out, "cancel"), "killed statement reports the cancellation: %s", ka.out);
+            }
+            my_query(&m, "SELECT COUNT(*) FROM kq", out, sizeof(out));
+            CHECK(!strcmp(out, "1500"), "the killed DELETE changed nothing: %s", out);
+            my_query(&m2, "KILL QUERY 999999", out, sizeof(out));
+            CHECK(strstr(out, "ERR:1094"), "unknown thread id: %s", out);
+            my_query(&m, "DROP TABLE kq", out, sizeof(out));
+        }
         my_query(&m, "START TRANSACTION; UPDATE p SET prezzo = 1 WHERE id = 1", out, sizeof(out));
         CHECK(!strcmp(out, "OK:0 / OK:1"), "A opens a transaction on p: %s", out);
         my_query(&m2, "START TRANSACTION; UPDATE q SET v = v + 1; SELECT v FROM q", out, sizeof(out));
