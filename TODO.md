@@ -1361,6 +1361,17 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
       environment variable of the server process to whoever writes a `.htaccess` (on a shared classroom
       server: any student site) — limit it to variables set by the site (`E=` flag, not implemented) or a
       fixed allow-list.
+    - `json.c` (read in full): no defect found (depth limit 64, surrogate pairs, output never longer than the
+      input, numbers by the JSON grammar).
+    - `service.c` (read in full): **fixed** — `--install-service --token T` wrote the token into the systemd
+      `ExecStart` line (unit file 0644) / the plist arguments, so it was on the service's command line, which
+      every local account can read in `/proc/PID/cmdline`; now the token goes into the service environment
+      (`Environment="SEGVAULT_TOKEN=…"` / plist `EnvironmentVariables`) and the unit / plist is 0600 (also
+      when it already existed); plist strings are XML-escaped (a path with `&` broke the file). Checked by hand
+      with `SEGVAULT_SERVICE_DRYRUN=1` + `systemd-analyze verify`. **Not changed:** the Windows Run key keeps
+      `--token` on the command line (per-user key; other users need administrator rights to read a process's
+      command line); `mkdir -p` / `launchctl` go through `system()` with paths from `$HOME` /
+      `$XDG_CONFIG_HOME` in single quotes (only the user's own environment can break them).
 
 - [ ] **P3.10 `[SECURITY]` Constrain the local certificate authority** — [code]
   - **Where:** `src/server/tls.c` `make_cert` (CA: `basicConstraints CA:TRUE, pathlen:0`, no `nameConstraints`),

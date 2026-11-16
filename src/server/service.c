@@ -3,6 +3,7 @@ SCOPO: segvault-server come servizio dell'utente (vedi service.h).
 */
 #include "common.h"
 #include "service.h"
+#include "platform_compat.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,7 +27,7 @@ static bool path_option(const char* a) {
 
 // opzioni seguite da un valore (non un percorso)
 static bool value_option(const char* a) {
-    static const char* const V[] = { "-p", "--port", "-b", "--bind", "-t", "--token", "-d", "--database", "--cors",
+    static const char* const V[] = { "-p", "--port", "-b", "--bind", "-d", "--database", "--cors",
                                      "--php-fcgi", "--php-workers", "--api-prefix", "--max-body", "--timeout",
                                      "--mysql-port", "--backup-every", "--backup-keep", "--mail-port", "--https-port" };
     for (size_t i = 0; i < sizeof(V) / sizeof(V[0]); i++) if (!strcmp(a, V[i])) return true;
@@ -58,14 +59,18 @@ static bool self_path(char* out, size_t n) {
 #endif
 }
 
-// argomenti per il servizio (assoluti), ognuno separato: argv_out[i] punto in buf
-static int build_args(int argc, char** argv, char* buf, size_t bufsz, char** out, int max) {
+// argomenti per il servizio (assoluti), ognuno separato: argv_out[i] punto in buf. --token non è fra gli argomenti
+// (sulla riga di comando di un processo lo legge ogni utente della macchina, /proc/PID/cmdline): va in *token e il
+// servizio lo riceve nell'ambiente (SEGVAULT_TOKEN), nel file dell'unità / plist leggibile solo dall'utente
+static int build_args(int argc, char** argv, char* buf, size_t bufsz, char** out, int max, char* token, size_t tokn) {
     size_t used = 0;
     int n = 0;
+    token[0] = '\0';
     for (int i = 0; i < argc && n < max - 1; i++) {
         const char* a = argv[i];
         char tmp[4096];
         if (!strcmp(a, "--install-service") || !strcmp(a, "--uninstall-service") || !strcmp(a, "--background")) continue;
+        if ((!strcmp(a, "-t") || !strcmp(a, "--token")) && i + 1 < argc) { snprintf(token, tokn, "%s", argv[++i]); continue; }
         if ((path_option(a) || !strcmp(a, "--php") || !strcmp(a, "--site")) && i + 1 < argc) {
             if (used + strlen(a) + 1 > bufsz) break;
             out[n++] = strcpy(buf + used, a);
@@ -105,12 +110,33 @@ static void data_dir_of(char** args, int n, char* out, size_t sz) {
     }
 }
 
+// testo in un file plist (XML): & < > protetti (un percorso con "&" rendeva il plist illeggibile)
+static void xml_put(FILE* f, const char* s) {
+    for (; *s; s++) {
+        if (*s == '&') fputs("&amp;", f);
+        else if (*s == '<') fputs("&lt;", f);
+        else if (*s == '>') fputs("&gt;", f);
+        else fputc(*s, f);
+    }
+}
+
+// testo fra virgolette in un'unità systemd: "\" e '"' protetti, '%' raddoppiato
+static void unit_put(FILE* f, const char* s) {
+    for (; *s; s++) {
+        if (*s == '"' || *s == '\\') fputc('\\', f);
+        if (*s == '%') fputc('%', f);
+        fputc(*s, f);
+    }
+}
+
 int sv_service_install(int argc, char** argv, char* out, size_t outsz) {
     char exe[2048];
     if (!self_path(exe, sizeof(exe))) { snprintf(out, outsz, "cannot find this program's path\n"); return 1; }
     static char buf[32768];
     char* args[256];
-    int n = build_args(argc, argv, buf, sizeof(buf), args, 256);
+    char token[512];
+    int n = build_args(argc, argv, buf, sizeof(buf), args, 256, token, sizeof(token));
+    if (!token[0]) { const char* et = getenv("SEGVAULT_TOKEN"); if (et) snprintf(token, sizeof(token), "%s", et); }
     char data[4096];
     data_dir_of(args, n, data, sizeof(data));
     bool has_data = false;
@@ -122,6 +148,8 @@ int sv_service_install(int argc, char** argv, char* out, size_t outsz) {
     // riga di comando con le virgolette; --background toglie la console e scrive il registro in un file
     static char cmd[32768];
     size_t k = (size_t)snprintf(cmd, sizeof(cmd), "\"%s\" --background", exe);
+    // (Windows: la riga di comando di un processo di un altro utente non si legge senza privilegi di amministratore)
+    if (token[0]) k += (size_t)snprintf(cmd + k, sizeof(cmd) - k, " --token \"%s\"", token);
     for (int i = 0; i < n && k < sizeof(cmd); i++) k += (size_t)snprintf(cmd + k, sizeof(cmd) - k, " \"%s\"", args[i]);
     HKEY h;
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &h) != ERROR_SUCCESS ||
@@ -146,14 +174,20 @@ int sv_service_install(int argc, char** argv, char* out, size_t outsz) {
     snprintf(dir, sizeof(dir), "%s/Library/LaunchAgents", home);
     mkdir(dir, 0755);
     snprintf(plist, sizeof(plist), "%s/dev.segvault.server.plist", dir);
-    FILE* f = fopen(plist, "w" SV_FE);
+    FILE* f = sv_fopen_private(plist, "w");          // può contenere il token
     if (!f) { snprintf(out, outsz, "cannot write %s\n", plist); return 1; }
+    if (chmod(plist, 0600)) {}
     fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
                "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n"
-               "<key>Label</key><string>dev.segvault.server</string>\n<key>ProgramArguments</key><array>\n<string>%s</string>\n", exe);
-    for (int i = 0; i < n; i++) fprintf(f, "<string>%s</string>\n", args[i]);
-    fprintf(f, "</array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n"
-               "<key>StandardErrorPath</key><string>%s/segvault-server.log</string>\n</dict></plist>\n", abs_data);
+               "<key>Label</key><string>dev.segvault.server</string>\n<key>ProgramArguments</key><array>\n<string>");
+    xml_put(f, exe);
+    fputs("</string>\n", f);
+    for (int i = 0; i < n; i++) { fputs("<string>", f); xml_put(f, args[i]); fputs("</string>\n", f); }
+    fputs("</array>\n", f);
+    if (token[0]) { fputs("<key>EnvironmentVariables</key><dict><key>SEGVAULT_TOKEN</key><string>", f); xml_put(f, token); fputs("</string></dict>\n", f); }
+    fputs("<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n<key>StandardErrorPath</key><string>", f);
+    xml_put(f, abs_data);
+    fputs("/segvault-server.log</string>\n</dict></plist>\n", f);
     fclose(f);
     char c[2600];
     snprintf(c, sizeof(c), "launchctl unload '%s' 2>/dev/null; launchctl load -w '%s'", plist, plist);
@@ -174,18 +208,19 @@ int sv_service_install(int argc, char** argv, char* out, size_t outsz) {
     snprintf(mk, sizeof(mk), "mkdir -p '%s'", dir);
     if (system(mk) != 0) { snprintf(out, outsz, "cannot create %s\n", dir); return 1; }
     snprintf(unit, sizeof(unit), "%s/segvault.service", dir);
-    FILE* f = fopen(unit, "w" SV_FE);
+    FILE* f = sv_fopen_private(unit, "w");           // 0600: può contenere il token
     if (!f) { snprintf(out, outsz, "cannot write %s\n", unit); return 1; }
+    if (chmod(unit, 0600)) {}                        // un'unità scritta da una versione precedente era 0644
     // systemd: argomenti tra virgolette, con "\" e "%" protetti
     fprintf(f, "[Unit]\nDescription=SegVault development server (web, PHP, MySQL protocol, mail)\nAfter=network.target\n\n"
-               "[Service]\nExecStart=\"%s\"", exe);
+               "[Service]\n");
+    if (token[0]) { fputs("Environment=\"", f); unit_put(f, "SEGVAULT_TOKEN="); unit_put(f, token); fputs("\"\n", f); }
+    fputs("ExecStart=\"", f);
+    unit_put(f, exe);
+    fputc('"', f);
     for (int i = 0; i < n; i++) {
         fputs(" \"", f);
-        for (const char* q = args[i]; *q; q++) {
-            if (*q == '"' || *q == '\\') fputc('\\', f);
-            if (*q == '%') fputc('%', f);
-            fputc(*q, f);
-        }
+        unit_put(f, args[i]);
         fputc('"', f);
     }
     fprintf(f, "\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n");
