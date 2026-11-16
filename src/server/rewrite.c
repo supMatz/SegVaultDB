@@ -292,7 +292,8 @@ typedef struct {
     const char* rel;               // percorso relativo alla cartella del .htaccess (per $N)
     size_t      rcaps[NCAPS][2];
     const char* ctext;             // testo dell'ultima RewriteCond con regex riuscita (per %N)
-    char        cbuf[4096];
+    char*       cdyn;              // la sua copia intera (malloc'd). Era un buffer di 4 KB con le catture calcolate
+                                   // sul testo intero: %N oltre il 4096° byte leggeva la memoria dopo (P3.9)
     size_t      ccaps[NCAPS][2];
 } Ctx;
 
@@ -394,9 +395,11 @@ static bool cond_ok(Ctx* c, Cond* k) {
         size_t caps[NCAPS][2];
         r = sv_regex_search_caps(k->re, s, 0, caps, NCAPS);
         if (r && !k->neg) {                     // %N: dall'ultima condizione riuscita
-            snprintf(c->cbuf, sizeof(c->cbuf), "%s", s);
-            c->ctext = c->cbuf;
-            memcpy(c->ccaps, caps, sizeof(caps));
+            char* copy = strdup(s);
+            free(c->cdyn);
+            c->cdyn = copy;
+            c->ctext = copy;
+            if (copy) memcpy(c->ccaps, caps, sizeof(caps));
         }
     }
     }
@@ -479,6 +482,8 @@ void rw_apply(const RwRequest* rq, RwResult* out) {
     bool changed_any = false;
     HtFile* lv[MAX_LEVELS];
     int n = 0;
+    Ctx c;
+    memset(&c, 0, sizeof(c));
     for (int pass = 0; pass < MAX_PASSES; pass++) {
         n = load_levels(rq, path, lv, out->error, sizeof(out->error));
         HtFile* h = NULL;                              // il .htaccess più profondo con le regole attive
@@ -492,7 +497,7 @@ void rw_apply(const RwRequest* rq, RwResult* out) {
             while (*rel == '/') rel++;
             char relbuf[RW_PATH_MAX];
             RW_PUT(relbuf, "%s", rel);
-            Ctx c;
+            free(c.cdyn);
             memset(&c, 0, sizeof(c));
             c.rq = rq;
             c.path = path;
@@ -547,6 +552,15 @@ void rw_apply(const RwRequest* rq, RwResult* out) {
                 if (strcmp(dec, path) || strcmp(nq, query)) { changed = true; changed_any = true; }
                 RW_PUT(path, "%s", dec);
                 RW_PUT(query, "%s", nq);
+                // un percorso con "/." (anche ".." da una cattura), "\" o ":" non si usa per altri passaggi: i
+                // .htaccess e gli stat (-f, -d) delle cartelle fuori dalla radice del sito non si leggono; il
+                // server lo rifiuta poi con i controlli di sempre (404)
+                if (strstr(path, "/.") || strchr(path, '\\') || strchr(path, ':')) {
+                    out->action = RW_REWRITE;
+                    RW_PUT(out->path, "%s", path);
+                    RW_PUT(out->query, "%s", query);
+                    goto done;
+                }
                 c.path = path;
                 c.query = query;
                 if (r->last || r->end) { stop = r->end; break; }
@@ -588,5 +602,6 @@ void rw_apply(const RwRequest* rq, RwResult* out) {
 done:
     if (too_long) out->action = RW_TOO_LONG;
 #undef RW_PUT
+    free(c.cdyn);
     for (int i = 0; i < n; i++) ht_free(lv[i]);
 }

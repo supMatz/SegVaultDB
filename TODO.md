@@ -1342,6 +1342,25 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
       machine's browsers accept; leaf certificates are minted for any SNI name a client sends (256-entry cache:
       with `--bind` on a network address a remote client can fill it and new site names fall back to the
       `localhost` certificate).
+    - `proxy.c` (read in full): **fixed** — a heap buffer overflow: a backend status line shorter than 8 bytes
+      (`HTTP/1.\r\n`) made the precision of `"%.*s"` negative, so `sprintf` copied the rest of the 64 KB header
+      buffer, body bytes included, into `out` (`hlen + 128` bytes). Confirmed under ASan; the status line must now
+      be `HTTP/1.x NNN` (else 502) and the copy uses `snprintf`. Test: `/short-status` in `tests/test_web.c`.
+      Checked and fine: chunked parser (15 hex digits, states), 1xx skipping, hop-by-hop headers, header size
+      limit, WebSocket bridging. Noted, not changed: a response with both `Content-Length` and
+      `Transfer-Encoding: chunked` is forwarded with both headers (the proxy itself follows chunked).
+    - `rewrite.c` (read in full): **fixed** — (1) an out-of-bounds read: the text of the last matching
+      `RewriteCond` was copied into a 4 KB buffer but its `%N` captures were computed on the whole text, so a
+      capture beyond byte 4096 (e.g. `%{HTTP_HOST}%{REQUEST_URI}` or a long query string) copied stack memory
+      into the rewritten URL or the `Location` of a redirect; the copy is now dynamic. (2) a rewritten path
+      containing `..` (from a capture) was used for the next rewrite passes: `.htaccess` files and `-f` / `-d`
+      checks outside the site root were read and applied (a test shows a parent folder's rule redirecting the
+      request); now such a path ends rewriting at once and is refused by the usual checks (404). Tests in
+      `tests/test_php.c` (both fail without the fix). Checked and fine: `S=` bounds, `<Files>` glob, nested
+      blocks, flag parsing, 414 on overlong results, `MAX_PASSES`. **Noted (low):** `%{ENV:NAME}` exposes any
+      environment variable of the server process to whoever writes a `.htaccess` (on a shared classroom
+      server: any student site) — limit it to variables set by the site (`E=` flag, not implemented) or a
+      fixed allow-list.
 
 - [ ] **P3.10 `[SECURITY]` Constrain the local certificate authority** — [code]
   - **Where:** `src/server/tls.c` `make_cert` (CA: `basicConstraints CA:TRUE, pathlen:0`, no `nameConstraints`),

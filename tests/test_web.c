@@ -167,6 +167,10 @@ static void backend_conn(int fd) {
         wr(fd, out, (size_t)n);
         memset(out, 'x', 50000);
         for (int i = 0; i < 20; i++) wr(fd, out, 50000);
+    } else if (!strcmp(path, "/short-status")) {          // riga di stato troncata + corpo lungo (P3.9)
+        n = snprintf(out, sizeof(out), "HTTP/1.\r\nContent-Length: 4000\r\n\r\n");
+        memset(out + n, 'y', 4000);
+        wr(fd, out, (size_t)n + 4000);
     } else if (!strcmp(path, "/continue")) {
         n = snprintf(out, sizeof(out), "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n");
         wr(fd, out, (size_t)n);
@@ -404,6 +408,9 @@ int main(void) {
     pthread_mutex_unlock(&g_mx);
     r = get(port, "app.localhost", "/api/v1/health");
     CHECK(r.status == 404 && has(&r, "not found") && !has(&r, "SegVault"), "the whole path space belongs to the app: %d %s", r.status, r.body);
+    free(r.body);
+    r = get(port, "app.localhost", "/short-status");
+    CHECK(r.status == 502, "a malformed status line from the backend is refused (502): %d", r.status);
     free(r.body);
     r = get(port, "app.localhost", "/eof");
     CHECK(r.status == 200 && has(&r, "fino alla chiusura"), "body until close: %d %s", r.status, r.body);

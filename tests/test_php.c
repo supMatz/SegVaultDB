@@ -839,6 +839,12 @@ int main(int argc, char** argv) {
         put(d, "y.txt", "ipsilon");
         snprintf(d, sizeof(d), "%s/files", w2); mkdir(d, 0755);
         put(d, ".htaccess", "Options -Indexes +FollowSymLinks\n");
+        // P3.9: %N oltre il 4096° byte del testo della condizione; un percorso riscritto con ".." non fa leggere i
+        // .htaccess fuori dalla radice (quello nella cartella sopra w2 ridirigerebbe altrove)
+        snprintf(d, sizeof(d), "%s/longcond", w2); mkdir(d, 0755);
+        put(d, ".htaccess", "RewriteEngine On\nRewriteCond %{QUERY_STRING}%{QUERY_STRING} (b+)$\nRewriteRule ^leak$ /got/%1 [R=302,L]\n"
+                            "RewriteCond %{QUERY_STRING} ^p=(.*)$\nRewriteRule ^trav$ /%1 [L]\n");
+        put(dir, ".htaccess", "RewriteEngine On\nRewriteRule . http://outside.example/ [R=302,L]\n");
         put(d, "a.txt", "a");
         // Laravel: il sito lara.localhost ha public/ come radice
         snprintf(d, sizeof(d), "%s/lara", w2); mkdir(d, 0755);
@@ -919,6 +925,21 @@ int main(int argc, char** argv) {
         r = req(port, "GET", "/.htaccess", NULL, NULL);
         CHECK(r.status == 404 && !has(&r, "RewriteEngine"), ".htaccess never served: %d", r.status);
         rfree(&r);
+        {
+            static char lq[4000];                 // (req: richiesta in 4 KB) testo della condizione: 7 000 byte
+            int k = snprintf(lq, sizeof(lq), "/longcond/leak?");
+            memset(lq + k, 'a', 2500); memset(lq + k + 2500, 'b', 1000); lq[k + 3500] = '\0';
+            r = req(port, "GET", lq, NULL, NULL);
+            const char* loc = r.head ? strcasestr(r.head, "Location: /got/") : NULL;
+            size_t nb = 0;
+            if (loc) for (const char* q = loc + 15; *q == 'b'; q++) nb++;
+            CHECK(r.status == 302 && loc && nb == 1000 && (loc[15 + nb] == '\r' || loc[15 + nb] == '?'),
+                  "%%1 past the 4096th byte of the condition text: %d, %zu b's", r.status, nb);
+            rfree(&r);
+            r = req(port, "GET", "/longcond/trav?p=../../x", NULL, NULL);
+            CHECK(r.status == 404 && !hdr(&r, "outside.example"), "a rewrite to '..' stops: no .htaccess outside the root: %d %s", r.status, r.head);
+            rfree(&r);
+        }
         // Laravel
         r = req(port, "GET", "/users?page=2", "Host: lara.localhost\r\nAuthorization: Bearer abc\r\n", NULL);
         CHECK(r.status == 200 && has(&r, "SCRIPT_NAME=/index.php\n") && has(&r, "QUERY_STRING=page=2\n") &&
@@ -928,6 +949,11 @@ int main(int argc, char** argv) {
         CHECK(r.status == 301 && hdr(&r, "Location: /users") && !hdr(&r, "Location: /users/"), "Laravel trailing slash redirect: %d %s", r.status, r.head);
         rfree(&r);
         stop(s, th);
+        {
+            char hp[1300];
+            snprintf(hp, sizeof(hp), "%s/.htaccess", dir);
+            remove(hp);
+        }
 
         // --no-htaccess: le regole non valgono più (resta il front controller di SegVault)
         SvServerConfig c2 = cfg;

@@ -283,7 +283,15 @@ int px_forward(px_sock client, const char* host, int port, const char* head, siz
         if (have >= HEAD_MAX) { snprintf(err, errsz, "%s:%d sent headers that are too large", host, port); free(in); sock_close(b); return -1; }
     }
     size_t hlen = (size_t)(hend - in) + 4;
-    if (strncmp(in, "HTTP/1.", 7) || have < 12) { snprintf(err, errsz, "%s:%d did not answer with HTTP", host, port); free(in); sock_close(b); return -1; }
+    // riga di stato "HTTP/1.x NNN ...": almeno 12 byte prima del CRLF e tre cifre. Una riga più corta di 8 byte
+    // rendeva negativa la precisione di "%.*s" qui sotto: sprintf copiava tutto il resto del buffer (corpo compreso)
+    // in out, grande hlen + 128 (heap overflow con un backend che risponde male, P3.9)
+    const char* sl_end = strstr(in, "\r\n");
+    if (strncmp(in, "HTTP/1.", 7) || !sl_end || sl_end - in < 12 || in[8] != ' ' ||
+        !isdigit((unsigned char)in[9]) || !isdigit((unsigned char)in[10]) || !isdigit((unsigned char)in[11])) {
+        snprintf(err, errsz, "%s:%d did not answer with HTTP", host, port);
+        free(in); sock_close(b); return -1;
+    }
     int status = atoi(in + 9);
     res->status = status;
 
@@ -295,7 +303,7 @@ int px_forward(px_sock client, const char* host, int port, const char* head, siz
     size_t ol = 0;
     const char* line = in;
     const char* eol = strstr(line, "\r\n");
-    ol += (size_t)sprintf(out, "HTTP/1.1%.*s\r\n", (int)(eol - line - 8), line + 8);
+    ol += (size_t)snprintf(out, hlen + 128, "HTTP/1.1%.*s\r\n", (int)(eol - line - 8), line + 8);
     for (line = eol + 2; line < in + hlen - 2; line = eol + 2) {
         eol = strstr(line, "\r\n");
         size_t len = (size_t)(eol - line);
