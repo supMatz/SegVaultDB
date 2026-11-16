@@ -1178,7 +1178,9 @@ int main(void) {
         }
         double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
         CHECK(made == 2000, "2 000 tables in one database (%d created)", made);
-        CHECK(ms < 2000, "1 000 CREATE TABLE in %.0f ms", ms);
+#ifndef __SANITIZE_ADDRESS__
+        CHECK(ms < 2000, "1 000 CREATE TABLE in %.0f ms", ms);   // (sotto ASan i tempi non valgono)
+#endif
         printf("1000 CREATE TABLE: %.0f ms\n", ms);
         db_shutdown();
         pid_t pp = fork();
@@ -1195,7 +1197,11 @@ int main(void) {
             ok("USE big");
             bool good = num("SELECT COUNT(*) FROM t1999") == 0 && num("SELECT COUNT(*) FROM wide WHERE c299 = 'last'") == 1;
             printf("engine start with 2 001 tables: +%ld KB resident\n", after - before);
+#ifdef __SANITIZE_ADDRESS__
+            _exit(!good ? 5 : 0);                             // sotto ASan la memoria non è confrontabile
+#else
             _exit(!good ? 5 : after - before >= 20 * 1024 ? 6 : 0);
+#endif
         }
         int ps;
         waitpid(pp, &ps, 0);

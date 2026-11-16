@@ -32,6 +32,7 @@ static void yield_cpu(void) {
 
 static bool part_init(BpPart* pt, int capacity) {
     memset(pt, 0, sizeof(*pt));
+    if (capacity < 1) capacity = 1;                 // (un int negativo come dimensione: GCC 13 MinGW lo segnala)
     int nb = 1;
     while (nb < capacity * 2) nb <<= 1;
     pt->frames = SV_ALLOC_N(Frame, capacity);
