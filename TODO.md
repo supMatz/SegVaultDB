@@ -1332,6 +1332,32 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     with `file:line`. Priorities: (1) executor write paths against the crash harness (P3.1), (2) `tls.c`
     certificate and key handling, (3) `proxy.c` response parsing, (4) `rewrite.c` against hostile `.htaccess`.
   - **Done when:** the "Not read line by line" list at the top of this file is empty.
+  - **Pass of 2026-11-16 (written as found):**
+    - `tls.c` (read in full): **fixed** — the CA private key (`certs/ca.key`, trusted by the browser after
+      `--trust-ca`) and `sites.key` were created by OpenSSL with the default umask and narrowed with `chmod`
+      only after the key was written, and got no ACL on Windows; now the file is created private first
+      (`sv_fopen_private`: 0600 / owner-only ACL), then written; a `certs` folder created by the server is
+      0700 / owner-only. Test: `tests/test_tls.c` checks both keys. **Open (P3.10):** the local CA has no
+      X.509 name constraints, so whoever reads `ca.key` can mint a certificate for any domain that the
+      machine's browsers accept; leaf certificates are minted for any SNI name a client sends (256-entry cache:
+      with `--bind` on a network address a remote client can fill it and new site names fall back to the
+      `localhost` certificate).
+
+- [ ] **P3.10 `[SECURITY]` Constrain the local certificate authority** — [code]
+  - **Where:** `src/server/tls.c` `make_cert` (CA: `basicConstraints CA:TRUE, pathlen:0`, no `nameConstraints`),
+    `ctx_for` (a leaf for any SNI name that passes `good_name`, cached up to `LEAF_CACHE` = 256).
+  - **Why:** the CA is installed as a trusted root by `--trust-ca`; it can sign for `bank.example` as well as
+    `shop.localhost`. A stolen `ca.key` (backup, synced folder, another local account before the P3.9 fix) is a
+    universal MITM certificate for that user's browsers. Remote clients (server bound to a LAN address) can
+    exhaust the leaf cache.
+  - **Do:** new CAs carry a critical `nameConstraints` extension (permitted `localhost`, `.localhost`, `.test`,
+    the configured site names, `127.0.0.0/8`, `::1`, private LAN ranges when `--bind` is not loopback); mint
+    leaves only for names that map to a configured site or vhost folder; replace the oldest cache entry instead
+    of refusing; offer `--renew-ca` that regenerates and re-trusts. Keep reading an old unconstrained CA but
+    print a one-line suggestion to renew it.
+  - **Done when:** a certificate for `example.com` signed by a new CA is rejected by `openssl verify` with the
+    CA as the only root, `shop.localhost` still verifies, and 1 000 random SNI names do not stop a new site name
+    from getting its certificate.
 
 ---
 

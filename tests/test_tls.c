@@ -105,6 +105,8 @@ int main(void) {
     char key[600];
     snprintf(key, sizeof(key), "%s/ca.key", certs);
     CHECK(stat(key, &st) == 0 && (st.st_mode & 077) == 0, "CA key private: %o", st.st_mode & 0777);
+    snprintf(key, sizeof(key), "%s/sites.key", certs);
+    CHECK(stat(key, &st) == 0 && (st.st_mode & 077) == 0, "site key private: %o", st.st_mode & 0777);
     pthread_t th;
     pthread_create(&th, NULL, run_server, s);
     int hp = sv_server_https_port(s), port = sv_server_port(s);

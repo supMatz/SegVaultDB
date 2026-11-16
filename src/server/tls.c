@@ -2,6 +2,7 @@
 SCOPO: HTTPS con OpenSSL caricato all'avvio (vedi tls.h).
 */
 #include "tls.h"
+#include "platform_compat.h"
 #include "h2.h"
 
 #include <errno.h>
@@ -60,7 +61,7 @@ SCOPO: HTTPS con OpenSSL caricato all'avvio (vedi tls.h).
   static void mx_lock(tls_mx* m) { pthread_mutex_lock(m); }
   static void mx_unlock(tls_mx* m) { pthread_mutex_unlock(m); }
   static void mx_destroy(tls_mx* m) { pthread_mutex_destroy(m); }
-  #define mkdir_p(d) mkdir(d, 0755)
+  #define mkdir_p(d) mkdir(d, 0700)
   static void set_nonblock(tls_sock fd, bool on) {
       int fl = fcntl(fd, F_GETFL, 0);
       fcntl(fd, F_SETFL, on ? fl | O_NONBLOCK : fl & ~O_NONBLOCK);
@@ -385,13 +386,21 @@ static X509* make_cert(EVP_PKEY* key, const char* cn, X509* issuer, EVP_PKEY* is
 }
 
 static bool write_pem(const char* path, X509* x, EVP_PKEY* k) {
+    // una chiave (della CA, che il browser considera fidata dopo --trust-ca: chi la legge può firmare un certificato
+    // per qualunque sito) è privata dal primo byte: il file nasce 0600 (ACL del solo utente su Windows) e solo poi
+    // OpenSSL lo riscrive. Prima: creato con i permessi di default e ristretto con chmod dopo la scrittura
+    if (k) {
+        FILE* f = sv_fopen_private(path, "w");
+        if (!f) return false;
+        fclose(f);
+#ifndef _WIN32
+        if (chmod(path, 0600) != 0) return false;     // un file che c'era già tiene i permessi che aveva
+#endif
+    }
     BIO* b = O.BIO_new_file(path, "w");
     if (!b) return false;
     bool ok = x ? O.PEM_write_bio_X509(b, x) == 1 : O.PEM_write_bio_PrivateKey(b, k, NULL, NULL, 0, NULL, NULL) == 1;
     O.BIO_free(b);
-#ifndef _WIN32
-    if (k) chmod(path, 0600);                 // la chiave della CA: solo per questo utente
-#endif
     return ok;
 }
 
@@ -496,7 +505,12 @@ TlsCtx* tls_create(const char* cert_dir, char* err, size_t errsz) {
     mx_init(&t->mx);
     snprintf(t->dir, sizeof(t->dir), "%s", cert_dir && cert_dir[0] ? cert_dir : "certs");
     struct stat st;
-    if (stat(t->dir, &st) != 0) mkdir_p(t->dir);
+    if (stat(t->dir, &st) != 0) {                 // creata qui: solo questo utente (e SYSTEM); una cartella
+        mkdir_p(t->dir);                          // indicata dall'utente che esiste già resta com'è (i file
+#ifdef _WIN32                                     // delle chiavi sono comunque privati, write_pem)
+        sv_win_private(t->dir, 1);
+#endif
+    }
     char kp[1100], lp[1100];
     snprintf(t->ca_path, sizeof(t->ca_path), "%s/ca.crt", t->dir);
     snprintf(kp, sizeof(kp), "%s/ca.key", t->dir);
