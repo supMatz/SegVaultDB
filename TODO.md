@@ -21,8 +21,9 @@ not executed; **[verify-win]** = Windows-only, needs a run on Windows.
 
 `[ ]` to do · `[~]` in progress · `[x]` done.
 
-**Status 2026-11-16 (in progress towards 1.4):** also closed P1.1, P1.5, P1.7, P1.11, P2.5, P2.14, P2.15;
-still open P1.6, P1.10 (part), P2.8 (part), P3.9.
+**Status 2026-11-16 (in progress towards 1.4):** also closed P1.1, P1.5, P1.7, P1.10, P1.11, P2.5, P2.8 (its
+streaming part moved to the new P1.14), P2.14, P2.15; still open P1.6 (on-disk B+tree), P1.14 (streaming
+executor, found while measuring P1.10), P3.9 (audit of the remaining modules).
 
 **Status after v1.3.0 (2026-11-15):** fixed `[x]` P0.1-P0.12 (Windows parts verified under wine), P1.2, P1.3, P1.4, P1.8, P1.12, P2.1, P2.9, P2.11, P2.13, P3.1, P3.4, P3.7;
 partly done `[~]` P1.5, P1.10, P2.2, P2.3, P2.4, P2.6, P2.7, P2.8,
@@ -593,7 +594,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     given (MySQL would round to `DECIMAL(10,0)`). **Not done:** an index lookup by a literal above 2⁶³ on a
     `BIGINT UNSIGNED` column finds nothing (the index keys use the signed bits).
 
-- [~] **P1.10 `[PERF]` Buffer pool: fixed 4 MB, one latch held across disk I/O, three syscalls per new page**
+- [x] **P1.10 `[PERF]` Buffer pool: fixed 4 MB, one latch held across disk I/O, three syscalls per new page**
   - **Where:** `include/common.h:41` (`SV_BUFFER_POOL_CAP 1024`), `src/bridge/db_api.c:128`;
     `src/storage/buffer_pool.c:258-269` (exclusive latch for every `bp_fetch` / `bp_unpin`), `:100-121` (disk read
     inside it), `:149-191` (`lseek` + `pwrite` per allocation), `src/table/heap.c:249-286` (two more page flushes
@@ -615,9 +616,18 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     marked `loading`, pinned; others asking for that page wait for it alone), dirty write-backs go through one
     `wmx` (the WAL's `before_write` is not reentrant), the flush sorts with an explicit `DirtyRef` array (no
     global comparator context). Measured: 8 readers doing full scans of a 65 MB table with a 16 MB cache went
-    from 1.8× to 4.1× over one reader. **Still open:** ≥ 5× (pin / unpin still take the partition latch; atomic
-    pins not done), 64-page file extension (tried caching the file end: overflow pages extend the file too,
-    so it reused pages — reverted), a scaling test in the suite.
+    from 1.8× to 4.1× over one reader.
+  - **Done (2026-11-16):** evicted page buffers are kept per partition and reused for the next read (`spare`):
+    a `malloc` / `free` of 4 KB per page read made glibc hand memory back and fault it in again. Measured on a
+    57 MB table with a 16 MB cache, engine just opened (`/tmp`, 16 CPUs): 8 readers do 6.1-7.3× the work of
+    one; with the table in cache 7×. **Tried and dropped:** a shared-latch fetch path with atomic pins — with
+    a cache smaller than the table almost every access is a miss, and the read-then-write latch upgrade cut
+    the 8-reader speed-up to 2.7×; with a hit-only workload it changed nothing. Test in `tests/test_parallel.c`
+    (engine reopened, `min(8, CPUs)` readers, ≥ 3× with ≥ 8 CPUs outside CI: today 3.7-3.9× there, because the
+    single reader is faster once the allocator is warm). **What limits scaling now is not the page cache:** every
+    scan copies each qualifying row into an arena (P1.14), so 8 threads fault in and unmap tens of MB each and
+    meet on the process memory map. **Not done:** 64-page file extension (tried caching the file end: overflow
+    pages extend the file too, so it reused pages — reverted); bulk-insert throughput not compared with 1.2.
 
 - [x] **P1.11 `[ENGINE]` Catalog: 1.71 GB fixed struct, raw struct dumps on disk, full rewrite + 2 `fsync`s per DDL**
   - **Where:** `src/catalog/schema.h:88-148` (`sizeof(Catalog)` = 1 834 562 576 bytes, `Database` = 27.3 MB,
@@ -715,6 +725,24 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     `SELECT *` columns after the reorder; exact row count after a rolled-back insert + delete; JSON plan.
     **Not done:** statistics are not refreshed automatically (only by `ANALYZE`); string columns get distinct
     count and NULL fraction but no histogram; joins with outer joins keep the written order.
+
+- [ ] **P1.14 `[PERF]` The executor materialises every row it reads; results are fully built before they are sent**
+  - **Where:** `src/query/executor.c` `plan_load` (~`:7024-7070`): the scan path copies every row that passes the
+    `WHERE` into the source's arena (`source_push`), all of them, before joins, aggregation or `LIMIT` run;
+    `query_exec` → `QueryResult` with every cell as a string (`db_api.h`), then the MySQL / HTTP layers encode it.
+  - **Why (measured 2026-11-16):** `SELECT COUNT(*), SUM(v) FROM big WHERE pad <> 'x'` over a 57 MB table copies
+    ~57 MB per execution: a freshly started process spends half of the scan in page faults of that arena, 8
+    parallel scans meet on the process memory map (≈ 3.8× instead of ~7× with the pages cached), memory grows
+    with the table (a `SELECT` over a 2 GB table needs > 2 GB), `LIMIT 10` on a big table still reads and copies
+    every row, and P2.8's "stream a 2 GB result with flat memory" cannot be done.
+  - **Do:** pull-based operators (open / next / close) for scan, filter, project, nested-loop and hash join,
+    aggregate, sort, limit; copy only the columns a later operator uses (column pruning); aggregates and
+    `COUNT(*)` consume rows straight from the page view; `LIMIT` without `ORDER BY` stops the scan; a cursor
+    API in `db_api.h` (`db_query_open` / `db_query_next` / `db_query_close`) used by the MySQL protocol, the
+    HTTP API and the CSV / SQL export; keep `QueryResult` as a convenience wrapper over the cursor.
+  - **Done when:** that `COUNT(*)` allocates O(1) memory; `SELECT * FROM t LIMIT 10` on a 1 GB table reads
+    one page chain prefix; `SELECT *` on a 2 GB table streams through PDO with flat RSS; 8 readers ≥ 6× on
+    the P1.10 test with a warm allocator.
 
 ---
 
@@ -924,7 +952,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     the audit file is `fsync`ed at most one second after its last line, from the accept loop and only when
     `exec_mx` is free (`audit_sync_tick`). Tests in `tests/test_server.c`.
 
-- [~] **P2.8 `[NET]` MySQL protocol completeness**
+- [x] **P2.8 `[NET]` MySQL protocol completeness**
   - **Where:** `src/server/mysql_wire.c:50-57` (`mw_end`: payloads over 16 MB − 1 are not split, the length is
     clamped → the stream desynchronises for a ≥ 16 MB value); `src/server/server.c:3410` (`COM_CHANGE_USER`,
     `COM_SET_OPTION`, `COM_STMT_FETCH`, `COM_STATISTICS`, `COM_PROCESS_KILL` → "Unknown command"); `:3292`
@@ -952,8 +980,8 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     `SERVER_STATUS_CURSOR_EXISTS`, and `COM_STMT_FETCH` sends the next N rows in binary form, then
     `LAST_ROW_SENT` (error 1421 without an open cursor; `COM_STMT_RESET`, a new `EXECUTE` and `CLOSE` drop it).
     Tests in `tests/test_server.c` (flags of a 5-column result; a cursor read 2 rows, then the rest).
-    **Still open:** streaming result sets with flat memory — the cursor serves a materialised `QueryResult`;
-    streaming needs the executor to hand rows out as it produces them.
+    **Moved to P1.14:** streaming result sets with flat memory — the cursor serves a materialised `QueryResult`;
+    streaming needs the executor to hand rows out as it produces them. Everything else in this item is done.
 
 - [x] **P2.9 `[NET]` Only `SELECT` scans can be interrupted**
   - **Where:** `src/server/server.c:3991-3998` (watchdog → `db_request_cancel`), `src/bridge/db_api.c:150-163`,

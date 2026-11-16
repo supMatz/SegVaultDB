@@ -53,6 +53,11 @@ typedef struct {
     uint64_t    tick;
     BufferStats stats;
     SvRwLock    latch;
+    // buffer di pagine sfrattate, riusati per le prossime letture: un malloc / free da 4 KB per ogni pagina letta
+    // faceva restituire memoria al sistema da glibc (trim) e ripagare i page fault a ogni scansione (P1.10:
+    // una scansione di una tabella più grande della cache era 1,9 volte più lenta in un processo appena avviato)
+    Page**      spare;
+    int         nspare;
 } BpPart;
 
 typedef struct {

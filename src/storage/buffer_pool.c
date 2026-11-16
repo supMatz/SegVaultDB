@@ -36,7 +36,8 @@ static bool part_init(BpPart* pt, int capacity) {
     while (nb < capacity * 2) nb <<= 1;
     pt->frames = SV_ALLOC_N(Frame, capacity);
     pt->buckets = sv_malloc(sizeof(int) * (size_t)nb);
-    if (!pt->frames || !pt->buckets) { free(pt->frames); free(pt->buckets); return false; }
+    pt->spare = sv_malloc(sizeof(Page*) * (size_t)capacity);
+    if (!pt->frames || !pt->buckets || !pt->spare) { free(pt->frames); free(pt->buckets); free(pt->spare); return false; }
     for (int i = 0; i < nb; i++) pt->buckets[i] = -1;
     for (int i = 0; i < capacity; i++) pt->frames[i].hnext = -1;
     pt->nbuckets = nb;
@@ -47,10 +48,26 @@ static bool part_init(BpPart* pt, int capacity) {
 
 static void part_free_frames(BpPart* pt) {
     for (int i = 0; pt->frames && i < pt->capacity; i++) if (pt->frames[i].page) page_free(pt->frames[i].page);
+    for (int i = 0; i < pt->nspare; i++) page_free(pt->spare[i]);
     free(pt->frames);
     free(pt->buckets);
+    free(pt->spare);
     pt->frames = NULL;
     pt->buckets = NULL;
+    pt->spare = NULL;
+    pt->nspare = 0;
+}
+
+// buffer di una pagina che lascia la cache: tenuto per la prossima lettura (sotto il latch della partizione).
+// Frame e buffer tenuti insieme non superano mai la capacità della partizione
+static void spare_put(BpPart* pt, Page* p) {
+    if (!p) return;
+    if (pt->spare && pt->nspare < pt->capacity) pt->spare[pt->nspare++] = p;
+    else page_free(p);
+}
+
+static Page* spare_get(BpPart* pt) {
+    return pt->nspare > 0 ? pt->spare[--pt->nspare] : (Page*)sv_malloc(sizeof(Page));
 }
 
 // partizioni per una cache di capacity frame: almeno 64 frame ciascuna
@@ -146,7 +163,7 @@ static bool frame_release(BufferPool* bp, BpPart* pt, int idx) {
     if (!f->page || f->loading) return f->page == NULL;
     if (!write_dirty(bp, pt, f)) return false;
     hash_remove(pt, idx);
-    page_free(f->page);
+    spare_put(pt, f->page);
     f->page      = NULL;
     f->dirty     = false;
     f->ref       = false;
@@ -218,7 +235,7 @@ Page* bp_fetch(BufferPool* bp, uint32_t page_id) {
         // Non in cache: un frame (libero o sostituito), riservato con il flag loading
         idx = part_evict(bp, pt);
         if (idx < 0) { sv_rw_wrunlock(&pt->latch); return NULL; }  // cache piena e tutto pinnato
-        Page* p = (Page*)sv_malloc(sizeof(Page));
+        Page* p = spare_get(pt);
         if (!p) { sv_rw_wrunlock(&pt->latch); return NULL; }
         frame_install(pt, idx, p, page_id, true);
         sv_rw_wrunlock(&pt->latch);
@@ -234,7 +251,7 @@ Page* bp_fetch(BufferPool* bp, uint32_t page_id) {
         f->loading = false;
         if (!ok) {
             hash_remove(pt, idx);
-            page_free(f->page);
+            spare_put(pt, f->page);
             f->page = NULL;
             f->pin_count = 0;
             f->ref = false;

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <unistd.h>
 
 static int g_tests, g_fail;
 #define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -109,6 +110,17 @@ static void* mix_reader(void* arg) {
     return NULL;
 }
 
+static atomic_int g_scan_bad;
+static void scan_rounds(int n) {
+    for (int i = 0; i < n; i++) {
+        bool refused;
+        QueryResult* r = db_execute_readonly("SELECT COUNT(*), SUM(v) FROM sc WHERE pad <> 'x'", "p", NULL, 0, &refused);
+        if (refused || !r || !r->success || strcmp(r->rows[0].cells[0].value, "130000")) atomic_fetch_add(&g_scan_bad, 1);
+        db_result_free(r);
+    }
+}
+static void* scan_reader(void* arg) { (void)arg; scan_rounds(3); return NULL; }
+
 int main(void) {
     if (system("rm -rf /tmp/sv_par_test && mkdir -p /tmp/sv_par_test") != 0) return 1;
     if (!db_init("/tmp/sv_par_test")) return 1;
@@ -205,6 +217,42 @@ int main(void) {
     r = db_execute_readonly("SELECT COUNT(*) FROM w", "p", "lu", 0, &refused);
     CHECK(!refused && r && r->success, "allowed read");
     db_result_free(r);
+
+    // P1.10: scansioni complete in parallelo su una tabella più grande della cache (16 MB, tabella ~57 MB): ogni
+    // pagina passa dal disco. min(8, CPU) lettori devono fare più lavoro insieme che uno solo. Guardia di
+    // regressione (3x con 8 lettori), solo con almeno 8 CPU e fuori dalla CI (macchine condivise): oggi ~3,7-3,9x,
+    // il limite è la copia in memoria di ogni riga letta (P1.14), non la cache delle pagine (in cache: 7x)
+    {
+        run("CREATE TABLE sc (id INT PRIMARY KEY, v INT, pad VARCHAR(500))");
+        run("BEGIN");
+        static char b[8000];
+        for (int i = 0; i < 130000; i += 10) {
+            int k = snprintf(b, sizeof(b), "INSERT INTO sc VALUES ");
+            for (int j = 0; j < 10; j++) k += snprintf(b + k, sizeof(b) - (size_t)k, "%s(%d, %d, '%0400d')", j ? "," : "", i + j, (i + j) % 97, i + j);
+            run(b);
+        }
+        run("COMMIT");
+        db_shutdown();                                          // a freddo: motore riaperto, cache vuota
+        CHECK(db_init("/tmp/sv_par_test"), "reopen for the scaling test");
+        run("USE p");
+        run("SET GLOBAL cache_size = 16");
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        int nth = ncpu >= 8 ? 8 : ncpu >= 2 ? (int)ncpu : 2;
+        scan_rounds(1);                                         // a regime
+        double ts0 = now_ms();
+        scan_rounds(3);
+        double one = now_ms() - ts0;
+        pthread_t sth[8];
+        ts0 = now_ms();
+        for (int i = 0; i < nth; i++) pthread_create(&sth[i], NULL, scan_reader, NULL);
+        for (int i = 0; i < nth; i++) pthread_join(sth[i], NULL);
+        double many = now_ms() - ts0;
+        double speed = many > 0 ? nth * one / many : 0;
+        printf("%d parallel full scans of a table larger than the cache: %.2fx the work of one reader (one: %.0f ms, %d: %.0f ms, %ld CPUs)\n",
+               nth, speed, one / 3, nth, many / 3, ncpu);
+        CHECK(atomic_load(&g_scan_bad) == 0, "parallel scans all correct (%d bad)", atomic_load(&g_scan_bad));
+        if (ncpu >= 8 && !getenv("CI")) CHECK(speed >= 3.0, "8 readers do at least 3x the work of one (%.2fx)", speed);
+    }
 
     db_shutdown();
     if (system("rm -rf /tmp/sv_par_test")) {}
