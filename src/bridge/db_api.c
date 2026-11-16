@@ -3030,13 +3030,16 @@ QueryResult* db_describe(const char* sql) {
 }
 
 void db_sync_tick(void) {
-    if (!g_db.initialized || g_lock_depth) return;
+    if (g_lock_depth) return;                        // (per thread) questo thread ha già il motore
     if (!sv_rw_trywr(&g_db_rw)) return;              // il motore è occupato: lo statement successivo farà il sync
     g_lock_depth = 1;
-    double now = get_time_ms();
-    if (g_db.initialized && g_sync_mode >= 1 && g_db.wal && g_db.wal->unsynced && !g_db.exec_ctx.tx_id && !io_failed() &&
-        now - g_last_sync >= SYNC_NORMAL_MS && wal_flush(g_db.wal) == SV_OK) g_last_sync = now;
-    pf_process();                                    // catene liberate ora che il log è su disco
+    // g_db.initialized si legge solo con il motore: db_shutdown lo azzera tenendolo (TSan: lettura prima del lock)
+    if (g_db.initialized) {
+        double now = get_time_ms();
+        if (g_sync_mode >= 1 && g_db.wal && g_db.wal->unsynced && !g_db.exec_ctx.tx_id && !io_failed() &&
+            now - g_last_sync >= SYNC_NORMAL_MS && wal_flush(g_db.wal) == SV_OK) g_last_sync = now;
+        pf_process();                                // catene liberate ora che il log è su disco
+    }
     db_unlock();
 }
 

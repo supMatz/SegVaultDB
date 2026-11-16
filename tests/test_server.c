@@ -196,7 +196,7 @@ static uint64_t my_lenenc(const uint8_t* p, size_t* pos) {
     return v;
 }
 
-static unsigned g_my_warn;                               // avvisi dell'ultimo OK di my_query
+static _Thread_local unsigned g_my_warn;                 // avvisi dell'ultimo OK di my_query (per thread)
 
 // esegue una query: "OK:n" / "ERR:codice messaggio" / righe "a|b;c|d" (più risultati separati da " / ")
 static void my_query(My* m, const char* sql, char* out, size_t on) {
