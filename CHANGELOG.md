@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.1 — 2026-11-16
+
+- Windows: the executables built by the release workflow (MinGW of Ubuntu, `msvcrt` printf) did not
+  understand `%zu`: the `CONTENT_LENGTH` given to PHP could be wrong, so POST bodies to PHP scripts were lost.
+  Windows builds now use MinGW's C99 printf (`__USE_MINGW_ANSI_STDIO`).
+- macOS: the server builds again (`prctl` is Linux-only).
+- CI: Windows ACL test accepts the built-in administrator account of the runners; no compiler warnings left.
+
 ## 1.4.0 — 2026-11-16
 
 Second round of the code audit (details and tests for each item in `TODO.md`).

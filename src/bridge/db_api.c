@@ -1044,8 +1044,12 @@ static uint64_t  g_chg_seq;
 static void chg_hook(uint64_t tx, const char* db, const char* table, uint8_t type, RID rid, RID nrid, const uint8_t* old, size_t ol) {
     if (g_nchg == g_capchg) {
         int nc = g_capchg ? g_capchg * 2 : 256;
-        TxChange* nv = sv_realloc(g_chg, sizeof(TxChange) * (size_t)nc);
+        // blocco nuovo + copia invece di realloc: il ramo "memoria esaurita" usa ancora il vecchio (GCC 13 vedeva un
+        // uso dopo realloc dove non c'è)
+        TxChange* nv = sv_try_malloc(sizeof(TxChange) * (size_t)nc);
         if (!nv) { if (g_nchg) g_chg[g_nchg - 1].type = 0; g_chg_lost = true; return; }   // la transazione non si potrà leggere confermata
+        if (g_nchg) memcpy(nv, g_chg, sizeof(TxChange) * (size_t)g_nchg);
+        free(g_chg);
         g_chg = nv;
         g_capchg = nc;
     }

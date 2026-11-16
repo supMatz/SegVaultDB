@@ -232,7 +232,7 @@ test_h2: $(TEST_H2_SRCS) src/server/h2.h
 # codice solo Windows (offset a 64 bit, MoveFileEx, motore): cross-compilato, eseguito con wine (o su Windows)
 WIN_RUN ?= WINEDEBUG=-all DISPLAY= wine   # su Windows (MSYS2): make test-win WIN_CC=gcc WIN_RUN=
 test-win: tests/test_win.c $(ENGINE_SRCS)
-	$(WIN_CC) -std=c11 -D_GNU_SOURCE -O1 -I. $(BASE_INCLUDES) -o test_win.exe tests/test_win.c $(ENGINE_SRCS) -static -lws2_32 -ladvapi32
+	$(WIN_CC) -std=c11 -D_GNU_SOURCE -O1 $(WIN_EXTRA) -I. $(BASE_INCLUDES) -o test_win.exe tests/test_win.c $(ENGINE_SRCS) -static -lws2_32 -ladvapi32
 	cd /tmp && $(WIN_RUN) $(CURDIR)/test_win.exe
 
 # fuzzer mutazionale sotto ASan + UBSan: make fuzz [FUZZ_TARGET=sql|json|login|page|catalog|exec|all] [FUZZ_SECS=60]
@@ -419,9 +419,13 @@ windows: $(WIN_OBJS) $(WIN_SERVER_OBJS)
 	$(WIN_CC) $(CFLAGS) -o segvault-server.exe $(WIN_SERVER_OBJS) -static -lws2_32 -liphlpapi -ladvapi32
 	@echo "=== Windows build: segvault.exe, segvault-server.exe ==="
 
+# printf C99 di MinGW (%zu, %lld anche con la msvcrt di Ubuntu); i "may be truncated" di GCC 13 MinGW sono snprintf
+# che troncano apposta
+WIN_EXTRA = -D__USE_MINGW_ANSI_STDIO=1 -Wno-format-truncation
+
 build-win/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(WIN_CC) $(CFLAGS) $(DEPFLAGS) $(BASE_INCLUDES) -c $< -o $@
+	$(WIN_CC) $(CFLAGS) $(WIN_EXTRA) $(DEPFLAGS) $(BASE_INCLUDES) -c $< -o $@
 
 clean:
 	$(RM) $(FULL_OBJS) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql bench_suite test_decimal test_decimal_asan build-test-decimal.txt test_examples test_examples_asan

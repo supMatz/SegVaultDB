@@ -89,7 +89,7 @@ int main(void) {
             int na = 0, nd = 0;
             for (const char* q = au; (q = strstr(q, "(A;")); q++) na++;
             for (const char* q = ad; (q = strstr(q, "(A;")); q++) nd++;
-            CHECK(!strncmp(au, "D:P", 3) && na == 2 && strstr(au, ";;;SY)") && strstr(au, "S-1-5-") && !strstr(au, ";;;WD)") && !strstr(au, ";;;BU)"),
+            CHECK(!strncmp(au, "D:P", 3) && na == 2 && strstr(au, ";;;SY)") && (strstr(au, "S-1-5-") || strstr(au, ";;;LA)")) && !strstr(au, ";;;WD)") && !strstr(au, ";;;BU)"),
                   "owner-only ACL on users.dat: %s", au);
             CHECK(!strncmp(ad, "D:P", 3) && nd == 2 && strstr(ad, "OICI"), "owner-only, inherited ACL on the data folder: %s", ad);
         }

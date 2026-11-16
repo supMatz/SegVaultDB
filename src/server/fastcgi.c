@@ -37,7 +37,9 @@ SCOPO: client FastCGI e gruppo di processi php-cgi (vedi fastcgi.h).
   #include <netinet/tcp.h>
   #include <pthread.h>
   #include <signal.h>
+  #ifdef __linux__
   #include <sys/prctl.h>
+  #endif
   #include <sys/socket.h>
   #include <sys/syscall.h>
   #include <sys/un.h>
@@ -296,7 +298,9 @@ static bool worker_start(FcgiPool* p, FcgiWorker* w, char* err, size_t errsz) {
     if (pid < 0) { snprintf(err, errsz, "fork failed: %s", strerror(errno)); return false; }
     if (pid == 0) {
         // figlio: solo chiamate sicure dopo fork in un processo con più thread
-        prctl(PR_SET_PDEATHSIG, SIGTERM);          // se SegVault muore, muore anche php-cgi
+#ifdef __linux__
+        prctl(PR_SET_PDEATHSIG, SIGTERM);          // se SegVault muore, muore anche php-cgi (solo Linux)
+#endif
         int nul = open("/dev/null", O_RDWR);
         if (nul >= 0) { dup2(nul, 0); dup2(nul, 1); }
 #ifdef SYS_close_range
