@@ -23,8 +23,8 @@ not executed; **[verify-win]** = Windows-only, needs a run on Windows.
 
 **Status 2026-11-16 (after 1.4.2):** closed P3.10 (CA name constraints); P1.14 partly done (column pruning,
 early stop at `LIMIT`); P3.9 advanced (executor write-path probes, `win32.c` launch / clipboard paths); still
-open P1.6 (step 1 done: read-only B+trees written at shutdown / `CHECKPOINT`; step 2, maintained trees, open),
-P1.14 (pull-based executor and cursor API), P3.9
+closed P1.6 (read-only B+trees written at shutdown / `CHECKPOINT`; maintained trees → new P1.15); open P1.14
+(single-table `SELECT` streams; `ORDER BY` / `GROUP BY` / joins still materialise), P1.15, P3.9
 (`parser.c`, most of `executor.c`, `src/widgets/*`, rest of `win32.c`).
 
 **Status after v1.3.0 (2026-11-15):** fixed `[x]` P0.1-P0.12 (Windows parts verified under wine), P1.2, P1.3, P1.4, P1.8, P1.12, P2.1, P2.9, P2.11, P2.13, P3.1, P3.4, P3.7;
@@ -498,7 +498,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     of other transactions), the free list still lives in `segvault.free` (rebuilt by VACUUM if lost), no
     size-class bins (the free-space map scan with its hint stays).
 
-- [~] **P1.6 `[ENGINE]` Indexes exist only in memory; the on-disk B+tree is dead code**
+- [x] **P1.6 `[ENGINE]` Indexes exist only in memory; the on-disk B+tree is dead code**
   - **Where:** `src/index/btree.c` (319 lines, `uint64_t` keys, unique only, no delete rebalancing, not WAL-logged)
     is referenced only by `tests/test_btree.c`; real indexes are `MemIndex` in `src/query/executor.c:1303-1560`,
     built by scanning the table on first use and dropped by every rollback / `REPAIR` (`db_api.c:1242,1302,475`).
@@ -557,7 +557,25 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     tree takes 21 ms once (0.4 ms afterwards). `bench/suite.c`: `cold_start` now runs the same first query as
     the SQLite variant (`SELECT COUNT(*)`) after one untimed reopen, new `cold_lookup` scenario (first
     primary-key lookup after reopening: 60 000/s, SQLite 92 000/s); both baselines updated for these two
-    scenarios only (the scenario changed, so the 1.3 ratio no longer applies).
+    scenarios only (the scenario changed, so the 1.3 ratio no longer applies). Power cut at every write of a
+    `CHECKPOINT` that rewrites a tree (51 points, `tests/test_durability.c` §10): lookups always right after
+    the restore, `VACUUM` works. **The three "Done when" criteria hold** (≤ 4 page reads after a cold start,
+    `EXPLAIN` shows the index, crash tests over a tree write in progress — bulk-built trees have no splits);
+    the maintained tree (step 2) is **P1.15**.
+
+- [ ] **P1.15 `[ENGINE]` On-disk B+tree maintained by writes (P1.6 step 2)** — [code] · **Size:** XL · **Deps:** P1.6
+  - **Where:** `src/index/bptree.c` (read-only trees), `src/query/executor.c` (`MemIndex`, `trees_on_write`).
+  - **Why:** after the first write a table goes back to its in-memory index (built by a full scan, memory outside
+    the buffer pool, lost on every rollback of a write to the table) until the next clean shutdown or
+    `CHECKPOINT`; uniqueness checks of bulk loads still need the whole index in RAM; range scans and composite
+    keys never use the disk.
+  - **Do:** insert / delete in the tree inside the transaction; every changed page logged as a page image with
+    the transaction id (`LOG_PAGE_IMAGE` exists; undo restores the before-image), splits and merges as one
+    atomic group of images; range scans through leaf sibling links; composite keys with the same text
+    encoding; `MemIndex` kept only as an optional cache.
+  - **Done when:** a table written after a restart keeps answering point and range lookups with ≤ 4 page reads
+    and no full scan; power cut at every write of a split; RSS of a 10 M-row table with two indexes does not
+    grow with the index size.
 
 - [x] **P1.7 `[CONCURRENCY]` Table locks for plain reads cause upgrade deadlocks; waits are polled; writers can starve** — [code]
   - **Where:** `src/bridge/db_api.c:841-878` (every `SELECT` takes `LK_S` on its tables, kept to `COMMIT`,

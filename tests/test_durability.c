@@ -1326,6 +1326,64 @@ int main(void) {
         ok("USE d");
         CHECK(num("SELECT id FROM big WHERE id = 456") == 456 && num("SELECT id FROM big WHERE email = 'User888@Example.com'") == 888,
               "a damaged tree falls back to the table");
+        // caduta di corrente a ogni scrittura di un CHECKPOINT che scrive gli alberi: dopo il ripristino le ricerche
+        // sono giuste (albero intero e nominato dal catalogo, o nessun albero) e VACUUM recupera le pagine orfane
+        db_shutdown();
+        sh("rm -rf " TB "_pw && mkdir -p " TB "_pw");
+        if (db_init(TB "_pw")) {
+            ok("CREATE DATABASE d"); ok("USE d");
+            ok("CREATE TABLE tp (id INT PRIMARY KEY, v VARCHAR(20))");
+            ok("BEGIN");
+            for (int i = 1; i <= 3000; i++) { char q2[100]; snprintf(q2, sizeof(q2), "INSERT INTO tp VALUES (%d, 'v%d')", i, i); ok(q2); }
+            ok("COMMIT");
+            ok("CHECKPOINT");                                   // nessun indice in memoria ancora: niente alberi
+            db_shutdown();
+        }
+        int pw_points = 0, pw_bad = 0, pw_done = 0;
+        for (int k = 1; k < 400 && !pw_done; k++) {
+            sh("rm -rf " TB "_pwk && cp -r " TB "_pw " TB "_pwk");
+            remove(POWER_JOURNAL);
+            pid_t pp = fork();
+            if (pp == 0) {
+                if (!db_init(TB "_pwk")) _exit(2);
+                ok("USE d");
+                ok("SET GLOBAL synchronous = FULL");
+                ok("UPDATE tp SET v = 'v1' WHERE id = 1");          // l'albero della chiusura non vale più
+                if (num("SELECT v FROM tp WHERE id = 10") < 0) {}   // indice in memoria: il checkpoint lo riscrive
+                g_power = true;
+                g_power_at = k;
+                ok("CHECKPOINT");
+                g_power = false;
+                _exit(3);
+            }
+            int ps;
+            waitpid(pp, &ps, 0);
+            if (WIFEXITED(ps) && WEXITSTATUS(ps) == 3) pw_done = 1;
+            power_restore();
+            if (!db_init(TB "_pwk")) { pw_bad++; CHECK(false, "restart after a power cut at write %d of the tree checkpoint: %s", k, db_init_error()); continue; }
+            ok("USE d");
+            bool good = true;
+            for (int id = 1; id <= 3000 && good; id += 499) {
+                char q2[100], want[16];
+                snprintf(q2, sizeof(q2), "SELECT v FROM tp WHERE id = %d", id);
+                snprintf(want, sizeof(want), "v%d", id);
+                QueryResult* rr = q(q2);
+                good = rr && rr->success && rr->num_rows == 1 && !strcmp(rr->rows[0].cells[0].value, want);
+                db_result_free(rr);
+            }
+            QueryResult* vr2 = q("VACUUM");
+            good = good && vr2 && vr2->success;
+            db_result_free(vr2);
+            if (!good) pw_bad++;
+            CHECK(good, "power cut at write %d of the tree checkpoint: lookups right, VACUUM works", k);
+            db_shutdown();
+            pw_points++;
+        }
+        CHECK(pw_done, "the tree checkpoint eventually completes");
+        printf("power cut while writing on-disk indexes: %d points checked, %d bad\n", pw_points, pw_bad);
+        sh("rm -rf " TB "_pw " TB "_pwk");
+        CHECK(db_init(TB), "reopen after the power-cut sweep");
+        ok("USE d");
         // DROP TABLE e VACUUM: le pagine degli alberi tornano libere
         db_shutdown();
         CHECK(db_init(TB), "reopen for VACUUM");
