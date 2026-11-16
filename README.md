@@ -200,7 +200,10 @@ Perl, Python e Ruby classici (`.cgi`, `.pl`, `.py`, `.rb`): `--cgi`.
 
 **HTTPS.** Ogni sito risponde anche su `https://NOME.localhost:8443` (HTTP/2). Una volta sola:
 `segvault-server --trust-ca data` (o *Trust certificate* nel pannello) e i browser non mostrano più
-avvisi. Serve per cookie `Secure`, service worker, OAuth, webcam e microfono.
+avvisi. Serve per cookie `Secure`, service worker, OAuth, webcam e microfono. Dalla 1.4.3 la CA locale può
+firmare solo `localhost`, `*.localhost`, `*.test`, `127.0.0.0/8` e `::1` (name constraints): anche chi ne
+copiasse la chiave non otterrebbe un certificato valido per un sito vero. Una CA creata prima si sostituisce con
+`segvault-server --renew-ca data` seguito da `--trust-ca` (la vecchia resta come `ca.crt.old`).
 
 **Posta.** Nessuna email esce dal computer; si leggono su `http://localhost:8484/.segvault/mail/`.
 

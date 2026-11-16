@@ -4,7 +4,7 @@ segvault.exe
 *.o
 obj/
 build-win/
-
+docs/prompts/
 # Runtime data directory (created by ./segvault)
 data/
 

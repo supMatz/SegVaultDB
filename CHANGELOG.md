@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+**Security**
+- The local certificate authority carries critical X.509 name constraints: it can only sign `localhost`,
+  `*.localhost`, `*.test`, `127.0.0.0/8` and `::1`. Certificates are minted only for local site names; the
+  256-entry leaf cache replaces its oldest entry instead of refusing new names. A CA made before is
+  recognised at start (one-line warning) and `--renew-ca` replaces it (the old one is kept as `ca.crt.old`).
+
 ## 1.4.2 — 2026-11-16
 
 - Windows: the 1.4.1 fix was not enough — with `_FORTIFY_SOURCE` the MinGW of Ubuntu still routes `snprintf`

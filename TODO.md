@@ -1400,7 +1400,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     - The fuzz harness (`tests/fuzz/fuzz.c`) had stopped working after P1.11 (a static `TableSchema` with no
       column storage: every target died at start-up under UBSan); fixed with `schema_new`.
 
-- [ ] **P3.10 `[SECURITY]` Constrain the local certificate authority** — [code]
+- [x] **P3.10 `[SECURITY]` Constrain the local certificate authority** — [code]
   - **Where:** `src/server/tls.c` `make_cert` (CA: `basicConstraints CA:TRUE, pathlen:0`, no `nameConstraints`),
     `ctx_for` (a leaf for any SNI name that passes `good_name`, cached up to `LEAF_CACHE` = 256).
   - **Why:** the CA is installed as a trusted root by `--trust-ca`; it can sign for `bank.example` as well as
@@ -1415,6 +1415,19 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
   - **Done when:** a certificate for `example.com` signed by a new CA is rejected by `openssl verify` with the
     CA as the only root, `shop.localhost` still verifies, and 1 000 random SNI names do not stop a new site name
     from getting its certificate.
+  - **Done (2026-11-16):** new CAs get a critical `nameConstraints` extension (permitted `DNS:localhost`, which
+    covers `*.localhost`, `DNS:test`, `127.0.0.0/8`, `::1/128`) — the server serves only those names, so no
+    configured-site list is needed. `ctx_for` mints a leaf only for `*.localhost` / `*.test` (other SNI names
+    get the `localhost` certificate); a full cache replaces its oldest entry, and the context is handed out
+    with its own reference (`SSL_CTX_up_ref`, dropped after `SSL_set_SSL_CTX`) so an eviction cannot free a
+    context another thread is about to use. A CA without the extension is still used (it is already
+    trusted) but reported at start; `segvault-server --renew-ca` moves it to `ca.crt.old` / `ca.key.old` and
+    makes a constrained one (restored if the new one cannot be made). Tests in `tests/test_tls.c`: the CA
+    carries the constraints; a certificate for `example.com` signed with the CA key by the `openssl` CLI fails
+    `openssl verify`, `shop.localhost` and `api.blog.test` verify; after 300 SNI names `fresh.localhost` and
+    an evicted name still get their own certificate, `example.com` gets `localhost`; an old-style CA is
+    recognised and `tls_renew_ca` replaces it keeping the old files. **Not verified:** which browsers enforce
+    name constraints on a user-added root (OpenSSL does; the `--trust-ca` stores were not exercised).
 
 ---
 

@@ -172,6 +172,7 @@ static void usage(const char* argv0) {
            "      --https-port P    HTTPS too (e.g. 8443), with certificates from a local authority (DATA/certs/ca.crt)\n"
            "                        made for each site name: https://NAME.localhost:P\n"
            "      --trust-ca        add the local authority to the trusted ones (browsers, and the system if root), then exit\n"
+           "      --renew-ca        replace the local authority with one limited to local names, then exit\n"
            "      --cert-dir DIR    where the local authority is kept (default DATA/certs)\n"
            "      --no-http2        HTTPS with HTTP/1.1 only\n"
            "      --install-service start this server (with the same options) when you log in: systemd user\n"
@@ -199,7 +200,7 @@ int main(int argc, char** argv) {
     bool no_auth = false;
     const char* sync_mode = NULL;
     const char* php_arg = NULL;
-    bool trust_ca = false, background = false;
+    bool trust_ca = false, renew_ca = false, background = false;
     // servizio dell'utente: stessa riga di comando, senza questa opzione
     for (int i = 1; i < argc; i++) {
         char out[8000];
@@ -268,6 +269,7 @@ int main(int argc, char** argv) {
         else if (ARG("--cert-dir", "--cert-dir")) cfg.cert_dir = argv[++i];
         else if (!strcmp(a, "--no-http2")) cfg.http2 = false;
         else if (!strcmp(a, "--trust-ca")) trust_ca = true;
+        else if (!strcmp(a, "--renew-ca")) renew_ca = true;
         else if (!strcmp(a, "--background")) background = true;
         else if (!strcmp(a, "--no-dir-listing")) cfg.dir_listing = false;
         else if (!strcmp(a, "--no-htaccess")) cfg.no_htaccess = true;
@@ -328,6 +330,12 @@ int main(int argc, char** argv) {
     if (!cfg.cert_dir) {
         snprintf(cert_dir_buf, sizeof(cert_dir_buf), "%s/certs", data_dir);
         cfg.cert_dir = cert_dir_buf;
+    }
+    if (renew_ca) {                     // CA nuova con i name constraints (P3.10) ed esce
+        char out[2000];
+        int r = tls_renew_ca(cfg.cert_dir, out, sizeof(out));
+        fputs(out, r ? stderr : stdout);
+        return r;
     }
     if (trust_ca) {                     // installa la CA locale tra quelle fidate ed esce
         char out[4000];

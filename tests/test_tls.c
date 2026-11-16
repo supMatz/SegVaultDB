@@ -2,6 +2,7 @@
 // certificati con la CA locale): senza curl o senza OpenSSL il test viene saltato.
 //   make test_tls && ./test_tls
 #include "src/server/server.h"
+#include "src/server/tls.h"
 #include "src/bridge/db_api.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -20,6 +21,17 @@ static int g_fail = 0, g_count = 0;
 #define CHECK(cond, ...) do { g_count++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 static char g_ca[600];
+
+// comando della shell, uscita raccolta (al più 64 KB)
+static char* sh_out(const char* cmd) {
+    FILE* p = popen(cmd, "r");
+    char* out = calloc(1, 65536);
+    if (!p) return out;
+    size_t n = fread(out, 1, 65535, p);
+    out[n] = 0;
+    pclose(p);
+    return out;
+}
 
 // esegue curl e ne raccoglie l'uscita
 static char* run(const char* args) {
@@ -233,6 +245,35 @@ int main(void) {
         CHECK(g == 0, "forged TLS marker refused: %zd", g);
         close(fd);
     }
+    // P3.10: la CA firma solo nomi locali; certificati al volo solo per *.localhost / *.test; cache piena = sostituzione
+    if (system("openssl version >/dev/null 2>&1") == 0) {
+        char cmd[3000];
+        snprintf(cmd, sizeof(cmd), "openssl x509 -in '%s' -noout -text | grep -c 'DNS:localhost\\|DNS:test\\|Name Constraints: critical'", g_ca);
+        o = sh_out(cmd);
+        CHECK(atoi(o) == 3, "CA with critical name constraints (localhost, test): %s", o);
+        free(o);
+        const char* names[] = { "example.com", "shop.localhost", "api.blog.test" };
+        const bool want[] = { false, true, true };
+        for (int i = 0; i < 3; i++) {
+            snprintf(cmd, sizeof(cmd), "cd '%s' && openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout k.pem "
+                     "-subj '/CN=%s' -addext 'subjectAltName=DNS:%s' -out r.csr 2>/dev/null && openssl x509 -req -in r.csr -CA '%s' "
+                     "-CAkey '%s/ca.key' -CAcreateserial -days 30 -copy_extensions copy -out c.pem 2>/dev/null && "
+                     "openssl verify -CAfile '%s' c.pem >/dev/null 2>&1 && echo VERIFIED; rm -f k.pem r.csr c.pem", tmp, names[i], names[i], g_ca, certs, g_ca);
+            o = sh_out(cmd);
+            CHECK((strstr(o, "VERIFIED") != NULL) == want[i], "a certificate for %s signed with the CA key %s", names[i], want[i] ? "verifies" : "is rejected");
+            free(o);
+        }
+        // 300 nomi diversi riempiono la cache (256): un nome nuovo riceve comunque il suo certificato
+        snprintf(cmd, sizeof(cmd), "for i in $(seq 300); do echo | openssl s_client -connect 127.0.0.1:%d -servername r$i.localhost >/dev/null 2>&1; done; "
+                 "echo | openssl s_client -connect 127.0.0.1:%d -servername fresh.localhost 2>/dev/null | openssl x509 -noout -subject; "
+                 "echo | openssl s_client -connect 127.0.0.1:%d -servername r1.localhost 2>/dev/null | openssl x509 -noout -subject; "
+                 "echo | openssl s_client -connect 127.0.0.1:%d -servername example.com 2>/dev/null | openssl x509 -noout -subject", hp, hp, hp, hp);
+        o = sh_out(cmd);
+        CHECK(strstr(o, "CN = fresh.localhost") || strstr(o, "CN=fresh.localhost"), "after 300 SNI names a new site still gets its certificate: %s", o);
+        CHECK(strstr(o, "CN = r1.localhost") || strstr(o, "CN=r1.localhost"), "an evicted name gets a new certificate: %s", o);
+        CHECK(strstr(o, "CN = localhost") || strstr(o, "CN=localhost\n"), "a name that is not a local site gets the localhost certificate: %s", o);
+        free(o);
+    }
     sv_server_stop(s);
     pthread_join(th, NULL);
     sv_server_free(s);
@@ -279,6 +320,25 @@ int main(void) {
     db_shutdown();
     char rm[400];
     snprintf(rm, sizeof(rm), "rm -rf %s", tmp);
+    // P3.10: una CA vecchia (senza name constraints) si riconosce e --renew-ca la sostituisce, tenendo la vecchia
+    if (system("openssl version >/dev/null 2>&1") == 0) {
+        char od[400], cmd[1200], out[2000], err2[300];
+        snprintf(od, sizeof(od), "%s/oldcerts", tmp);
+        mkdir(od, 0700);
+        snprintf(cmd, sizeof(cmd), "cd '%s' && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key -out ca.crt "
+                 "-days 30 -subj '/CN=old CA' -addext 'basicConstraints=critical,CA:TRUE' 2>/dev/null", od);
+        CHECK(system(cmd) == 0, "old-style CA prepared");
+        TlsCtx* t = tls_create(od, err2, sizeof(err2));
+        CHECK(t && tls_ca_unconstrained(t), "a CA without name constraints is recognised");
+        tls_free(t);
+        CHECK(tls_renew_ca(od, out, sizeof(out)) == 0, "--renew-ca: %s", out);
+        t = tls_create(od, err2, sizeof(err2));
+        CHECK(t && !tls_ca_unconstrained(t), "the renewed CA has name constraints");
+        tls_free(t);
+        snprintf(cmd, sizeof(cmd), "%s/ca.crt.old", od);
+        struct stat st2;
+        CHECK(stat(cmd, &st2) == 0, "the old CA is kept as ca.crt.old");
+    }
     if (system(rm)) {}
     printf("test_tls: %d checks, %d failed\n", g_count, g_fail);
     return g_fail ? 1 : 0;

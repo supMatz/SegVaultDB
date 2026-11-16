@@ -29,6 +29,9 @@ typedef struct TlsCtx TlsCtx;
 TlsCtx* tls_create(const char* cert_dir, char* err, size_t errsz);
 void    tls_free(TlsCtx* t);
 const char* tls_ca_path(const TlsCtx* t);     // percorso di ca.crt
+bool        tls_ca_unconstrained(const TlsCtx* t);   // CA di prima della 1.4.3 (senza name constraints)
+// nuova CA limitata ai nomi locali; la vecchia resta come ca.crt.old / ca.key.old. 0 = fatto, messaggio in out
+int         tls_renew_ca(const char* cert_dir, char* out, size_t outsz);
 const char* tls_library(const TlsCtx* t);     // "OpenSSL 3.x ..." (per il log)
 
 // una connessione dal client: handshake, poi i byte decifrati vanno e vengono da 127.0.0.1:inner_port.

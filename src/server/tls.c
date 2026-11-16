@@ -103,6 +103,7 @@ typedef struct asn1_string_st ASN1_TIME;
 #define NID_key_usage 83
 #define NID_ext_key_usage 126
 #define NID_subject_alt_name 85
+#define NID_name_constraints 666
 
 static struct {
     lib_t ssl, crypto;
@@ -127,6 +128,7 @@ static struct {
     int      (*SSL_get_error)(const SSL*, int);
     const char* (*SSL_get_servername)(const SSL*, int);
     SSL_CTX* (*SSL_set_SSL_CTX)(SSL*, SSL_CTX*);
+    int      (*SSL_CTX_up_ref)(SSL_CTX*);
     void     (*SSL_get0_alpn_selected)(const SSL*, const unsigned char**, unsigned int*);
     const void* (*SSL_get_current_cipher)(const SSL*);
     const char* (*SSL_CIPHER_get_name)(const void*);
@@ -160,6 +162,7 @@ static struct {
     EVP_PKEY* (*PEM_read_bio_PrivateKey)(BIO*, EVP_PKEY**, void*, void*);
     const char* (*OpenSSL_version)(int);
     int       (*RAND_bytes)(unsigned char*, int);
+    int       (*X509_get_ext_by_NID)(const X509*, int, int);
     // facoltative (caching_sha2_password via RSA): se mancano, solo quel percorso non c'è
     const void* (*BIO_s_mem)(void);
     BIO*      (*BIO_new)(const void*);
@@ -254,14 +257,14 @@ static bool openssl_load(char* err, size_t errsz) {
     S(TLS_server_method); S(SSL_CTX_new); S(SSL_CTX_free); S(SSL_CTX_use_certificate); S(SSL_CTX_use_PrivateKey);
     S(SSL_CTX_ctrl); S(SSL_CTX_callback_ctrl); S(SSL_CTX_set_alpn_select_cb); S(SSL_new); S(SSL_free); S(SSL_set_fd);
     S(SSL_accept); S(SSL_read); S(SSL_write); S(SSL_pending); S(SSL_shutdown); S(SSL_get_error); S(SSL_get_servername);
-    S(SSL_set_SSL_CTX); S(SSL_get0_alpn_selected); S(SSL_select_next_proto);
+    S(SSL_set_SSL_CTX); S(SSL_CTX_up_ref); S(SSL_get0_alpn_selected); S(SSL_select_next_proto);
     S(SSL_get_current_cipher); S(SSL_CIPHER_get_name); S(SSL_get_version);
     C(EVP_PKEY_Q_keygen); C(EVP_PKEY_free); C(EVP_sha256); C(X509_new); C(X509_free); C(X509_set_version);
     C(X509_get_serialNumber); C(ASN1_INTEGER_set); C(X509_getm_notBefore); C(X509_getm_notAfter); C(X509_gmtime_adj);
     C(X509_set_pubkey); C(X509_get_subject_name); C(X509_set_issuer_name); C(X509_NAME_add_entry_by_txt);
     C(X509V3_EXT_nconf_nid); C(X509_add_ext); C(X509_EXTENSION_free); C(X509_sign); C(BIO_new_file); C(BIO_free);
     C(PEM_write_bio_X509); C(PEM_write_bio_PrivateKey); C(PEM_read_bio_X509); C(PEM_read_bio_PrivateKey);
-    C(OpenSSL_version); C(RAND_bytes);
+    C(OpenSSL_version); C(RAND_bytes); C(X509_get_ext_by_NID);
     #define OPT(name) (*(void**)&O.name = lib_sym(O.crypto, #name))
     OPT(BIO_s_mem); OPT(BIO_new); OPT(BIO_ctrl); OPT(PEM_write_bio_PUBKEY); OPT(EVP_PKEY_CTX_new); OPT(EVP_PKEY_CTX_free);
     OPT(EVP_PKEY_decrypt_init); OPT(EVP_PKEY_CTX_set_rsa_padding); OPT(EVP_PKEY_decrypt);
@@ -344,6 +347,8 @@ struct TlsCtx {
     tls_mx    mx;
     Leaf      leaves[LEAF_CACHE];
     int       nleaves;
+    int       next_evict;             // cache piena: si sostituisce a giro (prima: nessun certificato nuovo)
+    bool      ca_unconstrained;       // CA di prima della 1.4.3, senza name constraints (--renew-ca)
 };
 
 static long rand_serial(void) {
@@ -363,6 +368,9 @@ static bool add_ext(X509* x, int nid, const char* value) {
     return ok;
 }
 
+#define TLS_CA_CONSTRAINTS "critical,permitted;DNS:localhost,permitted;DNS:test,permitted;IP:127.0.0.0/255.0.0.0," \
+                           "permitted;IP:0:0:0:0:0:0:0:1/FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF"
+
 // certificato firmato da issuer (o autofirmato se issuer è NULL)
 static X509* make_cert(EVP_PKEY* key, const char* cn, X509* issuer, EVP_PKEY* issuer_key, long days, bool ca, const char* san) {
     X509* x = O.X509_new();
@@ -376,7 +384,10 @@ static X509* make_cert(EVP_PKEY* key, const char* cn, X509* issuer, EVP_PKEY* is
     ok = ok && O.X509_NAME_add_entry_by_txt(nm, "O", MBSTRING_ASC, (const unsigned char*)"SegVault development", -1, -1, 0) == 1 &&
          O.X509_NAME_add_entry_by_txt(nm, "CN", MBSTRING_ASC, (const unsigned char*)cn, -1, -1, 0) == 1;
     ok = ok && O.X509_set_issuer_name(x, issuer ? O.X509_get_subject_name(issuer) : nm) == 1;
-    if (ca) ok = ok && add_ext(x, NID_basic_constraints, "critical,CA:TRUE,pathlen:0") && add_ext(x, NID_key_usage, "critical,keyCertSign,cRLSign");
+    // CA (P3.10): firma solo nomi di questa macchina. Chi le ruba la chiave non ottiene un certificato valido per
+    // un dominio vero: localhost / *.localhost, *.test, 127.0.0.0/8, ::1 (i nomi che il server serve)
+    if (ca) ok = ok && add_ext(x, NID_basic_constraints, "critical,CA:TRUE,pathlen:0") && add_ext(x, NID_key_usage, "critical,keyCertSign,cRLSign") &&
+              add_ext(x, NID_name_constraints, TLS_CA_CONSTRAINTS);
     else ok = ok && add_ext(x, NID_basic_constraints, "critical,CA:FALSE") && add_ext(x, NID_key_usage, "critical,digitalSignature,keyEncipherment") &&
               add_ext(x, NID_ext_key_usage, "serverAuth") && add_ext(x, NID_subject_alt_name, san);
     ok = ok && O.X509_sign(x, issuer_key ? issuer_key : key, O.EVP_sha256()) > 0;
@@ -469,28 +480,45 @@ static bool good_name(const char* n) {
     return true;
 }
 
+// nome servito dal server: localhost, *.localhost, *.test (gli altri nomi ricevono il certificato di localhost)
+static bool site_name(const char* n) {
+    size_t l = strlen(n);
+    return (l > 10 && !strcmp(n + l - 10, ".localhost")) || (l > 5 && !strcmp(n + l - 5, ".test"));
+}
+
+// contesto per il nome SNI, con un riferimento in più per il chiamante (SSL_CTX_free dopo SSL_set_SSL_CTX): un
+// altro thread può sostituire la voce della cache nel frattempo
 static SSL_CTX* ctx_for(TlsCtx* t, const char* name) {
     char lower[256];
     size_t l = strlen(name);
     if (l >= sizeof(lower)) return NULL;
     for (size_t i = 0; i <= l; i++) lower[i] = (char)((name[i] >= 'A' && name[i] <= 'Z') ? name[i] + 32 : name[i]);
-    if (!good_name(lower) || !strcmp(lower, "localhost")) return NULL;
+    if (!good_name(lower) || !strcmp(lower, "localhost") || !site_name(lower)) return NULL;
     mx_lock(&t->mx);
     for (int i = 0; i < t->nleaves; i++)
-        if (!strcmp(t->leaves[i].name, lower)) { SSL_CTX* c = t->leaves[i].ctx; mx_unlock(&t->mx); return c; }
+        if (!strcmp(t->leaves[i].name, lower)) {
+            SSL_CTX* c = t->leaves[i].ctx;
+            O.SSL_CTX_up_ref(c);
+            mx_unlock(&t->mx);
+            return c;
+        }
     SSL_CTX* c = NULL;
-    if (t->nleaves < LEAF_CACHE) {
-        char san[600];
-        snprintf(san, sizeof(san), "DNS:%s", lower);
-        X509* x = make_cert(t->leaf_key, lower, t->ca, t->ca_key, 397, false, san);
-        if (x) {
-            c = new_ctx(t, x);
-            O.X509_free(x);                       // il contesto ne tiene una copia
-            if (c) {
-                snprintf(t->leaves[t->nleaves].name, sizeof(t->leaves[0].name), "%s", lower);
-                t->leaves[t->nleaves].ctx = c;
-                t->nleaves++;
-            }
+    char san[600];
+    snprintf(san, sizeof(san), "DNS:%s", lower);
+    X509* x = make_cert(t->leaf_key, lower, t->ca, t->ca_key, 397, false, san);
+    if (x) {
+        c = new_ctx(t, x);
+        O.X509_free(x);                           // il contesto ne tiene una copia
+        if (c) {
+            int slot = t->nleaves;
+            if (slot == LEAF_CACHE) {             // piena: via la voce più vecchia (le connessioni che la usano
+                slot = t->next_evict;             // ne tengono un riferimento loro)
+                t->next_evict = (t->next_evict + 1) % LEAF_CACHE;
+                O.SSL_CTX_free(t->leaves[slot].ctx);
+            } else t->nleaves++;
+            snprintf(t->leaves[slot].name, sizeof(t->leaves[0].name), "%s", lower);
+            t->leaves[slot].ctx = c;
+            O.SSL_CTX_up_ref(c);                  // quello del chiamante
         }
     }
     mx_unlock(&t->mx);
@@ -503,7 +531,7 @@ static int sni_cb(SSL* s, int* ad, void* arg) {
     const char* name = O.SSL_get_servername(s, TLSEXT_NAMETYPE_host_name);
     if (name) {
         SSL_CTX* c = ctx_for(t, name);
-        if (c) O.SSL_set_SSL_CTX(s, c);
+        if (c) { O.SSL_set_SSL_CTX(s, c); O.SSL_CTX_free(c); }
     }
     return SSL_TLSEXT_ERR_OK;
 }
@@ -547,6 +575,11 @@ TlsCtx* tls_create(const char* cert_dir, char* err, size_t errsz) {
             return NULL;
         }
     }
+    // CA di prima della 1.4.3: senza name constraints può firmare qualunque dominio (la si tiene: è già fidata)
+    t->ca_unconstrained = O.X509_get_ext_by_NID(t->ca, NID_name_constraints, -1) < 0;
+    if (t->ca_unconstrained)
+        fprintf(stderr, "[SegVault] the local certificate authority in %s can sign any domain (made before 1.4.3): "
+                        "renew it with --renew-ca, then trust the new one with --trust-ca\n", t->dir);
     t->leaf_key = read_key(lp);
     if (!t->leaf_key) {
         t->leaf_key = O.EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
@@ -571,6 +604,32 @@ void tls_free(TlsCtx* t) {
 }
 
 const char* tls_ca_path(const TlsCtx* t) { return t->ca_path; }
+bool tls_ca_unconstrained(const TlsCtx* t) { return t->ca_unconstrained; }
+
+// --renew-ca: la CA attuale (ca.crt, ca.key) diventa ca.crt.old / ca.key.old e se ne crea una nuova, con i name
+// constraints. Le pagine aperte con la vecchia vanno ricaricate dopo --trust-ca
+int tls_renew_ca(const char* cert_dir, char* out, size_t outsz) {
+    char crt[1200], key[1200], o1[1300], o2[1300], err[300];
+    snprintf(crt, sizeof(crt), "%s/ca.crt", cert_dir);
+    snprintf(key, sizeof(key), "%s/ca.key", cert_dir);
+    snprintf(o1, sizeof(o1), "%s.old", crt);
+    snprintf(o2, sizeof(o2), "%s.old", key);
+    remove(o1);
+    remove(o2);
+    bool had = rename(crt, o1) == 0;
+    if (rename(key, o2) != 0 && had) { rename(o1, crt); snprintf(out, outsz, "cannot move %s away\n", key); return 1; }
+    TlsCtx* t = tls_create(cert_dir, err, sizeof(err));
+    if (!t) {                                       // si rimette la vecchia
+        if (had) { rename(o1, crt); rename(o2, key); }
+        snprintf(out, outsz, "%s\n", err);
+        return 1;
+    }
+    snprintf(out, outsz, "New local certificate authority: %s (limited to localhost, *.localhost, *.test, 127.0.0.0/8, ::1)\n"
+             "%sNow trust it with: segvault-server --trust-ca (and remove the old \"SegVault local CA\" from the browsers)\n",
+             t->ca_path, had ? "The old one is kept as ca.crt.old / ca.key.old.\n" : "");
+    tls_free(t);
+    return 0;
+}
 const char* tls_library(const TlsCtx* t) { (void)t; return O.desc; }
 
 // ── connessione ─────────────────────────────────────────────────
