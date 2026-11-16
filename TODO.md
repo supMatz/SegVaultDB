@@ -726,7 +726,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     **Not done:** statistics are not refreshed automatically (only by `ANALYZE`); string columns get distinct
     count and NULL fraction but no histogram; joins with outer joins keep the written order.
 
-- [ ] **P1.14 `[PERF]` The executor materialises every row it reads; results are fully built before they are sent**
+- [~] **P1.14 `[PERF]` The executor materialises every row it reads; results are fully built before they are sent**
   - **Where:** `src/query/executor.c` `plan_load` (~`:7024-7070`): the scan path copies every row that passes the
     `WHERE` into the source's arena (`source_push`), all of them, before joins, aggregation or `LIMIT` run;
     `query_exec` → `QueryResult` with every cell as a string (`db_api.h`), then the MySQL / HTTP layers encode it.
@@ -746,6 +746,21 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
   - **Done when:** that `COUNT(*)` allocates O(1) memory; `SELECT * FROM t LIMIT 10` on a 1 GB table reads
     one page chain prefix; `SELECT *` on a 2 GB table streams through PDO with flat RSS; 8 readers ≥ 6× on
     the P1.10 test with a warm allocator.
+  - **Partly done (2026-11-16):** (1) *column pruning* — the binder counts the references to every column of a
+    source (`Source.needc`, also for `*` expansion, `USING` / `NATURAL`, correlated references from
+    subqueries, index probe and range columns); the scan subtracts the references inside the read-time filters,
+    which are already evaluated on the page view, and copies into the arena only the text columns still used
+    later (the others become NULL in the copied row). (2) *early stop* — a single-table query with
+    `LIMIT` and no `ORDER BY`, grouping, `DISTINCT`, window functions, `SQL_CALC_FOUND_ROWS`, post-read
+    conditions or correlation stops reading at `OFFSET + LIMIT` rows. Measured on the 57 MB table:
+    `SELECT COUNT(*) … WHERE pad <> 'x'` 47 → 20 ms, `SELECT * … LIMIT 10` 56 → 8 ms,
+    `… WHERE v = 5 LIMIT 3` 11 → 0.02 ms; P1.10 scans: one reader 246 → 145 ms, 8 readers 316 → 250 ms for
+    32 scans. Tests: a block in `tests/test_sql.c` (text columns used only in `WHERE`, in `ORDER BY`, `GROUP BY` /
+    `HAVING`, correlated subqueries, `USING` / `NATURAL`, `*`, window partitions, `EXISTS`, `LIMIT` / `OFFSET`);
+    differential fuzzing against SQLite (280 000 queries, 0 different). **Still open:** pull-based operators
+    and a cursor API (results still built whole: no streaming of a 2 GB `SELECT *` through the MySQL protocol);
+    rows that pass the filters still cost a pointer, a RID and their numeric values each (`COUNT(*)` memory
+    is O(rows), not O(1)); the `scan_aggregate` regression is not isolated yet.
 
 ---
 

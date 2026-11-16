@@ -1444,6 +1444,29 @@ int main(void) {
         snprintf(deep + k2, sizeof(deep) - (size_t)k2, "'");
         t(deep, "0");
     }
+    {   // P1.14: la scansione copia solo i testi usati dopo i filtri di lettura; ogni altro uso deve vedere il valore
+        t("CREATE TABLE pr1 (id INT PRIMARY KEY, a VARCHAR(10), b VARCHAR(10), c TEXT)", "OK:0");
+        t("CREATE TABLE pr2 (id INT PRIMARY KEY, a VARCHAR(10), z VARCHAR(10))", "OK:0");
+        t("INSERT INTO pr1 VALUES (1, 'x', 'p', 'c1'), (2, 'y', 'q', 'c2'), (3, 'x', 'r', 'c3')", "OK:3");
+        t("INSERT INTO pr2 VALUES (10, 'x', 'z1'), (20, 'y', 'z2')", "OK:2");
+        t("SELECT COUNT(*), SUM(id) FROM pr1 WHERE b <> 'zz' AND c LIKE 'c%'", "3|6");
+        t("SELECT id FROM pr1 WHERE a = 'x' ORDER BY c DESC", "3;1");
+        t("SELECT a, COUNT(*) FROM pr1 WHERE b <> 'q' GROUP BY a", "x|2");
+        t("SELECT a FROM pr1 GROUP BY a HAVING MAX(c) = 'c3'", "x");
+        t("SELECT id, (SELECT z FROM pr2 WHERE pr2.a = pr1.a) FROM pr1 WHERE c <> 'c2' ORDER BY id", "1|z1;3|z1");
+        t("SELECT pr1.id, z FROM pr1 NATURAL JOIN pr2 ORDER BY pr1.id", "");
+        t("SELECT pr1.id, z FROM pr1 JOIN pr2 USING (a) ORDER BY pr1.id", "1|z1;2|z2;3|z1");
+        t("SELECT * FROM pr1 WHERE b = 'q'", "2|y|q|c2");
+        t("SELECT id, ROW_NUMBER() OVER (PARTITION BY a ORDER BY b DESC) FROM pr1 ORDER BY id", "1|2;2|1;3|1");
+        t("SELECT id FROM pr1 WHERE EXISTS (SELECT 1 FROM pr2 WHERE pr2.a = pr1.a AND pr1.b = 'q')", "2");
+        t("SELECT id FROM pr1 LIMIT 2", "1;2");
+        t("SELECT id, c FROM pr1 LIMIT 1 OFFSET 2", "3|c3");
+        t("SELECT id FROM pr1 WHERE b > 'p' LIMIT 1", "2");
+        t("SELECT DISTINCT a FROM pr1 LIMIT 1", "x");
+        t("SELECT CONCAT(a, b) FROM pr1 WHERE c = 'c1'", "xp");
+        t("DROP TABLE pr1", "OK:0");
+        t("DROP TABLE pr2", "OK:0");
+    }
     t("SELECT DATE_TRUNC('month', '2024-03-15 10:20:30'), DATE_TRUNC('week', '2024-03-15'), DATE_PART('quarter', '2024-08-01')", "2024-03-01 00:00:00|2024-03-11 00:00:00|3");
     t("SELECT MAKE_SET(5, 'a', 'b', 'c'), EXPORT_SET(5, 'Y', 'N', ',', 4)", "a,c|Y,N,Y,N");
     // ── RETURNING, ON CONFLICT, MERGE, ROLLUP / CUBE / GROUPING SETS, PREPARE / EXECUTE ──

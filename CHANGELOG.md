@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+**Performance**
+- Table scans copy only the text columns the query still uses after its read-time filters, and a
+  single-table `LIMIT` without `ORDER BY` / grouping stops reading at `OFFSET + LIMIT` rows
+  (`SELECT * … LIMIT 10` on a 57 MB table: 56 → 8 ms; a filtered `COUNT(*)`: 47 → 20 ms).
+
 **Security**
 - The local certificate authority carries critical X.509 name constraints: it can only sign `localhost`,
   `*.localhost`, `*.test`, `127.0.0.0/8` and `::1`. Certificates are minted only for local site names; the

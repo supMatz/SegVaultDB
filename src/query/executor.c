@@ -1795,7 +1795,26 @@ typedef struct {
     bool         lat_typed;                // tipi delle colonne della subquery già decisi dai valori
     Tuple**      pool;
     int          npool, cappool;
+    // riferimenti alle colonne nella query (P1.14), contati dal binder (255 = molti, non si scende più): la scansione
+    // copia nell'arena solo i testi delle colonne che servono dopo i filtri di lettura
+    uint8_t      needc[SV_MAX_COLUMNS];
 } Source;
+
+static void src_need(Source* S, int c) { if (S && c >= 0 && c < SV_MAX_COLUMNS && S->needc[c] < 255) S->needc[c]++; }
+
+// i riferimenti di un filtro di lettura (già valutato sulla riga prima di copiarla) non tengono la colonna. Si
+// scende solo in left / right / args: un riferimento in un'altra parte dell'albero resta contato (si copia)
+static void need_minus(uint8_t* need, int s, const struct ASTExpr* e) {
+    if (!e || e->type == EXPR_SUBQUERY) return;
+    if (e->type == EXPR_COLUMN && e->bound > 0 && e->outer == 0 && (e->bound - 1) / 1024 == s) {
+        int c = (e->bound - 1) % 1024;
+        if (need[c] > 0 && need[c] < 255) need[c]--;
+        return;
+    }
+    need_minus(need, s, e->left);
+    need_minus(need, s, e->right);
+    for (int i = 0; i < e->nargs; i++) need_minus(need, s, e->args[i]);
+}
 
 static void plan_free(struct SelectPlan* p);
 static void source_free(Source* s) {
@@ -2014,13 +2033,15 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
                 snprintf(rr->table_name, sizeof(rr->table_name), "%s", b->src[rk].name);
                 l->bound = s * 1024 + c + 1;
                 rr->bound = rk * 1024 + rc + 1;
+                src_need(&b->src[s], c);
+                src_need(&b->src[rk], rc);
                 args[0] = l; args[1] = rr;
                 e->type = EXPR_FUNC;
                 snprintf(e->func, sizeof(e->func), "COALESCE");
                 e->args = args; e->nargs = 2; e->depth = 2;
                 return;
             }
-            if (r == 1) { e->bound = s * 1024 + c + 1; return; }
+            if (r == 1) { e->bound = s * 1024 + c + 1; src_need(&b->src[s], c); return; }
             if (r == 0) {
                 // colonna di una query esterna: la subquery è correlata
                 int level = 1;
@@ -2029,6 +2050,7 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
                     if (r == 1) {
                         e->bound = s * 1024 + c + 1;
                         e->outer = level;
+                        src_need(&o->src[s], c);
                         // variabile della routine nella query principale di un'istruzione (ripianificata a ogni
                         // esecuzione): una costante, così vale per gli indici. Nelle subquery (piani tenuti
                         // nell'AST e riusati nei cicli) resta un riferimento correlato
@@ -6732,6 +6754,7 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
                     col->type = EXPR_COLUMN;
                     snprintf(col->col_name, sizeof(col->col_name), "%s", sr->ts->columns[c].name);
                     col->bound = s * 1024 + c + 1;
+                    src_need(sr, c);
                     // colonna unita con un RIGHT / FULL JOIN successivo: COALESCE(sinistra, destra)
                     int rk = -1, rcol = -1;
                     for (int q = s + 1; !e->table_name[0] && q < p->nsrc && rk < 0; q++)
@@ -6745,6 +6768,7 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
                         if (!other || !co || !args) { free(other); free(co); free(args); free(col); FAIL("Out of memory"); }
                         *other = *col;
                         other->bound = rk * 1024 + rcol + 1;
+                        src_need(&p->src[rk], rcol);
                         co->type = EXPR_FUNC;
                         snprintf(co->func, sizeof(co->func), "COALESCE");
                         co->args = args; co->nargs = 2; args[0] = col; args[1] = other;
@@ -6951,6 +6975,25 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
 static bool plan_load(SelectPlan* p) {
     if (p->loaded) return true;
     p->loaded = true;
+    // colonne lette per indice, non attraverso un'espressione: chiave di ricerca, intervallo, NATURAL / USING
+    for (int s = 0; s < p->nsrc; s++) {
+        src_need(&p->src[s], p->probe_col[s]);
+        src_need(&p->src[s], p->range_col[s]);
+        for (int c = 0; c < p->using_n[s]; c++) {
+            int v = p->using_left[s] ? p->using_left[s][c] : 0;
+            if (v > 0) { src_need(&p->src[s], c); if ((v - 1) / 1024 < p->nsrc) src_need(&p->src[(v - 1) / 1024], (v - 1) % 1024); }
+        }
+    }
+    // LIMIT senza ORDER BY, raggruppamenti, DISTINCT, finestre, join né condizioni dopo la lettura: la lettura della
+    // tabella si ferma a OFFSET + LIMIT righe (prima: letta e copiata tutta, poi tagliata)
+    long scan_max = -1;
+    {
+        const ASTNode* n = p->n;
+        if (p->nsrc == 1 && n->select_stmt.has_limit && n->select_stmt.limit >= 0 && n->select_stmt.offset >= 0 &&
+            !n->select_stmt.calc_found && !p->grouped && !n->select_stmt.num_order && !n->select_stmt.distinct && !p->nwins &&
+            !p->resid.n && !p->pre_dyn[0].n && !p->compound && !p->next_arm && !p->correlated && !p->src[0].lateral)
+            scan_max = (long)n->select_stmt.offset + n->select_stmt.limit;
+    }
     Database* db = catalog_current_db(p->x->catalog);
     Tuple* cur[MAX_SOURCES] = {0};
     EvalCtx ec;
@@ -7029,6 +7072,10 @@ static bool plan_load(SelectPlan* p) {
                 }
             }
             if (!done) {
+                // colonne che servono dopo la lettura: tutti i riferimenti meno quelli dei filtri di lettura
+                uint8_t* used = sv_malloc(SV_MAX_COLUMNS);
+                memcpy(used, S->needc, SV_MAX_COLUMNS);
+                for (int i = 0; i < f->n; i++) need_minus(used, s, f->v[i]);
                 // scansione: le righe vengono lette senza allocare e copiate solo se passano i filtri
                 HeapScan* scan = heap_scan_open(hf, S->ts);
                 Tuple* view = tuple_create(S->ts->num_columns);
@@ -7038,7 +7085,7 @@ static bool plan_load(SelectPlan* p) {
                 RID rid;
                 size_t len;
                 const uint8_t* data;
-                while (ok && (data = heap_scan_next_raw(scan, &rid, &len)) != NULL) {
+                while (ok && (scan_max < 0 || S->n < scan_max) && (data = heap_scan_next_raw(scan, &rid, &len)) != NULL) {
                     if (len + 64 > scap) {              // riga grande (pagine di overflow): buffer più grande
                         char* nb = sv_realloc(sbuf, len + 64);
                         if (!nb) { ok = false; break; }
@@ -7063,6 +7110,11 @@ static bool plan_load(SelectPlan* p) {
                     for (int c = 0; c < view->num_values; c++) {
                         vals[c] = view->values[c];
                         vals[c].owns_str = false;
+                        if (!vals[c].is_null && view->values[c].str_val && !is_num_storage(S->ts->columns[c].type) && !used[c]) {
+                            vals[c].str_val = NULL;            // testo che la query non usa: non copiato (P1.14)
+                            vals[c].is_null = true;
+                            continue;
+                        }
                         if (!vals[c].is_null && view->values[c].str_val && !is_num_storage(S->ts->columns[c].type)) {
                             size_t l = strlen(view->values[c].str_val) + 1;
                             char* cp = arena_alloc(&S->arena, l);
@@ -7077,6 +7129,7 @@ static bool plan_load(SelectPlan* p) {
                 }
                 if (view) { for (int c = 0; c < view->num_values; c++) view->values[c].owns_str = false; tuple_free(view); }
                 free(sbuf);
+                free(used);
                 heap_scan_close(scan);
                 if (!ok) { free(hf); snprintf(p->err, sizeof(p->err), "Out of memory while reading '%.64s'", S->table); return false; }
             }
