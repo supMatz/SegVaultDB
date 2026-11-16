@@ -84,7 +84,7 @@ constraints). In fondo al file c'è il riassunto delle milestone XAMPP già comp
 
 ## Vincoli
 
-- Non toccare altri file oltre a `TODO.md`; non fare commit né push (li fa l'utente). Se vuoi lasciare un
+- Non toccare altri file oltre a `TODO.md`; non fare push (le fa l'utente). Se vuoi lasciare un
   prototipo o una sonda, mettila in una cartella temporanea fuori dal repository.
 - Niente affermazioni non verificate: se una cosa non l'hai controllata, scrivi "not verified" nella voce.
 - Rispondi all'utente in italiano, breve: quante voci hai aggiunto per livello, le 5 più importanti in una

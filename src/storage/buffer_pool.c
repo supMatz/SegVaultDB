@@ -407,7 +407,7 @@ static int flush_all_locked(BufferPool* bp) {
         for (int k = 0; k < n; k++)
             if (bp->parts[dirty[k].part].frames[dirty[k].idx].page->flags & 0x08) { DirtyRef t = dirty[nov]; dirty[nov++] = dirty[k]; dirty[k] = t; }
         // doppia scrittura: tutte le immagini nel log e un solo fsync, poi le pagine
-        Page** pages = sv_malloc(sizeof(Page*) * (size_t)(n ? n : 1));
+        Page** pages = sv_malloc(sizeof(Page*) * (size_t)(n > 0 ? n : 1));
         int np = 0;
         for (int k = 0; k < n && pages; k++) {
             Frame* fr = &bp->parts[dirty[k].part].frames[dirty[k].idx];
