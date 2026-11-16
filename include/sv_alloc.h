@@ -35,7 +35,7 @@ int sv_fi_alloc_fail(void);
 __attribute__((noreturn, cold))
 #endif
 static inline void sv_oom(size_t n) {
-    fprintf(stderr, "[SegVault] out of memory (%zu bytes): stopping; committed data is recovered from the log at the next start\n", n);
+    fprintf(stderr, "[SegVault] out of memory (%llu bytes): stopping; committed data is recovered from the log at the next start\n", (unsigned long long)n);
     fflush(stderr);
     abort();
 }

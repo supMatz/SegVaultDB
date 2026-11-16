@@ -70,7 +70,7 @@ Tutti sotto `/api/v1`. Le risposte sono JSON con `"ok": true|false`.
 
 | Metodo | Percorso | Risposta |
 |---|---|---|
-| `GET` | `/health` | `{"ok":true,"server":"SegVault","version":"1.4.1"}` (senza token) |
+| `GET` | `/health` | `{"ok":true,"server":"SegVault","version":"1.4.2"}` (senza token) |
 | `GET` | `/status` | uptime, richieste, errori, righe inviate, connessioni aperte, `busy`, `timeout_ms` |
 | `GET` | `/metrics` | contatori in formato di testo di Prometheus (sotto) |
 | `POST` | `/query` | esegue SQL (sotto) |

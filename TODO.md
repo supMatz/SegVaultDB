@@ -623,7 +623,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     one; with the table in cache 7×. **Tried and dropped:** a shared-latch fetch path with atomic pins — with
     a cache smaller than the table almost every access is a miss, and the read-then-write latch upgrade cut
     the 8-reader speed-up to 2.7×; with a hit-only workload it changed nothing. Test in `tests/test_parallel.c`
-    (engine reopened, `min(8, CPUs)` readers, ≥ 3× with ≥ 8 CPUs outside CI: today 3.7-3.9× there, because the
+    (engine reopened, `min(8, CPUs)` readers, ≥ 2.5× with ≥ 8 CPUs outside CI: today 3-3.9× there, because the
     single reader is faster once the allocator is warm). **What limits scaling now is not the page cache:** every
     scan copies each qualifying row into an arena (P1.14), so 8 threads fault in and unmap tens of MB each and
     meet on the process memory map. **Not done:** 64-page file extension (tried caching the file end: overflow

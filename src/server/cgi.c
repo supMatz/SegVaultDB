@@ -185,7 +185,7 @@ int cgi_exec(const char* script, const char* const* env, const char* body, size_
             ssize_t g = read(pfd[0], buf, sizeof(buf));
             if (g < 0 && errno == EINTR) continue;
             if (g <= 0) break;
-            if (out->len + (size_t)g > max_out) { kill(pid, SIGKILL); snprintf(err, errsz, "CGI output larger than %zu MB", max_out >> 20); rc = 502; break; }
+            if (out->len + (size_t)g > max_out) { kill(pid, SIGKILL); snprintf(err, errsz, "CGI output larger than %llu MB", (unsigned long long)(max_out >> 20)); rc = 502; break; }
             jb_raw(out, buf, (size_t)g);
         }
         int st = 0;

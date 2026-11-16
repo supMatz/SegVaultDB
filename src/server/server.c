@@ -1772,7 +1772,7 @@ static void cgi_vars(SvServer* s, Request* rq, const char* script, const char* i
     if (info[0]) snprintf(translated, sizeof(v->translated), "%s%s", rq->root_abs, info);
     snprintf(port, sizeof(v->port), "%d", s->port);
     snprintf(rport, sizeof(v->rport), "%d", rq->client_port);
-    snprintf(clen, sizeof(v->clen), "%zu", rq->body_len);
+    snprintf(clen, sizeof(v->clen), "%llu", (unsigned long long)rq->body_len);   // non %zu: la printf di msvcrt non lo conosce
     snprintf(server_name, sizeof(v->server_name), "%s", rq->host[0] ? rq->host : s->cfg.bind_addr);
     char* colon = server_name[0] == '[' ? strchr(server_name, ']') : server_name;   // senza la porta
     if (colon && (colon = strchr(colon, ':'))) *colon = '\0';

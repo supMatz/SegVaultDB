@@ -424,7 +424,7 @@ static int fcgi_talk(sock_t fd, const FcgiParam* params, int nparams, const char
         if (r <= 0) { snprintf(err, errsz, r < 0 ? "PHP did not answer in time" : "PHP closed the connection"); return r < 0 ? 504 : 502; }
         if (h[1] == FCGI_STDOUT) {
             total += len;
-            if ((on_output ? out->len + len : total) > max_out) { snprintf(err, errsz, "PHP response larger than %zu MB", max_out >> 20); return 502; }
+            if ((on_output ? out->len + len : total) > max_out) { snprintf(err, errsz, "PHP response larger than %llu MB", (unsigned long long)(max_out >> 20)); return 502; }
             jb_raw(out, content, len);
             if (on_output && len && !out->oom && !on_output(ctx, out)) { snprintf(err, errsz, "the client went away"); return 499; }
         } else if (h[1] == FCGI_STDERR) {

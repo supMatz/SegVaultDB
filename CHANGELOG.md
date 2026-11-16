@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.2 — 2026-11-16
+
+- Windows: the 1.4.1 fix was not enough — with `_FORTIFY_SOURCE` the MinGW of Ubuntu still routes `snprintf`
+  to the `msvcrt` implementation. `%zu` is gone from the code (sizes are printed as `%llu`), so
+  `CONTENT_LENGTH` for PHP is right whatever C runtime the executable uses.
+
 ## 1.4.1 — 2026-11-16
 
 - Windows: the executables built by the release workflow (MinGW of Ubuntu, `msvcrt` printf) did not
