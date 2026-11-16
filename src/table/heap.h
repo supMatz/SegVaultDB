@@ -80,6 +80,7 @@ extern atomic_int g_sv_scan_cancel;
 void sv_scan_set_deadline(double deadline_ms);
 // la lettura in corso va interrotta? (annullamento globale o scadenza del thread)
 bool sv_scan_cancelled(void);
+bool sv_cancel_now(void);         // annullamento o scadenza, controllati subito (attese: SLEEP)
 // flag di annullamento della connessione di questo thread (KILL QUERY id): le scansioni lo guardano anche
 void sv_scan_set_cancel(atomic_int* flag);
 // solo il flag di questo thread (non quello globale della GUI): per le attese di un lock

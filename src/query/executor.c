@@ -3985,16 +3985,25 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     }
     if (!strcmp(f, "SLEEP")) {
         double s = N(0);
+        bool interrupted = false;
         if (s > 0) {
             long ms = (long)(s * 1000);
             if (ms > 60000) ms = 60000;
+            // a fette di 50 ms: KILL QUERY e --timeout la interrompono (prima no: SLEEP(60) su molte righe teneva il
+            // motore per ore). Come MySQL, una SLEEP interrotta vale 1
+            while (ms > 0) {
+                if (sv_cancel_now()) { interrupted = true; break; }
+                long d = ms < 50 ? ms : 50;
 #ifdef _WIN32
-            sv_win_sleep((unsigned long)ms);
+                sv_win_sleep((unsigned long)d);
 #else
-            struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
-            nanosleep(&ts, NULL);
+                struct timespec ts = { 0, d * 1000000L };
+                nanosleep(&ts, NULL);
 #endif
+                ms -= d;
+            }
         }
+        if (interrupted) { ctx_error(c, "%s", "Query cancelled"); ev_null(out); return true; }
         ev_int(out, 0);
         return true;
     }

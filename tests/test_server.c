@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -38,6 +39,8 @@ static int connect_to(int port) {
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     return fd;
 }
+
+static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
 static long proc_kb(const char* key) {                  // VmRSS / VmHWM del processo in KB
     FILE* f = fopen("/proc/self/status", "r");
@@ -1747,9 +1750,11 @@ int main(void) {
                 for (int i = b; i < b + 250; i++) l += snprintf(insb + l, sizeof(insb) - (size_t)l, "%s(%d, %d)", i > b ? "," : "", i, i);
                 my_query(&m, insb, out, sizeof(out));
             }
-            const char* longq[2] = { "SELECT COUNT(*) FROM kq a, kq b, kq c WHERE a.v + b.v = c.v + 7777777",
-                                     "DELETE FROM kq WHERE id IN (SELECT a.id FROM kq a, kq b, kq c WHERE a.v + b.v + c.v = -1) OR id >= 0" };
-            for (int t = 0; t < 2; t++) {
+            const char* longq[3] = { "SELECT COUNT(*) FROM kq a, kq b, kq c WHERE a.v + b.v = c.v + 7777777",
+                                     "DELETE FROM kq WHERE id IN (SELECT a.id FROM kq a, kq b, kq c WHERE a.v + b.v + c.v = -1) OR id >= 0",
+                                     "SELECT SLEEP(30), 'kq a, kq b'" };   // P3.9: SLEEP si interrompe
+            for (int t = 0; t < 3; t++) {
+                double tk0 = now_ms();
                 CcArg ka = { &m, longq[t], "" };
                 pthread_t kt;
                 pthread_create(&kt, NULL, cc_thread, &ka);
@@ -1768,6 +1773,7 @@ int main(void) {
                 CHECK(!strcmp(out, "OK:0"), "%s: %s", kill, out);
                 pthread_join(kt, NULL);
                 CHECK(strstr(ka.out, "ERR") && strstr(ka.out, "cancel"), "killed statement reports the cancellation: %s", ka.out);
+                CHECK(now_ms() - tk0 < 5000, "killed within seconds (%.0f ms)", now_ms() - tk0);
             }
             my_query(&m, "SELECT COUNT(*) FROM kq", out, sizeof(out));
             CHECK(!strcmp(out, "1500"), "the killed DELETE changed nothing: %s", out);

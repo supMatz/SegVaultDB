@@ -485,6 +485,13 @@ static _Thread_local atomic_int* t_cancel;          // annullamento di questa co
 void sv_scan_set_cancel(atomic_int* flag) { t_cancel = flag; }
 bool sv_thread_cancelled(void) { return t_cancel && atomic_load(t_cancel); }
 
+// lo stesso controllo, con la scadenza guardata a ogni chiamata (attese lunghe: SLEEP)
+bool sv_cancel_now(void) {
+    if (atomic_load(&g_sv_scan_cancel)) return true;
+    if (t_cancel && atomic_load(t_cancel)) return true;
+    return g_scan_deadline > 0 && sv_get_time_ms() > g_scan_deadline;
+}
+
 bool sv_scan_cancelled(void) {
     if (atomic_load(&g_sv_scan_cancel)) return true;
     if (t_cancel && atomic_load(t_cancel)) return true;

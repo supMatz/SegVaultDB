@@ -1507,6 +1507,13 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
       crash, and fails with an error if the state cannot be saved; a clean shutdown saves the exact values.
       Tests in `tests/test_durability.c` §10b (100 `NEXTVAL` ≤ 8 `fsync`s, exact continuation after a clean
       shutdown, no repeat after a crash, name with a space).
+    - `executor.c` long waits: **fixed** — `SLEEP(n)` slept up to 60 s per call without looking at `KILL QUERY` or
+      `--timeout` (`SELECT SLEEP(60) FROM t` held the engine for hours); it now sleeps in 50 ms slices and stops
+      (error "Query cancelled") when the statement is cancelled. Test: the `KILL QUERY` block of
+      `tests/test_server.c` kills a `SLEEP(30)` within seconds. Infinite `WHILE` loops in procedures and
+      functions were already cancellable (probed). **Noted:** `GET_LOCK` / `RELEASE_LOCK` / `IS_FREE_LOCK` are
+      no-ops that always succeed (MySQL named locks are not implemented: applications that use them for
+      mutual exclusion get none).
     - The fuzz harness (`tests/fuzz/fuzz.c`) had stopped working after P1.11 (a static `TableSchema` with no
       column storage: every target died at start-up under UBSan); fixed with `schema_new`.
 
