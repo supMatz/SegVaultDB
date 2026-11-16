@@ -41,7 +41,8 @@ jobs:
 
       - name: Windows-only code under wine (64-bit offsets, MoveFileEx, engine)
         run: |
-          sudo apt-get install -y --no-install-recommends wine64 || sudo apt-get install -y --no-install-recommends wine
+          # wine 10 (Ubuntu 25.x): il pacchetto wine64 non porta più il comando "wine", che sta nel pacchetto wine
+          sudo apt-get install -y --no-install-recommends wine64 wine || sudo apt-get install -y --no-install-recommends wine
           make test-win
 
       - name: Debug build compiles (-DDEBUG)
