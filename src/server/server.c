@@ -3575,10 +3575,40 @@ static bool my_read(SvServer* s, Conn* c, InBuf* in, MyPkt* out, size_t max) {
     return true;
 }
 
+static bool my_send_bytes(Conn* c, const char* p, size_t n) {
+    return c->mytls ? tls_write(c->mytls, p, n) : send_all(c->fd, p, n);
+}
+
+// i pacchetti riversati su file (resultset grandi, P1.14) prima di quelli in memoria
 static bool my_send(Conn* c, MwOut* o) {
-    bool ok = !o->oom && (c->mytls ? tls_write(c->mytls, (const char*)o->p, o->n) : send_all(c->fd, (const char*)o->p, o->n));
+    bool ok = !o->oom && !o->spill_err;
+    if (o->spill) {
+        FILE* f = (FILE*)o->spill;
+        static _Thread_local char buf[1 << 16];
+        rewind(f);
+        size_t got;
+        while (ok && (got = fread(buf, 1, sizeof(buf), f)) > 0) ok = my_send_bytes(c, buf, got);
+        if (ferror(f)) ok = false;
+        fclose(f);
+        o->spill = NULL;
+    }
+    o->spill_err = false;
+    ok = ok && my_send_bytes(c, (const char*)o->p, o->n);
     o->n = 0;
     return ok;
+}
+
+// righe di una SELECT a blocchi verso il client (P1.14): pacchetti nel buffer, oltre 4 MB su file temporaneo
+typedef struct { MwOut* o; const char* db; unsigned st; } MySink;
+static bool my_sink_begin(void* ud, const QueryResult* r) {
+    MySink* m = ud;
+    mw_resultset_head(m->o, r, m->db, m->st);
+    return !m->o->oom;
+}
+static bool my_sink_rows(void* ud, const QueryResult* r) {
+    MySink* m = ud;
+    mw_resultset_rows(m->o, r);
+    return !m->o->oom && mw_spill(m->o, (size_t)4 << 20);
 }
 
 // codice d'errore MySQL dal messaggio (i driver ne usano alcuni: 1062 duplicato, 1146 tabella, ...)
@@ -3974,15 +4004,21 @@ static void my_query_ex(SvServer* s, Conn* c, MwOut* o, char* sql, const char* u
         double q0 = now_ms();
         // un solo statement già analizzato (COM_STMT_EXECUTE): l'albero coi valori, senza rianalizzare il testo
         QueryResult* r = prep && nst == 1 ? db_prepared_exec(prep, (const char* const*)lits, nlits) : NULL;
-        if (!r) r = db_execute(one);
+        char sink_db[128];
+        const char* cdb0 = db_current_database();
+        snprintf(sink_db, sizeof(sink_db), "%s", cdb0 ? cdb0 : "");
+        MySink msink = { o, sink_db, my_status(*autocommit) | more };
+        DbRowSink dsink = { &msink, my_sink_begin, my_sink_rows };
+        if (!r) r = !binary && !cursor ? db_execute_stream(one, &dsink) : db_execute(one);
         audit_stmt(s, &rs, user, one, r);
         {                                       // registro: le query dell'app, una per riga
             char det[160];
             if (!r || !r->success) snprintf(det, sizeof(det), "%.150s", r ? r->error : "out of memory");
+            else if (r->streamed) snprintf(det, sizeof(det), "%lld row%s", r->streamed_rows, r->streamed_rows == 1 ? "" : "s");
             else if (r->num_cols > 0) snprintf(det, sizeof(det), "%d row%s", r->num_rows, r->num_rows == 1 ? "" : "s");
             else snprintf(det, sizeof(det), "%lld affected", r->rows_affected > 0 ? r->rows_affected : 0);
             log_entry(s, c->client, "mysql", "SQL", one, det, user, r && r->success ? 200 : 500, now_ms() - q0,
-                      r && r->success ? r->num_rows : 0);
+                      r && r->success ? (r->streamed ? (int)r->streamed_rows : r->num_rows) : 0);
         }
         sql[e] = saved;
         bool timeout = exec_timed_out(s);
@@ -3992,6 +4028,11 @@ static void my_query_ex(SvServer* s, Conn* c, MwOut* o, char* sql, const char* u
             break;
         }
         unsigned st = my_status(*autocommit) | more;
+        if (r->streamed) {                                // righe già nel buffer / sul file: manca l'EOF finale
+            mw_eof(o, st);
+            db_result_free(r);
+            continue;
+        }
         const char* cur = db_current_database();
         if (r->num_cols > 0 && cursor && k == last) { mw_cursor_open(o, r, cur ? cur : "", st); *cursor = r; continue; }
         if (r->num_cols > 0) { if (binary) mw_resultset_binary(o, r, cur ? cur : "", st); else mw_resultset(o, r, cur ? cur : "", st); }

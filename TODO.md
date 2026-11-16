@@ -802,10 +802,20 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     `… WHERE v = 5 LIMIT 3` 11 → 0.02 ms; P1.10 scans: one reader 246 → 145 ms, 8 readers 316 → 250 ms for
     32 scans. Tests: a block in `tests/test_sql.c` (text columns used only in `WHERE`, in `ORDER BY`, `GROUP BY` /
     `HAVING`, correlated subqueries, `USING` / `NATURAL`, `*`, window partitions, `EXISTS`, `LIMIT` / `OFFSET`);
-    differential fuzzing against SQLite (280 000 queries, 0 different). **Still open:** pull-based operators
-    and a cursor API (results still built whole: no streaming of a 2 GB `SELECT *` through the MySQL protocol);
-    rows that pass the filters still cost a pointer, a RID and their numeric values each (`COUNT(*)` memory
-    is O(rows), not O(1)); the `scan_aggregate` regression is not isolated yet.
+    differential fuzzing against SQLite (280 000 queries, 0 different).
+  - **Streaming results (2026-11-16):** a top-level `SELECT` on one table without `ORDER BY`, grouping,
+    `DISTINCT`, window functions, `LIMIT` or correlation runs in blocks of 2 048 rows read (`Source.bscan`
+    keeps the heap scan open between blocks, `scan_rows` is the scan loop shared with the normal path); every
+    block goes through the same pipeline and is handed to a sink (`db_execute_stream`, `DbRowSink`), then
+    freed. The MySQL text protocol uses it: column definitions with the first block, one packet per row,
+    packets beyond 4 MB moved to an unlinked temporary file (`mw_spill`, sent by `my_send` before the rest);
+    an error after rows becomes an `ERR` packet (allowed by the protocol). Measured in a new process on a
+    129 MB table: peak memory **+23 MB** streamed instead of +425 MB. Tests: `tests/test_durability.c` §11
+    (fresh process, 64 MB table: streamed peak below 32 MB and below half of the materialised one),
+    `tests/test_server.c` (131 072 rows of 1 KB through the MySQL protocol, all received).
+    **Still open:** queries with `ORDER BY` / `GROUP BY` / joins / aggregates still materialise (pull-based
+    operators and an external sort are needed); `COUNT(*)` memory is O(rows); the prepared-statement (binary)
+    protocol, cursors and the HTTP API do not stream yet; the `scan_aggregate` regression is not isolated.
 
 ---
 

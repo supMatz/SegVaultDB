@@ -904,6 +904,8 @@ static int ddl_durable(void) {
     return ok ? 2 : 0;
 }
 
+static _Thread_local DbRowSink* g_row_sink;        // db_execute_stream in corso su questo thread
+
 // esegue uno statement già analizzato (transazioni e CHECKPOINT gestiti qui)
 static QueryResult* exec_one_in(ASTNode* stmt) {
     QueryResult* result = NULL;
@@ -976,7 +978,10 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
         // sola lettura: interrompibile a metà
         atomic_store(&g_read_running, 1);
         if (atomic_load(&g_cancel_requested)) atomic_store(&g_sv_scan_cancel, 1);
+        ExecRowSink es;                                   // righe a blocchi verso chi le ha chieste (P1.14)
+        if (g_row_sink) { es.ud = g_row_sink->ud; es.begin = g_row_sink->begin; es.rows = g_row_sink->rows; executor_set_stream_sink(&es); }
         result = atomic_load(&g_sv_scan_cancel) ? NULL : executor_run(&g_db.exec_ctx, stmt);
+        executor_set_stream_sink(NULL);
         atomic_store(&g_read_running, 0);
         if (atomic_load(&g_sv_scan_cancel) || sv_scan_cancelled()) {   // risultato parziale: scartato
             if (result) db_result_free(result);
@@ -2350,6 +2355,13 @@ static QueryResult* result_ok(int rows_affected) {
 }
 
 // ── API pubblica: ogni chiamata tiene il mutex del motore ───────
+
+QueryResult* db_execute_stream(const char* sql, DbRowSink* sink) {
+    g_row_sink = sink;
+    QueryResult* r = db_execute(sql);
+    g_row_sink = NULL;
+    return r;
+}
 
 QueryResult* db_execute(const char* sql) {
     db_lock();

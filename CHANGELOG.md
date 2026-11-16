@@ -8,9 +8,13 @@
   2-3 pages instead of scanning the whole table to rebuild the index (20 000-row table: 3 pages instead of
   ~1 600). The first write to a table drops its trees (logged before the row, so a crash never uses a stale
   tree); `ALTER` / `TRUNCATE` / `VACUUM FULL` make them unusable; damaged index pages fall back to the table.
-  `EXPLAIN` shows "B+tree on disk".
+  `EXPLAIN` shows "B+tree on disk". Databases opened by this version (catalog format v7) cannot be opened by
+  1.4.2 or older.
 
 **Performance**
+- Large results stream: a `SELECT` on one table without `ORDER BY` / `GROUP BY` / `DISTINCT` / `LIMIT` is
+  computed in blocks of 2 048 rows and sent to MySQL clients as it goes (beyond 4 MB the packets wait in a
+  temporary file instead of memory): `SELECT *` of a 129 MB table needs +23 MB instead of +425 MB.
 - Table scans copy only the text columns the query still uses after its read-time filters, and a
   single-table `LIMIT` without `ORDER BY` / grouping stops reading at `OFFSET + LIMIT` rows
   (`SELECT * … LIMIT 10` on a 57 MB table: 56 → 8 ms; a filtered `COUNT(*)`: 47 → 20 ms).

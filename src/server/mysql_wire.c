@@ -2,6 +2,9 @@
 #include "../table/binesc.h"
 #include <ctype.h>
 #include <stdio.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -248,7 +251,7 @@ static unsigned result_col_flags(const QueryResult* r, const char* db, int c) {
     return db_column_flags(r->source_db[0] ? r->source_db : db, r->col_tables[c], r->col_columns[c]);
 }
 
-void mw_resultset(MwOut* o, const QueryResult* r, const char* db, unsigned status) {
+void mw_resultset_head(MwOut* o, const QueryResult* r, const char* db, unsigned status) {
     mw_begin(o);
     mw_lenenc(o, (uint64_t)r->num_cols);
     mw_end(o);
@@ -256,6 +259,45 @@ void mw_resultset(MwOut* o, const QueryResult* r, const char* db, unsigned statu
         column_def(o, db, r->col_tables && r->col_tables[c] ? r->col_tables[c] : "",
                    r->col_names[c], r->col_types ? r->col_types[c] : NULL, result_col_flags(r, db, c));
     mw_eof(o, status & ~MW_STATUS_MORE_RESULTS);
+}
+
+void mw_resultset_rows(MwOut* o, const QueryResult* r) {
+    for (int i = 0; i < r->num_rows && !o->oom; i++) {
+        mw_begin(o);
+        for (int c = 0; c < r->num_cols; c++) {
+            const Cell* cell = &r->rows[i].cells[c];
+            if (cell->is_null) mw_u8(o, 0xfb);
+            else mw_cell(o, cell->value);
+        }
+        mw_end(o);
+    }
+}
+
+// file temporaneo già cancellato (Windows: tmpfile() della msvcrt scrive nella radice del disco, spesso vietata)
+static FILE* spill_file(void) {
+#ifdef _WIN32
+    char dir[MAX_PATH], name[MAX_PATH];
+    if (!GetTempPathA(sizeof(dir), dir) || !GetTempFileNameA(dir, "svr", 0, name)) return NULL;
+    return fopen(name, "w+bTD");                               // D: cancellato alla chiusura
+#else
+    return tmpfile();
+#endif
+}
+
+bool mw_spill(MwOut* o, size_t limit) {
+    if (o->oom || o->spill_err || o->n <= limit) return !o->spill_err;
+    if (!o->spill) {
+        o->spill = spill_file();                              // 0600, cancellato alla chiusura
+        if (!o->spill) { o->spill_err = true; return false; }
+    }
+    if (fwrite(o->p, 1, o->n, (FILE*)o->spill) != o->n) { o->spill_err = true; return false; }
+    o->n = 0;
+    o->start = 0;
+    return true;
+}
+
+void mw_resultset(MwOut* o, const QueryResult* r, const char* db, unsigned status) {
+    mw_resultset_head(o, r, db, status);
     for (int i = 0; i < r->num_rows && !o->oom; i++) {
         mw_begin(o);
         for (int c = 0; c < r->num_cols; c++) {

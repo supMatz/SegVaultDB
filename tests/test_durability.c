@@ -165,6 +165,16 @@ static long long stat_num(const char* name) {               // valore numerico d
     db_result_free(r);
     return v;
 }
+static long proc_status_kb(const char* key) {
+    FILE* f = fopen("/proc/self/status", "r");
+    char line[256];
+    long v = -1;
+    while (f && fgets(line, sizeof(line), f)) if (!strncmp(line, key, strlen(key))) v = atol(line + strlen(key));
+    if (f) fclose(f);
+    return v;
+}
+static bool stream_begin(void* ud, const QueryResult* r) { (void)ud; return r->num_cols == 2; }
+static bool stream_rows(void* ud, const QueryResult* r) { *(long*)ud += r->num_rows; return true; }
 static void sh(const char* cmd) { if (system(cmd) != 0) { printf("command failed: %s\n", cmd); exit(1); } }
 
 #define BASE  "/tmp/sv_dur_base"
@@ -1335,6 +1345,61 @@ int main(void) {
         db_shutdown();
         sh("rm -rf " TB);
         #undef TB
+    }
+
+    // ── 11. P1.14: SELECT * a blocchi (db_execute_stream). In un processo nuovo il picco di memoria resta quello di
+    //        un blocco; il risultato normale della stessa query vale tutta la tabella ──
+    {
+        #define TS BASE "_stream"
+        sh("rm -rf " TS " && mkdir -p " TS);
+        CHECK(db_init(TS), "init for the streaming test");
+        ok("CREATE DATABASE d"); ok("USE d");
+        ok("CREATE TABLE bigs (id INT, pad TEXT)");
+        ok("INSERT INTO bigs VALUES (1, REPEAT('x', 1000))");
+        for (int k = 0; k < 16; k++) { char q2[160]; snprintf(q2, sizeof(q2), "INSERT INTO bigs SELECT id + %d, pad FROM bigs", 1 << k); ok(q2); }
+        db_shutdown();
+        long peak_kb[2] = { -1, -1 };
+        for (int mode = 0; mode < 2; mode++) {
+            int pfd[2];
+            if (pipe(pfd) != 0) break;
+            pid_t sp = fork();
+            if (sp == 0) {
+                close(pfd[0]);
+                db_set_cache_size(16);
+                long v[2] = { -1, -1 };
+                if (db_init(TS)) {
+                    ok("USE d");
+                    long base = proc_status_kb("VmRSS:");
+                    long rows = 0;
+                    if (mode == 0) {
+                        DbRowSink sk = { &rows, stream_begin, stream_rows };
+                        QueryResult* sr = db_execute_stream("SELECT id, pad FROM bigs WHERE id > 0", &sk);
+                        if (!sr || !sr->success || !sr->streamed || sr->streamed_rows != rows) rows = -1;
+                        db_result_free(sr);
+                    } else {
+                        QueryResult* mr = db_execute("SELECT id, pad FROM bigs WHERE id > 0");
+                        rows = mr && mr->success ? mr->num_rows : -1;
+                        db_result_free(mr);
+                    }
+                    v[0] = rows;
+                    v[1] = proc_status_kb("VmHWM:") - base;
+                }
+                if (write(pfd[1], v, sizeof(v)) < 0) {}
+                _exit(0);
+            }
+            close(pfd[1]);
+            long v[2] = { -1, -1 };
+            if (read(pfd[0], v, sizeof(v)) != (ssize_t)sizeof(v)) v[0] = -1;
+            close(pfd[0]);
+            int st2;
+            waitpid(sp, &st2, 0);
+            CHECK(v[0] == 65536, "%s: every row (%ld)", mode ? "materialised" : "streamed", v[0]);
+            peak_kb[mode] = v[1];
+        }
+        printf("SELECT of a 64 MB table: peak memory +%ld MB streamed, +%ld MB materialised\n", peak_kb[0] >> 10, peak_kb[1] >> 10);
+        CHECK(peak_kb[0] >= 0 && peak_kb[0] < 32 * 1024 && peak_kb[1] > 2 * peak_kb[0], "streaming keeps memory flat (+%ld KB vs +%ld KB)", peak_kb[0], peak_kb[1]);
+        sh("rm -rf " TS);
+        #undef TS
     }
 
     sh("rm -rf " BASE " " WORK " " CRASH);

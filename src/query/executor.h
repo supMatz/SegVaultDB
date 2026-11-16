@@ -96,6 +96,16 @@ void executor_set_drop_hook(void (*hook)(uint32_t root));
 // indici su disco (P1.6): hook chiamato quando una scrittura azzera gli alberi di una tabella (il motore lo registra
 // nel log prima della riga); scrittura degli alberi al checkpoint; radici abbandonate da liberare; contatore
 void executor_set_tree_hook(void (*hook)(void));
+// risultati in streaming (P1.14): per la prossima SELECT di primo livello di questo thread. begin riceve il primo
+// blocco (nomi e tipi delle colonne), rows ogni blocco (anche il primo); false = interrompere. La SELECT restituisce
+// allora un QueryResult senza righe con streamed = true e streamed_rows (se la query non si può fare a blocchi,
+// il risultato normale con streamed = false: le righe le manda chi chiama)
+typedef struct {
+    void* ud;
+    bool (*begin)(void* ud, const QueryResult* first_block);
+    bool (*rows)(void* ud, const QueryResult* block);
+} ExecRowSink;
+void executor_set_stream_sink(ExecRowSink* sink);
 int  executor_trees_write(ExecCtx* ctx, uint64_t lsn);
 int  executor_trees_garbage(uint32_t** roots);
 void executor_trees_drop_all(Catalog* c);

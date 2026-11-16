@@ -1941,6 +1941,10 @@ typedef struct {
     // riferimenti alle colonne nella query (P1.14), contati dal binder (255 = molti, non si scende più): la scansione
     // copia nell'arena solo i testi delle colonne che servono dopo i filtri di lettura
     uint8_t      needc[SV_MAX_COLUMNS];
+    // lettura a blocchi (P1.14, risultati in streaming): la scansione resta aperta fra un blocco e l'altro
+    HeapScan*    bscan;
+    HeapFile*    bhf;
+    bool         bmore;                    // la scansione non è finita: c'è un altro blocco
 } Source;
 
 static void src_need(Source* S, int c) { if (S && c >= 0 && c < SV_MAX_COLUMNS && S->needc[c] < 255) S->needc[c]++; }
@@ -1961,6 +1965,8 @@ static void need_minus(uint8_t* need, int s, const struct ASTExpr* e) {
 
 static void plan_free(struct SelectPlan* p);
 static void source_free(Source* s) {
+    if (s->bscan) heap_scan_close(s->bscan);
+    free(s->bhf);
     for (int i = 0; i < s->npool; i++) tuple_free(s->pool[i]);
     free(s->pool);
     if (s->lat_plan) plan_free(s->lat_plan);
@@ -5415,6 +5421,7 @@ struct SelectPlan {
     bool      probe_dyn[MAX_SOURCES];
     bool      used_index[MAX_SOURCES];
     bool      used_tree[MAX_SOURCES];     // la ricerca per chiave ha usato l'albero su disco (P1.6)
+    int       batch;                      // righe per blocco della lettura (0 = tutte insieme)
     // scansione per intervallo con l'indice: colonna >, >=, <, <=, BETWEEN costanti
     int       range_col[MAX_SOURCES];
     ASTExpr*  range_lo[MAX_SOURCES];
@@ -7116,6 +7123,73 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
 
 // ── lettura delle sorgenti ──
 
+// righe della scansione nella sorgente s (filtri di lettura applicati, testi non usati non copiati), al più
+// scan_max (< 0 = tutte); *ended = scansione finita. false = memoria esaurita
+static bool scan_rows(SelectPlan* p, int s, HeapScan* scan, long scan_max, EvalCtx* ec, Tuple** cur, int* cap, bool* ended) {
+    Source* S = &p->src[s];
+    ExprVec* f = &p->pre_static[s];
+                // colonne che servono dopo la lettura: tutti i riferimenti meno quelli dei filtri di lettura
+                uint8_t* used = sv_malloc(SV_MAX_COLUMNS);
+                memcpy(used, S->needc, SV_MAX_COLUMNS);
+                for (int i = 0; i < f->n; i++) need_minus(used, s, f->v[i]);
+                // scansione: le righe vengono lette senza allocare e copiate solo se passano i filtri
+                Tuple* view = tuple_create(S->ts->num_columns);
+                size_t scap = SV_PAGE_SIZE + 64;
+                char* sbuf = sv_malloc(scap);
+                bool ok = view && sbuf;
+                *ended = false;
+                RID rid;
+                size_t len;
+                const uint8_t* data;
+                while (ok && !(scan_max >= 0 && S->n >= scan_max)) {
+                    if ((data = heap_scan_next_raw(scan, &rid, &len)) == NULL) { *ended = true; break; }
+                    if (len + 64 > scap) {              // riga grande (pagine di overflow): buffer più grande
+                        char* nb = sv_realloc(sbuf, len + 64);
+                        if (!nb) { ok = false; break; }
+                        sbuf = nb;
+                        scap = len + 64;
+                    }
+                    if (!tuple_view(view, data, len, S->ts, sbuf, scap)) continue;
+                    p->st_scanned[s]++;
+                    if (f->n) {
+                        cur[s] = view;
+                        bool keep = xv_all_true(f, ec);
+                        cur[s] = NULL;
+                        if (!keep) continue;
+                    }
+                    // copia nell'arena della sorgente: nessuna malloc per riga
+                    Tuple* t = arena_alloc(&S->arena, sizeof(Tuple));
+                    Value* vals = t ? arena_alloc(&S->arena, sizeof(Value) * (size_t)view->num_values) : NULL;
+                    if (!vals) { ok = false; break; }
+                    S->arena_rows = true;
+                    t->values = vals;
+                    t->num_values = view->num_values;
+                    for (int c = 0; c < view->num_values; c++) {
+                        vals[c] = view->values[c];
+                        vals[c].owns_str = false;
+                        if (!vals[c].is_null && view->values[c].str_val && !is_num_storage(S->ts->columns[c].type) && !used[c]) {
+                            vals[c].str_val = NULL;            // testo che la query non usa: non copiato (P1.14)
+                            vals[c].is_null = true;
+                            continue;
+                        }
+                        if (!vals[c].is_null && view->values[c].str_val && !is_num_storage(S->ts->columns[c].type)) {
+                            size_t l = strlen(view->values[c].str_val) + 1;
+                            char* cp = arena_alloc(&S->arena, l);
+                            if (!cp) { ok = false; break; }
+                            memcpy(cp, view->values[c].str_val, l);
+                            vals[c].str_val = cp;
+                        }
+                    }
+                    if (!ok) break;
+                    t->rid = rid;
+                    if (!source_push(S, t, rid, cap)) ok = false;
+                }
+                if (view) { for (int c = 0; c < view->num_values; c++) view->values[c].owns_str = false; tuple_free(view); }
+                free(sbuf);
+                free(used);
+                return ok;
+}
+
 static bool plan_load(SelectPlan* p) {
     if (p->loaded) return true;
     p->loaded = true;
@@ -7137,6 +7211,7 @@ static bool plan_load(SelectPlan* p) {
             !n->select_stmt.calc_found && !p->grouped && !n->select_stmt.num_order && !n->select_stmt.distinct && !p->nwins &&
             !p->resid.n && !p->pre_dyn[0].n && !p->compound && !p->next_arm && !p->correlated && !p->src[0].lateral)
             scan_max = (long)n->select_stmt.offset + n->select_stmt.limit;
+        if (p->batch > 0) scan_max = p->batch;            // a blocchi (mai insieme a LIMIT: vedi plan_streamable)
     }
     Database* db = catalog_current_db(p->x->catalog);
     Tuple* cur[MAX_SOURCES] = {0};
@@ -7157,6 +7232,15 @@ static bool plan_load(SelectPlan* p) {
                 S->n = w;
                 cur[s] = NULL;
             }
+        } else if (S->bscan) {                                // lettura a blocchi: il blocco successivo
+            S->loaded = true;
+            int cap = 0;
+            bool ended = true;
+            bool ok = scan_rows(p, s, S->bscan, p->batch, &ec, cur, &cap, &ended);
+            S->bmore = ok && !ended;
+            if (!S->bmore) { heap_scan_close(S->bscan); free(S->bhf); S->bscan = NULL; S->bhf = NULL; }
+            if (!ok) { snprintf(p->err, sizeof(p->err), "Out of memory while reading '%.64s'", S->table); return false; }
+            cur[s] = NULL;
         } else {
             S->loaded = true;
             // aperta prima senza la mappa delle pagine (che legge tutta la catena): una ricerca per chiave legge solo
@@ -7246,65 +7330,15 @@ static bool plan_load(SelectPlan* p) {
                 }
             }
             if (!done) {
-                // colonne che servono dopo la lettura: tutti i riferimenti meno quelli dei filtri di lettura
-                uint8_t* used = sv_malloc(SV_MAX_COLUMNS);
-                memcpy(used, S->needc, SV_MAX_COLUMNS);
-                for (int i = 0; i < f->n; i++) need_minus(used, s, f->v[i]);
-                // scansione: le righe vengono lette senza allocare e copiate solo se passano i filtri
                 HeapScan* scan = heap_scan_open(hf, S->ts);
-                Tuple* view = tuple_create(S->ts->num_columns);
-                size_t scap = SV_PAGE_SIZE + 64;
-                char* sbuf = sv_malloc(scap);
-                bool ok = scan && view && sbuf;
-                RID rid;
-                size_t len;
-                const uint8_t* data;
-                while (ok && (scan_max < 0 || S->n < scan_max) && (data = heap_scan_next_raw(scan, &rid, &len)) != NULL) {
-                    if (len + 64 > scap) {              // riga grande (pagine di overflow): buffer più grande
-                        char* nb = sv_realloc(sbuf, len + 64);
-                        if (!nb) { ok = false; break; }
-                        sbuf = nb;
-                        scap = len + 64;
-                    }
-                    if (!tuple_view(view, data, len, S->ts, sbuf, scap)) continue;
-                    p->st_scanned[s]++;
-                    if (f->n) {
-                        cur[s] = view;
-                        bool keep = xv_all_true(f, &ec);
-                        cur[s] = NULL;
-                        if (!keep) continue;
-                    }
-                    // copia nell'arena della sorgente: nessuna malloc per riga
-                    Tuple* t = arena_alloc(&S->arena, sizeof(Tuple));
-                    Value* vals = t ? arena_alloc(&S->arena, sizeof(Value) * (size_t)view->num_values) : NULL;
-                    if (!vals) { ok = false; break; }
-                    S->arena_rows = true;
-                    t->values = vals;
-                    t->num_values = view->num_values;
-                    for (int c = 0; c < view->num_values; c++) {
-                        vals[c] = view->values[c];
-                        vals[c].owns_str = false;
-                        if (!vals[c].is_null && view->values[c].str_val && !is_num_storage(S->ts->columns[c].type) && !used[c]) {
-                            vals[c].str_val = NULL;            // testo che la query non usa: non copiato (P1.14)
-                            vals[c].is_null = true;
-                            continue;
-                        }
-                        if (!vals[c].is_null && view->values[c].str_val && !is_num_storage(S->ts->columns[c].type)) {
-                            size_t l = strlen(view->values[c].str_val) + 1;
-                            char* cp = arena_alloc(&S->arena, l);
-                            if (!cp) { ok = false; break; }
-                            memcpy(cp, view->values[c].str_val, l);
-                            vals[c].str_val = cp;
-                        }
-                    }
-                    if (!ok) break;
-                    t->rid = rid;
-                    if (!source_push(S, t, rid, &cap)) ok = false;
-                }
-                if (view) { for (int c = 0; c < view->num_values; c++) view->values[c].owns_str = false; tuple_free(view); }
-                free(sbuf);
-                free(used);
-                heap_scan_close(scan);
+                bool ended = true;
+                bool ok = scan && scan_rows(p, s, scan, scan_max, &ec, cur, &cap, &ended);
+                if (ok && p->batch > 0 && !ended) {           // lettura a blocchi: la scansione continua dopo
+                    S->bscan = scan;
+                    S->bhf = hf;
+                    S->bmore = true;
+                    hf = NULL;
+                } else if (scan) heap_scan_close(scan);
                 if (!ok) { free(hf); snprintf(p->err, sizeof(p->err), "Out of memory while reading '%.64s'", S->table); return false; }
             }
             free(hf);
@@ -9102,34 +9136,8 @@ static QueryResult* plan_explain(SelectPlan* p, bool analyze, long result_rows) 
 
 // ── SELECT di primo livello: risultato per la GUI ──
 
-static QueryResult* run_select_ex(ExecCtx* ctx, ASTNode* n, int depth, bool explain, bool analyze) {
-    char err[300] = "";
-    SelectPlan* p = plan_prepare(ctx, n, depth, ctx->trig_bind, NULL, err, sizeof(err));
-    if (!p) return result_error_msg(err);
-    if (explain) {
-        long nr = -1;
-        if (analyze) {                          // esegue la query: righe reali di ogni passo
-            ORows rows = {0};
-            if (!query_exec(p, ctx->trig_eval, 0, &rows)) {
-                snprintf(err, sizeof(err), "%s", p->err[0] ? p->err : "Query failed");
-                orows_free(&rows);
-                plan_free(p);
-                return result_error_msg(err);
-            }
-            nr = rows.nrows;
-            orows_free(&rows);
-        }
-        QueryResult* r = plan_explain(p, analyze, nr);
-        plan_free(p);
-        return r ? r : result_error_msg("Out of memory");
-    }
-    ORows rows = {0};
-    if (!query_exec(p, ctx->trig_eval, 0, &rows)) {
-        snprintf(err, sizeof(err), "%s", p->err[0] ? p->err : "Query failed");
-        orows_free(&rows);
-        plan_free(p);
-        return result_error_msg(err);
-    }
+// righe calcolate -> QueryResult (nomi, tipi, origine delle colonne, testi); NULL senza memoria
+static QueryResult* rows_result(ExecCtx* ctx, SelectPlan* p, ASTNode* n, int depth, ORows* rows) {
     int nout = p->nout;
     QueryResult* r = sv_calloc(1, sizeof(QueryResult));
     bool ok = r != NULL;
@@ -9138,7 +9146,7 @@ static QueryResult* run_select_ex(ExecCtx* ctx, ASTNode* n, int depth, bool expl
         r->num_cols = nout;
         r->col_names = sv_calloc((size_t)nout + 1, sizeof(char*));
         r->col_types = sv_calloc((size_t)nout + 1, sizeof(char*));
-        r->rows = sv_calloc((size_t)(rows.nrows ? rows.nrows : 1), sizeof(Row));
+        r->rows = sv_calloc((size_t)(rows->nrows ? rows->nrows : 1), sizeof(Row));
         ok = r->col_names && r->col_types && r->rows;
     }
     // origine delle colonne: solo se ogni riga del risultato è una riga di una tabella
@@ -9159,18 +9167,18 @@ static QueryResult* run_select_ex(ExecCtx* ctx, ASTNode* n, int depth, bool expl
     }
     for (int j = 0; ok && j < nout; j++) {
         r->col_names[j] = sv_strdup(p->out[j].name);
-        r->col_types[j] = sv_strdup(out_type_name(p, j, &rows, false));
+        r->col_types[j] = sv_strdup(out_type_name(p, j, rows, false));
     }
     // ogni riga è un solo blocco: le celle seguite dai testi, scritti prima in un buffer di appoggio
     size_t tcap = 4096, *toff = sv_malloc(sizeof(size_t) * (size_t)(nout ? nout : 1));
     char* tbuf = sv_malloc(tcap);
     CellType* ttype = sv_malloc(sizeof(CellType) * (size_t)(nout ? nout : 1));
     if (!toff || !tbuf || !ttype) ok = false;
-    for (int i = 0; ok && i < rows.nrows; i++) {
+    for (int i = 0; ok && i < rows->nrows; i++) {
         size_t tlen = 0;
         for (int j = 0; ok && j < nout; j++) {
             EvalVal v;
-            const OVal* o = &orow(&rows, i)[j];
+            const OVal* o = &orow(rows, i)[j];
             ev_from_oval(&v, o);
             const char* s = v.null ? "NULL" : ev_s(&v);
             size_t l = strlen(s);
@@ -9203,9 +9211,109 @@ static QueryResult* run_select_ex(ExecCtx* ctx, ASTNode* n, int depth, bool expl
         }
     }
     free(toff); free(tbuf); free(ttype);
+    if (!ok) { db_result_free(r); return NULL; }
+    return r;
+}
+
+// ── risultati in streaming (P1.14) ──
+// Una SELECT di primo livello su una tabella sola, senza ordinamento, raggruppamenti, DISTINCT, finestre, LIMIT né
+// correlazioni, si esegue a blocchi di STREAM_BATCH righe lette: ogni blocco passa per la stessa pipeline e va al
+// sink, poi le sue righe si liberano. La memoria resta quella di un blocco qualunque sia la tabella.
+#define STREAM_BATCH 2048
+
+static _Thread_local ExecRowSink* g_stream_sink;
+void executor_set_stream_sink(ExecRowSink* sink) { g_stream_sink = sink; }
+
+static bool plan_streamable(const SelectPlan* p) {
+    const ASTNode* n = p->n;
+    return p->nsrc == 1 && !p->src[0].is_view && !p->src[0].lateral && !p->grouped && !p->compound && !p->next_arm &&
+           !p->correlated && !n->select_stmt.num_order && !n->select_stmt.distinct && !p->nwins &&
+           !n->select_stmt.has_limit && !n->select_stmt.calc_found && !p->pre_dyn[0].n;
+}
+
+static QueryResult* stream_select(ExecCtx* ctx, SelectPlan* p, ASTNode* n, ExecRowSink* sink) {
+    p->batch = STREAM_BATCH;
+    long long total = 0;
+    int ncols = p->nout;
+    bool first = true;
+    char err[300] = "";
+    for (;;) {
+        ORows rows = {0};
+        if (!query_exec(p, ctx->trig_eval, 0, &rows)) {
+            snprintf(err, sizeof(err), "%s", p->err[0] ? p->err : "Query failed");
+            orows_free(&rows);
+            break;
+        }
+        QueryResult* r = rows_result(ctx, p, n, 0, &rows);
+        orows_free(&rows);
+        if (!r) { snprintf(err, sizeof(err), "Out of memory"); break; }
+        bool go = (!first || sink->begin(sink->ud, r)) && sink->rows(sink->ud, r);
+        first = false;
+        total += r->num_rows;
+        db_result_free(r);
+        if (!go) { snprintf(err, sizeof(err), "The result could not be sent"); break; }
+        Source* S = &p->src[0];
+        if (!S->bmore) break;
+        arena_free(&S->arena);                      // il blocco successivo: le righe di questo non servono più
+        free(S->rows);
+        free(S->rids);
+        S->rows = NULL;
+        S->rids = NULL;
+        S->n = 0;
+        S->arena_rows = false;
+        S->loaded = false;
+        p->loaded = false;
+    }
+    plan_free(p);
+    if (err[0]) {
+        QueryResult* e = result_error_msg(err);
+        if (e && !first) e->streamed = true;        // righe già mandate: chi chiama chiude il resultset con l'errore
+        return e;
+    }
+    QueryResult* res = sv_calloc(1, sizeof(QueryResult));
+    if (!res) return result_error_msg("Out of memory");
+    res->success = true;
+    res->streamed = true;
+    res->streamed_rows = total;                     // colonne e righe già consegnate al sink (num_cols resta 0)
+    (void)ncols;
+    return res;
+}
+
+static QueryResult* run_select_ex(ExecCtx* ctx, ASTNode* n, int depth, bool explain, bool analyze) {
+    char err[300] = "";
+    SelectPlan* p = plan_prepare(ctx, n, depth, ctx->trig_bind, NULL, err, sizeof(err));
+    if (!p) return result_error_msg(err);
+    if (explain) {
+        long nr = -1;
+        if (analyze) {                          // esegue la query: righe reali di ogni passo
+            ORows rows = {0};
+            if (!query_exec(p, ctx->trig_eval, 0, &rows)) {
+                snprintf(err, sizeof(err), "%s", p->err[0] ? p->err : "Query failed");
+                orows_free(&rows);
+                plan_free(p);
+                return result_error_msg(err);
+            }
+            nr = rows.nrows;
+            orows_free(&rows);
+        }
+        QueryResult* r = plan_explain(p, analyze, nr);
+        plan_free(p);
+        return r ? r : result_error_msg("Out of memory");
+    }
+    ExecRowSink* sink = depth == 0 ? g_stream_sink : NULL;
+    g_stream_sink = NULL;                               // solo per lo statement principale
+    if (sink && plan_streamable(p)) return stream_select(ctx, p, n, sink);
+    ORows rows = {0};
+    if (!query_exec(p, ctx->trig_eval, 0, &rows)) {
+        snprintf(err, sizeof(err), "%s", p->err[0] ? p->err : "Query failed");
+        orows_free(&rows);
+        plan_free(p);
+        return result_error_msg(err);
+    }
+    QueryResult* r = rows_result(ctx, p, n, depth, &rows);
     orows_free(&rows);
     plan_free(p);
-    if (!ok) { db_result_free(r); return result_error_msg("Out of memory"); }
+    if (!r) return result_error_msg("Out of memory");
     return r;
 }
 

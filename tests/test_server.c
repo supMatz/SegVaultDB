@@ -39,6 +39,15 @@ static int connect_to(int port) {
     return fd;
 }
 
+static long proc_kb(const char* key) {                  // VmRSS / VmHWM del processo in KB
+    FILE* f = fopen("/proc/self/status", "r");
+    char line[256];
+    long v = -1;
+    while (f && fgets(line, sizeof(line), f)) if (!strncmp(line, key, strlen(key))) v = atol(line + strlen(key));
+    if (f) fclose(f);
+    return v;
+}
+
 // ── client MySQL minimo (protocollo 4.1, mysql_native_password) ──
 typedef struct { int fd; uint8_t seq; uint8_t scr[20]; } My;
 
@@ -1440,6 +1449,50 @@ int main(void) {
         CHECK(!strcmp(out, "OK:0 / OK:1 / 2 / OK:0"), "transaction: %s", out);
         my_query(&m, "SELECT COUNT(*) FROM p", out, sizeof(out));
         CHECK(!strcmp(out, "3"), "rolled back: %s", out);
+
+        // P1.14: SELECT * su una tabella di ~130 MB in streaming: righe a blocchi, pacchetti oltre 4 MB su file
+        // temporaneo; il picco di memoria del processo (server e client qui insieme, il client scarta) resta basso
+        {
+            my_query(&m, "CREATE TABLE bigs (id INT, pad TEXT)", out, sizeof(out));
+            my_query(&m, "INSERT INTO bigs VALUES (1, REPEAT('x', 1000))", out, sizeof(out));
+            for (int k = 0; k < 17; k++) {
+                char qq[160];
+                snprintf(qq, sizeof(qq), "INSERT INTO bigs SELECT id + %d, pad FROM bigs", 1 << k);
+                my_query(&m, qq, out, sizeof(out));
+            }
+            my_query(&m, "SELECT COUNT(*) FROM bigs", out, sizeof(out));
+            CHECK(!strcmp(out, "131072"), "streaming table: %s rows", out);
+            my_query(&m, "SET GLOBAL cache_size = 16", out, sizeof(out));     // le pagine non restano tutte in cache
+            FILE* cr = fopen("/proc/self/clear_refs", "w");      // azzera il picco (VmHWM)
+            bool hwm = cr && fputs("5", cr) >= 0;
+            if (cr) fclose(cr);
+            long base = proc_kb("VmRSS:");
+            uint8_t qb[64];
+            qb[0] = 3;
+            const char* sq = "SELECT * FROM bigs";
+            memcpy(qb + 1, sq, strlen(sq));
+            m.seq = 0;
+            my_wr(&m, qb, strlen(sq) + 1);
+            uint8_t* pk; size_t pn;
+            long rows = 0, bytes = 0;
+            bool okr = my_rd(&m, &pk, &pn);
+            int ncols = okr ? pk[0] : 0;
+            if (okr) free(pk);
+            for (int i = 0; okr && i <= ncols; i++) { okr = my_rd(&m, &pk, &pn); if (okr) free(pk); }
+            while (okr && my_rd(&m, &pk, &pn)) {
+                bool end = (pk[0] == 0xfe && pn < 9) || pk[0] == 0xff;
+                if (!end) { rows++; bytes += (long)pn; }
+                free(pk);
+                if (end) break;
+            }
+            long peak = proc_kb("VmHWM:");
+            printf("SELECT * of %ld rows (%ld MB) through the MySQL protocol: peak memory +%ld MB\n", rows, bytes >> 20, (peak - base) >> 10);
+            CHECK(rows == 131072, "every row streamed (%ld)", rows);
+            (void)hwm;   // (la memoria si misura in tests/test_durability.c, in un processo nuovo: qui il processo ha già
+                         //  la memoria degli INSERT ... SELECT di preparazione e la riusa)
+            my_query(&m, "DROP TABLE bigs", out, sizeof(out));
+            my_query(&m, "SET GLOBAL cache_size = 64", out, sizeof(out));
+        }
 
         // prepared statement lato server (mysqli->prepare, JDBC, mysql-connector prepared=True)
         int np = -1, nc = -1;

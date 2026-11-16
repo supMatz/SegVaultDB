@@ -67,6 +67,9 @@ typedef struct {
     bool     oom;
     uint8_t  seq;        // sequenza del prossimo pacchetto
     size_t   start;      // inizio del pacchetto in costruzione
+    // pacchetti già pronti riversati su un file temporaneo (resultset grandi, P1.14): si mandano prima di p
+    void*    spill;      // FILE* (NULL = nessuno)
+    bool     spill_err;
 } MwOut;
 
 void mw_begin(MwOut* o);                                  // nuovo pacchetto
@@ -92,6 +95,12 @@ void mw_auth_more(MwOut* o, const void* data, size_t n);
 void mw_set_config(bool ssl, int max_connections);
 // risultato in formato testo: colonne, EOF, righe, EOF (status: con MORE_RESULTS se ne seguono altri)
 void mw_resultset(MwOut* o, const QueryResult* r, const char* db, unsigned status);
+// lo stesso a pezzi (righe a blocchi, P1.14): intestazione e colonne, righe di un blocco, EOF finale
+void mw_resultset_head(MwOut* o, const QueryResult* r, const char* db, unsigned status);
+void mw_resultset_rows(MwOut* o, const QueryResult* r);
+// con più di limit byte pronti (nessun pacchetto a metà), i byte vanno in coda al file temporaneo (creato al primo
+// uso, 0600, già cancellato). false = file non scrivibile (o->spill_err)
+bool mw_spill(MwOut* o, size_t limit);
 
 // risposta al login (HandshakeResponse41)
 typedef struct {

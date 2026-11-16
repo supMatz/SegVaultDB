@@ -92,6 +92,9 @@ typedef struct {
     char error[1024];    // 1024 per errori grandi, ma anche riducibile
     int error_line;      // riga del SQL dove è avvenuto l'errore
     int error_col;       // colonna del SQL dove è avvenuto l'errore
+    // righe già consegnate a blocchi (db_execute_stream, P1.14): num_rows = 0, streamed_rows = quante
+    bool streamed;
+    long long streamed_rows;
 } QueryResult;
 
 // lista di nomi generica (per sidebar)
@@ -187,6 +190,17 @@ typedef struct {
 // inizializzazione db engine
 bool db_init(const char* data_directory);
 const char* db_init_error(void);   // motivo dell'ultimo db_init fallito
+
+// SELECT con le righe consegnate a blocchi mentre si calcolano (P1.14): per una SELECT su una tabella sola senza
+// ORDER BY / GROUP BY / DISTINCT / LIMIT / finestre la memoria resta quella di un blocco (2 048 righe lette). begin
+// riceve il primo blocco (colonne), rows ogni blocco; false = interrompere. Ritorna il QueryResult di db_execute:
+// streamed = true (righe già consegnate, streamed_rows quante) oppure il risultato normale (righe in r->rows)
+typedef struct {
+    void* ud;
+    bool (*begin)(void* ud, const QueryResult* first_block);
+    bool (*rows)(void* ud, const QueryResult* block);
+} DbRowSink;
+QueryResult* db_execute_stream(const char* sql, DbRowSink* sink);
 
 // esecuzione di qualsiasi statement
 QueryResult* db_execute(const char* sql);
