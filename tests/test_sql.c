@@ -1417,6 +1417,25 @@ int main(void) {
     t("SELECT INITCAP('ciao mondo'), SPLIT_PART('a,b,c', ',', 2), SPLIT_PART('a,b,c', ',', -1), TRANSLATE('abcd', 'ab', 'x'), CHR(65)", "Ciao Mondo|b|c|xcd|A");
     t("SELECT CONV('ff', 16, 10), CONV(255, 10, 2), SOUNDEX('Robert'), SOUNDEX('Rupert')", "255|11111111|R163|R163");
     t("SELECT OVERLAY('abcdef' PLACING 'XY' FROM 2 FOR 3), STARTS_WITH('ciao', 'ci'), REGEXP_COUNT('a1b22c333', '[0-9]+')", "aXYef|1|3");
+    {   // P3.9: 100 000 parentesi annidate in una REGEXP facevano traboccare lo stack (il server cadeva)
+        static char deep[200100];
+        int k = snprintf(deep, sizeof(deep), "SELECT 'a' REGEXP '");
+        for (int i = 0; i < 100000; i++) deep[k++] = '(';
+        deep[k++] = 'a';
+        for (int i = 0; i < 100000; i++) deep[k++] = ')';
+        snprintf(deep + k, sizeof(deep) - (size_t)k, "'");
+        t(deep, "ERR:nested parentheses");
+        t("SELECT 'abc' REGEXP '((((a))))b', REGEXP_REPLACE('aXbXc', '(X)', '-')", "1|a-b-c");
+        // JSON_SEARCH: il LIKE era ricorsivo per carattere (stack) ed esponenziale con più %
+        int k2 = snprintf(deep, sizeof(deep), "SELECT JSON_SEARCH('[\"");
+        for (int i = 0; i < 90000; i++) deep[k2++] = 'a';
+        k2 += snprintf(deep + k2, sizeof(deep) - (size_t)k2, "\"]', 'one', '");
+        for (int i = 0; i < 90000; i++) deep[k2++] = '_';
+        snprintf(deep + k2, sizeof(deep) - (size_t)k2, "')");
+        t(deep, "\"$[0]\"");
+        t("SELECT JSON_SEARCH('[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]', 'one', '%a%a%a%a%a%a%a%a%a%a%a%a%a%b'), "
+          "JSON_SEARCH('[\"x_y\", \"xzy\"]', 'all', 'x\\\\_y'), JSON_SEARCH('[\"abc\"]', 'one', '%b%')", "NULL|\"$[0]\"|\"$[0]\"");
+    }
     t("SELECT DATE_TRUNC('month', '2024-03-15 10:20:30'), DATE_TRUNC('week', '2024-03-15'), DATE_PART('quarter', '2024-08-01')", "2024-03-01 00:00:00|2024-03-11 00:00:00|3");
     t("SELECT MAKE_SET(5, 'a', 'b', 'c'), EXPORT_SET(5, 'Y', 'N', ',', 4)", "a,c|Y,N,Y,N");
     // ── RETURNING, ON CONFLICT, MERGE, ROLLUP / CUBE / GROUPING SETS, PREPARE / EXECUTE ──

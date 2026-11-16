@@ -131,7 +131,8 @@ static void run_login(void) {
     MwLogin lg;
     (void)mw_parse_login(g_buf, g_n, &lg);
 }
-static TableSchema g_ts;
+static TableSchema* g_tsp;                 // schema per decodificare le righe (schema_new: colonne nel blocco)
+#define g_ts (*g_tsp)
 static void run_page(void) {
     Page p;
     memset(&p, 0, sizeof(p));
@@ -516,6 +517,7 @@ int main(int argc, char** argv) {
     double secs = argc > 2 ? atof(argv[2]) : 10;
     if (argc > 3) g_rng = strtoull(argv[3], NULL, 10) | 1;
     // schema per decodificare le righe: un po' di tutti i tipi
+    g_tsp = schema_new(6);
     snprintf(g_ts.name, sizeof(g_ts.name), "f");
     DataType ty[6] = { SV_TYPE_INT, SV_TYPE_BIGINT, SV_TYPE_VARCHAR, SV_TYPE_FLOAT, SV_TYPE_BOOL, SV_TYPE_TEXT };
     for (int i = 0; i < 6; i++) { g_ts.columns[i].type = ty[i]; snprintf(g_ts.columns[i].name, 64, "c%d", i); g_ts.columns[i].nullable = true; }

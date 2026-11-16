@@ -38,7 +38,10 @@ typedef struct {
     size_t errn;
     bool failed;
     int groups;                  // gruppi di cattura visti
+    int depth;                   // parentesi aperte: un pattern di 100 000 "(" faceva traboccare lo stack (P3.9)
 } RParse;
+
+#define MAX_NEST 250
 
 static RNode* rn_new(RNType t) {
     RNode* n = sv_calloc(1, sizeof(RNode));
@@ -145,11 +148,14 @@ static RNode* parse_class(RParse* r) {
 static RNode* parse_atom(RParse* r) {
     char c = *r->p;
     if (c == '(') {
+        if (r->depth >= MAX_NEST) { rfail(r, "too many nested parentheses (max 250)"); return NULL; }
         r->p++;
         int num = 0;
         if (r->p[0] == '?' && r->p[1] == ':') r->p += 2;   // (?: ...) senza cattura
         else num = ++r->groups;
+        r->depth++;
         RNode* inner = parse_alt(r);
+        r->depth--;
         if (r->failed) { rn_free(inner); return NULL; }
         if (*r->p != ')') { rfail(r, "missing )"); rn_free(inner); return NULL; }
         r->p++;
@@ -234,7 +240,7 @@ static RNode* parse_alt(RParse* r) {
 }
 
 SvRegex* sv_regex_compile(const char* pattern, bool icase, char* err, size_t errn) {
-    RParse r = { pattern ? pattern : "", icase, err, errn, false, 0 };
+    RParse r = { pattern ? pattern : "", icase, err, errn, false, 0, 0 };
     if (errn) err[0] = '\0';
     RNode* root = parse_alt(&r);
     if (!r.failed && *r.p) rfail(&r, "unbalanced )");

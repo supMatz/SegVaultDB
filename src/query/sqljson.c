@@ -522,14 +522,27 @@ char* sj_pretty(const char* doc) {
     return sb_done(&b);
 }
 
-// LIKE di MySQL (% e _) sul testo t
+// LIKE di MySQL (% e _, \ protegge il carattere dopo) sul testo t. Iterativo, con ritorno solo all'ultimo %:
+// la versione ricorsiva scendeva di un livello per carattere (stack overflow con testo e pattern di 100 000
+// caratteri) ed era esponenziale con più % (P3.9)
 static bool sj_like(const char* t, const char* p) {
-    if (!*p) return !*t;
-    if (*p == '%') { for (;; t++) { if (sj_like(t, p + 1)) return true; if (!*t) return false; } }
-    if (*p == '\\' && p[1]) { if (*t != p[1]) return false; return sj_like(t + 1, p + 2); }
-    if (!*t) return false;
-    if (*p == '_' || *p == *t) return sj_like(t + 1, p + 1);
-    return false;
+    const char *star_p = NULL, *star_t = NULL;
+    while (*t) {
+        if (*p == '%') {
+            while (*p == '%') p++;
+            if (!*p) return true;
+            star_p = p;
+            star_t = t;
+            continue;
+        }
+        bool esc = *p == '\\' && p[1];
+        if (*p && ((!esc && *p == '_') || (esc ? p[1] : *p) == *t)) { p += esc ? 2 : 1; t++; continue; }
+        if (!star_p) return false;
+        p = star_p;
+        t = ++star_t;
+    }
+    while (*p == '%') p++;
+    return !*p;
 }
 
 static void search(SjBuf* out, int* found, bool all, const char* v, const char* pat, char* path, size_t pl) {

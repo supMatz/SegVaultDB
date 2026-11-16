@@ -1372,6 +1372,19 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
       `--token` on the command line (per-user key; other users need administrator rights to read a process's
       command line); `mkdir -p` / `launchctl` go through `system()` with paths from `$HOME` /
       `$XDG_CONFIG_HOME` in single quotes (only the user's own environment can break them).
+    - `mail.c` (read in full): no defect found (line and message size limits, attachments served without a
+      file name in the header, message HTML in a sandboxed iframe with a CSP).
+    - `regex.c` (read in full): **fixed** — the pattern parser recursed once per `(` with no limit: one statement
+      `SELECT 'a' REGEXP '((((…a))))'` with 100 000 parentheses crashed the whole server (stack overflow; any SQL
+      user, also `.htaccess` patterns); nesting is now limited to 250. Test in `tests/test_sql.c`. Matching was
+      already bounded (2·10⁶ steps, depth 4 000).
+    - `sqljson.c` (read in full): **fixed** — the `LIKE` matcher of `JSON_SEARCH` recursed once per character
+      (stack overflow with a 90 000-character value and pattern) and was exponential with several `%`
+      (`'%a%a…%b'` on a short string never returned); now iterative with backtracking to the last `%` only.
+      Tests in `tests/test_sql.c`. Every other recursive helper receives documents already checked by
+      `sj_valid` (depth ≤ 128).
+    - The fuzz harness (`tests/fuzz/fuzz.c`) had stopped working after P1.11 (a static `TableSchema` with no
+      column storage: every target died at start-up under UBSan); fixed with `schema_new`.
 
 - [ ] **P3.10 `[SECURITY]` Constrain the local certificate authority** — [code]
   - **Where:** `src/server/tls.c` `make_cert` (CA: `basicConstraints CA:TRUE, pathlen:0`, no `nameConstraints`),
