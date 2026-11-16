@@ -70,25 +70,33 @@ static DataType parse_type(const char* type_name) {
 }
 
 // LIKE con % (qualsiasi sequenza) e _ (un carattere), senza distinzione maiuscole/minuscole;
-// esc (0 = nessuno): il carattere che lo segue nel pattern vale per sé (ESCAPE '!': '100!%')
+// esc (0 = nessuno): il carattere che lo segue nel pattern vale per sé (ESCAPE '!': '100!%').
+// Iterativo: a un errore si torna solo all'ultimo % (basta: % prende qualunque sequenza), tempo O(|s|·|p|).
+// Prima una ricorsione per ogni %: '%a%a%a…%b' su 40 'a' non finiva mai, 50 000 % facevano traboccare lo stack
 static bool like_match_esc(const char* s, const char* p, char esc) {
-    while (*p) {
-        if (esc && *p == esc && p[1]) {
-            if (tolower((unsigned char)p[1]) != tolower((unsigned char)*s) || !*s) return false;
-            s++; p += 2;
-            continue;
-        }
+    const char *star_p = NULL, *star_s = NULL;
+    for (;;) {
         if (*p == '%') {
             while (*p == '%') p++;
             if (!*p) return true;
-            for (; *s; s++) if (like_match_esc(s, p, esc)) return true;
-            return false;
+            star_p = p;
+            star_s = s;
+            continue;
         }
-        if (!*s) return false;
-        if (*p != '_' && tolower((unsigned char)*p) != tolower((unsigned char)*s)) return false;
-        s++; p++;
+        if (!*s) break;
+        bool lit = esc && *p == esc && p[1];
+        const char* pc = lit ? p + 1 : p;
+        if (*p && ((!lit && *p == '_') || tolower((unsigned char)*pc) == tolower((unsigned char)*s))) {
+            s++;
+            p = pc + 1;
+            continue;
+        }
+        if (!star_p) return false;
+        p = star_p;
+        s = ++star_s;
     }
-    return *s == '\0';
+    while (*p == '%') p++;
+    return !*p;
 }
 
 static bool like_match(const char* s, const char* p) { return like_match_esc(s, p, '\\'); }   // come MySQL e PostgreSQL: \\ protegge % e _

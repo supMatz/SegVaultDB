@@ -1383,6 +1383,17 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
       (`'%a%a…%b'` on a short string never returned); now iterative with backtracking to the last `%` only.
       Tests in `tests/test_sql.c`. Every other recursive helper receives documents already checked by
       `sj_valid` (depth ≤ 128).
+    - `executor.c` `like_match_esc` (the SQL `LIKE`): **fixed** — same two problems as `JSON_SEARCH`: one
+      recursion per `%` (stack overflow with 60 000 `%`) and exponential time (`'%a%a…%b'`); now iterative.
+      Tests in `tests/test_sql.c` (escape, `_`, case, empty strings).
+    - Depth probes (one forked process per case, stacks of 1, 2, 4 and 8 MB): the parser refuses expressions
+      deeper than 128 levels and over-nested derived tables; procedures, functions and triggers stop with
+      "nested too deeply"; recursive CTEs stop at 1 000 steps / 10⁶ rows; views at 16 levels; `REPEAT` / `LPAD`
+      stop at 16 MB. All hold with a 2 MB stack, but **with 1 MB a chain of nested views crashed the process**.
+      **Fixed:** the server's connection threads and the HTTP/2 worker pool get an explicit 8 MB stack
+      reservation (`SV_THREAD_STACK`; Windows took the executable's default of 1-2 MB, Linux `ulimit -s`).
+      **Noted (usability):** a flat `a + b + c + …` of more than 128 terms is refused as "too complex" (the
+      AST is a left-deep tree evaluated recursively) — generated SQL summing many columns can hit it.
     - The fuzz harness (`tests/fuzz/fuzz.c`) had stopped working after P1.11 (a static `TableSchema` with no
       column storage: every target died at start-up under UBSan); fixed with `schema_new`.
 

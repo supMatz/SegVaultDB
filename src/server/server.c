@@ -4396,10 +4396,15 @@ static void conn_finish(Conn* c) {
     free(c);
 }
 
+// stack dei thread che eseguono SQL: 8 MB riservati (solo memoria virtuale). Il default di Windows (quello
+// dell'eseguibile, 1-2 MB) non basta per le viste annidate al limite (16) o per procedure / trigger annidati: con
+// 1 MB una catena di viste faceva cadere il server (P3.9). Su Linux il default dipende da ulimit -s
+#define SV_THREAD_STACK ((size_t)8 << 20)
+
 #ifdef _WIN32
 static DWORD WINAPI conn_thread(LPVOID arg) { Conn* c = (Conn*)arg; if (c->tls) tls_serve(c->s->tls, c->fd, c->client, c->client_port, c->s->port, c->s->tls_secret, &c->s->stop); else if (c->smtp) mail_smtp_serve(c->s->mail, c->fd, c->client, &c->s->stop); else if (c->mysql) serve_mysql(c); else serve_connection(c); conn_finish(c); return 0; }
 static bool spawn(Conn* c) {
-    HANDLE h = CreateThread(NULL, 0, conn_thread, c, 0, NULL);
+    HANDLE h = CreateThread(NULL, SV_THREAD_STACK, conn_thread, c, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (!h) return false;
     CloseHandle(h);
     return true;
@@ -4411,6 +4416,7 @@ static bool spawn(Conn* c) {
     pthread_attr_t a;
     pthread_attr_init(&a);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&a, SV_THREAD_STACK);
     bool ok = pthread_create(&t, &a, conn_thread, c) == 0;
     pthread_attr_destroy(&a);
     return ok;
@@ -4462,8 +4468,12 @@ static bool inner_enqueue(SvServer* s, Conn* c) {
                 pthread_mutex_init(&p->mx, NULL);
                 pthread_cond_init(&p->cv, NULL);
                 s->inner = p;
+                pthread_attr_t ta;
+                pthread_attr_init(&ta);
+                pthread_attr_setstacksize(&ta, SV_THREAD_STACK);
                 for (int i = 0; i < INNER_WORKERS; i++)
-                    if (pthread_create(&p->th[p->nth], NULL, inner_worker, s) == 0) p->nth++;
+                    if (pthread_create(&p->th[p->nth], &ta, inner_worker, s) == 0) p->nth++;
+                pthread_attr_destroy(&ta);
             }
         }
         mx_unlock(&s->conn_mx);

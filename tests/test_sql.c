@@ -1435,6 +1435,14 @@ int main(void) {
         t(deep, "\"$[0]\"");
         t("SELECT JSON_SEARCH('[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]', 'one', '%a%a%a%a%a%a%a%a%a%a%a%a%a%b'), "
           "JSON_SEARCH('[\"x_y\", \"xzy\"]', 'all', 'x\\\\_y'), JSON_SEARCH('[\"abc\"]', 'one', '%b%')", "NULL|\"$[0]\"|\"$[0]\"");
+        // LIKE dell'executor: stessi due problemi (ricorsione per ogni %, tempo esponenziale)
+        t("SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' LIKE '%a%a%a%a%a%a%a%a%a%a%a%a%a%b', 'abcabc' LIKE '%b_a%c', "
+          "'100%' LIKE '100!%' ESCAPE '!', '1000' LIKE '100!%' ESCAPE '!', 'AbC' LIKE 'a%c', 'abc' LIKE 'ab', '' LIKE '%', 'x' LIKE ''",
+          "0|1|1|0|1|0|1|0");
+        k2 = snprintf(deep, sizeof(deep), "SELECT 'zzz' LIKE '");
+        for (int i = 0; i < 60000; i++) { deep[k2++] = '%'; deep[k2++] = 'z'; }
+        snprintf(deep + k2, sizeof(deep) - (size_t)k2, "'");
+        t(deep, "0");
     }
     t("SELECT DATE_TRUNC('month', '2024-03-15 10:20:30'), DATE_TRUNC('week', '2024-03-15'), DATE_PART('quarter', '2024-08-01')", "2024-03-01 00:00:00|2024-03-11 00:00:00|3");
     t("SELECT MAKE_SET(5, 'a', 'b', 'c'), EXPORT_SET(5, 'Y', 'N', ',', 4)", "a,c|Y,N,Y,N");
