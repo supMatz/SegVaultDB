@@ -2302,6 +2302,7 @@ static void db_shutdown_impl(void) {
     // di I/O non si scrive più niente (le pagine senza il loro log violerebbero la regola del WAL).
     bool clean = false;
     if (!io_failed()) {
+        executor_seq_flush();                            // sequenze col valore esatto (non la riserva)
         trees_write();                                   // indici su disco per il prossimo avvio (P1.6)
         bool flushed = wal_flush(g_db.wal) == SV_OK && bp_flush_all(g_db.bp) == SV_OK;
         bool cat = catalog_save(g_db.catalog, g_db.cat_path) == SV_OK;

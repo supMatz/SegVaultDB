@@ -106,6 +106,8 @@ typedef struct {
     bool (*rows)(void* ud, const QueryResult* block);
 } ExecRowSink;
 void executor_set_stream_sink(ExecRowSink* sink);
+// chiusura: sequenze salvate col valore esatto (senza la riserva di NEXTVAL)
+void executor_seq_flush(void);
 int  executor_trees_write(ExecCtx* ctx, uint64_t lsn);
 int  executor_trees_garbage(uint32_t** roots);
 void executor_trees_drop_all(Catalog* c);

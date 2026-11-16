@@ -2618,26 +2618,65 @@ static void rt_eval_function(ASTExpr* e, EvalCtx* c, EvalVal* out);
 
 // ── sequenze (CREATE SEQUENCE, NEXTVAL / CURRVAL / SETVAL): come in PostgreSQL non sono transazionali;
 //    stato in un file di testo accanto al catalogo, riscritto a ogni cambio ──
-typedef struct { char db[64], name[64]; int64_t value, inc, minv, maxv, start; bool cycle, called; } Seq;
+typedef struct {
+    char db[64], name[64]; int64_t value, inc, minv, maxv, start; bool cycle, called;
+    // riserva (P3.9): NEXTVAL salva "res" (fino a 32 incrementi avanti) e poi dà i valori fino a lì senza scrivere il
+    // file; dopo una caduta si riparte da res, quindi nessun valore già dato si ripete (resta un salto, come la
+    // cache delle sequenze di PostgreSQL). Alla chiusura pulita si salva il valore esatto
+    int64_t res; bool has_res;
+} Seq;
 // Protezione: solo con il motore in esclusiva; db_execute_readonly rifiuta NEXTVAL / SETVAL.
 static Seq*  g_seq;
 static int   g_nseq, g_capseq;
 static char  g_seq_path[1100];
 
-static void seq_save(void) {
-    if (!g_seq_path[0]) return;
+// nome nel file: %XX per spazi, controlli, '%' (prima un nome con spazi non si rileggeva più)
+static void seq_put_name(FILE* f, const char* n) {
+    for (const unsigned char* p = (const unsigned char*)n; *p; p++)
+        if (*p <= ' ' || *p == '%' || *p == 0x7f) fprintf(f, "%%%02X", *p); else fputc(*p, f);
+}
+static void seq_get_name(char* s) {
+    char* w = s;
+    for (char* r = s; *r; r++) {
+        if (r[0] == '%' && isxdigit((unsigned char)r[1]) && isxdigit((unsigned char)r[2])) {
+            char h[3] = { r[1], r[2], 0 };
+            *w++ = (char)strtol(h, NULL, 16);
+            r += 2;
+        } else *w++ = *r;
+    }
+    *w = '\0';
+}
+
+// stato delle sequenze nel file: temporaneo scritto e sincronizzato, poi sostituzione atomica (prima remove + rename
+// senza fsync: una caduta in mezzo perdeva il file e le sequenze ripartivano dall'inizio). false = non salvato
+static bool seq_save(void) {
+    if (!g_seq_path[0]) return true;
     char tmp[1200];
     snprintf(tmp, sizeof(tmp), "%s.tmp", g_seq_path);
     FILE* f = sv_fopen_private(tmp, "w");
-    if (!f) return;
-    for (int i = 0; i < g_nseq; i++) {
+    if (!f) return false;
+    bool ok = true;
+    for (int i = 0; i < g_nseq && ok; i++) {
         Seq* q = &g_seq[i];
-        fprintf(f, "%s %s %lld %lld %lld %lld %lld %d %d\n", q->db, q->name, (long long)q->value, (long long)q->inc,
-                (long long)q->minv, (long long)q->maxv, (long long)q->start, q->cycle, q->called);
+        seq_put_name(f, q->db);
+        fputc(' ', f);
+        seq_put_name(f, q->name);
+        int64_t v = q->has_res ? q->res : q->value;
+        bool called = q->has_res ? true : q->called;
+        ok = fprintf(f, " %lld %lld %lld %lld %lld %d %d\n", (long long)v, (long long)q->inc,
+                     (long long)q->minv, (long long)q->maxv, (long long)q->start, q->cycle, called) > 0;
     }
-    fclose(f);
-    remove(g_seq_path);
-    rename(tmp, g_seq_path);
+    ok = ok && fflush(f) == 0 && sv_fsync(fileno(f)) == 0;
+    if (fclose(f) != 0) ok = false;
+    if (!ok || sv_replace_file(tmp, g_seq_path) != 0) { remove(tmp); return false; }
+    return true;
+}
+
+// chiusura pulita: valori esatti, senza la riserva
+void executor_seq_flush(void) {
+    bool any = false;
+    for (int i = 0; i < g_nseq; i++) if (g_seq[i].has_res) { g_seq[i].has_res = false; any = true; }
+    if (any) seq_save();
 }
 
 void executor_set_seq_file(const char* path) {
@@ -2654,6 +2693,8 @@ void executor_set_seq_file(const char* path) {
         long long v, inc, mn, mx, st;
         int cy, ca;
         if (sscanf(line, "%63s %63s %lld %lld %lld %lld %lld %d %d", q.db, q.name, &v, &inc, &mn, &mx, &st, &cy, &ca) != 9) continue;
+        seq_get_name(q.db);
+        seq_get_name(q.name);
         q.value = v; q.inc = inc; q.minv = mn; q.maxv = mx; q.start = st; q.cycle = cy; q.called = ca;
         if (g_nseq == g_capseq) {
             int nc = g_capseq ? g_capseq * 2 : 16;
@@ -2735,7 +2776,8 @@ static bool eval_sequence(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         if (x < q->minv || x > q->maxv) { ctx_error(c, "setval: value %.40s is out of bounds for the sequence", ev_s(&v)); ev_null(out); return true; }
         q->value = x;
         q->called = ev_truth(&called) == 1;
-        seq_save();
+        q->has_res = false;
+        if (!seq_save()) { ctx_error(c, "setval: cannot save the state of sequence '%s' (disk?)", q->name); ev_null(out); return true; }
         if (q->called) seq_remember(q);
         ev_int(out, x);
         return true;
@@ -2746,9 +2788,20 @@ static bool eval_sequence(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         if (!q->cycle) { ctx_error(c, "nextval: reached the limit of sequence '%s'", q->name); ev_null(out); return true; }
         next = q->inc > 0 ? q->minv : q->maxv;
     }
+    bool wrapped = q->called && q->value != next && (q->inc > 0 ? next < q->value : next > q->value);
+    if (!q->has_res || wrapped || (q->inc > 0 ? next > q->res : next < q->res)) {   // riserva finita: un'altra
+        Seq keep = *q;
+        int64_t res;
+        if (__builtin_mul_overflow(q->inc, (int64_t)31, &res) || __builtin_add_overflow(next, res, &res) ||
+            res > q->maxv || res < q->minv) res = q->inc > 0 ? q->maxv : q->minv;
+        q->value = next;
+        q->called = true;
+        q->res = res;
+        q->has_res = true;
+        if (!seq_save()) { *q = keep; ctx_error(c, "nextval: cannot save the state of sequence '%s' (disk?)", q->name); ev_null(out); return true; }
+    }
     q->value = next;
     q->called = true;
-    seq_save();
     seq_remember(q);
     ev_int(out, next);
     return true;
@@ -2803,11 +2856,12 @@ static QueryResult* exec_sequence(ExecCtx* ctx, ASTNode* n) {
     else if (n->seq.op == 0) q->start = q->inc > 0 ? q->minv : q->maxv;
     if (n->seq.op == 0) { q->value = q->start; q->called = false; }
     if (n->seq.restart) { q->value = n->seq.has_restart_with ? n->seq.restart_with : q->start; q->called = false; }
+    q->has_res = false;                                      // ALTER: la riserva va rifatta con i nuovi limiti
     if (q->minv > q->maxv || q->start < q->minv || q->start > q->maxv) {
         if (n->seq.op == 0) g_nseq--; else *q = old;
         return result_error_msg("START value must be between MINVALUE and MAXVALUE");
     }
-    seq_save();
+    if (!seq_save()) return result_error_msg("Cannot save the sequences (disk?)");
     return result_ok_msg(0);
 }
 

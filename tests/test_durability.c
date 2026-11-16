@@ -1405,6 +1405,43 @@ int main(void) {
         #undef TB
     }
 
+    // ── 10b. P3.9: sequenze. Dopo una caduta NEXTVAL non ripete un valore già dato (riserva salvata con fsync);
+    //         dopo una chiusura pulita prosegue esatto; un nome con spazi si rilegge ──
+    {
+        #define TQ BASE "_seq"
+        sh("rm -rf " TQ " && mkdir -p " TQ);
+        CHECK(db_init(TQ), "init for the sequence tests");
+        ok("CREATE DATABASE d"); ok("USE d");
+        ok("CREATE SEQUENCE s1");
+        ok("CREATE SEQUENCE `my seq` START WITH 10");
+        CHECK(num("SELECT NEXTVAL('my seq')") == 10, "sequence with a space in the name");
+        long fs0 = g_fsyncs;
+        for (int i = 1; i <= 100; i++) if (num("SELECT NEXTVAL('s1')") != i) { CHECK(false, "nextval %d", i); break; }
+        CHECK(g_fsyncs - fs0 <= 8, "100 NEXTVAL calls: %ld fsyncs (reserve of 32)", g_fsyncs - fs0);
+        db_shutdown();
+        CHECK(db_init(TQ), "reopen after a clean shutdown");
+        ok("USE d");
+        CHECK(num("SELECT NEXTVAL('s1')") == 101 && num("SELECT NEXTVAL('my seq')") == 11, "after a clean shutdown the sequences continue exactly");
+        db_shutdown();
+        pid_t cp = fork();
+        if (cp == 0) {
+            if (!db_init(TQ)) _exit(2);
+            ok("USE d");
+            for (int i = 0; i < 50; i++) if (num("SELECT NEXTVAL('s1')") < 0) _exit(4);   // fino a 151
+            _exit(0);                                           // caduta: niente chiusura
+        }
+        int cst;
+        waitpid(cp, &cst, 0);
+        CHECK(WIFEXITED(cst) && WEXITSTATUS(cst) == 0, "NEXTVAL before the crash");
+        CHECK(db_init(TQ), "restart after a crash");
+        ok("USE d");
+        long long nv = num("SELECT NEXTVAL('s1')");
+        CHECK(nv > 151, "after a crash NEXTVAL never repeats a value already given (%lld > 151)", nv);
+        db_shutdown();
+        sh("rm -rf " TQ);
+        #undef TQ
+    }
+
     // ── 11. P1.14: SELECT * a blocchi (db_execute_stream). In un processo nuovo il picco di memoria resta quello di
     //        un blocco; il risultato normale della stessa query vale tutta la tabella ──
     {

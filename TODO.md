@@ -1499,6 +1499,14 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
       text-drawing buffer did not check `realloc`; a clipboard conversion returning 0 led to reading an
       uninitialised byte. Linux `xlib.c` launch paths (`xdg-open`, zenity / kdialog via `execv`, descriptors
       closed) are fine.
+    - `executor.c` sequences (`sequences.txt`): **fixed** — the file was rewritten with `remove` + `rename` and no
+      `fsync` (a power cut in between lost it: every sequence restarted from its start, giving values already
+      used), write errors were ignored, and a name with a space (`` `my seq` ``) was not read back. Now: temporary
+      file written, checked and synced, atomic replace; names %-encoded; `NEXTVAL` saves a reserve of 32 values
+      ahead (one `fsync` per 32 calls, like PostgreSQL's sequence cache) so a value is never given twice after a
+      crash, and fails with an error if the state cannot be saved; a clean shutdown saves the exact values.
+      Tests in `tests/test_durability.c` §10b (100 `NEXTVAL` ≤ 8 `fsync`s, exact continuation after a clean
+      shutdown, no repeat after a crash, name with a space).
     - The fuzz harness (`tests/fuzz/fuzz.c`) had stopped working after P1.11 (a static `TableSchema` with no
       column storage: every target died at start-up under UBSan); fixed with `schema_new`.
 

@@ -153,8 +153,8 @@ static inline int sv_replace_file(const char* tmp, const char* path) {
 #include <string.h>
 static inline int sv_replace_file(const char* tmp, const char* path) {
     if (rename(tmp, path) != 0) return -1;
-    char dir[1024];
-    snprintf(dir, sizeof(dir), "%s", path);
+    char dir[4096];
+    if (snprintf(dir, sizeof(dir), "%s", path) >= (int)sizeof(dir)) return 0;   // (sostituito; niente fsync della cartella)
     char* sl = strrchr(dir, '/');
     if (sl) { if (sl == dir) sl[1] = '\0'; else *sl = '\0'; } else snprintf(dir, sizeof(dir), ".");
     int fd = open(dir, O_RDONLY);
