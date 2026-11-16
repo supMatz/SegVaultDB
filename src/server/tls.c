@@ -2,7 +2,6 @@
 SCOPO: HTTPS con OpenSSL caricato all'avvio (vedi tls.h).
 */
 #include "tls.h"
-#include "platform_compat.h"
 #include "h2.h"
 
 #include <errno.h>
@@ -385,18 +384,29 @@ static X509* make_cert(EVP_PKEY* key, const char* cn, X509* issuer, EVP_PKEY* is
     return x;
 }
 
+// file nuovo (o svuotato) leggibile solo da questo utente: 0600 su POSIX, ACL protetta su Windows
+#ifdef _WIN32
+int sv_win_private(const char* path, int is_dir);      // src/platform/win_acl.c
+static bool private_create(const char* path) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    fclose(f);
+    return sv_win_private(path, 0) == 0;
+}
+#else
+static bool private_create(const char* path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return false;
+    close(fd);
+    return chmod(path, 0600) == 0;                    // un file che c'era già tiene i permessi che aveva
+}
+#endif
+
 static bool write_pem(const char* path, X509* x, EVP_PKEY* k) {
     // una chiave (della CA, che il browser considera fidata dopo --trust-ca: chi la legge può firmare un certificato
     // per qualunque sito) è privata dal primo byte: il file nasce 0600 (ACL del solo utente su Windows) e solo poi
     // OpenSSL lo riscrive. Prima: creato con i permessi di default e ristretto con chmod dopo la scrittura
-    if (k) {
-        FILE* f = sv_fopen_private(path, "w");
-        if (!f) return false;
-        fclose(f);
-#ifndef _WIN32
-        if (chmod(path, 0600) != 0) return false;     // un file che c'era già tiene i permessi che aveva
-#endif
-    }
+    if (k && !private_create(path)) return false;
     BIO* b = O.BIO_new_file(path, "w");
     if (!b) return false;
     bool ok = x ? O.PEM_write_bio_X509(b, x) == 1 : O.PEM_write_bio_PrivateKey(b, k, NULL, NULL, 0, NULL, NULL) == 1;

@@ -1,8 +1,46 @@
 # Changelog
 
-## Unreleased
+## 1.4.0 — 2026-11-16
 
-**Security**
+Second round of the code audit (details and tests for each item in `TODO.md`).
+
+**Storage engine**
+- Transaction log v2: every record has a CRC-32C and an LSN; a torn or damaged log is recognised, never
+  replayed. Checkpoints also run with transactions open (the log no longer grows without bound).
+- Data file format 2: every page carries its LSN and a CRC-32C; before a page is overwritten its image goes
+  to the log, so a torn page write is repaired. A 1.3 database is converted when it is opened (a copy is
+  kept until the conversion ends).
+- `ROLLBACK` / `ROLLBACK TO` work on the pages in memory (no flush, no `fsync`).
+- `UPDATE` rewrites a row in place when it fits; space of replaced large rows and dropped tables is reused at
+  once; `VACUUM FULL` compacts tables and shortens the file.
+- Catalog without fixed limits (format v6, explicit encoding): up to 1 024 columns per table, any number of
+  tables and databases; indexes and constraints allocated on demand (448 bytes per table instead of 30 KB).
+- Schema changes are records in the log instead of a full catalog rewrite with two `fsync`s: 1 000
+  `CREATE TABLE` in 0.3 s (4.4 s before on an NVMe disk). `TRUNCATE` gives the table a new empty page chain
+  (before, its deletions were not logged and came back after a crash).
+- Page cache split into partitions with disk reads outside the latch; evicted page buffers are reused.
+
+**Concurrency**
+- Lock waits are FIFO queues with condition variables (no polling, no writer starvation); deadlock detection
+  over the whole wait-for graph. A plain `SELECT` inside a transaction releases its table locks at the end of
+  the statement (READ COMMITTED): `BEGIN; SELECT …; UPDATE …` in two sessions no longer deadlocks.
+
+**Security fixes**
+- Local CA and site keys are private from the moment they are created (they were world-readable until the
+  key had been written); the `certs` folder is created private.
+- Reverse proxy: a malformed status line from the backend caused a heap buffer overflow.
+- `.htaccess`: `%N` captures beyond 4 KB of condition text read stack memory into URLs; rewritten paths with
+  `..` made rules outside the site root apply.
+- `REGEXP` with deeply nested parentheses, `LIKE` and `JSON_SEARCH` with many `%`, could crash the server or
+  never return: now bounded / linear.
+- `--install-service --token`: the token is passed in the service environment, not on its command line.
+- Server threads get an explicit 8 MB stack (deeply nested views could overflow a 1 MB Windows stack).
+
+**GUI**
+- Engine calls run on a worker thread (the window stays responsive during long statements; lock waits can be
+  cancelled); input methods (XIM) and per-monitor UI scale on Linux.
+
+**Authentication**
 - Passwords: PBKDF2-HMAC-SHA256 with the iteration count stored in the hash (100 000); older hashes are
   redone on the next successful login.
 - MySQL protocol: `caching_sha2_password` (MySQL 8 / 9 clients), with full authentication over TLS, the Unix
