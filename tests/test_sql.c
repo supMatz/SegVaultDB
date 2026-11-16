@@ -374,7 +374,7 @@ int main(void) {
     t("SELECT UPPER(a, b) FROM n", "ERR:Wrong number of arguments");
 
     // ── colonne, alias, ordinamento, LIMIT ──
-    cols("SELECT id, a + b AS total, a * 1.5, s FROM n", "id|total|a * 1.5|s", "INT|INT|FLOAT|VARCHAR");
+    cols("SELECT id, a + b AS total, a * 1.5, s FROM n", "id|total|a * 1.5|s", "INT|INT|DECIMAL|VARCHAR");
     t("SELECT id, a + b AS total FROM n ORDER BY total DESC", "1|9;2|-3;3|NULL");   // NULL in fondo con DESC
     t("SELECT id FROM n ORDER BY 1 DESC", "3;2;1");
     t("SELECT id, s FROM n ORDER BY s IS NULL, s", "1|Hello;3|abc;2|NULL");
@@ -391,7 +391,7 @@ int main(void) {
       "('south','pen',5,1.5), ('south','pen',1,1.5), ('east','ink',NULL,9.5)", "OK:5");
     t("SELECT COUNT(*), COUNT(qty), SUM(qty), MIN(price), MAX(price) FROM sales", "5|4|18|1.5|10.25");
     t("SELECT region, SUM(qty * price) AS revenue FROM sales GROUP BY region ORDER BY revenue DESC",
-      "north|35.5;south|9;east|NULL");
+      "north|35.50;south|9.0;east|NULL");
     t("SELECT region, COUNT(*) AS n FROM sales GROUP BY region HAVING n > 1 ORDER BY region", "north|2;south|2");
     t("SELECT product, COUNT(DISTINCT region) FROM sales GROUP BY product ORDER BY product", "ink|2;pen|2");
     t("SELECT UPPER(region) AS r, AVG(qty) FROM sales GROUP BY r ORDER BY r", "EAST|NULL;NORTH|6;SOUTH|3");
@@ -535,6 +535,83 @@ int main(void) {
         db_result_free(r);
     }
 
+    // ── P1.9: decimali esatti e BIGINT UNSIGNED (come MySQL 8) ──
+    t("SELECT 0.10 + 0.20 = 0.30, 0.1 + 0.2, 1.5 * 2, 2.50 - 1, 3.0 / 2, 1.0 * 1.0, ROUND(150.000, 2), ROUND(150, 2)",
+      "1|0.3|3.0|1.50|1.50000|1.00|150.00|150");
+    t("CREATE TABLE dz (id INT PRIMARY KEY, a DECIMAL(20,2), u BIGINT UNSIGNED)", "OK:0");
+    t("INSERT INTO dz VALUES (1, 12345678901234567.89, 1), (2, 0.01, 18446744073709551615)", "OK:2");
+    t("SELECT SUM(a), AVG(a), MIN(a), MAX(a), SUM(a) * 2 FROM dz",
+      "12345678901234567.90|6172839450617283.950000|0.01|12345678901234567.89|24691357802469135.80");
+    cols("SELECT SUM(a) FROM dz", "SUM(a)", "DECIMAL");
+    t("SELECT a FROM dz ORDER BY a DESC", "12345678901234567.89;0.01");
+    t("SELECT u, u + 0 FROM dz WHERE u > 9223372036854775807", "18446744073709551615|18446744073709551615");
+    t("INSERT INTO dz VALUES (3, 1, -1)", "ERR:out of range");
+    t("INSERT INTO dz VALUES (4, 1, 18446744073709551616)", "ERR:out of range");
+    t("SELECT a, COUNT(*) FROM (SELECT 1.50 AS a UNION ALL SELECT 1.5 UNION ALL SELECT 1.500) x GROUP BY a", "1.50|3");
+    t("SELECT TRUNCATE(-1.999, 2), ROUND(-2.5), ROUND(2.675, 2), ROUND(14.5, -1), 12345678901234567.89 % 10", "-1.99|-3|2.68|10|7.89");
+    t("DROP TABLE dz", "OK:0");
+
+    // ── P1.13: statistiche, indice o scansione, ordine dei join, stime, EXPLAIN FORMAT=JSON ──
+    {
+        t("CREATE TABLE sk (id INT PRIMARY KEY, k INT, v INT)", "OK:0");
+        t("CREATE INDEX ik ON sk (k)", "OK:0");
+        t("INSERT INTO sk SELECT x, CASE WHEN x <= 9000 THEN 1 ELSE x END, x % 7 FROM GENERATE_SERIES(1, 10000) AS g(x)", "OK:10000");
+        t("ANALYZE TABLE sk", "sk|analyze|status|OK (10000 rows)");
+        // tabella storta: k = 1 in 9000 righe su 10000 → scansione; k = 9500 (una riga) → indice
+        t("EXPLAIN SELECT id FROM sk WHERE k = 1",
+          "1|Table scan|sk (about 10000 rows; the index on k finds 9000, too many: reading every page in order is cheaper)|10000;"
+          "2|Filter|WHERE k = 1 (on sk, before the joins)|9000;3|Projection|id|9000");
+        t("EXPLAIN SELECT id FROM sk WHERE k = 9500", "1|Index lookup|sk using sk.k (in-memory index)|1;2|Filter|WHERE k = 9500 (on sk, before the joins)|1;3|Projection|id|1");
+        t("SELECT COUNT(*), SUM(id) FROM sk WHERE k = 1", "9000|40504500");
+        // stima dall'istogramma: v = 3 AND id > 5000 → 714 (le righe vere sono 715)
+        t("EXPLAIN SELECT id FROM sk WHERE v = 3 AND id > 5000",
+          "1|Table scan|sk (about 10000 rows)|10000;2|Filter|WHERE v = 3 AND id > 5000 (on sk, before the joins)|714;3|Projection|id|714");
+        // tre tabelle: lo stesso ordine (la più selettiva prima) comunque scritto il join; stime entro 2x
+        t("CREATE TABLE jb (id INT PRIMARY KEY, m INT, a INT)", "OK:0");
+        t("CREATE TABLE jm (id INT PRIMARY KEY, s INT, b INT)", "OK:0");
+        t("CREATE TABLE js (id INT PRIMARY KEY, c INT)", "OK:0");
+        t("INSERT INTO jb SELECT x, x % 1000, x % 10 FROM GENERATE_SERIES(1, 20000) AS g(x)", "OK:20000");
+        t("INSERT INTO jm SELECT x, x % 20, x FROM GENERATE_SERIES(1, 1000) AS g(x)", "OK:1000");
+        t("INSERT INTO js SELECT x, x FROM GENERATE_SERIES(1, 20) AS g(x)", "OK:20");
+        t("ANALYZE TABLE jb, jm, js", "jb|analyze|status|OK (20000 rows);jm|analyze|status|OK (1000 rows);js|analyze|status|OK (20 rows)");
+        const char* plan3 = "1|Table scan|js (about 20 rows)|20;2|Filter|WHERE js.c < 3 (on js, before the joins)|2;"
+                            "3|Table scan|jm (about 1000 rows)|1000;4|Hash join|INNER JOIN jm ON jm.s = js.id|125;"
+                            "5|Table scan|jb (about 20000 rows)|20000;6|Hash join|INNER JOIN jb ON jb.m = jm.id|2500;"
+                            "7|Aggregate|all rows as one group|1;8|Projection|COUNT(*)|1";
+        t("EXPLAIN SELECT COUNT(*) FROM jb JOIN jm ON jb.m = jm.id JOIN js ON jm.s = js.id WHERE js.c < 3", plan3);
+        t("EXPLAIN SELECT COUNT(*) FROM js JOIN jm ON jm.s = js.id JOIN jb ON jb.m = jm.id WHERE js.c < 3", plan3);
+        t("EXPLAIN SELECT COUNT(*) FROM jm, jb, js WHERE jb.m = jm.id AND jm.s = js.id AND js.c < 3", plan3);
+        t("SELECT COUNT(*) FROM jb JOIN jm ON jb.m = jm.id JOIN js ON jm.s = js.id WHERE js.c < 3", "2000");
+        {   // EXPLAIN ANALYZE: ogni stima entro 2x delle righe vere (l'ultima riga ha il tempo: non si confronta)
+            tests++;
+            QueryResult* r = db_execute("EXPLAIN ANALYZE SELECT COUNT(*) FROM jb JOIN jm ON jb.m = jm.id JOIN js ON jm.s = js.id WHERE js.c < 3");
+            char got[4096] = "";
+            if (r && r->success) render(r, got, sizeof(got));
+            const char* want = "1|Table scan|js (about 20 rows)|20|20;2|Filter|WHERE js.c < 3 (on js, before the joins)|2|2;"
+                               "3|Table scan|jm (about 1000 rows)|1000|1000;4|Hash join|INNER JOIN jm ON jm.s = js.id|125|100;"
+                               "5|Table scan|jb (about 20000 rows)|20000|20000;6|Hash join|INNER JOIN jb ON jb.m = jm.id|2500|2000;"
+                               "7|Aggregate|all rows as one group|1|1;8|Projection|COUNT(*)|1|1;9|Result|1 rows in ";
+            if (strncmp(got, want, strlen(want))) { failed++; printf("FAIL %d: EXPLAIN ANALYZE estimates\n   got: %s\n", tests, got); }
+            db_result_free(r);
+        }
+        // SELECT * dopo il riordino: colonne nell'ordine scritto, stessi nomi
+        cols("SELECT * FROM jb JOIN jm ON jb.m = jm.id JOIN js ON jm.s = js.id WHERE js.c < 2 LIMIT 1",
+             "jb.id|jb.m|jb.a|jm.id|jm.s|jm.b|js.id|js.c", "INT|INT|INT|INT|INT|INT|INT|INT");
+        t("SELECT * FROM jb JOIN jm ON jb.m = jm.id JOIN js ON jm.s = js.id WHERE js.c < 2 ORDER BY jb.id LIMIT 2", "1|1|1|1|1|1|1|1;21|21|1|21|1|21|1|1");
+        // num_rows esatto dopo un ROLLBACK (prima: le righe annullate restavano contate)
+        t("BEGIN", "OK:0");
+        t("INSERT INTO js SELECT x, x FROM GENERATE_SERIES(100, 599) AS g(x)", "OK:500");
+        t("DELETE FROM js WHERE id <= 10", "OK:10");
+        t("ROLLBACK", "OK:0");
+        t("EXPLAIN SELECT * FROM js", "1|Table scan|js (about 20 rows)|20;2|Projection|id, c|20");
+        t("EXPLAIN FORMAT=JSON SELECT id FROM sk WHERE k = 9500",
+          "{\"query_plan\": [{\"step\": 1, \"depth\": 0, \"operation\": \"Index lookup\", \"details\": \"sk using sk.k (in-memory index)\", \"estimated_rows\": 1}, "
+          "{\"step\": 2, \"depth\": 0, \"operation\": \"Filter\", \"details\": \"WHERE k = 9500 (on sk, before the joins)\", \"estimated_rows\": 1}, "
+          "{\"step\": 3, \"depth\": 0, \"operation\": \"Projection\", \"details\": \"id\", \"estimated_rows\": 1}]}");
+        t("EXPLAIN FORMAT=XML SELECT 1", "ERR:Expected FORMAT = JSON");
+        t("DROP TABLE sk", "OK:0"); t("DROP TABLE jb", "OK:0"); t("DROP TABLE jm", "OK:0"); t("DROP TABLE js", "OK:0");
+    }
+
     // ── DDL ──
     t("CREATE TABLE d1 (a INT, A INT)", "ERR:defined twice");
     t("CREATE TABLE d1 (a INT PRIMARY KEY, b INT PRIMARY KEY)", "ERR:only one PRIMARY KEY");
@@ -555,7 +632,7 @@ int main(void) {
 
     // ── SELECT senza FROM ──
     t("SELECT 1", "1");
-    t("SELECT 1 + 2 AS three, UPPER('x'), ROUND(2.5, 400), ROUND(123, -2)", "3|X|2.5|100");
+    t("SELECT 1 + 2 AS three, UPPER('x'), ROUND(2.5, 400), ROUND(123, -2)", "3|X|2.500000000000000000000000000000|100");
     t("SELECT LENGTH(NOW()) WHERE 1 = 0", "");
     t("SELECT *", "ERR:needs a FROM");
     t("SELECT id", "ERR:Unknown column 'id'");
@@ -762,7 +839,7 @@ int main(void) {
     t("INSERT INTO rg VALUES (5000, 'z', 0), (-7, 'a', 0)", "OK:2");
     t("SELECT id FROM rg WHERE id > 988 AND id < 996 OR id > 4000", "989;995;5000");
     t("SELECT id FROM rg WHERE id > 988 AND id < 996", "989;995");
-    t("SELECT id FROM rg WHERE id < 1", "0;-7");
+    t("SELECT id FROM rg WHERE id < 1 ORDER BY id", "-7;0");
     {
         tests++;
         QueryResult* r = db_execute("EXPLAIN ANALYZE SELECT * FROM rg WHERE id BETWEEN 200 AND 219");
@@ -1198,7 +1275,7 @@ int main(void) {
     t("CREATE FUNCTION iva(p DECIMAL(6,2)) RETURNS DECIMAL(6,2) RETURN p * 1.22", "OK:0");
     t("SELECT nome, iva(prezzo) FROM prod WHERE iva(prezzo) > 1 ORDER BY id", "penna|1.83;quaderno|3.90;zaino|30.50");
     t("SELECT nome FROM prod WHERE iva(prezzo) > 2 ORDER BY id", "quaderno;zaino");
-    t("SELECT fatt(3) + iva(10)", "18.2");
+    t("SELECT fatt(3) + iva(10)", "18.20");
     t("CREATE FUNCTION giudizio(v INT) RETURNS VARCHAR(20) BEGIN "
       "CASE WHEN v >= 28 THEN RETURN 'ottimo'; WHEN v >= 24 THEN RETURN 'buono'; ELSE RETURN 'sufficiente'; END CASE; END", "OK:0");
     t("SELECT giudizio(30), giudizio(25), giudizio(18)", "ottimo|buono|sufficiente");
@@ -1297,7 +1374,7 @@ int main(void) {
     t("SELECT ROUND(STDDEV(stip), 2), ROUND(STDDEV_SAMP(stip), 2), VARIANCE(stip), VAR_SAMP(stip) FROM dip WHERE rep = 'IT'", "216.02|264.58|46666.6666666667|70000");
     t("SELECT BIT_AND(id), BIT_OR(id), BIT_XOR(id), BOOL_AND(id > 0), BOOL_OR(id > 4), EVERY(id > 1) FROM dip", "0|7|1|1|1|0");
     t("SELECT JSON_ARRAYAGG(nome), JSON_OBJECTAGG(id, rep) FROM dip WHERE id < 3", "[\"Ada\", \"Bruno\"]|{\"1\": \"IT\", \"2\": \"IT\"}");
-    t("SELECT COUNT(*) FILTER (WHERE stip > 2500), SUM(stip) FILTER (WHERE rep = 'IT') FROM dip", "3|8100");
+    t("SELECT COUNT(*) FILTER (WHERE stip > 2500), SUM(stip) FILTER (WHERE rep = 'IT') FROM dip", "3|8100.00");
     t("SELECT nome, PERCENT_RANK() OVER (ORDER BY id), CUME_DIST() OVER (ORDER BY id), NTH_VALUE(nome, 2) OVER (ORDER BY id) FROM dip WHERE id <= 3 ORDER BY id",
       "Ada|0|0.333333333333333|NULL;Bruno|0.5|0.666666666666667|Bruno;Carla|1|1|Bruno");
     t("SELECT nome, RANK() OVER w FROM dip WHERE stip IS NOT NULL WINDOW w AS (PARTITION BY rep ORDER BY stip DESC) ORDER BY rep, stip DESC", "Carla|1;Ada|1;Elena|2;Bruno|3");
@@ -1471,6 +1548,8 @@ int main(void) {
     t("DROP SEQUENCE giro", "OK:0");
     t("DROP SEQUENCE giro", "ERR:does not exist");
     t("DROP SEQUENCE IF EXISTS giro", "OK:0");
+    // INTERVAL enorme (trovato dal fuzzer, P3.3): NULL, non più un overflow di intero (comportamento indefinito)
+    t("SELECT DATE_ADD('2020-01-01', INTERVAL '99999999999999999999' DAY), DATE_ADD('2020-01-01', INTERVAL '1844674407370955161' SECOND)", "NULL|NULL");
     // RANGE con INTERVAL sulle date; query su più database
     t("CREATE TABLE incassi (g DATE, x INT)", "OK:0");
     t("INSERT INTO incassi VALUES ('2024-01-01',10),('2024-01-02',20),('2024-01-05',30),('2024-01-06',40),('2024-01-10',50)", "OK:5");

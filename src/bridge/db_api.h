@@ -272,11 +272,15 @@ DbSession* db_session_new(void);
 DbSession* db_session_new_temp(void);
 // Più transazioni possono essere aperte insieme (sessioni diverse): ogni statement prende lock S / X
 // sulle tabelle che usa (vedi locks.h) e li tiene fino a COMMIT / ROLLBACK. Chi trova una tabella
-// occupata aspetta: prima di aspettare esce dal motore e chiama questo hook (del thread), che deve
-// lasciare per un attimo il turno a chi tiene il lock (il server rilascia e riprende il suo mutex).
-// Senza hook il thread dorme qualche millisecondo. Dopo 30 s: "Lock wait timeout exceeded";
-// un ciclo di attese: "Deadlock found" e la transazione viene annullata (come MySQL).
-void db_set_lock_wait_hook(void (*hook)(void* ud), void* ud);
+// occupata aspetta in coda (FIFO): esce dal motore, chiama leave(ud) (il server lascia il suo turno),
+// dorme finché un lock viene rilasciato (nessun polling), poi enter(ud). Hook del thread, NULL = nessuno.
+// Dopo 30 s: "Lock wait timeout exceeded"; un ciclo di attese: "Deadlock found" e la transazione viene
+// annullata (come MySQL); il flag di annullamento del thread (db_set_thread_cancel) ferma l'attesa.
+void db_set_lock_wait_hooks(void (*leave)(void* ud), void (*enter)(void* ud), void* ud);
+// db_session_enter è fallita (un'altra sessione è dentro il motore): db_session_seq prima di provare,
+// poi db_session_wait dorme finché una sessione esce (o max_ms)
+unsigned long long db_session_seq(void);
+void db_session_wait(unsigned long long seq, int max_ms);
 void db_set_lock_wait_timeout(int ms);         // attesa massima di un lock (default 30000)
 // rende attiva s (NULL = una richiesta senza sessione); false se un'altra sessione ha una transazione
 // aperta (riprovare più tardi)
@@ -291,6 +295,10 @@ bool db_session_blocked(void);                  // una sessione ha una transazio
 // quello corrente), user = permessi (NULL / "" = root), timeout_ms = limite (0 = nessuno).
 // *refused = true (e NULL) se non si può fare in parallelo: non è una SELECT, una transazione è
 // aperta, il database non esiste, ...: allora va eseguita con db_execute.
+// flag MySQL (NOT_NULL, PRI_KEY, UNIQUE_KEY, MULTIPLE_KEY, UNSIGNED, AUTO_INCREMENT) di una colonna di tabella
+unsigned db_column_flags(const char* db, const char* table, const char* column);
+// true se l'SQL contiene solo letture senza effetti (SELECT senza INTO / funzioni dell'utente, SHOW, DESCRIBE)
+bool db_statement_is_read(const char* sql);
 QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char* user, int timeout_ms, bool* refused);
 
 // modalità MySQL per il thread corrente (connessioni del protocollo MySQL): regole permissive di MySQL
@@ -306,6 +314,8 @@ typedef struct {
     unsigned long long wal_records, checkpoints;
     int       databases, tables;
     bool      in_transaction;
+    int       open_transactions;   // transazioni aperte in tutte le sessioni
+    unsigned long long lock_waits, deadlocks;
 } DbEngineStats;
 bool db_engine_stats(DbEngineStats* out);
 
@@ -328,6 +338,19 @@ bool        db_login(const char* name, const char* password);   // credenziali g
 // l'utente ha qualche permesso nel database (table NULL) o sulla tabella? "" = root, sempre
 // login col protocollo MySQL: 1 = ok, 0 = no, -1 = password da reimpostare (utente creato prima)
 int         db_login_native(const char* user, const uint8_t scramble[20], const uint8_t* resp, size_t rlen);
+// prepared statement analizzati una volta (P2.2): NULL se lo statement non si presta (il chiamante usa il
+// testo con i valori). exec: lits[i] = valore del '?' numero i+1 come letterale SQL ("12", "'x'", "NULL");
+// NULL = usare il testo (schema cambiato in modo che lo statement non si analizza più, valore non letterale)
+typedef struct DbPrepared DbPrepared;
+DbPrepared*  db_prepared_new(const char* sql);
+QueryResult* db_prepared_exec(DbPrepared* p, const char* const* lits, int n);
+int          db_prepared_params(const DbPrepared* p);
+void         db_prepared_free(DbPrepared* p);
+void         db_prepared_counts(unsigned long long* runs, unsigned long long* parses);   // per i test
+
+// caching_sha2_password, accesso veloce: 1 = giusto, 0 = sbagliato, -2 = serve la password in chiaro (db_login)
+int         db_login_sha2(const char* user, const uint8_t nonce[20], const uint8_t* resp, size_t rlen);
+bool        db_user_has_native(const char* user);   // l'utente ha il verificatore mysql_native_password?
 bool        db_user_can_see(const char* user, const char* db, const char* table);
 bool        db_has_users(void);
 // durabilità delle conferme: "OFF", "NORMAL" (predefinito), "FULL" (anche SET [GLOBAL] synchronous = ...).
@@ -340,6 +363,8 @@ void        db_set_cache_size(long mb);
 long        db_cache_size(void);
 const char* db_synchronous(void);
 void        db_sync_tick(void);
+// byte di log oltre i quali parte un checkpoint (default 16 MB; per i test e i carichi grandi)
+void        db_set_checkpoint_bytes(long long bytes);
 // flag di annullamento della connessione di questo thread (KILL QUERY): != 0 ferma lo statement in corso
 void        db_set_thread_cancel(atomic_int* flag);
 // colonne di una SELECT senza eseguirla (nessuna riga, nessun effetto): NULL se sql non è una SELECT sola

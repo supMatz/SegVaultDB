@@ -78,6 +78,22 @@ int main(void) {
     ok("USE d");
     CHECK(num("SELECT COUNT(*) FROM t") == 501 && num("SELECT LENGTH(v) FROM t WHERE id = 9999") == 3, "data after restart");
     CHECK(db_login("w", "w-pass"), "user after restart");
+    {   // P2.6: ACL protetta, solo l'utente corrente e SYSTEM (prima: quella ereditata dalla cartella sopra)
+        char up[600];
+        snprintf(up, sizeof(up), "%s\\users.dat", dir);
+        char au[600], ad[600];
+        sv_win_acl_sddl(up, au, sizeof(au));
+        sv_win_acl_sddl(dir, ad, sizeof(ad));
+        if (sv_win_under_wine()) printf("(wine keeps no ACLs: owner-only ACL not checked; users.dat %s)\n", au);
+        else {
+            int na = 0, nd = 0;
+            for (const char* q = au; (q = strstr(q, "(A;")); q++) na++;
+            for (const char* q = ad; (q = strstr(q, "(A;")); q++) nd++;
+            CHECK(!strncmp(au, "D:P", 3) && na == 2 && strstr(au, ";;;SY)") && strstr(au, "S-1-5-") && !strstr(au, ";;;WD)") && !strstr(au, ";;;BU)"),
+                  "owner-only ACL on users.dat: %s", au);
+            CHECK(!strncmp(ad, "D:P", 3) && nd == 2 && strstr(ad, "OICI"), "owner-only, inherited ACL on the data folder: %s", ad);
+        }
+    }
     db_shutdown();
     system("rmdir /s /q sv_win_test >nul 2>&1");
     if (g_fail) { printf("windows tests: %d of %d FAILED\n", g_fail, g_tests); return 1; }

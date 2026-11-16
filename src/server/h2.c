@@ -2,8 +2,8 @@
 SCOPO: HTTP/2 (vedi h2.h).
        Un thread per connessione con un ciclo di eventi (OpenSSL non consente letture e scritture
        da thread diversi sulla stessa sessione): frame dal client, una connessione HTTP/1.1 al server
-       interno per ogni stream (con "Connection: close"), risposte tradotte in HEADERS + DATA
-       rispettando le finestre di flusso del client.
+       interno per ogni stream (con "Connection: close"; in memoria e servita dal pool fisso del server,
+       vedi sv_inner_connect), risposte tradotte in HEADERS + DATA rispettando le finestre di flusso.
 */
 #include "h2.h"
 #include "json.h"
@@ -31,6 +31,8 @@ SCOPO: HTTP/2 (vedi h2.h).
   #include <fcntl.h>
   #include <netinet/in.h>
   #include <netinet/tcp.h>
+  #include <poll.h>
+  #include <pthread.h>
   #include <sys/select.h>
   #include <sys/socket.h>
   #include <unistd.h>
@@ -40,8 +42,94 @@ SCOPO: HTTP/2 (vedi h2.h).
   static void nonblock(tls_sock fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK); }
   static bool would_block(void) { return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR; }
 #endif
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0                  // Windows / macOS: nessun flag (Windows non eredita i socket: P2.10)
+#endif
 
 static atomic_int g_h2_on = 0;
+
+// ── connessioni interne (vedi h2.h) ──
+#define INNER_MAX 8
+static struct { int port; SvInnerConnect fn; void* ud; } g_inner[INNER_MAX];
+#ifdef _WIN32
+static SRWLOCK g_inner_mx = SRWLOCK_INIT;
+static void inner_lock(void)   { AcquireSRWLockExclusive(&g_inner_mx); }
+static void inner_unlock(void) { ReleaseSRWLockExclusive(&g_inner_mx); }
+#else
+static pthread_mutex_t g_inner_mx = PTHREAD_MUTEX_INITIALIZER;
+static void inner_lock(void)   { pthread_mutex_lock(&g_inner_mx); }
+static void inner_unlock(void) { pthread_mutex_unlock(&g_inner_mx); }
+#endif
+
+void sv_inner_register(int port, SvInnerConnect fn, void* ud) {
+    inner_lock();
+    int slot = -1;
+    for (int i = 0; i < INNER_MAX; i++) {
+        if (g_inner[i].port == port) { slot = i; break; }
+        if (slot < 0 && !g_inner[i].fn) slot = i;
+    }
+    if (slot >= 0) { g_inner[slot].port = port; g_inner[slot].fn = fn; g_inner[slot].ud = ud; }
+    inner_unlock();
+}
+
+void sv_inner_unregister(int port) {
+    inner_lock();
+    for (int i = 0; i < INNER_MAX; i++) if (g_inner[i].port == port) memset(&g_inner[i], 0, sizeof(g_inner[i]));
+    inner_unlock();
+}
+
+static tls_sock tcp_inner(int port) {
+    tls_sock fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd == BAD_SOCK) return BAD_SOCK;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((unsigned short)port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr*)&a, sizeof(a)) != 0) { sock_close(fd); return BAD_SOCK; }
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+    return fd;
+}
+
+tls_sock sv_inner_connect(int port, bool one_request) {
+    // la funzione si chiama col lock preso: sv_inner_unregister (arresto del server) aspetta che finisca
+    inner_lock();
+    tls_sock fd = BAD_SOCK;
+    bool registered = false;
+    for (int i = 0; i < INNER_MAX; i++)
+        if (g_inner[i].fn && g_inner[i].port == port) { registered = true; fd = g_inner[i].fn(g_inner[i].ud, one_request); break; }
+    inner_unlock();
+    // registrato ma pieno (o in arresto): BAD_SOCK, lo stream risponde 503; niente TCP che scavalchi il limite
+    return registered ? fd : tcp_inner(port);
+}
+
+int sv_poll(SvPoll* p, int n, int timeout_ms) {
+#ifdef _WIN32
+    WSAPOLLFD* v = calloc((size_t)(n > 0 ? n : 1), sizeof(WSAPOLLFD));
+    if (!v) return -1;
+    for (int i = 0; i < n; i++) { v[i].fd = p[i].fd; v[i].events = (short)((p[i].want & 1 ? POLLRDNORM : 0) | (p[i].want & 2 ? POLLWRNORM : 0)); }
+    int r = WSAPoll(v, (ULONG)n, timeout_ms);
+    for (int i = 0; i < n; i++) {
+        short e = v[i].revents;
+        p[i].got = (short)((e & (POLLRDNORM | POLLHUP | POLLERR) ? 1 : 0) | (e & (POLLWRNORM | POLLERR) ? 2 : 0));
+    }
+    free(v);
+    return r;
+#else
+    struct pollfd small[66];
+    struct pollfd* v = n <= 66 ? small : calloc((size_t)n, sizeof(struct pollfd));
+    if (!v) return -1;
+    for (int i = 0; i < n; i++) { v[i].fd = p[i].fd; v[i].events = (short)((p[i].want & 1 ? POLLIN : 0) | (p[i].want & 2 ? POLLOUT : 0)); v[i].revents = 0; }
+    int r = poll(v, (nfds_t)n, timeout_ms);
+    for (int i = 0; i < n; i++) {
+        short e = v[i].revents;
+        p[i].got = (short)((e & (POLLIN | POLLHUP | POLLERR) ? 1 : 0) | (e & (POLLOUT | POLLERR) ? 2 : 0));
+    }
+    if (v != small) free(v);
+    return r;
+#endif
+}
 
 bool h2_enabled(void) { return atomic_load(&g_h2_on) != 0; }
 void h2_set_enabled(bool on) { atomic_store(&g_h2_on, on ? 1 : 0); }
@@ -343,6 +431,7 @@ typedef struct Stream {
     bool      resp_done;          // tutto il corpo è in out
     bool      end_sent;
     long long window;             // finestra di invio verso il client
+    int       pi;                 // indice nel poll di questo giro (-1 = non atteso)
     struct Stream* next;
 } Stream;
 
@@ -420,17 +509,8 @@ static void stream_free(Conn2* c, Stream* s) {
 }
 
 static tls_sock connect_inner(int port) {
-    tls_sock fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == BAD_SOCK) return BAD_SOCK;
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET;
-    a.sin_port = htons((unsigned short)port);
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (connect(fd, (struct sockaddr*)&a, sizeof(a)) != 0) { sock_close(fd); return BAD_SOCK; }
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
-    nonblock(fd);
+    tls_sock fd = sv_inner_connect(port, true);
+    if (fd != BAD_SOCK) nonblock(fd);
     return fd;
 }
 
@@ -929,19 +1009,22 @@ void h2_serve(H2Io* io, int inner_port, const char* marker, atomic_int* stop) {
         if (c.goaway && !c.streams) break;
 
         // 4. attesa: client, server interni leggibili (se c'è finestra) o scrivibili
-        fd_set rd, wr;
-        FD_ZERO(&rd);
-        FD_ZERO(&wr);
-        FD_SET(io->fd, &rd);
-        tls_sock top = io->fd;
+        // poll (non select: un descrittore oltre 1024 in un fd_set è comportamento indefinito)
+        SvPoll pv[MAX_STREAMS + 1];
+        int np = 0;
+        pv[np++] = (SvPoll){ io->fd, 1, 0 };
         for (Stream* s = c.streams; s; s = s->next) {
-            if (s->fd == BAD_SOCK) continue;
-            if (!s->resp_done && s->out.len - s->out_off < BACKLOG_MAX) { FD_SET(s->fd, &rd); if (s->fd > top) top = s->fd; }
-            if (s->to_inner.len > s->to_inner_off) { FD_SET(s->fd, &wr); if (s->fd > top) top = s->fd; }
+            s->pi = -1;
+            if (s->fd == BAD_SOCK || np >= MAX_STREAMS + 1) continue;
+            short want = 0;
+            if (!s->resp_done && s->out.len - s->out_off < BACKLOG_MAX) want |= 1;
+            if (s->to_inner.len > s->to_inner_off) want |= 2;
+            if (!want) continue;
+            s->pi = np;
+            pv[np++] = (SvPoll){ s->fd, want, 0 };
         }
         int pend = io->pending(io->ssl);
-        struct timeval tv = { 0, pend > 0 ? 0 : 200000 };
-        int r = select((int)top + 1, &rd, &wr, NULL, &tv);
+        int r = sv_poll(pv, np, pend > 0 ? 0 : 200);
         if (r < 0) {
 #ifndef _WIN32
             if (errno == EINTR) continue;
@@ -950,7 +1033,7 @@ void h2_serve(H2Io* io, int inner_port, const char* marker, atomic_int* stop) {
         }
         if (r == 0 && !pend && !c.streams && now_ms2() - last > IDLE_MS) { send_goaway(&c, E_NO_ERROR); break; }
         for (Stream* s = c.streams; s && alive; s = s->next) {
-            if (s->fd == BAD_SOCK || !FD_ISSET(s->fd, &rd)) continue;
+            if (s->fd == BAD_SOCK || s->pi < 0 || !(pv[s->pi].got & 1)) continue;
             int g = (int)recv(s->fd, buf, sizeof(buf), 0);
             if (g < 0 && would_block()) continue;
             if (g <= 0) {

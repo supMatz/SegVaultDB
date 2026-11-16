@@ -1,6 +1,6 @@
 ifeq ($(OS), Windows_NT)
     PLATFORM_SRC = src/platform/win32.c src/platform/fonts_embed.c
-    LIBS         = -lgdi32 -luser32 -lkernel32 -lws2_32 -lshell32 -lcomdlg32 -liphlpapi
+    LIBS         = -lgdi32 -luser32 -lkernel32 -lws2_32 -lshell32 -lcomdlg32 -liphlpapi -ladvapi32
     OUT          = segvault.exe
     MKDIR        = mkdir
     RM           = del /Q /F
@@ -22,6 +22,9 @@ CFLAGS   = -std=c11 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -D_FORTIFY_SOURCE=2 -Wa
 # solo per gli eseguibili Linux (MinGW non li supporta tutti): canary sullo stack, PIE, RELRO completo
 HARDEN_CFLAGS  = -fstack-protector-strong -fPIE
 HARDEN_LDFLAGS = -pie -Wl,-z,relro,-z,now
+ifeq ($(shell uname -s 2>/dev/null), Darwin)
+    HARDEN_LDFLAGS =                 # il linker di macOS non ha -z relro / now (PIE è già il default)
+endif
 DEPFLAGS = -MMD -MP   # file .d: un header modificato ricompila chi lo include
 BASE_INCLUDES = -Iinclude -Isrc -Isrc/platform -Isrc/widgets -Isrc/catalog -Isrc/storage -Isrc/table -Isrc/index -Isrc/query -Isrc/tx -Isrc/bridge
 INCLUDES = $(XFT_CFLAGS) -Iinclude -Isrc -Isrc/platform -Isrc/widgets -Isrc/catalog -Isrc/storage -Isrc/table -Isrc/index -Isrc/query -Isrc/tx -Isrc/bridge
@@ -63,6 +66,7 @@ NET_SRCS = src/server/server.c src/server/json.c src/server/mysql_wire.c src/ser
 ENGINE_SRCS = \
 	src/catalog/schema.c \
 	src/storage/page.c \
+	src/storage/page_migrate.c \
 	src/storage/buffer_pool.c \
 	src/table/tuple.c \
 	src/table/heap.c \
@@ -73,11 +77,14 @@ ENGINE_SRCS = \
 	src/query/executor.c \
 	src/query/sqljson.c \
 	src/query/regex.c \
+	src/query/stats.c \
+	src/query/decimal.c \
 	src/tx/wal.c \
 	src/tx/transaction.c \
 	src/bridge/db_api.c \
 	src/bridge/locks.c \
-	src/bridge/auth.c
+	src/bridge/auth.c \
+	src/platform/win_acl.c
 
 # ── Targets ──
 #   full   — app desktop (editor SQL e server API) con il motore
@@ -86,7 +93,7 @@ ENGINE_SRCS = \
 FULL_SRCS = src/main.c $(PLATFORM_SRC) $(WIDGET_SRCS) $(NET_SRCS) $(ENGINE_SRCS)
 FULL_OBJS = $(FULL_SRCS:.c=.o)
 
-.PHONY: all full clean test test-asan test-tsan test-win fuzz windows bench server lib dist
+.PHONY: all full clean test test-asan test-tsan test-win fuzz windows bench bench-readme bench-baseline bench-check server lib dist
 
 all: full server
 
@@ -124,7 +131,7 @@ SQL_TEST_SRCS = tests/test_sql.c $(ENGINE_SRCS)
 
 EXAMPLES_TEST_SRCS = tests/test_examples.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
-test: test_engine test_btree test_sql test_mysql test_examples test_server test_web test_mail test_tls test_php test_grid_edit test_table_design test_schema_model test_db_tools test_png test_auth test_sessions test_parallel test_mysql_import test_overflow test_backup test_export test_durability test_h2
+test: test_engine test_btree test_sql test_mysql test_examples test_server test_web test_mail test_tls test_php test_grid_edit test_table_design test_schema_model test_db_tools test_png test_auth test_sessions test_parallel test_mysql_import test_overflow test_backup test_export test_durability test_h2 test_decimal test_platform
 	./test_btree
 	./test_engine
 	./test_sql
@@ -149,6 +156,12 @@ test: test_engine test_btree test_sql test_mysql test_examples test_server test_
 	./test_export
 	./test_durability
 	./test_h2
+	./test_decimal build-test-decimal.txt 10000 && python3 tests/check_decimal.py build-test-decimal.txt
+	./test_platform
+
+# piattaforma X11 (metodo di input, scala): senza display si salta da solo
+test_platform: tests/test_platform.c src/platform/xlib.c src/platform/fonts_embed.c src/platform/platform.h
+	$(CC) $(CFLAGS) $(INCLUDES) -o test_platform tests/test_platform.c src/platform/fonts_embed.c $(LIBS)
 
 TEST_DESIGN_SRCS = tests/test_table_design.c src/widgets/table_design.c $(ENGINE_SRCS)
 
@@ -190,11 +203,17 @@ TEST_PAR_SRCS = tests/test_parallel.c $(ENGINE_SRCS)
 test_parallel: $(TEST_PAR_SRCS) libsegvault.a
 	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_parallel $(filter-out $(ENGINE_SRCS),$(TEST_PAR_SRCS)) libsegvault.a -lm -pthread
 
-test-tsan: $(TEST_PAR_SRCS)
+test-tsan: $(TEST_PAR_SRCS) $(TEST_PHP_SRCS) $(TEST_SESS_SRCS) $(TEST_SERVER_SRCS)
 	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=thread -I. $(BASE_INCLUDES) -o test_parallel_tsan $(TEST_PAR_SRCS) -lm -pthread
 	./test_parallel_tsan
 	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=thread -I. $(BASE_INCLUDES) -o test_php_tsan $(TEST_PHP_SRCS) -lm -pthread -ldl
 	./test_php_tsan
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=thread -I. $(BASE_INCLUDES) -o test_sessions_tsan $(TEST_SESS_SRCS) -lm -pthread
+	./test_sessions_tsan
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=thread -I. $(BASE_INCLUDES) -o test_server_tsan $(TEST_SERVER_SRCS) -lm -pthread -ldl
+	./test_server_tsan
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=thread -I. $(BASE_INCLUDES) -o test_web_tsan $(TEST_WEB_SRCS) -lm -pthread -ldl
+	./test_web_tsan
 
 TEST_MY_SRCS = tests/test_mysql_import.c src/widgets/mysql_import.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
@@ -211,15 +230,21 @@ test_h2: $(TEST_H2_SRCS) src/server/h2.h
 	$(CC) $(CFLAGS) -I. $(BASE_INCLUDES) -o test_h2 $(TEST_H2_SRCS) -lm -pthread
 
 # codice solo Windows (offset a 64 bit, MoveFileEx, motore): cross-compilato, eseguito con wine (o su Windows)
+WIN_RUN ?= WINEDEBUG=-all DISPLAY= wine   # su Windows (MSYS2): make test-win WIN_CC=gcc WIN_RUN=
 test-win: tests/test_win.c $(ENGINE_SRCS)
-	$(WIN_CC) -std=c11 -D_GNU_SOURCE -O1 -I. $(BASE_INCLUDES) -o test_win.exe tests/test_win.c $(ENGINE_SRCS) -static -lws2_32
-	cd /tmp && WINEDEBUG=-all DISPLAY= wine $(CURDIR)/test_win.exe
+	$(WIN_CC) -std=c11 -D_GNU_SOURCE -O1 -I. $(BASE_INCLUDES) -o test_win.exe tests/test_win.c $(ENGINE_SRCS) -static -lws2_32 -ladvapi32
+	cd /tmp && $(WIN_RUN) $(CURDIR)/test_win.exe
 
 # fuzzer mutazionale sotto ASan + UBSan: make fuzz [FUZZ_TARGET=sql|json|login|page|catalog|exec|all] [FUZZ_SECS=60]
 FUZZ_TARGET ?= all
 FUZZ_SECS ?= 60
-fuzz: tests/fuzz/fuzz.c $(ENGINE_SRCS) src/server/json.c src/server/mysql_wire.c
-	$(CC) -std=c11 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -I. $(BASE_INCLUDES) -o fuzz_sv tests/fuzz/fuzz.c src/server/json.c src/server/mysql_wire.c $(ENGINE_SRCS) -lm -pthread
+FUZZ_SRCS = tests/fuzz/fuzz.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c \
+            src/server/mail.c src/server/rewrite.c src/server/cgi.c src/server/tls.c src/server/h2.c src/widgets/png_write.c \
+            src/widgets/sql_text.c $(ENGINE_SRCS)
+fuzz_sv: $(FUZZ_SRCS)
+	$(CC) -std=c11 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -I. $(BASE_INCLUDES) -o fuzz_sv $(FUZZ_SRCS) -lsqlite3 -lm -pthread -ldl
+
+fuzz: fuzz_sv
 	./fuzz_sv $(FUZZ_TARGET) $(FUZZ_SECS)
 
 TEST_DUR_SRCS = tests/test_durability.c $(ENGINE_SRCS)
@@ -294,9 +319,9 @@ test_btree: $(BTREE_TEST_SRCS)
 
 # test del motore con AddressSanitizer + UndefinedBehaviorSanitizer: fallisce su accessi fuori
 # memoria, use-after-free, leak e comportamenti indefiniti (es. letture disallineate)
-test-asan: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
+test-asan: tests/test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
 	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
-		$(INCLUDES) -o test_engine_asan test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c -lm -pthread
+		$(INCLUDES) -o test_engine_asan tests/test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c -lm -pthread
 	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
 		-I. $(INCLUDES) -o test_btree_asan $(BTREE_TEST_SRCS) -lm
 	ASAN_OPTIONS=detect_leaks=1 ./test_btree_asan
@@ -349,9 +374,34 @@ test-asan: test_engine.c $(ENGINE_SRCS) src/widgets/csv_import.c
 	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
 		-I. $(BASE_INCLUDES) -o test_export_asan $(TEST_EXP_SRCS) -lm -pthread
 	ASAN_OPTIONS=detect_leaks=1 ./test_export_asan
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
+		-I. $(BASE_INCLUDES) -o test_mysql_asan tests/test_mysql.c $(ENGINE_SRCS) -lm -pthread
+	ASAN_OPTIONS=detect_leaks=1 ./test_mysql_asan
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
+		-I. $(BASE_INCLUDES) -o test_web_asan $(TEST_WEB_SRCS) -lm -pthread -ldl
+	ASAN_OPTIONS=detect_leaks=1 ./test_web_asan
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
+		-I. $(BASE_INCLUDES) -o test_mail_asan $(TEST_MAIL_SRCS) -lm -pthread -ldl
+	ASAN_OPTIONS=detect_leaks=1 ./test_mail_asan
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
+		-I. $(BASE_INCLUDES) -o test_tls_asan $(TEST_TLS_SRCS) -lm -pthread -ldl
+	ASAN_OPTIONS=detect_leaks=1 ./test_tls_asan
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
+		-I. $(BASE_INCLUDES) -o test_h2_asan $(TEST_H2_SRCS) -lm -pthread
+	ASAN_OPTIONS=detect_leaks=1 ./test_h2_asan
+	$(CC) -std=c11 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
+		-DSV_FAULT_INJECTION -I. $(BASE_INCLUDES) -o test_durability_asan $(TEST_DUR_SRCS) -lm -pthread
+	ASAN_OPTIONS=detect_leaks=1 ./test_durability_asan
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
+		-I. $(BASE_INCLUDES) -o test_decimal_asan tests/test_decimal.c $(ENGINE_SRCS) -lm -pthread
+	ASAN_OPTIONS=detect_leaks=1 ./test_decimal_asan build-test-decimal.txt 3000 && python3 tests/check_decimal.py build-test-decimal.txt
 
-test_engine: test_engine.c src/widgets/csv_import.c libsegvault.a
-	$(CC) $(CFLAGS) $(INCLUDES) -o test_engine test_engine.c src/widgets/csv_import.c libsegvault.a -lm -pthread
+# decimali esatti (P1.9): 10 000 espressioni casuali, ricontrollate con il modulo decimal di Python
+test_decimal: tests/test_decimal.c libsegvault.a
+	$(CC) $(CFLAGS) -I. $(INCLUDES) -o test_decimal tests/test_decimal.c libsegvault.a -lm -pthread
+
+test_engine: tests/test_engine.c src/widgets/csv_import.c libsegvault.a
+	$(CC) $(CFLAGS) $(INCLUDES) -o test_engine tests/test_engine.c src/widgets/csv_import.c libsegvault.a -lm -pthread
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(HARDEN_CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
@@ -365,8 +415,8 @@ WIN_OBJS  = $(patsubst %.c,build-win/%.o,$(WIN_SRCS))
 WIN_SERVER_OBJS = $(patsubst %.c,build-win/%.o,$(SERVER_SRCS))
 
 windows: $(WIN_OBJS) $(WIN_SERVER_OBJS)
-	$(WIN_CC) $(CFLAGS) -o segvault.exe $(WIN_OBJS) -static -mwindows -lgdi32 -luser32 -lkernel32 -lws2_32 -lshell32 -lcomdlg32 -liphlpapi
-	$(WIN_CC) $(CFLAGS) -o segvault-server.exe $(WIN_SERVER_OBJS) -static -lws2_32 -liphlpapi
+	$(WIN_CC) $(CFLAGS) -o segvault.exe $(WIN_OBJS) -static -mwindows -lgdi32 -luser32 -lkernel32 -lws2_32 -lshell32 -lcomdlg32 -liphlpapi -ladvapi32
+	$(WIN_CC) $(CFLAGS) -o segvault-server.exe $(WIN_SERVER_OBJS) -static -lws2_32 -liphlpapi -ladvapi32
 	@echo "=== Windows build: segvault.exe, segvault-server.exe ==="
 
 build-win/%.o: %.c
@@ -374,9 +424,9 @@ build-win/%.o: %.c
 	$(WIN_CC) $(CFLAGS) $(DEPFLAGS) $(BASE_INCLUDES) -c $< -o $@
 
 clean:
-	$(RM) $(FULL_OBJS) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql test_examples test_examples_asan
-	$(RM) segvault-server segvault-server.exe libsegvault.a test_server test_server_asan test_web test_mail test_tls test_mysql test_php test_php_asan test_php_tsan test_grid_edit test_grid_edit_asan test_table_design test_table_design_asan test_schema_model test_schema_model_asan test_db_tools test_db_tools_asan test_png test_png_asan test_auth test_auth_asan test_sessions test_sessions_asan test_parallel test_parallel_asan test_parallel_tsan test_sessions_tsan test_mysql_import test_mysql_import_asan test_overflow test_overflow_asan test_backup test_backup_asan test_export test_export_asan test_durability test_h2 test_win.exe fuzz_sv
-	$(RM) -r obj build-win build-server build-dist
+	$(RM) $(FULL_OBJS) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql bench_suite test_decimal test_decimal_asan build-test-decimal.txt test_examples test_examples_asan
+	$(RM) segvault-server segvault-server.exe libsegvault.a test_server test_server_asan test_web test_mail test_tls test_mysql test_php test_php_asan test_php_tsan test_grid_edit test_grid_edit_asan test_table_design test_table_design_asan test_schema_model test_schema_model_asan test_db_tools test_db_tools_asan test_png test_png_asan test_auth test_auth_asan test_sessions test_sessions_asan test_parallel test_parallel_asan test_parallel_tsan test_sessions_tsan test_mysql_import test_mysql_import_asan test_overflow test_overflow_asan test_backup test_backup_asan test_export test_export_asan test_durability test_durability_asan test_h2 test_h2_asan test_mysql_asan test_web_asan test_mail_asan test_tls_asan test_server_tsan test_web_tsan test_win.exe test_platform fuzz_sv
+	$(RM) -r obj build-win build-server build-dist dist
 
 -include $(FULL_OBJS:.o=.d) $(WIN_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(WIN_SERVER_OBJS:.o=.d)
 
@@ -384,36 +434,65 @@ clean:
 bench_sql: bench/bench.c $(ENGINE_SRCS)
 	$(CC) $(CFLAGS) -I. $(INCLUDES) -o bench_sql bench/bench.c $(ENGINE_SRCS) -lm -pthread
 
-bench: bench_sql
-	./bench_sql 100000
+# ── benchmark confrontato (P3.6): gli stessi scenari su SegVault e SQLite (e PDO sul protocollo MySQL),
+#    3 esecuzioni, la migliore per scenario; tabella e confronto con bench/baseline.json (regressione = SegVault
+#    più lento di oltre il 15 % rispetto a SQLite misurato nella stessa esecuzione).
+#    make bench | make bench-readme (rigenera la sezione del README) | make bench-baseline | make bench-check (CI)
+BENCH_DIR ?= $(CURDIR)/build-bench
+bench_suite: bench/suite.c libsegvault.a
+	$(CC) $(CFLAGS) -I. $(INCLUDES) -o bench_suite bench/suite.c libsegvault.a -lsqlite3 -lm -pthread
+
+define bench_runs
+	@mkdir -p $(BENCH_DIR)
+	@for i in 1 2 3; do BENCH_DIR=$(BENCH_DIR) ./bench_suite $(1) --server ./segvault-server > $(BENCH_DIR)/run$$i.json || exit 1; done
+endef
+
+bench: bench_suite segvault-server
+	$(call bench_runs,)
+	python3 bench/compare.py $(BENCH_DIR)/run1.json $(BENCH_DIR)/run2.json $(BENCH_DIR)/run3.json --baseline bench/baseline.json
+
+bench-readme: bench_suite segvault-server
+	$(call bench_runs,)
+	python3 bench/compare.py $(BENCH_DIR)/run1.json $(BENCH_DIR)/run2.json $(BENCH_DIR)/run3.json --readme README.md
+
+bench-baseline: bench_suite segvault-server
+	$(call bench_runs,)
+	python3 bench/compare.py $(BENCH_DIR)/run1.json $(BENCH_DIR)/run2.json $(BENCH_DIR)/run3.json --save-baseline bench/baseline.json
+	$(call bench_runs,--quick)
+	python3 bench/compare.py $(BENCH_DIR)/run1.json $(BENCH_DIR)/run2.json $(BENCH_DIR)/run3.json --save-baseline bench/baseline-quick.json
+
+bench-check: bench_suite segvault-server
+	$(call bench_runs,--quick)
+	python3 bench/compare.py $(BENCH_DIR)/run1.json $(BENCH_DIR)/run2.json $(BENCH_DIR)/run3.json --baseline bench/baseline-quick.json
 
 # i font sono dentro l'eseguibile (.incbin): si ricompila se cambiano
 src/platform/fonts_embed.o build-win/src/platform/fonts_embed.o: $(wildcard assets/fonts/*.ttf)
 
-# ── eseguibili pronti da scaricare, nel repository (bin/): make dist ──
+# ── eseguibili pronti da scaricare: make dist → dist/ (allegati alla release, non nel repository) ──
 # Linux: l'app desktop e il server usano le librerie del sistema (glibc 2.38+; HTTPS carica OpenSSL
 # all'avvio, cosa che un eseguibile statico non può fare); segvault-server-static va su ogni Linux
 # x86-64, senza HTTPS. Windows 10 / 11: nessuna DLL da installare (HTTPS usa quelle di PHP).
-# I font sono dentro gli eseguibili. Pacchetti portabili: bin/SegVault-VERSIONE-*.zip / .tar.gz
+# I font sono dentro gli eseguibili. dist/SHA256SUMS contiene le somme di tutti i file.
 WIN_STRIP ?= x86_64-w64-mingw32-strip
 VERSION := $(shell sed -n 's/.*SV_VERSION_STR *"\(.*\)".*/\1/p' include/common.h)
 PKG_WIN := SegVault-$(VERSION)-windows-x86_64
 PKG_LIN := SegVault-$(VERSION)-linux-x86_64
 dist: all windows
-	@mkdir -p bin/linux-x86_64 bin/windows-x86_64
-	strip -o bin/linux-x86_64/segvault segvault
-	strip -o bin/linux-x86_64/segvault-server segvault-server
-	$(CC) -O2 -static -o bin/linux-x86_64/segvault-server-static $(SERVER_OBJS) -lm -pthread -ldl 2>/dev/null
-	strip bin/linux-x86_64/segvault-server-static
-	$(WIN_STRIP) -o bin/windows-x86_64/segvault.exe segvault.exe
-	$(WIN_STRIP) -o bin/windows-x86_64/segvault-server.exe segvault-server.exe
-	rm -rf build-dist
+	$(RM) -r dist build-dist
+	@mkdir -p dist
+	strip -o dist/segvault segvault
+	strip -o dist/segvault-server segvault-server
+	$(CC) -O2 -static -o dist/segvault-server-static $(SERVER_OBJS) -lm -pthread -ldl 2>/dev/null
+	strip dist/segvault-server-static
+	$(WIN_STRIP) -o dist/segvault.exe segvault.exe
+	$(WIN_STRIP) -o dist/segvault-server.exe segvault-server.exe
 	mkdir -p build-dist/$(PKG_WIN)/php build-dist/$(PKG_LIN)
-	cp bin/windows-x86_64/segvault.exe bin/windows-x86_64/segvault-server.exe build-dist/$(PKG_WIN)/
+	cp dist/segvault.exe dist/segvault-server.exe build-dist/$(PKG_WIN)/
 	for f in packaging/windows/*.cmd packaging/README.txt; do sed 's/$$/\r/' "$$f" > build-dist/$(PKG_WIN)/$$(basename "$$f"); done
 	printf 'Run get-php.cmd (next to segvault.exe) to download PHP here, or extract any PHP for Windows (Non Thread Safe, x64) into this folder.\r\n' > build-dist/$(PKG_WIN)/php/README.txt
 	cp -r packaging/www build-dist/$(PKG_WIN)/www
-	cp bin/linux-x86_64/segvault bin/linux-x86_64/segvault-server packaging/linux/start-server.sh packaging/README.txt build-dist/$(PKG_LIN)/
+	cp dist/segvault dist/segvault-server packaging/linux/start-server.sh packaging/README.txt build-dist/$(PKG_LIN)/
 	cp -r packaging/www build-dist/$(PKG_LIN)/www
-	cd build-dist && bsdtar -a -cf ../bin/$(PKG_WIN).zip $(PKG_WIN) && tar -czf ../bin/$(PKG_LIN).tar.gz $(PKG_LIN)
-	@echo "=== bin/: eseguibili pronti, $(PKG_WIN).zip, $(PKG_LIN).tar.gz ==="
+	cd build-dist && bsdtar -a -cf ../dist/$(PKG_WIN).zip $(PKG_WIN) && tar -czf ../dist/$(PKG_LIN).tar.gz $(PKG_LIN)
+	cd dist && sha256sum segvault segvault-server segvault-server-static segvault.exe segvault-server.exe $(PKG_WIN).zip $(PKG_LIN).tar.gz > SHA256SUMS
+	@echo "=== dist/: eseguibili, $(PKG_WIN).zip, $(PKG_LIN).tar.gz, SHA256SUMS (da allegare alla release) ==="

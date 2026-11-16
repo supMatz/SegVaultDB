@@ -1,3 +1,4 @@
+#include "common.h"
 #include "settings.h"
 #include "theme.h"
 #include <stdio.h>
@@ -27,6 +28,8 @@ static const char* const ONERR[]     = { "Stop at the first error", "Continue wi
 static const char* const HISTORY[]   = { "50 queries", "100 queries", "250 queries", "500 queries" };
 static const char* const DELIMS[]    = { "Comma  ,", "Semicolon  ;", "Tab" };
 static const char* const CSVNULLS[]  = { "Empty field", "NULL" };
+static const char* const UISCALE[]   = { "Automatic (screen DPI)", "100 %", "125 %", "150 %", "175 %", "200 %",
+                                         "250 %", "300 %" };
 static const char* const STARTUP[]   = { "Ask every time", "SQL editor", "API server" };
 
 #define N(a) ((int)(sizeof(a) / sizeof(a[0])))
@@ -39,6 +42,8 @@ static SettingDef DEFS[] = {
       SET_CHOICE, S(accent), ACCENT_THEME, 0, 0, ACCENTS, N(ACCENTS) },
     { "Appearance", "ui_font_size", "Interface text size", "Size of menus, labels and buttons",
       SET_INT, S(ui_font_size), 13, 11, 16, NULL, 0 },
+    { "Appearance", "ui_scale", "Display scale", "Size of the whole window on high-density screens (sharp, not stretched)",
+      SET_CHOICE, S(ui_scale), 0, 0, 0, UISCALE, N(UISCALE) },
     { "Appearance", "toolbar_style", "Toolbar buttons", "Show text labels or only icons",
       SET_CHOICE, S(toolbar_style), TOOLBAR_AUTO, 0, 0, TOOLBAR, N(TOOLBAR) },
     { "Appearance", "show_sidebar", "Explorer sidebar", "Database tree on the left (Ctrl+B)",
@@ -170,7 +175,7 @@ const char* settings_value_text(int i, char* buf, int n) {
 
 // settings.ini: chiave=valore; le scelte sono salvate per nome (resistono a riordini dell'elenco)
 bool settings_load(const char* path) {
-    FILE* f = fopen(path, "r");
+    FILE* f = fopen(path, "r" SV_FE);
     if (!f) return false;
     char line[256];
     while (fgets(line, sizeof(line), f)) {
@@ -196,7 +201,7 @@ bool settings_load(const char* path) {
 }
 
 bool settings_save(const char* path) {
-    FILE* f = fopen(path, "w");
+    FILE* f = fopen(path, "w" SV_FE);
     if (!f) return false;
     fprintf(f, "# SegVault settings (edited from Settings, Ctrl+,)\n");
     for (int i = 0; i < N(DEFS); i++) {
@@ -227,4 +232,10 @@ bool settings_accent_color(unsigned char rgb[3]) {
     if (a <= ACCENT_THEME || a >= N(ACCENTS)) return false;
     memcpy(rgb, ACCENT_RGB[a], 3);
     return true;
+}
+
+float settings_ui_scale(void) {
+    static const float V[] = { 0.0f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f, 3.0f };
+    int i = g_settings.ui_scale;
+    return (i >= 0 && i < (int)(sizeof(V) / sizeof(V[0]))) ? V[i] : 0.0f;
 }

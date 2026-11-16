@@ -227,6 +227,69 @@ int main(void) {
     CHECK(ok("USE shop") && rows("SELECT * FROM ordine") == 2 && denied("DELETE FROM ordine"), "grants after restart");
     db_set_user(NULL);
 
+    // ── P2.6: PBKDF2-HMAC-SHA256 (vettori di RFC 7914 §11 e dei test di Python / OpenSSL) ──
+    {
+        uint8_t d[32];
+        char ph[65];
+        auth_pbkdf2_sha256("passwd", 6, "salt", 4, 1, d);
+        for (int i = 0; i < 32; i++) sprintf(ph + 2 * i, "%02x", d[i]);
+        CHECK(!strcmp(ph, "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc"), "PBKDF2 c=1: %s", ph);
+        auth_pbkdf2_sha256("password", 8, "salt", 4, 4096, d);
+        for (int i = 0; i < 32; i++) sprintf(ph + 2 * i, "%02x", d[i]);
+        CHECK(!strcmp(ph, "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"), "PBKDF2 c=4096: %s", ph);
+        const char* longkey = "passwordPASSWORDpasswordPASSWORDpasswordPASSWORDpasswordPASSWORDxx";   // > 64 byte: chiave = SHA-256
+        auth_pbkdf2_sha256(longkey, strlen(longkey), "salt", 4, 2, d);
+        uint8_t d2[32];
+        uint8_t kh[32];
+        auth_sha256(longkey, strlen(longkey), kh);
+        auth_pbkdf2_sha256(kh, 32, "salt", 4, 2, d2);
+        CHECK(!memcmp(d, d2, 32), "PBKDF2 with a key longer than the block");
+    }
+    // il file ha l'hash nuovo ($p2$100000$...) e il verificatore native solo per chi lo chiede
+    CHECK(ok("CREATE USER nat IDENTIFIED WITH mysql_native_password BY 'nat-pass'") &&
+          ok("CREATE USER sha IDENTIFIED WITH caching_sha2_password BY 'sha-pass'") &&
+          !ok("CREATE USER bad IDENTIFIED WITH foo_password BY 'bad-pass'") && strstr(g_err, "Unknown authentication plugin"),
+          "IDENTIFIED WITH plugin: %s", g_err);
+    CHECK(db_user_has_native("nat") && !db_user_has_native("sha") && !db_user_has_native("anna"), "native hash only when asked");
+    db_shutdown();
+    {
+        FILE* uf = fopen("/tmp/sv_auth_test/users.dat", "r");
+        char ub[8192] = "";
+        size_t un = uf ? fread(ub, 1, sizeof(ub) - 1, uf) : 0;
+        ub[un] = '\0';
+        if (uf) fclose(uf);
+        char* an = strstr(ub, "user anna ");
+        CHECK(an && strstr(an, " $p2$100000$") && strstr(an, " -\n") == strchr(an, '\n') - 2, "anna: PBKDF2 hash, no native: %.120s", an ? an : "");
+        // un hash del formato vecchio (SHA-256 ripetuto 20 000 volte): il login riesce e l'hash si rifà
+        char salt[33];
+        if (an && sscanf(an, "user anna %32s", salt) == 1) {
+            const char* pw = "nuova-pw";
+            size_t sl = strlen(salt), pl = strlen(pw);
+            uint8_t hb[256], dg[32];
+            memcpy(hb, salt, sl); memcpy(hb + sl, pw, pl);
+            auth_sha256(hb, sl + pl, dg);
+            for (int i = 1; i < 20000; i++) { memcpy(hb, dg, 32); memcpy(hb + 32, salt, sl); auth_sha256(hb, 32 + sl, dg); }
+            char old[65];
+            for (int i = 0; i < 32; i++) sprintf(old + 2 * i, "%02x", dg[i]);
+            char cmd[600];
+            snprintf(cmd, sizeof(cmd), "sed -i 's/^user anna %s [^ ]*/user anna %s %s/' /tmp/sv_auth_test/users.dat", salt, salt, old);
+            CHECK(system(cmd) == 0, "rewrite anna with an old hash");
+        }
+    }
+    CHECK(db_init("/tmp/sv_auth_test"), "reopen with an old hash");
+    CHECK(!db_login("anna", "sbagliata") && db_login("anna", "nuova-pw"), "old-format hash still accepted");
+    db_shutdown();
+    {
+        FILE* uf = fopen("/tmp/sv_auth_test/users.dat", "r");
+        char ub[8192] = "";
+        size_t un = uf ? fread(ub, 1, sizeof(ub) - 1, uf) : 0;
+        ub[un] = '\0';
+        if (uf) fclose(uf);
+        char* an = strstr(ub, "user anna ");
+        CHECK(an && strstr(an, " $p2$100000$") && strstr(an, " $p2$") < strchr(an, '\n'), "old hash upgraded on login: %.120s", an ? an : "");
+    }
+    CHECK(db_init("/tmp/sv_auth_test") && db_login("anna", "nuova-pw") && !db_login("anna", "segreta1"), "upgraded hash works");
+
     db_shutdown();
     if (system("rm -rf /tmp/sv_auth_test")) {}
     if (g_fail) { printf("auth tests: %d of %d FAILED\n", g_fail, g_tests); return 1; }

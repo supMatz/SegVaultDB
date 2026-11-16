@@ -69,14 +69,21 @@ test_durability
 test_durability_asan
 test_h2
 
-# eseguibili pronti da scaricare (make dist): nel repository
-!/bin/
-!/bin/**
 test_php_tsan
 test_mysql
 build-dist/
-bin/SegVault-*.zip
-bin/SegVault-*.tar.gz
+dist/
+bin/linux-x86_64/
+bin/windows-x86_64/
+bin/SegVault-*
 *_tsan
 test_win.exe
 fuzz_sv
+*_asan
+
+# benchmark (make bench)
+build-bench/
+bench_suite
+test_decimal
+build-test-decimal.txt
+test_platform

@@ -21,4 +21,7 @@ QueryResult* dbt_search(const char* db, const char* needle, int limit, int* tabl
 
 QueryResult* dbt_overview(const char* db);
 
+// funzione che esegue gli statement (NULL = db_execute): la GUI passa la sua, che non blocca la finestra
+void dbt_set_exec(QueryResult* (*fn)(const char* sql));
+
 #endif

@@ -22,6 +22,9 @@ typedef struct {
     uint64_t last_access;  // ultimo accesso (informativo)
     int      pin_count;    // numero di pin attivi (può essere pinnata più volte)
     int      hnext;        // catena della tabella hash (-1 = fine)
+    uint32_t pid;          // pagina del frame (chiave della tabella hash, valida anche durante la lettura)
+    bool     loading;      // la lettura dal disco è in corso fuori dal latch: chi la vuole aspetta
+    bool     fresh;        // creata dopo l'ultimo checkpoint: il log ha tutti i suoi record, nessuna immagine serve
 } Frame;
 
 // contatori per lo studio del comportamento del buffer (SHOW BUFFER POOL)
@@ -36,22 +39,39 @@ typedef struct {
 
 #include "../platform_lock.h"
 
+// una partizione della cache (P1.10): le pagine si dividono per page_id fra BP_PARTS partizioni, ognuna con il
+// suo latch, i suoi frame, la sua tabella hash e la sua lancetta di CLOCK. Lettori di pagine diverse non si
+// aspettano più l'un l'altro, e la lettura dal disco avviene fuori dal latch (frame "loading")
+#define BP_PARTS 16
 typedef struct {
-    Frame*    frames;      // array di frame (dimensione = capacity)
-    int       capacity;    // numero massimo di frame
-    int       num_used;    // frame attualmente occupati
+    Frame*      frames;
+    int         capacity;
+    int         num_used;
+    int*        buckets;
+    int         nbuckets;
+    int         hand;
+    uint64_t    tick;
+    BufferStats stats;
+    SvRwLock    latch;
+} BpPart;
+
+typedef struct {
+    BpPart    parts[BP_PARTS];
+    int       nparts;      // partizioni usate (una sola per una cache piccola)
+    int       capacity;    // numero massimo di frame (tutte le partizioni)
+    int       num_used;    // (aggiornato da bp_stats)
     int       db_fd;       // file descriptor del file del database
-    uint64_t  tick;        // contatore monotono degli accessi
-    int*      buckets;     // tabella hash: page_id -> primo frame della catena
-    int       nbuckets;    // potenza di 2
-    int       hand;        // lancetta di CLOCK
+    SvRwLock  alloc;       // allocazione delle pagine nuove ed elenco delle pagine libere
+    SvRwLock  wmx;         // scritture di pagine modificate (regola del WAL: before_write non è rientrante)
     uint32_t  next_new_id; // prossima pagina da allocare in fondo al file (0 = da calcolare)
     uint32_t* free_ids;    // pagine liberate da VACUUM (flag PAGE_FLAG_FREE su disco), riusate per prime
     int       nfree, free_cap;
     BufferStats stats;
     // chiamata prima di scrivere una pagina su disco (regola del WAL: prima il log); false = il log
     // non è stato scritto, quindi nemmeno la pagina può esserlo
-    bool      (*before_write)(void* ctx);
+    // regola del WAL prima di scrivere pagine modificate: le immagini di pages[0..n) nel log, poi il log su disco
+    // (n == 0: solo il log). Le pagine di overflow non hanno immagine (immutabili, ricostruite dal log)
+    bool      (*before_write)(void* ctx, Page* const* pages, int n);
     void*     before_write_ctx;
     // pagina nuova di una tabella collegata dopo prev (0 = prima pagina): il WAL la registra (LOG_LINK)
     void      (*on_link)(void* ctx, uint32_t prev, uint32_t page);
@@ -59,8 +79,11 @@ typedef struct {
     // una scrittura o un fsync del file dei dati non è riuscito: le pagine non scritte restano in
     // memoria (mai scartate), il motore smette di accettare modifiche
     bool      io_error;
-    SvRwLock  latch;       // usato come mutex: più thread leggono in parallelo
+    bool      ov_unsynced; // pagine di overflow scritte dopo l'ultimo fsync: prima di una pagina di heap, fsync (P1.5)
 } BufferPool;
+
+// contatori di tutte le partizioni (e bp->num_used aggiornato)
+void bp_stats(BufferPool* bp, BufferStats* out);
 
 BufferPool* bp_create(int capacity, int db_fd);
 
@@ -100,5 +123,19 @@ void bp_destroy(BufferPool* bp);
 void bp_add_free(BufferPool* bp, uint32_t page_id);
 int  bp_free_count(BufferPool* bp);
 int  bp_free_list(BufferPool* bp, uint32_t* out, int max);
+
+// la pagina (se è nella cache) è stata cambiata dal record del log lsn: il suo LSN sale (doppia scrittura e redo)
+void bp_note_lsn(BufferPool* bp, uint32_t page_id, int64_t lsn);
+// checkpoint riuscito (tutte le pagine su disco): da qui ogni pagina ha un contenuto da proteggere con l'immagine
+void bp_checkpoint_done(BufferPool* bp);
+
+// pagina libera subito (P1.5): via dalla cache, scritta libera sul file con l'LSN dato, nella lista delle libere.
+// Solo per pagine che nessuna riga confermata o recuperabile riferisce più
+int bp_free_page_now(BufferPool* bp, uint32_t page_id, uint64_t lsn);
+
+// VACUUM FULL: le pagine libere si riusano dalla più bassa; poi le libere in fondo al file vengono tolte (file più corto).
+// Ritorna le pagine tolte (-1 = errore)
+void bp_free_lowest_first(BufferPool* bp);
+int  bp_truncate_free_tail(BufferPool* bp);
 
 #endif

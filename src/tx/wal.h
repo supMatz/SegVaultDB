@@ -3,6 +3,7 @@
 
 #include "../../include/common.h"
 #include "../table/tuple.h"
+#include "../storage/buffer_pool.h"
 
 #define LOG_BEGIN       1
 #define LOG_COMMIT      2
@@ -25,19 +26,43 @@
 #define LOG_CLR        10
 #define CLR_DELETE      1
 #define CLR_REVIVE      2
+#define CLR_REPLACE     3     // (log v2) lo slot vivo riprende la riga data (annullamento di un UPDATE sul posto)
 // pagina nuova di una tabella collegata alla catena: page_id = pagina nuova, data = [pagina
 // precedente: 4 byte] (0 = prima pagina). Le pagine nuove non sono su disco finché non c'è un
 // checkpoint: dopo una caduta di corrente il recupero le ricrea e le ricollega
 #define LOG_LINK       11
+// immagine intera di una pagina (data = i 4096 byte), scritta e resa durevole prima di scrivere la pagina nel
+// file dei dati (doppia scrittura): se la scrittura della pagina si interrompe a metà (CRC sbagliato), il
+// recupero rimette l'immagine. page_id = la pagina
+#define LOG_PAGE_IMAGE 12
 
 typedef struct {
     uint32_t page_id;
     uint16_t slot_id;
 } SVRID;
 
+// ── formato del log (v2, da SegVault 1.4) ──
+// File: intestazione di WAL_HDR byte ("SVWAL2", versione, dimensione della pagina, base, contig, CRC-32C),
+// poi i record. Record: len (4) | crc32c (4, dei byte da lsn alla fine) | lsn (8) | type (1) | tx (8) |
+// page (4) | slot (2) | dlen (4) | olen (4) | data | old. L'LSN di un record è la sua posizione logica nel
+// log, che non torna mai indietro: i record da contig in poi hanno lsn = base + (posizione - contig);
+// quelli fra l'intestazione e contig sono "portati" da un checkpoint (record delle transazioni ancora
+// aperte), con il loro LSN di prima. Un record troncato o con il CRC sbagliato in fondo è la fine del log
+// (scrittura interrotta); un record danneggiato seguito da record validi è un log danneggiato: il recupero
+// si ferma e lo dice, non applica mai niente di sbagliato. I log del formato v1 (intestazione di 23 byte,
+// nessun CRC) si leggono ancora per il recupero.
+#define WAL_HDR       48
+#define WAL_REC_HDR   39
+
 typedef struct {
     int      fd;
     char     path[512];
+    int      ver;           // 2 (1 solo per un log vecchio riaperto dal recupero)
+    int64_t  base;          // LSN del primo record contiguo
+    int64_t  contig;        // posizione nel file del primo record contiguo
+    int64_t  fsize;         // byte nel file (il buffer escluso)
+    int64_t  last_lsn;      // LSN dell'ultimo record scritto
+    int64_t  synced_lsn;    // fin qui il log è su disco (ultimo fsync riuscito)
     uint64_t sequence;
     uint64_t checkpoints;   // checkpoint eseguiti in questa sessione
     uint8_t* buf;           // voci non ancora scritte nel file (una write per gruppo, non per riga)
@@ -62,11 +87,29 @@ int  wal_recovery(const char* log_path, const char* db_path, const char* cat_pat
 // pages / npages (se non NULL): le pagine scritte dall'annullamento (da togliere dalla cache), malloc'd
 int  wal_undo_tx(WAL* wal, const char* db_path, uint64_t tx_id);
 int  wal_undo_tx_from(WAL* wal, const char* db_path, uint64_t tx_id, int64_t from, uint32_t** pages, int* npages);
-// dimensione del log in byte
+// la stessa cosa sulle pagine della cache (ROLLBACK / ROLLBACK TO a motore acceso, log v2): ogni passo è un CLR nel
+// buffer del log e una modifica della pagina in memoria (con il suo LSN); niente flush, niente fsync. Se il processo
+// cade prima del COMMIT di un'altra cosa, il recupero rifà i CLR e finisce l'annullamento. pages: le pagine cambiate
+int  wal_undo_tx_cache(WAL* wal, BufferPool* bp, uint64_t tx_id, int64_t from, uint32_t** pages, int* npages);
+// LSN del prossimo record (fine logica del log, buffer compreso): le posizioni salvate (BEGIN, savepoint)
 int64_t wal_size(WAL* wal);
+// byte occupati davvero dal log (file + buffer): per decidere quando fare un checkpoint
+int64_t wal_bytes(WAL* wal);
 // svuota il log (checkpoint: da chiamare solo con tutte le pagine già su disco e nessuna
-// transazione aperta)
+// transazione aperta). L'LSN continua da dove era
 int  wal_truncate(WAL* wal);
+// checkpoint con transazioni aperte (pagine già su disco): il log viene riscritto con i soli record delle
+// transazioni active[0..n) (servono per annullarle), così si accorcia anche se una transazione resta aperta
+// per ore. n == 0: come wal_truncate. Un errore lascia il log com'era
+int  wal_checkpoint_keep(WAL* wal, const uint64_t* active, int n);
+// LSN iniziale di un log nuovo (dal file dei dati: le pagine hanno LSN più bassi)
+void wal_set_initial_lsn(int64_t lsn);
+// fine del log dopo l'ultimo wal_recovery (LSN del record successivo; 0 = nessun log v2): il log nuovo riparte
+// da qui, così ogni pagina su disco ha un LSN minore dei record nuovi
+int64_t wal_recovery_end_lsn(void);
+// immagine della pagina nel log (senza fsync): prima di scriverla nel file dei dati, poi wal_flush
+struct Page;
+int  wal_log_page_image(WAL* wal, const void* page);
 void wal_destroy(WAL* wal);
 
 #endif

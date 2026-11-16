@@ -35,6 +35,7 @@ typedef enum {
     TOK_SHL,        // '<<'
     TOK_SHR,        // '>>'
     TOK_NSEQ,       // '<=>' uguaglianza che tratta NULL come un valore
+    TOK_PARAM,      // '?'  segnaposto di un prepared statement (accettato dal parser solo in quel caso)
 } TokenType;
 // @nome (variabile di sessione) e @@nome (variabile di sistema, senza session. / global.) sono
 // TOK_IDENTIFIER con il testo "@nome" / "@@nome"

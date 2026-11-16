@@ -92,7 +92,11 @@
 
   #define SV_PATH_SEP "/"
 
-  #define sv_open(path, flags, mode)    open(path, flags, mode)
+  #ifdef O_CLOEXEC                      // nessun descrittore del motore passa ai processi figli (P2.10)
+    #define sv_open(path, flags, mode)  open(path, (flags) | O_CLOEXEC, mode)
+  #else
+    #define sv_open(path, flags, mode)  open(path, flags, mode)
+  #endif
   #define sv_close(fd)                  close(fd)
   #define sv_read(fd, buf, count)       read(fd, buf, count)
   #define sv_write(fd, buf, count)      write(fd, buf, count)
@@ -162,7 +166,14 @@ static inline int sv_replace_file(const char* tmp, const char* path) {
 // file del motore leggibili solo dal proprietario (dati, log, catalogo, utenti con gli hash delle password):
 // su POSIX creati con permessi 0600; mode "w" o "a" come fopen
 #ifdef _WIN32
-static inline FILE* sv_fopen_private(const char* path, const char* mode) { return fopen(path, mode); }
+int sv_win_private(const char* path, int is_dir);      // ACL protetta: utente corrente + SYSTEM (win_acl.c)
+void sv_win_acl_sddl(const char* path, char* out, size_t n);   // per i test
+int  sv_win_under_wine(void);
+static inline FILE* sv_fopen_private(const char* path, const char* mode) {
+    FILE* f = fopen(path, mode);
+    if (f) sv_win_private(path, 0);
+    return f;
+}
 #else
 static inline FILE* sv_fopen_private(const char* path, const char* mode) {
     int fd = open(path, O_WRONLY | O_CREAT | (mode[0] == 'a' ? O_APPEND : O_TRUNC), 0600);

@@ -8,6 +8,7 @@ SCOPO: Stessa interfaccia di win32.c ma usa Xlib (Linux/X11).
        Appunti: selezione CLIPBOARD (ICCCM).
 */
 
+#include "common.h"
 #include "fonts_embed.h"
 #include <X11/X.h>
 #include <X11/Xlib.h>     // API Xlib
@@ -29,6 +30,8 @@ SCOPO: Stessa interfaccia di win32.c ma usa Xlib (Linux/X11).
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <locale.h>
+#include <math.h>
 #include "platform.h"
 
 // famiglie di font in ordine di preferenza: fontconfig sceglie la prima installata
@@ -80,7 +83,27 @@ struct PlatformWindow {
     int    tray_w, tray_h;
     bool   tray_active;
     bool   visible;
+
+    // metodo di input (tasti morti, compose, IME): testo già composto in UTF-8
+    XIM      xim;
+    XIC      xic;
+    uint32_t pending[64];   // codepoint ancora da consegnare come EVT_CHAR (testo composto lungo)
+    int      npending, pending_pos;
+
+    // scala dell'interfaccia: i widget lavorano in pixel "logici", qui si moltiplica per scale
+    float    scale;         // 1.0 = 96 dpi
+    float    scale_req;     // 0 = automatica (Xft.dpi / SV_UI_SCALE), altrimenti richiesta da Settings
+    bool     resize_pending;// scala cambiata: al prossimo poll un EVT_RESIZE con la nuova dimensione logica
 };
+
+// conversioni logico <-> fisico
+static inline int SC(const PlatformWindow* w, int v) { return (int)lroundf((float)v * w->scale); }
+static inline int UNSC(const PlatformWindow* w, int v) { return (int)lroundf((float)v / w->scale); }
+static inline Rect SCR(const PlatformWindow* w, Rect r) {
+    // bordi arrotondati separatamente: rettangoli adiacenti restano adiacenti
+    int x0 = SC(w, r.x), y0 = SC(w, r.y), x1 = SC(w, r.x + r.w), y1 = SC(w, r.y + r.h);
+    return (Rect){x0, y0, x1 - x0, y1 - y0};
+}
 
 // -- utilità --
 
@@ -126,9 +149,10 @@ static XftFont* get_font(PlatformWindow* win, int size, FontStyle style) {
 
 static void apply_clip(PlatformWindow* win) {
     if (win->has_clip) {
-        XRectangle xr = {(short)win->clip.x, (short)win->clip.y,
-                         (unsigned short)(win->clip.w > 0 ? win->clip.w : 0),
-                         (unsigned short)(win->clip.h > 0 ? win->clip.h : 0)};
+        Rect c = SCR(win, win->clip);
+        XRectangle xr = {(short)c.x, (short)c.y,
+                         (unsigned short)(c.w > 0 ? c.w : 0),
+                         (unsigned short)(c.h > 0 ? c.h : 0)};
         XSetClipRectangles(win->display, win->gc_buf, 0, 0, &xr, 1, Unsorted);
         XftDrawSetClipRectangles(win->xft, 0, 0, &xr, 1);
     } else {
@@ -166,7 +190,7 @@ static bool load_embedded_fonts(void) {
         if (stat(path, &st) == 0 && (size_t)st.st_size == f.size) continue;   // già copiato
         char tmp[4500];
         snprintf(tmp, sizeof(tmp), "%s.%d.tmp", path, (int)getpid());
-        FILE* o = fopen(tmp, "wb");
+        FILE* o = fopen(tmp, "wb" SV_FE);
         if (!o) return false;
         bool ok = fwrite(f.data, 1, f.size, o) == f.size;
         if (fclose(o) != 0) ok = false;
@@ -199,6 +223,42 @@ bool platform_init(void) {
     return true;
 }
 
+// scala automatica: SV_UI_SCALE (es. 1.5), altrimenti Xft.dpi / 96 (GNOME, KDE, xrdb), altrimenti 1
+static float auto_scale(Display* d) {
+    const char* e = getenv("SV_UI_SCALE");
+    float s = 0;
+    if (e && *e) s = strtof(e, NULL);
+    if (s <= 0) {
+        const char* dpi = XGetDefault(d, "Xft", "dpi");
+        if (dpi) s = strtof(dpi, NULL) / 96.0f;
+    }
+    if (!(s > 0)) s = 1.0f;
+    if (s < 0.75f) s = 0.75f;
+    if (s > 4.0f) s = 4.0f;
+    s = roundf(s * 4.0f) / 4.0f;            // passi di 25 %: niente metà pixel ovunque
+    return s;
+}
+
+// metodo di input X (XIM): lo apre nel locale dell'utente solo per il tipo dei caratteri (LC_CTYPE),
+// poi rimette il locale com'era, così printf / strtod non cambiano. Senza IM resta XLookupString
+static void open_input_method(PlatformWindow* win) {
+    char* old = setlocale(LC_CTYPE, NULL);
+    char saved[128] = "C";
+    if (old) snprintf(saved, sizeof(saved), "%s", old);
+    if (!setlocale(LC_CTYPE, "") || !XSupportsLocale()) setlocale(LC_CTYPE, "C.UTF-8");
+    if (XSupportsLocale()) {
+        XSetLocaleModifiers("");
+        win->xim = XOpenIM(win->display, NULL, NULL, NULL);
+        if (!win->xim) { XSetLocaleModifiers("@im=none"); win->xim = XOpenIM(win->display, NULL, NULL, NULL); }
+        if (win->xim) {
+            win->xic = XCreateIC(win->xim, XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+                                 XNClientWindow, win->window, XNFocusWindow, win->window, NULL);
+            if (!win->xic) { XCloseIM(win->xim); win->xim = NULL; }
+        }
+    }
+    setlocale(LC_CTYPE, saved);
+}
+
 PlatformWindow* platform_window_create(const char* title, int w, int h) {
     PlatformWindow* win = calloc(1, sizeof(PlatformWindow));
     if (!win) return NULL;
@@ -206,6 +266,9 @@ PlatformWindow* platform_window_create(const char* title, int w, int h) {
     // apertura della connessione al server X
     win->display = XOpenDisplay(NULL); // NULL per usare $DISPLAY default dell'OS
     if (!win->display) { free(win); return NULL; }
+    win->scale = auto_scale(win->display);
+    w = SC(win, w);
+    h = SC(win, h);
 
     win->screen   = DefaultScreen(win->display);
     win->visual   = DefaultVisual(win->display, win->screen);
@@ -225,16 +288,21 @@ PlatformWindow* platform_window_create(const char* title, int w, int h) {
     );
 
     // registrazione eventi da ricevere nella finestra
+    open_input_method(win);
+    long im_mask = 0;
+    if (win->xic) XGetICValues(win->xic, XNFilterEvents, &im_mask, NULL);
     XSelectInput(
         win->display,
         win->window,
         ExposureMask        | // finestra da disegnare
         KeyPressMask        | // EVT_KEY_DOWN / EVT_CHAR
+        KeyReleaseMask      | // alcuni metodi di input compongono al rilascio
         ButtonPressMask     | // EVT_MOUSE_DOWN / EVT_MOUSE_WHEEL
         ButtonReleaseMask   | // EVT_MOUSE_UP
         PointerMotionMask   | // EVT_MOUSE_MOVE
         StructureNotifyMask | // EVT_RESIZE
-        FocusChangeMask
+        FocusChangeMask     |
+        im_mask
     );
 
     // intercettazione click sulla X per generazione eventi chiusure
@@ -260,8 +328,8 @@ PlatformWindow* platform_window_create(const char* title, int w, int h) {
     XSizeHints* sh = XAllocSizeHints();
     if (sh) {
         sh->flags = PMinSize;
-        sh->min_width  = 820;
-        sh->min_height = 520;
+        sh->min_width  = SC(win, 820);
+        sh->min_height = SC(win, 520);
         XSetWMNormalHints(win->display, win->window, sh);
         XFree(sh);
     }
@@ -404,7 +472,7 @@ bool platform_autostart_set(bool on, const char* command) {
     snprintf(dir, sizeof(dir), "%s", p);
     char* sl = strrchr(dir, '/');
     if (sl) { *sl = '\0'; char* sl2 = strrchr(dir, '/'); if (sl2) { *sl2 = '\0'; mkdir(dir, 0755); *sl2 = '/'; } mkdir(dir, 0755); }
-    FILE* f = fopen(p, "w");
+    FILE* f = fopen(p, "w" SV_FE);
     if (!f) return false;
     fprintf(f, "[Desktop Entry]\nType=Application\nName=SegVault\nComment=Local development server and database\n"
                "Exec=%s\nTerminal=false\nX-GNOME-Autostart-enabled=true\n", command);
@@ -474,12 +542,52 @@ static uint32_t x_modifiers(unsigned int state) {
     return m;
 }
 
+// decodifica UTF-8 (testo dal metodo di input) in codepoint; sequenze non valide saltate
+static int utf8_to_cps(const char* s, int n, uint32_t* out, int max) {
+    int k = 0;
+    for (int i = 0; i < n && k < max; ) {
+        unsigned char c = (unsigned char)s[i];
+        uint32_t cp; int len;
+        if (c < 0x80) { cp = c; len = 1; }
+        else if ((c & 0xe0) == 0xc0) { cp = c & 0x1f; len = 2; }
+        else if ((c & 0xf0) == 0xe0) { cp = c & 0x0f; len = 3; }
+        else if ((c & 0xf8) == 0xf0) { cp = c & 0x07; len = 4; }
+        else { i++; continue; }
+        if (i + len > n) break;
+        bool ok = true;
+        for (int j = 1; j < len; j++) {
+            unsigned char cc = (unsigned char)s[i + j];
+            if ((cc & 0xc0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (cc & 0x3f);
+        }
+        if (!ok) { i++; continue; }
+        i += len;
+        if (cp >= 0x20 && cp != 0x7f && cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff)) out[k++] = cp;
+    }
+    return k;
+}
+
 bool platform_poll_event(PlatformWindow *win, sEvent *evt) {
+    if (win->resize_pending) {
+        win->resize_pending = false;
+        memset(evt, 0, sizeof(*evt));
+        evt->type       = EVT_RESIZE;
+        evt->new_width  = UNSC(win, win->w);
+        evt->new_height = UNSC(win, win->h);
+        return true;
+    }
+    if (win->pending_pos < win->npending) {             // resto di un testo composto
+        memset(evt, 0, sizeof(*evt));
+        evt->type      = EVT_CHAR;
+        evt->character = win->pending[win->pending_pos++];
+        return true;
+    }
     while (XPending(win->display)) {
         XEvent xe;
         XNextEvent(win->display, &xe);
         memset(evt, 0, sizeof(*evt));
         evt->type = EVT_NONE;
+        if (win->xic && XFilterEvent(&xe, None)) continue;   // tasto morto / composizione in corso
 
         if (win->tray && xe.xany.window == win->tray) {          // eventi dell'icona nel tray
             if (xe.type == Expose && xe.xexpose.count == 0) tray_draw(win);
@@ -500,19 +608,23 @@ bool platform_poll_event(PlatformWindow *win, sEvent *evt) {
 
             case FocusIn:
             case FocusOut:
+                if (win->xic) {
+                    if (xe.type == FocusIn) XSetICFocus(win->xic);
+                    else XUnsetICFocus(win->xic);
+                }
                 evt->type = EVT_PAINT;
                 break;
 
             case MotionNotify:
                 evt->type      = EVT_MOUSE_MOVE;
-                evt->mouse_x   = xe.xmotion.x;
-                evt->mouse_y   = xe.xmotion.y;
+                evt->mouse_x   = UNSC(win, xe.xmotion.x);
+                evt->mouse_y   = UNSC(win, xe.xmotion.y);
                 evt->modifiers = x_modifiers(xe.xmotion.state);
                 break;
 
             case ButtonPress:
-                evt->mouse_x   = xe.xbutton.x;
-                evt->mouse_y   = xe.xbutton.y;
+                evt->mouse_x   = UNSC(win, xe.xbutton.x);
+                evt->mouse_y   = UNSC(win, xe.xbutton.y);
                 evt->modifiers = x_modifiers(xe.xbutton.state);
                 if (xe.xbutton.button == Button4 || xe.xbutton.button == Button5) {
                     evt->type        = EVT_MOUSE_WHEEL;
@@ -531,16 +643,25 @@ bool platform_poll_event(PlatformWindow *win, sEvent *evt) {
             case ButtonRelease:
                 if (xe.xbutton.button >= Button4 && xe.xbutton.button <= 7) break; // rilascio rotella: ignorato
                 evt->type         = EVT_MOUSE_UP;
-                evt->mouse_x      = xe.xbutton.x;
-                evt->mouse_y      = xe.xbutton.y;
+                evt->mouse_x      = UNSC(win, xe.xbutton.x);
+                evt->mouse_y      = UNSC(win, xe.xbutton.y);
                 evt->mouse_button = (int)xe.xbutton.button;
                 evt->modifiers    = x_modifiers(xe.xbutton.state);
                 break;
 
             case KeyPress: {
-                char   buff[16] = {0};
+                char   buff[256] = {0};
                 KeySym sym = 0;
-                XLookupString(&xe.xkey, buff, sizeof(buff) - 1, &sym, NULL);
+                int    nbytes = 0;
+                Status st = XLookupKeySym;
+                if (win->xic) {
+                    nbytes = Xutf8LookupString(win->xic, &xe.xkey, buff, (int)sizeof(buff) - 1, &sym, &st);
+                    if (st == XBufferOverflow) { nbytes = 0; st = XLookupNone; }
+                    if (st == XLookupChars) sym = NoSymbol;
+                    else if (st != XLookupBoth) nbytes = 0;
+                } else {
+                    XLookupString(&xe.xkey, buff, sizeof(buff) - 1, &sym, NULL);
+                }
                 KeySym base = XLookupKeysym(&xe.xkey, 0);
 
                 evt->type      = EVT_KEY_DOWN;
@@ -588,6 +709,17 @@ bool platform_poll_event(PlatformWindow *win, sEvent *evt) {
                         } else {
                             evt->type = EVT_NONE;
                         }
+                    } else if (nbytes > 0) {
+                        // testo dal metodo di input (anche più caratteri: CJK, compose)
+                        int k = utf8_to_cps(buff, nbytes, win->pending, (int)(sizeof(win->pending) / sizeof(win->pending[0])));
+                        if (k > 0) {
+                            evt->type      = EVT_CHAR;
+                            evt->character = win->pending[0];
+                            win->npending = k;
+                            win->pending_pos = 1;
+                        } else {
+                            evt->type = EVT_NONE;
+                        }
                     } else {
                         uint32_t cp = keysym_to_unicode(sym);
                         if (cp >= 0x20 && cp != 0x7f) {
@@ -615,8 +747,8 @@ bool platform_poll_event(PlatformWindow *win, sEvent *evt) {
                     win->has_clip = false;
                     apply_clip(win);
                     evt->type       = EVT_RESIZE;
-                    evt->new_width  = win->w;
-                    evt->new_height = win->h;
+                    evt->new_width  = UNSC(win, win->w);
+                    evt->new_height = UNSC(win, win->h);
                 }
                 break;
             }
@@ -664,7 +796,8 @@ void platform_clear(PlatformWindow* win, Color c) {
     XFillRectangle(win->display, win->backbuf, win->gc_buf, 0, 0, win->w, win->h);
 }
 
-void platform_fill_rect(PlatformWindow* win, Rect r, Color c) {
+// in pixel fisici
+static void phys_fill_rect(PlatformWindow* win, Rect r, Color c) {
     if (r.w <= 0 || r.h <= 0 || c.a == 0) return;
     if (c.a == 255) {
         XSetForeground(win->display, win->gc_buf, to_pixel(c));
@@ -676,7 +809,13 @@ void platform_fill_rect(PlatformWindow* win, Rect r, Color c) {
     }
 }
 
+void platform_fill_rect(PlatformWindow* win, Rect r, Color c) {
+    phys_fill_rect(win, SCR(win, r), c);
+}
+
 void platform_draw_rect(PlatformWindow* win, Rect r, Color c, int thickness) {
+    r = SCR(win, r);
+    thickness = thickness <= 1 ? (win->scale >= 2.0f ? (int)win->scale : 1) : SC(win, thickness);
     if (thickness <= 1) {
         XSetForeground(win->display, win->gc_buf, to_pixel(c));
         XSetLineAttributes(win->display, win->gc_buf, 1, LineSolid, CapButt, JoinMiter);
@@ -684,31 +823,33 @@ void platform_draw_rect(PlatformWindow* win, Rect r, Color c, int thickness) {
                        r.w > 0 ? r.w - 1 : 0, r.h > 0 ? r.h - 1 : 0);
         return;
     }
-    platform_fill_rect(win, (Rect){r.x, r.y, r.w, thickness}, c);
-    platform_fill_rect(win, (Rect){r.x, r.y + r.h - thickness, r.w, thickness}, c);
-    platform_fill_rect(win, (Rect){r.x, r.y, thickness, r.h}, c);
-    platform_fill_rect(win, (Rect){r.x + r.w - thickness, r.y, thickness, r.h}, c);
+    phys_fill_rect(win, (Rect){r.x, r.y, r.w, thickness}, c);
+    phys_fill_rect(win, (Rect){r.x, r.y + r.h - thickness, r.w, thickness}, c);
+    phys_fill_rect(win, (Rect){r.x, r.y, thickness, r.h}, c);
+    phys_fill_rect(win, (Rect){r.x + r.w - thickness, r.y, thickness, r.h}, c);
 }
 
 void platform_draw_line(PlatformWindow* win, Point a, Point b, Color c, int thickness) {
     XSetForeground(win->display, win->gc_buf, to_pixel(c));
+    int t = SC(win, thickness < 1 ? 1 : thickness);
     XSetLineAttributes(win->display, win->gc_buf,
-                       thickness, LineSolid, CapButt, JoinMiter);
-    XDrawLine(win->display, win->backbuf, win->gc_buf, a.x, a.y, b.x, b.y);
+                       t <= 1 ? 0 : t, LineSolid, CapButt, JoinMiter);
+    XDrawLine(win->display, win->backbuf, win->gc_buf, SC(win, a.x), SC(win, a.y), SC(win, b.x), SC(win, b.y));
 }
 
 // rettangolo arrotondato con angoli antialiasing (copertura calcolata con 4x4 sotto-campioni)
 void platform_fill_rect_rounded(PlatformWindow* win, Rect r, Color c, int radius) {
     if (r.w <= 0 || r.h <= 0) return;
-    int rad = radius;
+    r = SCR(win, r);
+    int rad = SC(win, radius);
     if (rad > r.w / 2) rad = r.w / 2;
     if (rad > r.h / 2) rad = r.h / 2;
-    if (rad <= 0) { platform_fill_rect(win, r, c); return; }
+    if (rad <= 0) { phys_fill_rect(win, r, c); return; }
 
     // corpo centrale
-    platform_fill_rect(win, (Rect){r.x, r.y + rad, r.w, r.h - 2 * rad}, c);
-    platform_fill_rect(win, (Rect){r.x + rad, r.y, r.w - 2 * rad, rad}, c);
-    platform_fill_rect(win, (Rect){r.x + rad, r.y + r.h - rad, r.w - 2 * rad, rad}, c);
+    phys_fill_rect(win, (Rect){r.x, r.y + rad, r.w, r.h - 2 * rad}, c);
+    phys_fill_rect(win, (Rect){r.x + rad, r.y, r.w - 2 * rad, rad}, c);
+    phys_fill_rect(win, (Rect){r.x + rad, r.y + r.h - rad, r.w - 2 * rad, rad}, c);
 
     // angoli: per ogni pixel del quadrato rad x rad calcola la copertura del cerchio
     float rr = (float)rad * (float)rad;
@@ -729,18 +870,18 @@ void platform_fill_rect_rounded(PlatformWindow* win, Rect r, Color c, int radius
                 pc.a = (uint8_t)(c.a * inside / 16);
                 int lx = r.x + i,            rx = r.x + r.w - 1 - i;
                 int ty = r.y + j,            by = r.y + r.h - 1 - j;
-                platform_fill_rect(win, (Rect){lx, ty, 1, 1}, pc);
-                platform_fill_rect(win, (Rect){rx, ty, 1, 1}, pc);
-                platform_fill_rect(win, (Rect){lx, by, 1, 1}, pc);
-                platform_fill_rect(win, (Rect){rx, by, 1, 1}, pc);
+                phys_fill_rect(win, (Rect){lx, ty, 1, 1}, pc);
+                phys_fill_rect(win, (Rect){rx, ty, 1, 1}, pc);
+                phys_fill_rect(win, (Rect){lx, by, 1, 1}, pc);
+                phys_fill_rect(win, (Rect){rx, by, 1, 1}, pc);
             }
         }
         int run = rad - full_from;
         if (run > 0) {
-            platform_fill_rect(win, (Rect){r.x + full_from, r.y + j, run, 1}, c);
-            platform_fill_rect(win, (Rect){r.x + r.w - rad, r.y + j, run, 1}, c);
-            platform_fill_rect(win, (Rect){r.x + full_from, r.y + r.h - 1 - j, run, 1}, c);
-            platform_fill_rect(win, (Rect){r.x + r.w - rad, r.y + r.h - 1 - j, run, 1}, c);
+            phys_fill_rect(win, (Rect){r.x + full_from, r.y + j, run, 1}, c);
+            phys_fill_rect(win, (Rect){r.x + r.w - rad, r.y + j, run, 1}, c);
+            phys_fill_rect(win, (Rect){r.x + full_from, r.y + r.h - 1 - j, run, 1}, c);
+            phys_fill_rect(win, (Rect){r.x + r.w - rad, r.y + r.h - 1 - j, run, 1}, c);
         }
     }
 }
@@ -762,35 +903,35 @@ int platform_draw_text_ex(PlatformWindow* win, const char* text, int len, Point 
     if (!text) return 0;
     if (len < 0) len = (int)strlen(text);
     if (len == 0) return 0;
-    XftFont* f = get_font(win, size, style);
+    XftFont* f = get_font(win, SC(win, size), style);
     if (!f) return 0;
 
     XftColor xc;
     XRenderColor rc = { (unsigned short)(c.r * 257), (unsigned short)(c.g * 257),
                         (unsigned short)(c.b * 257), (unsigned short)(c.a * 257) };
     XftColorAllocValue(win->display, win->visual, win->colormap, &rc, &xc);
-    XftDrawStringUtf8(win->xft, &xc, f, pos.x, pos.y + f->ascent, (const FcChar8*)text, len);
+    XftDrawStringUtf8(win->xft, &xc, f, SC(win, pos.x), SC(win, pos.y) + f->ascent, (const FcChar8*)text, len);
     XftColorFree(win->display, win->visual, win->colormap, &xc);
 
     XGlyphInfo ext;
     XftTextExtentsUtf8(win->display, f, (const FcChar8*)text, len, &ext);
-    return ext.xOff;
+    return UNSC(win, ext.xOff);
 }
 
 int platform_measure_text_ex(PlatformWindow* win, const char* text, int len, int size, FontStyle style) {
     if (!text) return 0;
     if (len < 0) len = (int)strlen(text);
     if (len == 0) return 0;
-    XftFont* f = get_font(win, size, style);
+    XftFont* f = get_font(win, SC(win, size), style);
     if (!f) return 0;
     XGlyphInfo ext;
     XftTextExtentsUtf8(win->display, f, (const FcChar8*)text, len, &ext);
-    return ext.xOff;
+    return UNSC(win, ext.xOff);
 }
 
 int platform_text_height(PlatformWindow* win, int size, FontStyle style) {
-    XftFont* f = get_font(win, size, style);
-    return f ? f->ascent + f->descent : size;
+    XftFont* f = get_font(win, SC(win, size), style);
+    return f ? UNSC(win, f->ascent + f->descent) : size;
 }
 
 int platform_draw_text(PlatformWindow *win, const char *text, Point pos, Color c, int size) {
@@ -810,16 +951,21 @@ static uint32_t mask_channel(unsigned long px, unsigned long mask) {
     return (uint32_t)(v * 255 / max);
 }
 
-bool platform_read_pixels(PlatformWindow* win, Rect r, uint32_t* out) {
-    if (!win || !out || r.w <= 0 || r.h <= 0 || r.x < 0 || r.y < 0 || r.x + r.w > win->w || r.y + r.h > win->h) return false;
+bool platform_read_pixels(PlatformWindow* win, Rect lr, uint32_t* out) {
+    if (!win || !out || lr.w <= 0 || lr.h <= 0 || lr.x < 0 || lr.y < 0) return false;
+    Rect r = SCR(win, lr);
+    if (r.w <= 0 || r.h <= 0 || r.x + r.w > win->w || r.y + r.h > win->h) return false;
     XImage* img = XGetImage(win->display, win->backbuf, r.x, r.y, (unsigned)r.w, (unsigned)r.h, AllPlanes, ZPixmap);
     if (!img) return false;
     unsigned long rm = img->red_mask, gm = img->green_mask, bm = img->blue_mask;
     if (!rm) { rm = win->visual->red_mask; gm = win->visual->green_mask; bm = win->visual->blue_mask; }
-    for (int y = 0; y < r.h; y++)
-        for (int x = 0; x < r.w; x++) {
-            unsigned long px = XGetPixel(img, x, y);
-            out[y * r.w + x] = mask_channel(px, rm) << 16 | mask_channel(px, gm) << 8 | mask_channel(px, bm);
+    for (int y = 0; y < lr.h; y++)
+        for (int x = 0; x < lr.w; x++) {           // un pixel fisico per pixel logico (il più vicino)
+            int sx = (int)((float)x * (float)r.w / (float)lr.w), sy = (int)((float)y * (float)r.h / (float)lr.h);
+            if (sx >= r.w) sx = r.w - 1;
+            if (sy >= r.h) sy = r.h - 1;
+            unsigned long px = XGetPixel(img, sx, sy);
+            out[y * lr.w + x] = mask_channel(px, rm) << 16 | mask_channel(px, gm) << 8 | mask_channel(px, bm);
         }
     XDestroyImage(img);
     return true;
@@ -838,6 +984,35 @@ void platform_present(PlatformWindow *win) {
 void platform_draw_bitmap(PlatformWindow* win, Rect dest, uint32_t* pixels, int pw, int ph) {
     // Stub: da implementare con XPutImage se necessario
     (void)win; (void)dest; (void)pixels; (void)pw; (void)ph;
+}
+
+// -- scala --
+
+float platform_ui_scale(PlatformWindow* win) { return win ? win->scale : 1.0f; }
+
+void platform_set_ui_scale(PlatformWindow* win, float scale) {
+    if (!win) return;
+    win->scale_req = scale > 0 ? scale : 0;
+    float s = scale > 0 ? scale : auto_scale(win->display);
+    if (s < 0.75f) s = 0.75f;
+    if (s > 4.0f) s = 4.0f;
+    if (fabsf(s - win->scale) < 0.001f) return;
+    // stessa finestra logica: la dimensione fisica segue la scala (il gestore delle finestre può rifiutare)
+    int lw = UNSC(win, win->w), lh = UNSC(win, win->h);
+    win->scale = s;
+    XSizeHints* sh = XAllocSizeHints();
+    if (sh) {
+        sh->flags = PMinSize;
+        sh->min_width  = SC(win, 820);
+        sh->min_height = SC(win, 520);
+        XSetWMNormalHints(win->display, win->window, sh);
+        XFree(sh);
+    }
+    XResizeWindow(win->display, win->window, (unsigned)SC(win, lw), (unsigned)SC(win, lh));
+    win->has_clip = false;
+    apply_clip(win);
+    win->resize_pending = true;
+    XFlush(win->display);
 }
 
 // -- cursore --
@@ -1083,6 +1258,8 @@ void platform_window_destroy(PlatformWindow* win) {
     for (int i = 0; i < CURSOR_COUNT; i++)
         if (win->cursors[i]) XFreeCursor(win->display, win->cursors[i]);
     if (win->xft) XftDrawDestroy(win->xft);
+    if (win->xic) XDestroyIC(win->xic);
+    if (win->xim) XCloseIM(win->xim);
     XFreePixmap(win->display, win->backbuf);
     XFreeGC(win->display, win->gc);
     XFreeGC(win->display, win->gc_buf);

@@ -21,6 +21,7 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
 
 // ── mutex del motore e lock della cartella dati ─────────────────
 // Il motore non è rientrante: ogni funzione pubblica che tocca catalogo, pagine o
@@ -51,10 +52,24 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
 // tutto il resto in scrittura (esclusivo). L'esclusivo è rientrante con un contatore per thread.
 #include "../platform_lock.h"
 #include "locks.h"
+#include "../storage/page_migrate.h"
+#include "../query/stats.h"
+#include "sv_alloc.h"
 static SvRwLock g_db_rw;
 static _Thread_local int g_lock_depth;
 static void chg_hook(uint64_t tx, const char* db, const char* table, uint8_t type, RID rid, RID nrid, const uint8_t* old, size_t ol);
-static void db_mutex_init(void) { sv_rw_init(&g_db_rw); lk_init(); executor_set_change_hook(chg_hook); }
+static void on_chain_abandoned(uint32_t first, uint32_t total);
+static void on_table_dropped(uint32_t root);
+static void pf_stmt_end(void);
+static void pf_process(void);
+static void pf_ddl_saved(void);
+static void db_mutex_init(void) {
+    sv_rw_init(&g_db_rw);
+    lk_init();
+    executor_set_change_hook(chg_hook);
+    heap_set_abandon_hook(on_chain_abandoned);     // spazio liberato subito (P1.5)
+    executor_set_drop_hook(on_table_dropped);
+}
 static void db_lock(void)       { if (g_lock_depth++ == 0) sv_rw_wr(&g_db_rw); }
 static void db_unlock(void)     { if (--g_lock_depth == 0) sv_rw_wrunlock(&g_db_rw); }
 
@@ -93,9 +108,17 @@ static double get_time_ms(void) { return sv_get_time_ms(); }
 
 // ── API principale ───────────────────────────────────────────────
 
-static bool wal_before_page_write(void* w) { return wal_write_buffer((WAL*)w) == SV_OK; }
+// regola del WAL + doppia scrittura: prima di scrivere pagine modificate nel file dei dati, le loro immagini nel
+// log e il log su disco (un fsync per gruppo). Una scrittura interrotta a metà di una pagina (CRC sbagliato al
+// riavvio) si ripara dall'immagine
+static bool wal_before_page_write(void* w, Page* const* pages, int n) {
+    for (int i = 0; i < n; i++) if (wal_log_page_image((WAL*)w, pages[i]) != SV_OK) return false;
+    return wal_flush((WAL*)w) == SV_OK;
+}
 static void wal_on_link(void* w, uint32_t prev, uint32_t page) {
-    wal_write((WAL*)w, LOG_LINK, 0, page, (SVRID){ page, 0 }, (const uint8_t*)&prev, 4, NULL, 0);
+    if (wal_write((WAL*)w, LOG_LINK, 0, page, (SVRID){ page, 0 }, (const uint8_t*)&prev, 4, NULL, 0) != SV_OK) return;
+    bp_note_lsn(g_db.bp, page, ((WAL*)w)->last_lsn);
+    if (prev) bp_note_lsn(g_db.bp, prev, ((WAL*)w)->last_lsn);
 }
 
 // ── errore di I/O: il motore si ferma ───────────────────────────
@@ -163,6 +186,15 @@ static bool db_init_impl(const char* data_directory) {
     g_db.db_fd = sv_open(g_db.db_path, SV_O_RDWR | SV_O_CREAT, 0600);
 #ifndef _WIN32
     if (g_db.db_fd >= 0) fchmod(g_db.db_fd, 0600);       // anche un file creato da una versione precedente (0644)
+#else
+    // la cartella dei dati e i file già presenti: solo l'utente corrente (e SYSTEM); i file nuovi ereditano
+    sv_win_private(data_directory, 1);
+    {
+        char up[1100];
+        snprintf(up, sizeof(up), "%s" SV_PATH_SEP "users.dat", data_directory);
+        const char* files[] = { g_db.db_path, g_db.cat_path, g_db.log_path, up };
+        for (int i = 0; i < 4; i++) if (_access(files[i], 0) == 0) sv_win_private(files[i], 0);
+    }
 #endif
     if (g_db.db_fd < 0) {
         snprintf(g_init_error, sizeof(g_init_error), "cannot open %.200s", g_db.db_path);
@@ -175,15 +207,34 @@ static bool db_init_impl(const char* data_directory) {
         return false;
     }
 
-    // recovery dopo un arresto anomalo (con il lock già preso); se non riesce il motore non parte:
-    // il log resta com'è e nessuna scrittura nuova può peggiorare le cose
+    // formato del file dei dati: un file della 1.3 (formato 1) diventa formato 2 (LSN e CRC in ogni pagina);
+    // una conversione interrotta riprende dalla copia segvault.db.v1
     {
-        char rerr[200] = "";
-        if (wal_recovery(g_db.log_path, g_db.db_path, g_db.cat_path, rerr, sizeof(rerr)) != SV_OK) {
-            snprintf(g_init_error, sizeof(g_init_error), "crash recovery failed: %.200s", rerr[0] ? rerr : "I/O error");
+        char merr[300] = "";
+        int lf = sv_open(g_db.log_path, SV_O_RDONLY, 0);
+        bool log_present = lf >= 0 && sv_lseek(lf, 0, SEEK_END) > 0;
+        if (lf >= 0) sv_close(lf);
+        if (page_migrate(g_db.db_fd, g_db.db_path, log_present, merr, sizeof(merr)) != SV_OK) {
+            snprintf(g_init_error, sizeof(g_init_error), "cannot upgrade the data file: %.300s", merr[0] ? merr : "I/O error");
             sv_close(g_db.db_fd);
             return false;
         }
+    }
+
+    // recovery dopo un arresto anomalo (con il lock già preso); se non riesce il motore non parte:
+    // il log resta com'è e nessuna scrittura nuova può peggiorare le cose
+    {
+        char rerr[400] = "";
+        if (wal_recovery(g_db.log_path, g_db.db_path, g_db.cat_path, rerr, sizeof(rerr)) != SV_OK) {
+            snprintf(g_init_error, sizeof(g_init_error), "crash recovery failed: %.300s", rerr[0] ? rerr : "I/O error");
+            sv_close(g_db.db_fd);
+            return false;
+        }
+        // il log nuovo riparte oltre ogni LSN già scritto nelle pagine (intestazione del file, fine del log recuperato)
+        uint64_t hl = 1;
+        page_header_read(g_db.db_fd, &hl);
+        int64_t start = (int64_t)hl > wal_recovery_end_lsn() ? (int64_t)hl : wal_recovery_end_lsn();
+        wal_set_initial_lsn(start > 0 ? start : 1);
     }
 
     // Inizializza i componenti
@@ -218,6 +269,11 @@ static bool db_init_impl(const char* data_directory) {
     g_db.exec_ctx.wal     = g_db.wal;
     g_db.exec_ctx.tx_id   = 0;
     g_engine_gen++;
+    {                                           // statistiche dell'ottimizzatore (ANALYZE): danneggiate = nessuna
+        char sp[1100];
+        snprintf(sp, sizeof(sp), "%s" SV_PATH_SEP "segvault.stats", data_directory);
+        stats_load(sp);
+    }
 
     g_db.initialized = true;
     if (!auth_init(data_directory)) {          // utenti illeggibili: mai "nessun utente" (= tutti root)
@@ -257,12 +313,24 @@ bool db_cancel_requested(void) { return atomic_load(&g_cancel_requested) != 0; }
 // Automatico quando il log supera SV_WAL_CHECKPOINT_BYTES, oppure con CHECKPOINT.
 #define SV_WAL_CHECKPOINT_BYTES (16L << 20)
 
+static int64_t g_ckpt_kept;      // byte rimasti nel log dopo l'ultimo checkpoint (record delle transazioni aperte)
+
+// Checkpoint: pagine e catalogo su disco, poi il log si accorcia. Senza transazioni aperte si svuota; con
+// transazioni aperte (P1.1) resta solo ciò che serve per annullarle (i loro record), così una transazione
+// dimenticata aperta non fa più crescere il log all'infinito né blocca il checkpoint
 static bool do_checkpoint(void) {
-    if (!g_db.initialized || g_open_tx > 0 || io_failed()) return false;   // il log serve ancora
-    // il log si svuota solo con tutte le pagine e il catalogo davvero su disco
+    if (!g_db.initialized || io_failed()) return false;
     if (wal_flush(g_db.wal) != SV_OK || bp_flush_all(g_db.bp) != SV_OK) return false;
     if (catalog_save(g_db.catalog, g_db.cat_path) != SV_OK) return false;
-    return wal_truncate(g_db.wal) == SV_OK;
+    bp_checkpoint_done(g_db.bp);          // prima di accorciare il log: da qui le pagine vecchie vogliono l'immagine
+    uint64_t act[SV_MAX_TRANSACTIONS];
+    int n = 0;
+    for (int i = 0; i < g_db.txm->num_transactions; i++)
+        if (g_db.txm->transactions[i].active) act[n++] = g_db.txm->transactions[i].tx_id;
+    bool ok = wal_checkpoint_keep(g_db.wal, act, n) == SV_OK;
+    if (ok) g_ckpt_kept = wal_bytes(g_db.wal);
+    if (ok) page_header_write(g_db.db_fd, (uint64_t)wal_size(g_db.wal));   // da dove ripartirebbe un log nuovo
+    return ok;
 }
 
 // ── VACUUM: pagine di overflow non più usate -> riusabili ───────
@@ -271,7 +339,7 @@ static void free_list_path(char* out, size_t n) { snprintf(out, n, "%s" SV_PATH_
 
 static void free_list_save(void) {
     int n = bp_free_count(g_db.bp);
-    uint32_t* ids = malloc(sizeof(uint32_t) * (size_t)(n ? n : 1));
+    uint32_t* ids = sv_malloc(sizeof(uint32_t) * (size_t)(n ? n : 1));
     if (!ids) return;
     n = bp_free_list(g_db.bp, ids, n);
     char p[600];
@@ -284,7 +352,7 @@ static void free_list_save(void) {
 static void free_list_load(void) {
     char p[600];
     free_list_path(p, sizeof(p));
-    FILE* f = fopen(p, "r");
+    FILE* f = fopen(p, "r" SV_FE);
     if (!f) return;
     unsigned id;
     while (fscanf(f, "%u", &id) == 1) if (id) bp_add_free(g_db.bp, id);   // validi solo se su disco sono FREE
@@ -292,6 +360,48 @@ static void free_list_load(void) {
 }
 
 static bool do_checkpoint(void);
+static bool do_vacuum(int* freed);
+static void free_heap(uint32_t root, uint64_t lsn);
+
+// VACUUM FULL (P1.5): ogni tabella riscritta in pagine compatte (prima le pagine libere più basse, due giri: il
+// secondo riempie i buchi lasciati dal primo), le pagine vecchie liberate, le libere in fondo al file tolte. Ritorna
+// in *freed le pagine tolte dal file. Ogni tabella è un passo a sé: catalogo salvato con la radice nuova, poi le
+// pagine vecchie libere (un arresto a metà lascia tabelle già compattate e altre com'erano)
+static bool do_vacuum_full(int* freed) {
+    int f0 = 0;
+    if (!do_vacuum(&f0)) return false;
+    for (int pass = 0; pass < 2; pass++) {
+        bp_free_lowest_first(g_db.bp);
+        for (int d = 0; d < g_db.catalog->num_databases; d++) {
+            Database* db = &g_db.catalog->databases[d];
+            int prev = g_db.catalog->current_db;
+            g_db.catalog->current_db = d;
+            for (int t = 0; t < db->num_tables; t++) {
+                TableSchema* ts = db->tables[t];
+                uint32_t old_root = ts->root_page_id, root = 0, pages = 0;
+                if (!old_root) continue;
+                const char* fail = executor_rebuild_table(&g_db.exec_ctx, ts, &root, &pages);
+                if (fail) { g_db.catalog->current_db = prev; fprintf(stderr, "[SegVault] VACUUM FULL: %s (table %s)\n", fail, ts->name); return false; }
+                ts->root_page_id = root;
+                ts->num_pages = pages;
+                if (bp_flush_all(g_db.bp) != SV_OK || catalog_save(g_db.catalog, g_db.cat_path) != SV_OK) {
+                    g_db.catalog->current_db = prev;
+                    return false;
+                }
+                executor_invalidate_table(g_db.bp, db->name, ts->name, old_root);
+                free_heap(old_root, (uint64_t)wal_size(g_db.wal));
+                bp_free_lowest_first(g_db.bp);
+            }
+            g_db.catalog->current_db = prev;
+        }
+    }
+    if (bp_flush_all(g_db.bp) != SV_OK) return false;
+    int cut = bp_truncate_free_tail(g_db.bp);
+    if (cut < 0) return false;
+    free_list_save();
+    *freed = cut;
+    return do_checkpoint();
+}
 
 static bool do_vacuum(int* freed) {
     *freed = 0;
@@ -299,14 +409,14 @@ static bool do_vacuum(int* freed) {
     int64_t end = sv_lseek(g_db.db_fd, 0, SEEK_END);
     uint32_t npages = end > 0 ? (uint32_t)(end / SV_PAGE_SIZE) : 0;
     heap_damage_clear();
-    uint8_t* used = calloc((size_t)npages / 8 + 1, 1);
-    uint8_t* heapu = calloc((size_t)npages / 8 + 1, 1);       // pagine raggiungibili dalla catena di una tabella
+    uint8_t* used = sv_calloc((size_t)npages / 8 + 1, 1);
+    uint8_t* heapu = sv_calloc((size_t)npages / 8 + 1, 1);       // pagine raggiungibili dalla catena di una tabella
     if (!used || !heapu) { free(used); free(heapu); return false; }
     heap_pages_bitmap = heapu;
     for (int d = 0; d < g_db.catalog->num_databases; d++) {
         Database* db = &g_db.catalog->databases[d];
         for (int t = 0; t < db->num_tables; t++) {
-            HeapFile* hf = heap_open(g_db.bp, db->tables[t].root_page_id, db->tables[t].num_pages);
+            HeapFile* hf = heap_open(g_db.bp, db->tables[t]->root_page_id, db->tables[t]->num_pages);
             if (hf) heap_mark_overflow(hf, used, npages);
             free(hf);
         }
@@ -353,10 +463,16 @@ static bool do_vacuum(int* freed) {
 #define SV_AUTO_VACUUM_PAGES 1024
 static bool do_vacuum(int* freed);
 
+static long long g_ckpt_bytes = SV_WAL_CHECKPOINT_BYTES;
+void db_set_checkpoint_bytes(long long bytes) { g_ckpt_bytes = bytes > 0 ? bytes : SV_WAL_CHECKPOINT_BYTES; }
+
 static void maybe_checkpoint(void) {
-    if (!g_db.initialized || g_open_tx != 0) return;
-    if (atomic_load(&g_sv_abandoned_pages) > SV_AUTO_VACUUM_PAGES) { int fr = 0; do_vacuum(&fr); return; }
-    if (wal_size(g_db.wal) > SV_WAL_CHECKPOINT_BYTES) do_checkpoint();
+    if (!g_db.initialized) return;
+    if (g_open_tx == 0 && atomic_load(&g_sv_abandoned_pages) > SV_AUTO_VACUUM_PAGES) { int fr = 0; do_vacuum(&fr); return; }
+    // anche con transazioni aperte; ma se i loro record da soli sono tanti, non a ogni statement: solo quando
+    // il log è almeno il doppio di quanto era rimasto dopo l'ultimo checkpoint
+    int64_t b = wal_bytes(g_db.wal);
+    if (b > g_ckpt_bytes && b > 2 * g_ckpt_kept) do_checkpoint();
 }
 
 static int g_num_savepoints;
@@ -469,7 +585,7 @@ static void maint_row(MaintOut* m, const char* table, const char* op, const char
     if (!m->r) return;
     if (m->r->num_rows >= m->cap) {
         int nc = m->cap ? m->cap * 2 : 8;
-        Row* nr = realloc(m->r->rows, sizeof(Row) * (size_t)nc);
+        Row* nr = sv_realloc(m->r->rows, sizeof(Row) * (size_t)nc);
         if (!nr) return;
         m->r->rows = nr;
         m->cap = nc;
@@ -479,6 +595,81 @@ static void maint_row(MaintOut* m, const char* table, const char* op, const char
 }
 
 // una query interna con un solo numero come risultato (-1 = errore, messaggio in err)
+// query interna (permessi già controllati): il risultato, NULL + err se fallisce
+static QueryResult* maint_query(const char* sql, char* err, size_t en) {
+    TokenList* tk = lexer_tokenize(sql);
+    ParseResult* pr = tk ? parser_parse(tk) : NULL;
+    QueryResult* r = NULL;
+    if (pr && pr->success && pr->count == 1) {
+        g_db.exec_ctx.priv_off++;
+        r = executor_run(&g_db.exec_ctx, pr->statements[0]);
+        g_db.exec_ctx.priv_off--;
+        if (r && !r->success) { snprintf(err, en, "%.250s", r->error); db_result_free(r); r = NULL; }
+        else if (!r) snprintf(err, en, "out of memory");
+    } else snprintf(err, en, "%.250s", pr ? pr->error : "out of memory");
+    if (pr) parse_result_free(pr);
+    if (tk) lexer_free(tk);
+    return r;
+}
+
+// ANALYZE: statistiche delle colonne per l'ottimizzatore (P1.13; vedi src/query/stats.h)
+static bool analyze_columns(const char* db, const TableSchema* ts, long long rows, char* err, size_t en) {
+    TableStats t;
+    memset(&t, 0, sizeof(t));
+    snprintf(t.db, sizeof(t.db), "%s", db ? db : "");
+    snprintf(t.table, sizeof(t.table), "%s", ts->name);
+    t.rows = (double)rows;
+    t.ncols = ts->num_columns;
+    t.cols = sv_calloc((size_t)(ts->num_columns ? ts->num_columns : 1), sizeof(ColStats));
+    bool ok = true;
+    for (int c = 0; ok && c < ts->num_columns; c++) {
+        const Column* cd = &ts->columns[c];
+        ColStats* cs = &t.cols[c];
+        snprintf(cs->name, sizeof(cs->name), "%s", cd->name);
+        if (cd->type == SV_TYPE_BLOB || cd->type == SV_TYPE_TEXT) {   // testi lunghi: solo i NULL
+            char q[400];
+            snprintf(q, sizeof(q), "SELECT COUNT(*) FROM `%s` WHERE `%s` IS NULL", ts->name, cd->name);
+            QueryResult* r = maint_query(q, err, en);
+            if (!r) { ok = false; break; }
+            double nulls = r->num_rows ? atof(r->rows[0].cells[0].value) : 0;
+            db_result_free(r);
+            cs->null_frac = rows > 0 ? nulls / (double)rows : 0;
+            cs->ndv = rows > 0 ? (double)rows * (1 - cs->null_frac) : 0;
+            continue;
+        }
+        char q[400];
+        snprintf(q, sizeof(q), "SELECT COUNT(DISTINCT `%s`), COUNT(*) - COUNT(`%s`) FROM `%s`", cd->name, cd->name, ts->name);
+        QueryResult* r = maint_query(q, err, en);
+        if (!r) { ok = false; break; }
+        if (r->num_rows) {
+            cs->ndv = r->rows[0].cells[0].is_null ? 0 : atof(r->rows[0].cells[0].value);
+            double nulls = r->rows[0].cells[1].is_null ? 0 : atof(r->rows[0].cells[1].value);
+            cs->null_frac = rows > 0 ? nulls / (double)rows : 0;
+        }
+        db_result_free(r);
+        bool num = cd->type == SV_TYPE_INT || cd->type == SV_TYPE_BIGINT || cd->type == SV_TYPE_FLOAT ||
+                   cd->type == SV_TYPE_DECIMAL || cd->type == SV_TYPE_BOOL;
+        if (!num || rows <= 0) continue;
+        // istogramma equi-depth: i valori ordinati, presi alle posizioni k / STATS_BUCKETS
+        snprintf(q, sizeof(q), "SELECT `%s` FROM `%s` WHERE `%s` IS NOT NULL ORDER BY `%s`", cd->name, ts->name, cd->name, cd->name);
+        r = maint_query(q, err, en);
+        if (!r) { ok = false; break; }
+        if (r->num_rows > 0) {
+            cs->numeric = true;
+            for (int k = 0; k <= STATS_BUCKETS; k++) {
+                long i = (long)((double)(r->num_rows - 1) * k / STATS_BUCKETS);
+                cs->hist[k] = atof(r->rows[i].cells[0].value);
+            }
+            cs->min = cs->hist[0];
+            cs->max = cs->hist[STATS_BUCKETS];
+        }
+        db_result_free(r);
+    }
+    if (ok) stats_put(&t);
+    free(t.cols);
+    return ok;
+}
+
 static long long maint_count(const char* sql, char* err, size_t en) {
     TokenList* tk = lexer_tokenize(sql);
     ParseResult* pr = tk ? parser_parse(tk) : NULL;
@@ -575,14 +766,14 @@ static QueryResult* exec_table_maint(ASTNode* stmt) {
     for (char* c = opl; *c; c++) *c = (char)tolower((unsigned char)*c);
     bool optimize = !strcmp(op, "OPTIMIZE");
     if ((optimize) && g_open_tx > 0) return result_error("OPTIMIZE TABLE is not allowed while a transaction is open");
-    MaintOut m = { calloc(1, sizeof(QueryResult)), 0 };
+    MaintOut m = { sv_calloc(1, sizeof(QueryResult)), 0 };
     if (!m.r) return result_error("Out of memory");
     static const char* const NAMES[4] = { "Table", "Op", "Msg_type", "Msg_text" };
     m.r->success = true;
     m.r->num_cols = 4;
-    m.r->col_names = calloc(4, sizeof(char*));
-    m.r->col_types = calloc(4, sizeof(char*));
-    for (int i = 0; m.r->col_names && m.r->col_types && i < 4; i++) { m.r->col_names[i] = strdup(NAMES[i]); m.r->col_types[i] = strdup("VARCHAR"); }
+    m.r->col_names = sv_calloc(4, sizeof(char*));
+    m.r->col_types = sv_calloc(4, sizeof(char*));
+    for (int i = 0; m.r->col_names && m.r->col_types && i < 4; i++) { m.r->col_names[i] = sv_strdup(NAMES[i]); m.r->col_types[i] = sv_strdup("VARCHAR"); }
     bool vacuumed = false;
     for (int i = 0; i < stmt->maint.ntables; i++) {
         const char* tn = stmt->maint.tables[i];
@@ -597,6 +788,11 @@ static QueryResult* exec_table_maint(ASTNode* stmt) {
         ts = catalog_get_table(g_db.catalog, dbname, tn);
         if (ts) ts->num_rows = (uint64_t)rows;
         if (strcmp(op, "ANALYZE")) executor_invalidate_indexes();          // ricostruiti al primo uso
+        else if (ts && !analyze_columns(dbname, ts, rows, err, sizeof(err))) {
+            snprintf(msg, sizeof(msg), "column statistics: %.170s", err);
+            maint_row(&m, tn, opl, "error", msg);
+            continue;
+        }
         if (optimize && !vacuumed) {
             int freed = 0;
             vacuumed = do_vacuum(&freed);
@@ -608,6 +804,11 @@ static QueryResult* exec_table_maint(ASTNode* stmt) {
         maint_row(&m, tn, opl, "status", msg);
     }
     catalog_save(g_db.catalog, g_db.cat_path);                             // statistiche aggiornate
+    if (!strcmp(op, "ANALYZE")) {
+        char sp[1100];
+        snprintf(sp, sizeof(sp), "%s" SV_PATH_SEP "segvault.stats", g_db.data_dir);
+        stats_save(sp);
+    }
     return m.r;
 }
 
@@ -674,12 +875,11 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
         result = db_backup_impl(stmt->backup.path, err, sizeof(err)) ? result_ok(0) : result_error(err);
     } else if (stmt->type == NODE_VACUUM) {
         int freed = 0;
+        bool full = stmt->delete_stmt.num_targets == 1;
         result = g_open_tx > 0 ? result_error("VACUUM is not allowed while a transaction is open")
-               : do_vacuum(&freed) ? result_ok(freed) : result_error("VACUUM failed");
+               : (full ? do_vacuum_full(&freed) : do_vacuum(&freed)) ? result_ok(freed) : result_error("VACUUM failed");
     } else if (stmt->type == NODE_CHECKPOINT) {
-        result = g_open_tx > 0 ? result_error(g_db.exec_ctx.tx_id ? "CHECKPOINT is not allowed inside a transaction"
-                                                                  : "CHECKPOINT is not allowed while a transaction is open")
-               : do_checkpoint() ? result_ok(0) : result_error("Checkpoint failed");
+        result = do_checkpoint() ? result_ok(0) : result_error("Checkpoint failed");   // anche con transazioni aperte (P1.1)
     } else if (stmt->type == NODE_SAVEPOINT) {
         result = db_savepoint(stmt->savepoint.name) ? result_ok(0) : result_error("Failed to set savepoint");
     } else if (stmt->type == NODE_ROLLBACK_TO) {
@@ -742,7 +942,7 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
             case NODE_ALTER_TABLE: case NODE_TRUNCATE: case NODE_CREATE_TRIGGER: case NODE_DROP_TRIGGER:
             case NODE_CREATE_PROCEDURE: case NODE_DROP_PROCEDURE:
                 bp_flush_all(g_db.bp);
-                catalog_save(g_db.catalog, g_db.cat_path);
+                if (catalog_save(g_db.catalog, g_db.cat_path) == SV_OK) pf_ddl_saved();
                 break;
             default: break;
         }
@@ -789,7 +989,7 @@ static int ctab_id(const char* db, const char* table, bool create) {
     if (!create || g_nctab >= 65535) return -1;
     if (g_nctab == g_capctab) {
         int nc = g_capctab ? g_capctab * 2 : 16;
-        ChgTable* nv = realloc(g_ctab, sizeof(ChgTable) * (size_t)nc);
+        ChgTable* nv = sv_realloc(g_ctab, sizeof(ChgTable) * (size_t)nc);
         if (!nv) return -1;
         g_ctab = nv;
         g_capctab = nc;
@@ -815,7 +1015,7 @@ static uint64_t  g_chg_seq;
 static void chg_hook(uint64_t tx, const char* db, const char* table, uint8_t type, RID rid, RID nrid, const uint8_t* old, size_t ol) {
     if (g_nchg == g_capchg) {
         int nc = g_capchg ? g_capchg * 2 : 256;
-        TxChange* nv = realloc(g_chg, sizeof(TxChange) * (size_t)nc);
+        TxChange* nv = sv_realloc(g_chg, sizeof(TxChange) * (size_t)nc);
         if (!nv) { if (g_nchg) g_chg[g_nchg - 1].type = 0; g_chg_lost = true; return; }   // la transazione non si potrà leggere confermata
         g_chg = nv;
         g_capchg = nc;
@@ -831,7 +1031,7 @@ static void chg_hook(uint64_t tx, const char* db, const char* table, uint8_t typ
     c->rid = rid;
     c->nrid = nrid;
     if (old && ol) {
-        c->old = malloc(ol);
+        c->old = sv_malloc(ol);
         if (c->old) { memcpy(c->old, old, ol); c->ol = (uint32_t)ol; }
         else { c->type = 0; g_chg_lost = true; }
     }
@@ -867,7 +1067,7 @@ static size_t rid_hash(RID r, size_t cap) {
 static bool ridmap_grow(RidMap* mp, const SnapRow* m, int n) {
     size_t nc = mp->cap ? mp->cap * 2 : 256;
     while (nc < (size_t)n * 2 + 2) nc *= 2;
-    int* nh = malloc(sizeof(int) * nc);
+    int* nh = sv_malloc(sizeof(int) * nc);
     if (!nh) return false;
     for (size_t i = 0; i < nc; i++) nh[i] = -1;
     for (int k = 0; k < n; k++) {
@@ -925,7 +1125,7 @@ static bool snapshot_build(uint64_t tx, int dbi, const char* table, HeapSnapshot
         if (!c->type) { fail = true; break; }
         if (n + 2 > cap) {
             cap = cap ? cap * 2 : 64;
-            SnapRow* nm = realloc(m, sizeof(SnapRow) * (size_t)cap);
+            SnapRow* nm = sv_realloc(m, sizeof(SnapRow) * (size_t)cap);
             if (!nm) { fail = true; break; }
             m = nm;
         }
@@ -958,8 +1158,8 @@ static bool snapshot_build(uint64_t tx, int dbi, const char* table, HeapSnapshot
             if (!origin.fresh && origin.old) {                     // riga confermata cancellata: torna in fondo
                 if (out->nextra + 1 > ecap) {
                     ecap = ecap ? ecap * 2 : 16;
-                    uint8_t** ne = realloc(out->extra, sizeof(uint8_t*) * (size_t)ecap);
-                    size_t* nl = realloc(out->extra_len, sizeof(size_t) * (size_t)ecap);
+                    uint8_t** ne = sv_realloc(out->extra, sizeof(uint8_t*) * (size_t)ecap);
+                    size_t* nl = sv_realloc(out->extra_len, sizeof(size_t) * (size_t)ecap);
                     if (ne) out->extra = ne;
                     if (nl) out->extra_len = nl;
                     if (!ne || !nl) { fail = true; break; }
@@ -978,10 +1178,10 @@ static bool snapshot_build(uint64_t tx, int dbi, const char* table, HeapSnapshot
         n = k;
     }
     if (n) qsort(m, (size_t)n, sizeof(SnapRow), snaprow_cmp);
-    out->hide = malloc(sizeof(RID) * (size_t)(n + 1));
-    out->repl_rid = malloc(sizeof(RID) * (size_t)(n + 1));
-    out->repl = malloc(sizeof(uint8_t*) * (size_t)(n + 1));
-    out->repl_len = malloc(sizeof(size_t) * (size_t)(n + 1));
+    out->hide = sv_malloc(sizeof(RID) * (size_t)(n + 1));
+    out->repl_rid = sv_malloc(sizeof(RID) * (size_t)(n + 1));
+    out->repl = sv_malloc(sizeof(uint8_t*) * (size_t)(n + 1));
+    out->repl_len = sv_malloc(sizeof(size_t) * (size_t)(n + 1));
     if (!out->hide || !out->repl_rid || !out->repl || !out->repl_len) { free(m); return false; }
     for (int k = 0; k < n; k++) {
         if (m[k].fresh) out->hide[out->nhide++] = m[k].rid;
@@ -1012,10 +1212,25 @@ static int g_lock_wait_ms = 30000;
 void db_set_lock_wait_timeout(int ms) { g_lock_wait_ms = ms > 0 ? ms : 30000; }
 #define MAX_STMT_LOCKS 96
 
-static _Thread_local void (*g_wait_hook)(void*);
+static _Thread_local void (*g_wait_leave)(void*);
+static _Thread_local void (*g_wait_enter)(void*);
 static _Thread_local void* g_wait_ud;
 
-void db_set_lock_wait_hook(void (*hook)(void* ud), void* ud) { g_wait_hook = hook; g_wait_ud = ud; }
+void db_set_lock_wait_hooks(void (*leave)(void* ud), void (*enter)(void* ud), void* ud) {
+    g_wait_leave = leave;
+    g_wait_enter = enter;
+    g_wait_ud = ud;
+}
+
+// attesa senza polling: fuori dal motore (e dal turno del server) finché un lock viene rilasciato o una
+// sessione esce; al massimo 200 ms per ricontrollare tempo scaduto e annullamento
+static void wait_lock_change(unsigned long long seq, double deadline) {
+    if (g_wait_leave) g_wait_leave(g_wait_ud);
+    double left = deadline - get_time_ms();
+    int ms = left > 200 ? 200 : left < 1 ? 1 : (int)left;
+    lk_wait_change(seq, ms);
+    if (g_wait_enter) g_wait_enter(g_wait_ud);
+}
 
 typedef struct {
     LkReq r[MAX_STMT_LOCKS];
@@ -1050,19 +1265,19 @@ static void ls_name(LockSet* ls, int dbi, const char* name, uint8_t mode, int de
     if (dbi < 0 || dbi >= g_db.catalog->num_databases || depth > 8 || !name[0]) return;
     Database* d = &g_db.catalog->databases[dbi];
     for (int t = 0; t < d->num_tables; t++) {
-        if (strcasecmp(d->tables[t].name, name)) continue;
+        if (strcasecmp(d->tables[t]->name, name)) continue;
         if (ls_mode(ls, dbi, name) >= mode) return;            // già visto (anche nei cicli di riferimenti)
         ls_add(ls, dbi, name, mode);
         if (mode != LK_X) return;
         for (int g = 0; g < d->num_triggers; g++)               // i trigger possono scrivere ovunque
             if (!strcasecmp(d->triggers[g].table_name, name)) ls_scan_text(ls, dbi, d->triggers[g].body, LK_X, depth + 1);
-        const TableSchema* ts = &d->tables[t];
+        const TableSchema* ts = d->tables[t];
         for (int c = 0; c < ts->num_constraints; c++)           // tabelle riferite: controllate (lettura)
             if (ts->constraints[c].kind == CONS_FOREIGN) ls_name(ls, dbi, ts->constraints[c].ref_table, LK_S, depth + 1);
         for (int u = 0; u < d->num_tables; u++)                 // tabelle che la riferiscono: CASCADE / SET NULL
-            for (int c = 0; c < d->tables[u].num_constraints; c++)
-                if (d->tables[u].constraints[c].kind == CONS_FOREIGN && !strcasecmp(d->tables[u].constraints[c].ref_table, name))
-                    ls_name(ls, dbi, d->tables[u].name, LK_X, depth + 1);
+            for (int c = 0; c < d->tables[u]->num_constraints; c++)
+                if (d->tables[u]->constraints[c].kind == CONS_FOREIGN && !strcasecmp(d->tables[u]->constraints[c].ref_table, name))
+                    ls_name(ls, dbi, d->tables[u]->name, LK_X, depth + 1);
         return;
     }
     for (int v = 0; v < d->num_views; v++)
@@ -1178,39 +1393,29 @@ static int acquire_locks(const LockSet* ls, bool allow_snapshot) {
     double t0 = get_time_ms();
     for (;;) {
         const void* owner = lock_owner();
+        unsigned long long seq = lk_seq();              // prima del tentativo: un rilascio dopo non si perde
         int r = lk_acquire(owner, ls->r, ls->n);
         if (r == LK_GRANTED) return 0;
         if (r == LK_DEADLOCK) return 1;
         if (allow_snapshot && try_snapshot(ls)) return 3;     // SELECT: la versione confermata, subito
+        if (sv_thread_cancelled()) { lk_cancel_wait(owner); return 4; }   // KILL QUERY / Annulla della GUI
         if (get_time_ms() - t0 > g_lock_wait_ms || g_lock_depth != 1) { lk_cancel_wait(owner); return 2; }
         DbSession* s = g_active;
         if (s) { session_save(s); session_load(&g_default_session); g_active = NULL; }
         g_lock_depth = 0;
+        if (s) lk_notify();                         // la sessione è uscita: chi aspettava di entrare entra
         sv_rw_wrunlock(&g_db_rw);
-        if (g_wait_hook) g_wait_hook(g_wait_ud);
-        else {
-#ifdef _WIN32
-            Sleep(3);
-#else
-            struct timespec ts = { 0, 3000000 };
-            nanosleep(&ts, NULL);
-#endif
-        }
+        wait_lock_change(seq, t0 + g_lock_wait_ms);
         sv_rw_wr(&g_db_rw);
         g_lock_depth = 1;
         if (s) {
             while (g_active) {                      // un'altra sessione è dentro: si aspetta che esca
+                unsigned long long seq2 = lk_sess_seq();
                 g_lock_depth = 0;
                 sv_rw_wrunlock(&g_db_rw);
-                if (g_wait_hook) g_wait_hook(g_wait_ud);
-                else {
-#ifdef _WIN32
-                    Sleep(1);
-#else
-                    struct timespec ts1 = { 0, 1000000 };
-                    nanosleep(&ts1, NULL);
-#endif
-                }
+                if (g_wait_leave) g_wait_leave(g_wait_ud);
+                lk_wait_sess(seq2, 200);
+                if (g_wait_enter) g_wait_enter(g_wait_ud);
                 sv_rw_wr(&g_db_rw);
                 g_lock_depth = 1;
             }
@@ -1229,12 +1434,20 @@ static QueryResult* lock_error(int why) {
         if (g_db.exec_ctx.tx_id) db_rollback_impl();
         return result_error("Deadlock found when trying to get lock; try restarting transaction");
     }
+    if (why == 4) return result_error("Query cancelled while waiting for a lock held by another session");
     return result_error("Lock wait timeout exceeded; try restarting transaction (a table is in use by another session's open transaction)");
 }
 
 // a fine statement, senza transazione aperta, i lock si liberano subito
 static void release_if_autocommit(void) {
     if (!g_db.exec_ctx.tx_id) lk_release_all(lock_owner());
+}
+
+// SELECT semplice (non FOR UPDATE / FOR SHARE) in una transazione: i lock S che ha preso non restano
+// fino a COMMIT. Così due sessioni che leggono e poi scrivono la stessa tabella non finiscono in un
+// deadlock di conversione S -> X; la lettura vede l'ultima versione confermata (READ COMMITTED)
+static void release_plain_read(const LockSet* ls, const uint8_t* prior) {
+    if (ls && prior && g_db.exec_ctx.tx_id) lk_release_reads(lock_owner(), ls->r, ls->n, prior);
 }
 
 static QueryResult* db_execute_impl(const char* sql);
@@ -1264,12 +1477,12 @@ static QueryResult* prepared_statement(const TokenList* tk) {
     #define TW(i, w) ((i) < n && t[i].text && t[i].type != TOK_STRING && !strcasecmp(t[i].text, w))
     if (TW(0, "PREPARE") && n >= 4 && t[1].type == TOK_IDENTIFIER && TW(2, "FROM")) {
         char* text = NULL;
-        if (t[3].type == TOK_STRING) text = strdup(t[3].text);
+        if (t[3].type == TOK_STRING) text = sv_strdup(t[3].text);
         else if (t[3].type == TOK_IDENTIFIER && t[3].text[0] == '@') {
             text = executor_uservar_literal(t[3].text + 1);
             if (text && text[0] == '\'') {                        // il testo della variabile, senza apici
                 TokenList* lt = lexer_tokenize(text);
-                char* raw = lt && lt->count > 0 && lt->tokens[0].type == TOK_STRING ? strdup(lt->tokens[0].text) : NULL;
+                char* raw = lt && lt->count > 0 && lt->tokens[0].type == TOK_STRING ? sv_strdup(lt->tokens[0].text) : NULL;
                 if (lt) lexer_free(lt);
                 free(text);
                 text = raw;
@@ -1307,7 +1520,7 @@ static QueryResult* prepared_statement(const TokenList* tk) {
         }
         size_t len = strlen(sql) + 1;
         for (int k = 0; k < na; k++) len += args[k] ? strlen(args[k]) : 4;
-        char* full = malloc(len);
+        char* full = sv_malloc(len);
         if (!full) { for (int k = 0; k < na; k++) free(args[k]); return result_error("Out of memory"); }
         size_t o = 0;
         const char* from = sql;
@@ -1327,6 +1540,16 @@ static QueryResult* prepared_statement(const TokenList* tk) {
     }
     #undef TW
     return NULL;
+}
+
+// ── generazione dello schema (P2.2) ─────────────────────────────
+// Cambia dopo ogni statement che non è una lettura o una modifica di righe (DDL, USE, CALL, ROLLBACK, ...):
+// gli alberi dei prepared statement analizzati prima si rifanno (l'executor vi lascia risoluzioni che
+// dipendono dallo schema, come le colonne di USING). Prudente: più invalidazioni del necessario, mai meno.
+static uint64_t g_schema_gen = 1;
+static void schema_maybe_changed(const ASTNode* st) {
+    if (!st || (st->type != NODE_SELECT && st->type != NODE_INSERT && st->type != NODE_UPDATE && st->type != NODE_DELETE))
+        g_schema_gen++;
 }
 
 static QueryResult* db_execute_impl(const char* sql) {
@@ -1358,23 +1581,29 @@ static QueryResult* db_execute_impl(const char* sql) {
     // Esegui il primo statement (multi-statement gestito da db_execute_multi), con i suoi lock
     QueryResult* result;
     if (parsed->count > 0) {
-        LockSet* ls = malloc(sizeof(LockSet));
+        LockSet* ls = sv_malloc(sizeof(LockSet));
         if (!ls) result = result_error("Out of memory");
         else {
             stmt_locks(parsed->statements[0], tokens, ls, g_db.catalog->current_db);
             bool snap = stmt_lock_kind(parsed->statements[0]) == 1 && !locking_read(tokens);
+            uint8_t prior[MAX_STMT_LOCKS];
+            if (snap) lk_modes(lock_owner(), ls->r, ls->n, prior);
             int why = acquire_locks(ls, snap);
-            result = why == 1 || why == 2 ? lock_error(why) : exec_one(parsed->statements[0]);
+            result = why == 1 || why == 2 || why == 4 ? lock_error(why) : exec_one(parsed->statements[0]);
             if (why == 3) snapshot_clear();
+            if (snap) release_plain_read(ls, prior);
             release_if_autocommit();
             free(ls);
         }
+        schema_maybe_changed(parsed->statements[0]);
     } else result = result_ok(0);
     if (result) result->exec_time_ms = get_time_ms() - t_start;
 
     parse_result_free(parsed);
     lexer_free(tokens);
     wal_write_buffer(g_db.wal);       // a fine statement il log è nel file (sopravvive a un crash del processo)
+    pf_stmt_end();
+    pf_process();
     maybe_checkpoint();
     return result;
 }
@@ -1404,23 +1633,31 @@ static QueryResult** db_execute_multi_impl(const char* sql, int* out_count) {
     }
 
     QueryResult** results = SV_ALLOC_N(QueryResult*, parsed->count);
-    LockSet* ls = malloc(sizeof(LockSet));
+    LockSet* ls = sv_malloc(sizeof(LockSet));
     for (int i = 0; i < parsed->count; i++) {
         // i lock di ogni statement dal testo intero (sovrastima: più tabelle, mai meno)
         int why = 0;
+        bool plain = false;
+        uint8_t prior[MAX_STMT_LOCKS];
         if (ls) {
             stmt_locks(parsed->statements[i], tokens, ls, g_db.catalog->current_db);
-            why = acquire_locks(ls, stmt_lock_kind(parsed->statements[i]) == 1 && !locking_read(tokens));
+            plain = stmt_lock_kind(parsed->statements[i]) == 1 && !locking_read(tokens);
+            if (plain) lk_modes(lock_owner(), ls->r, ls->n, prior);
+            why = acquire_locks(ls, plain);
         }
-        results[i] = !ls ? result_error("Out of memory") : why == 1 || why == 2 ? lock_error(why) : exec_one(parsed->statements[i]);
+        results[i] = !ls ? result_error("Out of memory") : why == 1 || why == 2 || why == 4 ? lock_error(why) : exec_one(parsed->statements[i]);
         if (why == 3) snapshot_clear();
+        if (plain) release_plain_read(ls, prior);
         release_if_autocommit();
+        schema_maybe_changed(parsed->statements[i]);
         if (results[i])
             results[i]->exec_time_ms = get_time_ms() - t_start;
     }
     free(ls);
     *out_count = parsed->count;
     wal_write_buffer(g_db.wal);
+    pf_stmt_end();
+    pf_process();
     maybe_checkpoint();
 
     parse_result_free(parsed);
@@ -1473,14 +1710,29 @@ static const void* lock_owner(void);
 // dopo l'annullamento delle modifiche di tx (quelle dopo la sequenza after): via dalla cache solo le pagine
 // riscritte e, delle tabelle toccate, gli indici in memoria e la mappa dello spazio libero. Con DDL nella
 // transazione o modifiche non registrate si invalida tutto, come prima
+// righe di ogni tabella dopo l'annullamento (P1.13: num_rows esatto, non più gonfiato da un ROLLBACK di
+// INSERT o calato da uno di DELETE): ogni modifica annullata conta al contrario
+static void rows_after_undo(uint64_t tx, uint64_t after) {
+    for (int i = 0; i < g_nchg; i++) {
+        const TxChange* c = &g_chg[i];
+        if (c->tx != tx || c->seq <= after || c->tid >= g_nctab) continue;
+        if (c->type != LOG_INSERT && c->type != LOG_DELETE) continue;
+        TableSchema* ts = catalog_get_table(g_db.catalog, g_ctab[c->tid].db, g_ctab[c->tid].table);
+        if (!ts) continue;
+        if (c->type == LOG_INSERT) { if (ts->num_rows > 0) ts->num_rows--; }
+        else ts->num_rows++;
+    }
+}
+
 static void invalidate_after_undo(uint64_t tx, uint64_t after, const uint32_t* pages, int npages, bool undo_ok) {
+    if (undo_ok && !g_tx_ddl && !g_chg_lost) rows_after_undo(tx, after);
     if (!undo_ok || g_tx_ddl || g_chg_lost || !pages) {
         bp_remove_all(g_db.bp);
         executor_invalidate_indexes();
         return;
     }
     for (int i = 0; i < npages; i++) bp_remove_page(g_db.bp, pages[i]);
-    uint8_t* seen = calloc((size_t)g_nctab + 1, 1);           // una volta per tabella
+    uint8_t* seen = sv_calloc((size_t)g_nctab + 1, 1);           // una volta per tabella
     if (!seen) { bp_remove_all(g_db.bp); executor_invalidate_indexes(); return; }
     for (int i = 0; i < g_nchg; i++) {
         const TxChange* c = &g_chg[i];
@@ -1495,8 +1747,143 @@ static void invalidate_after_undo(uint64_t tx, uint64_t after, const uint32_t* p
     free(seen);
 }
 
+// dopo un annullamento sulle pagine della cache (P1.1): le pagine sono già giuste in memoria, si buttano solo le
+// strutture derivate (indici in memoria, mappa dello spazio libero) delle tabelle toccate; con DDL nella transazione,
+// modifiche non registrate o un annullamento fallito, quelle di tutte le tabelle
+static void invalidate_after_cache_undo(uint64_t tx, uint64_t after, bool undo_ok) {
+    if (undo_ok && !g_tx_ddl && !g_chg_lost) rows_after_undo(tx, after);
+    if (!undo_ok || g_tx_ddl || g_chg_lost) { executor_invalidate_indexes(); return; }
+    uint8_t* seen = sv_calloc((size_t)g_nctab + 1, 1);
+    if (!seen) { executor_invalidate_indexes(); return; }
+    for (int i = 0; i < g_nchg; i++) {
+        const TxChange* c = &g_chg[i];
+        if (c->tx != tx || c->seq <= after || c->tid >= g_nctab || seen[c->tid]) continue;
+        seen[c->tid] = 1;
+        const ChgTable* ct = &g_ctab[c->tid];
+        TableSchema* ts = catalog_get_table(g_db.catalog, ct->db, ct->table);
+        if (ts) executor_invalidate_table(g_db.bp, ct->db, ct->table, ts->root_page_id);
+        else { executor_invalidate_indexes(); break; }
+    }
+    free(seen);
+}
+
+// ── spazio liberato subito (P1.5) ────────────────────────────────
+// Una catena di overflow sostituita o eliminata, e le pagine di una tabella eliminata, tornano nella lista delle
+// pagine libere appena la modifica che le ha abbandonate è durevole nel log (prima: solo un VACUUM, che vuole
+// zero transazioni aperte). Fino ad allora un arresto potrebbe far tornare la riga di prima, che le usa ancora.
+// tx != 0: aspetta la fine della transazione (COMMIT o ROLLBACK: dopo l'annullamento le righe rimesse hanno
+// catene nuove); ready = LSN da cui la si può liberare (-1 = non ancora deciso); heap: radice di una tabella
+typedef struct { uint64_t tx; int64_t ready; uint32_t first, total; uint8_t heap; } PendFree;
+static PendFree* g_pf;
+static int g_npf, g_cappf;
+static unsigned long long g_pf_pages;          // pagine liberate così (SHOW STATUS)
+
+static void pf_add(uint64_t tx, uint32_t first, uint32_t total, uint8_t heap) {
+    if (!first) return;
+    if (g_npf == g_cappf) {
+        int nc = g_cappf ? g_cappf * 2 : 64;
+        PendFree* nv = sv_try_realloc(g_pf, sizeof(PendFree) * (size_t)nc);
+        if (!nv) { atomic_fetch_add(&g_sv_abandoned_pages, (int)(total / SV_PAGE_SIZE + 1)); return; }   // VACUUM poi
+        g_pf = nv;
+        g_cappf = nc;
+    }
+    g_pf[g_npf++] = (PendFree){ tx, -1, first, total, heap };
+}
+
+static void on_chain_abandoned(uint32_t first, uint32_t total) { pf_add(g_db.exec_ctx.tx_id, first, total, 0); }
+static void on_table_dropped(uint32_t root) { pf_add(0, root, 0, 1); }
+
+static void pf_tx_end(uint64_t tx) {
+    int64_t at = wal_size(g_db.wal);
+    for (int i = 0; i < g_npf; i++) if (tx && g_pf[i].tx == tx) { g_pf[i].tx = 0; g_pf[i].ready = at; }
+}
+
+static void pf_stmt_end(void) {                // statement in autocommit concluso: le sue catene, dal suo ultimo record
+    int64_t at = wal_size(g_db.wal);
+    for (int i = 0; i < g_npf; i++) if (!g_pf[i].tx && g_pf[i].ready < 0 && !g_pf[i].heap) g_pf[i].ready = at;
+}
+
+static void pf_ddl_saved(void) {               // DROP TABLE su disco (catalogo salvato con fsync): subito
+    for (int i = 0; i < g_npf; i++) if (g_pf[i].heap && g_pf[i].ready < 0) g_pf[i].ready = 0;
+}
+
+static void free_chain(uint32_t first, uint32_t total, uint64_t lsn) {
+    uint32_t guard = total / (SV_PAGE_SIZE - SV_PAGE_HEADER_SIZE - 2) + 2;
+    for (uint32_t pid = first; pid && guard--; ) {
+        Page* p = bp_fetch(g_db.bp, pid);
+        if (!p) break;
+        bool ov = (p->flags & PAGE_FLAG_OVERFLOW) != 0;
+        uint32_t nx = page_next(p);
+        bp_unpin(g_db.bp, pid, false);
+        if (!ov || bp_free_page_now(g_db.bp, pid, lsn) != SV_OK) break;
+        g_pf_pages++;
+        pid = nx;
+    }
+}
+
+static void free_heap(uint32_t root, uint64_t lsn) {
+    uint32_t* ids = NULL;
+    int n = 0, cap = 0;
+    for (uint32_t pid = root, guard = 0; pid && guard < (1u << 24); guard++) {
+        Page* p = bp_fetch(g_db.bp, pid);
+        if (!p) break;
+        if (p->flags & (PAGE_FLAG_FREE | PAGE_FLAG_OVERFLOW)) { bp_unpin(g_db.bp, pid, false); break; }
+        for (uint16_t s = 0; s < p->num_slots; s++) {          // le righe grandi: anche le loro catene
+            uint16_t l = 0;
+            const void* d = page_get_slot(p, s, &l);
+            uint32_t t = 0, f = 0;
+            if (d && ov_is_stub(d, l, &t, &f)) {
+                bp_unpin(g_db.bp, pid, false);
+                free_chain(f, t, lsn);
+                p = bp_fetch(g_db.bp, pid);
+                if (!p) break;
+            }
+        }
+        if (!p) break;
+        uint32_t nx = page_next(p);
+        bp_unpin(g_db.bp, pid, false);
+        if (n == cap) {
+            int nc = cap ? cap * 2 : 64;
+            uint32_t* nv = sv_try_realloc(ids, sizeof(uint32_t) * (size_t)nc);
+            if (!nv) break;
+            ids = nv;
+            cap = nc;
+        }
+        ids[n++] = pid;
+        pid = nx;
+    }
+    for (int i = 0; i < n; i++) if (bp_free_page_now(g_db.bp, ids[i], lsn) == SV_OK) g_pf_pages++;
+    free(ids);
+}
+
+// libera ciò che è pronto: la modifica che l'ha abbandonato è nel log su disco. Se aspettano almeno 64 KB (righe
+// grandi sostituite) e il log non è ancora su disco (synchronous = NORMAL: fsync di gruppo), si fa l'fsync subito:
+// così lo statement successivo riusa quelle pagine invece di allungare il file
+#define PF_SYNC_PAGES 16
+static void pf_process(void) {
+    if (!g_npf || io_failed()) return;
+    if (g_sync_mode >= 1 && g_db.wal->synced_lsn < wal_size(g_db.wal)) {
+        uint64_t waiting = 0;
+        for (int i = 0; i < g_npf; i++)
+            if (!g_pf[i].tx && g_pf[i].ready >= 0 && g_pf[i].ready > g_db.wal->synced_lsn)
+                waiting += g_pf[i].heap ? PF_SYNC_PAGES : g_pf[i].total / (SV_PAGE_SIZE - SV_PAGE_HEADER_SIZE - 2) + 1;
+        if (waiting >= PF_SYNC_PAGES && wal_flush(g_db.wal) == SV_OK) g_last_sync = get_time_ms();
+    }
+    int64_t synced = g_db.wal->synced_lsn;
+    uint64_t lsn = (uint64_t)wal_size(g_db.wal);
+    int k = 0;
+    for (int i = 0; i < g_npf; i++) {
+        PendFree* e = &g_pf[i];
+        if (e->tx || e->ready < 0 || e->ready > synced) { g_pf[k++] = *e; continue; }
+        if (e->heap) free_heap(e->first, lsn);
+        else free_chain(e->first, e->total, lsn);
+    }
+    g_npf = k;
+}
+
 // fine della transazione in memoria (dopo COMMIT, ROLLBACK, o un errore che li ha interrotti)
 static void tx_end(bool committed) {
+    pf_tx_end(g_db.exec_ctx.tx_id);
     if (committed) txm_commit(g_db.txm, g_db.exec_ctx.tx_id);
     else txm_abort(g_db.txm, g_db.exec_ctx.tx_id);
     chg_drop(g_db.exec_ctx.tx_id, 0);
@@ -1535,7 +1922,7 @@ static bool db_commit_impl(void) {
     if (!ok) {
         g_db.wal->failed = true;
         g_db.wal->blen = 0;
-        if (before >= 0 && sv_ftruncate(g_db.wal->fd, before) != 0) {}
+        if (before >= 0 && sv_ftruncate(g_db.wal->fd, before) == 0) g_db.wal->fsize = before;
         snprintf(g_tx_err, sizeof(g_tx_err), "COMMIT failed, the transaction was not saved: %.300s", io_failed_msg());
         tx_end(false);
         return false;
@@ -1550,19 +1937,17 @@ static bool db_rollback_impl(void) {
     if (!g_db.initialized || !g_db.exec_ctx.tx_id) return false;
     g_tx_err[0] = '\0';
     // il log si legge dal BEGIN della transazione, non dall'inizio (O(transazione), non O(log))
+    // (P1.1) sulle pagine della cache: CLR nel buffer del log, nessun flush, nessun fsync. L'ABORT non deve essere
+    // durevole: se il processo cade prima, il recupero trova la transazione senza COMMIT, rifà i CLR e finisce
     uint32_t* pages = NULL;
     int npages = 0;
     bool undone = !io_failed() &&
-                  wal_flush(g_db.wal) == SV_OK &&          // il log da leggere, tutto nel file
-                  bp_flush_all(g_db.bp) == SV_OK &&        // l'annullamento legge le pagine dal file
-                  wal_undo_tx_from(g_db.wal, g_db.db_path, g_db.exec_ctx.tx_id, g_tx_start, &pages, &npages) == SV_OK;
+                  wal_undo_tx_cache(g_db.wal, g_db.bp, g_db.exec_ctx.tx_id, g_tx_start, &pages, &npages) == SV_OK;
     bool ok = undone &&
-              wal_write(g_db.wal, LOG_ABORT, g_db.exec_ctx.tx_id, 0, (SVRID){0,0}, NULL, 0, NULL, 0) == SV_OK &&
-              wal_flush(g_db.wal) == SV_OK;
+              wal_write(g_db.wal, LOG_ABORT, g_db.exec_ctx.tx_id, 0, (SVRID){0,0}, NULL, 0, NULL, 0) == SV_OK;
     if (!ok && !io_failed()) g_db.wal->failed = true;     // (annullamento non riuscito: stato non più certo)
     if (!ok) snprintf(g_tx_err, sizeof(g_tx_err), "ROLLBACK failed: %.300s", io_failed_msg());
-    // via dalla cache quello che l'annullamento ha cambiato sul file (solo quello)
-    invalidate_after_undo(g_db.exec_ctx.tx_id, 0, pages, npages, undone);
+    invalidate_after_cache_undo(g_db.exec_ctx.tx_id, 0, undone);
     free(pages);
     tx_end(false);
     return ok;
@@ -1616,11 +2001,10 @@ static bool db_rollback_to_impl(const char* name) {
     int64_t sp64 = (int64_t)sp_off;
     uint32_t* pages = NULL;
     int npages = 0;
-    bool undone = wal_flush(g_db.wal) == SV_OK && bp_flush_all(g_db.bp) == SV_OK &&
-                  wal_undo_tx_from(g_db.wal, g_db.db_path, g_db.exec_ctx.tx_id, sp_off, &pages, &npages) == SV_OK;
+    bool undone = wal_undo_tx_cache(g_db.wal, g_db.bp, g_db.exec_ctx.tx_id, sp_off, &pages, &npages) == SV_OK;
     bool ok = undone &&
               wal_write(g_db.wal, LOG_ROLLBACK_TO, g_db.exec_ctx.tx_id, 0, (SVRID){0,0}, (const uint8_t*)&sp64, 8, NULL, 0) == SV_OK;
-    invalidate_after_undo(g_db.exec_ctx.tx_id, g_savepoints[sp_idx].chg_seq, pages, npages, undone);
+    invalidate_after_cache_undo(g_db.exec_ctx.tx_id, g_savepoints[sp_idx].chg_seq, undone);
     free(pages);
     if (!ok) {
         if (!io_failed()) g_db.wal->failed = true;
@@ -1641,7 +2025,7 @@ static NameList* db_list_databases_impl(void) {
     nl->names     = SV_ALLOC_N(char*, nl->count);
     nl->extras    = NULL;
     for (int i = 0; i < nl->count; i++) {
-        nl->names[i] = strdup(c->databases[i].name);
+        nl->names[i] = sv_strdup(c->databases[i].name);
     }
     return nl;
 }
@@ -1655,7 +2039,7 @@ static NameList* db_list_tables_impl(const char* db_name) {
     nl->names    = SV_ALLOC_N(char*, nl->count);
     nl->extras   = NULL;
     for (int i = 0; i < nl->count; i++)
-        nl->names[i] = strdup(db->tables[i].name);
+        nl->names[i] = sv_strdup(db->tables[i]->name);
     return nl;
 }
 
@@ -1668,7 +2052,7 @@ static NameList* db_list_views_impl(const char* db_name) {
     nl->names    = SV_ALLOC_N(char*, nl->count);
     nl->extras   = NULL;
     for (int i = 0; i < nl->count; i++)
-        nl->names[i] = strdup(db->views[i].name);
+        nl->names[i] = sv_strdup(db->views[i].name);
     return nl;
 }
 
@@ -1682,7 +2066,7 @@ static NameList* db_list_procedures_impl(const char* db_name) {
     nl->extras   = NULL;
     for (int i = 0; i < db->num_routines; i++)
         if (!db->routines[i].is_function)
-            nl->names[nl->count++] = strdup(db->routines[i].name);
+            nl->names[nl->count++] = sv_strdup(db->routines[i].name);
     return nl;
 }
 
@@ -1696,7 +2080,7 @@ static NameList* db_list_functions_impl(const char* db_name) {
     nl->extras   = NULL;
     for (int i = 0; i < db->num_routines; i++)
         if (db->routines[i].is_function)
-            nl->names[nl->count++] = strdup(db->routines[i].name);
+            nl->names[nl->count++] = sv_strdup(db->routines[i].name);
     return nl;
 }
 
@@ -1710,7 +2094,7 @@ static NameList* db_list_triggers_impl(const char* db_name, const char* table) {
     nl->extras   = NULL;
     for (int i = 0; i < db->num_triggers; i++) {
         if (!table || strcmp(db->triggers[i].table_name, table) == 0)
-            nl->names[nl->count++] = strdup(db->triggers[i].name);
+            nl->names[nl->count++] = sv_strdup(db->triggers[i].name);
     }
     return nl;
 }
@@ -1722,7 +2106,7 @@ static ColumnInfo* db_list_columns_impl(const char* db_name, const char* table,
     if (!t) return NULL;
     ColumnInfo* cols = SV_ALLOC_N(ColumnInfo, t->num_columns);
     for (int i = 0; i < t->num_columns; i++) {
-        strncpy(cols[i].name, t->columns[i].name, 63);
+        snprintf(cols[i].name, sizeof(cols[i].name), "%s", t->columns[i].name);
         if ((t->columns[i].type == SV_TYPE_VARCHAR || t->columns[i].type == SV_TYPE_CHAR) && t->columns[i].size > 0)
             snprintf(cols[i].type, sizeof(cols[i].type), "%s(%d)", datatype_name(t->columns[i].type), t->columns[i].size);
         else
@@ -1808,6 +2192,7 @@ void db_free_string(char* s) { free(s); }
 static void db_shutdown_impl(void) {
     if (!g_db.initialized) return;
     auth_shutdown();
+    stats_clear();
     g_session_user[0] = '\0';
     // una transazione lasciata aperta viene annullata (le sue pagine sono già nel buffer)
     if (g_db.exec_ctx.tx_id) db_rollback();
@@ -1829,6 +2214,8 @@ static void db_shutdown_impl(void) {
     if (io_failed()) g_db.bp->io_error = true;   // bp_destroy non scrive più pagine
     if (!io_failed()) wal_write_buffer(g_db.wal);
     else g_db.wal->blen = 0;
+    // senza log (eliminato qui sotto) il prossimo avvio riparte dall'LSN scritto nell'intestazione del file
+    if (clean && (page_header_write(g_db.db_fd, (uint64_t)wal_size(g_db.wal)) != SV_OK || sv_fsync(g_db.db_fd) != 0)) clean = false;
     wal_destroy(g_db.wal);
     // checkpoint: tutte le modifiche sono su disco, il log non serve più.
     // Al prossimo avvio il recovery lavora solo dopo un arresto anomalo.
@@ -1874,6 +2261,163 @@ QueryResult* db_execute(const char* sql) {
     return r;
 }
 
+// ── prepared statement analizzati una volta (P2.2) ───────────────
+// Il testo con i '?' si analizza una volta: i segnaposto diventano nodi letterali dell'albero (il parser li
+// elenca, copie comprese), e ogni esecuzione vi scrive i valori e riusa albero e token. Solo SELECT, INSERT,
+// UPDATE e DELETE di un solo statement; tutto il resto (e ciò che l'executor rianalizza dal testo, come le
+// condizioni degli UPDATE / DELETE su più tabelle) torna NULL e il chiamante usa il testo con i valori.
+struct DbPrepared {
+    char*        sql;
+    TokenList*   tokens;
+    ParseResult* parsed;
+    ASTExpr**    nodes;
+    int          nnodes, nparams;
+    uint64_t     gen;               // g_schema_gen dell'analisi
+    uint64_t     engine_gen;        // avvio del motore (dopo un riavvio si rianalizza)
+    bool         broken;            // da non usare più: il chiamante passa al testo
+};
+
+static void prep_clear(DbPrepared* p) {
+    free(p->nodes);
+    p->nodes = NULL;
+    p->nnodes = 0;
+    if (p->parsed) parse_result_free(p->parsed);
+    if (p->tokens) lexer_free(p->tokens);
+    p->parsed = NULL;
+    p->tokens = NULL;
+}
+
+static unsigned long long g_prep_runs, g_prep_parses;   // esecuzioni dall'albero, analisi (sotto il lock)
+
+void db_prepared_counts(unsigned long long* runs, unsigned long long* parses) {
+    db_lock();
+    *runs = g_prep_runs;
+    *parses = g_prep_parses;
+    db_unlock();
+}
+
+static bool prep_parse(DbPrepared* p) {
+    prep_clear(p);
+    g_prep_parses++;
+    p->tokens = lexer_tokenize(p->sql);
+    if (!p->tokens) return false;
+    int need = 0;
+    for (int i = 0; i < p->tokens->count; i++) if (p->tokens->tokens[i].type == TOK_PARAM) need++;
+    const Token* t0 = p->tokens->count ? &p->tokens->tokens[0] : NULL;
+    bool dml = t0 && (t0->type == TOK_SELECT || t0->type == TOK_INSERT || t0->type == TOK_UPDATE || t0->type == TOK_DELETE ||
+                      t0->type == TOK_LPAREN);
+    if (!dml) return false;                         // PREPARE / EXECUTE / utenti / DDL / WITH ...: col testo
+    parser_params_begin();
+    p->parsed = parser_parse(p->tokens);
+    p->nnodes = parser_params_end(&p->nodes);
+    if (!p->parsed || !p->parsed->success || p->parsed->count != 1) return false;
+    StmtType ty = p->parsed->statements[0]->type;
+    if (ty != NODE_SELECT && ty != NODE_INSERT && ty != NODE_UPDATE && ty != NODE_DELETE) return false;
+    // ogni '?' deve essere diventato almeno un nodo (uno finito in un pezzo di testo dello statement no)
+    for (int k = 1; k <= need; k++) {
+        bool seen = false;
+        for (int i = 0; i < p->nnodes && !seen; i++) seen = p->nodes[i]->param == k;
+        if (!seen) return false;
+    }
+    p->nparams = need;
+    p->gen = g_schema_gen;
+    p->engine_gen = g_engine_gen;
+    return true;
+}
+
+DbPrepared* db_prepared_new(const char* sql) {
+    if (!sql) return NULL;
+    DbPrepared* p = sv_calloc(1, sizeof(DbPrepared));
+    p->sql = sv_strdup(sql);
+    db_lock();
+    bool ok = g_db.initialized && prep_parse(p);
+    db_unlock();
+    if (!ok) { db_prepared_free(p); return NULL; }
+    return p;
+}
+
+void db_prepared_free(DbPrepared* p) {
+    if (!p) return;
+    db_lock();
+    prep_clear(p);
+    db_unlock();
+    free(p->sql);
+    free(p);
+}
+
+int db_prepared_params(const DbPrepared* p) { return p ? p->nparams : -1; }
+
+// un valore nel formato di un letterale SQL ("12", "-3.5", "'testo'", "NULL") nel nodo del suo '?'
+static bool prep_bind(ASTExpr* e, const char* lit) {
+    if (e->type == EXPR_STRING) free(e->str_val);
+    e->str_val = NULL;
+    e->type = EXPR_NULL;
+    if (!lit || !strcmp(lit, "NULL")) return true;
+    const char* q = lit;
+    bool neg = *q == '-';
+    if (neg) q++;
+    if (isdigit((unsigned char)*q)) {                     // numero: come parse_primary (oltre 64 bit: decimale)
+        char* end;
+        errno = 0;
+        long long v = strtoll(q, &end, 10);
+        if (*end == '\0' && errno != ERANGE) { e->type = EXPR_INT; e->int_val = neg ? -v : v; return true; }
+        double d = strtod(q, &end);
+        if (*end == '\0') { e->type = EXPR_FLOAT; e->float_val = neg ? -d : d; return true; }
+        return false;
+    }
+    if (*lit != '\'') return false;
+    TokenList* tl = lexer_tokenize(lit);                  // stringa: gli escape come nel testo
+    bool ok = tl && tl->count >= 1 && tl->tokens[0].type == TOK_STRING && (tl->count == 1 || tl->tokens[1].type == TOK_EOF);
+    if (ok) { e->type = EXPR_STRING; e->str_val = sv_strdup(tl->tokens[0].text); }
+    if (tl) lexer_free(tl);
+    return ok;
+}
+
+QueryResult* db_prepared_exec(DbPrepared* p, const char* const* lits, int n) {
+    if (!p || p->broken) return NULL;
+    db_lock();
+    if (!g_db.initialized || ((p->gen != g_schema_gen || p->engine_gen != g_engine_gen) && !prep_parse(p))) {
+        p->broken = true;
+        db_unlock();
+        return NULL;
+    }
+    if (n != p->nparams) { db_unlock(); return NULL; }
+    for (int i = 0; i < p->nnodes; i++) {
+        int k = p->nodes[i]->param;
+        if (k < 1 || k > n || !prep_bind(p->nodes[i], lits[k - 1])) { db_unlock(); return NULL; }
+    }
+    double t_start = get_time_ms();
+    ASTNode* st = p->parsed->statements[0];
+    QueryResult* result;
+    LockSet* ls = sv_malloc(sizeof(LockSet));
+    if (!ls) result = result_error("Out of memory");
+    else {
+        stmt_locks(st, p->tokens, ls, g_db.catalog->current_db);
+        bool plain = stmt_lock_kind(st) == 1 && !locking_read(p->tokens);
+        uint8_t prior[MAX_STMT_LOCKS];
+        if (plain) lk_modes(lock_owner(), ls->r, ls->n, prior);
+        int why = acquire_locks(ls, plain);
+        result = why == 1 || why == 2 || why == 4 ? lock_error(why) : exec_one(st);
+        if (why == 3) snapshot_clear();
+        if (plain) release_plain_read(ls, prior);
+        release_if_autocommit();
+        free(ls);
+    }
+    // un pezzo dello statement rianalizzato dal testo dall'executor ha trovato un '?': si torna al testo
+    if (result && !result->success && strstr(result->error, "placeholders work only in prepared statements")) {
+        db_result_free(result);
+        result = NULL;
+        p->broken = true;
+    }
+    if (result) { result->exec_time_ms = get_time_ms() - t_start; g_prep_runs++; }
+    wal_write_buffer(g_db.wal);
+    pf_stmt_end();
+    pf_process();
+    maybe_checkpoint();
+    db_unlock();
+    return result;
+}
+
 QueryResult** db_execute_multi(const char* sql, int* out_count) {
     db_lock();
     QueryResult** r = db_execute_multi_impl(sql, out_count);
@@ -1898,6 +2442,7 @@ bool db_commit(void) {
 bool db_rollback(void) {
     db_lock();
     bool r = db_rollback_impl();
+    g_schema_gen++;                               // un ROLLBACK può annullare una DDL
     db_unlock();
     return r;
 }
@@ -1981,10 +2526,10 @@ ForeignKeyInfo* db_list_foreign_keys(const char* db_name, int* out_count) {
     Database* db = db_name ? catalog_get_db(g_db.catalog, db_name) : NULL;
     int n = 0;
     for (int t = 0; db && t < db->num_tables; t++)
-        for (int k = 0; k < db->tables[t].num_constraints; k++) n += db->tables[t].constraints[k].kind == CONS_FOREIGN;
-    ForeignKeyInfo* out = n ? calloc((size_t)n, sizeof(ForeignKeyInfo)) : NULL;
+        for (int k = 0; k < db->tables[t]->num_constraints; k++) n += db->tables[t]->constraints[k].kind == CONS_FOREIGN;
+    ForeignKeyInfo* out = n ? sv_calloc((size_t)n, sizeof(ForeignKeyInfo)) : NULL;
     for (int t = 0; out && t < db->num_tables; t++) {
-        const TableSchema* ts = &db->tables[t];
+        const TableSchema* ts = db->tables[t];
         for (int k = 0; k < ts->num_constraints; k++) {
             const Constraint* c = &ts->constraints[k];
             if (c->kind != CONS_FOREIGN) continue;
@@ -2059,13 +2604,13 @@ static void session_load(const DbSession* s) {
 }
 
 DbSession* db_session_new(void) {
-    DbSession* s = calloc(1, sizeof(DbSession));
+    DbSession* s = sv_calloc(1, sizeof(DbSession));
     if (s) s->cur_db = -1;
     return s;
 }
 
 DbSession* db_session_new_temp(void) {
-    DbSession* s = calloc(1, sizeof(DbSession));
+    DbSession* s = sv_calloc(1, sizeof(DbSession));
     if (!s) return NULL;
     db_lock();
     s->cur_db = g_active ? g_default_session.cur_db : (g_db.catalog ? g_db.catalog->current_db : -1);
@@ -2089,13 +2634,19 @@ bool db_session_enter(DbSession* s) {
 void db_session_leave(DbSession* s) {
     if (!s) return;
     db_lock();
+    bool left = false;
     if (g_active == s) {
         session_save(s);
         session_load(&g_default_session);
         g_active = NULL;
+        left = true;
     }
     db_unlock();
+    if (left) lk_notify();                       // chi aspetta di entrare (db_session_wait) riprova subito
 }
+
+unsigned long long db_session_seq(void) { return lk_sess_seq(); }
+void db_session_wait(unsigned long long seq, int max_ms) { lk_wait_sess(seq, max_ms); }
 
 void db_session_end(DbSession* s) {
     if (!s) return;
@@ -2116,6 +2667,80 @@ bool db_session_in_transaction(const DbSession* s) { return s && s->tx_id != 0; 
 bool db_session_blocked(void) { return false; }   // le transazioni non si escludono più a vicenda
 
 // ── letture in parallelo ────────────────────────────────────────
+
+// flag della definizione di colonna del protocollo MySQL (NOT_NULL 1, PRI_KEY 2, UNIQUE_KEY 4, MULTIPLE_KEY 8,
+// UNSIGNED 32, AUTO_INCREMENT 512) per una colonna di tabella; 0 se la tabella o la colonna non esistono (P2.8)
+unsigned db_column_flags(const char* db, const char* table, const char* column) {
+    if (!g_db.initialized || !db || !db[0] || !table || !table[0] || !column || !column[0]) return 0;
+    bool locked = false;
+    if (g_lock_depth == 0) { sv_rw_rd(&g_db_rw); locked = true; }
+    unsigned fl = 0;
+    TableSchema* t = catalog_get_table(g_db.catalog, db, table);
+    int ci = -1;
+    for (int i = 0; t && i < t->num_columns && ci < 0; i++) if (!strcasecmp(t->columns[i].name, column)) ci = i;
+    if (ci >= 0) {
+        const Column* c = &t->columns[ci];
+        if (!c->nullable || c->primary_key) fl |= 1;
+        if (c->primary_key) fl |= 2;
+        if (c->unique) fl |= 4;
+        if (c->flags & COLF_UNSIGNED) fl |= 32;
+        if (c->auto_increment) fl |= 512;
+        for (int k = 0; k < t->num_constraints; k++) {
+            const Constraint* cs = &t->constraints[k];
+            if (cs->kind != CONS_PRIMARY && cs->kind != CONS_UNIQUE) continue;
+            for (int j = 0; j < cs->ncols; j++)
+                if (cs->cols[j] == ci) {
+                    if (cs->kind == CONS_PRIMARY) fl |= 2 | 1;
+                    else if (cs->ncols == 1) fl |= 4;
+                    else if (j == 0) fl |= 8;
+                }
+        }
+        for (int k = 0; k < t->num_indexes; k++) {
+            const Index* ix = &t->indexes[k];
+            if (strcasecmp(ix->col_name, column)) continue;   // prima colonna dell'indice
+            bool single = ix->ncols <= 1;
+            if (ix->unique && single) fl |= 4;
+            else if (!(fl & 2)) fl |= 8;
+        }
+        if (fl & 2) fl &= ~(unsigned)(4 | 8);                  // come MySQL: la chiave primaria vince
+        else if (fl & 4) fl &= ~(unsigned)8;
+    }
+    if (locked) sv_rw_rdunlock(&g_db_rw);
+    return fl;
+}
+
+// solo letture (per il registro di controllo): ogni istruzione è una SELECT senza INTO, SHOW o DESCRIBE,
+// senza @variabili (assegnazioni), sequenze o funzioni dell'utente (possono scrivere). Deciso dal parser,
+// non dalla prima parola: "SELECT f()" con f che scrive e "SELECT … INTO @v" non sono letture
+bool db_statement_is_read(const char* sql) {
+    if (!g_db.initialized || !sql) return false;
+    TokenList* tokens = lexer_tokenize(sql);
+    ParseResult* parsed = tokens ? parser_parse(tokens) : NULL;
+    bool ok = parsed && parsed->success && parsed->count >= 1;
+    for (int i = 0; ok && i < parsed->count; i++) {
+        const ASTNode* n = parsed->statements[i];
+        if (n->type == NODE_SELECT) ok = n->select_stmt.num_into == 0;
+        else ok = n->type == NODE_SHOW || n->type == NODE_DESCRIBE;
+    }
+    bool locked = false;
+    if (ok && g_lock_depth == 0) { sv_rw_rd(&g_db_rw); locked = true; }
+    for (int i = 0; ok && tokens && i < tokens->count; i++) {
+        const Token* t = &tokens->tokens[i];
+        if (t->type != TOK_IDENTIFIER || !t->text) continue;
+        if (t->text[0] == '@') { ok = false; break; }
+        if (!strcasecmp(t->text, "NEXTVAL") || !strcasecmp(t->text, "SETVAL") || !strcasecmp(t->text, "NEXT")) { ok = false; break; }
+        if (i + 1 < tokens->count && tokens->tokens[i + 1].type == TOK_LPAREN)
+            for (int di = 0; ok && di < g_db.catalog->num_databases; di++) {
+                const Database* d = &g_db.catalog->databases[di];
+                for (int ri = 0; ri < d->num_routines && ok; ri++)
+                    if (d->routines[ri].is_function && !strcasecmp(d->routines[ri].name, t->text)) ok = false;
+            }
+    }
+    if (locked) sv_rw_rdunlock(&g_db_rw);
+    if (parsed) parse_result_free(parsed);
+    if (tokens) lexer_free(tokens);
+    return ok;
+}
 
 QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char* user, int timeout_ms, bool* refused) {
     *refused = false;
@@ -2163,7 +2788,7 @@ QueryResult* db_execute_readonly(const char* sql, const char* dbname, const char
     static _Thread_local char ro_owner;
     LockSet* rls = NULL;
     if (ok) {
-        rls = malloc(sizeof(LockSet));
+        rls = sv_malloc(sizeof(LockSet));
         if (rls) stmt_locks(parsed->statements[0], tokens, rls, idx);   // nomi non qualificati: il database della richiesta
         if (!rls || !lk_try(&ro_owner, rls->r, rls->n)) { ok = false; *refused = true; }
     }
@@ -2209,7 +2834,9 @@ bool db_engine_stats(DbEngineStats* out) {
     db_lock();
     bool ok = g_db.initialized && g_db.bp;
     if (ok) {
-        const BufferStats* st = &g_db.bp->stats;
+        BufferStats stv;
+        bp_stats(g_db.bp, &stv);
+        const BufferStats* st = &stv;
         out->page_size = SV_PAGE_SIZE;
         out->db_pages = (long long)(sv_lseek(g_db.bp->db_fd, 0, SEEK_END) / SV_PAGE_SIZE);
         out->pool_frames = g_db.bp->capacity;
@@ -2219,13 +2846,15 @@ bool db_engine_stats(DbEngineStats* out) {
         out->pool_misses = st->misses;
         out->pool_evictions = st->evictions;
         out->pages_written = st->dirty_writes;
-        out->wal_bytes = g_db.wal ? (long long)wal_size(g_db.wal) : 0;
+        out->wal_bytes = g_db.wal ? (long long)wal_bytes(g_db.wal) : 0;
         out->wal_records = g_db.wal ? (unsigned long long)g_db.wal->sequence : 0;
         out->checkpoints = g_db.wal ? (unsigned long long)g_db.wal->checkpoints : 0;
         out->databases = g_db.catalog ? g_db.catalog->num_databases : 0;
         for (int i = 0; g_db.catalog && i < g_db.catalog->num_databases; i++) out->tables += g_db.catalog->databases[i].num_tables;
         out->in_transaction = g_db.exec_ctx.tx_id != 0;
+        for (int i = 0; g_db.txm && i < g_db.txm->num_transactions; i++) if (g_db.txm->transactions[i].active) out->open_transactions++;
     }
+    lk_stats(&out->lock_waits, &out->deadlocks);
     db_unlock();
     return ok;
 }
@@ -2240,22 +2869,40 @@ bool db_set_user(const char* name) {
 
 const char* db_session_user(void) { return g_session_user; }
 
-// l'hash della password (20 000 giri di SHA-256) si calcola fuori dal lock del motore: un'ondata di
-// login sbagliati non ferma più le query di tutti
+// l'hash della password (PBKDF2, 100 000 giri) si calcola fuori dal lock del motore: un'ondata di login
+// sbagliati non ferma più le query di tutti. Dopo una verifica riuscita, sotto il lock: si ricontrolla che sale
+// e hash siano ancora quelli (password cambiata o utente eliminato nel frattempo), si ricorda SHA256(SHA256(pw))
+// per caching_sha2_password e un hash di formato vecchio si rifà
 bool db_login(const char* name, const char* password) {
-    if (!name || !name[0]) return false;
-    char salt[33], hash[65];
+    if (!name || !name[0] || !password) return false;
+    char salt[33], hash[AUTH_HASH_MAX];
     db_lock();
     bool found = auth_user_secret(name, salt, hash);
     db_unlock();
     bool ok = found && auth_password_matches(salt, hash, password);
+    if (ok) {
+        db_lock();
+        char s2[33], h2[AUTH_HASH_MAX];
+        ok = auth_user_secret(name, s2, h2) && !strcmp(s2, salt) && !strcmp(h2, hash);
+        if (ok) auth_password_verified(name, salt, hash, password);
+        db_unlock();
+    }
     memset(hash, 0, sizeof(hash));
-    if (!ok) return false;
-    db_lock();                                    // password cambiata o utente eliminato nel frattempo?
-    char s2[33], h2[65];
-    ok = auth_user_secret(name, s2, h2) && !strcmp(s2, salt) && auth_password_matches(s2, h2, password);
-    db_unlock();
     return ok;
+}
+
+int db_login_sha2(const char* user, const uint8_t nonce[20], const uint8_t* resp, size_t rlen) {
+    db_lock();
+    int r = user && user[0] ? auth_login_sha2(user, nonce, resp, rlen) : 0;
+    db_unlock();
+    return r;
+}
+
+bool db_user_has_native(const char* user) {
+    db_lock();
+    bool r = user && auth_has_native(user);
+    db_unlock();
+    return r;
 }
 
 unsigned long db_users_version(void) {
@@ -2356,6 +3003,7 @@ void db_sync_tick(void) {
     double now = get_time_ms();
     if (g_db.initialized && g_sync_mode >= 1 && g_db.wal && g_db.wal->unsynced && !g_db.exec_ctx.tx_id && !io_failed() &&
         now - g_last_sync >= SYNC_NORMAL_MS && wal_flush(g_db.wal) == SV_OK) g_last_sync = now;
+    pf_process();                                    // catene liberate ora che il log è su disco
     db_unlock();
 }
 
@@ -2438,7 +3086,7 @@ static void sb_cat(char** p, size_t* n, size_t* cap, const char* a) {
     if (!*p) return;
     if (*n + l + 1 > *cap) {
         size_t nc = (*n + l + 1) * 2;
-        char* q = realloc(*p, nc);
+        char* q = sv_realloc(*p, nc);
         if (!q) { free(*p); *p = NULL; return; }
         *p = q; *cap = nc;
     }
@@ -2462,13 +3110,13 @@ static char* db_get_objects_sql_impl(const char* db_name, int what) {
     Database* db = g_db.initialized ? catalog_get_db(g_db.catalog, db_name) : NULL;
     if (!db) return NULL;
     size_t n = 0, cap = 4096;
-    char* out = malloc(cap);
+    char* out = sv_malloc(cap);
     if (!out) return NULL;
     out[0] = '\0';
     char head[400];
     // viste in ordine di dipendenza: una vista va dopo quelle che nomina (ciascuna viene controllata
     // quando si ricrea); con un ciclo apparente si prosegue nell'ordine del catalogo
-    bool* done = what == 0 ? calloc((size_t)db->num_views + 1, 1) : NULL;
+    bool* done = what == 0 ? sv_calloc((size_t)db->num_views + 1, 1) : NULL;
     for (int left = what == 0 ? db->num_views : 0; left > 0; ) {
         int pick = -1;
         for (int i = 0; i < db->num_views && pick < 0; i++) {
@@ -2526,7 +3174,7 @@ static bool bk_copy(const char* from, const char* to, bool must_exist, char* err
     }
     int out = sv_open(to, SV_O_WRONLY | SV_O_CREAT | SV_O_TRUNC, 0600);
     if (out < 0) { sv_close(in); snprintf(err, errn, "cannot write %.400s", to); return false; }
-    char* buf = malloc(1 << 20);
+    char* buf = sv_malloc(1 << 20);
     bool ok = buf != NULL;
     while (ok) {
         int n = (int)sv_read(in, buf, 1u << 20);

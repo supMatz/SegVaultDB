@@ -16,7 +16,7 @@ for HTTPS. The build must stay free of warnings (`-Wall -Wextra`, `-D_FORTIFY_SO
 ```bash
 make test                  # every suite (about 2 minutes on 16 cores with -j16)
 make test-asan             # the suites under AddressSanitizer + UndefinedBehaviorSanitizer
-make test-tsan             # parallel reads and PHP under ThreadSanitizer
+make test-tsan             # parallel reads, PHP, sessions, HTTP server and web under ThreadSanitizer
 make test-win              # Windows-only code: MinGW build run under wine
 make bench                 # bench/bench.c: inserts, scans, joins, rollback cost
 ```
@@ -25,6 +25,13 @@ make bench                 # bench/bench.c: inserts, scans, joins, rollback cost
   `pread` of the engine goes through shims that can fail or stop the process at the N-th call. Use it for
   anything that touches the WAL, the buffer pool, the catalog or recovery: a change there is not done until
   it survives a crash at every write.
+* **Allocations** in the engine (`src/catalog`, `storage`, `table`, `index`, `query`, `tx`, `bridge`) go
+  through `include/sv_alloc.h`: `sv_malloc` / `sv_calloc` / `sv_realloc` / `sv_strdup` stop the process with
+  an "out of memory" message when the system refuses memory (committed data is recovered from the log at the
+  next start); only allocations whose size comes from the data and can be unreasonable use `sv_try_*`, and
+  their callers must turn `NULL` into a statement error. Never call `malloc` directly there. The durability
+  suite fails the N-th allocation of a workload for ~400 values of N (`SV_OOM_ALL=1 ./test_durability` for
+  every N) and checks the outcome after a restart.
 * A bug fix comes with a test that fails without the fix.
 * Engine changes that affect files on disk must keep reading the files of the previous release (see
   `docs/FORMATS.md`).

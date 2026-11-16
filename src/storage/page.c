@@ -1,9 +1,11 @@
 #include "page.h"
 #include "common.h"
+#include "crc32c.h"
 #include "platform_compat.h"
+#include <string.h>
 
 Page* page_create(uint32_t id) {
-    Page* p = (Page*)calloc(1, sizeof(Page));
+    Page* p = (Page*)sv_calloc(1, sizeof(Page));
     if (!p) return NULL;
     p->page_id   = id;
     p->free_space = SV_PAGE_SIZE - SV_PAGE_HEADER_SIZE;
@@ -15,14 +17,50 @@ Page* page_create(uint32_t id) {
 
 void page_free(Page* p) { free(p); }
 
+static uint32_t page_crc(const Page* p) {
+    uint32_t c = sv_crc32c(0, p, offsetof(Page, crc));
+    static const uint8_t zero[4] = { 0, 0, 0, 0 };
+    c = sv_crc32c(c, zero, 4);
+    return sv_crc32c(c, p->data, sizeof(p->data));
+}
+
+bool page_crc_ok(const Page* p) { return p->crc == page_crc(p); }
+
 int page_write(Page* p, int fd) {
+    p->crc = page_crc(p);                            // ogni pagina su disco ha il suo CRC
     int64_t offset = (int64_t)p->page_id * SV_PAGE_SIZE;
     ssize_t written = sv_pwrite(fd, p, SV_PAGE_SIZE, offset);
     return (written == SV_PAGE_SIZE) ? SV_OK : SV_IO_ERROR;
 }
 
+bool page_header_read(int fd, uint64_t* next_lsn) {
+    uint8_t h[28];
+    if (sv_pread(fd, h, sizeof(h), 0) != (ssize_t)sizeof(h)) return false;
+    if (memcmp(h, SV_DATA_MAGIC, 8)) return false;
+    uint32_t fmt, psz, crc;
+    memcpy(&fmt, h + 8, 4);
+    memcpy(&psz, h + 12, 4);
+    memcpy(&crc, h + 24, 4);
+    if (fmt != SV_DATA_FORMAT || psz != SV_PAGE_SIZE || crc != sv_crc32c(0, h, 24)) return false;
+    if (next_lsn) memcpy(next_lsn, h + 16, 8);
+    return true;
+}
+
+int page_header_write(int fd, uint64_t next_lsn) {
+    uint8_t pg[SV_PAGE_SIZE];
+    memset(pg, 0, sizeof(pg));
+    memcpy(pg, SV_DATA_MAGIC, 8);
+    uint32_t fmt = SV_DATA_FORMAT, psz = SV_PAGE_SIZE;
+    memcpy(pg + 8, &fmt, 4);
+    memcpy(pg + 12, &psz, 4);
+    memcpy(pg + 16, &next_lsn, 8);
+    uint32_t crc = sv_crc32c(0, pg, 24);
+    memcpy(pg + 24, &crc, 4);
+    return sv_pwrite(fd, pg, SV_PAGE_SIZE, 0) == SV_PAGE_SIZE ? SV_OK : SV_IO_ERROR;
+}
+
 Page* page_read(uint32_t id, int fd) {
-    Page* p = (Page*)malloc(sizeof(Page));
+    Page* p = (Page*)sv_malloc(sizeof(Page));
     if (!p) return NULL;
     int64_t offset = (int64_t)id * SV_PAGE_SIZE;
     ssize_t n = sv_pread(fd, p, SV_PAGE_SIZE, offset);
@@ -32,6 +70,7 @@ Page* page_read(uint32_t id, int fd) {
 
 bool page_validate(const Page* p, uint32_t id) {
     if (p->page_id != id) return false;                  // pagina mai scritta, o di un altro posto
+    if (!page_crc_ok(p)) return false;                   // scrittura interrotta o byte cambiati sul disco
     if (p->num_slots > SV_MAX_SLOTS) return false;
     uint32_t dir = (uint32_t)p->num_slots * SV_SLOT_ENTRY_SIZE, size = (uint32_t)sizeof(p->data);
     if (dir > size || p->free_space > size - dir) return false;

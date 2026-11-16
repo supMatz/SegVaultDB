@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <strings.h>
 #include <errno.h>
+#include "sv_alloc.h"
 
 typedef struct {
     TokenList* tokens;
@@ -52,10 +53,10 @@ static const char* token_name(TokenType tt) {
         "'('", "')'", "'='", "'!='", "'<'", "'>'", "'<='", "'>='", "'+'", "'-'",
         "'/'", "'%'", "end of statement", "invalid token",
     };
-    static const char* const MORE[] = { "':'", "':='", "'||'", "'&&'", "'|'", "'&'", "'^'", "'~'", "'<<'", "'>>'", "'<=>'" };
+    static const char* const MORE[] = { "':'", "':='", "'||'", "'&&'", "'|'", "'&'", "'^'", "'~'", "'<<'", "'>>'", "'<=>'", "'?'" };
     _Static_assert(sizeof(NAMES) / sizeof(NAMES[0]) == TOK_ERROR + 1, "token_name non allineato a TokenType");
-    _Static_assert(sizeof(MORE) / sizeof(MORE[0]) == TOK_NSEQ - TOK_ERROR, "token_name non allineato a TokenType");
-    if (tt > TOK_ERROR && tt <= TOK_NSEQ) return MORE[tt - TOK_ERROR - 1];
+    _Static_assert(sizeof(MORE) / sizeof(MORE[0]) == TOK_PARAM - TOK_ERROR, "token_name non allineato a TokenType");
+    if (tt > TOK_ERROR && tt <= TOK_PARAM) return MORE[tt - TOK_ERROR - 1];
     return (tt >= 0 && tt <= TOK_ERROR) ? NAMES[tt] : "?";
 }
 
@@ -110,7 +111,7 @@ static Token table_tok(ParserState* ps) {
 static void add_stmt(ParserState* ps, ASTNode* stmt) {
     if (ps->result->count >= ps->result->capacity) {
         ps->result->capacity = ps->result->capacity ? ps->result->capacity * 2 : 16;
-        ps->result->statements = realloc(ps->result->statements,
+        ps->result->statements = sv_realloc(ps->result->statements,
                                           ps->result->capacity * sizeof(ASTNode*));
     }
     ps->result->statements[ps->result->count++] = stmt;
@@ -203,8 +204,38 @@ static void win_free(WindowSpec* w) {
     free(w);
 }
 
+// ── segnaposto dei prepared statement (P2.2) ────────────────────
+static _Thread_local struct { bool on; ASTExpr** v; int n, cap; } g_preg;
+
+static void preg_add(ASTExpr* e) {
+    if (g_preg.n == g_preg.cap) {
+        int nc = g_preg.cap ? g_preg.cap * 2 : 16;
+        g_preg.v = sv_realloc(g_preg.v, sizeof(ASTExpr*) * (size_t)nc);
+        g_preg.cap = nc;
+    }
+    g_preg.v[g_preg.n++] = e;
+}
+
+static void preg_drop(const ASTExpr* e) {
+    for (int i = 0; i < g_preg.n; i++) if (g_preg.v[i] == e) { g_preg.v[i] = g_preg.v[--g_preg.n]; return; }
+}
+
+void parser_params_begin(void) {
+    free(g_preg.v);
+    memset(&g_preg, 0, sizeof(g_preg));
+    g_preg.on = true;
+}
+
+int parser_params_end(ASTExpr*** nodes) {
+    *nodes = g_preg.v;
+    int n = g_preg.n;
+    memset(&g_preg, 0, sizeof(g_preg));
+    return n;
+}
+
 void ast_expr_free(ASTExpr* e) {
     if (!e) return;
+    if (e->param && g_preg.on) preg_drop(e);
     if (e->type == EXPR_STRING) free(e->str_val);
     subq_release(e->subq);
     win_free(e->win);
@@ -217,20 +248,21 @@ void ast_expr_free(ASTExpr* e) {
 
 ASTExpr* ast_expr_clone(const ASTExpr* e) {
     if (!e) return NULL;
-    ASTExpr* c = malloc(sizeof(ASTExpr));
+    ASTExpr* c = sv_malloc(sizeof(ASTExpr));
     if (!c) return NULL;
     *c = *e;
     if (e->type == EXPR_STRING) {
-        c->str_val = e->str_val ? strdup(e->str_val) : NULL;
+        c->str_val = e->str_val ? sv_strdup(e->str_val) : NULL;
         if (e->str_val && !c->str_val) { free(c); return NULL; }
     }
     c->left = c->right = NULL;
     c->args = NULL;
     c->nargs = 0;
+    if (c->param && g_preg.on) preg_add(c);       // anche la copia riceverà il valore del suo '?'
     if (c->subq) c->subq->refs++;
     c->win = NULL;
     if (e->win) {
-        c->win = calloc(1, sizeof(WindowSpec));
+        c->win = sv_calloc(1, sizeof(WindowSpec));
         if (!c->win) { ast_expr_free(c); return NULL; }
         c->win->slot = e->win->slot;
         c->win->frame = e->win->frame; c->win->fs = e->win->fs; c->win->fe = e->win->fe;
@@ -245,7 +277,7 @@ ASTExpr* ast_expr_clone(const ASTExpr* e) {
     if (e->left && !(c->left = ast_expr_clone(e->left))) { ast_expr_free(c); return NULL; }
     if (e->right && !(c->right = ast_expr_clone(e->right))) { ast_expr_free(c); return NULL; }
     if (e->nargs > 0) {
-        c->args = calloc((size_t)e->nargs, sizeof(ASTExpr*));
+        c->args = sv_calloc((size_t)e->nargs, sizeof(ASTExpr*));
         if (!c->args) { ast_expr_free(c); return NULL; }
         for (int i = 0; i < e->nargs; i++) {
             c->args[i] = ast_expr_clone(e->args[i]);
@@ -283,7 +315,9 @@ static void fmt_rec(const ASTExpr* e, char* out, size_t n, size_t* len, bool top
     if (!e) { fmt_put(out, n, len, "NULL"); return; }
     switch (e->type) {
         case EXPR_INT:    snprintf(buf, sizeof(buf), "%lld", (long long)e->int_val); fmt_put(out, n, len, buf); break;
-        case EXPR_FLOAT:  snprintf(buf, sizeof(buf), "%.15g", e->float_val); fmt_put(out, n, len, buf); break;
+        case EXPR_FLOAT:  if (e->col_name[0]) fmt_put(out, n, len, e->col_name);
+                          else { snprintf(buf, sizeof(buf), "%.15g", e->float_val); fmt_put(out, n, len, buf); }
+                          break;
         case EXPR_NULL:   fmt_put(out, n, len, "NULL"); break;
         case EXPR_STRING: {
             fmt_put(out, n, len, "'");
@@ -411,7 +445,7 @@ void ast_expr_format(const ASTExpr* e, char* out, size_t n) {
 }
 
 static ASTExpr* new_expr(ExprType type) {
-    ASTExpr* e = calloc(1, sizeof(ASTExpr));
+    ASTExpr* e = sv_calloc(1, sizeof(ASTExpr));
     if (e) e->type = type;
     return e;
 }
@@ -449,7 +483,7 @@ typedef struct { ASTExpr** v; int n, cap; } ExprList;
 static bool elist_push(ExprList* l, ASTExpr* e) {
     if (l->n >= l->cap) {
         int nc = l->cap ? l->cap * 2 : 8;
-        ASTExpr** nv = realloc(l->v, sizeof(ASTExpr*) * (size_t)nc);
+        ASTExpr** nv = sv_realloc(l->v, sizeof(ASTExpr*) * (size_t)nc);
         if (!nv) return false;
         l->v = nv;
         l->cap = nc;
@@ -620,7 +654,7 @@ static ASTExpr* parse_subquery(ParserState* ps, int kind, OpType op, ASTExpr* le
     if (!q || !ps->result->success) { free_node(q); ast_expr_free(left); return NULL; }
     if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')' to close the subquery", peek(ps)); free_node(q); ast_expr_free(left); return NULL; }
     ASTExpr* e = new_expr(EXPR_SUBQUERY);
-    SubQuery* sq = calloc(1, sizeof(SubQuery));
+    SubQuery* sq = sv_calloc(1, sizeof(SubQuery));
     if (!e || !sq) { free(e); free(sq); free_node(q); ast_expr_free(left); parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
     sq->node = q;
     sq->refs = 1;
@@ -644,7 +678,7 @@ static ASTExpr* parse_case(ParserState* ps) {
     while (ps->result->success && match(ps, TOK_WHEN)) {
         if (e->nargs + 2 > cap) {
             int nc = cap ? cap * 2 : 8;
-            ASTExpr** na = realloc(e->args, sizeof(ASTExpr*) * (size_t)nc);
+            ASTExpr** na = sv_realloc(e->args, sizeof(ASTExpr*) * (size_t)nc);
             if (!na) { parse_fail(ps, "Out of memory", peek(ps)); break; }
             e->args = na;
             cap = nc;
@@ -685,7 +719,7 @@ static ASTExpr* parse_call(ParserState* ps) {
         if (strcmp(e->func, "COUNT") != 0 || e->agg_distinct) parse_fail(ps, "Only COUNT accepts *", fn);
         strcpy(e->col_name, "*");
     } else if (peek(ps).type != TOK_RPAREN) {
-        e->args = calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
+        e->args = sv_calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
         if (!e->args) { ast_expr_free(e); return NULL; }
         do {
             if (e->nargs >= MAX_FUNC_ARGS) { parse_fail(ps, "Too many function arguments", peek(ps)); break; }
@@ -707,7 +741,7 @@ static ASTExpr* parse_call(ParserState* ps) {
         ASTExpr* cond = parse_expr(ps);
         if (!cond || !match(ps, TOK_RPAREN)) { if (ps->result->success) parse_fail(ps, "Expected ')' after FILTER", peek(ps)); ast_expr_free(cond); ast_expr_free(e); return NULL; }
         ASTExpr* cs = new_expr(EXPR_CASE);
-        ASTExpr** ca = cs ? calloc(2, sizeof(ASTExpr*)) : NULL;
+        ASTExpr** ca = cs ? sv_calloc(2, sizeof(ASTExpr*)) : NULL;
         if (!ca) { free(cs); ast_expr_free(cond); ast_expr_free(e); return NULL; }
         bool star = !strcmp(e->col_name, "*");
         ASTExpr* val = star ? new_expr(EXPR_INT) : e->args[0];
@@ -716,7 +750,7 @@ static ASTExpr* parse_call(ParserState* ps) {
         cs->args = ca; cs->nargs = 2;
         cs->depth = (cond->depth > (val ? val->depth : 0) ? cond->depth : (val ? val->depth : 0)) + 1;
         if (star) {
-            e->args = calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
+            e->args = sv_calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
             if (!e->args) { ast_expr_free(cs); ast_expr_free(e); return NULL; }
             e->col_name[0] = '\0';
             e->nargs = 1;
@@ -726,7 +760,7 @@ static ASTExpr* parse_call(ParserState* ps) {
     }
     if (ident_is(ps, "OVER")) {                       // funzione finestra
         consume(ps);
-        WindowSpec* w = calloc(1, sizeof(WindowSpec));
+        WindowSpec* w = sv_calloc(1, sizeof(WindowSpec));
         if (!w) { ast_expr_free(e); parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
         e->win = w;
         e->type = EXPR_WINDOW;
@@ -776,7 +810,7 @@ static ASTExpr* mkfunc2(const char* name, ASTExpr* a, ASTExpr* b) {
     ASTExpr* f = new_expr(EXPR_FUNC);
     if (!f || !a || !b) { ast_expr_free(f); ast_expr_free(a); ast_expr_free(b); return NULL; }
     snprintf(f->func, sizeof(f->func), "%s", name);
-    f->args = calloc(2, sizeof(ASTExpr*));
+    f->args = sv_calloc(2, sizeof(ASTExpr*));
     if (!f->args) { ast_expr_free(f); ast_expr_free(a); ast_expr_free(b); return NULL; }
     f->args[0] = a;
     f->args[1] = b;
@@ -788,7 +822,7 @@ static ASTExpr* mkfunc2(const char* name, ASTExpr* a, ASTExpr* b) {
 // aggiunge un terzo argomento a una funzione di mkfunc2
 static ASTExpr* add_arg(ASTExpr* f, ASTExpr* x) {
     if (!f || !x) { ast_expr_free(f); ast_expr_free(x); return NULL; }
-    ASTExpr** na = realloc(f->args, (size_t)(f->nargs + 1) * sizeof(ASTExpr*));
+    ASTExpr** na = sv_realloc(f->args, (size_t)(f->nargs + 1) * sizeof(ASTExpr*));
     if (!na) { ast_expr_free(f); ast_expr_free(x); return NULL; }
     f->args = na;
     f->args[f->nargs++] = x;
@@ -798,7 +832,7 @@ static ASTExpr* add_arg(ASTExpr* f, ASTExpr* x) {
 
 static ASTExpr* mkstr(const char* text) {
     ASTExpr* e = new_expr(EXPR_STRING);
-    if (e && !(e->str_val = strdup(text))) { free(e); return NULL; }
+    if (e && !(e->str_val = sv_strdup(text))) { free(e); return NULL; }
     return e;
 }
 
@@ -952,7 +986,7 @@ static ASTExpr* parse_special_form(ParserState* ps) {
             ASTExpr* f = new_expr(EXPR_FUNC);
             if (!f) { ast_expr_free(str); return NULL; }
             snprintf(f->func, sizeof(f->func), "TRIM");
-            f->args = calloc(1, sizeof(ASTExpr*));
+            f->args = sv_calloc(1, sizeof(ASTExpr*));
             if (!f->args) { ast_expr_free(f); ast_expr_free(str); return NULL; }
             f->args[0] = str; f->nargs = 1; f->depth = str->depth + 1;
             return f;
@@ -972,7 +1006,7 @@ static ASTExpr* parse_special_form(ParserState* ps) {
                 ASTExpr* f = new_expr(EXPR_FUNC);
                 if (!f) return NULL;
                 snprintf(f->func, sizeof(f->func), "SUBSTRING");
-                f->args = calloc(3, sizeof(ASTExpr*));
+                f->args = sv_calloc(3, sizeof(ASTExpr*));
                 if (!f->args) { ast_expr_free(f); return NULL; }
                 do {
                     if (f->nargs >= 3) { parse_fail(ps, "MID takes 2 or 3 arguments", peek(ps)); break; }
@@ -1028,7 +1062,7 @@ static ASTExpr* parse_special_form(ParserState* ps) {
         if (!e) return NULL;
         snprintf(e->func, sizeof(e->func), "GROUP_CONCAT");
         if (match(ps, TOK_DISTINCT)) e->agg_distinct = true;
-        e->args = calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
+        e->args = sv_calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
         if (!e->args) { ast_expr_free(e); return NULL; }
         ASTExpr* v = parse_expr(ps);
         if (!v) { ast_expr_free(e); return NULL; }
@@ -1077,7 +1111,7 @@ static ASTExpr* parse_special_form(ParserState* ps) {
         if (!e) return NULL;
         snprintf(e->func, sizeof(e->func), "GROUP_CONCAT");
         if (match(ps, TOK_DISTINCT)) e->agg_distinct = true;
-        e->args = calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
+        e->args = sv_calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
         if (!e->args) { ast_expr_free(e); return NULL; }
         int nv = 0, no = 0;
         char flags[MAX_FUNC_ARGS + 1] = "";
@@ -1128,22 +1162,39 @@ static ASTExpr* parse_primary(ParserState* ps) {
             consume(ps);
             errno = 0;
             long long v = strtoll(t.text, NULL, 10);
-            if (errno == ERANGE) {   // oltre 64 bit: numero decimale
+            if (errno == ERANGE) {   // oltre 64 bit: numero decimale esatto (P1.9; 18446744073709551615 per UNSIGNED)
                 e = new_expr(EXPR_FLOAT);
-                if (e) e->float_val = strtod(t.text, NULL);
+                if (e) { e->float_val = strtod(t.text, NULL); if (strlen(t.text) < sizeof(e->col_name)) snprintf(e->col_name, sizeof(e->col_name), "%s", t.text); }
             } else {
                 e = new_expr(EXPR_INT);
                 if (e) e->int_val = v;
             }
             return e;
         }
-        case TOK_FLOAT:   consume(ps); e = new_expr(EXPR_FLOAT); if (e) e->float_val = strtod(t.text, NULL); return e;
+        case TOK_FLOAT:
+            // 0.10 è un DECIMAL esatto, come in MySQL (col_name = il testo); con l'esponente (1e5) è un double
+            consume(ps);
+            e = new_expr(EXPR_FLOAT);
+            if (e) {
+                e->float_val = strtod(t.text, NULL);
+                if (!strpbrk(t.text, "eE") && strlen(t.text) < sizeof(e->col_name)) snprintf(e->col_name, sizeof(e->col_name), "%s", t.text);
+            }
+            return e;
         case TOK_STRING:
             consume(ps);
             e = new_expr(EXPR_STRING);
-            if (e && !(e->str_val = strdup(t.text))) { free(e); e = NULL; parse_fail(ps, "Out of memory", t); }
+            if (e && !(e->str_val = sv_strdup(t.text))) { free(e); e = NULL; parse_fail(ps, "Out of memory", t); }
             return e;
         case TOK_NULL:    consume(ps); return new_expr(EXPR_NULL);
+        case TOK_PARAM: {
+            if (!g_preg.on) { parse_fail(ps, "'?' placeholders work only in prepared statements", t); return NULL; }
+            int ord = 1;                                         // numero del '?' nel testo, da 1
+            for (int i = 0; i < ps->pos; i++) if (ps->tokens->tokens[i].type == TOK_PARAM) ord++;
+            consume(ps);
+            e = new_expr(EXPR_NULL);
+            if (e) { e->param = ord; preg_add(e); }
+            return e;
+        }
         case TOK_EXISTS:
             consume(ps);
             return parse_subquery(ps, SUBQ_EXISTS, OP_EQ, NULL);
@@ -1156,7 +1207,7 @@ static ASTExpr* parse_primary(ParserState* ps) {
             e = parse_expr(ps);
             if (e && peek(ps).type == TOK_COMMA) {          // (a, b, ...): valore di riga (confronti e IN)
                 ASTExpr* row = new_expr(EXPR_FUNC);
-                if (!row || !(row->args = calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*)))) { free(row); ast_expr_free(e); return NULL; }
+                if (!row || !(row->args = sv_calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*)))) { free(row); ast_expr_free(e); return NULL; }
                 snprintf(row->func, sizeof(row->func), "__ROW");
                 row->args[row->nargs++] = e;
                 while (ps->result->success && match(ps, TOK_COMMA)) {
@@ -1184,7 +1235,7 @@ static ASTExpr* parse_primary(ParserState* ps) {
                 consume(ps);
                 bool sys = t.text[1] == '@';
                 ASTExpr* nm = new_expr(EXPR_STRING);
-                if (!nm || !(nm->str_val = strdup(t.text + (sys ? 2 : 1)))) { ast_expr_free(nm); parse_fail(ps, "Out of memory", t); return NULL; }
+                if (!nm || !(nm->str_val = sv_strdup(t.text + (sys ? 2 : 1)))) { ast_expr_free(nm); parse_fail(ps, "Out of memory", t); return NULL; }
                 if (!sys && match(ps, TOK_ASSIGN)) return op_call(ps, "__UASSIGN", nm, parse_expr(ps));
                 return depth_check(ps, json_call(sys ? "__SYSVAR" : "__UVAR", nm, NULL));
             }
@@ -1234,7 +1285,7 @@ static ASTExpr* parse_match(ParserState* ps) {
     ASTExpr* f = new_expr(EXPR_FUNC);
     if (!f) return NULL;
     snprintf(f->func, sizeof(f->func), "MATCH_AGAINST");
-    f->args = calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
+    f->args = sv_calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
     if (!f->args) { ast_expr_free(f); parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
     do {
         if (f->nargs >= 16) { parse_fail(ps, "Too many columns in MATCH (max 16)", peek(ps)); ast_expr_free(f); return NULL; }
@@ -1307,7 +1358,7 @@ static ASTExpr* parse_multiplicative(ParserState* ps) {
             ASTExpr* r = parse_unary(ps);
             if (!f || !r) { ast_expr_free(f); ast_expr_free(r); ast_expr_free(e); return NULL; }
             snprintf(f->func, sizeof(f->func), "%s", div ? "INTDIV" : "MOD");
-            f->args = calloc(2, sizeof(ASTExpr*));
+            f->args = sv_calloc(2, sizeof(ASTExpr*));
             if (!f->args) { ast_expr_free(f); ast_expr_free(r); ast_expr_free(e); return NULL; }
             f->args[0] = e; f->args[1] = r; f->nargs = 2;
             f->depth = (e->depth > r->depth ? e->depth : r->depth) + 1;
@@ -1325,7 +1376,7 @@ static ASTExpr* json_call(const char* name, ASTExpr* a, ASTExpr* b) {
     ASTExpr* f = new_expr(EXPR_FUNC);
     if (!f) { ast_expr_free(a); ast_expr_free(b); return NULL; }
     snprintf(f->func, sizeof(f->func), "%s", name);
-    f->args = calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
+    f->args = sv_calloc(MAX_FUNC_ARGS, sizeof(ASTExpr*));
     if (!f->args) { ast_expr_free(f); ast_expr_free(a); ast_expr_free(b); return NULL; }
     f->args[f->nargs++] = a;
     if (b) f->args[f->nargs++] = b;
@@ -1464,7 +1515,7 @@ static ASTExpr* parse_predicate(ParserState* ps) {
         ASTExpr* f = new_expr(EXPR_FUNC);
         if (!pat || !f) { ast_expr_free(pat); ast_expr_free(f); ast_expr_free(left); return NULL; }
         snprintf(f->func, sizeof(f->func), "REGEXP_LIKE");
-        f->args = calloc(2, sizeof(ASTExpr*));
+        f->args = sv_calloc(2, sizeof(ASTExpr*));
         if (!f->args) { ast_expr_free(pat); ast_expr_free(f); ast_expr_free(left); return NULL; }
         f->args[0] = left; f->args[1] = pat; f->nargs = 2;
         f->depth = (left->depth > pat->depth ? left->depth : pat->depth) + 1;
@@ -1634,15 +1685,14 @@ static ASTNode* parse_values_rows(ParserState* ps) {
         if (ident_is(ps, "ROW")) consume(ps);            // VALUES ROW(1, 2) di MySQL
         else if (peek(ps).type == TOK_ROW) consume(ps);
         if (!match(ps, TOK_LPAREN)) { parse_fail(ps, "Expected '(' in VALUES", peek(ps)); break; }
-        ASTNode* r = calloc(1, sizeof(ASTNode));
+        ASTNode* r = sv_calloc(1, sizeof(ASTNode));
         if (!r) { parse_fail(ps, "Out of memory", peek(ps)); break; }
         r->type = NODE_SELECT;
         do {
-            if (r->select_stmt.num_cols >= 64) { parse_fail(ps, "Too many values in a VALUES row (max 64)", peek(ps)); break; }
             ASTExpr* e = parse_expr(ps);
             if (!e) break;
-            int k = r->select_stmt.num_cols++;
-            r->select_stmt.columns[k] = e;
+            int k = r->select_stmt.num_cols;
+            if (!ast_select_push(r, e)) { ast_expr_free(e); parse_fail(ps, "Too many values in a VALUES row (max 1024)", peek(ps)); break; }
             snprintf(e->alias, sizeof(e->alias), "column%d", k + 1);
         } while (ps->result->success && match(ps, TOK_COMMA));
         if (ps->result->success && !match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' after the VALUES row", peek(ps));
@@ -1723,7 +1773,7 @@ static void parse_tf_on(ParserState* ps, TFCol* c) {
 static void parse_tf_columns(ParserState* ps, TableFunc* t, int depth) {
     if (depth > 16) { parse_fail(ps, "NESTED PATH nested too deeply", peek(ps)); return; }
     do {
-        TFCol* nc = realloc(t->cols, sizeof(TFCol) * (size_t)(t->ncols + 1));
+        TFCol* nc = sv_realloc(t->cols, sizeof(TFCol) * (size_t)(t->ncols + 1));
         if (!nc) { parse_fail(ps, "Out of memory", peek(ps)); return; }
         t->cols = nc;
         int ci = t->ncols++;
@@ -1769,7 +1819,7 @@ static void parse_tf_columns(ParserState* ps, TableFunc* t, int depth) {
 // JSON_TABLE(doc, 'percorso' COLUMNS (nome tipo PATH 'p' | nome FOR ORDINALITY | nome tipo EXISTS PATH 'p', ...))
 // GENERATE_SERIES(da, a [, passo]); poi [AS] alias [(colonne)]
 static TableFunc* parse_table_func(ParserState* ps, char* alias, size_t acap) {
-    TableFunc* t = calloc(1, sizeof(TableFunc));
+    TableFunc* t = sv_calloc(1, sizeof(TableFunc));
     if (!t) { parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
     Token fn = consume(ps);
     for (int i = 0; fn.text[i] && i < 31; i++) t->func[i] = (char)toupper((unsigned char)fn.text[i]);
@@ -2081,7 +2131,7 @@ static bool parse_group_by(ParserState* ps, ASTNode* n, uint32_t* sets, int* nse
 
 static ASTNode* parse_select_core(ParserState* ps) {
     int core_start = ps->pos;
-    ASTNode* n = calloc(1, sizeof(ASTNode));
+    ASTNode* n = sv_calloc(1, sizeof(ASTNode));
     if (!n) return NULL;
     n->type = NODE_SELECT;
     if (!match(ps, TOK_SELECT)) { parse_fail(ps, "Expected SELECT", peek(ps)); return n; }
@@ -2099,7 +2149,6 @@ static ASTNode* parse_select_core(ParserState* ps) {
     // elenco: *  |  tabella.*  |  espressione [[AS] alias]
     n->select_stmt.num_cols = 0;
     do {
-        if (n->select_stmt.num_cols >= 64) { parse_fail(ps, "Too many columns in SELECT (max 64)", peek(ps)); break; }
         ASTExpr* e = NULL;
         if (peek(ps).type == TOK_STAR) {
             consume(ps);
@@ -2118,7 +2167,7 @@ static ASTNode* parse_select_core(ParserState* ps) {
             }
         }
         if (!e) { if (ps->result->success) parse_fail(ps, "Out of memory", peek(ps)); break; }
-        n->select_stmt.columns[n->select_stmt.num_cols++] = e;
+        if (!ast_select_push(n, e)) { ast_expr_free(e); parse_fail(ps, "Too many columns in SELECT (max 1024)", peek(ps)); break; }
     } while (ps->result->success && match(ps, TOK_COMMA));
     parse_select_into(ps, n);
 
@@ -2262,7 +2311,7 @@ static ASTNode* parse_query(ParserState* ps) {
         do {
             Token nm = consume(ps);
             if (nm.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a name after WITH", nm); break; }
-            ASTCte* nc = realloc(ctes, sizeof(ASTCte) * (size_t)(nctes + 1));
+            ASTCte* nc = sv_realloc(ctes, sizeof(ASTCte) * (size_t)(nctes + 1));
             if (!nc) { parse_fail(ps, "Out of memory", nm); break; }
             ctes = nc;
             ASTCte* c = &ctes[nctes++];
@@ -2356,7 +2405,7 @@ static void parse_on_duplicate(ParserState* ps, ASTNode* n) {
             if (!cond) return;
             for (int k = 0; k < n->insert_stmt.num_dup; k++) {
                 ASTExpr* cs = new_expr(EXPR_CASE);
-                ASTExpr** a = cs ? calloc(2, sizeof(ASTExpr*)) : NULL;
+                ASTExpr** a = cs ? sv_calloc(2, sizeof(ASTExpr*)) : NULL;
                 ASTExpr* keep = new_expr(EXPR_COLUMN);
                 if (!a || !keep) { free(cs); free(a); free(keep); ast_expr_free(cond); parse_fail(ps, "Out of memory", peek(ps)); return; }
                 snprintf(keep->col_name, sizeof(keep->col_name), "%s", n->insert_stmt.dup_cols[k]);
@@ -2400,8 +2449,8 @@ static void parse_insert(ParserState* ps, ASTNode* n) {
         do {
             Token c = consume(ps);
             if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", c); return; }
-            if (n->insert_stmt.num_cols >= 64) { parse_fail(ps, "Too many columns in INSERT (max 64)", c); return; }
-            n->insert_stmt.columns[n->insert_stmt.num_cols++] = strdup(c.text);
+            char* cname = sv_strdup(c.text);
+            if (!ast_insert_push_col(n, cname)) { free(cname); parse_fail(ps, "Too many columns in INSERT (max 1024)", c); return; }
         } while (match(ps, TOK_COMMA));
         if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')' after the column list", peek(ps)); return; }
     }
@@ -2422,18 +2471,20 @@ static void parse_insert(ParserState* ps, ASTNode* n) {
         do {
             Token c = consume(ps);
             if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name in SET", c); return; }
-            if (n->insert_stmt.num_cols >= 64) { parse_fail(ps, "Too many columns in INSERT (max 64)", c); return; }
+            if (n->insert_stmt.num_cols >= SV_MAX_COLUMNS) { parse_fail(ps, "Too many columns in INSERT (max 1024)", c); return; }
             if (!match(ps, TOK_EQ)) { parse_fail(ps, "Expected '=' in SET", peek(ps)); return; }
             ASTExpr* v = parse_expr(ps);
             if (!v) return;
             if (n->insert_stmt.num_cols >= cap) {
                 cap = cap ? cap * 2 : 16;
-                ASTExpr** nv = realloc(n->insert_stmt.values, sizeof(ASTExpr*) * (size_t)cap);
+                ASTExpr** nv = sv_realloc(n->insert_stmt.values, sizeof(ASTExpr*) * (size_t)cap);
                 if (!nv) { ast_expr_free(v); parse_fail(ps, "Out of memory", peek(ps)); return; }
                 n->insert_stmt.values = nv;
             }
-            n->insert_stmt.columns[n->insert_stmt.num_cols] = strdup(c.text);
-            n->insert_stmt.values[n->insert_stmt.num_cols++] = v;
+            int at = n->insert_stmt.num_cols;
+            char* cname = sv_strdup(c.text);
+            if (!ast_insert_push_col(n, cname)) { free(cname); ast_expr_free(v); parse_fail(ps, "Out of memory", peek(ps)); return; }
+            n->insert_stmt.values[at] = v;
             n->insert_stmt.num_values = n->insert_stmt.num_cols;
             n->insert_stmt.num_rows = 1;
         } while (match(ps, TOK_COMMA));
@@ -2451,7 +2502,7 @@ static void parse_insert(ParserState* ps, ASTNode* n) {
             if (count >= 64) { parse_fail(ps, "Too many values in INSERT (max 64)", peek(ps)); ok = false; break; }
             if (total + count >= cap) {
                 int nc = cap ? cap * 2 : 64;
-                ASTExpr** nv = realloc(n->insert_stmt.values, sizeof(ASTExpr*) * (size_t)nc);
+                ASTExpr** nv = sv_realloc(n->insert_stmt.values, sizeof(ASTExpr*) * (size_t)nc);
                 if (!nv) { parse_fail(ps, "Out of memory", peek(ps)); ok = false; break; }
                 n->insert_stmt.values = nv;
                 cap = nc;
@@ -2502,10 +2553,10 @@ static int scan_until(ParserState* ps, int from, const char* const* stops, int n
 
 static char* text_of(ParserState* ps, int from, int to) {
     if (to <= from) return NULL;
-    char* buf = malloc(SV_MAX_SQL_LEN);
+    char* buf = sv_malloc(SV_MAX_SQL_LEN);
     if (!buf) { parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
     if (!tokens_text(ps, from, to, buf, SV_MAX_SQL_LEN)) { free(buf); parse_fail(ps, "Statement is too long", peek(ps)); return NULL; }
-    char* r = strdup(buf);
+    char* r = sv_strdup(buf);
     free(buf);
     return r;
 }
@@ -2589,7 +2640,7 @@ static void parse_delete(ParserState* ps, ASTNode* n) {
         n->delete_stmt.where = parse_expr(ps);
         if (ps->result->success && (peek(ps).type == TOK_ORDER || peek(ps).type == TOK_LIMIT)) {   // ... WHERE x ORDER BY / LIMIT
             n->delete_stmt.multi_where = text_of(ps, wstart, ps->pos);
-            n->delete_stmt.multi_from = strdup(n->delete_stmt.table_name);
+            n->delete_stmt.multi_from = sv_strdup(n->delete_stmt.table_name);
             snprintf(n->delete_stmt.targets[0], 64, "%s", n->delete_stmt.table_name);
             n->delete_stmt.num_targets = 1;
             int start = ps->pos, end = scan_until(ps, start, NULL, 0);
@@ -2638,7 +2689,7 @@ static void parse_update(ParserState* ps, ASTNode* n) {
     int wstart = -1;
     if (match(ps, TOK_WHERE)) { wstart = ps->pos; n->update_stmt.where = parse_expr(ps); }
     if (ps->result->success && (peek(ps).type == TOK_ORDER || peek(ps).type == TOK_LIMIT)) {   // UPDATE t SET ... ORDER BY / LIMIT
-        n->update_stmt.multi_from = strdup(n->update_stmt.table_name);
+        n->update_stmt.multi_from = sv_strdup(n->update_stmt.table_name);
         if (wstart >= 0) n->update_stmt.multi_where = text_of(ps, wstart, ps->pos);
         int start = ps->pos, end = scan_until(ps, start, NULL, 0);
         n->update_stmt.order_limit = text_of(ps, start, end);
@@ -2647,7 +2698,7 @@ static void parse_update(ParserState* ps, ASTNode* n) {
         for (int k = 0; k < n->update_stmt.num_sets; k++) {
             char buf[4096];
             ast_expr_format(n->update_stmt.set_exprs[k], buf, sizeof(buf));
-            n->update_stmt.set_texts[k] = strdup(buf);
+            n->update_stmt.set_texts[k] = sv_strdup(buf);
         }
     }
 }
@@ -2706,7 +2757,7 @@ void trig_program_free(TrigProgram* p) {
 }
 
 static bool trig_push(ParserState* ps, TrigStmt*** v, int* n, TrigStmt* t) {
-    TrigStmt** nv = realloc(*v, sizeof(TrigStmt*) * (size_t)(*n + 1));
+    TrigStmt** nv = sv_realloc(*v, sizeof(TrigStmt*) * (size_t)(*n + 1));
     if (!nv) { trig_stmt_free(t); parse_fail(ps, "Out of memory", peek(ps)); return false; }
     *v = nv;
     (*v)[(*n)++] = t;
@@ -2733,7 +2784,7 @@ static void parse_trig_list(ParserState* ps, TrigStmt*** v, int* n) {
 
 // IF ... THEN ... {ELSEIF ... THEN ...} [ELSE ...] END IF  (IF già consumato)
 static TrigStmt* parse_trig_if(ParserState* ps) {
-    TrigStmt* t = calloc(1, sizeof(TrigStmt));
+    TrigStmt* t = sv_calloc(1, sizeof(TrigStmt));
     if (!t) return NULL;
     t->kind = TS_IF;
     t->cond = parse_expr(ps);
@@ -2761,14 +2812,14 @@ static TrigStmt* parse_trig_if(ParserState* ps) {
 }
 
 static TrigStmt* trig_new(ParserState* ps, TrigStmtKind k) {
-    TrigStmt* t = calloc(1, sizeof(TrigStmt));
+    TrigStmt* t = sv_calloc(1, sizeof(TrigStmt));
     if (!t) { parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
     t->kind = k;
     return t;
 }
 
 static bool trig_add_name(ParserState* ps, TrigStmt* t, const char* name) {
-    char (*nn)[64] = realloc(t->names, sizeof(*t->names) * (size_t)(t->nnames + 1));
+    char (*nn)[64] = sv_realloc(t->names, sizeof(*t->names) * (size_t)(t->nnames + 1));
     if (!nn) { parse_fail(ps, "Out of memory", peek(ps)); return false; }
     t->names = nn;
     copy_text(ps, t->names[t->nnames++], 64, name);
@@ -2891,7 +2942,7 @@ static TrigStmt* parse_trig_declare(ParserState* ps) {
                 for (char* q = c; *q; q++) *q = (char)toupper((unsigned char)*q);
                 if (!strcmp(c, "1329")) snprintf(c, sizeof(c), "NOTFOUND");
             }
-            char (*nc)[16] = realloc(t->conds, sizeof(*t->conds) * (size_t)(t->nconds + 1));
+            char (*nc)[16] = sv_realloc(t->conds, sizeof(*t->conds) * (size_t)(t->nconds + 1));
             if (!nc) { parse_fail(ps, "Out of memory", peek(ps)); trig_stmt_free(t); return NULL; }
             t->conds = nc;
             snprintf(t->conds[t->nconds++], 16, "%s", c);
@@ -2927,7 +2978,7 @@ static TrigStmt* parse_trig_declare(ParserState* ps) {
         if (v.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a variable name", v); trig_stmt_free(t); return NULL; }
         if (!trig_add_name(ps, t, v.text)) { trig_stmt_free(t); return NULL; }
     }
-    t->vdef = calloc(1, sizeof(ColumnDef));
+    t->vdef = sv_calloc(1, sizeof(ColumnDef));
     if (!t->vdef) { parse_fail(ps, "Out of memory", peek(ps)); trig_stmt_free(t); return NULL; }
     t->vdef->nullable = true;
     if (!parse_type_spec(ps, t->vdef)) { if (ps->result->success) parse_fail(ps, "Expected the type of the variable", peek(ps)); trig_stmt_free(t); return NULL; }
@@ -3023,7 +3074,7 @@ static TrigStmt* parse_trig_stmt(ParserState* ps) {
         while (peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF && peek(ps).type != TOK_END) consume(ps);
         return t;
     }
-    TrigStmt* t = calloc(1, sizeof(TrigStmt));
+    TrigStmt* t = sv_calloc(1, sizeof(TrigStmt));
     if (!t) { parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
     if (peek(ps).type == TOK_SET) {
         // SET v = espr [, @x = espr, NEW.c = espr ...]
@@ -3033,7 +3084,7 @@ static TrigStmt* parse_trig_stmt(ParserState* ps) {
             char nm[64];
             // prima lo spazio per l'espressione (NULL), poi il nome: se il SET è incompleto trig_stmt_free
             // libera exprs[0 .. nnames-1] senza leggere oltre l'array (trovato dal fuzzer)
-            ASTExpr** ne = realloc(t->exprs, sizeof(ASTExpr*) * (size_t)(t->nnames + 1));
+            ASTExpr** ne = sv_realloc(t->exprs, sizeof(ASTExpr*) * (size_t)(t->nnames + 1));
             if (!ne) { parse_fail(ps, "Out of memory", peek(ps)); trig_stmt_free(t); return NULL; }
             t->exprs = ne;
             t->exprs[t->nnames] = NULL;
@@ -3086,7 +3137,7 @@ static TrigStmt* parse_trig_stmt(ParserState* ps) {
         t->kind = TS_SIGNAL;
         if (peek(ps).type == TOK_SEMICOLON || peek(ps).type == TOK_END) {
             t->expr = new_expr(EXPR_STRING);
-            if (t->expr) t->expr->str_val = strdup("Error raised by a trigger");
+            if (t->expr) t->expr->str_val = sv_strdup("Error raised by a trigger");
         } else {
             t->expr = parse_expr(ps);
         }
@@ -3145,7 +3196,7 @@ static void parse_trigger_rest(ParserState* ps, TrigProgram* p) {
 }
 
 TrigProgram* parser_parse_trigger(TokenList* tokens) {
-    TrigProgram* p = calloc(1, sizeof(TrigProgram));
+    TrigProgram* p = sv_calloc(1, sizeof(TrigProgram));
     if (!p) return NULL;
     ParseResult r;
     memset(&r, 0, sizeof(r));
@@ -3174,7 +3225,7 @@ static void skip_routine_traits(ParserState* ps) {
 }
 
 TrigProgram* parser_parse_procedure(TokenList* tokens, int start) {
-    TrigProgram* p = calloc(1, sizeof(TrigProgram));
+    TrigProgram* p = sv_calloc(1, sizeof(TrigProgram));
     if (!p) return NULL;
     ParseResult r;
     memset(&r, 0, sizeof(r));
@@ -3238,7 +3289,7 @@ static void parse_routine_def(ParserState* ps, RoutineDef* d) {
             consume(ps);
         }
     }
-    d->prog = calloc(1, sizeof(TrigProgram));
+    d->prog = sv_calloc(1, sizeof(TrigProgram));
     if (!d->prog) { parse_fail(ps, "Out of memory", peek(ps)); return; }
     skip_routine_traits(ps);
     TrigStmt* st = parse_trig_stmt(ps);                 // BEGIN ... END è un blocco come gli altri
@@ -3252,7 +3303,7 @@ void routine_def_free(RoutineDef* d) {
 }
 
 RoutineDef* parser_parse_routine(TokenList* tokens, bool is_function) {
-    RoutineDef* d = calloc(1, sizeof(RoutineDef));
+    RoutineDef* d = sv_calloc(1, sizeof(RoutineDef));
     if (!d) return NULL;
     d->is_function = is_function;
     ParseResult r;
@@ -3277,7 +3328,7 @@ static ASTNode* parse_create_procedure(ParserState* ps, ASTNode* n, bool is_func
     if (peek(ps).type == TOK_DOT && next_is(ps, 1, TOK_IDENTIFIER)) { consume(ps); nm = consume(ps); }   // db.nome
     copy_text(ps, n->create_trigger.name, sizeof(n->create_trigger.name), nm.text);
     int start = ps->pos;
-    RoutineDef* d = calloc(1, sizeof(RoutineDef));
+    RoutineDef* d = sv_calloc(1, sizeof(RoutineDef));
     if (!d) { parse_fail(ps, "Out of memory", peek(ps)); return n; }
     d->is_function = is_function;
     parse_routine_def(ps, d);
@@ -3295,10 +3346,10 @@ static ASTNode* parse_create_procedure(ParserState* ps, ASTNode* n, bool is_func
 
 // testo SQL dei token [from, to) (malloc'd)
 static char* text_dup(ParserState* ps, int from, int to) {
-    char* buf = malloc(SV_MAX_SQL_LEN);
+    char* buf = sv_malloc(SV_MAX_SQL_LEN);
     if (!buf) { parse_fail(ps, "Out of memory", peek(ps)); return NULL; }
     if (!tokens_text(ps, from, to, buf, SV_MAX_SQL_LEN)) { free(buf); parse_fail(ps, "Statement is too long", peek(ps)); return NULL; }
-    char* r = strdup(buf);
+    char* r = sv_strdup(buf);
     free(buf);
     return r;
 }
@@ -3345,7 +3396,7 @@ static void parse_merge(ParserState* ps, ASTNode* n) {
     char* cols = ps->pos > cols_st ? text_dup(ps, cols_st, ps->pos) : NULL;
     if (!src) { free(cols); return; }
     size_t need = strlen(src) + strlen(sa[0] ? sa : n->merge.salias) + (cols ? strlen(cols) : 0) + 16;
-    n->merge.source = malloc(need);
+    n->merge.source = sv_malloc(need);
     if (n->merge.source) snprintf(n->merge.source, need, "%s AS `%s`%s", src, n->merge.salias, cols ? cols : "");
     free(src); free(cols);
     if (!n->merge.source) { parse_fail(ps, "Out of memory", peek(ps)); return; }
@@ -3505,13 +3556,13 @@ static ASTNode* parse_create_trigger(ParserState* ps, ASTNode* n) {
     copy_text(ps, n->create_trigger.table_name, sizeof(n->create_trigger.table_name), tbl.text);
     // il resto viene controllato ora e salvato come testo (OF ... + FOR EACH ... + corpo)
     int start = ps->pos;
-    TrigProgram* prog = calloc(1, sizeof(TrigProgram));
+    TrigProgram* prog = sv_calloc(1, sizeof(TrigProgram));
     if (!prog) { parse_fail(ps, "Out of memory", peek(ps)); return n; }
     parse_trigger_rest(ps, prog);
     trig_program_free(prog);
     if (!ps->result->success) return n;
     int end = ps->pos;
-    char* text = malloc(SV_MAX_SQL_LEN);
+    char* text = sv_malloc(SV_MAX_SQL_LEN);
     if (!text) { parse_fail(ps, "Out of memory", peek(ps)); return n; }
     size_t len = 0;
     text[0] = '\0';
@@ -3863,9 +3914,8 @@ static bool parse_gen_column(ParserState* ps, ColumnDef* cd) {
 }
 
 static void parse_column_def(ParserState* ps, ASTNode* n) {
-    if (n->create_table.num_columns >= 64) { parse_fail(ps, "Too many columns (max 64)", peek(ps)); return; }
-    ColumnDef* cd = &n->create_table.columns[n->create_table.num_columns];
-    memset(cd, 0, sizeof(ColumnDef));
+    ColumnDef* cd = ast_create_new_col(n);
+    if (!cd) { parse_fail(ps, "Too many columns (max 1024)", peek(ps)); return; }
     cd->nullable = true;                       // come in SQL standard: NULL ammesso se non dichiarato
     Token cn = consume(ps);
     if (cn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", cn); return; }
@@ -4353,7 +4403,7 @@ static void parse_alter_op(ParserState* ps, ASTNode* n) {
                 copy_text(ps, n->alter_table.alter_col, sizeof(n->alter_table.alter_col), a.text);
                 n->alter_table.alter_kind = ALT_TYPE;
                 if (strcasecmp(a.text, b.text)) {                 // nome nuovo: prima il tipo, poi RENAME COLUMN
-                    ASTNode* rn = calloc(1, sizeof(ASTNode));
+                    ASTNode* rn = sv_calloc(1, sizeof(ASTNode));
                     if (!rn) { parse_fail(ps, "Out of memory", peek(ps)); return; }
                     rn->type = NODE_ALTER_TABLE;
                     snprintf(rn->alter_table.table_name, sizeof(rn->alter_table.table_name), "%s", n->alter_table.table_name);
@@ -4393,7 +4443,7 @@ static void parse_alter_op(ParserState* ps, ASTNode* n) {
                     while (peek(ps).type != TOK_RPAREN && peek(ps).type != TOK_EOF) consume(ps);    // altre colonne, prefissi, ASC / DESC
                     match(ps, TOK_RPAREN);
                     if (ident_is(ps, "USING")) { consume(ps); consume(ps); }
-                    ASTNode* ix = calloc(1, sizeof(ASTNode));
+                    ASTNode* ix = sv_calloc(1, sizeof(ASTNode));
                     if (!ix) { parse_fail(ps, "Out of memory", peek(ps)); return; }
                     ix->type = NODE_CREATE_INDEX;
                     if (!iname[0]) snprintf(iname, sizeof(iname), "%.24s_%.24s_index", n->alter_table.table_name, c0.text);
@@ -4407,7 +4457,7 @@ static void parse_alter_op(ParserState* ps, ASTNode* n) {
                 if (ident_is(ps, "COLUMN") || (peek(ps).type == TOK_IDENTIFIER && !ident_is(ps, "CONSTRAINT") &&
                     !ident_is(ps, "PRIMARY") && !ident_is(ps, "UNIQUE") && !ident_is(ps, "FOREIGN") && !ident_is(ps, "CHECK"))) {
                     if (ident_is(ps, "COLUMN")) consume(ps);           // ADD [COLUMN] nome tipo modificatori
-                    ASTNode* def = calloc(1, sizeof(ASTNode));
+                    ASTNode* def = sv_calloc(1, sizeof(ASTNode));
                     if (!def) { parse_fail(ps, "Out of memory", peek(ps)); return; }
                     def->type = NODE_CREATE_TABLE;
                     n->alter_table.add_column = def;
@@ -4433,7 +4483,7 @@ static void parse_alter_op(ParserState* ps, ASTNode* n) {
                     consume(ps);
                     Token in = consume(ps);
                     if (in.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected the index name", in); return; }
-                    ASTNode* ix = calloc(1, sizeof(ASTNode));
+                    ASTNode* ix = sv_calloc(1, sizeof(ASTNode));
                     if (!ix) { parse_fail(ps, "Out of memory", peek(ps)); return; }
                     ix->type = NODE_DROP_INDEX;
                     copy_text(ps, ix->drop_index.index_name, sizeof(ix->drop_index.index_name), in.text);
@@ -4506,7 +4556,7 @@ static void parse_alter_op(ParserState* ps, ASTNode* n) {
 }
 
 static ASTNode* parse_statement(ParserState* ps) {
-    ASTNode* n = calloc(1, sizeof(ASTNode));
+    ASTNode* n = sv_calloc(1, sizeof(ASTNode));
     if (!n) return NULL;
     Token t = peek(ps);
     if (ident_is(ps, "CALL") && next_is(ps, 1, TOK_IDENTIFIER)) { parse_call_stmt(ps, n); return n; }
@@ -4518,7 +4568,7 @@ static ASTNode* parse_statement(ParserState* ps) {
         n->type = NODE_SELECT;
         ASTExpr* star = new_expr(EXPR_STAR);
         if (!star) { parse_fail(ps, "Out of memory", t); return n; }
-        n->select_stmt.columns[n->select_stmt.num_cols++] = star;
+        if (!ast_select_push(n, star)) { ast_expr_free(star); parse_fail(ps, "Out of memory", t); return n; }
         Token tn = table_tok(ps);
         copy_text(ps, n->select_stmt.table_name, sizeof(n->select_stmt.table_name), tn.text);
         parse_order_limit(ps, n);
@@ -4707,7 +4757,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                 parse_alter_op(ps, cur);
                 while (cur->chain && cur->chain->type == NODE_ALTER_TABLE) cur = cur->chain;   // (CHANGE ne aggiunge uno)
                 if (cur->chain) {                       // ADD / DROP INDEX: nodo dell'indice, poi un ALTER vuoto per le altre
-                    ASTNode* hold = calloc(1, sizeof(ASTNode));
+                    ASTNode* hold = sv_calloc(1, sizeof(ASTNode));
                     if (!hold) { parse_fail(ps, "Out of memory", peek(ps)); break; }
                     hold->type = NODE_ALTER_TABLE;
                     hold->alter_table.noop = true;
@@ -4716,7 +4766,7 @@ static ASTNode* parse_statement(ParserState* ps) {
                     cur = hold;
                 }
                 if (!ps->result->success || !match(ps, TOK_COMMA)) break;
-                ASTNode* nx = calloc(1, sizeof(ASTNode));
+                ASTNode* nx = sv_calloc(1, sizeof(ASTNode));
                 if (!nx) { parse_fail(ps, "Out of memory", peek(ps)); break; }
                 nx->type = NODE_ALTER_TABLE;
                 snprintf(nx->alter_table.table_name, sizeof(nx->alter_table.table_name), "%s", n->alter_table.table_name);
@@ -4796,8 +4846,8 @@ static ASTNode* parse_statement(ParserState* ps) {
                     consume(ps);
                     ASTExpr* x = parse_expr(ps);
                     if (!x) break;
-                    char (*nn)[64] = realloc(n->set_names, sizeof(*n->set_names) * (size_t)(n->set_n + 1));
-                    ASTExpr** ne = nn ? realloc(n->set_exprs, sizeof(ASTExpr*) * (size_t)(n->set_n + 1)) : NULL;
+                    char (*nn)[64] = sv_realloc(n->set_names, sizeof(*n->set_names) * (size_t)(n->set_n + 1));
+                    ASTExpr** ne = nn ? sv_realloc(n->set_exprs, sizeof(ASTExpr*) * (size_t)(n->set_n + 1)) : NULL;
                     if (nn) n->set_names = nn;
                     if (ne) n->set_exprs = ne;
                     if (!nn || !ne) { ast_expr_free(x); parse_fail(ps, "Out of memory", v); break; }
@@ -4910,7 +4960,21 @@ static ASTNode* parse_statement(ParserState* ps) {
         case TOK_EXPLAIN: {
             consume(ps);
             n->type = NODE_EXPLAIN;
-            if (ident_is(ps, "ANALYZE")) { consume(ps); n->explain.analyze = true; }
+            for (int k = 0; k < 2; k++) {                       // [ANALYZE] [FORMAT = JSON | TRADITIONAL | TREE], in un ordine o nell'altro
+                if (ident_is(ps, "ANALYZE")) { consume(ps); n->explain.analyze = true; }
+                if (ident_is(ps, "FORMAT")) {
+                    consume(ps);
+                    match(ps, TOK_EQ);
+                    Token f = peek(ps);
+                    if (f.type != TOK_IDENTIFIER || (strcasecmp(f.text, "JSON") && strcasecmp(f.text, "TRADITIONAL") && strcasecmp(f.text, "TREE"))) {
+                        parse_fail(ps, "Expected FORMAT = JSON or FORMAT = TRADITIONAL", f);
+                        break;
+                    }
+                    n->explain.json = !strcasecmp(f.text, "JSON");
+                    consume(ps);
+                }
+            }
+            if (!ps->result->success) break;
             if (!query_starts(ps, 0)) { parse_fail(ps, "EXPLAIN works with SELECT statements", peek(ps)); break; }
             n->explain.stmt = parse_query(ps);
             break;
@@ -4958,7 +5022,12 @@ static ASTNode* parse_statement(ParserState* ps) {
         default:
             if (query_starts(ps, 0)) { free(n); return parse_query(ps); }   // WITH ...
             if (ident_is(ps, "CHECKPOINT")) { consume(ps); n->type = NODE_CHECKPOINT; break; }
-            if (ident_is(ps, "VACUUM")) { consume(ps); n->type = NODE_VACUUM; break; }
+            if (ident_is(ps, "VACUUM")) {
+                consume(ps);
+                n->type = NODE_VACUUM;
+                if (ident_is(ps, "FULL")) { consume(ps); n->delete_stmt.num_targets = 1; }   // VACUUM FULL: compatta e accorcia
+                break;
+            }
             if (ident_is(ps, "REPLACE") && !next_is(ps, 1, TOK_LPAREN)) {   // MySQL: REPLACE [INTO] t ...
                 consume(ps);
                 parse_insert(ps, n);
@@ -4974,7 +5043,7 @@ static ASTNode* parse_statement(ParserState* ps) {
     // RETURNING espr [[AS] nome], ... | *
     if (ps->result->success && (n->type == NODE_INSERT || n->type == NODE_UPDATE || n->type == NODE_DELETE) && ident_is(ps, "RETURNING")) {
         consume(ps);
-        n->returning = calloc(64, sizeof(ASTExpr*));
+        n->returning = sv_calloc(64, sizeof(ASTExpr*));
         if (!n->returning) { parse_fail(ps, "Out of memory", peek(ps)); return n; }
         do {
             if (n->nret >= 64) { parse_fail(ps, "Too many RETURNING expressions (max 64)", peek(ps)); break; }
@@ -4996,7 +5065,7 @@ static ASTNode* parse_statement(ParserState* ps) {
 }
 
 ParseResult* parser_parse(TokenList* tokens) {
-    ParseResult* r = calloc(1, sizeof(ParseResult));
+    ParseResult* r = sv_calloc(1, sizeof(ParseResult));
     if (!r) return NULL;
     r->success = true;
     r->count = 0;
@@ -5073,6 +5142,46 @@ static void tf_free(TableFunc* t) {
     free(t);
 }
 
+bool ast_select_push(ASTNode* n, ASTExpr* e) {
+    if (n->select_stmt.num_cols >= SV_MAX_COLUMNS) return false;
+    if (n->select_stmt.num_cols >= n->select_stmt.cap_cols) {
+        int nc = n->select_stmt.cap_cols ? n->select_stmt.cap_cols * 2 : 8;
+        ASTExpr** nv = sv_try_realloc(n->select_stmt.columns, sizeof(ASTExpr*) * (size_t)nc);
+        if (!nv) return false;
+        n->select_stmt.columns = nv;
+        n->select_stmt.cap_cols = nc;
+    }
+    n->select_stmt.columns[n->select_stmt.num_cols++] = e;
+    return true;
+}
+
+bool ast_insert_push_col(ASTNode* n, char* name) {
+    if (!name || n->insert_stmt.num_cols >= SV_MAX_COLUMNS) return false;
+    if (n->insert_stmt.num_cols >= n->insert_stmt.cap_cols) {
+        int nc = n->insert_stmt.cap_cols ? n->insert_stmt.cap_cols * 2 : 8;
+        char** nv = sv_try_realloc(n->insert_stmt.columns, sizeof(char*) * (size_t)nc);
+        if (!nv) return false;
+        n->insert_stmt.columns = nv;
+        n->insert_stmt.cap_cols = nc;
+    }
+    n->insert_stmt.columns[n->insert_stmt.num_cols++] = name;
+    return true;
+}
+
+ColumnDef* ast_create_new_col(ASTNode* n) {
+    if (n->create_table.num_columns >= SV_MAX_COLUMNS) return NULL;
+    if (n->create_table.num_columns >= n->create_table.cap_columns) {
+        int nc = n->create_table.cap_columns ? n->create_table.cap_columns * 2 : 8;
+        ColumnDef* nv = sv_try_realloc(n->create_table.columns, sizeof(ColumnDef) * (size_t)nc);
+        if (!nv) return NULL;
+        n->create_table.columns = nv;
+        n->create_table.cap_columns = nc;
+    }
+    ColumnDef* cd = &n->create_table.columns[n->create_table.num_columns];
+    memset(cd, 0, sizeof(*cd));
+    return cd;
+}
+
 static void free_node(ASTNode* n) {
     if (!n) return;
     free_node(n->chain);
@@ -5081,6 +5190,7 @@ static void free_node(ASTNode* n) {
     switch (n->type) {
         case NODE_SELECT:
             for (int j = 0; j < n->select_stmt.num_cols; j++) ast_expr_free(n->select_stmt.columns[j]);
+            free(n->select_stmt.columns);
             ast_expr_free(n->select_stmt.where);
             ast_expr_free(n->select_stmt.having);
             for (int j = 0; j < n->select_stmt.num_joins; j++) {
@@ -5098,6 +5208,7 @@ static void free_node(ASTNode* n) {
             break;
         case NODE_INSERT:
             for (int j = 0; j < n->insert_stmt.num_cols; j++) free(n->insert_stmt.columns[j]);
+            free(n->insert_stmt.columns);
             for (int j = 0; j < n->insert_stmt.num_rows * n->insert_stmt.num_values; j++)
                 ast_expr_free(n->insert_stmt.values[j]);
             free(n->insert_stmt.values);
@@ -5120,6 +5231,7 @@ static void free_node(ASTNode* n) {
             free_node(n->alter_table.add_column);
             break;
         case NODE_CREATE_TABLE:
+            free(n->create_table.columns);
             free_node(n->create_table.as_select);
             break;
         case NODE_CALL:

@@ -8,7 +8,9 @@ SCOPO: cattura delle email di sviluppo (vedi mail.h).
        - pagina web e API JSON sotto /.segvault/mail;
        - client "sendmail" per mail() di PHP.
 */
+#include "common.h"
 #include "mail.h"
+#include "h2.h"     // sv_poll
 
 #include <ctype.h>
 #include <dirent.h>
@@ -54,6 +56,9 @@ SCOPO: cattura delle email di sviluppo (vedi mail.h).
   static void mx_destroy(ml_mutex* m) { pthread_mutex_destroy(m); }
   static double ml_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6; }
   #define mkdir_p(d) mkdir(d, 0755)
+#endif
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0                  // Windows / macOS: nessun flag (Windows non eredita i socket: P2.10)
 #endif
 
 #define MAIL_MAX_SIZE   (32u << 20)      // un messaggio (con gli allegati)
@@ -383,7 +388,7 @@ static void mime_free(Mime* m) { free(m->text.data); free(m->html.data); }
 static void eml_path(const MailStore* m, long id, char* out, size_t n) { snprintf(out, n, "%s/%ld.eml", m->dir, id); }
 
 static char* read_file(const char* path, size_t* n, size_t max) {
-    FILE* f = fopen(path, "rb");
+    FILE* f = fopen(path, "rb" SV_FE);
     if (!f) return NULL;
     JsonBuf b = {0};
     char chunk[65536];
@@ -490,7 +495,7 @@ static long store_message(MailStore* m, const char* client, const char* from, ch
     long id = m->next_id++;
     char path[1200];
     eml_path(m, id, path, sizeof(path));
-    FILE* fp = fopen(path, "wb");
+    FILE* fp = fopen(path, "wb" SV_FE);
     bool ok = fp && fwrite(f.data, 1, f.len, fp) == f.len;
     if (fp && fclose(fp) != 0) ok = false;
     MailEnt e;
@@ -550,11 +555,8 @@ static bool read_line(LineIn* in, JsonBuf* out, size_t max) {
             if (out->len < max) jb_raw(out, &c, 1);
         }
         if (*in->stop || ml_now() - t0 > SMTP_IDLE_MS) return false;
-        fd_set rd;
-        FD_ZERO(&rd);
-        FD_SET(in->fd, &rd);
-        struct timeval tv = { 0, 200000 };
-        int r = select((int)in->fd + 1, &rd, NULL, NULL, &tv);
+        SvPoll pv = { in->fd, 1, 0 };                        // poll: descrittori oltre 1024 ammessi
+        int r = sv_poll(&pv, 1, 200);
         if (r <= 0) continue;
         int got = (int)recv(in->fd, in->buf, (int)sizeof(in->buf), 0);
         if (got <= 0) return false;
@@ -1005,7 +1007,7 @@ int mail_sendmail_main(int port, int argc, char** argv) {
     }
     if (!nrcpt) { fprintf(stderr, "sendmail: no recipients\n"); free(msg.data); return 64; }
 
-    ml_sock fd = socket(AF_INET, SOCK_STREAM, 0);
+    ml_sock fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_in a;
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;

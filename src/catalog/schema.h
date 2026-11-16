@@ -85,10 +85,17 @@ typedef struct {
 } Constraint;
 
 // -- definizione tabella --
+// Dal formato v6 del catalogo (P1.11) le colonne non sono più dentro la struttura: columns punta a cap_columns
+// colonne. Una tabella del catalogo le ha in un'allocazione sua (own_columns = 1, cresce con ALTER TABLE ... ADD);
+// una tabella di lavoro dell'executor (risultati, viste, variabili) le ha nello stesso blocco della struttura
+// (schema_new: own_columns = 0, si libera con un solo free). Copiare una TableSchema con '=' condividerebbe le
+// colonne: si usano schema_dup / schema_assign.
 typedef struct {
     char      name[SV_MAX_NAME_LEN];
-    Column  columns[SV_MAX_COLUMNS];
+    Column*   columns;
     int       num_columns;
+    int       cap_columns;
+    uint8_t   own_columns;     // 1 = columns è un'allocazione a parte (catalogo), 0 = nello stesso blocco o nessuna
     Index   indexes[SV_MAX_INDEXES];
     int       num_indexes;
     uint32_t  root_page_id;    // prima pagina dell'heap file
@@ -127,22 +134,25 @@ typedef struct {
 } TriggerSchema;
 
 // -- database --
+// Liste dinamiche (P1.11: prima array fissi di 256 tabelle e 64 viste / routine / trigger, 27 MB per database e
+// 1,7 GB per il catalogo intero). Ogni tabella è un'allocazione a sé: il puntatore resta valido quando se ne
+// aggiungono o tolgono altre (tables[i] è il puntatore).
 typedef struct {
     char             name[SV_MAX_NAME_LEN];
-    TableSchema    tables[SV_MAX_TABLES];
-    int              num_tables;
-    ViewSchema     views[64];
-    int              num_views;
-    RoutineSchema  routines[64];
-    int              num_routines;
-    TriggerSchema  triggers[64];
-    int              num_triggers;
+    TableSchema**    tables;
+    int              num_tables, cap_tables;
+    ViewSchema*      views;
+    int              num_views, cap_views;
+    RoutineSchema*   routines;
+    int              num_routines, cap_routines;
+    TriggerSchema*   triggers;
+    int              num_triggers, cap_triggers;
 } Database;
 
 // -- catalogo globale --
 typedef struct {
-    Database  databases[SV_MAX_DATABASES];
-    int         num_databases;
+    Database*   databases;
+    int         num_databases, cap_databases;
     int         current_db;      // Indice del database corrente (-1 = nessuno)
     uint32_t    next_page_id;    // Prossima page_id libera (globale)
 } Catalog;
@@ -181,5 +191,22 @@ int catalog_add_index(Catalog* c, const char* db, const char* table, Index* idx)
 
 // Colonne
 int catalog_get_col_index(TableSchema* t, const char* col_name);
+
+// ── tabelle di lavoro e copie (P1.11) ──
+// schema_new: struttura e cap colonne in un solo blocco azzerato (free() la libera tutta)
+TableSchema* schema_new(int cap);
+// copia profonda in un blocco nuovo con spazio per extra colonne in più
+TableSchema* schema_dup(const TableSchema* src, int extra);
+// dst prende tutti i campi di src, colonne comprese, tenendo la sua memoria per le colonne (cresce se è del
+// catalogo). false se dst ha le colonne nel suo blocco e non bastano
+bool schema_assign(TableSchema* dst, const TableSchema* src);
+// una colonna in più (azzerata) in fondo; NULL se non c'è spazio (blocco fisso pieno o memoria)
+Column* schema_add_column(TableSchema* ts);
+// libera la memoria delle colonne di una tabella del catalogo (non la struttura)
+void schema_release(TableSchema* ts);
+
+// ── oggetti nuovi in un database (le liste crescono) ──
+RoutineSchema* catalog_new_routine(Database* d);     // azzerata in fondo alla lista, NULL senza memoria
+TriggerSchema* catalog_new_trigger(Database* d);
 
 #endif 

@@ -1,3 +1,4 @@
+#include "common.h"
 #include "png_write.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -232,7 +233,7 @@ bool png_write_file(const char* path, int w, int h, const uint32_t* pixels) {
     size_t n = 0;
     uint8_t* png = png_encode(w, h, pixels, &n);
     if (!png) return false;
-    FILE* f = fopen(path, "wb");
+    FILE* f = fopen(path, "wb" SV_FE);
     bool ok = f && fwrite(png, 1, n, f) == n;
     if (f && fclose(f) != 0) ok = false;
     free(png);

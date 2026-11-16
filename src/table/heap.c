@@ -1,6 +1,7 @@
 #include "heap.h"
 #include "platform_compat.h"
 #include "overflow.h"
+#include "sv_alloc.h"
 
 // limite di sicurezza contro catene corrotte (cicli)
 #define HEAP_MAX_CHAIN SV_MAX_PAGE_ID
@@ -50,8 +51,8 @@ void heap_cache_forget(BufferPool* bp, uint32_t root_page_id) {
 static bool meta_hash_put(HeapMeta* m, uint32_t pid, uint32_t idx) {
     if ((m->npages + 1) * 2 > m->hcap) {
         uint32_t nc = m->hcap ? m->hcap * 2 : 64;
-        uint32_t* nk = calloc(nc, sizeof(uint32_t));
-        uint32_t* nv = malloc(sizeof(uint32_t) * nc);
+        uint32_t* nk = sv_calloc(nc, sizeof(uint32_t));
+        uint32_t* nv = sv_malloc(sizeof(uint32_t) * nc);
         if (!nk || !nv) { free(nk); free(nv); return false; }
         for (uint32_t i = 0; i < m->hcap; i++) {
             if (!m->hkeys[i]) continue;
@@ -81,10 +82,10 @@ static int64_t meta_index(const HeapMeta* m, uint32_t pid) {
 static bool meta_append(HeapMeta* m, uint32_t pid, uint16_t freeb) {
     if (m->npages >= m->cap) {
         uint32_t nc = m->cap ? m->cap * 2 : 16;
-        uint32_t* np = realloc(m->pages, sizeof(uint32_t) * nc);
+        uint32_t* np = sv_realloc(m->pages, sizeof(uint32_t) * nc);
         if (!np) return false;
         m->pages = np;
-        uint16_t* nf = realloc(m->freeb, sizeof(uint16_t) * nc);
+        uint16_t* nf = sv_realloc(m->freeb, sizeof(uint16_t) * nc);
         if (!nf) return false;
         m->freeb = nf;
         m->cap = nc;
@@ -117,7 +118,7 @@ static HeapMeta* meta_build(BufferPool* bp, uint32_t root_page_id, uint32_t num_
         bp_unpin(bp, root_page_id, false);
     }
 
-    HeapMeta* m = calloc(1, sizeof(HeapMeta));
+    HeapMeta* m = sv_calloc(1, sizeof(HeapMeta));
     if (!m) return NULL;
     m->bp = bp;
     m->root = root_page_id;
@@ -196,7 +197,7 @@ int heap_insert(HeapFile* hf, Tuple* t, TableSchema* schema, RID* out_rid) {
     // forma di uno stub va in overflow: così uno slot con la forma di uno stub è sempre uno stub vero, e
     // una riga costruita non può puntare alla catena di un'altra tabella (P1.12)
     if (tuple_len > OV_INLINE_MAX || ov_is_stub(data, tuple_len, NULL, NULL)) {
-        uint8_t* stub = malloc(OV_STUB_LEN);
+        uint8_t* stub = sv_malloc(OV_STUB_LEN);
         int rc = stub ? ov_store_bp(hf->bp, data, tuple_len, stub) : SV_ERR;
         free(data);
         if (rc != SV_OK) { free(stub); return rc; }
@@ -361,18 +362,26 @@ Tuple* heap_get(HeapFile* hf, RID rid, TableSchema* schema) {
     return t;
 }
 
+// catena di overflow non più riferita (riga grande eliminata o sostituita): la callback del motore (db_api.c) la
+// libera quando la modifica è confermata (P1.5); senza callback conta per il VACUUM automatico come prima
+static void (*g_abandon_hook)(uint32_t first, uint32_t total);
+void heap_set_abandon_hook(void (*hook)(uint32_t first, uint32_t total)) { g_abandon_hook = hook; }
+void heap_chain_abandoned(uint32_t first, uint32_t total) {
+    if (g_abandon_hook) g_abandon_hook(first, total);
+    else atomic_fetch_add(&g_sv_abandoned_pages, (int)(total / (SV_PAGE_SIZE - 16) + 1));
+}
+
 int heap_delete(HeapFile* hf, RID rid) {
     if (!hf) return SV_ERR;
     Page* p = bp_fetch(hf->bp, rid.page_id);
     if (!p) return SV_NOT_FOUND;
     uint16_t len = 0;
     const void* old = page_get_slot(p, rid.slot_id, &len);
-    uint32_t ovtotal = 0;
-    bool stub = old && ov_is_stub(old, len, &ovtotal, NULL);
+    uint32_t ovtotal = 0, ovfirst = 0;
+    bool stub = old && ov_is_stub(old, len, &ovtotal, &ovfirst);
     int rc = page_delete_slot(p, rid.slot_id);
-    // una riga grande eliminata (o sostituita da un UPDATE): la sua catena di overflow non serve più;
-    // il conteggio fa partire un VACUUM automatico al prossimo checkpoint (vedi db_api.c)
-    if (rc == SV_OK && stub) atomic_fetch_add(&g_sv_abandoned_pages, (int)(ovtotal / (SV_PAGE_SIZE - 16) + 1));
+    // una riga grande eliminata (o sostituita da un UPDATE): la sua catena di overflow non serve più
+    if (rc == SV_OK && stub) heap_chain_abandoned(ovfirst, ovtotal);
     if (rc == SV_OK && hf->meta) {
         // lo spazio della riga torna utilizzabile (con la compattazione della pagina)
         int64_t idx = meta_index(hf->meta, rid.page_id);
@@ -386,8 +395,56 @@ int heap_delete(HeapFile* hf, RID rid) {
     return rc;
 }
 
+// UPDATE sul posto (P1.5): la riga nuova prende lo stesso slot se ci sta nella pagina (anche compattandola), così
+// un UPDATE non consuma più uno slot e 4 byte di directory ogni volta; altrimenti delete + insert (la riga cambia
+// posizione e il WAL registra il RID nuovo). Una riga grande ha una catena nuova, lo stub resta nello stesso slot
 int heap_update(HeapFile* hf, RID rid, Tuple* t, TableSchema* schema, RID* out_new_rid) {
     if (!hf || !t || !schema) return SV_ERR;
+    size_t nl = 0;
+    uint8_t* nd = tuple_serialize(t, schema, &nl);
+    if (nd) {
+        Page* p = bp_fetch(hf->bp, rid.page_id);
+        if (!p) { free(nd); return SV_NOT_FOUND; }
+        uint16_t olen = 0;
+        const void* old = page_get_slot(p, rid.slot_id, &olen);
+        if (!old) { bp_unpin(hf->bp, rid.page_id, false); free(nd); return SV_NOT_FOUND; }
+        bool big = nl > OV_INLINE_MAX || ov_is_stub(nd, nl, NULL, NULL);
+        uint32_t need = big ? OV_STUB_LEN : (uint32_t)nl;
+        // spazio: quello della riga vecchia più quello recuperabile della pagina
+        if (need <= (uint32_t)olen + page_usable_space(p)) {
+            uint32_t ovtotal = 0, ovfirst = 0;
+            bool was_stub = ov_is_stub(old, olen, &ovtotal, &ovfirst);
+            uint8_t stubb[OV_STUB_LEN];
+            const uint8_t* put = nd;
+            int rc = SV_OK;
+            if (big) {                                  // catena nuova prima di toccare lo slot
+                bp_unpin(hf->bp, rid.page_id, false);
+                rc = ov_store_bp(hf->bp, nd, nl, stubb);
+                p = rc == SV_OK ? bp_fetch(hf->bp, rid.page_id) : NULL;
+                if (!p) { free(nd); return rc != SV_OK ? rc : SV_ERR; }
+                if (!page_get_slot(p, rid.slot_id, &olen)) { bp_unpin(hf->bp, rid.page_id, false); free(nd); return SV_NOT_FOUND; }
+                put = stubb;
+            }
+            page_delete_slot(p, rid.slot_id);
+            if (page_revive_slot(p, rid.slot_id, put, (uint16_t)need) == SV_OK) {
+                if (was_stub) heap_chain_abandoned(ovfirst, ovtotal);
+                if (hf->meta) {
+                    int64_t idx = meta_index(hf->meta, rid.page_id);
+                    if (idx >= 0) hf->meta->freeb[idx] = page_usable_space(p);
+                }
+                bp_unpin(hf->bp, rid.page_id, true);
+                free(nd);
+                if (out_new_rid) *out_new_rid = rid;
+                return SV_OK;
+            }
+            // (non dovrebbe succedere: lo spazio c'era) la riga torna com'era e si sposta
+            bp_unpin(hf->bp, rid.page_id, true);
+            free(nd);
+            return SV_ERR;
+        }
+        bp_unpin(hf->bp, rid.page_id, false);
+        free(nd);
+    }
     // delete + insert: la riga può cambiare posizione (il WAL registra il nuovo RID)
     int rc = heap_delete(hf, rid);
     if (rc != SV_OK) return rc;
@@ -416,6 +473,7 @@ void sv_scan_set_deadline(double deadline_ms) { g_scan_deadline = deadline_ms; g
 
 static _Thread_local atomic_int* t_cancel;          // annullamento di questa connessione (KILL QUERY)
 void sv_scan_set_cancel(atomic_int* flag) { t_cancel = flag; }
+bool sv_thread_cancelled(void) { return t_cancel && atomic_load(t_cancel); }
 
 bool sv_scan_cancelled(void) {
     if (atomic_load(&g_sv_scan_cancel)) return true;

@@ -32,6 +32,7 @@ typedef struct {
     int show_footer;
     int toolbar_style;
     int ui_font_size;       // dimensione del testo dell'interfaccia (11..16)
+    int ui_scale;           // scala della finestra: 0 = automatica (dpi), poi 100 %, 125 % ... 300 %
     // editor
     int font_size;
     int tab_size;           // indice: 2, 4, 8
@@ -106,6 +107,7 @@ int  settings_history_limit(void);
 int  settings_row_height(void);
 const char* settings_null_text(void);
 char settings_csv_delimiter(void);
-bool settings_accent_color(unsigned char rgb[3]);      // false = accento del tema
+bool settings_accent_color(unsigned char rgb[3]);
+float settings_ui_scale(void);                         // 0 = automatica      // false = accento del tema
 
 #endif

@@ -1,0 +1,38 @@
+name: fuzz
+
+# P3.3: ogni notte ogni bersaglio di tests/fuzz/fuzz.c gira 10 minuti sotto ASan + UBSan (diff: SQL casuale
+# confrontato con SQLite). Un errore del sanitizer o una differenza fa fallire il bersaglio; l'input che l'ha
+# causato (fuzz-crash.bin, fuzz-diff.txt) resta come artifact. Il seme cambia ogni notte (numero dell'esecuzione).
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "seconds per target"
+        default: "600"
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [sql, json, login, page, catalog, exec, http, h2, smtp, htaccess, regex, sqljson, diff]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libsqlite3-dev
+      - name: Build the fuzzer (ASan + UBSan)
+        run: make fuzz_sv
+      - name: Fuzz ${{ matrix.target }}
+        run: |
+          mkdir -p work && cd work
+          ../fuzz_sv ${{ matrix.target }} ${{ github.event.inputs.seconds || '600' }} ${{ github.run_number }}
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: |
+            work/fuzz-crash.bin
+            work/fuzz-diff.txt

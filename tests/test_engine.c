@@ -1,5 +1,5 @@
-#include "src/bridge/db_api.h"
-#include "src/widgets/csv_import.h"
+#include "bridge/db_api.h"
+#include "widgets/csv_import.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

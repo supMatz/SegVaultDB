@@ -46,6 +46,11 @@ void     tls_close(TlsConn* c);
 const char* tls_cipher(TlsConn* c);                   // "TLS_AES_256_GCM_SHA384"
 const char* tls_version(TlsConn* c);                  // "TLSv1.3"
 
+// caching_sha2_password senza TLS: chiave pubblica RSA del server (PEM, generata al primo uso; NULL se OpenSSL
+// manca) e decifratura OAEP di ciò che il client cifra con essa (byte scritti, -1 errore)
+const char* tls_rsa_public_pem(void);
+int         tls_rsa_decrypt(const unsigned char* in, size_t n, unsigned char* out, size_t cap);
+
 // installa la CA tra quelle fidate da questo utente (Windows: archivio "Root" dell'utente; macOS:
 // portachiavi login; Linux: archivio NSS di Chrome / Firefox con certutil e, se si è root, quello del
 // sistema). Scrive su out cosa ha fatto. 0 = fatto

@@ -3,6 +3,7 @@
 #include "platform_compat.h"
 #include <stdlib.h>
 #include <string.h>
+#include "sv_alloc.h"
 
 static const uint8_t MAGIC[8] = { 0xFF, 0x00, 'S', 'V', 'O', 'V', 'F', '1' };
 #define CHUNK ((int)sizeof(((Page*)0)->data) - 2)      // byte di dati in una pagina di overflow
@@ -13,7 +14,7 @@ static uint32_t fnv(const uint8_t* p, size_t n) {
     return h;
 }
 
-static void make_stub(uint8_t* s, uint32_t total, uint32_t first, uint32_t npages) {
+void ov_make_stub(uint8_t* s, uint32_t total, uint32_t first, uint32_t npages) {
     memcpy(s, MAGIC, 8);
     memcpy(s + 8, &total, 4);
     memcpy(s + 12, &first, 4);
@@ -49,7 +50,7 @@ static void fill_page(Page* p, const uint8_t* data, size_t n, uint32_t next) {
 int ov_store_bp(BufferPool* bp, const uint8_t* data, size_t n, uint8_t* stub) {
     if (n > OV_MAX_ROW) return SV_FULL;
     uint32_t k = chunks_for(n), first = 0;
-    uint32_t* ids = malloc(sizeof(uint32_t) * (k ? k : 1));
+    uint32_t* ids = sv_malloc(sizeof(uint32_t) * (k ? k : 1));
     if (!ids) return SV_ERR;
     for (uint32_t i = 0; i < k; i++) {
         if (bp_new_page(bp, &ids[i]) != SV_OK) { free(ids); return SV_FULL; }
@@ -66,7 +67,7 @@ int ov_store_bp(BufferPool* bp, const uint8_t* data, size_t n, uint8_t* stub) {
     }
     first = k ? ids[0] : 0;
     free(ids);
-    make_stub(stub, (uint32_t)n, first, k);
+    ov_make_stub(stub, (uint32_t)n, first, k);
     return SV_OK;
 }
 
@@ -77,7 +78,7 @@ typedef void  (*PutFn)(void* ctx, uint32_t id, Page* p);
 static uint8_t* load(const uint8_t* stub, size_t stub_len, size_t* out_n, GetFn get, PutFn put, void* ctx) {
     uint32_t total, pid;
     if (!ov_is_stub(stub, stub_len, &total, &pid) || total > OV_MAX_ROW) return NULL;
-    uint8_t* buf = malloc(total ? total : 1);
+    uint8_t* buf = sv_malloc(total ? total : 1);
     if (!buf) return NULL;
     size_t got = 0;
     uint32_t guard = 0;
@@ -108,7 +109,11 @@ uint8_t* ov_load_bp(BufferPool* bp, const uint8_t* stub, size_t stub_len, size_t
 
 // ── direttamente sul file (WAL: recupero e annullamento) ────────
 
-static Page* get_fd(void* ctx, uint32_t id) { return page_read(id, *(int*)ctx); }
+static Page* get_fd(void* ctx, uint32_t id) {
+    Page* p = page_read(id, *(int*)ctx);
+    if (p && !page_validate(p, id)) { page_free(p); return NULL; }   // CRC sbagliato: catena danneggiata
+    return p;
+}
 static void  put_fd(void* ctx, uint32_t id, Page* p) { (void)ctx; (void)id; page_free(p); }
 
 uint8_t* ov_load_fd(int db_fd, const uint8_t* stub, size_t stub_len, size_t* n) {
@@ -119,11 +124,8 @@ int ov_store_fd(int db_fd, const uint8_t* data, size_t n, uint8_t* stub) {
     if (n > OV_MAX_ROW) return SV_FULL;
     int64_t end = sv_lseek(db_fd, 0, SEEK_END);
     uint32_t base = end > 0 ? (uint32_t)((end + SV_PAGE_SIZE - 1) / SV_PAGE_SIZE) : 0;
-    if (base == 0) {                                  // la pagina 0 è riservata
-        Page* z = page_create(0);
-        if (!z) return SV_ERR;
-        page_write(z, db_fd);
-        page_free(z);
+    if (base == 0) {                                  // la pagina 0 è l'intestazione del file
+        if (page_header_write(db_fd, 1) != SV_OK) return SV_ERR;
         base = 1;
     }
     uint32_t k = chunks_for(n);
@@ -136,7 +138,7 @@ int ov_store_fd(int db_fd, const uint8_t* data, size_t n, uint8_t* stub) {
         page_free(p);
         if (rc != SV_OK) return SV_ERR;
     }
-    make_stub(stub, (uint32_t)n, k ? base : 0, k);
+    ov_make_stub(stub, (uint32_t)n, k ? base : 0, k);
     return SV_OK;
 }
 

@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
+#include "sv_alloc.h"
 
 typedef struct {
     const char* start;
@@ -45,7 +46,7 @@ static void make_token_into(LexTok* t, Lexer* lx, TokenType type) {
 static int add_token(TokenList* list, const LexTok* t) {
     if (list->count >= list->capacity) {
         int nc = list->capacity ? list->capacity * 2 : 256;
-        Token* nt = realloc(list->tokens, (size_t)nc * sizeof(Token));
+        Token* nt = sv_realloc(list->tokens, (size_t)nc * sizeof(Token));
         if (!nt) return 0;
         list->tokens = nt;
         list->capacity = nc;
@@ -55,7 +56,7 @@ static int add_token(TokenList* list, const LexTok* t) {
     if (list->plen + l > list->pcap) {
         size_t nc = list->pcap ? list->pcap * 2 : 4096;
         while (nc < list->plen + l) nc *= 2;
-        char* np = realloc(list->pool, nc);
+        char* np = sv_realloc(list->pool, nc);
         if (!np) return 0;
         list->pool = np;
         list->pcap = nc;
@@ -132,7 +133,7 @@ static TokenType keyword_or_id(const char* word, int len) {
 }
 
 TokenList* lexer_tokenize(const char* sql) {
-    TokenList* list = calloc(1, sizeof(TokenList));
+    TokenList* list = sv_calloc(1, sizeof(TokenList));
     if (!list) return NULL;
 
     Lexer lx;
@@ -205,7 +206,7 @@ TokenList* lexer_tokenize(const char* sql) {
                 if (n + 2 > scap) { \
                     if (n + 2 > LEX_MAX_STRING) { overflow = true; break; } \
                     size_t nc = scap ? scap * 2 : 1024; \
-                    char* nb = realloc(sbuf, nc); \
+                    char* nb = sv_realloc(sbuf, nc); \
                     if (!nb) { oom = true; break; } \
                     sbuf = nb; scap = nc; \
                 } \
@@ -279,7 +280,7 @@ TokenList* lexer_tokenize(const char* sql) {
                 size_t nd = (size_t)(e - h);
                 size_t need = nd + 4;                    // (i byte codificati occupano al più 2 per 2 cifre)
                 if (need > LEX_MAX_STRING) need = LEX_MAX_STRING;
-                if (need > scap) { char* nb = realloc(sbuf, need); if (nb) { sbuf = nb; scap = need; } }
+                if (need > scap) { char* nb = sv_realloc(sbuf, need); if (nb) { sbuf = nb; scap = need; } }
                 tok.type = TOK_STRING; tok.line = lx.line; tok.col = lx.col; tok.ext = NULL;
                 size_t n = 0;
                 bool text = sbuf && nd % 2 == 0;
@@ -409,6 +410,7 @@ TokenList* lexer_tokenize(const char* sql) {
             case '&': tt = *(lx.pos+1) == '&' ? (advance=2,TOK_AMPAMP) : TOK_AMP; break;
             case '^': tt = TOK_CARET; break;
             case '~': tt = TOK_TILDE; break;
+            case '?': tt = TOK_PARAM; break;
         }
         if (tt != TOK_ERROR) {
             lx.pos += advance;

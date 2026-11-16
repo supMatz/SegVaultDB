@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "sv_alloc.h"
 
 static const char* ws(const char* p) { while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++; return p; }
 
@@ -173,7 +174,7 @@ static void put_utf8(char* out, size_t* k, unsigned cp) {
 }
 
 char* sj_unquote(const char* v, size_t len) {
-    char* out = malloc(len + 1);
+    char* out = sv_malloc(len + 1);
     if (!out) return NULL;
     if (len < 2 || v[0] != '"' || v[len - 1] != '"') { memcpy(out, v, len); out[len] = '\0'; return out; }
     size_t k = 0;
@@ -211,7 +212,7 @@ char* sj_unquote(const char* v, size_t len) {
 
 char* sj_quote(const char* s) {
     size_t n = strlen(s);
-    char* out = malloc(n * 6 + 3);
+    char* out = sv_malloc(n * 6 + 3);
     if (!out) return NULL;
     size_t k = 0;
     out[k++] = '"';
@@ -238,7 +239,7 @@ static void sb_put(SjBuf* b, const char* s, size_t n) {
     if (b->n + n + 1 > b->cap) {
         size_t nc = b->cap ? b->cap * 2 : 256;
         while (nc < b->n + n + 1) nc *= 2;
-        char* nd = realloc(b->d, nc);
+        char* nd = sv_realloc(b->d, nc);
         if (!nd) { b->err = true; return; }
         b->d = nd; b->cap = nc;
     }
@@ -247,7 +248,7 @@ static void sb_put(SjBuf* b, const char* s, size_t n) {
     b->d[b->n] = '\0';
 }
 static void sb_puts(SjBuf* b, const char* s) { sb_put(b, s, strlen(s)); }
-static char* sb_done(SjBuf* b) { if (b->err) { free(b->d); return NULL; } if (!b->d) return strdup(""); return b->d; }
+static char* sb_done(SjBuf* b) { if (b->err) { free(b->d); return NULL; } if (!b->d) return sv_strdup(""); return b->d; }
 
 // ultimo passo del percorso: parent riceve il percorso senza l'ultimo passo
 static bool split_last(const char* path, char* parent, size_t pn, char* key, size_t kn, long* idx) {
@@ -329,7 +330,7 @@ char* sj_modify(const char* doc, const char* path, const char* val, int op) {
     if (!sj_valid(doc)) return NULL;
     if (op == 4) {                                    // aggiunge in fondo all'array (un valore semplice diventa [v, nuovo])
         const char* t; size_t tl;
-        if (!sj_extract(doc, path, &t, &tl)) return strdup(doc);
+        if (!sj_extract(doc, path, &t, &tl)) return sv_strdup(doc);
         SjBuf b = {0};
         sb_put(&b, doc, (size_t)(t - doc));
         if (*t == '[') {
@@ -350,23 +351,23 @@ char* sj_modify(const char* doc, const char* path, const char* val, int op) {
     if (!split_last(path, parent, sizeof(parent), key, sizeof(key), &idx)) {
         // "$": SET / REPLACE sostituiscono tutto il documento
         const char* q = path; while (*q == ' ') q++;
-        if (!strcmp(q, "$") && (op == 0 || op == 2)) return strdup(val);
-        return strcmp(q, "$") ? NULL : strdup(doc);
+        if (!strcmp(q, "$") && (op == 0 || op == 2)) return sv_strdup(val);
+        return strcmp(q, "$") ? NULL : sv_strdup(doc);
     }
     const char* c; size_t cl;
-    if (!sj_extract(doc, parent, &c, &cl)) return strdup(doc);           // contenitore che non c'è: invariato
+    if (!sj_extract(doc, parent, &c, &cl)) return sv_strdup(doc);           // contenitore che non c'è: invariato
     const char *vs, *ve, *rs, *re;
     bool found = find_member(c, key, idx, &vs, &ve, &rs, &re);
     SjBuf b = {0};
     if (found) {
-        if (op == 1) return strdup(doc);                                  // INSERT: c'è già
+        if (op == 1) return sv_strdup(doc);                                  // INSERT: c'è già
         if (op == 3) { sb_put(&b, doc, (size_t)(rs - doc)); sb_puts(&b, re); return sb_done(&b); }
         sb_put(&b, doc, (size_t)(vs - doc)); sb_puts(&b, val); sb_puts(&b, ve);
         return sb_done(&b);
     }
-    if (op == 2 || op == 3) return strdup(doc);                           // REPLACE / REMOVE: non c'è
+    if (op == 2 || op == 3) return sv_strdup(doc);                           // REPLACE / REMOVE: non c'è
     bool obj = *c == '{';
-    if ((obj && idx >= 0) || (!obj && *c != '[') || (!obj && idx < 0)) return strdup(doc);
+    if ((obj && idx >= 0) || (!obj && *c != '[') || (!obj && idx < 0)) return sv_strdup(doc);
     const char* close = c + cl - 1;                                       // nuovo membro / elemento in fondo
     bool empty = *ws(c + 1) == (obj ? '}' : ']');
     sb_put(&b, doc, (size_t)(close - doc));
@@ -400,7 +401,7 @@ char* sj_keys(const char* v, size_t len) {
 
 // testo JSON senza spazi fuori dalle stringhe (per i confronti)
 static char* compact(const char* v, size_t len) {
-    char* o = malloc(len + 1);
+    char* o = sv_malloc(len + 1);
     if (!o) return NULL;
     size_t k = 0;
     bool str = false;
@@ -581,7 +582,7 @@ char* sj_search(const char* doc, bool all, const char* pat) {
     if (!r || !found) { free(r); return NULL; }
     if (found == 1 || !all) return r;
     size_t l = strlen(r);
-    char* w = malloc(l + 3);
+    char* w = sv_malloc(l + 3);
     if (w) { w[0] = '['; memcpy(w + 1, r, l); w[l + 1] = ']'; w[l + 2] = '\0'; }
     free(r);
     return w;

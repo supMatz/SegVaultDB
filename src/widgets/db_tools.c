@@ -77,6 +77,11 @@ char* dbt_search_select(const char* db, const char* table, const char* needle) {
     return s;
 }
 
+// esecuzione degli statement: la GUI la fa passare dal suo thread di lavoro (ui_exec in window.c)
+static QueryResult* (*g_dbt_exec)(const char*) = NULL;
+void dbt_set_exec(QueryResult* (*fn)(const char* sql)) { g_dbt_exec = fn; }
+static QueryResult* dbt_exec(const char* sql) { return g_dbt_exec ? g_dbt_exec(sql) : db_execute(sql); }
+
 QueryResult* dbt_search(const char* db, const char* needle, int limit, int* tables_hit, bool* truncated) {
     static const char* const NAMES[4] = { "Table", "Column", "Value", "Row" };
     if (tables_hit) *tables_hit = 0;
@@ -89,7 +94,7 @@ QueryResult* dbt_search(const char* db, const char* needle, int limit, int* tabl
     for (int t = 0; t < tables->count && out->num_rows < limit; t++) {
         char* sql = dbt_search_select(db, tables->names[t], needle);
         if (!sql) continue;
-        QueryResult* r = db_execute(sql);
+        QueryResult* r = dbt_exec(sql);
         free(sql);
         if (!r || !r->success || r->num_rows == 0) { db_result_free(r); continue; }
         if (tables_hit) (*tables_hit)++;
@@ -152,7 +157,7 @@ QueryResult* dbt_overview(const char* db) {
         // righe contate; dopo ~1,5 s di conteggi il contatore del catalogo ("~")
         if ((double)(clock() - start) / CLOCKS_PER_SEC < 1.5 || !have_info) {
             snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM `%.120s`", name);
-            QueryResult* c = db_execute(sql);
+            QueryResult* c = dbt_exec(sql);
             if (c && c->success && c->num_rows) { snprintf(rows, sizeof(rows), "%s", c->rows[0].cells[0].value); tot_rows += strtoull(rows, NULL, 10); }
             db_result_free(c);
         } else {

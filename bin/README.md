@@ -5,12 +5,14 @@ accanto, al primo avvio (`./data`, oppure quella indicata sulla riga di comando)
 
 | Sistema | App desktop (editor SQL + server) | Solo server (HTTP/JSON e protocollo MySQL) |
 |---|---|---|
-| Windows 10 / 11 (64 bit) | [`segvault.exe`](windows-x86_64/segvault.exe) | [`segvault-server.exe`](windows-x86_64/segvault-server.exe) |
-| Linux x86-64 | [`segvault`](linux-x86_64/segvault) | [`segvault-server`](linux-x86_64/segvault-server) (o [`segvault-server-static`](linux-x86_64/segvault-server-static), senza HTTPS) |
+| Windows 10 / 11 (64 bit) | [`segvault.exe`](https://github.com/supMatz/SegVaultDB/releases/latest/download/segvault.exe) | [`segvault-server.exe`](https://github.com/supMatz/SegVaultDB/releases/latest/download/segvault-server.exe) |
+| Linux x86-64 | [`segvault`](https://github.com/supMatz/SegVaultDB/releases/latest/download/segvault) | [`segvault-server`](https://github.com/supMatz/SegVaultDB/releases/latest/download/segvault-server) (o [`segvault-server-static`](https://github.com/supMatz/SegVaultDB/releases/latest/download/segvault-server-static), senza HTTPS) |
 
-Pacchetti completi (eseguibili, script di avvio, sito d'esempio, `get-php.cmd` per Windows):
-`SegVault-1.2.0-windows-x86_64.zip` e `SegVault-1.2.0-linux-x86_64.tar.gz` nelle
-[release](https://github.com/supMatz/SegVaultDB/releases).
+I file sono allegati a ogni [release](https://github.com/supMatz/SegVaultDB/releases) (i link sopra
+puntano all'ultima); il repository non contiene eseguibili. Pacchetti completi (eseguibili, script di
+avvio, sito d'esempio, `get-php.cmd` per Windows): `SegVault-VERSIONE-windows-x86_64.zip` e
+`SegVault-VERSIONE-linux-x86_64.tar.gz`. Ogni release allega anche `SHA256SUMS`: nella cartella dei
+file scaricati, `sha256sum -c --ignore-missing SHA256SUMS` li verifica.
 
 - **Windows:** doppio clic su `segvault.exe` (se SmartScreen avvisa: *Ulteriori informazioni → Esegui
   comunque*: l'eseguibile non è firmato).
@@ -32,4 +34,6 @@ Esempi:
                                              # ambiente di sviluppo completo: siti NOME.localhost, PHP, posta, HTTPS
 ```
 
-Gli eseguibili si rigenerano dai sorgenti con `make dist` (vedi il [README](../README.md)).
+Gli eseguibili si rigenerano dai sorgenti con `make dist`, che li scrive in `dist/` con `SHA256SUMS`
+(vedi il [README](../README.md)); il workflow `.github/workflows/release.yml` li allega alla release
+quando si pubblica un tag `vX.Y.Z`.

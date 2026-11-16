@@ -6,6 +6,7 @@ SCOPO: reverse proxy HTTP/1.1 (vedi proxy.h).
        del client). Con "101 Switching Protocols" i due socket vengono collegati finché uno chiude.
 */
 #include "proxy.h"
+#include "h2.h"     // sv_poll
 
 #include <ctype.h>
 #include <errno.h>
@@ -34,6 +35,9 @@ SCOPO: reverse proxy HTTP/1.1 (vedi proxy.h).
   #define sock_close close
   #define SEND_FLAGS MSG_NOSIGNAL
   static double px_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6; }
+#endif
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0                  // Windows / macOS: nessun flag (Windows non eredita i socket: P2.10)
 #endif
 
 #define HEAD_MAX        (64 * 1024)
@@ -96,14 +100,11 @@ static int wait_readable(px_sock fd, int ms, atomic_int* stop) {
     double t0 = px_now();
     for (;;) {
         if (stop && *stop) return -1;
-        fd_set rd;
-        FD_ZERO(&rd);
-        FD_SET(fd, &rd);
         double left = ms - (px_now() - t0);
         if (left <= 0) return 0;
         int tick = left < TICK_MS ? (int)left + 1 : TICK_MS;
-        struct timeval tv = { tick / 1000, (tick % 1000) * 1000 };
-        int r = select((int)fd + 1, &rd, NULL, NULL, &tv);
+        SvPoll pv = { fd, 1, 0 };                            // poll: descrittori oltre 1024 ammessi
+        int r = sv_poll(&pv, 1, tick);
         if (r > 0) return 1;
 #ifndef _WIN32
         if (r < 0 && errno != EINTR) return 1;               // l'errore lo dirà recv
@@ -126,7 +127,7 @@ static px_sock px_connect(const char* host, int port, char* err, size_t errsz) {
     }
     px_sock fd = BAD_SOCK;
     for (struct addrinfo* a = res; a && fd == BAD_SOCK; a = a->ai_next) {
-        fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        fd = socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
         if (fd == BAD_SOCK) continue;
         if (connect(fd, a->ai_addr, (int)a->ai_addrlen) != 0) { sock_close(fd); fd = BAD_SOCK; }
     }
@@ -137,7 +138,7 @@ static px_sock px_connect(const char* host, int port, char* err, size_t errsz) {
             struct addrinfo* r2 = NULL;
             hints.ai_flags = AI_NUMERICHOST;
             if (getaddrinfo(alt[i], ps, &hints, &r2) == 0 && r2) {
-                fd = socket(r2->ai_family, r2->ai_socktype, r2->ai_protocol);
+                fd = socket(r2->ai_family, r2->ai_socktype | SOCK_CLOEXEC, r2->ai_protocol);
                 if (fd != BAD_SOCK && connect(fd, r2->ai_addr, (int)r2->ai_addrlen) != 0) { sock_close(fd); fd = BAD_SOCK; }
                 freeaddrinfo(r2);
             }
@@ -206,12 +207,8 @@ static void pipe_both(px_sock a, px_sock b, atomic_int* stop) {
     char buf[65536];
     for (;;) {
         if (*stop) return;
-        fd_set rd;
-        FD_ZERO(&rd);
-        FD_SET(a, &rd);
-        FD_SET(b, &rd);
-        struct timeval tv = { 0, TICK_MS * 1000 };
-        int r = select((int)(a > b ? a : b) + 1, &rd, NULL, NULL, &tv);
+        SvPoll pv[2] = { { a, 1, 0 }, { b, 1, 0 } };
+        int r = sv_poll(pv, 2, TICK_MS);
         if (r < 0) {
 #ifndef _WIN32
             if (errno == EINTR) continue;
@@ -221,7 +218,7 @@ static void pipe_both(px_sock a, px_sock b, atomic_int* stop) {
         if (r == 0) continue;
         px_sock from[2] = { a, b }, to[2] = { b, a };
         for (int k = 0; k < 2; k++) {
-            if (!FD_ISSET(from[k], &rd)) continue;
+            if (!(pv[k].got & 1)) continue;
             int got = (int)recv(from[k], buf, sizeof(buf), 0);
             if (got <= 0) return;
             if (!px_send(to[k], buf, (size_t)got)) return;

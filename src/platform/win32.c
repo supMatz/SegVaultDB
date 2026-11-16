@@ -16,6 +16,7 @@ SCOPO: Implementa platform.h usando le API native Windows.
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 #include "platform.h"
 
 #define EVT_QUEUE_CAP  512
@@ -60,7 +61,61 @@ struct PlatformWindow {
     NOTIFYICONDATAA nid;
     HICON           tray_icons[2];          // spento / acceso
     bool            visible;
+
+    // scala dell'interfaccia: i widget lavorano in pixel logici (96 dpi), qui si moltiplica per scale
+    float   scale;
+    float   scale_req;   // 0 = dpi del monitor (aggiornato da WM_DPICHANGED), altrimenti da Settings
+    UINT    dpi;
 };
+
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
+
+static inline int SC(const PlatformWindow* w, int v) { return (int)lroundf((float)v * w->scale); }
+static inline int UNSC(const PlatformWindow* w, int v) { return (int)lroundf((float)v / w->scale); }
+static inline Rect SCR(const PlatformWindow* w, Rect r) {
+    int x0 = SC(w, r.x), y0 = SC(w, r.y), x1 = SC(w, r.x + r.w), y1 = SC(w, r.y + r.h);
+    return (Rect){x0, y0, x1 - x0, y1 - y0};
+}
+
+// per-monitor DPI v2 (Windows 10 1703+), poi v1 (8.1), poi system-aware (Vista): chiamate risolte a
+// runtime, così l'eseguibile parte anche dove non esistono. Senza, Windows ingrandisce la bitmap (sfocata)
+static void enable_dpi_awareness(void) {
+    HMODULE u = GetModuleHandleW(L"user32.dll");
+    typedef BOOL (WINAPI *SetCtx)(HANDLE);
+    SetCtx set_ctx = u ? (SetCtx)(void*)GetProcAddress(u, "SetProcessDpiAwarenessContext") : NULL;
+    if (set_ctx && set_ctx((HANDLE)(INT_PTR)-4)) return;          // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    HMODULE sh = LoadLibraryW(L"shcore.dll");
+    typedef HRESULT (WINAPI *SetAw)(int);
+    SetAw set_aw = sh ? (SetAw)(void*)GetProcAddress(sh, "SetProcessDpiAwareness") : NULL;
+    if (set_aw && set_aw(2) == S_OK) return;                      // PROCESS_PER_MONITOR_DPI_AWARE
+    typedef BOOL (WINAPI *SetOld)(void);
+    SetOld set_old = u ? (SetOld)(void*)GetProcAddress(u, "SetProcessDPIAware") : NULL;
+    if (set_old) set_old();
+}
+
+static UINT window_dpi(HWND hwnd) {
+    HMODULE u = GetModuleHandleW(L"user32.dll");
+    typedef UINT (WINAPI *GetDpi)(HWND);
+    GetDpi get = u ? (GetDpi)(void*)GetProcAddress(u, "GetDpiForWindow") : NULL;
+    UINT d = (get && hwnd) ? get(hwnd) : 0;
+    if (!d) {
+        HDC dc = GetDC(NULL);
+        d = dc ? (UINT)GetDeviceCaps(dc, LOGPIXELSX) : 96;
+        if (dc) ReleaseDC(NULL, dc);
+    }
+    return d ? d : 96;
+}
+
+static float scale_for(const PlatformWindow* win) {
+    float s = win->scale_req > 0 ? win->scale_req : (float)win->dpi / 96.0f;
+    const char* e = getenv("SV_UI_SCALE");
+    if (win->scale_req <= 0 && e && *e && strtof(e, NULL) > 0) s = strtof(e, NULL);
+    if (s < 0.75f) s = 0.75f;
+    if (s > 4.0f) s = 4.0f;
+    return s;
+}
 
 #define WM_SV_TRAY (WM_APP + 7)
 
@@ -85,8 +140,8 @@ static uint32_t win_modifiers(void) {
 static void push_mouse(PlatformWindow* win, sEventType type, int button, LPARAM lp) {
     sEvent e = {0};
     e.type         = type;
-    e.mouse_x      = GET_X_LPARAM(lp);
-    e.mouse_y      = GET_Y_LPARAM(lp);
+    e.mouse_x      = UNSC(win, GET_X_LPARAM(lp));
+    e.mouse_y      = UNSC(win, GET_Y_LPARAM(lp));
     e.mouse_button = button;
     e.modifiers    = win_modifiers();
     push_event(win, &e);
@@ -219,8 +274,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int delta = GET_WHEEL_DELTA_WPARAM(wp);
             sEvent e = {0};
             e.type        = EVT_MOUSE_WHEEL;
-            e.mouse_x     = p.x;
-            e.mouse_y     = p.y;
+            e.mouse_x     = UNSC(win, p.x);
+            e.mouse_y     = UNSC(win, p.y);
             e.modifiers   = win_modifiers();
             e.wheel_delta = delta > 0 ? 1 : -1;
             if (msg == WM_MOUSEHWHEEL) { e.modifiers |= SV_MOD_SHIFT; e.wheel_delta = -e.wheel_delta; }
@@ -257,8 +312,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_GETMINMAXINFO: {
             MINMAXINFO* mmi = (MINMAXINFO*)lp;
-            mmi->ptMinTrackSize.x = 820;
-            mmi->ptMinTrackSize.y = 520;
+            mmi->ptMinTrackSize.x = SC(win, 820);
+            mmi->ptMinTrackSize.y = SC(win, 520);
             return 0;
         }
 
@@ -270,8 +325,22 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             recreate_backbuffer(win);
             sEvent e = {0};
             e.type       = EVT_RESIZE;
-            e.new_width  = w;
-            e.new_height = h;
+            e.new_width  = UNSC(win, w);
+            e.new_height = UNSC(win, h);
+            push_event(win, &e);
+            return 0;
+        }
+
+        case WM_DPICHANGED: {                       // finestra spostata su un monitor con un'altra scala
+            win->dpi = HIWORD(wp) ? HIWORD(wp) : 96;
+            win->scale = scale_for(win);
+            const RECT* r = (const RECT*)lp;
+            SetWindowPos(hwnd, NULL, r->left, r->top, r->right - r->left, r->bottom - r->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            sEvent e = {0};
+            e.type       = EVT_RESIZE;
+            e.new_width  = UNSC(win, win->width);
+            e.new_height = UNSC(win, win->height);
             push_event(win, &e);
             return 0;
         }
@@ -324,6 +393,7 @@ static void load_bundled_fonts(void) {
 }
 
 bool platform_init(void) {
+    enable_dpi_awareness();
     load_bundled_fonts();
     return true;
 }
@@ -332,6 +402,10 @@ PlatformWindow* platform_window_create(const char* title, int w, int h) {
     PlatformWindow* win = calloc(1, sizeof(PlatformWindow));
     if (!win) return NULL;
 
+    win->dpi    = window_dpi(NULL);
+    win->scale  = scale_for(win);
+    w = SC(win, w);
+    h = SC(win, h);
     win->width  = w;
     win->height = h;
     g_win = win;
@@ -362,6 +436,18 @@ PlatformWindow* platform_window_create(const char* title, int w, int h) {
         GetModuleHandleW(NULL), NULL
     );
     if (!win->hwnd) { free(win); g_win = NULL; return NULL; }
+    {                                               // il monitor della finestra può avere un'altra scala
+        UINT d = window_dpi(win->hwnd);
+        if (d != win->dpi) {
+            int lw = UNSC(win, w), lh = UNSC(win, h);
+            win->dpi = d;
+            win->scale = scale_for(win);
+            RECT r2 = {0, 0, SC(win, lw), SC(win, lh)};
+            AdjustWindowRect(&r2, WS_OVERLAPPEDWINDOW, FALSE);
+            SetWindowPos(win->hwnd, NULL, 0, 0, r2.right - r2.left, r2.bottom - r2.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
 
     // crea il double buffer (evita flickering durante il ridisegno)
     win->hdc     = GetDC(win->hwnd);
@@ -482,36 +568,36 @@ int platform_draw_text_ex(PlatformWindow* win, const char* text, int len, Point 
     if (!text) return 0;
     if (len < 0) len = (int)strlen(text);
     if (len == 0) return 0;
-    FontEntry* fe = get_font(win, size, style);
+    FontEntry* fe = get_font(win, SC(win, size), style);
     WCHAR* w;
     int n = to_wide(text, len, &w);
 
     HFONT old = SelectObject(win->hdc_mem, fe->font);
     SetTextColor(win->hdc_mem, RGB(c.r, c.g, c.b));
     SetBkMode(win->hdc_mem, TRANSPARENT);
-    TextOutW(win->hdc_mem, pos.x, pos.y, w, n);
+    TextOutW(win->hdc_mem, SC(win, pos.x), SC(win, pos.y), w, n);
     SIZE sz;
     GetTextExtentPoint32W(win->hdc_mem, w, n, &sz);
     SelectObject(win->hdc_mem, old);
-    return sz.cx;
+    return UNSC(win, sz.cx);
 }
 
 int platform_measure_text_ex(PlatformWindow* win, const char* text, int len, int size, FontStyle style) {
     if (!text) return 0;
     if (len < 0) len = (int)strlen(text);
     if (len == 0) return 0;
-    FontEntry* fe = get_font(win, size, style);
+    FontEntry* fe = get_font(win, SC(win, size), style);
     WCHAR* w;
     int n = to_wide(text, len, &w);
     HFONT old = SelectObject(win->hdc_mem, fe->font);
     SIZE sz;
     GetTextExtentPoint32W(win->hdc_mem, w, n, &sz);
     SelectObject(win->hdc_mem, old);
-    return sz.cx;
+    return UNSC(win, sz.cx);
 }
 
 int platform_text_height(PlatformWindow* win, int size, FontStyle style) {
-    return get_font(win, size, style)->height;
+    return UNSC(win, get_font(win, SC(win, size), style)->height);
 }
 
 int platform_draw_text(PlatformWindow* win, const char* text, Point pos, Color c, int size) {
@@ -531,7 +617,7 @@ void platform_clear(PlatformWindow* win, Color c) {
     DeleteObject(brush);
 }
 
-void platform_fill_rect(PlatformWindow* win, Rect r, Color c) {
+static void phys_fill_rect(PlatformWindow* win, Rect r, Color c) {
     if (r.w <= 0 || r.h <= 0 || c.a == 0) return;
     if (c.a == 255) {
         HBRUSH brush = CreateSolidBrush(RGB(c.r, c.g, c.b));
@@ -547,19 +633,25 @@ void platform_fill_rect(PlatformWindow* win, Rect r, Color c) {
     GdiAlphaBlend(win->hdc_mem, r.x, r.y, r.w, r.h, win->hdc_px, 0, 0, 1, 1, bf);
 }
 
+void platform_fill_rect(PlatformWindow* win, Rect r, Color c) {
+    phys_fill_rect(win, SCR(win, r), c);
+}
+
 void platform_draw_rect(PlatformWindow* win, Rect r, Color c, int thickness) {
     if (thickness < 1) thickness = 1;
-    platform_fill_rect(win, (Rect){r.x, r.y, r.w, thickness}, c);
-    platform_fill_rect(win, (Rect){r.x, r.y + r.h - thickness, r.w, thickness}, c);
-    platform_fill_rect(win, (Rect){r.x, r.y, thickness, r.h}, c);
-    platform_fill_rect(win, (Rect){r.x + r.w - thickness, r.y, thickness, r.h}, c);
+    r = SCR(win, r);
+    thickness = thickness == 1 ? (win->scale >= 2.0f ? (int)win->scale : 1) : SC(win, thickness);
+    phys_fill_rect(win, (Rect){r.x, r.y, r.w, thickness}, c);
+    phys_fill_rect(win, (Rect){r.x, r.y + r.h - thickness, r.w, thickness}, c);
+    phys_fill_rect(win, (Rect){r.x, r.y, thickness, r.h}, c);
+    phys_fill_rect(win, (Rect){r.x + r.w - thickness, r.y, thickness, r.h}, c);
 }
 
 void platform_draw_line(PlatformWindow* win, Point a, Point b, Color c, int thickness) {
-    HPEN pen = CreatePen(PS_SOLID, thickness, RGB(c.r, c.g, c.b));
+    HPEN pen = CreatePen(PS_SOLID, SC(win, thickness < 1 ? 1 : thickness), RGB(c.r, c.g, c.b));
     HPEN old = SelectObject(win->hdc_mem, pen);
-    MoveToEx(win->hdc_mem, a.x, a.y, NULL);
-    LineTo(win->hdc_mem, b.x, b.y);
+    MoveToEx(win->hdc_mem, SC(win, a.x), SC(win, a.y), NULL);
+    LineTo(win->hdc_mem, SC(win, b.x), SC(win, b.y));
     SelectObject(win->hdc_mem, old);
     DeleteObject(pen);
 }
@@ -567,14 +659,15 @@ void platform_draw_line(PlatformWindow* win, Point a, Point b, Color c, int thic
 // rettangolo arrotondato con angoli antialiasing (stesso algoritmo di xlib.c)
 void platform_fill_rect_rounded(PlatformWindow* win, Rect r, Color c, int radius) {
     if (r.w <= 0 || r.h <= 0) return;
-    int rad = radius;
+    r = SCR(win, r);
+    int rad = SC(win, radius);
     if (rad > r.w / 2) rad = r.w / 2;
     if (rad > r.h / 2) rad = r.h / 2;
-    if (rad <= 0) { platform_fill_rect(win, r, c); return; }
+    if (rad <= 0) { phys_fill_rect(win, r, c); return; }
 
-    platform_fill_rect(win, (Rect){r.x, r.y + rad, r.w, r.h - 2 * rad}, c);
-    platform_fill_rect(win, (Rect){r.x + rad, r.y, r.w - 2 * rad, rad}, c);
-    platform_fill_rect(win, (Rect){r.x + rad, r.y + r.h - rad, r.w - 2 * rad, rad}, c);
+    phys_fill_rect(win, (Rect){r.x, r.y + rad, r.w, r.h - 2 * rad}, c);
+    phys_fill_rect(win, (Rect){r.x + rad, r.y, r.w - 2 * rad, rad}, c);
+    phys_fill_rect(win, (Rect){r.x + rad, r.y + r.h - rad, r.w - 2 * rad, rad}, c);
 
     float rr = (float)rad * (float)rad;
     for (int j = 0; j < rad; j++) {
@@ -593,23 +686,24 @@ void platform_fill_rect_rounded(PlatformWindow* win, Rect r, Color c, int radius
                 pc.a = (uint8_t)(c.a * inside / 16);
                 int lx = r.x + i, rx = r.x + r.w - 1 - i;
                 int ty = r.y + j, by = r.y + r.h - 1 - j;
-                platform_fill_rect(win, (Rect){lx, ty, 1, 1}, pc);
-                platform_fill_rect(win, (Rect){rx, ty, 1, 1}, pc);
-                platform_fill_rect(win, (Rect){lx, by, 1, 1}, pc);
-                platform_fill_rect(win, (Rect){rx, by, 1, 1}, pc);
+                phys_fill_rect(win, (Rect){lx, ty, 1, 1}, pc);
+                phys_fill_rect(win, (Rect){rx, ty, 1, 1}, pc);
+                phys_fill_rect(win, (Rect){lx, by, 1, 1}, pc);
+                phys_fill_rect(win, (Rect){rx, by, 1, 1}, pc);
             }
         }
         int run = rad - full_from;
         if (run > 0) {
-            platform_fill_rect(win, (Rect){r.x + full_from, r.y + j, run, 1}, c);
-            platform_fill_rect(win, (Rect){r.x + r.w - rad, r.y + j, run, 1}, c);
-            platform_fill_rect(win, (Rect){r.x + full_from, r.y + r.h - 1 - j, run, 1}, c);
-            platform_fill_rect(win, (Rect){r.x + r.w - rad, r.y + r.h - 1 - j, run, 1}, c);
+            phys_fill_rect(win, (Rect){r.x + full_from, r.y + j, run, 1}, c);
+            phys_fill_rect(win, (Rect){r.x + r.w - rad, r.y + j, run, 1}, c);
+            phys_fill_rect(win, (Rect){r.x + full_from, r.y + r.h - 1 - j, run, 1}, c);
+            phys_fill_rect(win, (Rect){r.x + r.w - rad, r.y + r.h - 1 - j, run, 1}, c);
         }
     }
 }
 
 void platform_set_clip(PlatformWindow* win, Rect r) {
+    r = SCR(win, r);
     HRGN rgn = CreateRectRgn(r.x, r.y, r.x + r.w, r.y + r.h);
     SelectClipRgn(win->hdc_mem, rgn);
     DeleteObject(rgn);
@@ -619,8 +713,10 @@ void platform_reset_clip(PlatformWindow* win) {
     SelectClipRgn(win->hdc_mem, NULL);
 }
 
-bool platform_read_pixels(PlatformWindow* win, Rect r, uint32_t* out) {
-    if (!win || !out || r.w <= 0 || r.h <= 0 || r.x < 0 || r.y < 0 || r.x + r.w > win->width || r.y + r.h > win->height) return false;
+bool platform_read_pixels(PlatformWindow* win, Rect lr, uint32_t* out) {
+    if (!win || !out || lr.w <= 0 || lr.h <= 0 || lr.x < 0 || lr.y < 0) return false;
+    Rect r = SCR(win, lr);
+    if (r.w <= 0 || r.h <= 0 || r.x + r.w > win->width || r.y + r.h > win->height) return false;
     // copia del backbuffer in una DIB a 32 bit (GetDIBits non vuole bitmap selezionate in un DC)
     BITMAPINFO bmi = {0};
     bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
@@ -637,7 +733,13 @@ bool platform_read_pixels(PlatformWindow* win, Rect r, uint32_t* out) {
     BitBlt(dc, 0, 0, r.w, r.h, win->hdc_mem, r.x, r.y, SRCCOPY);
     GdiFlush();
     const uint32_t* p = (const uint32_t*)bits;      // BGRA in memoria = 0xAARRGGBB
-    for (int i = 0; i < r.w * r.h; i++) out[i] = p[i] & 0x00FFFFFFu;
+    for (int y = 0; y < lr.h; y++)                  // un pixel fisico per pixel logico (il più vicino)
+        for (int x = 0; x < lr.w; x++) {
+            int sx = (int)((float)x * (float)r.w / (float)lr.w), sy = (int)((float)y * (float)r.h / (float)lr.h);
+            if (sx >= r.w) sx = r.w - 1;
+            if (sy >= r.h) sy = r.h - 1;
+            out[y * lr.w + x] = p[sy * r.w + sx] & 0x00FFFFFFu;
+        }
     SelectObject(dc, old);
     DeleteObject(dib);
     DeleteDC(dc);
@@ -656,10 +758,33 @@ void platform_draw_bitmap(PlatformWindow* win, Rect dest, uint32_t* pixels, int 
     bmi.bmiHeader.biPlanes      = 1;
     bmi.bmiHeader.biBitCount    = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
+    dest = SCR(win, dest);
     StretchDIBits(win->hdc_mem,
         dest.x, dest.y, dest.w, dest.h,
         0, 0, pw, ph,
         pixels, &bmi, DIB_RGB_COLORS, SRCCOPY);
+}
+
+// -- scala --
+
+float platform_ui_scale(PlatformWindow* win) { return win ? win->scale : 1.0f; }
+
+void platform_set_ui_scale(PlatformWindow* win, float scale) {
+    if (!win) return;
+    win->scale_req = scale > 0 ? scale : 0;
+    float s = scale_for(win);
+    if (fabsf(s - win->scale) < 0.001f) return;
+    int lw = UNSC(win, win->width), lh = UNSC(win, win->height);
+    win->scale = s;
+    RECT r = {0, 0, SC(win, lw), SC(win, lh)};
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    if (!IsZoomed(win->hwnd))
+        SetWindowPos(win->hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    sEvent e = {0};
+    e.type       = EVT_RESIZE;
+    e.new_width  = UNSC(win, win->width);
+    e.new_height = UNSC(win, win->height);
+    push_event(win, &e);
 }
 
 // -- cursore --

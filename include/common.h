@@ -13,6 +13,14 @@ SCOPO: Header incluso da TUTTI i moduli del progetto.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "sv_alloc.h"
+
+// modo di fopen che chiude il file nei processi figli (O_CLOEXEC): "e" con glibc, nulla altrove
+#if defined(__GLIBC__)
+  #define SV_FE "e"
+#else
+  #define SV_FE ""
+#endif
 
 // versioni
 #define SV_VERSION_MAJOR 1
@@ -30,9 +38,9 @@ SCOPO: Header incluso da TUTTI i moduli del progetto.
 #define SV_DUPLICATE -4  // elemento già esistente
 #define SV_IO_ERROR  -5 // errore di I/O su  disco 
 
-#define SV_MAX_DATABASES    64   // max database
-#define SV_MAX_TABLES       256  // max tabelle per db
-#define SV_MAX_COLUMNS      64   // max colonne per tabella
+#define SV_MAX_DATABASES    100000   // max database (liste dinamiche dal formato v6 del catalogo)
+#define SV_MAX_TABLES       1000000  // max tabelle per db (liste dinamiche)
+#define SV_MAX_COLUMNS      1024 // max colonne per tabella (MySQL: 4096, InnoDB: 1017)
 #define SV_MAX_INDEXES      16   // max index per tabella
 #define SV_MAX_NAME_LEN     64   // max lunghezza nomi tabelle, colonne
 #define SV_MAX_SQL_LEN     65536 // max lunghezza di una query SQL
@@ -77,7 +85,7 @@ SCOPO: Header incluso da TUTTI i moduli del progetto.
 #define SV_CLAMP(v, lo, hi) (SV_MIN(SV_MAX((v), (lo)), (hi))) // se v < lo => v = lo; se v > hi => v = hi; mantiene v in un range di valori passati
 #define SV_ARRAY_LEN(arr) (sizeof(arr) / sizeof((arr)[0]))
 
-#define SV_ALLOC(type) ((type*)calloc(1, sizeof(type))) // alloca e azzera — simile a calloc ma per tipo singolo
-#define SV_ALLOC_N(type, n) ((type*)calloc((n), sizeof(type))) // alloca array e azzera
+#define SV_ALLOC(type) ((type*)sv_calloc(1, sizeof(type))) // alloca e azzera — simile a calloc ma per tipo singolo
+#define SV_ALLOC_N(type, n) ((type*)sv_calloc((n), sizeof(type))) // alloca array e azzera
 
 #endif

@@ -207,7 +207,7 @@ static void select_result_tab(AppWindow* app, int i) {
 // legge un file di testo (max SV_MAX_SQL_LEN - 1 byte); malloc'd o NULL
 static char* read_text_file(const char* path, bool* truncated) {
     if (truncated) *truncated = false;
-    FILE* f = fopen(path, "rb");
+    FILE* f = fopen(path, "rb" SV_FE);
     if (!f) return NULL;
     size_t cap = SV_MAX_SQL_LEN;
     char* buf = malloc(cap);
@@ -223,7 +223,7 @@ static char* read_text_file(const char* path, bool* truncated) {
 }
 
 static bool write_text_file(const char* path, const char* text) {
-    FILE* f = fopen(path, "wb");
+    FILE* f = fopen(path, "wb" SV_FE);
     if (!f) return false;
     size_t n = strlen(text);
     bool ok = fwrite(text, 1, n, f) == n;
@@ -355,7 +355,7 @@ static void history_add(AppWindow* app, const char* sql, bool ok, int rows, doub
     if (!app->data_dir[0]) return;
     char path[1100];
     join_path(path, sizeof(path), app->data_dir, HISTORY_FILE);
-    FILE* f = fopen(path, "ab");
+    FILE* f = fopen(path, "ab" SV_FE);
     if (!f) return;
     fprintf(f, HISTORY_MARK "%s | %s | %d | %.2f\n%s\n", when, ok ? "ok" : "error", rows, ms, copy);
     fclose(f);
@@ -364,7 +364,7 @@ static void history_add(AppWindow* app, const char* sql, bool ok, int rows, doub
 static void history_load(AppWindow* app) {
     char path[1100];
     join_path(path, sizeof(path), app->data_dir, HISTORY_FILE);
-    FILE* f = fopen(path, "rb");
+    FILE* f = fopen(path, "rb" SV_FE);
     if (!f) return;
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
@@ -416,7 +416,7 @@ static void saved_write(AppWindow* app) {
     char path[1100], tmp[1110];
     join_path(path, sizeof(path), app->data_dir, SAVED_FILE);
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    FILE* f = fopen(tmp, "wb");
+    FILE* f = fopen(tmp, "wb" SV_FE);
     if (!f) return;
     fprintf(f, "-- SegVault saved queries (Query > Saved queries)\n");
     for (int i = 0; i < app->saved_count; i++) fprintf(f, SAVED_MARK "%s\n%s\n", app->saved[i].name, app->saved[i].sql);
@@ -428,7 +428,7 @@ static void saved_write(AppWindow* app) {
 static void saved_load(AppWindow* app) {
     char path[1100];
     join_path(path, sizeof(path), app->data_dir, SAVED_FILE);
-    FILE* f = fopen(path, "rb");
+    FILE* f = fopen(path, "rb" SV_FE);
     if (!f) return;
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
@@ -847,12 +847,119 @@ static void on_tree_select(TreeNode* node, void* ud) {
     }
 }
 
+// ── chiamate al motore dalla GUI ─────────────────────────────────
+// Ogni statement lanciato da un gestore di eventi (anteprima di una tabella, chiavi esterne, modifica
+// della griglia, Designer, import, dump...) gira in un thread di lavoro: il motore può aspettare il lock
+// di un'altra sessione (server PHP / MySQL nello stesso processo, fino a 30 s) o leggere una tabella
+// grande. Intanto la finestra resta viva: dopo 150 ms compare "Waiting for the database" con Cancel
+// (anche Esc), che ferma una SELECT o l'attesa di un lock. In attesa si ridisegna solo il riquadro sopra
+// l'ultimo fotogramma (lo stato dell'app è a metà di un gestore: non si tocca), un ridimensionamento
+// viene applicato dopo, la chiusura della finestra pure.
+typedef struct {
+    const char*  sql;
+    QueryResult* res;
+    atomic_int   done;
+    atomic_int   cancel;
+} UiExec;
+
+static AppWindow* s_ui_app;          // finestra principale (per ui_exec delle funzioni senza app)
+static atomic_int s_ui_waits;        // attese mostrate (per i test)
+
+static void ui_exec_worker(void* arg) {
+    UiExec* u = (UiExec*)arg;
+    db_set_thread_cancel(&u->cancel);
+    u->res = db_execute(u->sql);
+    db_set_thread_cancel(NULL);
+    atomic_store(&u->done, 1);
+}
+
+static Rect ui_wait_box(int win_w, int win_h, Rect* cancel_btn) {
+    int w = 380, h = 64;
+    Rect box = { (win_w - w) / 2, (win_h - h) / 2, w, h };
+    if (cancel_btn) *cancel_btn = (Rect){ box.x + box.w - 96, box.y + 16, 80, 32 };
+    return box;
+}
+
+static void ui_wait_draw(AppWindow* app, int win_w, int win_h, uint64_t since, bool cancelling) {
+    PlatformWindow* win = app->win;
+    Rect cb;
+    Rect box = ui_wait_box(win_w, win_h, &cb);
+    ui_round_box(win, (Rect){box.x - 1, box.y - 1, box.w + 2, box.h + 2}, TH_BORDER_STRONG, TH_BORDER_STRONG, 9);
+    ui_round_box(win, box, TH_ELEVATED, TH_BORDER, 8);
+    char msg[96];
+    unsigned secs = (unsigned)((platform_time_ms() - since) / 1000);
+    snprintf(msg, sizeof(msg), cancelling ? "Cancelling\xe2\x80\xa6" : "Waiting for the database\xe2\x80\xa6 %us", secs);
+    int fs = TH_FONT_UI;
+    platform_draw_text_ex(win, msg, -1, (Point){box.x + 18, box.y + 14}, TH_TEXT, fs, FONT_UI_BOLD);
+    platform_draw_text_ex(win, "Another session may hold a lock \xc2\xb7 Esc cancels", -1,
+                          (Point){box.x + 18, box.y + 36}, TH_TEXT_DIM, TH_FONT_SMALL, FONT_UI);
+    ui_round_box(win, cb, cancelling ? TH_ELEVATED_PRESS : TH_ELEVATED_HOVER, TH_BORDER_STRONG, 6);
+    int tw = platform_measure_text_ex(win, "Cancel", -1, fs, FONT_UI);
+    platform_draw_text_ex(win, "Cancel", -1, (Point){cb.x + (cb.w - tw) / 2, ui_text_y(win, cb, fs, FONT_UI)},
+                          TH_TEXT, fs, FONT_UI);
+    platform_present(win);
+}
+
+static QueryResult* ui_exec(const char* sql) {
+    AppWindow* app = s_ui_app;
+    if (!app || !app->win) return db_execute(sql);
+    UiExec* u = calloc(1, sizeof(UiExec));
+    if (!u) return db_execute(sql);
+    u->sql = sql;
+    PlatformThread* t = platform_thread_start(ui_exec_worker, u);
+    if (!t) { free(u); return db_execute(sql); }
+    uint64_t t0 = platform_time_ms(), last_draw = 0;
+    bool shown = false, cancelling = false;
+    int pend_w = 0, pend_h = 0, cur_w = app->win_w, cur_h = app->win_h;
+    while (!atomic_load(&u->done)) {
+        uint64_t now = platform_time_ms();
+        bool redraw = false;
+        if (!shown && now - t0 >= 150) { shown = true; redraw = true; atomic_fetch_add(&s_ui_waits, 1); }
+        sEvent ev;
+        while (platform_poll_event(app->win, &ev)) {
+            switch (ev.type) {
+                case EVT_PAINT: redraw = shown; break;
+                case EVT_RESIZE:                         // il contenuto è da rifare: sfondo + riquadro
+                    pend_w = cur_w = ev.new_width; pend_h = cur_h = ev.new_height;
+                    if (shown) platform_clear(app->win, TH_BG);
+                    redraw = shown;
+                    break;
+                case EVT_QUIT: app->quit_requested = true; /* fallthrough */
+                case EVT_KEY_DOWN:
+                    if (ev.type == EVT_QUIT || ev.key == KEY_ESCAPE) { cancelling = true; atomic_store(&u->cancel, 1); redraw = shown; }
+                    break;
+                case EVT_MOUSE_DOWN: {
+                    Rect cb;
+                    ui_wait_box(cur_w, cur_h, &cb);
+                    if (shown && ev.mouse_x >= cb.x && ev.mouse_x < cb.x + cb.w && ev.mouse_y >= cb.y && ev.mouse_y < cb.y + cb.h) {
+                        cancelling = true;
+                        atomic_store(&u->cancel, 1);
+                        redraw = true;
+                    }
+                    break;
+                }
+                default: break;                          // il resto dell'input è ignorato finché si aspetta
+            }
+        }
+        if (shown && now - last_draw >= 1000) redraw = true;      // contatore dei secondi
+        if (redraw) { ui_wait_draw(app, cur_w, cur_h, t0, cancelling); last_draw = now; }
+        platform_wait_event(app->win, 15);
+    }
+    platform_thread_join(t);
+    QueryResult* r = u->res;
+    free(u);
+    if (pend_w > 0 && pend_h > 0) app_window_resize(app, pend_w, pend_h);
+    return r;
+}
+
+int app_window_ui_waits(void) { return atomic_load(&s_ui_waits); }
+
 static bool use_database(AppWindow* app, const char* db) {
     const char* cur = db_current_database();
     if (cur && strcmp(cur, db) == 0) return true;
     char sql[256];
     snprintf(sql, sizeof(sql), "USE `%.200s`;", db);
-    QueryResult* r = db_execute(sql);
+    QueryResult* r = ui_exec(sql);
     bool ok = r && r->success;
     if (r) db_result_free(r);
     update_session(app);
@@ -864,7 +971,7 @@ static void preview_table(AppWindow* app, const char* db, const char* table) {
     if (db) use_database(app, db);
     char sql[256];
     snprintf(sql, sizeof(sql), "SELECT * FROM %.120s LIMIT 200;", table);
-    QueryResult* r = db_execute(sql);
+    QueryResult* r = ui_exec(sql);
     char msg[256], meta[128];
     app->page = PAGE_SQL;
     if (r && r->success) {
@@ -981,7 +1088,7 @@ static bool fk_follow(AppWindow* app, bool parent, bool run) {
     snprintf(sql, sizeof(sql), "SELECT * FROM `%.63s` WHERE `%.63s` = %.1000s LIMIT 200;", target, tcol, lit ? lit : "NULL");
     free(lit);
     if (db) use_database(app, db);
-    QueryResult* r = db_execute(sql);
+    QueryResult* r = ui_exec(sql);
     char msg[300], meta[128];
     if (r && r->success) {
         r->sql = strdup(sql);
@@ -1262,7 +1369,7 @@ static void bar_submit(AppWindow* app, bool shift, bool ctrl) {
             const char* title = app->results->result && app->results->result->sql ? app->results->result->sql : "SegVault export";
             unsigned char* out = export_result_bin(app->results, fmt, &o, title, &olen);
             if (!out) { set_status(app, STATUS_INFO, "Nothing to export: run a query first", ""); bar_close(app); return; }
-            FILE* ef = fopen(path, "wb");
+            FILE* ef = fopen(path, "wb" SV_FE);
             bool ok = ef && fwrite(out, 1, olen, ef) == olen;
             if (ef && fclose(ef) != 0) ok = false;
             free(out);
@@ -1825,11 +1932,11 @@ static QueryResult* gedit_exec(AppWindow* app, const char* sql) {
     if (cur) snprintf(prev, sizeof(prev), "%s", cur);
     bool switched = app->gedit.db[0] && strcmp(prev, app->gedit.db) != 0;
     char use[96];
-    if (switched) { snprintf(use, sizeof(use), "USE `%.60s`", app->gedit.db); db_result_free(db_execute(use)); }
+    if (switched) { snprintf(use, sizeof(use), "USE `%.60s`", app->gedit.db); db_result_free(ui_exec(use)); }
     uint64_t t0 = platform_time_ms();
-    QueryResult* r = db_execute(sql);
+    QueryResult* r = ui_exec(sql);
     double ms = (double)(platform_time_ms() - t0);
-    if (switched && prev[0]) { snprintf(use, sizeof(use), "USE `%.60s`", prev); db_result_free(db_execute(use)); }
+    if (switched && prev[0]) { snprintf(use, sizeof(use), "USE `%.60s`", prev); db_result_free(ui_exec(use)); }
     history_add(app, sql, r && r->success, r ? r->rows_affected : 0, ms);
     return r;
 }
@@ -1864,9 +1971,9 @@ static bool gedit_refetch(AppWindow* app, int src, int t, const char* const* key
     if (cur) snprintf(prev, sizeof(prev), "%s", cur);
     bool switched = app->gedit.db[0] && strcmp(prev, app->gedit.db) != 0;
     char use[96];
-    if (switched) { snprintf(use, sizeof(use), "USE `%.60s`", app->gedit.db); db_result_free(db_execute(use)); }
-    QueryResult* fr = db_execute(sql);
-    if (switched && prev[0]) { snprintf(use, sizeof(use), "USE `%.60s`", prev); db_result_free(db_execute(use)); }
+    if (switched) { snprintf(use, sizeof(use), "USE `%.60s`", app->gedit.db); db_result_free(ui_exec(use)); }
+    QueryResult* fr = ui_exec(sql);
+    if (switched && prev[0]) { snprintf(use, sizeof(use), "USE `%.60s`", prev); db_result_free(ui_exec(use)); }
     free(sql);
     bool ok = fr && fr->success && fr->num_rows == 1;
     if (ok) {
@@ -3084,7 +3191,7 @@ static int exec_statements(const char* sql, int* total, char* err, size_t errn) 
     for (char* p = copy; p; ) {
         char* e = strstr(p, ";\n");
         if (e) *e = '\0';
-        QueryResult* r = db_execute(p);
+        QueryResult* r = ui_exec(p);
         bool ok = r && r->success;
         if (!ok) snprintf(err, errn, "%.380s", r ? r->error : "no response");
         db_result_free(r);
@@ -3188,7 +3295,7 @@ static void confirm_open(AppWindow* app, const char* db, char* sql, bool drop_db
 static long long count_rows(const char* table) {
     char sql[200];
     snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM `%.120s`", table);
-    QueryResult* r = db_execute(sql);
+    QueryResult* r = ui_exec(sql);
     long long n = r && r->success && r->num_rows ? atoll(r->rows[0].cells[0].value) : -1;
     db_result_free(r);
     return n;
@@ -3334,7 +3441,7 @@ static void designer_apply(AppWindow* app) {
     for (char* p = sql; p; ) {
         char* e = strstr(p, ";\n");
         if (e) *e = '\0';
-        QueryResult* r = db_execute(p);
+        QueryResult* r = ui_exec(p);
         bool ok = r && r->success;
         if (!ok) snprintf(err, sizeof(err), "%.380s", r ? r->error : "no response");
         db_result_free(r);
@@ -3512,7 +3619,7 @@ static void ctx_run(AppWindow* app, int a) {
             break;
         }
         case CTX_BEGIN: {
-            QueryResult* r = db_execute("BEGIN");
+            QueryResult* r = ui_exec("BEGIN");
             bool ok = r && r->success;
             db_result_free(r);
             update_session(app);
@@ -3643,7 +3750,7 @@ static void ctx_run(AppWindow* app, int a) {
             if (!d || !use_database(app, d)) break;
             char sql[256];
             snprintf(sql, sizeof(sql), "SHOW CREATE TABLE %.120s", t->label);
-            QueryResult* r = db_execute(sql);
+            QueryResult* r = ui_exec(sql);
             if (r && r->success && r->num_rows > 0 && r->num_cols > 1 && !r->rows[0].cells[1].is_null) {
                 editor_append(app, r->rows[0].cells[1].value);
                 set_status(app, STATUS_OK, "CREATE TABLE inserted into the editor", t->label);
@@ -3845,6 +3952,7 @@ static int settings_rows(int section, int* out, int max) {
 static void apply_settings(AppWindow* app) {
     Settings* s = &g_settings;
     g_ui_font = SV_CLAMP(s->ui_font_size, 11, 16);
+    if (app->win) platform_set_ui_scale(app->win, settings_ui_scale());   // EVT_RESIZE se cambia
     unsigned char rgb[3];
     bool custom = settings_accent_color(rgb);
     theme_set_accent(custom, (Color){rgb[0], rgb[1], rgb[2], 255});
@@ -4158,7 +4266,7 @@ static void draw_info(AppWindow* app) {
 
 // legge un file intero (max 256 MB); malloc'd o NULL
 static char* read_whole_file(const char* path, size_t* out_len) {
-    FILE* f = fopen(path, "rb");
+    FILE* f = fopen(path, "rb" SV_FE);
     if (!f) return NULL;
     size_t cap = 1 << 16, n = 0;
     char* buf = malloc(cap);
@@ -4271,7 +4379,7 @@ static bool dump_database(AppWindow* app, const char* path) {
             db_free_string(create);
         }
         snprintf(line, sizeof(line), "SELECT * FROM %s", t);
-        QueryResult* r = db_execute(line);
+        QueryResult* r = ui_exec(line);
         if (r && r->success) {
             for (int k = 0; k < r->num_rows; k++) {
                 snprintf(line, sizeof(line), "INSERT INTO %s VALUES (", t);
@@ -4621,6 +4729,7 @@ AppWindow* app_window_create(PlatformWindow* win, int width, int height) {
     if (!app) return NULL;
 
     app->win    = win;
+    if (win) { s_ui_app = app; dbt_set_exec(ui_exec); }
     app->server = server_panel_create(win);
     app->start.hover = -1;
     app->win_w  = width;
@@ -5939,7 +6048,7 @@ static void finish_run(AppWindow* app) {
 
     bool changed = j->changed;
     // un dump fermato a metà lascerebbe SET FOREIGN_KEY_CHECKS = 0 nella sessione dell'editor
-    if (j->import) db_result_free(db_execute("SET FOREIGN_KEY_CHECKS = 1"));
+    if (j->import) db_result_free(ui_exec("SET FOREIGN_KEY_CHECKS = 1"));
     job_free(j);
     db_clear_cancel();
 
@@ -5950,6 +6059,7 @@ static void finish_run(AppWindow* app) {
 
 void app_window_destroy(AppWindow* app) {
     if (!app) return;
+    if (s_ui_app == app) { s_ui_app = NULL; dbt_set_exec(NULL); }
     server_panel_destroy(app->server);      // prima del motore: le richieste in corso finiscono qui
     app->server = NULL;
     if (app->job) {   // chiusura durante un'esecuzione: annulla e attende il thread prima di chiudere il motore
@@ -6024,7 +6134,7 @@ void app_window_set_data_dir(AppWindow* app, const char* dir) {
 
     int cursor = 0, modified = 0;
     join_path(path, sizeof(path), dir, SESSION_META);
-    FILE* f = fopen(path, "rb");
+    FILE* f = fopen(path, "rb" SV_FE);
     if (f) {
         char line[1200];
         while (fgets(line, sizeof(line), f)) {
@@ -6096,7 +6206,7 @@ void app_window_save_session(AppWindow* app) {
     join_path(path, sizeof(path), app->data_dir, SESSION_TEXT);
     write_text_file(path, textbox_get_text(app->editor));
     join_path(path, sizeof(path), app->data_dir, SESSION_META);
-    FILE* f = fopen(path, "wb");
+    FILE* f = fopen(path, "wb" SV_FE);
     if (!f) return;
     fprintf(f, "file=%s\ncursor=%d\nmodified=%d\nfont=%d\ntheme=%s\nsidebar=%d\n",
             app->file_path, app->editor->cursor_pos, app->modified ? 1 : 0, app->editor->font_size,

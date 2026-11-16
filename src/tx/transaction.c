@@ -1,8 +1,9 @@
 #include "transaction.h"
 #include <string.h>
+#include "sv_alloc.h"
 
 TxManager* txm_create(void) {
-    TxManager* txm = calloc(1, sizeof(TxManager));
+    TxManager* txm = sv_calloc(1, sizeof(TxManager));
     txm->autocommit = true;
     txm->next_tx_id = 1;
     return txm;

@@ -11,7 +11,7 @@ SCOPO: Struttura e operazioni su una pagina disco (4 KB).
 
 #include "../../include/common.h"
 
-#define SV_PAGE_HEADER_SIZE  12   // Byte occupati dall'header (id+free+slots+flags)
+#define SV_PAGE_HEADER_SIZE  24   // Byte occupati dall'header (id+free+slots+flags+next+lsn+crc), formato 2
 #define SV_SLOT_ENTRY_SIZE    4   // Byte per ogni entry nella slot directory
 #define SV_MAX_SLOTS        ((SV_PAGE_SIZE - SV_PAGE_HEADER_SIZE) / SV_SLOT_ENTRY_SIZE)
 
@@ -28,9 +28,24 @@ typedef struct {
     uint16_t num_slots;                      // numero di slot occupati
     uint16_t flags;                          // bitmask PAGE_FLAG_*
     uint16_t next_page_id;                   // prossima pagina nella chain (0 = fine)
+    // ── dal formato 2 del file dei dati (SegVault 1.4) ──
+    uint64_t lsn;                            // LSN dell'ultimo record del log applicato alla pagina (0 = nessuno)
+    uint32_t crc;                            // CRC-32C dei 4096 byte con questo campo a 0 (scritto da page_write)
     uint8_t  data[SV_PAGE_SIZE - SV_PAGE_HEADER_SIZE]; // payload
 } Page;
 #pragma pack(pop)
+_Static_assert(sizeof(Page) == SV_PAGE_SIZE, "Page deve essere esattamente SV_PAGE_SIZE byte");
+
+// ── file dei dati: la pagina 0 è l'intestazione (formato 2) ──
+//   "SVDATA2\0" | uint32 formato | uint32 dimensione della pagina | uint64 LSN da cui ripartire con un log nuovo |
+//   uint32 CRC-32C dei 24 byte precedenti. I file del formato 1 (pagina 0 vuota, intestazioni di 12 byte senza
+//   LSN né CRC) vengono convertiti all'apertura (vedi page_migrate.c).
+#define SV_DATA_MAGIC   "SVDATA2"
+#define SV_DATA_FORMAT  2u
+bool page_header_read(int fd, uint64_t* next_lsn);        // true se il file è del formato 2
+int  page_header_write(int fd, uint64_t next_lsn);        // SV_OK / SV_IO_ERROR (senza fsync)
+// CRC della pagina giusto (pagina letta dal disco)
+bool page_crc_ok(const Page* p);
 
 // Una slot entry: descrive dove si trova una tuple nel data[]
 typedef struct {

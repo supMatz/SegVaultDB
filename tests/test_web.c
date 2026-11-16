@@ -15,6 +15,8 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <errno.h>
+#include <time.h>
 
 static int g_fail = 0, g_count = 0;
 #define CHECK(cond, ...) do { g_count++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -286,6 +288,52 @@ int main(void) {
         if (fd >= 0) close(fd);
     }
 
+    // P2.4: corpo mandato a gocce (meno di 1 KB/s oltre i 10 s): connessione chiusa, il posto si libera
+    {
+        int fd = connect_to(port);
+        const char* h = "POST /api/v1/query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n{";
+        if (fd >= 0 && send(fd, h, strlen(h), MSG_NOSIGNAL) > 0) {
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            bool closed = false;
+            for (int i = 0; i < 30 && !closed; i++) {       // un byte ogni 0,5 s per al massimo 15 s
+                if (send(fd, " ", 1, MSG_NOSIGNAL) < 0) closed = true;
+                struct timeval tv = { 0, 500000 };
+                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                char b2[64];
+                ssize_t g = recv(fd, b2, sizeof(b2), 0);
+                if (g == 0 || (g < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) closed = true;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double secs = (double)(t1.tv_sec - t0.tv_sec);
+            CHECK(closed && secs >= 9 && secs <= 14, "slow request body: connection closed after the grace period (%.0f s)", secs);
+        } else CHECK(0, "slow body: connect");
+        if (fd >= 0) close(fd);
+    }
+    // P2.3: intestazioni oltre --max-header-size: 431 (qui 8 KB; predefinito 64 KB)
+    {
+        SvServerConfig hc = { .port = 0, .quiet = true, .max_header = 8 << 10 };
+        SvServer* hs = sv_server_start(&hc, err, sizeof(err));
+        pthread_t ht;
+        pthread_create(&ht, NULL, run_server, hs);
+        char big[12000];
+        int bl = snprintf(big, sizeof(big), "GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\nX-Pad: %09000d\r\nConnection: close\r\n\r\n", 0);
+        int fd = connect_to(sv_server_port(hs));
+        wr(fd, big, (size_t)bl);
+        Resp hr = {0};
+        CHECK(read_resp(fd, &hr, false) && hr.status == 431, "9 KB of headers with --max-header-size 8: %d", hr.status);
+        free(hr.body);
+        close(fd);
+        fd = connect_to(port);                           // il server predefinito (64 KB) le accetta
+        wr(fd, big, (size_t)bl);
+        CHECK(read_resp(fd, &hr, false) && hr.status == 200, "the same headers with the default limit: %d", hr.status);
+        free(hr.body);
+        close(fd);
+        sv_server_stop(hs);
+        pthread_join(ht, NULL);
+        sv_server_free(hs);
+    }
+
     // ── siti automatici ──
     r = get(port, "blog.localhost", "/");
     CHECK(r.status == 200 && has(&r, "blog home"), "blog.localhost: %d %s", r.status, r.body);
@@ -464,7 +512,7 @@ int main(void) {
         snprintf(want, sizeof(want), "port %d (web) is in use by test_web", bp);
         CHECK(!x && strstr(err, want) && strstr(err, "(mail catcher) is in use"), "busy ports reported with their owner: %s", err);
         char who[160];
-        CHECK(sv_port_owner(bp, who, sizeof(who)) && strstr(who, "test_web (pid "), "port owner: %s", who);
+        CHECK(sv_port_owner(bp, who, sizeof(who)) && strstr(who, "test_web") && strstr(who, " (pid "), "port owner: %s", who);
         sv_server_free(busy);
     }
 
@@ -478,6 +526,12 @@ int main(void) {
         put(f, "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\nX-Cgi: yes\\r\\n\\r\\n'\n"
                "echo \"method=$REQUEST_METHOD query=$QUERY_STRING info=$PATH_INFO script=$SCRIPT_NAME gw=$GATEWAY_INTERFACE\"\n"
                "echo \"body=$(cat)\"\necho \"cwd=$(basename \"$(pwd)\")\"\necho oops >&2\n");
+        chmod(f, 0755);
+        snprintf(f, sizeof(f), "%s/cgi-bin/fds.cgi", cg);                // P2.10: quali descrittori eredita
+        put(f, "#!/bin/sh\nprintf 'Content-Type: text/plain\\n\\n'\nls /proc/$$/fd | sort -n | tr '\\n' ' '\n");
+        chmod(f, 0755);
+        snprintf(f, sizeof(f), "%s/cgi-bin/count.cgi", cg);              // P2.4: corpo grande, letto da disco
+        put(f, "#!/bin/sh\nprintf 'Content-Type: text/plain\\n\\n'\nn=$(wc -c | tr -d ' ')\necho \"bytes=$n\"\n");
         chmod(f, 0755);
         snprintf(f, sizeof(f), "%s/cgi-bin/status.cgi", cg);
         put(f, "#!/bin/sh\nprintf 'Status: 404 Not Found\\nContent-Type: text/html\\n\\n<p>custom 404</p>'\n");
@@ -497,6 +551,10 @@ int main(void) {
         pthread_t tc;
         pthread_create(&tc, NULL, run_server, sc);
         int cp = sv_server_port(sc);
+        r = get(cp, "localhost", "/cgi-bin/fds.cgi");
+        CHECK(r.status == 200 && r.body && !strncmp(r.body, "0 1 2 ", 6) && strlen(r.body) <= 10,
+              "a CGI program inherits only stdin / stdout / stderr: %s", r.body ? r.body : "");
+        free(r.body);
         r = get(cp, "localhost", "/cgi-bin/env.cgi/extra/path?a=1&b=2");
         CHECK(r.status == 200 && strcasestr(r.head, "X-Cgi: yes") && has(&r, "method=GET query=a=1&b=2 info=/extra/path script=/cgi-bin/env.cgi gw=CGI/1.1") &&
               has(&r, "cwd=cgi-bin"), "sh CGI: %d %s", r.status, r.body);
@@ -512,6 +570,30 @@ int main(void) {
         }
         SvLogEntry le;
         CHECK(sv_server_recent(sc, &le, 1) == 1 && !strcmp(le.svc, "cgi") && strstr(le.detail, "oops"), "stderr in the log: %s %s", le.svc, le.detail);
+        {   // P2.4: un corpo di 5 MB passa dal file temporaneo al programma intero, e la richiesta che lo segue
+            // sulla stessa connessione (pipelining) non va persa
+            size_t big = 5u << 20;
+            char head[200];
+            int hl = snprintf(head, sizeof(head), "POST /cgi-bin/count.cgi HTTP/1.1\r\nHost: localhost\r\nContent-Length: %zu\r\n\r\n", big);
+            const char* next = "GET /cgi-bin/count.cgi HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            size_t tot = (size_t)hl + big + strlen(next);
+            char* msg = malloc(tot);
+            memcpy(msg, head, (size_t)hl);
+            for (size_t i = 0; i < big; i++) msg[hl + i] = (char)('a' + i % 26);
+            memcpy(msg + hl + big, next, strlen(next));
+            int fd = connect_to(cp);
+            wr(fd, msg, tot);
+            free(msg);
+            char all[16384];
+            size_t al = 0;
+            ssize_t g;
+            while (al < sizeof(all) - 1 && (g = recv(fd, all + al, sizeof(all) - 1 - al, 0)) > 0) al += (size_t)g;
+            all[al] = 0;
+            char* b1 = strstr(all, "bytes=5242880");
+            CHECK(!strncmp(all, "HTTP/1.1 200", 12) && b1, "5 MB body through the spool file: %.200s", all);
+            CHECK(b1 && strstr(b1, "HTTP/1.1 200") && strstr(b1, "bytes=0"), "pipelined request after a spooled body: %.400s", all);
+            close(fd);
+        }
         r = get(cp, "localhost", "/cgi-bin/status.cgi");
         CHECK(r.status == 404 && has(&r, "custom 404"), "Status: header: %d %s", r.status, r.body);
         free(r.body);

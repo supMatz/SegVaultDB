@@ -114,6 +114,8 @@ typedef struct ASTExpr {
     SubQuery* subq;           // EXPR_SUBQUERY
     int      subkind;         // EXPR_SUBQUERY: SUBQ_*
     WindowSpec* win;          // EXPR_WINDOW
+    int      param;           // > 0: segnaposto '?' numero param (1 = il primo nel testo) di un prepared
+                              // statement; il nodo è un letterale (EXPR_NULL finché non riceve un valore)
 } ASTExpr;
 
 // libera un'espressione e tutti i suoi figli
@@ -247,8 +249,8 @@ typedef struct ASTNode {
     int      set_n;
     union {
         struct {
-            ASTExpr*   columns[64];
-            int        num_cols;
+            ASTExpr**  columns;          // num_cols espressioni (lista dinamica dal P1.11, prima 64 al massimo)
+            int        num_cols, cap_cols;
             char       table_name[64];
             char       table_alias[64];  // "" = nessun alias
             char       show_like[128];   // SHOW TABLES / DATABASES LIKE 'p'
@@ -284,8 +286,8 @@ typedef struct ASTNode {
         } select_stmt;
         struct {
             char       table_name[64];
-            char*      columns[64];
-            int        num_cols;
+            char**     columns;        // lista dinamica (P1.11)
+            int        num_cols, cap_cols;
             ASTExpr**  values;         // num_rows * num_values espressioni (riga per riga)
             int        num_values;     // valori per riga
             int        num_rows;
@@ -327,8 +329,8 @@ typedef struct ASTNode {
         } drop_db;
         struct {
             char       table_name[64];
-            ColumnDef  columns[64];
-            int        num_columns;
+            ColumnDef* columns;               // lista dinamica (P1.11: fino a SV_MAX_COLUMNS colonne)
+            int        num_columns, cap_columns;
             ConstraintDef cons[SV_MAX_CONS_DEFS];
             int        num_cons;
             TableKeyDef keys[SV_MAX_KEY_DEFS];
@@ -432,6 +434,7 @@ typedef struct ASTNode {
         struct {
             void*      stmt;           // ASTNode* della SELECT da spiegare
             bool       analyze;        // EXPLAIN ANALYZE: esegue la query e mostra le righe reali
+            bool       json;           // EXPLAIN FORMAT=JSON: una riga con il piano in JSON (vista del piano della GUI)
         } explain;
     };
 } ASTNode;
@@ -445,6 +448,11 @@ typedef struct {
 } ParseResult;
 
 ParseResult* parser_parse(TokenList* tokens);
+// prepared statement analizzati una volta (P2.2): fra begin ed end il parser accetta i '?' e ricorda ogni
+// nodo che li rappresenta (anche le copie fatte durante l'analisi); end restituisce l'elenco (da liberare con
+// free, i nodi appartengono all'albero). Fuori da begin / end un '?' è un errore di sintassi.
+void parser_params_begin(void);
+int  parser_params_end(ASTExpr*** nodes);
 // una sola espressione (vincoli CHECK salvati nel catalogo); NULL con il messaggio in err
 ASTExpr*    parser_parse_expr(TokenList* tokens, char* err, size_t errn);
 void        ast_node_free(ASTNode* n);
@@ -531,5 +539,10 @@ TrigProgram* parser_parse_trigger(TokenList* tokens);
 // corpo di una procedura dal token start: BEGIN ... END oppure una sola istruzione
 TrigProgram* parser_parse_procedure(TokenList* tokens, int start);
 void         trig_program_free(TrigProgram* p);
+
+// liste dinamiche dei nodi (P1.11): false senza memoria o oltre SV_MAX_COLUMNS
+bool ast_select_push(ASTNode* n, ASTExpr* e);
+bool ast_insert_push_col(ASTNode* n, char* name);
+ColumnDef* ast_create_new_col(ASTNode* n);          // azzerata in fondo, NULL se non c'è posto
 
 #endif

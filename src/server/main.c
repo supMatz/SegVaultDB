@@ -146,7 +146,9 @@ static void usage(const char* argv0) {
            "      --php-workers N   php-cgi processes, i.e. PHP requests at the same time (default 4)\n"
            "      --api-prefix P    where the HTTP API lives (default /api/v1; none = HTTP API off).\n"
            "                        With PHP, paths under it that are not API paths go to the site\n"
-           "      --max-body MB     largest request body (default 16)\n"
+           "      --max-body MB     largest request body, also PHP's post_max_size / upload_max_filesize (default 128)\n"
+           "      --max-header-size KB  largest request header block (default 64; larger: 431)\n"
+           "      --max-per-address N   connections at once from one non-local address (default 32)\n"
            "      --timeout S       stop a request that runs longer than S seconds (default 30, 0 = never)\n"
            "      --no-auth         allow listening on a non-local address without a token\n"
            "      --mysql-socket P  MySQL also on the Unix socket P (default: DATA_DIR/mysql.sock; PHP's\n"
@@ -231,6 +233,8 @@ int main(int argc, char** argv) {
         else if (ARG("--php-workers", "--php-workers")) cfg.php_workers = atoi(argv[++i]);
         else if (ARG("--api-prefix", "--api-prefix")) cfg.api_prefix = argv[++i];
         else if (ARG("--max-body", "--max-body")) cfg.max_body = (size_t)atoi(argv[++i]) << 20;
+        else if (ARG("--max-header-size", "--max-header-size")) cfg.max_header = (size_t)atoi(argv[++i]) << 10;
+        else if (ARG("--max-per-address", "--max-per-address")) cfg.max_per_addr = atoi(argv[++i]);
         else if (ARG("--timeout", "--timeout")) cfg.timeout_ms = atoi(argv[++i]) * 1000;
         else if (!strcmp(a, "--no-auth")) no_auth = true;
         else if (!strcmp(a, "--users")) cfg.require_login = true;

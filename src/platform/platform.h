@@ -172,6 +172,12 @@ bool platform_read_pixels(PlatformWindow* win, Rect r, uint32_t* out);
 // presenta il frame disegnato (swap backbuffer → schermo)
 void platform_present(PlatformWindow* win);
 
+// scala dell'interfaccia: i widget disegnano in pixel logici (96 dpi), la piattaforma moltiplica per la
+// scala (testo nitido alla dimensione reale, non un'immagine ingrandita). 0 = automatica (X11: Xft.dpi o
+// SV_UI_SCALE; Windows: dpi del monitor, aggiornato con WM_DPICHANGED). Dopo il cambio arriva un EVT_RESIZE
+float platform_ui_scale(PlatformWindow* win);
+void  platform_set_ui_scale(PlatformWindow* win, float scale);
+
 // cursore del mouse sulla finestra
 void platform_set_cursor(PlatformWindow* win, CursorKind kind);
 

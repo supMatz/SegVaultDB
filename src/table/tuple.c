@@ -1,6 +1,8 @@
 #include "tuple.h"
+#include <errno.h>
 #include <strings.h>
 #include <stdio.h>
+#include "sv_alloc.h"
 
 Tuple* tuple_create(int num_cols) {
     Tuple* t = SV_ALLOC(Tuple);
@@ -61,7 +63,7 @@ uint8_t* tuple_serialize(Tuple* t, TableSchema* s, size_t* out_len) {
         }
     }
 
-    uint8_t* buf = (uint8_t*)calloc(1, total);
+    uint8_t* buf = (uint8_t*)sv_calloc(1, total);
     if (!buf) return NULL;
 
     // Scrivi il null bitmap
@@ -147,7 +149,7 @@ Tuple* tuple_deserialize(const uint8_t* data, size_t len,
                 slen = s16;
                 if (s16 == 0xFFFF) { NEED(4); memcpy(&slen, data + pos, 4); pos += 4; }
                 NEED(slen);
-                v->str_val = (char*)malloc(slen + 1);
+                v->str_val = (char*)sv_malloc(slen + 1);
                 v->owns_str = v->str_val != NULL;
                 if (v->str_val) {
                     memcpy(v->str_val, data + pos, slen);
@@ -203,13 +205,20 @@ void value_set_from_text(Value* v, DataType type, const char* text) {
     if (!text) { v->is_null = true; return; }   // NULL SQL = puntatore nullo (la stringa 'NULL' è testo)
     switch (type) {
         case SV_TYPE_INT:    v->int_val = atoi(text); break;
-        case SV_TYPE_BIGINT: v->bigint_val = atoll(text); break;
+        case SV_TYPE_BIGINT: {                  // oltre 2^63 - 1 (BIGINT UNSIGNED): i 64 bit del valore senza segno
+            char* e = NULL;
+            errno = 0;
+            long long x = strtoll(text, &e, 10);
+            if (errno == ERANGE && x > 0) x = (long long)strtoull(text, NULL, 10);
+            v->bigint_val = x;
+            break;
+        }
         case SV_TYPE_FLOAT:  v->float_val = atof(text); break;
         case SV_TYPE_BOOL:
             v->bool_val = strcmp(text, "1") == 0 || strcasecmp(text, "true") == 0;
             break;
         default:
-            v->str_val = strdup(text);
+            v->str_val = sv_strdup(text);
             v->owns_str = v->str_val != NULL;
             break;
     }

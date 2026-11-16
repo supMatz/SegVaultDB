@@ -6,6 +6,8 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <stdatomic.h>
+#include <time.h>
 
 static int g_tests, g_fail;
 #define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -18,6 +20,52 @@ static long long num(const char* sql) {
     return v;
 }
 static const char* cur(void) { const char* c = db_current_database(); return c ? c : ""; }
+
+static double now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6; }
+
+// statement con il flag di annullamento del thread (Cancel della GUI, KILL QUERY): ferma anche l'attesa di un lock
+typedef struct { const char* sql; atomic_int cancel; bool ok; char err[300]; double ms; } CancelArg;
+static void* cancel_thread(void* p) {
+    CancelArg* a = p;
+    db_set_thread_cancel(&a->cancel);
+    double t0 = now_ms();
+    QueryResult* r = db_execute(a->sql);
+    a->ms = now_ms() - t0;
+    a->ok = r && r->success;
+    snprintf(a->err, sizeof(a->err), "%.290s", r && !r->success ? r->error : "");
+    db_result_free(r);
+    db_set_thread_cancel(NULL);
+    return NULL;
+}
+
+// lettori sovrapposti (P1.7): BEGIN; SELECT ... FOR SHARE; pausa; COMMIT in ciclo finché stop
+typedef struct { DbSession* s; atomic_int* stop; int rounds; } RdArg;
+static void enter_wait(DbSession* s) {
+    for (;;) {
+        unsigned long long seq = db_session_seq();
+        if (db_session_enter(s)) return;
+        db_session_wait(seq, 50);
+    }
+}
+static void* reader_thread(void* p) {
+    RdArg* a = p;
+    while (!atomic_load(a->stop)) {
+        enter_wait(a->s);
+        QueryResult* r = db_execute("BEGIN");
+        db_result_free(r);
+        r = db_execute("SELECT COUNT(*) FROM a.t FOR SHARE");
+        db_result_free(r);
+        db_session_leave(a->s);
+        usleep(15 * 1000);                           // tiene il lock S mentre gli altri entrano
+        enter_wait(a->s);
+        r = db_execute("COMMIT");
+        db_result_free(r);
+        db_session_leave(a->s);
+        a->rounds++;
+        usleep(2 * 1000);
+    }
+    return NULL;
+}
 
 // uno statement di una sessione in un thread (deadlock)
 typedef struct { DbSession* s; const char* sql; bool ok; char err[300]; } DlArg;
@@ -173,6 +221,94 @@ int main(void) {
     CHECK(num("SELECT v FROM a.t WHERE id = 1") == (x.ok ? 11 : 20) , "a.t after the deadlock: %lld", num("SELECT v FROM a.t WHERE id = 1"));
     db_session_end(s4);
     db_session_end(s5);
+
+    // P1.7: due sessioni leggono e poi scrivono la stessa tabella: nessun deadlock, confermano entrambe
+    {
+        db_set_lock_wait_timeout(5000);
+        DbSession* ra = db_session_new();
+        DbSession* rb = db_session_new();
+        CHECK(db_session_enter(ra) && ok("USE a") && ok("BEGIN") && num("SELECT v FROM t WHERE id = 1") >= 0, "A reads t");
+        db_session_leave(ra);
+        CHECK(db_session_enter(rb) && ok("USE a") && ok("BEGIN") && num("SELECT v FROM t WHERE id = 1") >= 0, "B reads t");
+        db_session_leave(rb);
+        CHECK(db_session_enter(ra) && ok("UPDATE t SET v = v + 1 WHERE id = 1"), "A writes t after B read it");
+        db_session_leave(ra);
+        DlArg bw = { rb, "UPDATE t SET v = v + 1 WHERE id = 1", false, "" };
+        pthread_t th;
+        pthread_create(&th, NULL, dl_thread, &bw);       // B aspetta A (non un deadlock)
+        usleep(100 * 1000);
+        CHECK(db_session_enter(ra) && ok("COMMIT"), "A commits");
+        db_session_leave(ra);
+        pthread_join(th, NULL);
+        CHECK(bw.ok, "B's write went through after A's commit: %s", bw.err);
+        CHECK(db_session_enter(rb) && ok("COMMIT"), "B commits");
+        db_session_leave(rb);
+        db_session_end(ra);
+        db_session_end(rb);
+    }
+    // P1.7: uno scrittore dietro 8 lettori che si sovrappongono (FOR SHARE) entra in tempo limitato (coda FIFO)
+    {
+        db_set_lock_wait_timeout(10000);
+        atomic_int stop;
+        atomic_init(&stop, 0);
+        RdArg ra[8];
+        pthread_t rt[8];
+        for (int i = 0; i < 8; i++) { ra[i] = (RdArg){ db_session_new(), &stop, 0 }; pthread_create(&rt[i], NULL, reader_thread, &ra[i]); }
+        usleep(150 * 1000);
+        DbSession* wr = db_session_new();
+        enter_wait(wr);
+        double t0 = now_ms();
+        bool wok = ok("UPDATE a.t SET v = v + 1 WHERE id = 1");
+        double wms = now_ms() - t0;
+        db_session_leave(wr);
+        usleep(100 * 1000);
+        atomic_store(&stop, 1);
+        int rounds = 0;
+        for (int i = 0; i < 8; i++) { pthread_join(rt[i], NULL); rounds += ra[i].rounds; db_session_end(ra[i].s); }
+        db_session_end(wr);
+        CHECK(wok && wms < 2000, "writer behind 8 readers: %s after %.0f ms", wok ? "granted" : "refused", wms);
+        if (getenv("SV_VERBOSE")) printf("writer behind 8 readers: %.0f ms\n", wms);
+        CHECK(rounds > 8, "readers kept going: %d rounds", rounds);
+    }
+    // P1.7: chi aspetta un lock dorme (nessun polling): quasi niente CPU in 1 s di attesa
+    {
+        db_set_lock_wait_timeout(1000);
+        DbSession* holder = db_session_new();
+        CHECK(db_session_enter(holder) && ok("USE a") && ok("BEGIN") && ok("UPDATE t SET v = v WHERE id = 1"), "holder takes X");
+        db_session_leave(holder);
+        struct timespec c0, c1;
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &c0);
+        double t0 = now_ms();
+        CHECK(!ok("UPDATE a.t SET v = 0 WHERE id = 1"), "the waiter times out");
+        double wall = now_ms() - t0;
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &c1);
+        double cpu = (c1.tv_sec - c0.tv_sec) * 1e3 + (c1.tv_nsec - c0.tv_nsec) / 1e6;
+        CHECK(wall >= 900 && cpu < 60, "idle waiter: %.0f ms CPU in %.0f ms", cpu, wall);
+        CHECK(db_session_enter(holder) && ok("ROLLBACK"), "holder rolls back");
+        db_session_leave(holder);
+        db_session_end(holder);
+    }
+
+    // P2.14: la GUI aspetta un lock tenuto da un'altra sessione; Cancel lo interrompe subito (non 30 s)
+    {
+        db_set_lock_wait_timeout(30000);
+        DbSession* holder = db_session_new();
+        CHECK(db_session_enter(holder) && ok("USE a") && ok("BEGIN") && ok("UPDATE t SET v = v + 100 WHERE id = 1"),
+              "another session holds a write lock on a.t");
+        db_session_leave(holder);
+        CancelArg ca = { .sql = "UPDATE a.t SET v = 0 WHERE id = 1" };
+        atomic_init(&ca.cancel, 0);
+        pthread_t th;
+        pthread_create(&th, NULL, cancel_thread, &ca);
+        usleep(200 * 1000);
+        atomic_store(&ca.cancel, 1);
+        pthread_join(th, NULL);
+        CHECK(!ca.ok && strstr(ca.err, "cancelled") && ca.ms < 2000, "lock wait cancelled after %.0f ms: %s", ca.ms, ca.err);
+        CHECK(db_session_enter(holder) && ok("ROLLBACK"), "holder rolls back");
+        db_session_leave(holder);
+        db_session_end(holder);
+        CHECK(ok("UPDATE a.t SET v = v WHERE id = 1"), "the table is usable afterwards");
+    }
 
     db_shutdown();
     if (system("rm -rf /tmp/sv_sess_test")) {}

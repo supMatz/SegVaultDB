@@ -109,7 +109,7 @@ bool sm_load(SchemaModel* m, const char* db) {
 // ── posizioni ──────────────────────────────────────────────────
 
 bool sm_load_positions(SchemaModel* m, const char* path) {
-    FILE* f = fopen(path, "r");
+    FILE* f = fopen(path, "r" SV_FE);
     if (!f) return false;
     char line[256], name[64];
     int x, y;
@@ -131,7 +131,7 @@ bool sm_load_positions(SchemaModel* m, const char* path) {
 }
 
 bool sm_save_positions(const SchemaModel* m, const char* path) {
-    FILE* f = fopen(path, "w");
+    FILE* f = fopen(path, "w" SV_FE);
     if (!f) return false;
     fprintf(f, "# SegVault schema diagram: %s\n", m->db);
     if (m->view[0]) fprintf(f, "%s\n", m->view);

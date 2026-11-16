@@ -29,7 +29,10 @@ typedef struct {
     const char* cors_origin;  // se non NULL: origine ammessa per le chiamate dal browser ("*" = tutte)
     const char* default_db;   // database usato quando la richiesta non ne indica uno
     const char* static_dir;   // se non NULL: file statici serviti fuori da /api (una web app)
-    size_t      max_body;     // byte massimi del corpo di una richiesta (0 = 16 MB)
+    size_t      max_body;     // byte massimi del corpo di una richiesta (0 = 128 MB); anche post_max_size /
+                              // upload_max_filesize del php-cgi avviato da SegVault: un solo limite
+    size_t      max_header;   // byte massimi delle intestazioni di una richiesta (0 = 64 KB; più: 431)
+    int         max_per_addr; // connessioni contemporanee da un indirizzo non locale (0 = 32)
     int         max_clients;  // connessioni contemporanee (0 = 64)
     int         timeout_ms;   // una richiesta che lavora più a lungo viene interrotta (0 = mai)
     bool        quiet;        // niente log delle richieste su stderr
@@ -129,6 +132,7 @@ void      sv_server_free(SvServer* s);    // chiude le connessioni rimaste e lib
 
 // lettura thread-safe (copie): statistiche e ultime richieste, dalla più recente
 void      sv_server_stats(SvServer* s, SvStats* out);
+int       sv_process_threads(void);            // thread del processo (Linux: /proc/self/status), -1 se non si sa
 int       sv_server_recent(SvServer* s, SvLogEntry* out, int max);
 // gli ultimi n secondi fino ad adesso, dal più vecchio (i secondi senza richieste valgono zero)
 int       sv_server_series(SvServer* s, SvBucket* out, int n);

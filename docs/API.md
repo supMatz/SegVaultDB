@@ -72,6 +72,7 @@ Tutti sotto `/api/v1`. Le risposte sono JSON con `"ok": true|false`.
 |---|---|---|
 | `GET` | `/health` | `{"ok":true,"server":"SegVault","version":"1.3.0"}` (senza token) |
 | `GET` | `/status` | uptime, richieste, errori, righe inviate, connessioni aperte, `busy`, `timeout_ms` |
+| `GET` | `/metrics` | contatori in formato di testo di Prometheus (sotto) |
 | `POST` | `/query` | esegue SQL (sotto) |
 | `GET` | `/databases` | `{"ok":true,"databases":["shop", ...]}` |
 | `GET` | `/databases/{db}/tables` | `{"ok":true,"database":"shop","tables":[...],"views":[...]}` |
@@ -96,6 +97,9 @@ Tutti sotto `/api/v1`. Le risposte sono JSON con `"ok": true|false`.
 | `database` | stringa o `null` | `USE` eseguito prima dello script (default: `--database` del server) |
 | `transaction` | booleano | tutto lo script in una transazione: se uno statement fallisce non resta nulla |
 | `rows` | `"arrays"` (default) o `"objects"` | righe come `[1,"pane"]` oppure `{"id":1,"nome":"pane"}` |
+| `max_rows` | numero | al massimo tante righe per risultato; il resto si legge a pagine con `cursor` (sotto) |
+| `big_ints` | `"string"` | interi oltre 2⁵³ − 1 come stringhe (`"9007199254740993"`): JavaScript li arrotonderebbe |
+| `cursor` | stringa | la pagina seguente di un risultato (con `max_rows` facoltativo): niente `sql` |
 
 In alternativa il corpo può essere SQL puro con `Content-Type: text/plain`, e database e formato
 nella query string: `POST /api/v1/query?database=shop&rows=objects`.
@@ -114,6 +118,13 @@ nella query string: `POST /api/v1/query?database=shop&rows=objects`.
   "time_ms": 0.084
 }
 ```
+
+**Risultati grandi a pagine.** Con `"max_rows": 1000` un risultato più lungo restituisce le prime 1000
+righe, `"next": "<cursore>"` e `"rows_left"`; le pagine seguenti arrivano con
+`{"cursor": "<cursore>", "max_rows": 1000}` finché una risposta non ha più `next`. Il cursore
+appartiene a chi l'ha aperto e scade 5 minuti dopo l'ultima pagina letta (poi `404`); il server ne
+tiene al massimo 32. È lo stesso risultato, calcolato una volta: le righe non cambiano fra una pagina e
+l'altra.
 
 Un `INSERT` in una tabella con `AUTO_INCREMENT` riporta anche l'ultimo id generato:
 `{ "rows_affected": 1, "last_insert_id": 42, "time_ms": 0.03 }`.
@@ -141,6 +152,26 @@ tutto il resto (`VARCHAR`, `TEXT`, `DATE`, ...) → stringa. Le date sono string
 | 413 | corpo oltre `--max-body` |
 | 415 | `Content-Type` diverso da `application/json` / `text/plain` |
 | 503 | troppe connessioni contemporanee (64) |
+
+### `GET /api/v1/metrics`
+
+Formato di testo di Prometheus (`text/plain; version=0.0.4`), con le stesse regole di accesso di
+`/status`. Ci sono le richieste per servizio (`api`, `web`, `php`, `cgi`, `proxy`, `mysql`, `mail`) e
+classe di stato (`segvault_requests_total`), i tempi in un istogramma
+(`segvault_request_duration_seconds`), le connessioni aperte, la cache delle pagine (richieste, letture
+dalla memoria e dal disco, pagine tolte), le pagine scritte, la dimensione del file dei dati e del log,
+i record del log, i checkpoint, le attese di lock, i deadlock e le transazioni aperte. Gli stessi
+numeri del motore sono anche in `SHOW STATUS` del protocollo MySQL (`Innodb_buffer_pool_read_requests`,
+`Innodb_buffer_pool_reads`, `Innodb_row_lock_waits`, `Innodb_deadlocks`, `Open_transactions`, ...).
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: segvault
+    metrics_path: /api/v1/metrics
+    authorization: { credentials: "IL-TOKEN" }
+    static_configs: [{ targets: ["127.0.0.1:8484"] }]
+```
 
 ## Endpoint salvati (un'API senza scrivere backend)
 
@@ -301,9 +332,16 @@ DROP USER anna;
   `DROP` (anche `TRUNCATE`), `ALTER` (anche indici e trigger), `ALL`.
 - Il controllo copre tutte le tabelle toccate da uno statement: subquery, `JOIN`, tabelle derivate,
   CTE, rami di `UNION`, `INSERT ... SELECT`, `EXPLAIN`. Una vista si autorizza come una tabella.
-- Le password sono salvate in `<data>/users.dat` come hash SHA-256 con sale, ripetuto 20.000 volte;
-  dopo un tentativo sbagliato il server aspetta 300 ms. Le credenziali giuste restano in memoria al
-  massimo un minuto (un utente eliminato è escluso subito).
+- Le password sono salvate in `<data>/users.dat` (solo il proprietario può leggerlo) come
+  PBKDF2-HMAC-SHA256 con sale e 100.000 giri; il numero di giri è scritto nell'hash, e un hash di una
+  versione precedente si rifà al primo login riuscito. Dopo un tentativo sbagliato il server aspetta
+  300 ms; dopo 5 errori di fila per lo stesso utente dallo stesso indirizzo ogni nuovo tentativo deve
+  aspettare 1 s, poi 2, 4, ... fino a 5 minuti (HTTP `429` con `Retry-After`; MySQL errore 1045 con il
+  tempo da aspettare). Le credenziali giuste restano in memoria al massimo un minuto, e una modifica
+  qualsiasi agli utenti le cancella subito.
+- Protocollo MySQL: `CREATE USER u IDENTIFIED WITH mysql_native_password BY '...'` conserva anche il
+  verificatore di `mysql_native_password` (SHA1 di SHA1, senza sale) per i client che non conoscono
+  `caching_sha2_password`; senza `WITH` non viene scritto.
 - Il token, se impostato, continua a dare accesso completo. Gli endpoint salvati girano con i
   permessi di chi li ha creati (come una procedura), quindi un endpoint pubblico può leggere una
   tabella che i visitatori non vedono direttamente.

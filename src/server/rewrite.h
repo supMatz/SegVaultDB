@@ -28,14 +28,17 @@ typedef struct {
     bool        https;
 } RwRequest;
 
-typedef enum { RW_NONE, RW_REWRITE, RW_REDIRECT, RW_FORBIDDEN, RW_GONE } RwAction;
+typedef enum { RW_NONE, RW_REWRITE, RW_REDIRECT, RW_FORBIDDEN, RW_GONE, RW_TOO_LONG } RwAction;   // RW_TOO_LONG: 414, mai troncare
+
+#define RW_PATH_MAX  4096             // come Request.path del server
+#define RW_QUERY_MAX 16384            // la query della richiesta (8 KB) più quella della regola (QSA)
 
 typedef struct {
     RwAction action;
-    char     path[2048];        // RW_REWRITE: nuovo percorso interno (decodificato)
-    char     query[2048];       // RW_REWRITE: nuova QUERY_STRING
+    char     path[RW_PATH_MAX];  // RW_REWRITE: nuovo percorso interno (decodificato)
+    char     query[RW_QUERY_MAX];// RW_REWRITE: nuova QUERY_STRING
     int      status;            // RW_REDIRECT: 301, 302, ...
-    char     location[4096];    // RW_REDIRECT
+    char     location[RW_PATH_MAX + RW_QUERY_MAX];   // RW_REDIRECT
     bool     no_listing;        // Options -Indexes
     char     error[200];        // un problema nel .htaccess (per il registro), "" se nessuno
 } RwResult;

@@ -64,7 +64,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential php-cgi
-      - name: ThreadSanitizer (parallel reads, PHP)
+      - name: ThreadSanitizer (parallel reads, PHP, sessions, HTTP server, web)
         run: make test-tsan
       - name: Durability under AddressSanitizer + UBSan (fault injection, crash points)
         run: |
@@ -75,6 +75,34 @@ jobs:
           make test_h2 CFLAGS="-std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined"
           ./test_h2
 
+  windows-native:
+    runs-on: windows-latest
+    continue-on-error: true          # nuovo: informativo finché non è stabile sui runner
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: make mingw-w64-ucrt-x86_64-gcc
+      - name: Windows-only code, natively (64-bit offsets, MoveFileEx, engine)
+        run: make test-win WIN_CC=gcc WIN_RUN=
+      - name: Build segvault-server.exe and segvault.exe natively
+        run: make -j4 windows WIN_CC=gcc
+
+  macos:
+    runs-on: macos-latest
+    continue-on-error: true          # nuovo: informativo finché non è stabile sui runner
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build segvault-server and run the engine suites
+        run: |
+          make -j4 server
+          make test_engine test_sql test_sessions test_durability
+          ./test_engine && ./test_sql && ./test_sessions && ./test_durability
+
   analyze:
     runs-on: ubuntu-latest
     continue-on-error: true          # informativo: non blocca le pull request
@@ -84,3 +112,21 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cppcheck
       - name: cppcheck (engine and server)
         run: cppcheck --enable=warning,portability --inline-suppr --quiet -Iinclude -Isrc src/storage src/table src/tx src/bridge src/catalog src/server
+
+  bench:
+    # P3.6: gli scenari di bench/suite.c su SegVault e SQLite; fallisce se uno scenario peggiora di oltre il
+    # 15 % rispetto a SQLite misurato nella stessa esecuzione (bench/baseline-quick.json). Il baseline viene
+    # da un PC di sviluppo: informativo finché non se ne salva uno fatto su questi runner (artifact bench-json).
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libsqlite3-dev php-cli php-mysql
+      - name: Benchmark against SQLite and the baseline
+        run: make -j4 lib server bench_suite && make bench-check
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-json
+          path: build-bench/run*.json

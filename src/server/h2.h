@@ -29,4 +29,17 @@ void h2_set_enabled(bool on);
 // connessione al server interno (vedi tls.h)
 void h2_serve(H2Io* io, int inner_port, const char* marker, atomic_int* stop);
 
+// ── connessioni al server interno ──
+// Il server HTTP dello stesso processo registra per la sua porta una funzione che crea la connessione
+// in memoria (socketpair: niente accept, niente porta TCP, niente slot di connessione); one_request =
+// uno stream HTTP/2 (una richiesta, servita dal pool fisso di thread), altrimenti il ponte TLS HTTP/1.1.
+// Senza registrazione (o se fallisce) si apre una connessione TCP a 127.0.0.1:port come prima.
+typedef tls_sock (*SvInnerConnect)(void* ud, bool one_request);
+void     sv_inner_register(int port, SvInnerConnect fn, void* ud);
+void     sv_inner_unregister(int port);
+tls_sock sv_inner_connect(int port, bool one_request);   // socket bloccante, BAD_SOCK se non riesce
+// attesa su più socket (poll; WSAPoll su Windows): niente limite di FD_SETSIZE. ev: 1 = lettura, 2 = scrittura
+typedef struct { tls_sock fd; short want; short got; } SvPoll;
+int      sv_poll(SvPoll* p, int n, int timeout_ms);
+
 #endif

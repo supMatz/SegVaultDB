@@ -39,12 +39,26 @@ bool auth_statement(const void* tokens, const char* session_user, const char* cu
 // lo statement è permesso all'utente? (cur_db = database corrente, "" se nessuno)
 bool auth_check(const char* user, const struct ASTNode* stmt, const char* cur_db, char* err, size_t errn);
 
+// hash delle password: "$p2$<giri>$<hex>" (PBKDF2-HMAC-SHA256); vedi auth.c
+#define AUTH_HASH_MAX    96
+#define AUTH_PBKDF2_ITER 100000
 bool     auth_login(const char* user, const char* password);
 bool     auth_user_exists(const char* user);
 bool     auth_is_admin(const char* user);
 // login in due tempi: sale e hash copiati (sotto il lock del motore), poi l'hash lento calcolato fuori
-bool     auth_user_secret(const char* user, char salt[33], char hash[65]);
+bool     auth_user_secret(const char* user, char salt[33], char hash[AUTH_HASH_MAX]);
 bool     auth_password_matches(const char* salt, const char* hash, const char* password);
+bool     auth_hash_is_current(const char* hash);   // PBKDF2 con almeno AUTH_PBKDF2_ITER giri?
+// dopo una verifica riuscita (sale e hash quelli copiati): ricorda SHA256(SHA256(pw)) per caching_sha2 e
+// rifà un hash vecchio; true se l'hash è stato rifatto
+bool     auth_password_verified(const char* user, const char* salt, const char* hash, const char* password);
+void     auth_pbkdf2_sha256(const void* pw, size_t pl, const void* salt, size_t sl, unsigned iter, uint8_t out[32]);
+// caching_sha2_password: SHA256(SHA256(pw)); verifica di una risposta veloce; login (1 / 0 / -2 = serve
+// l'accesso completo con la password in chiaro)
+void     auth_sha2_stage2(const char* password, uint8_t out[32]);
+bool     auth_sha2_check(const uint8_t stage2[32], const uint8_t nonce[20], const uint8_t* resp, size_t rlen);
+int      auth_login_sha2(const char* user, const uint8_t nonce[20], const uint8_t* resp, size_t rlen);
+bool     auth_has_native(const char* user);          // ha il verificatore mysql_native_password?
 unsigned long auth_users_version(void);   // cambia a ogni CREATE / ALTER / DROP USER, GRANT, REVOKE
 // nessun utente non amministratore ha uno dei permessi privs su db.table?
 bool     auth_only_admins(const char* db, const char* table, unsigned privs);

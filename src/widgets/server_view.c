@@ -270,7 +270,7 @@ static bool token_load(ServerPanel* p, bool regenerate) {
     char path[600];
     token_path(p, path, sizeof(path));
     if (!regenerate) {
-        FILE* f = fopen(path, "rb");
+        FILE* f = fopen(path, "rb" SV_FE);
         if (f) {
             size_t n = fread(p->token, 1, sizeof(p->token) - 1, f);
             fclose(f);
@@ -280,7 +280,7 @@ static bool token_load(ServerPanel* p, bool regenerate) {
         }
     }
     if (!sv_random_token(p->token, 24)) { p->token[0] = '\0'; return false; }
-    FILE* f = fopen(path, "wb");
+    FILE* f = fopen(path, "wb" SV_FE);
     if (f) { fprintf(f, "%s\n", p->token); fclose(f); }
     return true;
 }
@@ -296,7 +296,7 @@ static void web_load(ServerPanel* p) {
     p->php_cgi[0] = '\0';
     p->n_sites = 0;
     web_path(p, path, sizeof(path));
-    FILE* f = fopen(path, "rb");
+    FILE* f = fopen(path, "rb" SV_FE);
     if (!f) return;
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\r\n")] = '\0';
@@ -315,7 +315,7 @@ static void web_load(ServerPanel* p) {
 static void web_save(ServerPanel* p) {
     char path[600];
     web_path(p, path, sizeof(path));
-    FILE* f = fopen(path, "wb");
+    FILE* f = fopen(path, "wb" SV_FE);
     if (!f) return;
     fprintf(f, "web_folder=%s\n", p->web_dir);
     if (p->php_cgi[0]) fprintf(f, "php_cgi=%s\n", p->php_cgi);

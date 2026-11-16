@@ -18,6 +18,8 @@
 #include <sys/stat.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <netinet/tcp.h>
+#include <ctype.h>
 
 static int g_fail = 0, g_count = 0;
 
@@ -30,6 +32,8 @@ static int connect_to(int port) {
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons((unsigned short)port) };
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(fd, (struct sockaddr*)&a, sizeof(a)) != 0) { close(fd); return -1; }
+    int one = 1;                     // intestazione e pacchetto in due send: senza, Nagle + ACK ritardato = 40 ms
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     struct timeval tv = { 10, 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     return fd;
@@ -57,10 +61,76 @@ static bool my_wr(My* m, const uint8_t* p, size_t n) {
     return send(m->fd, h, 4, 0) == 4 && send(m->fd, p, n, 0) == (ssize_t)n;
 }
 
-// connessione e login; NULL + messaggio in err se rifiutata
-static bool my_connect(My* m, int port, const char* user, const char* pw, const char* db, char* err, size_t en) {
+// risposta al nonce per il plugin: mysql_native_password (20 byte) o caching_sha2_password (32 byte)
+static size_t my_scramble(const char* plugin, const char* pw, const uint8_t nonce[20], uint8_t out[32]) {
+    if (!pw[0]) return 0;
+    if (!strcmp(plugin, "caching_sha2_password")) {
+        uint8_t s1[32], s2[32], buf[52], x[32];
+        auth_sha256(pw, strlen(pw), s1);
+        auth_sha256(s1, 32, s2);
+        memcpy(buf, s2, 32); memcpy(buf + 32, nonce, 20);
+        auth_sha256(buf, 52, x);
+        for (int i = 0; i < 32; i++) out[i] = s1[i] ^ x[i];
+        return 32;
+    }
+    uint8_t a[20], b[20], buf[40], x[20];
+    auth_sha1(pw, strlen(pw), a);
+    auth_sha1(a, 20, b);
+    memcpy(buf, nonce, 20); memcpy(buf + 20, b, 20);
+    auth_sha1(buf, 40, x);
+    for (int i = 0; i < 20; i++) out[i] = a[i] ^ x[i];
+    return 20;
+}
+
+static const char* g_my_plugin = "mysql_native_password";   // plugin della prima risposta
+static bool g_my_full_auth;                                  // l'ultimo login ha chiesto la password in chiaro?
+static int  g_my_switches;                                   // cambi di plugin chiesti dal server nell'ultimo login
+
+// dopo la risposta al login: cambio di plugin (0xfe), accesso veloce (0x01 0x03), accesso completo (0x01 0x04:
+// password in chiaro, solo se secure); true con l'OK finale
+static bool my_finish_login(My* m, const char* pw, bool secure, char* err, size_t en) {
+    uint8_t* p; size_t n;
+    g_my_full_auth = false;
+    g_my_switches = 0;
+    if (!my_rd(m, &p, &n)) { snprintf(err, en, "no reply to login"); return false; }
+    for (int step = 0; step < 4; step++) {
+        if (p[0] == 0xfe && n > 1) {                         // AuthSwitchRequest
+            g_my_switches++;
+            char plugin[64];
+            snprintf(plugin, sizeof(plugin), "%s", (char*)p + 1);
+            size_t pl = strlen(plugin) + 2;
+            uint8_t nonce[20] = {0};
+            if (n >= pl + 20) memcpy(nonce, p + pl, 20);
+            memcpy(m->scr, nonce, 20);
+            free(p);
+            uint8_t r[32];
+            size_t rl = my_scramble(plugin, pw, nonce, r);
+            if (!my_wr(m, r, rl) || !my_rd(m, &p, &n)) { snprintf(err, en, "no reply after auth switch"); return false; }
+            continue;
+        }
+        if (p[0] == 0x01 && n == 2 && p[1] == 0x03 && !g_my_full_auth) {   // accesso veloce riuscito: segue l'OK
+            free(p);
+            if (!my_rd(m, &p, &n)) { snprintf(err, en, "no OK after fast auth"); return false; }
+            continue;
+        }
+        if (p[0] == 0x01 && n == 2 && p[1] == 0x04) {        // serve la password in chiaro
+            free(p);
+            g_my_full_auth = true;
+            if (!secure) { snprintf(err, en, "full authentication needs a secure channel"); return false; }
+            if (!my_wr(m, (const uint8_t*)pw, strlen(pw) + 1) || !my_rd(m, &p, &n)) { snprintf(err, en, "no reply to full auth"); return false; }
+            continue;
+        }
+        break;
+    }
+    bool ok = p[0] == 0;
+    if (!ok && p[0] == 0xff && n > 9) snprintf(err, en, "%u %s", (unsigned)(p[1] | p[2] << 8), (char*)p + 9);
+    free(p);
+    return ok;
+}
+
+// login su un socket già connesso
+static bool my_login_fd(My* m, const char* user, const char* pw, const char* db, bool secure, char* err, size_t en) {
     err[0] = '\0';
-    m->fd = connect_to(port);
     uint8_t* p; size_t n;
     if (m->fd < 0 || !my_rd(m, &p, &n)) { snprintf(err, en, "no handshake"); return false; }
     uint8_t scr[20];
@@ -70,12 +140,8 @@ static bool my_connect(My* m, int port, const char* user, const char* pw, const 
     memcpy(scr + 8, p + pos, 12);
     memcpy(m->scr, scr, 20);
     free(p);
-    uint8_t a[20], b[20], buf[40], x[20], tokn[20];
-    auth_sha1(pw, strlen(pw), a);
-    auth_sha1(a, 20, b);
-    memcpy(buf, scr, 20); memcpy(buf + 20, b, 20);
-    auth_sha1(buf, 40, x);
-    for (int i = 0; i < 20; i++) tokn[i] = a[i] ^ x[i];
+    uint8_t tokn[32];
+    size_t tl = my_scramble(g_my_plugin, pw, scr, tokn);
     uint8_t lg[300];
     size_t k = 0;
     uint32_t caps = 0x200 | 0x8000 | 0x80000 | (db ? 8 : 0) | 0x10000 | 0x20000;
@@ -84,14 +150,17 @@ static bool my_connect(My* m, int port, const char* user, const char* pw, const 
     lg[k++] = 45;
     memset(lg + k, 0, 23); k += 23;
     memcpy(lg + k, user, strlen(user) + 1); k += strlen(user) + 1;
-    lg[k++] = 20; memcpy(lg + k, tokn, 20); k += 20;
+    lg[k++] = (uint8_t)tl; memcpy(lg + k, tokn, tl); k += tl;
     if (db) { memcpy(lg + k, db, strlen(db) + 1); k += strlen(db) + 1; }
-    memcpy(lg + k, "mysql_native_password", 22); k += 22;
-    if (!my_wr(m, lg, k) || !my_rd(m, &p, &n)) { snprintf(err, en, "no reply to login"); return false; }
-    bool ok = p[0] == 0;
-    if (!ok && p[0] == 0xff && n > 9) snprintf(err, en, "%u %s", (unsigned)(p[1] | p[2] << 8), (char*)p + 9);
-    free(p);
-    return ok;
+    memcpy(lg + k, g_my_plugin, strlen(g_my_plugin) + 1); k += strlen(g_my_plugin) + 1;
+    if (!my_wr(m, lg, k)) { snprintf(err, en, "no reply to login"); return false; }
+    return my_finish_login(m, pw, secure, err, en);
+}
+
+// connessione e login; NULL + messaggio in err se rifiutata
+static bool my_connect(My* m, int port, const char* user, const char* pw, const char* db, char* err, size_t en) {
+    m->fd = connect_to(port);
+    return my_login_fd(m, user, pw, db, false, err, en);
 }
 
 // COM_CHANGE_USER: "OK" o "ERR:codice"
@@ -111,11 +180,10 @@ static void my_change_user(My* m, const char* user, const char* pw, const char* 
     q[k++] = 45; q[k++] = 0;
     memcpy(q + k, "mysql_native_password", 22); k += 22;
     m->seq = 0;
-    uint8_t* p; size_t n;
-    if (!my_wr(m, q, k) || !my_rd(m, &p, &n)) { snprintf(out, on, "io"); return; }
-    if (p[0] == 0) snprintf(out, on, "OK");
-    else snprintf(out, on, "ERR:%u", (unsigned)(p[1] | p[2] << 8));
-    free(p);
+    char e[300];
+    if (!my_wr(m, q, k)) { snprintf(out, on, "io"); return; }
+    if (my_finish_login(m, pw, false, e, sizeof(e))) snprintf(out, on, "OK");
+    else snprintf(out, on, "ERR:%u", (unsigned)atoi(e));
 }
 
 static uint64_t my_lenenc(const uint8_t* p, size_t* pos) {
@@ -127,6 +195,8 @@ static uint64_t my_lenenc(const uint8_t* p, size_t* pos) {
     *pos += (size_t)k;
     return v;
 }
+
+static unsigned g_my_warn;                               // avvisi dell'ultimo OK di my_query
 
 // esegue una query: "OK:n" / "ERR:codice messaggio" / righe "a|b;c|d" (più risultati separati da " / ")
 static void my_query(My* m, const char* sql, char* out, size_t on) {
@@ -148,6 +218,7 @@ static void my_query(My* m, const char* sql, char* out, size_t on) {
             uint64_t aff = my_lenenc(p, &pos);
             my_lenenc(p, &pos);
             unsigned st = p[pos] | p[pos + 1] << 8;
+            g_my_warn = p[pos + 2] | p[pos + 3] << 8;
             more = (st & 8) != 0;
             ol += (size_t)snprintf(out + ol, on - ol, "OK:%llu", (unsigned long long)aff);
             free(p);
@@ -175,6 +246,35 @@ static void my_query(My* m, const char* sql, char* out, size_t on) {
             free(p);
         }
     }
+}
+
+// SELECT -> flag delle definizioni di colonna (P2.8), restituisce il numero di colonne (-1 = errore)
+static int my_col_flags(My* m, const char* sql, unsigned* flags, int maxc) {
+    uint8_t q[4096];
+    q[0] = 3;
+    size_t sl = strlen(sql);
+    memcpy(q + 1, sql, sl);
+    m->seq = 0;
+    uint8_t* p; size_t n;
+    if (!my_wr(m, q, sl + 1) || !my_rd(m, &p, &n)) return -1;
+    if (p[0] == 0xff || p[0] == 0) { free(p); return -1; }
+    size_t pos = 0;
+    int ncols = (int)my_lenenc(p, &pos);
+    free(p);
+    for (int i = 0; i < ncols; i++) {
+        if (!my_rd(m, &p, &n)) return -1;
+        pos = 0;
+        for (int k = 0; k < 6; k++) { uint64_t l = my_lenenc(p, &pos); pos += (size_t)l; }
+        pos += 1 + 2 + 4 + 1;                                  // 0x0c, charset, lunghezza, tipo
+        if (i < maxc) flags[i] = p[pos] | p[pos + 1] << 8;
+        free(p);
+    }
+    for (int eofs = 0; eofs < 2; ) {                           // EOF, righe, EOF
+        if (!my_rd(m, &p, &n)) return -1;
+        if (p[0] == 0xfe && n < 9) eofs++;
+        free(p);
+    }
+    return ncols;
 }
 
 // prepared statement: PREPARE -> id (0 = errore, messaggio in out), numero di parametri e colonne
@@ -217,6 +317,47 @@ static void my_execute_bytes(My* m, uint32_t id, const uint8_t* v, size_t vl, ch
     if (p[0] == 0) snprintf(out, on, "OK");
     else snprintf(out, on, "ERR:%u %s", (unsigned)(p[1] | p[2] << 8), (char*)p + 9);
     free(p);
+}
+
+// EXECUTE senza parametri con CURSOR_TYPE_READ_ONLY: colonne ed EOF; restituisce lo stato dell'EOF (-1 = errore)
+static int my_execute_cursor(My* m, uint32_t id) {
+    uint8_t q[16];
+    size_t k = 0;
+    q[k++] = 0x17;
+    for (int i = 0; i < 4; i++) q[k++] = (uint8_t)(id >> (8 * i));
+    q[k++] = 1;                                            // CURSOR_TYPE_READ_ONLY
+    q[k++] = 1; q[k++] = 0; q[k++] = 0; q[k++] = 0;
+    m->seq = 0;
+    uint8_t* p; size_t n;
+    if (!my_wr(m, q, k) || !my_rd(m, &p, &n)) return -1;
+    if (p[0] == 0xff || p[0] == 0) { free(p); return -1; }
+    size_t pos = 0;
+    int ncols = (int)my_lenenc(p, &pos);
+    free(p);
+    for (int i = 0; i < ncols; i++) { if (!my_rd(m, &p, &n)) return -1; free(p); }
+    if (!my_rd(m, &p, &n)) return -1;
+    int st = p[0] == 0xfe ? (p[3] | p[4] << 8) : -1;
+    free(p);
+    return st;
+}
+
+// COM_STMT_FETCH: quante righe arrivano, lo stato dell'EOF in *st (out: "ERR:..." se errore)
+static int my_fetch(My* m, uint32_t id, uint32_t rows, int* st, char* out, size_t on) {
+    uint8_t q[9] = { 0x1c };
+    for (int i = 0; i < 4; i++) { q[1 + i] = (uint8_t)(id >> (8 * i)); q[5 + i] = (uint8_t)(rows >> (8 * i)); }
+    m->seq = 0;
+    out[0] = 0;
+    *st = -1;
+    if (!my_wr(m, q, 9)) return -1;
+    int got = 0;
+    for (;;) {
+        uint8_t* p; size_t n;
+        if (!my_rd(m, &p, &n)) return -1;
+        if (p[0] == 0xff) { snprintf(out, on, "ERR:%u", (unsigned)(p[1] | p[2] << 8)); free(p); return -1; }
+        if (p[0] == 0xfe && n < 9) { *st = p[3] | p[4] << 8; free(p); return got; }
+        got++;
+        free(p);
+    }
 }
 
 // EXECUTE con parametri di testo (NULL = valore NULL) o un intero (vals[i] che inizia con '#');
@@ -614,6 +755,107 @@ int main(void) {
                     "INSERT INTO gen64 (v) VALUES (1)\"}");
     CHECK(resp_ok(&r) && strstr(r.body, "\"last_insert_id\":3000000000"), "64-bit last_insert_id: %s", r.body);
     resp_free(&r);
+    // P2.12: max_rows + cursore. 25 righe a pagine da 10: 10 + next, 10 + next, 5 senza next, poi il cursore non c'è più
+    r = query(port, "{\"database\":\"t\",\"sql\":\"CREATE TABLE pg (id INT PRIMARY KEY); "
+                    "INSERT INTO pg SELECT * FROM GENERATE_SERIES(1, 25)\"}");
+    CHECK(resp_ok(&r), "pagination table: %s", r.body);
+    resp_free(&r);
+    {
+        char next[64] = "", body[200];
+        int got = 0, pages = 0, last_id = 0;
+        r = query(port, "{\"database\":\"t\",\"sql\":\"SELECT id FROM pg ORDER BY id\",\"max_rows\":10,\"rows\":\"arrays\"}");
+        for (;;) {
+            const JsonVal* res0 = r.json && json_get(r.json, "results") ? &json_get(r.json, "results")->items[0] : NULL;
+            const JsonVal* rows = res0 ? json_get(res0, "rows") : NULL;
+            const JsonVal* nx = res0 ? json_get(res0, "next") : NULL;
+            if (!rows) break;
+            pages++;
+            for (int i = 0; i < rows->count; i++) { got++; last_id = (int)rows->items[i].items[0].number; }
+            CHECK(rows->count == (pages < 3 ? 10 : 5), "page %d has %d rows", pages, rows->count);
+            if (!nx || nx->type != JSON_STRING) { next[0] = '\0'; break; }
+            snprintf(next, sizeof(next), "%s", nx->str);
+            resp_free(&r);
+            snprintf(body, sizeof(body), "{\"cursor\":\"%s\",\"max_rows\":10}", next);
+            r = query(port, body);
+        }
+        resp_free(&r);
+        CHECK(got == 25 && pages == 3 && last_id == 25, "25 rows in 3 pages through the cursor: %d rows, %d pages, last %d", got, pages, last_id);
+        snprintf(body, sizeof(body), "{\"cursor\":\"%s\"}", "0123456789abcdef0123456789abcdef");
+        r = query(port, body);
+        CHECK(r.status == 404, "unknown cursor: %d", r.status);
+        resp_free(&r);
+        // il resto in una volta: senza max_rows nella richiesta del cursore
+        r = query(port, "{\"database\":\"t\",\"sql\":\"SELECT id FROM pg\",\"max_rows\":20}");
+        const JsonVal* res0 = r.json && json_get(r.json, "results") ? &json_get(r.json, "results")->items[0] : NULL;
+        const JsonVal* nx = res0 ? json_get(res0, "next") : NULL;
+        const JsonVal* left = res0 ? json_get(res0, "rows_left") : NULL;
+        CHECK(nx && left && left->number == 5, "rows_left: %s", r.body);
+        if (nx) snprintf(next, sizeof(next), "%s", nx->str);
+        resp_free(&r);
+        snprintf(body, sizeof(body), "{\"cursor\":\"%s\"}", next);
+        r = query(port, body);
+        res0 = r.json && json_get(r.json, "results") ? &json_get(r.json, "results")->items[0] : NULL;
+        CHECK(res0 && json_get(res0, "row_count")->number == 5 && !json_get(res0, "next"), "rest of the cursor: %s", r.body);
+        resp_free(&r);
+        // senza max_rows nessun cursore (come prima)
+        r = query(port, "{\"database\":\"t\",\"sql\":\"SELECT id FROM pg\"}");
+        CHECK(resp_ok(&r) && strstr(r.body, "\"row_count\":25") && !strstr(r.body, "\"next\""), "no max_rows: whole result");
+        resp_free(&r);
+    }
+    // P2.12: interi oltre 2^53 come stringhe se chiesto (JavaScript li arrotonderebbe)
+    r = query(port, "{\"sql\":\"SELECT 9007199254740993 AS big, 9007199254740991 AS ok, -9223372036854775807 AS neg\",\"big_ints\":\"string\"}");
+    CHECK(resp_ok(&r) && strstr(r.body, "[\"9007199254740993\",9007199254740991,\"-9223372036854775807\"]"), "big_ints as strings: %s", r.body);
+    resp_free(&r);
+    r = query(port, "{\"sql\":\"SELECT 9007199254740993 AS big\"}");
+    CHECK(resp_ok(&r) && strstr(r.body, "[[9007199254740993]]"), "big_ints default: numbers: %s", r.body);
+    resp_free(&r);
+    // P2.12: /metrics nel formato di Prometheus: ogni riga è un commento HELP / TYPE o "nome{etichette} valore";
+    // gli istogrammi sono cumulativi e +Inf = _count
+    r = request(port, "GET", "/api/v1/metrics", NULL, NULL);
+    {
+        bool fmt = r.status == 200 && r.body && strstr(r.body, "segvault_requests_total{service=\"api\",code=\"2xx\"}") &&
+                   strstr(r.body, "segvault_buffer_pool_hits_total ") && strstr(r.body, "segvault_lock_waits_total ") &&
+                   strstr(r.body, "# TYPE segvault_request_duration_seconds histogram");
+        char bad[200] = "";
+        unsigned long long prev = 0, inf = 0, cnt = 0;
+        for (char* line = r.body; fmt && line && *line; ) {
+            char* nl = strchr(line, '\n');
+            if (!nl) { snprintf(bad, sizeof(bad), "no final newline"); fmt = false; break; }
+            *nl = '\0';
+            if (line[0] == '#') {
+                if (strncmp(line, "# HELP segvault_", 16) && strncmp(line, "# TYPE segvault_", 16)) { snprintf(bad, sizeof(bad), "%s", line); fmt = false; }
+            } else {
+                const char* p = line;
+                if (!(isalpha((unsigned char)*p) || *p == '_')) fmt = false;
+                while (isalnum((unsigned char)*p) || *p == '_' || *p == ':') p++;
+                if (*p == '{') {
+                    p++;
+                    while (fmt && *p != '}') {
+                        while (isalnum((unsigned char)*p) || *p == '_') p++;
+                        if (*p++ != '=' || *p++ != '"') { fmt = false; break; }
+                        while (*p && *p != '"') p++;
+                        if (*p++ != '"') { fmt = false; break; }
+                        if (*p == ',') p++;
+                    }
+                    if (fmt) p++;
+                }
+                char* e;
+                if (fmt && (*p != ' ' || (strtod(p + 1, &e), *e != '\0'))) fmt = false;
+                if (!fmt) snprintf(bad, sizeof(bad), "%s", line);
+                if (strstr(line, "_bucket{service=\"api\"")) {
+                    unsigned long long v = strtoull(strrchr(line, ' ') + 1, NULL, 10);
+                    if (v < prev) { fmt = false; snprintf(bad, sizeof(bad), "not cumulative: %s", line); }
+                    prev = v;
+                    if (strstr(line, "le=\"+Inf\"")) inf = v;
+                }
+                if (strstr(line, "duration_seconds_count{service=\"api\"}")) cnt = strtoull(strrchr(line, ' ') + 1, NULL, 10);
+            }
+            *nl = '\n';
+            line = nl + 1;
+        }
+        CHECK(fmt && inf > 0 && inf == cnt, "Prometheus text format: %s (inf %llu, count %llu)", bad, inf, cnt);
+    }
+    resp_free(&r);
     r = request(port, "GET", "/api/v1/databases/t/tables/gen", NULL, NULL);
     CHECK(r.body && strstr(r.body, "\"default\":\"7\""), "column default: %s", r.body);
     resp_free(&r);
@@ -991,6 +1233,12 @@ int main(void) {
                     "{\"sql\":\"CREATE USER zed IDENTIFIED BY 'zed-s3cret''pw'; DROP USER zed; INSERT INTO p (id, nome) VALUES (77, 'a\\u001b[2Jb'); DELETE FROM p WHERE id = 77\"}");
         CHECK(resp_ok(&r), "statements for the audit check: %s", r.body);
         resp_free(&r);
+        // P2.7: il tipo lo decide il parser: SELECT … INTO @v e SELECT di una funzione che scrive vanno nel registro
+        r = request(port3, "POST", "/api/v1/query", hdr,
+                    "{\"sql\":\"CREATE FUNCTION audf() RETURNS INT BEGIN INSERT INTO p (id, nome) VALUES (78, 'f'); RETURN 1; END; "
+                    "SELECT audf(); SELECT 5 INTO @audv; SELECT COUNT(*) FROM p; DELETE FROM p WHERE id = 78; DROP FUNCTION audf\"}");
+        CHECK(resp_ok(&r), "statements for the audit-kind check: %s", r.body);
+        resp_free(&r);
         // P0.2: un endpoint gira con i permessi di chi l'ha salvato (definer, scritto dal motore), mai come root
         q = db_execute("CREATE USER eva IDENTIFIED BY 'eva-pass'"); db_result_free(q);
         q = db_execute("GRANT ALL ON t2.* TO eva"); db_result_free(q);
@@ -1042,7 +1290,8 @@ int main(void) {
         audit[an] = '\0';
         if (af) fclose(af);
         CHECK(strstr(audit, "127.0.0.1  anna  t  ERROR Access denied") && strstr(audit, "DELETE FROM p"), "audit: denied delete logged: %s", audit);
-        CHECK(!strstr(audit, "  SELECT "), "audit: reads not logged: %s", audit);
+        CHECK(!strstr(audit, "SELECT COUNT(*) FROM p"), "audit: reads not logged: %s", audit);
+        CHECK(strstr(audit, "SELECT audf()") && strstr(audit, "SELECT 5 INTO @audv"), "audit: SELECT with side effects logged: %s", audit);
         CHECK(strstr(audit, "CREATE USER zed IDENTIFIED BY '***'") && !strstr(audit, "s3cret") && !strstr(audit, "''pw"),
               "audit: password redacted: %s", audit);
         CHECK(!strchr(audit, 0x1b) && strstr(audit, "a\\x1b[2Jb"), "audit: control bytes escaped");
@@ -1054,6 +1303,16 @@ int main(void) {
         QueryResult* q;
         q = db_execute("CREATE USER mia IDENTIFIED BY 'mia-pass'"); db_result_free(q);
         q = db_execute("GRANT SELECT, INSERT ON t.* TO mia"); db_result_free(q);
+        // P2.6: utenti per i metodi di login; poi un riavvio del motore, così SHA256(SHA256(pw)) di caching_sha2
+        // non è in memoria per nessuno (come dopo il riavvio del server)
+        q = db_execute("CREATE USER nat IDENTIFIED WITH mysql_native_password BY 'nat-pass'"); db_result_free(q);
+        q = db_execute("CREATE USER rsa IDENTIFIED BY 'rsa-pass'"); db_result_free(q);
+        q = db_execute("CREATE USER lock IDENTIFIED BY 'lock-pass'"); db_result_free(q);
+        q = db_execute("GRANT SELECT ON t.* TO nat"); db_result_free(q);
+        q = db_execute("GRANT SELECT ON t.* TO rsa"); db_result_free(q);
+        q = db_execute("GRANT SELECT ON t.* TO lock"); db_result_free(q);
+        db_shutdown();
+        CHECK(db_init(dir), "restart before the MySQL login tests: %s", db_init_error());
         SvServerConfig cfg4 = { .port = 0, .token = "tok4", .quiet = true, .require_login = true, .mysql = true, .mysql_port = 0,
                                 .mysql_socket = "/tmp/sv_test_mysql.sock" };
         SvServer* s4 = sv_server_start(&cfg4, err, sizeof(err));
@@ -1093,6 +1352,67 @@ int main(void) {
         CHECK(mp > 0, "mysql port: %s", err);
         My m;
         char e[300], out[4096];
+        {   // P2.6: caching_sha2_password. Senza SHA256(SHA256(pw)) in memoria, su TCP senza TLS serve l'accesso
+            // completo con RSA (qui rifiutato: il client di prova non cifra); sul socket Unix la password passa
+            // in chiaro, e da lì in poi l'accesso veloce funziona anche su TCP
+            g_my_plugin = "caching_sha2_password";
+            CHECK(!my_connect(&m, mp, "mia", "mia-pass", "t", e, sizeof(e)) && g_my_full_auth, "sha2 without cache asks for full auth: %s", e);
+            close(m.fd);
+            int uf = socket(AF_UNIX, SOCK_STREAM, 0);
+            struct sockaddr_un ua;
+            memset(&ua, 0, sizeof(ua));
+            ua.sun_family = AF_UNIX;
+            snprintf(ua.sun_path, sizeof(ua.sun_path), "/tmp/sv_test_mysql.sock");
+            struct timeval tvu = { 10, 0 };
+            setsockopt(uf, SOL_SOCKET, SO_RCVTIMEO, &tvu, sizeof(tvu));
+            m.fd = connect(uf, (struct sockaddr*)&ua, sizeof(ua)) == 0 ? uf : -1;
+            CHECK(my_login_fd(&m, "mia", "mia-pass", "t", true, e, sizeof(e)) && g_my_full_auth, "full auth in clear text over the Unix socket: %s", e);
+            my_query(&m, "SELECT COUNT(*) FROM p", out, sizeof(out));
+            CHECK(!strcmp(out, "3"), "query after full auth: %s", out);
+            close(uf);
+            CHECK(my_connect(&m, mp, "mia", "mia-pass", "t", e, sizeof(e)) && !g_my_full_auth, "then fast auth over TCP: %s", e);
+            close(m.fd);
+            CHECK(!my_connect(&m, mp, "mia", "sbagliata", "t", e, sizeof(e)) && strstr(e, "1045"), "sha2 wrong password: %s", e);
+            close(m.fd);
+            g_my_plugin = "mysql_native_password";
+            // un client che parte con native: per chi non ha il verificatore native si passa a caching_sha2
+            CHECK(my_connect(&m, mp, "mia", "mia-pass", "t", e, sizeof(e)) && g_my_switches == 1, "native client switched to sha2: %s", e);
+            close(m.fd);
+            // utente con mysql_native_password: nessun cambio, nessun accesso completo (anche senza cache)
+            CHECK(my_connect(&m, mp, "nat", "nat-pass", "t", e, sizeof(e)) && g_my_switches == 0 && !g_my_full_auth, "native user: %s", e);
+            close(m.fd);
+            // root col token, con i due metodi
+            CHECK(my_connect(&m, mp, "root", "tok4", NULL, e, sizeof(e)), "root token, native: %s", e);
+            close(m.fd);
+            g_my_plugin = "caching_sha2_password";
+            CHECK(my_connect(&m, mp, "root", "tok4", NULL, e, sizeof(e)) && !g_my_full_auth, "root token, sha2: %s", e);
+            close(m.fd);
+            g_my_plugin = "mysql_native_password";
+            // RSA: PHP (mysqlnd) chiede la chiave pubblica del server e manda la password cifrata
+            if (system("php -n -d extension=mysqli -r 'exit(class_exists(\"mysqli\") ? 0 : 1);' 2>/dev/null") == 0) {
+                char cmd[700];
+                snprintf(cmd, sizeof(cmd), "php -n -d extension=mysqli -r '"
+                         "mysqli_report(MYSQLI_REPORT_OFF); $m = @new mysqli(\"127.0.0.1\", \"rsa\", \"rsa-pass\", \"t\", %d);"
+                         "if ($m->connect_errno) { echo \"ERR \", $m->connect_error; exit(1); }"
+                         "echo $m->query(\"SELECT COUNT(*) FROM p\")->fetch_row()[0];' 2>&1", mp);
+                FILE* pp = popen(cmd, "r");
+                char po[400] = "";
+                size_t pn = pp ? fread(po, 1, sizeof(po) - 1, pp) : 0;
+                po[pn] = '\0';
+                if (pp) pclose(pp);
+                CHECK(!strcmp(po, "3"), "PHP mysqli, caching_sha2 with the server's RSA key over TCP: %s", po);
+            } else printf("(php mysqli not available: RSA login not tested)\n");
+            // tentativi sbagliati: dopo 5 l'account (da questo indirizzo) aspetta, anche con la password giusta
+            for (int i = 0; i < 5; i++) { my_connect(&m, mp, "lock", "nope", NULL, e, sizeof(e)); close(m.fd); }
+            CHECK(!my_connect(&m, mp, "lock", "lock-pass", NULL, e, sizeof(e)) && strstr(e, "Too many wrong passwords"), "back-off after 5 failures: %s", e);
+            close(m.fd);
+            usleep(1100 * 1000);
+            g_my_plugin = "caching_sha2_password";               // lock non ha la cache: si vede che si arriva fino
+            CHECK(!my_connect(&m, mp, "lock", "lock-pass", NULL, e, sizeof(e)) && g_my_full_auth,   // alla verifica
+                  "login attempted again after the wait: %s", e);
+            close(m.fd);
+            g_my_plugin = "mysql_native_password";
+        }
         CHECK(!my_connect(&m, mp, "mia", "sbagliata", NULL, e, sizeof(e)) && strstr(e, "1045"), "wrong password refused: %s", e);
         close(m.fd);
         CHECK(my_connect(&m, mp, "mia", "mia-pass", "t", e, sizeof(e)), "login: %s", e);
@@ -1104,6 +1424,8 @@ int main(void) {
         CHECK(!strcmp(out, "SegVault"), "client variable: %s", out);
         my_query(&m, "SET NAMES utf8mb4", out, sizeof(out));
         CHECK(!strcmp(out, "OK:0"), "set names: %s", out);
+        my_query(&m, "SHOW STATUS LIKE 'Innodb_buffer_pool_read_requests'", out, sizeof(out));
+        CHECK(!strncmp(out, "Innodb_buffer_pool_read_requests|", 33) && atoll(out + 33) > 0, "SHOW STATUS has the engine counters: %s", out);
         my_query(&m, "DELETE FROM p", out, sizeof(out));
         CHECK(strstr(out, "ERR:1142"), "privileges enforced: %s", out);
         my_query(&m, "SELECT * FROM nessuna", out, sizeof(out));
@@ -1128,6 +1450,26 @@ int main(void) {
         const char* v2[] = { "#3", "zzz" };
         my_execute(&m, sid, 2, v2, out, sizeof(out));
         CHECK(!strncmp(out, "3|", 2) && !strchr(out, ';'), "same statement, other values: %s", out);
+        // P2.8: cursore lato server (JDBC useCursorFetch=true): EXECUTE con CURSOR_TYPE_READ_ONLY, poi COM_STMT_FETCH
+        {
+            int cnp = -1, cnc = -1, est, fst;
+            uint32_t cid = my_prepare(&m, "SELECT id FROM p ORDER BY id", &cnp, &cnc, out, sizeof(out));
+            long long total = -1;
+            my_query(&m, "SELECT COUNT(*) FROM p", out, sizeof(out));
+            total = atoll(out);
+            est = my_execute_cursor(&m, cid);
+            CHECK(est >= 0 && (est & 0x40), "EXECUTE with a cursor: no rows, CURSOR_EXISTS (status 0x%x)", est);
+            int got = my_fetch(&m, cid, 2, &fst, out, sizeof(out));
+            CHECK(got == (total < 2 ? (int)total : 2) && fst >= 0, "COM_STMT_FETCH 2 rows: %d (status 0x%x) %s", got, fst, out);
+            int rest = 0, more;
+            while ((more = my_fetch(&m, cid, 1000, &fst, out, sizeof(out))) > 0) rest += more;
+            CHECK(more == 0 || (fst & 0x80), "fetch reaches the end");
+            CHECK(got + rest == total && (fst & 0x80), "all %lld rows through the cursor (%d + %d), LAST_ROW_SENT (0x%x)", total, got, rest, fst);
+            my_fetch(&m, cid, 1, &fst, out, sizeof(out));
+            CHECK(fst & 0x80, "fetch after the end: LAST_ROW_SENT again (0x%x) %s", fst, out);
+            my_fetch(&m, sid, 1, &fst, out, sizeof(out));
+            CHECK(!strncmp(out, "ERR:1421", 8), "fetch without an open cursor: 1421 (%s)", out);
+        }
         uint32_t ins = my_prepare(&m, "INSERT INTO p (id, nome, prezzo) VALUES (?, ?, ?)", &np, &nc, out, sizeof(out));
         CHECK(ins && np == 3 && nc == 0, "prepare insert: %u %d %d %s", ins, np, nc, out);
         const char* v3[] = { "#40", "it's \\ ok -- not a comment", NULL };
@@ -1147,6 +1489,83 @@ int main(void) {
         my_execute(&m, sid, 2, v1, out, sizeof(out));
         CHECK(strstr(out, "ERR:1243"), "closed statement: %s", out);
         my_query(&m, "DELETE FROM p WHERE id = 40", out, sizeof(out));
+
+        {   // P2.2: il testo di un prepared statement si analizza una volta; ogni EXECUTE riusa l'albero coi valori
+            My rt;
+            CHECK(my_connect(&rt, mp, "root", "tok4", "t", e, sizeof(e)), "root for the prepared tests: %s", e);
+            my_query(&rt, "CREATE TABLE pp (id INT PRIMARY KEY, a VARCHAR(40))", out, sizeof(out));
+            my_query(&rt, "INSERT INTO pp VALUES (1, 'uno'), (2, 'due'), (3, 'tre')", out, sizeof(out));
+            unsigned long long r0, p0, r1, p1;
+            db_prepared_counts(&r0, &p0);
+            int pnp, pnc;
+            uint32_t q1 = my_prepare(&rt, "SELECT a FROM pp WHERE id = ?", &pnp, &pnc, out, sizeof(out));
+            const char* k1[] = { "#1" }, *k2[] = { "#2" }, *k3[] = { "#3" };
+            char o1[200], o2[200], o3[200];
+            my_execute(&rt, q1, 1, k1, o1, sizeof(o1));
+            my_execute(&rt, q1, 1, k2, o2, sizeof(o2));
+            my_execute(&rt, q1, 1, k3, o3, sizeof(o3));
+            db_prepared_counts(&r1, &p1);
+            CHECK(!strcmp(o1, "uno") && !strcmp(o2, "due") && !strcmp(o3, "tre"), "three executes, three values: %s %s %s", o1, o2, o3);
+            CHECK(r1 - r0 == 3 && p1 - p0 == 1, "parsed once, run three times from the tree: %llu runs, %llu parses", r1 - r0, p1 - p0);
+            // valori difficili: apici, barre, commenti, NULL, negativi, interi a 64 bit
+            uint32_t q2 = my_prepare(&rt, "SELECT ?, ?, ?, ?", &pnp, &pnc, out, sizeof(out));
+            const char* kv[] = { "it's \\ -- x ? 'y'", NULL, "#-42", "#9223372036854775807" };
+            my_execute(&rt, q2, 4, kv, out, sizeof(out));
+            CHECK(!strcmp(out, "it's \\ -- x ? 'y'|NULL|-42|9223372036854775807"), "typed values bound into the tree: %s", out);
+            // lo schema cambia fra due EXECUTE: l'albero si rifà
+            my_query(&rt, "DROP TABLE pp", out, sizeof(out));
+            my_query(&rt, "CREATE TABLE pp (x INT, id INT PRIMARY KEY, a VARCHAR(40))", out, sizeof(out));
+            my_query(&rt, "INSERT INTO pp VALUES (9, 1, 'nuova')", out, sizeof(out));
+            db_prepared_counts(&r0, &p0);
+            my_execute(&rt, q1, 1, k1, o1, sizeof(o1));
+            db_prepared_counts(&r1, &p1);
+            CHECK(!strcmp(o1, "nuova") && p1 - p0 == 1 && r1 - r0 == 1, "re-parsed after DDL: %s (%llu parses)", o1, p1 - p0);
+            // NEXTVAL: un EXECUTE, un passo della sequenza (il PREPARE non la tocca)
+            my_query(&rt, "CREATE SEQUENCE psq", out, sizeof(out));
+            uint32_t q3 = my_prepare(&rt, "SELECT NEXTVAL('psq')", &pnp, &pnc, out, sizeof(out));
+            my_execute(&rt, q3, 0, NULL, o1, sizeof(o1));
+            my_query(&rt, "SELECT NEXTVAL('psq')", o2, sizeof(o2));
+            CHECK(!strcmp(o1, "1") && !strcmp(o2, "2"), "prepared NEXTVAL advances once: %s then %s", o1, o2);
+            // ciò che l'albero non copre torna al testo con i valori: UPDATE su più tabelle con un '?' nella condizione
+            my_query(&rt, "CREATE TABLE pq (id INT PRIMARY KEY, v INT)", out, sizeof(out));
+            my_query(&rt, "INSERT INTO pq VALUES (1, 0)", out, sizeof(out));
+            uint32_t q4 = my_prepare(&rt, "UPDATE pq, pp SET pq.v = pp.x WHERE pq.id = pp.id AND pp.a = ?", &pnp, &pnc, out, sizeof(out));
+            const char* k4[] = { "nuova" };
+            my_execute(&rt, q4, 1, k4, out, sizeof(out));
+            my_query(&rt, "SELECT v FROM pq", o1, sizeof(o1));
+            CHECK(!strcmp(out, "OK:1") && !strcmp(o1, "9"), "multi-table UPDATE falls back to the text: %s, v = %s", out, o1);
+            // velocità: 3000 ricerche per chiave preparate contro 3000 COM_QUERY col valore nel testo
+            my_query(&rt, "CREATE TABLE pk (id INT PRIMARY KEY, a VARCHAR(20), b INT)", out, sizeof(out));
+            my_query(&rt, "INSERT INTO pk SELECT x, CONCAT('n', x), x * 3 FROM GENERATE_SERIES(1, 3000) AS g(x)", out, sizeof(out));
+            uint32_t q5 = my_prepare(&rt, "SELECT a, b FROM pk WHERE id = ?", &pnp, &pnc, out, sizeof(out));
+            struct timespec ta, tb, tc;
+            clock_gettime(CLOCK_MONOTONIC, &ta);
+            bool same = true;
+            for (int i = 1; i <= 3000; i++) {
+                char kq[24], want[48];
+                snprintf(kq, sizeof(kq), "#%d", i);
+                const char* kk[] = { kq };
+                my_execute(&rt, q5, 1, kk, out, sizeof(out));
+                snprintf(want, sizeof(want), "n%d|%d", i, i * 3);
+                if (strcmp(out, want)) same = false;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &tb);
+            for (int i = 1; i <= 3000; i++) {
+                char qq[80];
+                snprintf(qq, sizeof(qq), "SELECT a, b FROM pk WHERE id = %d", i);
+                my_query(&rt, qq, out, sizeof(out));
+            }
+            clock_gettime(CLOCK_MONOTONIC, &tc);
+            double tp = (double)(tb.tv_sec - ta.tv_sec) * 1e3 + (double)(tb.tv_nsec - ta.tv_nsec) / 1e6;
+            double tq = (double)(tc.tv_sec - tb.tv_sec) * 1e3 + (double)(tc.tv_nsec - tb.tv_nsec) / 1e6;
+            printf("(prepared point lookups: %.1f us each, text queries %.1f us: %.2fx)\n", tp * 1000 / 3000, tq * 1000 / 3000, tq / tp);
+            CHECK(same, "3000 prepared lookups return the right rows");
+            my_query(&rt, "DROP TABLE pk", out, sizeof(out));
+            my_query(&rt, "DROP TABLE pq", out, sizeof(out));
+            my_query(&rt, "DROP TABLE pp", out, sizeof(out));
+            my_query(&rt, "DROP SEQUENCE psq", out, sizeof(out));
+            close(rt.fd);
+        }
 
         // P2.8: COM_STATISTICS, COM_SET_OPTION, COM_CHANGE_USER
         {
@@ -1181,6 +1600,33 @@ int main(void) {
         my_query(&m, "INSERT INTO fk_child VALUES (2, 99)", out, sizeof(out));
         CHECK(strstr(out, "ERR"), "foreign keys checked again after the dump: %s", out);
         my_query(&m, "DROP TABLE fk_child; DROP TABLE fk_par", out, sizeof(out));
+        // P2.8: flag delle colonne dal catalogo (NOT_NULL, PRI_KEY, UNIQUE, MULTIPLE_KEY, UNSIGNED, AUTO_INCREMENT)
+        {
+            my_query(&m, "CREATE TABLE cflags (id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT, code VARCHAR(10) NOT NULL UNIQUE, "
+                         "grp INT, note TEXT, KEY (grp))", out, sizeof(out));
+            my_query(&m, "INSERT INTO cflags (code, grp) VALUES ('a', 1)", out, sizeof(out));
+            unsigned fl[8] = {0};
+            int ncf = my_col_flags(&m, "SELECT id, code, grp, note, id + 1 AS calc FROM cflags", fl, 8);
+            CHECK(ncf == 5, "column flags: %d columns", ncf);
+            CHECK((fl[0] & 1) && (fl[0] & 2) && (fl[0] & 32) && (fl[0] & 512), "id: NOT_NULL | PRI_KEY | UNSIGNED | AUTO_INCREMENT (0x%x)", fl[0]);
+            CHECK((fl[1] & 1) && (fl[1] & 4) && !(fl[1] & 2), "code: NOT_NULL | UNIQUE_KEY (0x%x)", fl[1]);
+            CHECK(!(fl[2] & 1) && (fl[2] & 8), "grp: nullable, MULTIPLE_KEY (0x%x)", fl[2]);
+            CHECK(!(fl[3] & (1 | 2 | 4 | 8)), "note: no key flags (0x%x)", fl[3]);
+            CHECK(!(fl[4] & (2 | 512)), "computed column: no key flags (0x%x)", fl[4]);
+            my_query(&m, "DROP TABLE cflags", out, sizeof(out));
+        }
+        // P2.1: un SET senza effetto su una variabile sconosciuta risponde con un avviso, SHOW WARNINGS lo mostra
+        my_query(&m, "SET SESSION sql_mode = 'STRICT_TRANS_TABLES', NAMES utf8mb4", out, sizeof(out));
+        CHECK(!strcmp(out, "OK:0") && g_my_warn == 0, "known system variables: no warning (%s, %u)", out, g_my_warn);
+        my_query(&m, "SET @@session.no_such_variable_x = 1", out, sizeof(out));
+        CHECK(!strcmp(out, "OK:0") && g_my_warn == 1, "unknown system variable: one warning (%s, %u)", out, g_my_warn);
+        my_query(&m, "SHOW WARNINGS", out, sizeof(out));
+        CHECK(strstr(out, "Warning|1193|") && strstr(out, "no_such_variable_x"), "SHOW WARNINGS names it: %s", out);
+        my_query(&m, "SET GLOBAL synchronous = FULL; SELECT @@synchronous; SET GLOBAL synchronous = NORMAL", out, sizeof(out));
+        CHECK(strstr(out, "FULL"), "SET GLOBAL synchronous reaches the engine over the MySQL protocol: %s", out);
+        my_query(&m, "SELECT 1", out, sizeof(out));
+        my_query(&m, "SHOW WARNINGS", out, sizeof(out));
+        CHECK(!strstr(out, "no_such_variable_x"), "the warning is cleared by the next statement: %s", out);
 
         // P0.8: i 256 valori di byte, anche 0x00 e 0xC0, interi attraverso il protocollo MySQL
         {

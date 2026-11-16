@@ -39,6 +39,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
   #include <ws2tcpip.h>
   #include <windows.h>
   #include <iphlpapi.h>
+  #include <io.h>
   typedef SOCKET sock_t;
   #define BAD_SOCK INVALID_SOCKET
   #define sock_close closesocket
@@ -47,6 +48,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
   static void mx_init(sv_mutex* m)    { InitializeCriticalSection(m); }
   static void mx_lock(sv_mutex* m)    { EnterCriticalSection(m); }
   static void mx_unlock(sv_mutex* m)  { LeaveCriticalSection(m); }
+  static bool mx_trylock(sv_mutex* m) { return TryEnterCriticalSection(m) != 0; }
   static void mx_destroy(sv_mutex* m) { DeleteCriticalSection(m); }
   static void sleep_ms(int ms) { Sleep((DWORD)ms); }
   static double now_ms(void) { return (double)GetTickCount64(); }
@@ -61,6 +63,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
   #include <unistd.h>
   #include <fcntl.h>
   #include <sys/un.h>
+  #include <sys/mman.h>
   typedef int sock_t;
   #define BAD_SOCK (-1)
   #define sock_close close
@@ -69,13 +72,20 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
   static void mx_init(sv_mutex* m)    { pthread_mutex_init(m, NULL); }
   static void mx_lock(sv_mutex* m)    { pthread_mutex_lock(m); }
   static void mx_unlock(sv_mutex* m)  { pthread_mutex_unlock(m); }
+  static bool mx_trylock(sv_mutex* m) { return pthread_mutex_trylock(m) == 0; }
   static void mx_destroy(sv_mutex* m) { pthread_mutex_destroy(m); }
   static void sleep_ms(int ms) { struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L }; nanosleep(&ts, NULL); }
   static double now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6; }
 #endif
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0                  // Windows / macOS: nessun flag (Windows non eredita i socket: P2.10)
+#endif
 
 #define API_PREFIX      "/api/v1"     // prefisso predefinito (vedi SvServerConfig.api_prefix)
-#define MAX_HEADER      (16 * 1024)
+#define MAX_HEADER      (64 * 1024)   // intestazioni di una richiesta, predefinito (--max-header-size KB)
+#define MIN_BODY_RATE   1024          // byte/s minimi di un corpo dopo BODY_GRACE_MS (client lentissimi: 408)
+#define BODY_GRACE_MS   10000
+#define MAX_PER_ADDR    32            // connessioni contemporanee da un indirizzo non locale
 #define IDLE_TIMEOUT_MS 15000          // connessione keep-alive inattiva
 #define HEADER_DEADLINE_MS 10000        // intestazione completa entro 10 s dal primo byte
 #define MAX_PARAMS      1024
@@ -101,6 +111,14 @@ typedef struct {
     char       user[64];
     double     last_ms;
 } SvSess;
+
+// servizi delle metriche e fasce dell'istogramma dei tempi (ms)
+enum { SVC_API, SVC_WEB, SVC_PHP, SVC_CGI, SVC_PROXY, SVC_MYSQL, SVC_MAIL, SVC_OTHER, SVC_N };
+static const char* const SVC_NAME[SVC_N] = { "api", "web", "php", "cgi", "proxy", "mysql", "mail", "other" };
+#define LAT_N 12
+static const double LAT_LE[LAT_N] = { 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000 };
+#define QCURSORS 32
+#define QCURSOR_IDLE_MS (5 * 60 * 1000)
 
 struct SvServer {
     SvServerConfig cfg;
@@ -136,6 +154,8 @@ struct SvServer {
     sock_t         to_close[8];         // socket in ascolto di servizi fermati: li chiude il ciclo di accept
     int            n_to_close;
     uint8_t*       conn_kind;           // per slot di conns[]: 0 HTTP, 1 MySQL, 2 SMTP, 3 TLS
+    uint64_t*      conn_addr;           // per slot: indirizzo remoto (hash; 0 = locale), per il limite per indirizzo
+    struct { uint64_t key; int fails; double last, until; } login_fail[64];   // login sbagliati per utente + indirizzo
     char           tls_info[300];
     int            mysql_port;
     uint32_t       mysql_ids;           // id delle connessioni MySQL
@@ -145,15 +165,26 @@ struct SvServer {
     sock_t*        conns;               // socket aperti (per chiuderli allo stop)
     int            active;
     sv_mutex       exec_mx;             // una richiesta alla volta sul motore
+    size_t         max_header;          // byte massimi delle intestazioni (cfg.max_header o MAX_HEADER)
     FILE*          audit;               // registro di audit (scritto con exec_mx)
+    bool           audit_dirty;         // righe scritte dopo l'ultimo fsync (con exec_mx)
+    double         audit_synced_ms;     // ultimo fsync del registro (solo il ciclo di accept)
     // statistiche e registro (protetti da conn_mx)
     double         started_ms;
     long long      n_requests, n_errors, n_rows;
+    // metriche (GET /api/v1/metrics, P2.12): richieste per servizio e classe di stato, tempi in un istogramma
+    unsigned long long m_req[SVC_N][6];        // [servizio][1xx..5xx, altro]
+    unsigned long long m_lat[SVC_N][LAT_N + 1]; // conteggi per fascia (non cumulativi; l'ultima = oltre)
+    double         m_lat_sum[SVC_N];
+    // cursori di /query (max_rows): il resto di un risultato, letto a pagine con {"cursor": "..."}
+    struct QCursor { char id[40]; char user[64]; QueryResult* r; int pos; double last; bool objects, big_str; } cursors[QCURSORS];
     double         exec_since;          // inizio della richiesta che usa il motore (0 = libero)
     bool           timed_out;           // il watchdog ha interrotto la richiesta in corso
     SvLogEntry     log[SV_LOG_MAX];     // anello: log[(seq - 1) % SV_LOG_MAX]
     SvBucket       series[SV_SERIES_MAX]; // anello per secondo: series[sec % SV_SERIES_MAX]
     SvSess         sess[SV_MAX_SESSIONS];  // sessioni dei client (protette da exec_mx)
+    struct InnerPool* inner;            // pool fisso per gli stream HTTP/2 in memoria (NULL = non ancora avviato)
+    bool           inner_registered;    // sv_inner_register fatto per port
 };
 
 typedef struct {
@@ -167,6 +198,7 @@ typedef struct {
     bool      tls;                     // connessione HTTPS da decifrare (porta https)
     bool      https;                   // richieste arrivate dal ponte TLS
     TlsConn*  mytls;                   // protocollo MySQL cifrato (dopo la richiesta SSL del client)
+    bool      unix_sock;               // arrivata dal socket Unix (canale sicuro come TLS: password in chiaro ammessa)
 } Conn;
 
 // ── richiesta / risposta ────────────────────────────────────────
@@ -175,7 +207,7 @@ typedef struct {
     char   method[16];
     char   uri[8192];                   // destinazione grezza, come arrivata (REQUEST_URI); più lunga: 414
     char   path[4096];                  // decodificato (%xx)
-    char   query[8192];                 // grezzo, dopo '?'
+    char   query[RW_QUERY_MAX];         // grezzo, dopo '?' (8 KB dal client; dopo una regola QSA fino a 16 KB)
     bool   http10;
     bool   keep_alive;
     bool   has_length;
@@ -572,10 +604,21 @@ static bool is_json_number(const char* s) {
     return *p == '\0';
 }
 
-static void cell_json(JsonBuf* b, const Cell* c) {
+// intero oltre 2^53 - 1 (non rappresentabile esattamente in un double di JavaScript)?
+static bool beyond_js_int(const char* v) {
+    if (*v == '-') v++;
+    size_t n = strlen(v);
+    for (size_t i = 0; i < n; i++) if (!isdigit((unsigned char)v[i])) return false;
+    return n > 16 || (n == 16 && strcmp(v, "9007199254740991") > 0);
+}
+
+static void cell_json(JsonBuf* b, const Cell* c, bool big_str) {
     if (c->is_null || c->type == CELL_TYPE_NULL) { jb_lit(b, "null"); return; }
     switch (c->type) {
         case CELL_TYPE_INT:
+            if (big_str && beyond_js_int(c->value)) { jb_str(b, c->value); return; }
+            if (is_json_number(c->value)) { jb_raw(b, c->value, strlen(c->value)); return; }
+            break;
         case CELL_TYPE_FLOAT:
             if (is_json_number(c->value)) { jb_raw(b, c->value, strlen(c->value)); return; }
             break;
@@ -593,7 +636,19 @@ static void cell_json(JsonBuf* b, const Cell* c) {
     jb_strn(b, c->value, n);
 }
 
-static void result_json(JsonBuf* b, const QueryResult* r, bool objects) {
+// forma dei risultati di /query
+typedef struct {
+    bool        objects;     // righe come oggetti {"col": v} invece di array
+    bool        big_str;     // "big_ints": "string": interi oltre 2^53 come stringhe
+    long long   max_rows;    // > 0: al massimo tante righe, il resto in un cursore ("next")
+    SvServer*   s;           // per i cursori
+    const char* user;
+} JsonOpts;
+
+static void qcursor_drop(struct QCursor* c) { db_result_free(c->r); memset(c, 0, sizeof(*c)); }
+
+// righe [start, end) di r; se end < num_rows e cursor_id: il resto resta nel cursore cursor_id
+static void result_page(JsonBuf* b, const QueryResult* r, int start, int end, bool objects, bool big_str, const char* cursor_id) {
     jb_lit(b, "{");
     if (r->num_cols > 0) {
         jb_lit(b, "\"columns\":[");
@@ -605,23 +660,84 @@ static void result_json(JsonBuf* b, const QueryResult* r, bool objects) {
             jb_lit(b, "}");
         }
         jb_lit(b, "],\"rows\":[");
-        for (int i = 0; i < r->num_rows && !b->oom; i++) {
+        for (int i = start; i < end && !b->oom; i++) {
             const Row* row = &r->rows[i];
-            if (i) jb_lit(b, ",");
+            if (i > start) jb_lit(b, ",");
             jb_raw(b, objects ? "{" : "[", 1);
             for (int j = 0; j < row->num_cells && j < r->num_cols; j++) {
                 if (j) jb_lit(b, ",");
                 if (objects) { jb_str(b, r->col_names[j]); jb_lit(b, ":"); }
-                cell_json(b, &row->cells[j]);
+                cell_json(b, &row->cells[j], big_str);
             }
             jb_raw(b, objects ? "}" : "]", 1);
         }
-        jb_printf(b, "],\"row_count\":%d", r->num_rows);
+        jb_printf(b, "],\"row_count\":%d", end - start);
+        if (cursor_id) jb_printf(b, ",\"next\":\"%s\",\"rows_left\":%d", cursor_id, r->num_rows - end);
     } else {
         jb_printf(b, "\"rows_affected\":%lld", r->rows_affected);
         if (r->last_insert_id > 0) jb_printf(b, ",\"last_insert_id\":%lld", r->last_insert_id);
     }
     jb_printf(b, ",\"time_ms\":%.3f}", r->exec_time_ms);
+}
+
+// un risultato di /query. true = r è passato a un cursore (chi chiama non lo libera)
+static bool result_json(JsonBuf* b, QueryResult* r, const JsonOpts* jo) {
+    int end = r->num_rows;
+    if (jo->max_rows > 0 && r->num_cols > 0 && (long long)r->num_rows > jo->max_rows && jo->s) end = (int)jo->max_rows;
+    if (end == r->num_rows) { result_page(b, r, 0, end, jo->objects, jo->big_str, NULL); return false; }
+    SvServer* s = jo->s;
+    char id[40];
+    if (!sv_random_token(id, 16)) { result_page(b, r, 0, r->num_rows, jo->objects, jo->big_str, NULL); return false; }
+    double now = now_ms();
+    mx_lock(&s->conn_mx);
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < QCURSORS; i++) {
+        if (s->cursors[i].r && now - s->cursors[i].last > QCURSOR_IDLE_MS) qcursor_drop(&s->cursors[i]);
+        if (!s->cursors[i].r && slot < 0) slot = i;
+        if (s->cursors[i].last < s->cursors[oldest].last) oldest = i;
+    }
+    if (slot < 0) { qcursor_drop(&s->cursors[oldest]); slot = oldest; }   // tutti occupati: si perde il più vecchio
+    struct QCursor* c = &s->cursors[slot];
+    snprintf(c->id, sizeof(c->id), "%s", id);
+    snprintf(c->user, sizeof(c->user), "%s", jo->user ? jo->user : "");
+    c->r = r;
+    c->pos = end;
+    c->last = now;
+    c->objects = jo->objects;
+    c->big_str = jo->big_str;
+    mx_unlock(&s->conn_mx);
+    // r appartiene al cursore ma nessuno lo tocca finché questa richiesta non finisce: chi lo legge deve
+    // conoscere l'id, che il client riceve solo con questa risposta
+    result_page(b, r, 0, end, jo->objects, jo->big_str, id);
+    return true;
+}
+
+// {"cursor": "...", "max_rows": n}: la pagina seguente di un risultato (senza toccare il motore)
+static void handle_cursor(SvServer* s, Response* rs, const char* id, long long max_rows, const char* user) {
+    double t0 = now_ms();
+    mx_lock(&s->conn_mx);
+    struct QCursor* c = NULL;
+    for (int i = 0; i < QCURSORS && !c; i++)
+        if (s->cursors[i].r && secret_equal(s->cursors[i].id, id) && now_ms() - s->cursors[i].last <= QCURSOR_IDLE_MS) c = &s->cursors[i];
+    if (!c || strcmp(c->user, user ? user : "")) {
+        mx_unlock(&s->conn_mx);
+        json_error(rs, 404, "cursor not found or expired (cursors last 5 minutes after their last page)");
+        return;
+    }
+    // la pagina si scrive tenendo il cursore (conn_mx): un'altra richiesta con lo stesso id aspetta
+    QueryResult* r = c->r;
+    int start = c->pos;
+    int end = max_rows > 0 && (long long)(r->num_rows - start) > max_rows ? start + (int)max_rows : r->num_rows;
+    JsonBuf* b = &rs->body;
+    jb_lit(b, "{\"ok\":true,\"results\":[");
+    result_page(b, r, start, end, c->objects, c->big_str, end < r->num_rows ? c->id : NULL);
+    rs->rows += end - start;
+    if (end < r->num_rows) { c->pos = end; c->last = now_ms(); }
+    else qcursor_drop(c);
+    mx_unlock(&s->conn_mx);
+    jb_printf(b, "],\"time_ms\":%.3f}", now_ms() - t0);
+    rs->status = 200;
+    if (b->oom) json_error(rs, 500, "result too large for memory");
 }
 
 static int line_of(const char* s, int pos) {
@@ -676,14 +792,10 @@ static void engine_leave(SvServer* s, DbSession* t) {
     mx_unlock(&s->exec_mx);
 }
 
-// un'altra sessione tiene un lock che serve a questa richiesta (vedi db_set_lock_wait_hook): il turno
-// sul motore passa per un attimo agli altri, poi si riprende
-static void lock_wait_hook(void* ud) {
-    SvServer* s = ud;
-    exec_end(s);
-    sleep_ms(2);
-    exec_begin(s);
-}
+// un'altra sessione tiene un lock che serve a questa richiesta (vedi db_set_lock_wait_hooks): mentre il
+// motore aspetta il rilascio, il turno sul motore passa agli altri, poi si riprende
+static void lock_wait_leave(void* ud) { exec_end((SvServer*)ud); }
+static void lock_wait_enter(void* ud) { exec_begin((SvServer*)ud); }
 
 // ── POST /api/v1/query ──────────────────────────────────────────
 
@@ -768,11 +880,8 @@ static void audit_stmt(SvServer* s, const Response* rs, const char* user, const 
     if (!s->audit) return;
     const char* p = stmt;
     while (isspace((unsigned char)*p)) p++;
-    static const char* const READS[] = { "SELECT", "WITH", "SHOW", "DESCRIBE", "DESC", "EXPLAIN" };
-    for (int i = 0; i < 6; i++) {
-        size_t l = strlen(READS[i]);
-        if (!strncasecmp(p, READS[i], l) && !isalnum((unsigned char)p[l]) && p[l] != '_') return;
-    }
+    // le letture pure non vanno nel registro; il tipo lo decide il parser (P2.7), non la prima parola
+    if (r && r->success && db_statement_is_read(p)) return;
     time_t t = time(NULL);
     struct tm tmv;
 #ifdef _WIN32
@@ -794,12 +903,31 @@ static void audit_stmt(SvServer* s, const Response* rs, const char* user, const 
                 db && db[0] ? db : "-", e, text);
     }
     fflush(s->audit);
+    s->audit_dirty = true;
+}
+
+// il registro di audit su disco al massimo un secondo dopo l'ultima riga (P2.7): fsync dal ciclo di
+// accept, solo se exec_mx è libero (mai in attesa dietro un'istruzione lunga)
+static void audit_sync_tick(SvServer* s) {
+    if (!s->audit || now_ms() - s->audit_synced_ms < 1000) return;
+    if (!mx_trylock(&s->exec_mx)) return;
+    if (s->audit_dirty) {
+        fflush(s->audit);
+#ifdef _WIN32
+        _commit(_fileno(s->audit));
+#else
+        if (fsync(fileno(s->audit)) != 0) {}
+#endif
+        s->audit_dirty = false;
+    }
+    mx_unlock(&s->exec_mx);
+    s->audit_synced_ms = now_ms();
 }
 
 // esegue lo script (già con i parametri) nel database indicato e scrive la risposta;
 // sql_for_log: il testo originale, con i segnaposto, per il registro. Libera script.
 static void run_script(SvServer* s, Response* rs, char* script, const char* sql_for_log, const char* dbname,
-                       bool want_tx, bool objects, const char* user, SvSess* ss) {
+                       bool want_tx, const JsonOpts* jo, const char* user, SvSess* ss) {
     int len = (int)strlen(script), cap = 64, nst;
     SqlRange* ranges = NULL;
     for (;;) {                                  // quanti statement: si raddoppia finché bastano
@@ -844,9 +972,9 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
             }
             if (!first) jb_lit(b, ",");
             first = false;
-            result_json(b, r, objects);
-            rs->rows += r->num_rows;
-            db_result_free(r);
+            int nr = r->num_rows;
+            if (!result_json(b, r, jo)) db_result_free(r);
+            rs->rows += jo->max_rows > 0 && nr > jo->max_rows ? jo->max_rows : nr;
             idx++;
         }
         if (!parallel) {                        // si ricomincia per la via normale
@@ -863,16 +991,19 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
     DbSession* tmp = ss ? NULL : db_session_new_temp();
     DbSession* ds = ss ? ss->db : tmp;
     if (!ss && !tmp) { exec_end(s); free(ranges); free(script); json_error(rs, 500, "out of memory"); return; }
-    for (double waited = 0; !db_session_enter(ds); waited += 20) {
+    // un'altra sessione è dentro il motore: si dorme finché esce (nessun polling), al massimo SESSION_WAIT_MS
+    for (double w0 = now_ms();;) {
+        unsigned long long seq = db_session_seq();
+        if (db_session_enter(ds)) break;
         exec_end(s);
-        if (waited >= SESSION_WAIT_MS) {
+        if (now_ms() - w0 >= SESSION_WAIT_MS) {
             free(ranges);
             free(script);
             if (tmp) db_session_end(tmp);
             json_error(rs, 409, "the engine is busy: retry");
             return;
         }
-        sleep_ms(20);
+        db_session_wait(seq, 200);
         exec_begin(s);
         expire_sessions(s);
     }
@@ -926,8 +1057,9 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
         } else {
             if (!first) jb_lit(b, ",");
             first = false;
-            result_json(b, r, objects);
-            rs->rows += r->num_rows;
+            int nr = r->num_rows;
+            if (result_json(b, r, jo)) r = NULL;                // passato a un cursore
+            rs->rows += jo->max_rows > 0 && nr > jo->max_rows ? jo->max_rows : nr;
         }
         db_result_free(r);
         idx++;
@@ -996,7 +1128,10 @@ static void run_script(SvServer* s, Response* rs, char* script, const char* sql_
 // legge una richiesta /query (JSON o SQL puro); false = errore già scritto in rs.
 // *root riceve l'albero JSON (lo libera chi chiama, anche in caso di errore)
 static bool read_query_request(SvServer* s, Request* rq, Response* rs, JsonVal** root, const char** sql,
-                               char* dbname, size_t dbn, const JsonVal** params, bool* want_tx, bool* objects) {
+                               char* dbname, size_t dbn, const JsonVal** params, bool* want_tx, JsonOpts* jo,
+                               char* cursor, size_t curn) {
+    bool* objects = &jo->objects;
+    cursor[0] = '\0';
     char err[512];
     char ct[256];
     snprintf(ct, sizeof(ct), "%s", rq->content_type);
@@ -1007,11 +1142,22 @@ static bool read_query_request(SvServer* s, Request* rq, Response* rs, JsonVal**
         query_param(rq->query, "database", dbname, dbn);
         char f[32];
         if (query_param(rq->query, "rows", f, sizeof(f))) *objects = !strcmp(f, "objects");
+        if (query_param(rq->query, "max_rows", f, sizeof(f))) jo->max_rows = atoll(f);
+        if (query_param(rq->query, "big_ints", f, sizeof(f))) jo->big_str = !strcmp(f, "string");
+        query_param(rq->query, "cursor", cursor, curn);
+        if (cursor[0]) return true;
     } else if (!ct[0] || !strncmp(ct, "application/json", 16)) {
         *root = json_parse(rq->body, rq->body_len, err, sizeof(err));
         if (!*root) { json_error(rs, 400, "invalid JSON: %s", err); return false; }
         if ((*root)->type != JSON_OBJECT) { json_error(rs, 400, "the body must be a JSON object"); return false; }
-        const JsonVal* v = json_get(*root, "sql");
+        const JsonVal* v = json_get(*root, "max_rows");
+        if (v && v->type == JSON_NUMBER) jo->max_rows = (long long)v->number;
+        else if (v && v->type != JSON_NULL) { json_error(rs, 400, "\"max_rows\" must be a number"); return false; }
+        v = json_get(*root, "big_ints");
+        if (v && v->type == JSON_STRING) jo->big_str = !strcmp(v->str, "string");
+        v = json_get(*root, "cursor");
+        if (v && v->type == JSON_STRING) { snprintf(cursor, curn, "%s", v->str); return true; }
+        v = json_get(*root, "sql");
         if (!v || v->type != JSON_STRING) { json_error(rs, 400, "missing \"sql\" (string)"); return false; }
         if (memchr(v->str, '\0', v->len)) { json_error(rs, 400, "\"sql\" cannot contain NUL characters"); return false; }
         *sql = v->str;
@@ -1039,9 +1185,12 @@ static void handle_query(SvServer* s, Request* rq, Response* rs) {
     JsonVal* root = NULL;
     const char* sql = NULL;
     const JsonVal* params = NULL;
-    char dbname[128] = "";
-    bool want_tx = false, objects = false;
-    if (read_query_request(s, rq, rs, &root, &sql, dbname, sizeof(dbname), &params, &want_tx, &objects)) {
+    char dbname[128] = "", cursor[64];
+    bool want_tx = false;
+    JsonOpts jo = { .s = s, .user = rq->user };
+    if (read_query_request(s, rq, rs, &root, &sql, dbname, sizeof(dbname), &params, &want_tx, &jo, cursor, sizeof(cursor))) {
+        if (jo.max_rows < 0) { json_free(root); json_error(rs, 400, "\"max_rows\" must be positive"); return; }
+        if (cursor[0]) { handle_cursor(s, rs, cursor, jo.max_rows, rq->user); json_free(root); return; }
         char err[512];
         char* script = bind_params(sql, params, err, sizeof(err));
         if (!script) json_error(rs, 400, "%s", err);
@@ -1052,7 +1201,7 @@ static void handle_query(SvServer* s, Request* rq, Response* rs) {
                 if (!ss) { free(script); json_free(root); json_error(rs, 404, "session not found or expired: create one with POST /api/v1/sessions"); return; }
                 if (strcmp(ss->user, rq->user)) { free(script); json_free(root); json_error(rs, 403, "this session belongs to another user"); return; }
             }
-            run_script(s, rs, script, sql, dbname, want_tx, objects, rq->user, ss);   // libera script
+            run_script(s, rs, script, sql, dbname, want_tx, &jo, rq->user, ss);   // libera script
         }
     }
     json_free(root);
@@ -1136,7 +1285,8 @@ static JsonVal* query_params_json(const char* q) {
         char key[128], val[2048];
         if (eq && url_decode(q, (size_t)(eq - q), key, sizeof(key), true) > 0 &&
             url_decode(eq + 1, seg - (size_t)(eq - q) - 1, val, sizeof(val), true) >= 0 &&
-            strcmp(key, "database") && strcmp(key, "rows") && !seen_key(&j, key)) {
+            strcmp(key, "database") && strcmp(key, "rows") && strcmp(key, "max_rows") && strcmp(key, "big_ints") &&
+            !seen_key(&j, key)) {
             if (n++) jb_lit(&j, ",");
             jb_str(&j, key);
             jb_lit(&j, ":");
@@ -1172,7 +1322,12 @@ static void handle_endpoint(SvServer* s, Request* rq, Response* rs, const char* 
     if (!script) { json_error(rs, 400, "endpoint '%s': %s", name, err); return; }
     char label[200];
     snprintf(label, sizeof(label), "endpoint %.60s: %.120s", name, sql);
-    run_script(s, rs, script, label, db, true, objects, runas[0] ? runas : NULL, NULL);   // sempre atomico; con i permessi di chi l'ha salvato
+    JsonOpts jo = { .objects = objects, .s = s, .user = rq->user };
+    char f2[32];
+    if (query_param(rq->query, "max_rows", f2, sizeof(f2))) jo.max_rows = atoll(f2);
+    if (query_param(rq->query, "big_ints", f2, sizeof(f2))) jo.big_str = !strcmp(f2, "string");
+    if (jo.max_rows < 0) jo.max_rows = 0;
+    run_script(s, rs, script, label, db, true, &jo, runas[0] ? runas : NULL, NULL);   // sempre atomico; con i permessi di chi l'ha salvato
 }
 
 static void handle_endpoint_list(SvServer* s, Request* rq, Response* rs, const char* db) {
@@ -1405,7 +1560,7 @@ static void set_own_headers(Response* rs, const char* text) {
 static void web_not_found(const Request* rq, Response* rs) {
     char p[4300];
     snprintf(p, sizeof(p), "%s/404.html", rq->root ? rq->root : ".");
-    FILE* f = fopen(p, "rb");
+    FILE* f = fopen(p, "rb" SV_FE);
     if (!f) { json_error(rs, 404, "not found"); return; }
     char chunk[65536];
     size_t got;
@@ -1445,7 +1600,7 @@ static void serve_file(SvServer* s, const Request* rq, Response* rs, const char*
         jb_lit(&rs->body, "range not satisfiable\n");
         return;
     }
-    FILE* f = fopen(full, "rb");
+    FILE* f = fopen(full, "rb" SV_FE);
     if (!f) { web_not_found(rq, rs); return; }
     if (r > 0) snprintf(hdr + hl, sizeof(hdr) - (size_t)hl, "Content-Range: bytes %lld-%lld/%lld\r\n", from, from + len - 1, size);
     set_own_headers(rs, hdr);
@@ -2192,6 +2347,12 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
         rw_apply(&rr, rw);
         if (rw->error[0] && !s->cfg.quiet) fprintf(stderr, "[htaccess] %s\n", rw->error);
         rq->no_listing = rw->no_listing;
+        if (rw->action == RW_TOO_LONG || (rw->action == RW_REWRITE && (strlen(rw->path) >= sizeof(rq->path) ||
+                                                                       strlen(rw->query) >= sizeof(rq->query)))) {
+            free(rw);                                  // una regola produrrebbe un indirizzo troppo lungo: 414, non troncato
+            json_error(rs, 414, "request target too long after the .htaccess rewrite");
+            return;
+        }
         if (rw->action == RW_FORBIDDEN || rw->action == RW_GONE) {
             int st = rw->action == RW_FORBIDDEN ? 403 : 410;
             free(rw);
@@ -2383,7 +2544,65 @@ static size_t b64_decode(const char* in, char* out, size_t cap) {
 // GRANT...) invalida tutte le voci, così una password cambiata non vale più nemmeno per un minuto
 static struct { uint8_t key[32]; char user[64]; double until; unsigned long ver; } g_login_cache[LOGIN_CACHE];
 
-static bool basic_login(SvServer* s, const char* b64, char* user, size_t un) {
+// ── tentativi di login sbagliati (P2.6) ─────────────────────────
+// Per coppia utente + indirizzo: i primi LOGIN_FREE_FAILS errori non costano niente (errori di battitura), poi
+// ogni errore raddoppia l'attesa prima del prossimo tentativo (1 s, 2 s, 4 s, ... fino a 5 minuti). Durante
+// l'attesa i tentativi si rifiutano senza calcolare l'hash; un login riuscito azzera il conto.
+#define LOGIN_FREE_FAILS 5
+#define LOGIN_MAX_WAIT_MS (5 * 60 * 1000)
+
+static uint64_t login_key(const char* user, const char* addr) {
+    uint64_t h = 1469598103934665603ull;
+    for (const char* p = user ? user : ""; *p; p++) h = (h ^ (uint8_t)tolower((unsigned char)*p)) * 1099511628211ull;
+    h = (h ^ 0xff) * 1099511628211ull;
+    for (const char* p = addr ? addr : ""; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ull;
+    return h | 1;
+}
+
+#define LOGIN_FORGET_MS (15 * 60 * 1000)      // un conto fermo da 15 minuti si dimentica
+
+// millisecondi da aspettare prima di poter riprovare (0 = si può)
+static double login_blocked(SvServer* s, const char* user, const char* addr) {
+    uint64_t k = login_key(user, addr);
+    double now = now_ms(), wait = 0;
+    mx_lock(&s->conn_mx);
+    for (int i = 0; i < 64; i++)
+        if (s->login_fail[i].key == k && s->login_fail[i].until > now) wait = s->login_fail[i].until - now;
+    mx_unlock(&s->conn_mx);
+    return wait;
+}
+
+static void login_failed(SvServer* s, const char* user, const char* addr) {
+    uint64_t k = login_key(user, addr);
+    double now = now_ms();
+    mx_lock(&s->conn_mx);
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < 64 && slot < 0; i++) if (s->login_fail[i].key == k) slot = i;
+    if (slot >= 0 && now - s->login_fail[slot].last > LOGIN_FORGET_MS) s->login_fail[slot].fails = 0;
+    if (slot < 0) {                                  // la voce usata meno di recente (le libere hanno last = 0)
+        for (int i = 1; i < 64; i++) if (s->login_fail[i].last < s->login_fail[oldest].last) oldest = i;
+        slot = oldest;
+        memset(&s->login_fail[slot], 0, sizeof(s->login_fail[slot]));
+        s->login_fail[slot].key = k;
+    }
+    int f = ++s->login_fail[slot].fails;
+    s->login_fail[slot].last = now;
+    if (f >= LOGIN_FREE_FAILS) {
+        int sh = f - LOGIN_FREE_FAILS;
+        double wait = sh >= 20 ? LOGIN_MAX_WAIT_MS : 1000.0 * (double)(1u << sh);
+        s->login_fail[slot].until = now + (wait > LOGIN_MAX_WAIT_MS ? LOGIN_MAX_WAIT_MS : wait);
+    }
+    mx_unlock(&s->conn_mx);
+}
+
+static void login_succeeded(SvServer* s, const char* user, const char* addr) {
+    uint64_t k = login_key(user, addr);
+    mx_lock(&s->conn_mx);
+    for (int i = 0; i < 64; i++) if (s->login_fail[i].key == k) memset(&s->login_fail[i], 0, sizeof(s->login_fail[i]));
+    mx_unlock(&s->conn_mx);
+}
+
+static bool basic_login(SvServer* s, const char* b64, const char* client, char* user, size_t un, double* wait) {
     char dec[400];
     if (!b64_decode(b64, dec, sizeof(dec))) return false;
     char* colon = strchr(dec, ':');
@@ -2404,12 +2623,16 @@ static bool basic_login(SvServer* s, const char* b64, char* user, size_t un) {
             return true;
         }
     mx_unlock(&s->conn_mx);
+    *wait = login_blocked(s, dec, client);
+    if (*wait > 0) { memset(colon + 1, 0, strlen(colon + 1)); return false; }   // troppi errori: non si prova nemmeno
     bool ok = db_login(dec, colon + 1);
     memset(colon + 1, 0, strlen(colon + 1));
     if (!ok) {
+        login_failed(s, dec, client);
         sleep_ms(300);                           // rallenta i tentativi di indovinare la password
         return false;
     }
+    login_succeeded(s, dec, client);
     snprintf(user, un, "%s", dec);
     mx_lock(&s->conn_mx);
     int slot = 0;
@@ -2422,9 +2645,70 @@ static bool basic_login(SvServer* s, const char* b64, char* user, size_t un) {
     return true;
 }
 
+// GET /api/v1/metrics: contatori del server e del motore nel formato di testo di Prometheus (0.0.4)
+static void metrics_text(SvServer* s, JsonBuf* b) {
+    unsigned long long req[SVC_N][6], lat[SVC_N][LAT_N + 1];
+    double lsum[SVC_N];
+    mx_lock(&s->conn_mx);
+    memcpy(req, s->m_req, sizeof(req));
+    memcpy(lat, s->m_lat, sizeof(lat));
+    memcpy(lsum, s->m_lat_sum, sizeof(lsum));
+    mx_unlock(&s->conn_mx);
+    SvStats st;
+    sv_server_stats(s, &st);
+    DbEngineStats es;
+    bool eng = db_engine_stats(&es);
+    static const char* const CLS[6] = { "1xx", "2xx", "3xx", "4xx", "5xx", "other" };
+    jb_lit(b, "# HELP segvault_info SegVault version.\n# TYPE segvault_info gauge\n");
+    jb_printf(b, "segvault_info{version=\"%s\"} 1\n", SV_VERSION_STR);
+    jb_lit(b, "# HELP segvault_uptime_seconds Seconds since the server started.\n# TYPE segvault_uptime_seconds gauge\n");
+    jb_printf(b, "segvault_uptime_seconds %.0f\n", st.uptime_s);
+    jb_lit(b, "# HELP segvault_connections Open client connections.\n# TYPE segvault_connections gauge\n");
+    jb_printf(b, "segvault_connections %d\n", st.connections);
+    jb_lit(b, "# HELP segvault_requests_total Requests served, by service and status class.\n# TYPE segvault_requests_total counter\n");
+    for (int i = 0; i < SVC_N; i++)
+        for (int k = 0; k < 6; k++)
+            if (req[i][k]) jb_printf(b, "segvault_requests_total{service=\"%s\",code=\"%s\"} %llu\n", SVC_NAME[i], CLS[k], req[i][k]);
+    jb_lit(b, "# HELP segvault_request_duration_seconds Time to serve a request, by service.\n"
+              "# TYPE segvault_request_duration_seconds histogram\n");
+    for (int i = 0; i < SVC_N; i++) {
+        unsigned long long cum = 0, tot = 0;
+        for (int k = 0; k <= LAT_N; k++) tot += lat[i][k];
+        if (!tot) continue;
+        for (int k = 0; k < LAT_N; k++) {
+            cum += lat[i][k];
+            jb_printf(b, "segvault_request_duration_seconds_bucket{service=\"%s\",le=\"%g\"} %llu\n", SVC_NAME[i], LAT_LE[k] / 1000.0, cum);
+        }
+        jb_printf(b, "segvault_request_duration_seconds_bucket{service=\"%s\",le=\"+Inf\"} %llu\n", SVC_NAME[i], tot);
+        jb_printf(b, "segvault_request_duration_seconds_sum{service=\"%s\"} %.6f\n", SVC_NAME[i], lsum[i] / 1000.0);
+        jb_printf(b, "segvault_request_duration_seconds_count{service=\"%s\"} %llu\n", SVC_NAME[i], tot);
+    }
+    jb_lit(b, "# HELP segvault_rows_sent_total Rows returned by queries.\n# TYPE segvault_rows_sent_total counter\n");
+    jb_printf(b, "segvault_rows_sent_total %lld\n", st.rows_sent);
+    if (!eng) return;
+    #define MG(name, help, type, fmt, v) jb_printf(b, "# HELP segvault_" name " " help "\n# TYPE segvault_" name " " type "\nsegvault_" name " " fmt "\n", v)
+    MG("buffer_pool_frames", "Pages the buffer pool can hold.", "gauge", "%d", es.pool_frames);
+    MG("buffer_pool_used_frames", "Pages in the buffer pool now.", "gauge", "%d", es.pool_used);
+    MG("buffer_pool_requests_total", "Page requests to the buffer pool.", "counter", "%llu", es.pool_requests);
+    MG("buffer_pool_hits_total", "Page requests served from memory.", "counter", "%llu", es.pool_hits);
+    MG("buffer_pool_misses_total", "Page requests read from disk.", "counter", "%llu", es.pool_misses);
+    MG("buffer_pool_evictions_total", "Pages evicted from the buffer pool.", "counter", "%llu", es.pool_evictions);
+    MG("pages_written_total", "Dirty pages written to the data file.", "counter", "%llu", es.pages_written);
+    MG("data_file_bytes", "Size of the data file.", "gauge", "%lld", es.db_pages * (long long)es.page_size);
+    MG("wal_bytes", "Size of the transaction log.", "gauge", "%lld", es.wal_bytes);
+    MG("wal_records_total", "Records written to the transaction log.", "counter", "%llu", es.wal_records);
+    MG("checkpoints_total", "Checkpoints of the transaction log.", "counter", "%llu", es.checkpoints);
+    MG("lock_waits_total", "Lock requests that had to wait.", "counter", "%llu", es.lock_waits);
+    MG("deadlocks_total", "Deadlocks found (one transaction was refused).", "counter", "%llu", es.deadlocks);
+    MG("open_transactions", "Transactions open in all sessions.", "gauge", "%d", es.open_transactions);
+    MG("databases", "Databases.", "gauge", "%d", es.databases);
+    MG("tables", "Tables in all databases.", "gauge", "%d", es.tables);
+    #undef MG
+}
+
 // percorsi dell'API di SegVault (dopo il prefisso)
 static bool api_route(const char* sub) {
-    static const char* const R[] = { "/health", "/status", "/query", "/endpoints", "/sessions", "/databases" };
+    static const char* const R[] = { "/health", "/status", "/metrics", "/query", "/endpoints", "/sessions", "/databases" };
     for (size_t i = 0; i < sizeof(R) / sizeof(R[0]); i++) {
         size_t l = strlen(R[i]);
         if (!strncmp(sub, R[i], l) && (sub[l] == '\0' || sub[l] == '/')) return true;
@@ -2486,9 +2770,17 @@ static void route(SvServer* s, Request* rq, Response* rs) {
         const char* a = rq->auth;
         bool bearer = s->token && !strncasecmp(a, "Bearer ", 7) && secret_equal(a + 7, s->token);
         if (!strncasecmp(a, "Basic ", 6)) {
-            if (!basic_login(s, a + 6, rq->user, sizeof(rq->user))) {
-                rs->extra_headers = "WWW-Authenticate: Basic realm=\"SegVault\"\r\n";
-                json_error(rs, 401, "wrong user or password");
+            double wait = 0;
+            if (!basic_login(s, a + 6, rq->client, rq->user, sizeof(rq->user), &wait)) {
+                if (wait > 0) {
+                    static _Thread_local char ra[48];
+                    snprintf(ra, sizeof(ra), "Retry-After: %.0f\r\n", wait / 1000.0 + 0.999);
+                    rs->extra_headers = ra;
+                    json_error(rs, 429, "too many wrong passwords for this user: try again in %.0f s", wait / 1000.0 + 0.999);
+                } else {
+                    rs->extra_headers = "WWW-Authenticate: Basic realm=\"SegVault\"\r\n";
+                    json_error(rs, 401, "wrong user or password");
+                }
                 free(ep_sql);
                 return;
             }
@@ -2512,6 +2804,13 @@ static void route(SvServer* s, Request* rq, Response* rs) {
                       "\"errors\":%lld,\"rows_sent\":%lld,\"connections\":%d,\"busy\":%s,\"timeout_ms\":%d}",
                       st.uptime_s, st.requests, st.errors, st.rows_sent, st.connections, st.busy ? "true" : "false",
                       s->cfg.timeout_ms);
+            return;
+        }
+        if (!strcmp(sub, "/metrics")) {                     // formato di testo di Prometheus (P2.12)
+            if (strcmp(rq->method, "GET")) { json_error(rs, 405, "use GET"); return; }
+            metrics_text(s, &rs->body);
+            rs->status = 200;
+            rs->content_type = "text/plain; version=0.0.4; charset=utf-8";
             return;
         }
         if (ep) {
@@ -2709,8 +3008,14 @@ typedef struct {
 // il buffer cresce con i dati arrivati (al massimo raddoppiando), non subito fino a need: 64 richieste che
 // dichiarano 16 MB senza mandarli non riservano più 1 GB
 static bool fill(sock_t fd, InBuf* in, size_t need, atomic_int* stop) {
+    double t0 = now_ms();
+    size_t len0 = in->len;
     while (in->len < need) {
         if (*stop) return false;
+        // corpo che arriva più piano di MIN_BODY_RATE (dopo BODY_GRACE_MS): la connessione si chiude, non
+        // tiene un posto per minuti mandando un byte ogni tanto (slowloris sul corpo, P2.4)
+        double el = now_ms() - t0;
+        if (el > BODY_GRACE_MS && (double)(in->len - len0) < (el / 1000.0) * MIN_BODY_RATE) return false;
         if (in->cap < in->len + 4097) {                    // almeno 4 KB liberi, al massimo 1 MB oltre i dati
             size_t nc = in->cap ? in->cap * 2 : 8192;
             if (nc > in->len + 1 + (1u << 20)) nc = in->len + 1 + (1u << 20);
@@ -2734,6 +3039,116 @@ static bool fill(sock_t fd, InBuf* in, size_t need, atomic_int* stop) {
     return true;
 }
 
+// ── corpi grandi su disco (P2.4) ────────────────────────────────
+// Un corpo oltre SPOOL_MIN non viene accumulato in memoria: arriva a blocchi in un file temporaneo già
+// cancellato (nessun nome resta su disco), poi chi lo usa (FastCGI, CGI, proxy, API) lo legge da una mappa in
+// sola lettura del file. Le pagine sono cache del file, non memoria del processo: 64 upload da 100 MB non
+// costano 6,4 GB di RSS. La mappa termina con un '\0' come il corpo in memoria (alcune API lo leggono come C
+// string).
+#define SPOOL_MIN ((size_t)1 << 20)
+
+typedef struct {
+    char*  map;
+    size_t maplen;
+#ifdef _WIN32
+    HANDLE file, mapping;
+#endif
+} Spool;
+
+static void spool_free(Spool* sp) {
+    if (!sp->map) return;
+#ifdef _WIN32
+    UnmapViewOfFile(sp->map);
+    CloseHandle(sp->mapping);
+    CloseHandle(sp->file);
+#else
+    munmap(sp->map, sp->maplen);
+#endif
+    memset(sp, 0, sizeof(*sp));
+}
+
+#ifndef _WIN32
+static bool write_full(int fd, const char* p, size_t n) {
+    while (n) {
+        ssize_t w = write(fd, p, n);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return false;
+        p += w;
+        n -= (size_t)w;
+    }
+    return true;
+}
+#endif
+
+// legge il corpo di cl byte: i primi `have` sono già in `pre`, il resto arriva da fd. false = connessione
+// chiusa, troppo lenta (MIN_BODY_RATE) o errore del file temporaneo
+static bool spool_body(sock_t fd, const char* pre, size_t have, size_t cl, atomic_int* stop, Spool* sp) {
+    memset(sp, 0, sizeof(*sp));
+    if (have > cl) have = cl;
+#ifdef _WIN32
+    char dir[MAX_PATH], path[MAX_PATH];
+    if (!GetTempPathA(sizeof(dir), dir) || !GetTempFileNameA(dir, "svb", 0, path)) return false;
+    HANDLE f = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if (f == INVALID_HANDLE_VALUE) { DeleteFileA(path); return false; }
+    #define SPOOL_WRITE(buf, n) (WriteFile(f, (buf), (DWORD)(n), &wr, NULL) && wr == (DWORD)(n))
+    DWORD wr;
+#else
+    const char* td = getenv("TMPDIR");
+    char path[1100];
+    snprintf(path, sizeof(path), "%s/segvault-body-XXXXXX", td && td[0] == '/' ? td : "/tmp");
+    int f = mkostemp(path, O_CLOEXEC);
+    if (f < 0) return false;
+    unlink(path);                                   // nessun nome: il file sparisce con l'ultimo descrittore
+    #define SPOOL_WRITE(buf, n) (write_full(f, (buf), (n)))
+#endif
+    bool ok = have == 0 || SPOOL_WRITE(pre, have);
+    size_t got = have;
+    double t0 = now_ms();
+    static _Thread_local char chunk[64 * 1024];
+    while (ok && got < cl) {
+        if (*stop) { ok = false; break; }
+        double el = now_ms() - t0;
+        if (el > BODY_GRACE_MS && (double)(got - have) < (el / 1000.0) * MIN_BODY_RATE) { ok = false; break; }
+        size_t want = cl - got < sizeof(chunk) ? cl - got : sizeof(chunk);
+        int r = (int)recv(fd, chunk, (int)want, 0);
+        if (r <= 0) {
+#ifndef _WIN32
+            if (r < 0 && errno == EINTR) continue;
+#endif
+            ok = false;
+            break;
+        }
+        ok = SPOOL_WRITE(chunk, (size_t)r);
+        got += (size_t)r;
+    }
+    ok = ok && SPOOL_WRITE("", 1);                  // il '\0' finale
+    #undef SPOOL_WRITE
+    if (ok) {
+        sp->maplen = cl + 1;
+#ifdef _WIN32
+        sp->file = f;
+        sp->mapping = CreateFileMappingA(f, NULL, PAGE_READONLY, 0, 0, NULL);
+        sp->map = sp->mapping ? (char*)MapViewOfFile(sp->mapping, FILE_MAP_READ, 0, 0, sp->maplen) : NULL;
+        if (!sp->map) { if (sp->mapping) CloseHandle(sp->mapping); ok = false; }
+#else
+        void* m = mmap(NULL, sp->maplen, PROT_READ, MAP_SHARED, f, 0);
+        if (m == MAP_FAILED) ok = false;
+        else sp->map = (char*)m;
+        close(f);                                   // la mappa tiene vivo il file
+#endif
+    }
+    if (!ok) {
+#ifdef _WIN32
+        CloseHandle(f);
+#else
+        if (!sp->map) close(f);
+#endif
+        memset(sp, 0, sizeof(*sp));
+    }
+    return ok;
+}
+
 // una voce del registro (richieste HTTP, query del protocollo MySQL, messaggi della posta)
 static void log_entry(SvServer* s, const char* client, const char* svc, const char* method, const char* path,
                       const char* detail, const char* user, int status, double ms, long long rows) {
@@ -2744,10 +3159,18 @@ static void log_entry(SvServer* s, const char* client, const char* svc, const ch
 #else
     localtime_r(&now, &tmv);
 #endif
+    int sv = SVC_OTHER;
+    for (int i = 0; i < SVC_N; i++) if (!strcmp(svc, SVC_NAME[i])) sv = i;
+    int cls = status >= 100 && status < 600 ? status / 100 - 1 : 5;
+    int lb = 0;
+    while (lb < LAT_N && ms > LAT_LE[lb]) lb++;
     mx_lock(&s->conn_mx);
     s->n_requests++;
     if (status >= 400) s->n_errors++;
     s->n_rows += rows;
+    s->m_req[sv][cls]++;
+    s->m_lat[sv][lb]++;
+    s->m_lat_sum[sv] += ms;
     SvLogEntry* e = &s->log[(s->n_requests - 1) % SV_LOG_MAX];
     memset(e, 0, sizeof(*e));
     e->seq = s->n_requests;
@@ -2808,7 +3231,7 @@ static int read_chunked(SvServer* s, Conn* c, InBuf* in, size_t pos, JsonBuf* ou
         if (size == 0) {                                        // ultimo pezzo: eventuali trailer, poi riga vuota
             for (;;) {
                 while ((le = find_crlf(in, pos)) == (size_t)-1) {
-                    if (in->len - pos > MAX_HEADER) return 431;
+                    if (in->len - pos > s->max_header) return 431;
                     if (!fill(c->fd, in, in->len + 1, &s->stop)) return -1;
                 }
                 bool empty = le == pos;
@@ -2935,7 +3358,7 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
     double hfirst = in->len ? now_ms() : 0;
     while (!(hend = in->data ? strstr(in->data, "\r\n\r\n") : NULL)) {
         bool late = hfirst > 0 && now_ms() - hfirst > HEADER_DEADLINE_MS;
-        if (in->len >= MAX_HEADER || late) {
+        if (in->len >= s->max_header || late) {
             Response rs = { .close = true };
             if (late) json_error(&rs, 408, "request headers not received in time");
             else json_error(&rs, 431, "request headers too large");
@@ -2947,6 +3370,13 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
         if (!hfirst) hfirst = now_ms();
     }
     size_t head_len = (size_t)(hend - in->data) + 4;
+    if (head_len > s->max_header) {               // arrivate tutte insieme, ma oltre il limite: 431 lo stesso
+        Response rs = { .close = true };
+        json_error(&rs, 431, "request headers too large");
+        send_response(s, c->fd, NULL, &rs);
+        free(rs.body.data);
+        return false;
+    }
     double t0 = now_ms();
     Request rq;
     memset(&rq, 0, sizeof(rq));
@@ -2979,6 +3409,7 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
     }
     size_t used;                                 // byte della richiesta in in->data (intestazione + corpo)
     JsonBuf chunked = {0};
+    Spool spool = {0};
     char after = 0;
     if (rq.chunked) {
         int cerr = read_chunked(s, c, in, head_len, &chunked, &used);
@@ -2998,6 +3429,20 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
         rq.body = chunked.data;
         rq.body_len = rq.content_length = chunked.len - 1;
         rq.has_length = true;
+    } else if (rq.content_length > SPOOL_MIN) {  // corpo grande: su disco mentre arriva, non in memoria
+        size_t inbody = in->len - head_len < rq.content_length ? in->len - head_len : rq.content_length;
+        if (!spool_body(c->fd, in->data + head_len, inbody, rq.content_length, &s->stop, &spool)) {
+            free(rq.headers);
+            return false;
+        }
+        // i byte del corpo già letti escono dal buffer: resta l'intestazione e, dopo, l'eventuale richiesta seguente
+        memmove(in->data + head_len, in->data + head_len + inbody, in->len - head_len - inbody);
+        in->len -= inbody;
+        in->data[in->len] = '\0';
+        used = head_len;
+        after = in->data[used];
+        rq.body = spool.map;
+        rq.body_len = rq.content_length;
     } else {
         if (!fill(c->fd, in, head_len + rq.content_length, &s->stop)) { free(rq.headers); return false; }
         used = head_len + rq.content_length;
@@ -3012,6 +3457,7 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
         if (!rq.chunked) in->data[used] = after; // il corpo ha la sua lunghezza; i byte dopo vanno inoltrati intatti
         bool keep = proxy_request(s, c, in, &rq, used, t0);
         free(chunked.data);
+        spool_free(&spool);
         free(rq.headers);
         if (!keep) return false;
         memmove(in->data, in->data + used, in->len - used);
@@ -3023,6 +3469,7 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
     rs.close = rs.close || !rq.keep_alive || s->stop || (rs.streamed && rq.http10);
     if (!rq.chunked) in->data[used] = after;
     free(chunked.data);
+    spool_free(&spool);
     rq.body = NULL;
     bool sent = rs.streamed ? true : send_response(s, c->fd, &rq, &rs);
     double ms = now_ms() - t0;
@@ -3048,7 +3495,7 @@ static bool serve_one(SvServer* s, Conn* c, InBuf* in) {
 static void serve_connection(Conn* c) {
     InBuf in = {0};
     set_timeout(c->fd, IDLE_TIMEOUT_MS);
-    db_set_lock_wait_hook(lock_wait_hook, c->s);
+    db_set_lock_wait_hooks(lock_wait_leave, lock_wait_enter, c->s);
     // connessione dal ponte TLS: "SVTLS <segreto> <ip> <porta>\r\n" prima della richiesta
     SvServer* s = c->s;
     if (s->tls && !strncmp(c->client, "127.", 4)) {
@@ -3157,39 +3604,144 @@ static void my_error(MwOut* o, const char* msg) {
     mw_err(o, code, st, msg);
 }
 
-// login: utenti di SegVault (verificatore mysql_native_password); "root" col token = accesso completo;
-// server senza token né --users = locale e aperto: qualunque nome entra come root
-static int my_login(SvServer* s, const MwLogin* lg, const uint8_t* resp, size_t rlen, const uint8_t scramble[20], char* user, size_t un) {
-    user[0] = '\0';
-    int r = db_login_native(lg->user, scramble, resp, rlen);
-    if (r == 1) { snprintf(user, un, "%s", lg->user); return 1; }
-    if (r == -1) return -1;
-    if (s->token && !strcmp(lg->user, "root")) {
-        uint8_t a[20], b[20];
-        auth_sha1(s->token, strlen(s->token), a);
-        auth_sha1(a, 20, b);
-        uint8_t buf[40], x[20], cand[20], chk[20];
-        memcpy(buf, scramble, 20);
-        memcpy(buf + 20, b, 20);
-        auth_sha1(buf, 40, x);
-        for (int i = 0; i < 20 && rlen == 20; i++) cand[i] = resp[i] ^ x[i];
-        auth_sha1(cand, 20, chk);
-        if (rlen == 20 && !memcmp(chk, b, 20)) return 1;          // root
-        return 0;
+// login col protocollo MySQL: utenti di SegVault; "root" col token = accesso completo; server senza token né
+// --users = locale e aperto: qualunque nome entra come root.
+//   mysql_native_password: solo per chi ha il verificatore SHA1(SHA1(pw)) (IDENTIFIED WITH mysql_native_password)
+//   caching_sha2_password (MySQL 8): accesso veloce da SHA256(SHA256(pw)) in memoria; altrimenti accesso
+//   completo con la password in chiaro, ammessa solo su TLS o socket Unix, altrimenti cifrata con la chiave
+//   RSA del server (il client la chiede col byte 0x02)
+// 1 = dentro (user = nome, "" per root), 0 = no, -1 = no con un messaggio in msg; la risposta d'errore la manda
+// chi chiama, quella di successo intermedia (0x03) questa funzione
+static bool open_mode(SvServer* s) { return !s->token && !s->cfg.require_login; }
+
+static bool token_native_ok(const char* token, const uint8_t scramble[20], const uint8_t* resp, size_t rlen) {
+    uint8_t a[20], b[20];
+    auth_sha1(token, strlen(token), a);
+    auth_sha1(a, 20, b);
+    uint8_t buf[40], x[20], cand[20], chk[20];
+    memcpy(buf, scramble, 20);
+    memcpy(buf + 20, b, 20);
+    auth_sha1(buf, 40, x);
+    if (rlen != 20) return false;
+    for (int i = 0; i < 20; i++) cand[i] = resp[i] ^ x[i];
+    auth_sha1(cand, 20, chk);
+    return !memcmp(chk, b, 20);
+}
+
+static bool const_eq(const char* a, const char* b) {
+    size_t la = strlen(a), lb = strlen(b);
+    unsigned d = (unsigned)(la ^ lb);
+    for (size_t i = 0; i < la && i < lb; i++) d |= (unsigned)(a[i] ^ b[i]);
+    return d == 0;
+}
+
+// accesso completo di caching_sha2_password: legge la password (in chiaro su canale sicuro, o cifrata RSA)
+static int my_sha2_full(SvServer* s, Conn* c, InBuf* in, MwOut* o, const char* uname, bool root_tok,
+                        const uint8_t scramble[20], char* msg, size_t msz) {
+    static const uint8_t full = 0x04;
+    mw_auth_more(o, &full, 1);
+    MyPkt pk;
+    if (!my_send(c, o) || !my_read(s, c, in, &pk, 4096)) return 0;
+    o->seq = (uint8_t)(pk.seq + 1);
+    char pw[600];
+    pw[0] = '\0';
+    bool secure = c->mytls || c->unix_sock;
+    if (pk.n == 1 && pk.p[0] == 0x02 && !secure) {             // il client chiede la chiave pubblica
+        free(pk.p);
+        const char* pem = tls_rsa_public_pem();
+        if (!pem) {
+            snprintf(msg, msz, "Authentication requires a secure connection: connect with TLS (--https) or over the "
+                               "Unix socket, or install OpenSSL 3 so SegVault can offer an RSA key");
+            return -1;
+        }
+        mw_auth_more(o, pem, strlen(pem));
+        if (!my_send(c, o) || !my_read(s, c, in, &pk, 4096)) return 0;
+        o->seq = (uint8_t)(pk.seq + 1);
+        uint8_t plain[600];
+        int n = tls_rsa_decrypt(pk.p, pk.n, plain, sizeof(plain) - 1);
+        free(pk.p);
+        if (n <= 0) return 0;
+        for (int i = 0; i < n; i++) plain[i] ^= scramble[i % 20];      // password + '\0', XOR col nonce
+        size_t l = strnlen((const char*)plain, (size_t)n);
+        if (l >= sizeof(pw)) return 0;
+        memcpy(pw, plain, l);
+        pw[l] = '\0';
+        memset(plain, 0, sizeof(plain));
+    } else if (secure) {                                          // password in chiaro + '\0'
+        size_t l = strnlen((const char*)pk.p, pk.n);
+        if (l >= sizeof(pw)) { free(pk.p); return 0; }
+        memcpy(pw, pk.p, l);
+        pw[l] = '\0';
+        memset(pk.p, 0, pk.n);
+        free(pk.p);
+    } else {                                                      // password in chiaro su TCP: rifiutata
+        free(pk.p);
+        snprintf(msg, msz, "Authentication requires a secure connection");
+        return -1;
     }
-    if (!s->token && !s->cfg.require_login) return 1;          // locale, aperto (come l'HTTP senza token)
-    return 0;
+    int r = root_tok ? (const_eq(pw, s->token) ? 1 : 0) : (db_login(uname, pw) ? 1 : 0);
+    memset(pw, 0, sizeof(pw));
+    return r;
+}
+
+static int my_login(SvServer* s, Conn* c, InBuf* in, MwOut* o, const MwLogin* lg, const uint8_t scramble[20],
+                    char* user, size_t un, char* msg, size_t msz) {
+    user[0] = msg[0] = '\0';
+    uint8_t resp[64];
+    size_t rlen = lg->auth_len < sizeof(resp) ? lg->auth_len : sizeof(resp);
+    memcpy(resp, lg->auth, rlen);
+    const char* plugin = lg->plugin[0] ? lg->plugin : "mysql_native_password";
+    bool root_tok = s->token && !strcmp(lg->user, "root");
+    bool open = open_mode(s) && !root_tok;
+    bool sha2 = !strcmp(plugin, "caching_sha2_password");
+    bool native = !strcmp(plugin, "mysql_native_password");
+    // verificatore da usare: native se il client lo usa e l'utente ce l'ha (o è root col token), altrimenti sha2
+    bool use_native = open ? !sha2 : root_tok ? !sha2 : (native && db_user_has_native(lg->user));
+    if ((use_native && !native) || (!use_native && !sha2)) {     // il client passa all'altro metodo
+        mw_auth_switch_to(o, use_native ? "mysql_native_password" : "caching_sha2_password", scramble);
+        MyPkt pk;
+        if (!my_send(c, o) || !my_read(s, c, in, &pk, 4096)) return 0;
+        o->seq = (uint8_t)(pk.seq + 1);
+        rlen = pk.n < sizeof(resp) ? pk.n : sizeof(resp);
+        memcpy(resp, pk.p, rlen);
+        free(pk.p);
+    }
+    int r;
+    bool full = false;
+    if (open) r = 1;
+    else if (use_native) r = root_tok ? (token_native_ok(s->token, scramble, resp, rlen) ? 1 : 0)
+                                      : (db_login_native(lg->user, scramble, resp, rlen) == 1 ? 1 : 0);
+    else if (rlen == 0) r = 0;                                    // password vuota: nessun utente ce l'ha
+    else {
+        if (root_tok) {
+            uint8_t st2[32];
+            auth_sha2_stage2(s->token, st2);
+            r = auth_sha2_check(st2, scramble, resp, rlen) ? 1 : 0;
+        } else r = db_login_sha2(lg->user, scramble, resp, rlen);
+        if (r == -2) {
+            full = true;
+            r = my_sha2_full(s, c, in, o, lg->user, root_tok, scramble, msg, msz);
+        }
+    }
+    // caching_sha2, accesso veloce riuscito: 0x03 prima dell'OK (dopo l'accesso completo arriva solo l'OK)
+    if (r == 1 && !use_native && !full) {
+        static const uint8_t fast_ok = 0x03;
+        mw_auth_more(o, &fast_ok, 1);
+    }
+    if (r == 1 && !open && !root_tok) snprintf(user, un, "%s", lg->user);
+    return r;
 }
 
 static bool my_enter(SvServer* s, DbSession* ds) {
     exec_begin(s);
-    for (double waited = 0; !db_session_enter(ds); waited += 20) {
+    for (double w0 = now_ms();;) {
+        unsigned long long seq = db_session_seq();
+        if (db_session_enter(ds)) return true;
         exec_end(s);
-        if (waited >= SESSION_WAIT_MS || s->stop) return false;
-        sleep_ms(20);
+        if (now_ms() - w0 >= SESSION_WAIT_MS || s->stop) return false;
+        db_session_wait(seq, 200);
         exec_begin(s);
     }
-    return true;
 }
 
 static void my_leave(SvServer* s, DbSession* ds) {
@@ -3333,7 +3885,16 @@ static bool my_admin_cmd(SvServer* s, Conn* c, MwOut* o, const char* sql, const 
 // *autocommit è quello della connessione: con SET autocommit = 0 la prima istruzione che
 // modifica i dati apre una transazione, che resta aperta fino a COMMIT / ROLLBACK (come MySQL;
 // le sole letture non la aprono, così una connessione che legge non blocca chi scrive)
+// prep / lits: un prepared statement già analizzato e i valori dei suoi '?' (NULL = si esegue il testo)
+static void my_query_ex(SvServer* s, Conn* c, MwOut* o, char* sql, const char* user, bool binary, bool* autocommit,
+                        QueryResult** cursor, DbPrepared* prep, char* const* lits, int nlits);
 static void my_query(SvServer* s, Conn* c, MwOut* o, char* sql, const char* user, bool binary, bool* autocommit) {
+    my_query_ex(s, c, o, sql, user, binary, autocommit, NULL, NULL, NULL, 0);
+}
+
+// cursor != NULL (EXECUTE con cursore): un resultset non si manda, resta in *cursor per COM_STMT_FETCH
+static void my_query_ex(SvServer* s, Conn* c, MwOut* o, char* sql, const char* user, bool binary, bool* autocommit,
+                        QueryResult** cursor, DbPrepared* prep, char* const* lits, int nlits) {
     int len = (int)strlen(sql), cap = 32, nst;
     SqlRange* ranges = NULL;
     for (;;) {
@@ -3378,10 +3939,28 @@ static void my_query(SvServer* s, Conn* c, MwOut* o, char* sql, const char* user
             snprintf(up, sizeof(up), "%.0f", stt.uptime_s);
             snprintf(th, sizeof(th), "%d", stt.connections);
             snprintf(qs, sizeof(qs), "%lld", stt.requests);
+            // gli stessi numeri di /api/v1/metrics, coi nomi di MySQL / MariaDB (P2.12)
+            DbEngineStats es;
+            if (!db_engine_stats(&es)) memset(&es, 0, sizeof(es));
+            char ev[11][24];
+            snprintf(ev[0], 24, "%llu", es.pool_requests);
+            snprintf(ev[1], 24, "%llu", es.pool_misses);
+            snprintf(ev[2], 24, "%d", es.pool_frames);
+            snprintf(ev[3], 24, "%d", es.pool_used);
+            snprintf(ev[4], 24, "%llu", es.pages_written);
+            snprintf(ev[5], 24, "%lld", es.wal_bytes);
+            snprintf(ev[6], 24, "%llu", es.lock_waits);
+            snprintf(ev[7], 24, "%llu", es.deadlocks);
+            snprintf(ev[8], 24, "%d", es.open_transactions);
+            snprintf(ev[9], 24, "%d", es.tables);
+            snprintf(ev[10], 24, "%llu", es.checkpoints);
             const char* nm[] = { "Uptime", "Threads_connected", "Threads_running", "Questions", "Queries", "Ssl_cipher", "Ssl_version",
-                                 "Max_used_connections", "Open_tables", "Com_select" };
+                                 "Max_used_connections", "Open_tables", "Com_select",
+                                 "Innodb_buffer_pool_read_requests", "Innodb_buffer_pool_reads", "Innodb_buffer_pool_pages_total",
+                                 "Innodb_buffer_pool_pages_data", "Innodb_buffer_pool_pages_flushed", "Innodb_os_log_written",
+                                 "Innodb_row_lock_waits", "Innodb_deadlocks", "Open_transactions", "Opened_tables", "Innodb_checkpoints" };
             const char* vv[] = { up, th, "1", qs, qs, c->mytls ? tls_cipher(c->mytls) : "", c->mytls ? tls_version(c->mytls) : "",
-                                 th, "0", "0" };
+                                 th, ev[9], "0", ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8], ev[9], ev[10] };
             mw_name_values(o, nm, vv, (int)(sizeof(nm) / sizeof(nm[0])), pat, my_status(*autocommit) | more);
             sql[e] = saved;
             continue;
@@ -3393,7 +3972,9 @@ static void my_query(SvServer* s, Conn* c, MwOut* o, char* sql, const char* user
             break;
         }
         double q0 = now_ms();
-        QueryResult* r = db_execute(one);
+        // un solo statement già analizzato (COM_STMT_EXECUTE): l'albero coi valori, senza rianalizzare il testo
+        QueryResult* r = prep && nst == 1 ? db_prepared_exec(prep, (const char* const*)lits, nlits) : NULL;
+        if (!r) r = db_execute(one);
         audit_stmt(s, &rs, user, one, r);
         {                                       // registro: le query dell'app, una per riga
             char det[160];
@@ -3412,6 +3993,7 @@ static void my_query(SvServer* s, Conn* c, MwOut* o, char* sql, const char* user
         }
         unsigned st = my_status(*autocommit) | more;
         const char* cur = db_current_database();
+        if (r->num_cols > 0 && cursor && k == last) { mw_cursor_open(o, r, cur ? cur : "", st); *cursor = r; continue; }
         if (r->num_cols > 0) { if (binary) mw_resultset_binary(o, r, cur ? cur : "", st); else mw_resultset(o, r, cur ? cur : "", st); }
         else mw_ok(o, (uint64_t)(r->rows_affected > 0 ? r->rows_affected : 0),
                    (uint64_t)(r->last_insert_id > 0 ? r->last_insert_id : 0), st, NULL);
@@ -3428,6 +4010,10 @@ typedef struct {
     uint8_t*    types;          // 2 byte per parametro, dall'ultimo EXECUTE che li ha mandati
     bool        types_set;
     MwLongData* ld;             // valori mandati con COM_STMT_SEND_LONG_DATA
+    QueryResult* cur;           // cursore aperto (EXECUTE con CURSOR_TYPE_READ_ONLY) e prossima riga
+    int         cur_pos;
+    DbPrepared* prep;           // albero analizzato una volta (P2.2), al primo EXECUTE; NULL = col testo
+    bool        prep_tried;
 } MyStmt;
 
 typedef struct { MyStmt* v; int n, cap; uint32_t next_id; bool autocommit; } MyStmts;   // + autocommit della connessione
@@ -3438,7 +4024,16 @@ static void stmt_clear_ld(MyStmt* st) {
     for (int i = 0; st->ld && i < st->nparams; i++) { free(st->ld[i].p); st->ld[i] = (MwLongData){0}; }
 }
 
+static void stmt_close_cursor(MyStmt* st) {
+    db_result_free(st->cur);
+    st->cur = NULL;
+    st->cur_pos = 0;
+}
+
 static void stmt_free(MyStmt* st) {
+    db_prepared_free(st->prep);
+    st->prep = NULL;
+    stmt_close_cursor(st);
     stmt_clear_ld(st);
     free(st->ld);
     free(st->types);
@@ -3532,10 +4127,16 @@ static void my_execute(SvServer* s, Conn* c, MyStmts* ss, MwOut* o, const uint8_
     MyStmt* st = stmt_find(ss, id);
     if (!st) { mw_err(o, 1243, "HY000", "Unknown prepared statement handler given to mysqld_stmt_execute"); return; }
     char err[160];
-    char* sql = mw_bind_execute(st->sql, p + 5, n - 5, st->nparams, st->types, &st->types_set, st->ld, err, sizeof(err));
+    char** lits = NULL;
+    char* sql = mw_bind_execute(st->sql, p + 5, n - 5, st->nparams, st->types, &st->types_set, st->ld, &lits, err, sizeof(err));
     stmt_clear_ld(st);                                     // i dati lunghi valgono per un solo EXECUTE
     if (!sql) { mw_err(o, 1210, "HY000", err); return; }
-    my_query(s, c, o, sql, user, true, &ss->autocommit);
+    stmt_close_cursor(st);                                 // un nuovo EXECUTE chiude il cursore precedente
+    if (!st->prep_tried) { st->prep = db_prepared_new(st->sql); st->prep_tried = true; }   // al primo EXECUTE
+    bool want_cursor = (p[5] & 0x07) != 0;                 // CURSOR_TYPE_READ_ONLY / FOR_UPDATE / SCROLLABLE
+    my_query_ex(s, c, o, sql, user, true, &ss->autocommit, want_cursor ? &st->cur : NULL, st->prep, lits, st->nparams);
+    for (int i = 0; lits && i < st->nparams; i++) free(lits[i]);
+    free(lits);
     free(sql);
 }
 
@@ -3559,7 +4160,7 @@ static void my_long_data(MyStmts* ss, const uint8_t* p, size_t n) {
 
 static void serve_mysql(Conn* c) {
     db_set_mysql_mode(true);                     // questo thread serve solo la connessione MySQL
-    db_set_lock_wait_hook(lock_wait_hook, c->s);
+    db_set_lock_wait_hooks(lock_wait_leave, lock_wait_enter, c->s);
     SvServer* s = c->s;
     InBuf in = {0};
     MwOut o = {0};
@@ -3588,30 +4189,23 @@ static void serve_mysql(Conn* c) {
     o.seq = (uint8_t)(pk.seq + 1);
     free(pk.p);
     if (!parsed) { mw_err(&o, 1043, "08S01", "Bad handshake (protocol 4.1 required)"); my_send(c, &o); free(o.p); free(in.data); return; }
-    uint8_t resp[64];
-    size_t rlen = lg.auth_len;
-    memcpy(resp, lg.auth, rlen);
-    if (lg.plugin[0] && strcmp(lg.plugin, "mysql_native_password")) {     // es. caching_sha2_password: si chiede l'altro
-        mw_auth_switch(&o, scramble);
-        if (!my_send(c, &o) || !my_read(s, c, &in, &pk, 4096)) { free(o.p); free(in.data); return; }
-        o.seq = (uint8_t)(pk.seq + 1);
-        rlen = pk.n < sizeof(resp) ? pk.n : sizeof(resp);
-        memcpy(resp, pk.p, rlen);
-        free(pk.p);
-    }
-    char user[64];
-    int lr = my_login(s, &lg, resp, rlen, scramble, user, sizeof(user));
+    char user[64], why[300];
+    double lwait = login_blocked(s, lg.user, c->client);
+    int lr = -1;
+    if (lwait > 0) snprintf(why, sizeof(why), "Too many wrong passwords for user '%.63s': try again in %.0f s", lg.user, lwait / 1000.0 + 0.999);
+    else lr = my_login(s, c, &in, &o, &lg, scramble, user, sizeof(user), why, sizeof(why));
     if (lr != 1) {
-        char m[300];
-        if (lr == -1) snprintf(m, sizeof(m), "User '%.63s' was created before MySQL logins were supported: set the password again (ALTER USER %.63s IDENTIFIED BY '...')", lg.user, lg.user);
-        else snprintf(m, sizeof(m), "Access denied for user '%.63s' (using password: %s)", lg.user, rlen ? "YES" : "NO");
-        sleep_ms(300);                                      // rallenta i tentativi
+        char m[400];
+        if (lr == -1 && why[0]) snprintf(m, sizeof(m), "%s", why);
+        else snprintf(m, sizeof(m), "Access denied for user '%.63s' (using password: %s)", lg.user, lg.auth_len ? "YES" : "NO");
+        if (lwait <= 0) { login_failed(s, lg.user, c->client); sleep_ms(300); }   // rallenta i tentativi
         mw_err(&o, 1045, "28000", m);
         my_send(c, &o);
         if (!s->cfg.quiet) fprintf(stderr, "%s mysql login refused for '%s'\n", c->client, lg.user);
         free(o.p); free(in.data);
         return;
     }
+    login_succeeded(s, lg.user, c->client);
     mx_lock(&s->exec_mx);
     DbSession* ds = db_session_new();
     mx_unlock(&s->exec_mx);
@@ -3664,7 +4258,16 @@ static void serve_mysql(Conn* c) {
         else if (cmd == MW_COM_STMT_RESET) {
             MyStmt* st = pk.n >= 5 ? stmt_find(&stmts, (uint32_t)pk.p[1] | (uint32_t)pk.p[2] << 8 | (uint32_t)pk.p[3] << 16 | (uint32_t)pk.p[4] << 24) : NULL;
             if (!st) mw_err(&o, 1243, "HY000", "Unknown prepared statement handler given to mysqld_stmt_reset");
-            else { stmt_clear_ld(st); mw_ok(&o, 0, 0, my_status(stmts.autocommit), NULL); }
+            else { stmt_clear_ld(st); stmt_close_cursor(st); mw_ok(&o, 0, 0, my_status(stmts.autocommit), NULL); }
+        } else if (cmd == MW_COM_STMT_FETCH) {                 // righe dal cursore (già calcolate): niente motore
+            uint32_t sid = pk.n >= 9 ? (uint32_t)pk.p[1] | (uint32_t)pk.p[2] << 8 | (uint32_t)pk.p[3] << 16 | (uint32_t)pk.p[4] << 24 : 0;
+            uint32_t cnt = pk.n >= 9 ? (uint32_t)pk.p[5] | (uint32_t)pk.p[6] << 8 | (uint32_t)pk.p[7] << 16 | (uint32_t)pk.p[8] << 24 : 0;
+            MyStmt* st = sid ? stmt_find(&stmts, sid) : NULL;
+            char em[96];
+            snprintf(em, sizeof(em), "The statement (%u) has no open cursor.", (unsigned)sid);
+            if (!st) mw_err(&o, 1243, "HY000", "Unknown prepared statement handler given to mysqld_stmt_fetch");
+            else if (!st->cur) mw_err(&o, 1421, "HY000", em);
+            else mw_cursor_fetch(&o, st->cur, &st->cur_pos, cnt ? cnt : 1, my_status(stmts.autocommit));
         } else if (cmd == MW_COM_STATISTICS) {              // una riga di testo, come mysqladmin status
             SvStats stt;
             sv_server_stats(s, &stt);
@@ -3684,14 +4287,23 @@ static void serve_mysql(Conn* c) {
             while (pos < pk.n && pk.p[pos]) pos++;
             pos++;
             size_t al = pos < pk.n ? pk.p[pos++] : 0;
-            const uint8_t* ar = pk.p + pos;
             if (pos + al > pk.n) al = 0;
+            if (al > sizeof(nl.auth)) al = sizeof(nl.auth);
+            memcpy(nl.auth, pk.p + pos, al);
+            nl.auth_len = al;
             pos += al;
             size_t dk = 0;
             while (pos < pk.n && pk.p[pos] && dk < sizeof(nl.db) - 1) nl.db[dk++] = (char)pk.p[pos++];
-            char nu[64];
-            int lr2 = my_login(s, &nl, ar, al, scramble, nu, sizeof(nu));
+            while (pos < pk.n && pk.p[pos]) pos++;
+            pos++;
+            pos += 2;                                      // set di caratteri
+            size_t pk2 = 0;                                // plugin di autenticazione (se il client lo manda)
+            while (pos < pk.n && pk.p[pos] && pk2 < sizeof(nl.plugin) - 1) nl.plugin[pk2++] = (char)pk.p[pos++];
+            char nu[64], why2[300];
+            double w2 = login_blocked(s, nl.user, c->client);
+            int lr2 = w2 > 0 ? -1 : my_login(s, c, &in, &o, &nl, scramble, nu, sizeof(nu), why2, sizeof(why2));
             if (lr2 != 1) {
+                if (w2 <= 0) login_failed(s, nl.user, c->client);
                 mw_err(&o, 1045, "28000", "Access denied for the new user");
                 my_send(c, &o);
                 free(pk.p);
@@ -3777,7 +4389,7 @@ static void conn_finish(Conn* c) {
     SvServer* s = c->s;
     if (c->mytls) tls_close(c->mytls);
     mx_lock(&s->conn_mx);
-    s->conns[c->slot] = BAD_SOCK;
+    if (c->slot >= 0) s->conns[c->slot] = BAD_SOCK;   // -1: connessione interna in memoria (nessuno slot)
     s->active--;
     mx_unlock(&s->conn_mx);
     sock_close(c->fd);
@@ -3805,6 +4417,127 @@ static bool spawn(Conn* c) {
 }
 #endif
 
+// ── connessioni interne in memoria (P2.5) ──
+// Il ponte TLS e ogni stream HTTP/2 parlano al server HTTP con un socketpair invece di una connessione TCP
+// a 127.0.0.1: niente accept né slot di connessione. Il ponte TLS HTTP/1.1 (una connessione lunga) ha il suo
+// thread come prima; gli stream HTTP/2 (una richiesta ciascuno, "Connection: close") vanno in coda a un pool
+// fisso di INNER_WORKERS thread, così 50 connessioni HTTP/2 con 32 stream ciascuna non diventano 1600 thread.
+// Coda piena: lo stream riceve 503. Windows non ha socketpair: resta la connessione TCP locale.
+#ifndef _WIN32
+#define INNER_WORKERS 24
+#define INNER_QUEUE   8192
+typedef struct InnerPool {
+    pthread_mutex_t mx;
+    pthread_cond_t  cv;
+    Conn*           q[INNER_QUEUE];
+    int             head, n;
+    pthread_t       th[INNER_WORKERS];
+    int             nth;
+    bool            stop;
+} InnerPool;
+
+static void* inner_worker(void* arg) {
+    SvServer* s = arg;
+    InnerPool* p = s->inner;
+    for (;;) {
+        pthread_mutex_lock(&p->mx);
+        while (!p->n && !p->stop) pthread_cond_wait(&p->cv, &p->mx);
+        if (!p->n) { pthread_mutex_unlock(&p->mx); break; }     // stop e coda vuota
+        Conn* c = p->q[p->head];
+        p->head = (p->head + 1) % INNER_QUEUE;
+        p->n--;
+        pthread_mutex_unlock(&p->mx);
+        serve_connection(c);
+        conn_finish(c);
+    }
+    return NULL;
+}
+
+static bool inner_enqueue(SvServer* s, Conn* c) {
+    if (!s->inner) {                                   // primo stream: si avvia il pool (con conn_mx)
+        mx_lock(&s->conn_mx);
+        if (!s->inner) {
+            InnerPool* p = calloc(1, sizeof(InnerPool));
+            if (p) {
+                pthread_mutex_init(&p->mx, NULL);
+                pthread_cond_init(&p->cv, NULL);
+                s->inner = p;
+                for (int i = 0; i < INNER_WORKERS; i++)
+                    if (pthread_create(&p->th[p->nth], NULL, inner_worker, s) == 0) p->nth++;
+            }
+        }
+        mx_unlock(&s->conn_mx);
+        if (!s->inner || !s->inner->nth) return false;
+    }
+    InnerPool* p = s->inner;
+    pthread_mutex_lock(&p->mx);
+    bool ok = !p->stop && p->n < INNER_QUEUE;
+    if (ok) {
+        p->q[(p->head + p->n) % INNER_QUEUE] = c;
+        p->n++;
+        pthread_cond_signal(&p->cv);
+    }
+    pthread_mutex_unlock(&p->mx);
+    return ok;
+}
+
+static void inner_pool_stop(SvServer* s) {
+    InnerPool* p = s->inner;
+    if (!p) return;
+    pthread_mutex_lock(&p->mx);
+    p->stop = true;
+    pthread_cond_broadcast(&p->cv);
+    pthread_mutex_unlock(&p->mx);
+    for (int i = 0; i < p->nth; i++) pthread_join(p->th[i], NULL);
+    pthread_mutex_destroy(&p->mx);
+    pthread_cond_destroy(&p->cv);
+    free(p);
+    s->inner = NULL;
+}
+
+static sock_t inner_connect(void* ud, bool one_request) {
+    SvServer* s = ud;
+    if (s->stop) return BAD_SOCK;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) return BAD_SOCK;
+    Conn* c = calloc(1, sizeof(Conn));
+    if (!c) { close(sv[0]); close(sv[1]); return BAD_SOCK; }
+    c->s = s;
+    c->fd = sv[1];
+    c->slot = -1;
+    snprintf(c->client, sizeof(c->client), "127.0.0.1");   // il vero indirizzo arriva con la riga SVTLS
+    mx_lock(&s->conn_mx);
+    s->active++;
+    mx_unlock(&s->conn_mx);
+    bool ok = one_request ? inner_enqueue(s, c) : spawn(c);
+    if (!ok) {
+        mx_lock(&s->conn_mx);
+        s->active--;
+        mx_unlock(&s->conn_mx);
+        close(sv[0]);
+        close(sv[1]);
+        free(c);
+        return BAD_SOCK;
+    }
+    return sv[0];
+}
+#endif
+
+// thread del processo (diagnostica: /api/v1/metrics, test del carico HTTP/2); -1 se non si sa
+int sv_process_threads(void) {
+#ifdef __linux__
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256];
+    int n = -1;
+    while (fgets(line, sizeof(line), f)) if (!strncmp(line, "Threads:", 8)) { n = atoi(line + 8); break; }
+    fclose(f);
+    return n;
+#else
+    return -1;
+#endif
+}
+
 // socket in ascolto su addr:port (port 0 = scelta dal sistema, *actual = quella vera)
 static sock_t listen_tcp(const char* addr_s, int port, int* actual) {
     struct sockaddr_in addr;
@@ -3812,7 +4545,7 @@ static sock_t listen_tcp(const char* addr_s, int port, int* actual) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons((unsigned short)port);
     addr.sin_addr.s_addr = inet_addr(addr_s);
-    sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    sock_t fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd == BAD_SOCK) return BAD_SOCK;
     int one = 1;
 #ifndef _WIN32
@@ -3860,7 +4593,7 @@ bool sv_port_owner(int port, char* out, size_t outsz) {
     unsigned uid = 0;
     static const char* const F[] = { "/proc/net/tcp", "/proc/net/tcp6" };
     for (int k = 0; k < 2 && !inode; k++) {
-        FILE* f = fopen(F[k], "r");
+        FILE* f = fopen(F[k], "r" SV_FE);
         if (!f) continue;
         char line[512];
         if (!fgets(line, sizeof(line), f)) { fclose(f); continue; }
@@ -3897,7 +4630,7 @@ bool sv_port_owner(int port, char* out, size_t outsz) {
             if (strcmp(tgt, want)) continue;
             char cp[300], comm[64] = "";
             snprintf(cp, sizeof(cp), "/proc/%s/comm", e->d_name);
-            FILE* c = fopen(cp, "r");
+            FILE* c = fopen(cp, "r" SV_FE);
             if (c) { if (fgets(comm, sizeof(comm), c)) comm[strcspn(comm, "\n")] = '\0'; fclose(c); }
             snprintf(out, outsz, "%s (pid %s)", comm[0] ? comm : "a program", e->d_name);
             break;
@@ -4052,7 +4785,7 @@ static bool svc_mysql_start(SvServer* s, char* err, size_t errsz) {
         if (strlen(s->cfg.mysql_socket) < sizeof(ua.sun_path)) {
             snprintf(ua.sun_path, sizeof(ua.sun_path), "%s", s->cfg.mysql_socket);
             unlink(ua.sun_path);
-            sock_t uf = socket(AF_UNIX, SOCK_STREAM, 0);
+            sock_t uf = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
             if (uf != BAD_SOCK && bind(uf, (struct sockaddr*)&ua, sizeof(ua)) == 0 && chmod(ua.sun_path, 0600) == 0 && listen(uf, 64) == 0)
                 svc_publish(s, &s->mysql_unix_fd, uf);
             else if (uf != BAD_SOCK) sock_close(uf);
@@ -4072,8 +4805,15 @@ static bool svc_php_start(SvServer* s, char* err, size_t errsz) {
     int n_ini = 0;
     // PHP senza php.ini (lo zip di PHP per Windows): estensioni presenti e valori da sviluppo
     if (s->php_cgi_path) {
-        int k = fcgi_zero_config(s->php_cgi_path, ini_buf + 2, 32);
+        int k = fcgi_zero_config(s->php_cgi_path, ini_buf + 2, 30);
         for (int i = 0; i < k; i++) ini[n_ini++] = ini_buf[2 + i];
+        // un solo limite per gli upload (P2.4): quello del server (--max-body) vale anche per PHP, così un file
+        // che il server accetta non viene scartato da post_max_size (e viceversa)
+        unsigned mb = (unsigned)((s->cfg.max_body + (1u << 20) - 1) >> 20);
+        snprintf(ini_buf[32], sizeof(ini_buf[32]), "post_max_size=%uM", mb);
+        snprintf(ini_buf[33], sizeof(ini_buf[33]), "upload_max_filesize=%uM", mb);
+        ini[n_ini++] = ini_buf[32];
+        ini[n_ini++] = ini_buf[33];
     }
     if (s->mail_fd != BAD_SOCK) {                     // mail() di PHP verso la cattura delle email
 #ifdef _WIN32
@@ -4206,7 +4946,9 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
     s->listen6_fd = BAD_SOCK;
     s->cfg = *cfg;
     if (!s->cfg.bind_addr) s->cfg.bind_addr = "127.0.0.1";
-    if (!s->cfg.max_body) s->cfg.max_body = 16u << 20;
+    if (!s->cfg.max_body) s->cfg.max_body = 128u << 20;
+    s->max_header = s->cfg.max_header ? s->cfg.max_header : MAX_HEADER;
+    if (s->max_header < 4096) s->max_header = 4096;
     if (s->cfg.max_clients <= 0) s->cfg.max_clients = cfg->https ? 256 : 64;   // HTTPS: ogni connessione ne usa almeno due
     s->token      = cfg->token && cfg->token[0] ? strdup(cfg->token) : NULL;
     s->cors       = cfg->cors_origin && cfg->cors_origin[0] ? strdup(cfg->cors_origin) : NULL;
@@ -4218,6 +4960,7 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
     }
     s->conns = malloc(sizeof(sock_t) * (size_t)s->cfg.max_clients);
     s->conn_kind = calloc((size_t)s->cfg.max_clients, 1);
+    s->conn_addr = calloc((size_t)s->cfg.max_clients, sizeof(uint64_t));
     s->procs = calloc((size_t)s->cfg.max_clients, sizeof(MyProc));
     s->listen_fd = BAD_SOCK;
     s->mysql_fd = BAD_SOCK;
@@ -4244,7 +4987,7 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
             if (afd >= 0 && !s->audit) close(afd);
         }
 #else
-        s->audit = fopen(cfg->audit_file, "a");
+        s->audit = fopen(cfg->audit_file, "a" SV_FE);
 #endif
         if (!s->audit) { snprintf(err, errsz, "cannot open the audit log %.200s: %s", cfg->audit_file, strerror(errno)); sv_server_free(s); return NULL; }
     }
@@ -4322,7 +5065,7 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
         sv_server_free(s);
         return NULL;
     }
-    s->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    s->listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (s->listen_fd == BAD_SOCK) { snprintf(err, errsz, "socket() failed"); sv_server_free(s); return NULL; }
     int one = 1;
 #ifndef _WIN32
@@ -4339,6 +5082,10 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
     socklen_t al = sizeof(addr);
     getsockname(s->listen_fd, (struct sockaddr*)&addr, &al);
     s->port = ntohs(addr.sin_port);
+#ifndef _WIN32
+    sv_inner_register(s->port, inner_connect, s);      // ponte TLS e stream HTTP/2 in memoria (anche se HTTPS parte dopo)
+    s->inner_registered = true;
+#endif
     // la stessa porta su IPv6 (solo v6: il socket IPv4 resta com'è). Senza IPv6 nel sistema: niente, come prima
     if (!strcmp(s->cfg.bind_addr, "127.0.0.1") || !strcmp(s->cfg.bind_addr, "0.0.0.0")) {
         struct sockaddr_in6 a6;
@@ -4346,7 +5093,7 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
         a6.sin6_family = AF_INET6;
         a6.sin6_port = htons((unsigned short)s->port);
         if (!strcmp(s->cfg.bind_addr, "127.0.0.1")) a6.sin6_addr = in6addr_loopback;
-        sock_t f6 = socket(AF_INET6, SOCK_STREAM, 0);
+        sock_t f6 = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (f6 != BAD_SOCK) {
             int on = 1;
             setsockopt(f6, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&on, sizeof(on));
@@ -4407,6 +5154,7 @@ void sv_server_run(SvServer* s) {
         }
         mx_unlock(&s->conn_mx);
         db_sync_tick();                              // synchronous = NORMAL: le scritture in autocommit su disco entro 100 ms
+        audit_sync_tick(s);
         if (r <= 0) continue;
         struct sockaddr_storage peer;
         socklen_t pl = sizeof(peer);
@@ -4418,12 +5166,42 @@ void sv_server_run(SvServer* s) {
         sock_t fd = accept(is_myu ? myu_fd : is_mysql ? mysql_fd : is_smtp ? mail_fd : is_tls ? https_fd : is_v6 ? l6_fd : s->listen_fd,
                            (struct sockaddr*)&peer, &pl);
         if (fd == BAD_SOCK) continue;
+#ifndef _WIN32
+        fcntl(fd, F_SETFD, FD_CLOEXEC);              // come i socket in ascolto: mai ereditato da un figlio (P2.10)
+#endif
         int one = 1;
         if (!is_myu) setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+        // indirizzo remoto: i client non locali hanno al massimo MAX_PER_ADDR connessioni (uno solo non occupa
+        // tutti i posti); 127.0.0.0/8, ::1 e il socket Unix no (browser, PHP e strumenti locali)
+        uint64_t akey = 0;
+        if (!is_myu) {
+            const uint8_t* ab = NULL;
+            size_t al = 0;
+            if (peer.ss_family == AF_INET6) {
+                const struct sockaddr_in6* p6 = (const struct sockaddr_in6*)&peer;
+                static const uint8_t loop6[16] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1 };
+                static const uint8_t v4map[12] = { 0,0,0,0,0,0,0,0,0,0,0xff,0xff };
+                ab = (const uint8_t*)&p6->sin6_addr; al = 16;
+                if (!memcmp(ab, loop6, 16) || (!memcmp(ab, v4map, 12) && ab[12] == 127)) ab = NULL;
+            } else if (peer.ss_family == AF_INET) {
+                const struct sockaddr_in* p4 = (const struct sockaddr_in*)&peer;
+                ab = (const uint8_t*)&p4->sin_addr.s_addr; al = 4;
+                if (ab[0] == 127) ab = NULL;
+            }
+            if (ab) { akey = 1469598103934665603ull; for (size_t i = 0; i < al; i++) akey = (akey ^ ab[i]) * 1099511628211ull; akey |= 1; }
+        }
         mx_lock(&s->conn_mx);
-        int slot = -1;
-        for (int i = 0; i < s->cfg.max_clients && slot < 0; i++) if (s->conns[i] == BAD_SOCK) slot = i;
-        if (slot >= 0) { s->conns[slot] = fd; s->conn_kind[slot] = is_mysql ? CK_MYSQL : is_smtp ? CK_SMTP : is_tls ? CK_TLS : CK_HTTP; s->active++; }
+        int slot = -1, same = 0;
+        for (int i = 0; i < s->cfg.max_clients; i++) {
+            if (s->conns[i] == BAD_SOCK) { if (slot < 0) slot = i; }
+            else if (akey && s->conn_addr && s->conn_addr[i] == akey) same++;
+        }
+        int per_addr = s->cfg.max_per_addr > 0 ? s->cfg.max_per_addr : MAX_PER_ADDR;
+        if (akey && same >= per_addr) slot = -1;
+        if (slot >= 0) {
+            s->conns[slot] = fd; s->conn_kind[slot] = is_mysql ? CK_MYSQL : is_smtp ? CK_SMTP : is_tls ? CK_TLS : CK_HTTP; s->active++;
+            if (s->conn_addr) s->conn_addr[slot] = akey;
+        }
         mx_unlock(&s->conn_mx);
         if (slot < 0 && is_tls) { sock_close(fd); continue; }
         if (slot < 0 && is_smtp) {
@@ -4451,6 +5229,7 @@ void sv_server_run(SvServer* s) {
         Conn* c = malloc(sizeof(Conn));
         if (c) {
             c->s = s; c->fd = fd; c->slot = slot; c->mysql = is_mysql; c->smtp = is_smtp; c->tls = is_tls; c->https = false; c->mytls = NULL;
+            c->unix_sock = is_myu;
             if (is_myu) { snprintf(c->client, sizeof(c->client), "127.0.0.1"); c->client_port = 0; }   // socket Unix: locale
             else if (peer.ss_family == AF_INET6) {
                 const struct sockaddr_in6* p6 = (const struct sockaddr_in6*)&peer;
@@ -4476,6 +5255,7 @@ void sv_server_run(SvServer* s) {
 
 void sv_server_free(SvServer* s) {
     if (!s) return;
+    for (int i = 0; i < QCURSORS; i++) if (s->cursors[i].r) qcursor_drop(&s->cursors[i]);
     s->stop = 1;
     if (s->listen_fd != BAD_SOCK) sock_close(s->listen_fd);
     if (s->listen6_fd != BAD_SOCK) sock_close(s->listen6_fd);
@@ -4484,6 +5264,7 @@ void sv_server_free(SvServer* s) {
     if (s->mail_fd != BAD_SOCK) sock_close(s->mail_fd);
     if (s->https_fd != BAD_SOCK) sock_close(s->https_fd);
     for (int i = 0; i < s->n_to_close; i++) sock_close(s->to_close[i]);
+    if (s->inner_registered) { sv_inner_unregister(s->port); s->inner_registered = false; }   // nessuna nuova
     // le connessioni aperte vengono interrotte; si aspetta che i thread finiscano
     for (int tries = 0; s->conns; tries++) {
         mx_lock(&s->conn_mx);
@@ -4500,6 +5281,9 @@ void sv_server_free(SvServer* s) {
         if (tries > 3000) return;
         sleep_ms(10);
     }
+#ifndef _WIN32
+    inner_pool_stop(s);
+#endif
     for (int i = 0; i < SV_MAX_SESSIONS; i++)            // le transazioni rimaste aperte si annullano
         if (s->sess[i].db) { db_session_end(s->sess[i].db); s->sess[i].db = NULL; }
     mx_destroy(&s->conn_mx);
@@ -4520,6 +5304,7 @@ void sv_server_free(SvServer* s) {
     free(s->cert_dir);
     free(s->self_exe_path);
     free(s->conn_kind);
+    free(s->conn_addr);
     free(s->procs);
     mail_store_free(s->mail);
     tls_free(s->tls);
@@ -4575,7 +5360,7 @@ bool sv_random_token(char* out, int bytes) {
         for (int k = 0; k < 4 && i + k < bytes; k++) raw[i + k] = (unsigned char)(v >> (8 * k));
     }
 #else
-    FILE* f = fopen("/dev/urandom", "rb");
+    FILE* f = fopen("/dev/urandom", "rb" SV_FE);
     if (!f) return false;
     size_t got = fread(raw, 1, (size_t)bytes, f);
     fclose(f);
@@ -4589,7 +5374,7 @@ bool sv_random_token(char* out, int bytes) {
 
 bool sv_local_ip(char* out, size_t n) {
     // l'indirizzo con cui questa macchina esce in rete: un socket UDP "connesso" non invia nulla
-    sock_t fd = socket(AF_INET, SOCK_DGRAM, 0);
+    sock_t fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd == BAD_SOCK) return false;
     struct sockaddr_in a;
     memset(&a, 0, sizeof(a));

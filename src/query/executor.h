@@ -91,4 +91,10 @@ void executor_set_change_hook(ExecChangeHook hook);
 void executor_set_fk_checks(bool on);
 bool executor_fk_checks(void);
 
+// tabella eliminata: la sua catena di pagine (root) non è più riferita dal catalogo (P1.5: il motore la libera)
+void executor_set_drop_hook(void (*hook)(uint32_t root));
+
+// VACUUM FULL: riscrive le righe della tabella in pagine nuove; NULL = fatto (radice e pagine in out_*)
+const char* executor_rebuild_table(ExecCtx* ctx, TableSchema* ts, uint32_t* out_root, uint32_t* out_pages);
+
 #endif

@@ -79,6 +79,8 @@ void sv_scan_set_deadline(double deadline_ms);
 bool sv_scan_cancelled(void);
 // flag di annullamento della connessione di questo thread (KILL QUERY id): le scansioni lo guardano anche
 void sv_scan_set_cancel(atomic_int* flag);
+// solo il flag di questo thread (non quello globale della GUI): per le attese di un lock
+bool sv_thread_cancelled(void);
 void heap_scan_close(HeapScan* scan);
 
 // Una scansione di questo thread ha trovato una pagina illeggibile o danneggiata, una catena di overflow
@@ -86,5 +88,9 @@ void heap_scan_close(HeapScan* scan);
 // heap_damage: true se è successo dall'ultimo heap_damage_clear (messaggio in msg)
 void heap_damage_clear(void);
 bool heap_damage(char* msg, size_t n);
+
+// catene di overflow abbandonate (P1.5): first = prima pagina, total = byte della riga
+void heap_set_abandon_hook(void (*hook)(uint32_t first, uint32_t total));
+void heap_chain_abandoned(uint32_t first, uint32_t total);
 
 #endif

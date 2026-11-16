@@ -1,6 +1,7 @@
 /*
 SCOPO: segvault-server come servizio dell'utente (vedi service.h).
 */
+#include "common.h"
 #include "service.h"
 
 #include <stdio.h>
@@ -145,7 +146,7 @@ int sv_service_install(int argc, char** argv, char* out, size_t outsz) {
     snprintf(dir, sizeof(dir), "%s/Library/LaunchAgents", home);
     mkdir(dir, 0755);
     snprintf(plist, sizeof(plist), "%s/dev.segvault.server.plist", dir);
-    FILE* f = fopen(plist, "w");
+    FILE* f = fopen(plist, "w" SV_FE);
     if (!f) { snprintf(out, outsz, "cannot write %s\n", plist); return 1; }
     fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
                "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n"
@@ -173,7 +174,7 @@ int sv_service_install(int argc, char** argv, char* out, size_t outsz) {
     snprintf(mk, sizeof(mk), "mkdir -p '%s'", dir);
     if (system(mk) != 0) { snprintf(out, outsz, "cannot create %s\n", dir); return 1; }
     snprintf(unit, sizeof(unit), "%s/segvault.service", dir);
-    FILE* f = fopen(unit, "w");
+    FILE* f = fopen(unit, "w" SV_FE);
     if (!f) { snprintf(out, outsz, "cannot write %s\n", unit); return 1; }
     // systemd: argomenti tra virgolette, con "\" e "%" protetti
     fprintf(f, "[Unit]\nDescription=SegVault development server (web, PHP, MySQL protocol, mail)\nAfter=network.target\n\n"

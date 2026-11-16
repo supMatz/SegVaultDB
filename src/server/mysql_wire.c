@@ -120,25 +120,37 @@ void mw_handshake(MwOut* o, uint32_t conn_id, const uint8_t scramble[20], bool s
     mw_end(o);
 }
 
-void mw_auth_switch(MwOut* o, const uint8_t scramble[20]) {
+void mw_auth_switch(MwOut* o, const uint8_t scramble[20]) { mw_auth_switch_to(o, "mysql_native_password", scramble); }
+
+void mw_auth_more(MwOut* o, const void* data, size_t n) {
+    mw_begin(o);
+    mw_u8(o, 0x01);
+    mw_bytes(o, data, n);
+    mw_end(o);
+}
+
+void mw_auth_switch_to(MwOut* o, const char* plugin, const uint8_t scramble[20]) {
     mw_begin(o);
     mw_u8(o, 0xfe);
-    const char* plugin = "mysql_native_password";
     mw_bytes(o, plugin, strlen(plugin) + 1);
     mw_bytes(o, scramble, 20);
     mw_u8(o, 0);
     mw_end(o);
 }
 
-void mw_ok(MwOut* o, uint64_t affected, uint64_t insert_id, unsigned status, const char* info) {
+static void mw_ok_w(MwOut* o, uint64_t affected, uint64_t insert_id, unsigned status, unsigned warnings, const char* info) {
     mw_begin(o);
     mw_u8(o, 0);
     mw_lenenc(o, affected);
     mw_lenenc(o, insert_id);
     mw_u16(o, status);
-    mw_u16(o, 0);                                          // avvisi
+    mw_u16(o, warnings);                                   // avvisi
     if (info && info[0]) mw_bytes(o, info, strlen(info));
     mw_end(o);
+}
+
+void mw_ok(MwOut* o, uint64_t affected, uint64_t insert_id, unsigned status, const char* info) {
+    mw_ok_w(o, affected, insert_id, status, 0, info);
 }
 
 void mw_err(MwOut* o, unsigned code, const char* sqlstate, const char* msg) {
@@ -196,7 +208,7 @@ static bool split_qualified(const char* name, char* tbl, size_t tn, const char**
     return true;
 }
 
-static void column_def_ex(MwOut* o, const char* db, const char* table, const char* name, const char* type, bool bin) {
+static void column_def_ex(MwOut* o, const char* db, const char* table, const char* name, const char* type, bool bin, unsigned extra) {
     char qtable[80];
     const char* col;
     if (name && split_qualified(name, qtable, sizeof(qtable), &col)) {
@@ -207,6 +219,8 @@ static void column_def_ex(MwOut* o, const char* db, const char* table, const cha
     uint32_t len;
     map_type(type, &ty, &fl, &cs, &len, &dec);
     if (bin && ty == MT_LONG) { ty = MT_LONGLONG; len = 20; }
+    fl |= extra;
+    if ((extra & 32) && !strncasecmp(type ? type : "", "INT", 3) && !bin) len = 10;
     mw_begin(o);
     mw_lenz(o, "def");
     mw_lenz(o, db);
@@ -224,8 +238,14 @@ static void column_def_ex(MwOut* o, const char* db, const char* table, const cha
     mw_end(o);
 }
 
-static void column_def(MwOut* o, const char* db, const char* table, const char* name, const char* type) {
-    column_def_ex(o, db, table, name, type, false);
+static void column_def(MwOut* o, const char* db, const char* table, const char* name, const char* type, unsigned extra) {
+    column_def_ex(o, db, table, name, type, false, extra);
+}
+
+// flag della colonna c dal catalogo, se il risultato dice da quale tabella e colonna viene (P2.8)
+static unsigned result_col_flags(const QueryResult* r, const char* db, int c) {
+    if (!r->col_tables || !r->col_columns || !r->col_tables[c] || !r->col_columns[c]) return 0;
+    return db_column_flags(r->source_db[0] ? r->source_db : db, r->col_tables[c], r->col_columns[c]);
 }
 
 void mw_resultset(MwOut* o, const QueryResult* r, const char* db, unsigned status) {
@@ -234,7 +254,7 @@ void mw_resultset(MwOut* o, const QueryResult* r, const char* db, unsigned statu
     mw_end(o);
     for (int c = 0; c < r->num_cols; c++)
         column_def(o, db, r->col_tables && r->col_tables[c] ? r->col_tables[c] : "",
-                   r->col_names[c], r->col_types ? r->col_types[c] : NULL);
+                   r->col_names[c], r->col_types ? r->col_types[c] : NULL, result_col_flags(r, db, c));
     mw_eof(o, status & ~MW_STATUS_MORE_RESULTS);
     for (int i = 0; i < r->num_rows && !o->oom; i++) {
         mw_begin(o);
@@ -361,7 +381,7 @@ static void text_header(MwOut* o, int ncols, const char* const* names) {
     mw_begin(o);
     mw_lenenc(o, (uint64_t)ncols);
     mw_end(o);
-    for (int i = 0; i < ncols; i++) column_def(o, "", "", names[i], "VARCHAR");
+    for (int i = 0; i < ncols; i++) column_def(o, "", "", names[i], "VARCHAR", 0);
 }
 
 static void text_row(MwOut* o, int n, const char* const* v) {
@@ -400,8 +420,72 @@ void mw_name_values(MwOut* o, const char* const* names, const char* const* value
     mw_eof(o, status);
 }
 
+// avviso dell'ultimo SET senza effetto su una variabile sconosciuta (una connessione = un thread):
+// SHOW WARNINGS lo mostra, ogni altra istruzione lo cancella, come in MySQL
+static _Thread_local char g_set_warn[200];
+
+// variabili di sistema che un SET può nominare senza effetto: quelle di VARS e le famiglie che i driver
+// e i dump impostano (set di caratteri, modalità SQL, fuso orario, timeout di rete, transazioni)
+static bool known_sysvar(const char* n, size_t l) {
+    static const char* const PREFIX[] = { "character_set_", "collation_", "net_", "sql_", "innodb_", "session_track_",
+                                          "transaction_", "tx_", "optimizer_", "max_", "default_", "group_concat_" };
+    static const char* const EXACT[] = { "names", "character", "charset", "time_zone", "unique_checks", "wait_timeout",
+                                         "interactive_timeout", "autocommit", "transaction", "lc_time_names",
+                                         "lc_messages", "long_query_time", "profiling", "big_tables", "div_precision_increment",
+                                         "explicit_defaults_for_timestamp", "information_schema_stats_expiry",
+                                         "cte_max_recursion_depth", "lock_wait_timeout", "foreign_key_checks", "synchronous", "cache_size" };
+    char b[80];
+    if (l == 0 || l >= sizeof(b)) return false;
+    for (size_t i = 0; i < l; i++) b[i] = (char)tolower((unsigned char)n[i]);
+    b[l] = 0;
+    for (size_t i = 0; i < sizeof(EXACT) / sizeof(EXACT[0]); i++) if (!strcmp(b, EXACT[i])) return true;
+    for (size_t i = 0; i < sizeof(PREFIX) / sizeof(PREFIX[0]); i++) if (!strncmp(b, PREFIX[i], strlen(PREFIX[i]))) return true;
+    return var_value(b) != NULL;
+}
+
+// la prima variabile sconosciuta di un SET (nome in out), false se sono tutte note
+static bool set_unknown_var(const char* p, char* out, size_t on) {
+    for (;;) {
+        p = skip_ws(p);
+        while (*p == '@') p++;
+        for (int k = 0; k < 2; k++) {                       // SESSION / GLOBAL / LOCAL / PERSIST, anche come session.
+            static const char* const SCOPE[] = { "SESSION", "GLOBAL", "LOCAL", "PERSIST", "PERSIST_ONLY" };
+            for (size_t i = 0; i < 5; i++) {
+                size_t sl = strlen(SCOPE[i]);
+                if (!strncasecmp(p, SCOPE[i], sl) && (p[sl] == '.' || isspace((unsigned char)p[sl]))) { p = skip_ws(p + sl + (p[sl] == '.')); break; }
+            }
+        }
+        const char* n = p;
+        while (isalnum((unsigned char)*p) || *p == '_' || *p == '$') p++;
+        size_t l = (size_t)(p - n);
+        if (!l) return false;                                // forma che non si capisce: nessun avviso
+        if (!known_sysvar(n, l)) {
+            snprintf(out, on, "%.*s", (int)(l > 64 ? 64 : l), n);
+            return true;
+        }
+        if ((l == 5 && !strncasecmp(n, "names", 5)) || (l == 9 && !strncasecmp(n, "character", 9)) ||
+            (l == 11 && !strncasecmp(n, "transaction", 11))) return false;   // SET NAMES x COLLATE y, SET TRANSACTION ...
+        // salta il valore fino alla virgola successiva fuori da apici e parentesi
+        int depth = 0;
+        char quote = 0;
+        for (; *p; p++) {
+            if (quote) { if (*p == '\\' && p[1]) p++; else if (*p == quote) quote = 0; continue; }
+            if (*p == '\'' || *p == '"' || *p == '`') quote = *p;
+            else if (*p == '(') depth++;
+            else if (*p == ')') depth--;
+            else if (*p == ',' && depth == 0) break;
+        }
+        if (*p != ',') return false;
+        p++;
+    }
+}
+
 bool mw_client_noise(MwOut* o, const char* sql, unsigned status) {
     const char* p = skip_ws(sql);
+    {
+        const char* w = p;
+        if (!(word(&w, "SHOW") && (word(&w, "WARNINGS") || word(&w, "COUNT")))) g_set_warn[0] = 0;
+    }
     // SET NAMES / SET sql_mode / SET SESSION ...: accettati senza effetto. Vanno al motore, che li
     // applica: le variabili dell'utente (SET @x = ...) e FOREIGN_KEY_CHECKS / UNIQUE_CHECKS (la prima
     // riga di ogni mysqldump), oltre a SET PASSWORD
@@ -409,10 +493,19 @@ bool mw_client_noise(MwOut* o, const char* sql, unsigned status) {
         const char* q = p;
         if (word(&q, "PASSWORD")) return false;
         for (const char* c = p; *c; c++) {
-            if (*c == '@' && c[1] != '@') return false;                  // @variabile dell'utente
+            if (*c == '@' && c[1] == '@') { c++; continue; }               // @@variabile di sistema
+            if (*c == '@') return false;                                  // @variabile dell'utente
             if ((*c == 'f' || *c == 'F') && !strncasecmp(c, "foreign_key_checks", 18)) return false;
+            if ((*c == 's' || *c == 'S') && !strncasecmp(c, "synchronous", 11)) return false;   // applicate dal motore
+            if ((*c == 'c' || *c == 'C') && !strncasecmp(c, "cache_size", 10)) return false;
         }
-        mw_ok(o, 0, 0, status, NULL);
+        char unk[80];
+        if (set_unknown_var(p, unk, sizeof(unk))) {
+            snprintf(g_set_warn, sizeof(g_set_warn), "Unknown system variable '%s' (ignored by SegVault)", unk);
+            mw_ok_w(o, 0, 0, status, 1, NULL);
+        } else {
+            mw_ok(o, 0, 0, status, NULL);
+        }
         return true;
     }
     p = skip_ws(sql);
@@ -454,6 +547,7 @@ bool mw_client_noise(MwOut* o, const char* sql, unsigned status) {
         if (names == E) { const char* v[6] = { "SegVault", "DEFAULT", "SegVault storage engine", "YES", "NO", "YES" }; text_row(o, 6, v); }
         if (names == S) { const char* v[4] = { "utf8mb4", "UTF-8 Unicode", "utf8mb4_general_ci", "4" }; text_row(o, 4, v); }
         if (names == C) { const char* v[6] = { "utf8mb4_general_ci", "utf8mb4", "45", "Yes", "Yes", "1" }; text_row(o, 6, v); }
+        if (names == W && g_set_warn[0]) { const char* v[3] = { "Warning", "1193", g_set_warn }; text_row(o, 3, v); }
         mw_eof(o, status);
         return true;
     }
@@ -474,6 +568,9 @@ bool mw_client_noise(MwOut* o, const char* sql, unsigned status) {
         size_t l = 0;
         while ((isalnum((unsigned char)*q) || *q == '_') && l < sizeof(var) - 1) var[l++] = *q++;
         var[l] = '\0';
+        if (!strcasecmp(var, "synchronous") || !strcasecmp(var, "cache_size") || !strcasecmp(var, "foreign_key_checks") ||
+            !strcasecmp(var, "identity") || !strcasecmp(var, "last_insert_id"))
+            return false;                                    // valori reali: li conosce il motore
         const char* v = var_value(var);
         snprintf(names[n], sizeof(names[n]), "@@%.*s", (int)(q - p), p);
         snprintf(vals[n], sizeof(vals[n]), "%s", v ? v : "");
@@ -552,13 +649,13 @@ void mw_prepare_ok(MwOut* o, uint32_t id, int nparams, const QueryResult* meta, 
     mw_u16(o, 0);
     mw_end(o);
     if (nparams > 0) {
-        for (int i = 0; i < nparams; i++) column_def_ex(o, "", "", "?", NULL, true);
+        for (int i = 0; i < nparams; i++) column_def_ex(o, "", "", "?", NULL, true, 0);
         mw_eof(o, status);
     }
     if (ncols > 0) {
         for (int c = 0; c < ncols; c++)
             column_def_ex(o, db, meta->col_tables && meta->col_tables[c] ? meta->col_tables[c] : "",
-                          meta->col_names[c], meta->col_types ? meta->col_types[c] : NULL, true);
+                          meta->col_names[c], meta->col_types ? meta->col_types[c] : NULL, true, result_col_flags(meta, db, c));
         mw_eof(o, status);
     }
 }
@@ -603,25 +700,34 @@ static void put_datetime(MwOut* o, const char* v) {
     if (len == 11) mw_u32(o, (uint32_t)us);
 }
 
-void mw_resultset_binary(MwOut* o, const QueryResult* r, const char* db, unsigned status) {
+// tipi binari delle colonne (INT come BIGINT: vedi column_def_ex); NULL se manca la memoria
+static unsigned* binary_types(const QueryResult* r) {
+    unsigned* types = calloc((size_t)(r->num_cols ? r->num_cols : 1), sizeof(unsigned));
+    if (!types) return NULL;
+    for (int c = 0; c < r->num_cols; c++) {
+        unsigned fl, cs, dec;
+        uint32_t len;
+        map_type(r->col_types ? r->col_types[c] : NULL, &types[c], &fl, &cs, &len, &dec);
+        if (types[c] == MT_LONG) types[c] = MT_LONGLONG;
+    }
+    return types;
+}
+
+static void binary_header(MwOut* o, const QueryResult* r, const char* db) {
     mw_begin(o);
     mw_lenenc(o, (uint64_t)r->num_cols);
     mw_end(o);
-    unsigned* types = calloc((size_t)(r->num_cols ? r->num_cols : 1), sizeof(unsigned));
-    if (!types) { o->oom = true; return; }
-    for (int c = 0; c < r->num_cols; c++) {
-        const char* t = r->col_types ? r->col_types[c] : NULL;
-        column_def_ex(o, db, r->col_tables && r->col_tables[c] ? r->col_tables[c] : "", r->col_names[c], t, true);
-        unsigned fl, cs, dec;
-        uint32_t len;
-        map_type(t, &types[c], &fl, &cs, &len, &dec);
-        if (types[c] == MT_LONG) types[c] = MT_LONGLONG;
-    }
-    mw_eof(o, status & ~MW_STATUS_MORE_RESULTS);
+    for (int c = 0; c < r->num_cols; c++)
+        column_def_ex(o, db, r->col_tables && r->col_tables[c] ? r->col_tables[c] : "", r->col_names[c],
+                      r->col_types ? r->col_types[c] : NULL, true, result_col_flags(r, db, c));
+}
+
+// righe [from, to) in formato binario
+static void binary_rows(MwOut* o, const QueryResult* r, const unsigned* types, int from, int to) {
     size_t nb = ((size_t)r->num_cols + 7 + 2) / 8;
     uint8_t* bitmap = calloc(nb, 1);
-    if (!bitmap) { free(types); o->oom = true; return; }
-    for (int i = 0; i < r->num_rows && !o->oom; i++) {
+    if (!bitmap) { o->oom = true; return; }
+    for (int i = from; i < to && !o->oom; i++) {
         mw_begin(o);
         mw_u8(o, 0);
         memset(bitmap, 0, nb);
@@ -643,8 +749,32 @@ void mw_resultset_binary(MwOut* o, const QueryResult* r, const char* db, unsigne
         mw_end(o);
     }
     free(bitmap);
+}
+
+void mw_resultset_binary(MwOut* o, const QueryResult* r, const char* db, unsigned status) {
+    unsigned* types = binary_types(r);
+    if (!types) { o->oom = true; return; }
+    binary_header(o, r, db);
+    mw_eof(o, status & ~MW_STATUS_MORE_RESULTS);
+    binary_rows(o, r, types, 0, r->num_rows);
     free(types);
     mw_eof(o, status);
+}
+
+void mw_cursor_open(MwOut* o, const QueryResult* r, const char* db, unsigned status) {
+    binary_header(o, r, db);
+    mw_eof(o, (status & ~MW_STATUS_MORE_RESULTS) | MW_STATUS_CURSOR_EXISTS);
+}
+
+void mw_cursor_fetch(MwOut* o, const QueryResult* r, int* pos, uint32_t count, unsigned status) {
+    unsigned* types = binary_types(r);
+    if (!types) { o->oom = true; return; }
+    int from = *pos, to = from;
+    while (to < r->num_rows && (uint32_t)(to - from) < count) to++;
+    binary_rows(o, r, types, from, to);
+    free(types);
+    *pos = to;
+    mw_eof(o, (status & ~MW_STATUS_MORE_RESULTS) | (to >= r->num_rows ? MW_STATUS_LAST_ROW_SENT : MW_STATUS_CURSOR_EXISTS));
 }
 
 // ── valori dei parametri ─────────────────────────────────────────
@@ -782,7 +912,8 @@ static void subst_at(void* ctx, size_t at) {
 }
 
 char* mw_bind_execute(const char* sql, const uint8_t* p, size_t n, int nparams, uint8_t* types,
-                      bool* types_set, MwLongData* ld, char* err, size_t en) {
+                      bool* types_set, MwLongData* ld, char*** lits_out, char* err, size_t en) {
+    if (lits_out) *lits_out = NULL;
     // p: dopo il comando e l'id (flag u8, iteration_count u32, poi i parametri)
     size_t pos = 5;
     if (n < pos) { snprintf(err, en, "malformed COM_STMT_EXECUTE packet"); return NULL; }
@@ -823,6 +954,7 @@ char* mw_bind_execute(const char* sql, const uint8_t* p, size_t n, int nparams, 
         res = o.p ? o.p : strdup("");
     }
 out:
+    if (res && lits_out) { *lits_out = lits; return res; }   // i letterali passano al chiamante
     for (int i = 0; i < nparams; i++) free(lits[i]);
     free(lits);
     return res;

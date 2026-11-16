@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -140,6 +141,10 @@ int sv_fi_fsync(int fd) {
     }
     return r;
 }
+// allocazioni del motore (include/sv_alloc.h): la N-esima fallisce; g_allocs le conta
+static long g_fail_alloc, g_allocs;
+int sv_fi_alloc_fail(void) { g_allocs++; return hit(&g_fail_alloc); }
+
 static void faults_off(void) { g_fail_write = g_fail_fsync = g_exit_pwrite = g_exit_write = g_fail_pread = 0; }
 
 // ── aiuti ──
@@ -230,9 +235,11 @@ int main(void) {
     check_committed("failed log write", 0);
     db_shutdown();
 
-    // ── 3. arresto alla k-esima scrittura di pagina durante ROLLBACK: il recupero finisce l'annullamento ──
+    // ── 3. arresto alla k-esima scrittura (di pagina, poi del log) durante ROLLBACK: il recupero finisce
+    //       l'annullamento. Dal P1.1 il ROLLBACK lavora sulle pagine della cache: scrive solo il log ──
     int ks = 0, done_all = 0;
-    for (int k = 1; k < 400 && !done_all; k++) {
+    for (int k = 1, by_write = 0; k < 400 && (!done_all || !by_write); k++) {
+        if (done_all && !by_write) { by_write = 1; done_all = 0; k = 1; }
         sh("rm -rf " WORK " && cp -r " BASE " " WORK);
         pid_t pid = fork();
         if (pid == 0) {
@@ -242,8 +249,10 @@ int main(void) {
             ok("DELETE FROM t WHERE id <= 200");
             ok("UPDATE t SET v = v + 1000 WHERE id > 400");
             ok("INSERT INTO t VALUES (20001, 5, 'new'), (20002, 6, 'new')");
-            g_exit_pwrite = k;
+            if (by_write) g_exit_write = k; else g_exit_pwrite = k;
             db_rollback();
+            ok("SELECT 1");                             // anche il buffer del log del ROLLBACK arriva nel file
+            g_exit_write = g_exit_pwrite = 0;
             _exit(3);                                   // ROLLBACK finito prima della k-esima scrittura
         }
         int st = 0;
@@ -268,7 +277,8 @@ int main(void) {
         ok("DELETE FROM t WHERE id <= 250");
         ok("UPDATE t SET v = v * 2 WHERE id > 500");
         ok("SAVEPOINT s");
-        ok("ROLLBACK TO s");                            // scrive tutte le pagine modificate sul file
+        ok("ROLLBACK TO s");
+        ok("CHECKPOINT");                               // pagine sul file, nel log solo i record della transazione aperta
         _exit(0);                                       // arresto con la transazione aperta
     }
     int st = 0;
@@ -334,7 +344,9 @@ int main(void) {
             ok("CREATE DATABASE d"); ok("USE d");
             ok("CREATE TABLE big (id INT PRIMARY KEY, pad VARCHAR(400))");
             ok("CREATE TABLE hold (id INT PRIMARY KEY)");
-            DbSession* h = db_session_new();                // transazione aperta: niente checkpoint, il log cresce
+            // il log cresce oltre la soglia del checkpoint (alzata: dal P1.1 una transazione aperta non lo ferma più)
+            db_set_checkpoint_bytes(1LL << 30);
+            DbSession* h = db_session_new();
             db_session_enter(h); ok("USE d"); ok("BEGIN"); ok("INSERT INTO hold VALUES (1)"); db_session_leave(h);
             char q[600], pad[401];
             memset(pad, 'p', 400); pad[400] = 0;
@@ -368,6 +380,176 @@ int main(void) {
         CHECK(db_init(WORK), "reopen after the big recovery");
         ok("USE d");
         CHECK(num("SELECT COUNT(*) FROM big") == 60000 && num("SELECT COUNT(*) FROM hold") == 0, "big recovery: committed rows kept, open one undone");
+        db_shutdown();
+    }
+
+    // ── 4f. P1.1: una transazione aperta non impedisce più al log di accorciarsi (checkpoint con i soli record
+    //        delle transazioni aperte); dopo una caduta la transazione aperta viene annullata dai record portati ──
+    for (int crash = 0; crash < 2; crash++) {
+        sh("rm -rf " WORK " && mkdir -p " WORK);
+        pid = fork();
+        if (pid == 0) {
+            if (!db_init(WORK)) _exit(2);
+            ok("CREATE DATABASE d"); ok("USE d");
+            ok("CREATE TABLE big (id INT PRIMARY KEY, pad VARCHAR(400))");
+            ok("CREATE TABLE hold (id INT PRIMARY KEY, v INT)");
+            ok("INSERT INTO hold VALUES (100, 1)");
+            DbSession* h = db_session_new();
+            db_session_enter(h); ok("USE d"); ok("BEGIN"); ok("INSERT INTO hold VALUES (1, 1)");
+            ok("UPDATE hold SET v = 2 WHERE id = 100"); db_session_leave(h);
+            char q[600], pad[401];
+            memset(pad, 'p', 400); pad[400] = 0;
+            for (int i = 0; i < 60000; i++) { snprintf(q, sizeof(q), "INSERT INTO big VALUES (%d, '%s')", i, pad); ok(q); }
+            struct stat ws;
+            long long wb = stat(WORK "/segvault.wal", &ws) == 0 ? (long long)ws.st_size : -1;
+            if (wb < 0 || wb > (20LL << 20)) { printf("FAIL: log of %lld bytes with a transaction open\n", wb); _exit(4); }
+            db_session_enter(h); ok("INSERT INTO hold VALUES (2, 1)"); db_session_leave(h);
+            if (crash) _exit(0);                              // caduta: la transazione aperta va annullata
+            db_session_enter(h);
+            bool rb = ok("ROLLBACK");
+            db_session_leave(h);
+            if (!rb || num("SELECT COUNT(*) FROM hold") != 1 || num("SELECT v FROM hold WHERE id = 100") != 1) _exit(5);
+            db_shutdown();
+            _exit(0);
+        }
+        waitpid(pid, &st, 0);
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "log stays under 20 MB with a transaction open for 60 000 statements (%s): exit %d",
+              crash ? "then a crash" : "then ROLLBACK", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+        CHECK(db_init(WORK), "restart: %s", db_init_error());
+        ok("USE d");
+        CHECK(num("SELECT COUNT(*) FROM big") == 60000 && num("SELECT COUNT(*) FROM hold") == 1 &&
+              num("SELECT v FROM hold WHERE id = 100") == 1, "open transaction undone from the carried records (%s): big %lld, hold %lld",
+              crash ? "crash" : "rollback", num("SELECT COUNT(*) FROM big"), num("SELECT COUNT(*) FROM hold"));
+        db_shutdown();
+    }
+
+    // ── 4g. P1.1: un byte cambiato nel log non viene mai applicato: a metà il recupero si ferma e lo dice; in fondo
+    //        (una scrittura interrotta) il record si scarta ──
+    {
+        sh("rm -rf " BASE "_log && mkdir -p " BASE "_log");
+        pid = fork();
+        if (pid == 0) {
+            if (!db_init(BASE "_log")) _exit(2);
+            ok("CREATE DATABASE d"); ok("USE d");
+            ok("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(40))");
+            ok("CHECKPOINT");
+            ok("SET GLOBAL synchronous = FULL");
+            for (int i = 0; i < 40; i++) { char q[100]; snprintf(q, sizeof(q), "INSERT INTO t VALUES (%d, 'row %d')", i, i); ok(q); }
+            _exit(0);                                         // il log resta con 40 inserimenti confermati
+        }
+        waitpid(pid, &st, 0);
+        struct stat ls;
+        CHECK(stat(BASE "_log/segvault.wal", &ls) == 0 && ls.st_size > 2000, "log with 40 committed inserts: %lld bytes", (long long)ls.st_size);
+        long long wsz = (long long)ls.st_size;
+        const long long spots[3] = { 20, wsz / 2, wsz - 30 };   // intestazione, a metà, nell'ultimo record
+        for (int k = 0; k < 3; k++) {
+            sh("rm -rf " WORK " && cp -r " BASE "_log " WORK);
+            FILE* f = fopen(WORK "/segvault.wal", "r+b");
+            fseek(f, spots[k], SEEK_SET);
+            int ch = fgetc(f);
+            fseek(f, spots[k], SEEK_SET);
+            fputc(ch ^ 0x40, f);
+            fclose(f);
+            bool up = db_init(WORK);
+            if (k < 2) {
+                CHECK(!up && strstr(db_init_error(), "damaged"), "flipped byte at %lld of the log refused: %s", spots[k], db_init_error());
+                struct stat l2;
+                CHECK(stat(WORK "/segvault.wal", &l2) == 0 && l2.st_size == wsz, "damaged log left unchanged");
+            } else {
+                CHECK(up, "damaged last record dropped as an interrupted write: %s", db_init_error());
+                if (up) {
+                    ok("USE d");
+                    long long n = num("SELECT COUNT(*) FROM t");
+                    CHECK(n == 39 && num("SELECT COUNT(*) FROM t WHERE v <> CONCAT('row ', id)") == 0,
+                          "only the damaged last insert lost, nothing wrong applied: %lld rows", n);
+                    db_shutdown();
+                }
+            }
+        }
+        sh("rm -rf " BASE "_log");
+    }
+
+    // ── 4h. P1.1: file dei dati della 1.3.0 (formato 1) convertito al formato 2 all'apertura: stessi dati, righe
+    //        grandi riscritte, pagine piene sistemate; una conversione interrotta riparte dalla copia .v1 ──
+    {
+        for (int interrupted = 0; interrupted < 2; interrupted++) {
+            sh("rm -rf " WORK " && mkdir -p " WORK " && tar -C " WORK " -xzf tests/fixtures/format1-v1.3.0.tar.gz");
+            if (interrupted) {                                  // copia fatta, file dei dati rovinato a metà conversione
+                sh("cp " WORK "/segvault.db " WORK "/segvault.db.v1 && dd if=/dev/zero of=" WORK "/segvault.db bs=4096 seek=20 count=30 conv=notrunc 2>/dev/null");
+            }
+            CHECK(db_init(WORK), "format 1 file opened (%s): %s", interrupted ? "interrupted upgrade" : "first open", db_init_error());
+            ok("USE m");
+            CHECK(num("SELECT COUNT(*) FROM small") == 2572 && num("SELECT SUM(LENGTH(v)) FROM small") == 90942 &&
+                  num("SELECT SUM(id) FROM small") == 3858858, "small rows unchanged after the upgrade: %lld", num("SELECT COUNT(*) FROM small"));
+            CHECK(num("SELECT SUM(LENGTH(data)) FROM big") == 300000 && num("SELECT COUNT(*) FROM big WHERE data = REPEAT(SUBSTR(data, 1, 1), LENGTH(data))") == 5,
+                  "large rows (overflow chains rewritten) intact");
+            CHECK(num("SELECT SUM(LENGTH(pad)) FROM full1") == 39921, "rows of full pages intact");
+            CHECK(ok("INSERT INTO small VALUES (99999, 'after upgrade')") && num("SELECT COUNT(*) FROM small") == 2573, "writes after the upgrade");
+            db_shutdown();
+            CHECK(access(WORK "/segvault.db.v1", F_OK) != 0, "the format 1 copy is removed after the upgrade");
+            CHECK(db_init(WORK), "reopen in format 2");
+            ok("USE m");
+            CHECK(num("SELECT COUNT(*) FROM small") == 2573, "data kept across the restart");
+            db_shutdown();
+        }
+        // un byte cambiato in una pagina del file dei dati: la pagina è rifiutata (CRC), mai letta come buona
+        sh("rm -rf " WORK " && mkdir -p " WORK " && tar -C " WORK " -xzf tests/fixtures/format1-v1.3.0.tar.gz");
+        CHECK(db_init(WORK), "open for the page corruption test");
+        db_shutdown();
+        FILE* f = fopen(WORK "/segvault.db", "r+b");
+        fseek(f, 5 * 4096 + 1000, SEEK_SET);
+        int ch = fgetc(f);
+        fseek(f, 5 * 4096 + 1000, SEEK_SET);
+        fputc(ch ^ 0x20, f);
+        fclose(f);
+        CHECK(db_init(WORK), "open with a damaged page");
+        ok("USE m");
+        QueryResult* qr = q("SELECT COUNT(*) FROM small");
+        CHECK(qr && !qr->success && strstr(qr->error, "damaged"), "flipped byte in a data page reported: %s", qr ? (qr->success ? "no error" : qr->error) : "null");
+        db_result_free(qr);
+        db_shutdown();
+    }
+
+    // ── 4i. P1.1: pagina scritta a metà (scrittura interrotta, "torn page"): il recupero la rimette dall'immagine
+    //        scritta nel log prima della pagina (doppia scrittura) ──
+    for (int tpass = 0; tpass < 2; tpass++) {
+        sh("rm -rf " WORK " && mkdir -p " WORK);
+        pid = fork();
+        if (pid == 0) {
+            db_set_cache_size(4);                               // cache piccola: le pagine sporche escono durante il carico
+            db_set_checkpoint_bytes(1LL << 30);                 // nessun checkpoint automatico: le scritture restano "in volo"
+            if (!db_init(WORK)) _exit(2);
+            ok("CREATE DATABASE d"); ok("USE d");
+            ok("CREATE TABLE tp (id INT PRIMARY KEY, pad VARCHAR(200))");
+            char q2[400], pad[201];
+            memset(pad, 'q', 200); pad[200] = 0;
+            ok("BEGIN");
+            for (int i = 0; i < 30000; i++) { snprintf(q2, sizeof(q2), "INSERT INTO tp VALUES (%d, '%s')", i, pad); ok(q2); }
+            ok("COMMIT");
+            if (tpass == 1) {                                   // pagine vecchie (prima del checkpoint): scritte con l'immagine
+                ok("CHECKPOINT");
+                ok("UPDATE tp SET pad = REPEAT('r', 200)");
+            }
+            _exit(0);                                           // pagine nuove: rifatte da vuote dal log; vecchie: dall'immagine
+        }
+        waitpid(pid, &st, 0);
+        struct stat ds;
+        CHECK(stat(WORK "/segvault.db", &ds) == 0 && ds.st_size > 200 * 4096, "pages written during the load: %lld bytes", (long long)ds.st_size);
+        int torn = 0;
+        for (long pg = 20; pg < 200; pg += 37) {                // metà pagina azzerata: come una scrittura interrotta
+            FILE* f = fopen(WORK "/segvault.db", "r+b");
+            char z[2048];
+            memset(z, 0, sizeof(z));
+            fseek(f, pg * 4096 + 2048, SEEK_SET);
+            if (fwrite(z, 1, sizeof(z), f) == sizeof(z)) torn++;
+            fclose(f);
+        }
+        CHECK(db_init(WORK), "recovery with %d torn pages: %s", torn, db_init_error());
+        ok("USE d");
+        CHECK(num("SELECT COUNT(*) FROM tp") == 30000 && num("SELECT COUNT(*) FROM tp WHERE LENGTH(pad) = 200") == 30000 &&
+              num("SELECT SUM(id) FROM tp") == 449985000LL && num("SELECT COUNT(*) FROM tp WHERE pad LIKE 'r%'") == (tpass ? 30000 : 0),
+              "torn pages repaired (%s): %lld rows", tpass ? "old pages, from their images" : "new pages, from the log",
+              num("SELECT COUNT(*) FROM tp"));
         db_shutdown();
     }
 
@@ -558,7 +740,9 @@ int main(void) {
         }
         sh("rm -rf " WORK " && cp -r " BASE " " WORK);
         f = fopen(WORK "/segvault.cat", "r+b");
-        unsigned v = 99;
+        unsigned v = 99, v_orig = 0;
+        fseek(f, 8, SEEK_SET);
+        if (fread(&v_orig, 4, 1, f) != 1) v_orig = 0;
         fseek(f, 8, SEEK_SET);
         fwrite(&v, 4, 1, f);
         fclose(f);
@@ -568,7 +752,7 @@ int main(void) {
         int ch = fgetc(f);
         fseek(f, 300, SEEK_SET);
         fputc(ch ^ 0x55, f);
-        v = 5;
+        v = v_orig;
         fseek(f, 8, SEEK_SET);
         fwrite(&v, 4, 1, f);
         fclose(f);
@@ -643,6 +827,178 @@ int main(void) {
         }
         CHECK(pw_done, "the workload eventually completes before the power cut");
         printf("power cut: %d points checked\n", points);
+    }
+
+    // ── 7c. P1.1: caduta di corrente a OGNI scrittura di un carico di 10 transazioni interlacciate su 3 sessioni
+    //        (ognuna sulla sua tabella: i lock sono per tabella). Dopo il recupero: ogni transazione confermata
+    //        c'è per intero, quella del COMMIT in corso per intero o per niente, le altre per niente ──
+    {
+        sh("rm -rf " BASE "_il && mkdir -p " BASE "_il");
+        if (db_init(BASE "_il")) {
+            ok("CREATE DATABASE d"); ok("USE d");
+            for (int k = 0; k < 3; k++) {
+                char q[200];
+                snprintf(q, sizeof(q), "CREATE TABLE s%d (id INT PRIMARY KEY, v INT, pad VARCHAR(100))", k);
+                ok(q);
+                for (int i = 0; i < 40; i++) { snprintf(q, sizeof(q), "INSERT INTO s%d VALUES (%d, %d, 'base')", k, i, i); ok(q); }
+            }
+            db_shutdown();
+        }
+        int points = 0, il_done = 0, bad = 0;
+        for (int k = 1; k < 4000 && !il_done; k++) {
+            sh("rm -rf " WORK " && cp -r " BASE "_il " WORK);
+            remove(POWER_JOURNAL);
+            remove("/tmp/sv_dur_commits");
+            pid_t pp = fork();
+            if (pp == 0) {
+                if (!db_init(WORK)) _exit(2);
+                ok("USE d");
+                ok("SET GLOBAL synchronous = FULL");
+                DbSession* ses[3];
+                for (int j = 0; j < 3; j++) { ses[j] = db_session_new(); db_session_enter(ses[j]); ok("USE d"); db_session_leave(ses[j]); }
+                g_power = true;
+                g_power_at = k;
+                int cur[3] = { -1, -1, -1 }, step[3] = { 0, 0, 0 }, next_tx = 0, done = 0;
+                for (int tick = 0; done < 10 && tick < 1000; tick++) {
+                    int j = tick % 3;
+                    if (cur[j] < 0) { if (next_tx >= 10) continue; cur[j] = next_tx++; step[j] = 0; }
+                    int t = cur[j];
+                    char q[200];
+                    db_session_enter(ses[j]);
+                    switch (step[j]) {
+                        case 0: ok("BEGIN"); break;
+                        case 1: snprintf(q, sizeof(q), "INSERT INTO s%d VALUES (%d, 0, 'tx')", j, 1000 + t); ok(q); break;
+                        case 2: snprintf(q, sizeof(q), "UPDATE s%d SET v = v + 1000000 WHERE id = %d", j, t); ok(q); break;
+                        case 3: snprintf(q, sizeof(q), "DELETE FROM s%d WHERE id = %d", j, 20 + t); ok(q); break;
+                        case 4:
+                            if (ok("COMMIT")) {
+                                FILE* cf = fopen("/tmp/sv_dur_commits", "a");
+                                if (cf) { fprintf(cf, "%d\n", t); fclose(cf); }
+                            }
+                            break;
+                    }
+                    db_session_leave(ses[j]);
+                    if (++step[j] == 5) { cur[j] = -1; done++; }
+                }
+                g_power = false;
+                _exit(3);
+            }
+            int ps;
+            waitpid(pp, &ps, 0);
+            if (WIFEXITED(ps) && WEXITSTATUS(ps) == 3) il_done = 1;
+            power_restore();
+            bool reported[10] = { false };
+            int nrep = 0, x;
+            FILE* cf = fopen("/tmp/sv_dur_commits", "r");
+            while (cf && fscanf(cf, "%d", &x) == 1) if (x >= 0 && x < 10) { reported[x] = true; nrep++; }
+            if (cf) fclose(cf);
+            if (!db_init(WORK)) { bad++; CHECK(false, "interleaved: restart after a power cut at write %d: %s", k, db_init_error()); continue; }
+            ok("USE d");
+            int extra = 0;
+            bool whole = true;
+            for (int t = 0; t < 10; t++) {
+                int j = t % 3;                                  // la sessione che l'ha eseguita (assegnazione a turno)
+                (void)j;
+                long long ins = 0, upd = 0, del = 0;
+                for (int jj = 0; jj < 3; jj++) {
+                    char q[200];
+                    snprintf(q, sizeof(q), "SELECT COUNT(*) FROM s%d WHERE id = %d", jj, 1000 + t); ins += num(q);
+                }
+                // UPDATE e DELETE della transazione t sono sulla stessa tabella del suo INSERT
+                int tab = -1;
+                for (int jj = 0; jj < 3 && tab < 0; jj++) { char q[200]; snprintf(q, sizeof(q), "SELECT COUNT(*) FROM s%d WHERE id = %d", jj, 1000 + t); if (num(q)) tab = jj; }
+                if (tab >= 0) {
+                    char q[200];
+                    snprintf(q, sizeof(q), "SELECT COUNT(*) FROM s%d WHERE id = %d AND v >= 1000000", tab, t); upd = num(q);
+                    snprintf(q, sizeof(q), "SELECT COUNT(*) FROM s%d WHERE id = %d", tab, 20 + t); del = 1 - num(q);
+                }
+                bool present = ins == 1;
+                if (present && (upd != 1 || del != 1)) whole = false;          // parziale: mai
+                if (ins > 1) whole = false;
+                if (reported[t] && !present) whole = false;                    // confermata ma persa
+                if (present && !reported[t]) extra++;                          // il COMMIT in corso
+            }
+            long long total = 0;
+            for (int jj = 0; jj < 3; jj++) { char q[100]; snprintf(q, sizeof(q), "SELECT COUNT(*) FROM s%d WHERE v >= 1000000", jj); total += num(q); }
+            if (!whole || extra > 1) bad++;
+            CHECK(whole && extra <= 1, "interleaved power cut at write %d: %d commits reported, %d unreported present, %lld updates",
+                  k, nrep, extra, total);
+            db_shutdown();
+            points++;
+        }
+        CHECK(il_done, "the interleaved workload eventually completes before the power cut");
+        printf("interleaved power cut (10 transactions, 3 sessions): every one of %d writes checked, %d bad\n", points, bad);
+        sh("rm -rf " BASE "_il");
+    }
+
+    // ── 7b. memoria esaurita (P3.8): l'N-esima allocazione fallisce, per ogni N del carico (avvio compreso).
+    //        Regola: arresto controllato (SIGABRT con "out of memory") o errore dell'istruzione, mai un crash
+    //        diverso; al riavvio le righe confermate ci sono tutte, quelle della transazione aperta nessuna;
+    //        un'istruzione fallita con un errore lascia la transazione aperta (come MySQL), quindi il COMMIT
+    //        può confermare meno di 30 righe, ma ogni UPDATE è intero. ──
+    {
+        #define OOM_WORK() do { \
+            if (!db_init(WORK)) _exit(2); \
+            q("SET synchronous = FULL"); q("USE d"); \
+            q("BEGIN"); \
+            for (int i_ = 0; i_ < 30; i_++) { char s_[200]; snprintf(s_, sizeof(s_), "INSERT INTO t VALUES (%d, 1, 'oom')", 100000 + i_); q(s_); } \
+            q("UPDATE t SET pad = 'x' WHERE id >= 100000"); \
+            q("COMMIT"); \
+            q("BEGIN"); q("DELETE FROM t WHERE id <= 300"); q("SELECT COUNT(*), SUM(v) FROM t"); \
+        } while (0)
+        sh("rm -rf " WORK " && cp -r " BASE " " WORK);
+        pid_t cp = fork();
+        if (cp == 0) {                                   // passata di conteggio: quante allocazioni fa il carico
+            g_allocs = 0;
+            OOM_WORK();
+            FILE* f = fopen(WORK "_allocs", "w");
+            if (f) { fprintf(f, "%ld\n", g_allocs); fclose(f); }
+            _exit(3);
+        }
+        int cst = 0;
+        waitpid(cp, &cst, 0);
+        long total = 0;
+        FILE* f = fopen(WORK "_allocs", "r");
+        if (f) { if (fscanf(f, "%ld", &total) != 1) total = 0; fclose(f); }
+        remove(WORK "_allocs");
+        CHECK(WIFEXITED(cst) && WEXITSTATUS(cst) == 3 && total > 100, "allocation count of the workload: %ld", total);
+        long stride = total > 400 ? total / 400 : 1;   // SV_OOM_ALL=1: ogni allocazione
+        if (getenv("SV_OOM_ALL")) stride = 1;
+        int points = 0, aborted = 0, bad = 0;
+        for (long k = 1; k <= total + 1; k += stride) {
+            sh("rm -rf " WORK " && cp -r " BASE " " WORK);
+            pid_t pid2 = fork();
+            if (pid2 == 0) {
+                struct rlimit nocore = { 0, 0 };
+                setrlimit(RLIMIT_CORE, &nocore);
+                if (!freopen("/dev/null", "w", stderr)) {}
+                g_fail_alloc = k;
+                OOM_WORK();
+                _exit(3);
+            }
+            int st2 = 0;
+            waitpid(pid2, &st2, 0);
+            bool clean = (WIFEXITED(st2) && (WEXITSTATUS(st2) == 3 || WEXITSTATUS(st2) == 2)) ||
+                         (WIFSIGNALED(st2) && WTERMSIG(st2) == SIGABRT);
+            if (WIFSIGNALED(st2) && WTERMSIG(st2) == SIGABRT) aborted++;
+            if (!clean) { bad++; CHECK(0, "allocation failure %ld: child ended with status %d", k, st2); continue; }
+            if (!db_init(WORK)) { bad++; CHECK(0, "restart after allocation failure %ld: %s", k, db_init_error()); continue; }
+            q("USE d");
+            long long c = num("SELECT COUNT(*) FROM t WHERE id <= 600"), sum = num("SELECT SUM(v) FROM t WHERE id <= 600");
+            long long extra = num("SELECT COUNT(*) FROM t WHERE id >= 100000");
+            long long padx = num("SELECT COUNT(*) FROM t WHERE id >= 100000 AND pad = 'x'");
+            if (!(c == N && sum == (long long)N * (N + 1) / 2 && extra >= 0 && extra <= 30 && (padx == 0 || padx == extra))) {
+                bad++;
+                CHECK(0, "after allocation failure %ld: count %lld, sum %lld, new rows %lld (updated %lld)", k, c, sum, extra, padx);
+            }
+            db_shutdown();
+            points++;
+        }
+        g_fail_alloc = 0;
+        CHECK(bad == 0, "allocation-failure sweep: %d bad outcomes", bad);
+        CHECK(aborted > 0, "some allocation failures stop the process with the out-of-memory handler");
+        printf("allocation failures: %d points checked (%d stopped by the out-of-memory handler)\n", points, aborted);
+        #undef OOM_WORK
     }
 
     // ── 8. file oltre 2 GiB: pagina 600 000 (offset 2,4 GB) scritta e riletta (P0.12) ──

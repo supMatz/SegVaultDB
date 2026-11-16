@@ -156,11 +156,12 @@ int main(void) {
         long g_before = 0, g_after = 0;
         FILE* fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
         if (fd2) { fseek(fd2, 0, SEEK_END); g_before = ftell(fd2); fclose(fd2); }
-        for (int i = 0; i < 200; i++) ok("UPDATE grow SET body = CONCAT(SUBSTR(body, 2), 'h') WHERE id = 1");
+        for (int i = 0; i < 1000; i++) ok("UPDATE grow SET body = CONCAT(SUBSTR(body, 2), 'h') WHERE id = 1");
         fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
         if (fd2) { fseek(fd2, 0, SEEK_END); g_after = ftell(fd2); fclose(fd2); }
-        // 200 riscritture da 100 KB = 20 MB se nulla tornasse riusabile
-        CHECK(g_after - g_before < (8L << 20), "200 updates of a 100 KB row: file %ld -> %ld (< +8 MB)", g_before, g_after);
+        // 1000 riscritture da 100 KB = 100 MB se nulla tornasse riusabile. Dal P1.5 la catena vecchia torna libera
+        // appena l'UPDATE è nel log su disco: resta al più una copia in volo della riga (~100 KB)
+        CHECK(g_after - g_before <= (300L << 10), "1000 updates of a 100 KB row: file %ld -> %ld (<= +300 KB)", g_before, g_after);
         CHECK(num("SELECT LENGTH(body) FROM grow WHERE id = 1") == 100000, "large row intact");
         for (int k = 0; k < 20; k++) {
             ok("CREATE TABLE cyc (id INT PRIMARY KEY, pad VARCHAR(300))");
@@ -173,7 +174,46 @@ int main(void) {
         fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
         long cyc = 0;
         if (fd2) { fseek(fd2, 0, SEEK_END); cyc = ftell(fd2); fclose(fd2); }
-        CHECK(cyc - g_after < (6L << 20), "20 x (CREATE, 150 rows, DROP): file %ld -> %ld", g_after, cyc);
+        CHECK(cyc - g_after <= 16 * 4096, "20 x (CREATE, 150 rows, DROP): file %ld -> %ld (dropped pages reused at once)", g_after, cyc);
+        // dieci UPDATE di tutta la tabella: ogni riga resta nel suo slot, il file non cresce
+        ok("CREATE TABLE upd (id INT PRIMARY KEY, v VARCHAR(60), n INT)");
+        {
+            char ins[200000];
+            int l = snprintf(ins, sizeof(ins), "INSERT INTO upd VALUES ");
+            for (int i = 0; i < 2000; i++) l += snprintf(ins + l, sizeof(ins) - (size_t)l, "%s(%d, 'value %d with some padding text', %d)", i ? "," : "", i, i, i);
+            ok(ins);
+        }
+        fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+        long u0 = 0, u1 = 0;
+        if (fd2) { fseek(fd2, 0, SEEK_END); u0 = ftell(fd2); fclose(fd2); }
+        for (int k = 0; k < 10; k++) ok("UPDATE upd SET n = n + 1");
+        fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+        if (fd2) { fseek(fd2, 0, SEEK_END); u1 = ftell(fd2); fclose(fd2); }
+        CHECK(u1 <= u0 + u0 / 10 && num("SELECT SUM(n) FROM upd") == 1999000 + 20000, "10 full-table UPDATEs: file %ld -> %ld (within 10%%)", u0, u1);
+        ok("DROP TABLE upd");
+        // VACUUM FULL: tabelle riscritte compatte e file accorciato (le pagine libere in fondo tolte)
+        ok("CREATE TABLE vf (id INT PRIMARY KEY, pad VARCHAR(300), big TEXT)");
+        {
+            char ins[400000];
+            int l = snprintf(ins, sizeof(ins), "INSERT INTO vf VALUES ");
+            for (int i = 0; i < 1200; i++) l += snprintf(ins + l, sizeof(ins) - (size_t)l, "%s(%d, '%0250d', %s)", i ? "," : "", i, i,
+                                                         i % 100 == 0 ? "REPEAT('B', 9000)" : "NULL");
+            ok(ins);
+        }
+        ok("DELETE FROM vf WHERE id % 10 <> 0");
+        fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+        long v0 = 0, v1 = 0;
+        if (fd2) { fseek(fd2, 0, SEEK_END); v0 = ftell(fd2); fclose(fd2); }
+        CHECK(ok("VACUUM FULL"), "VACUUM FULL: %s", g_err);
+        fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+        if (fd2) { fseek(fd2, 0, SEEK_END); v1 = ftell(fd2); fclose(fd2); }
+        CHECK(v1 < v0 - (200L << 10), "VACUUM FULL shrinks the file: %ld -> %ld", v0, v1);
+        CHECK(num("SELECT COUNT(*) FROM vf") == 120 && num("SELECT SUM(id) FROM vf") == 71400 &&
+              num("SELECT COUNT(*) FROM vf WHERE big = REPEAT('B', 9000)") == 12 && num("SELECT COUNT(*) FROM grow") == 1,
+              "rows intact after VACUUM FULL");
+        CHECK(ok("INSERT INTO vf VALUES (5000, 'x', REPEAT('C', 20000))") && num("SELECT LENGTH(big) FROM vf WHERE id = 5000") == 20000,
+              "writes after VACUUM FULL");
+        ok("DROP TABLE vf");
         ok("DROP TABLE grow");
     }
 

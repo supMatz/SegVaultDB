@@ -66,6 +66,9 @@ SCOPO: HTTPS con OpenSSL caricato all'avvio (vedi tls.h).
       fcntl(fd, F_SETFL, on ? fl | O_NONBLOCK : fl & ~O_NONBLOCK);
   }
 #endif
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0                  // Windows / macOS: nessun flag (Windows non eredita i socket: P2.10)
+#endif
 
 // ── OpenSSL: solo le funzioni che servono, prese a runtime ──────
 
@@ -157,6 +160,16 @@ static struct {
     EVP_PKEY* (*PEM_read_bio_PrivateKey)(BIO*, EVP_PKEY**, void*, void*);
     const char* (*OpenSSL_version)(int);
     int       (*RAND_bytes)(unsigned char*, int);
+    // facoltative (caching_sha2_password via RSA): se mancano, solo quel percorso non c'è
+    const void* (*BIO_s_mem)(void);
+    BIO*      (*BIO_new)(const void*);
+    long      (*BIO_ctrl)(BIO*, int, long, void*);
+    int       (*PEM_write_bio_PUBKEY)(BIO*, const EVP_PKEY*);
+    void*     (*EVP_PKEY_CTX_new)(EVP_PKEY*, void*);
+    void      (*EVP_PKEY_CTX_free)(void*);
+    int       (*EVP_PKEY_decrypt_init)(void*);
+    int       (*EVP_PKEY_CTX_set_rsa_padding)(void*, int);
+    int       (*EVP_PKEY_decrypt)(void*, unsigned char*, size_t*, const unsigned char*, size_t);
 } O;
 
 static tls_mx g_load_mx;
@@ -249,6 +262,10 @@ static bool openssl_load(char* err, size_t errsz) {
     C(X509V3_EXT_nconf_nid); C(X509_add_ext); C(X509_EXTENSION_free); C(X509_sign); C(BIO_new_file); C(BIO_free);
     C(PEM_write_bio_X509); C(PEM_write_bio_PrivateKey); C(PEM_read_bio_X509); C(PEM_read_bio_PrivateKey);
     C(OpenSSL_version); C(RAND_bytes);
+    #define OPT(name) (*(void**)&O.name = lib_sym(O.crypto, #name))
+    OPT(BIO_s_mem); OPT(BIO_new); OPT(BIO_ctrl); OPT(PEM_write_bio_PUBKEY); OPT(EVP_PKEY_CTX_new); OPT(EVP_PKEY_CTX_free);
+    OPT(EVP_PKEY_decrypt_init); OPT(EVP_PKEY_CTX_set_rsa_padding); OPT(EVP_PKEY_decrypt);
+    #undef OPT
     #undef S
     #undef C
     if (!ok) {
@@ -264,6 +281,48 @@ static bool openssl_load(char* err, size_t errsz) {
     g_loaded = 1;
     mx_unlock(&g_load_mx);
     return true;
+}
+
+// ── RSA per caching_sha2_password (P2.6) ─────────────────────────
+// Senza TLS il client MySQL manda la password cifrata con la chiave pubblica del server (OAEP). La coppia di
+// chiavi si genera al primo uso e vive solo in memoria: niente da custodire su disco.
+
+static EVP_PKEY* g_rsa;
+static char*     g_rsa_pem;
+
+static bool rsa_ready(void) {
+    char err[300];
+    if (!openssl_load(err, sizeof(err))) return false;
+    if (!O.BIO_s_mem || !O.BIO_new || !O.BIO_ctrl || !O.PEM_write_bio_PUBKEY || !O.EVP_PKEY_CTX_new ||
+        !O.EVP_PKEY_CTX_free || !O.EVP_PKEY_decrypt_init || !O.EVP_PKEY_CTX_set_rsa_padding || !O.EVP_PKEY_decrypt) return false;
+    mx_lock(&g_load_mx);
+    if (!g_rsa) {
+        EVP_PKEY* k = O.EVP_PKEY_Q_keygen(NULL, NULL, "RSA", (size_t)2048);
+        BIO* b = k ? O.BIO_new(O.BIO_s_mem()) : NULL;
+        char* data = NULL;
+        long n = b && O.PEM_write_bio_PUBKEY(b, k) == 1 ? O.BIO_ctrl(b, 3 /* BIO_CTRL_INFO */, 0, &data) : 0;
+        char* pem = n > 0 && data ? malloc((size_t)n + 1) : NULL;
+        if (pem) { memcpy(pem, data, (size_t)n); pem[n] = '\0'; }
+        if (b) O.BIO_free(b);
+        if (pem) { g_rsa = k; g_rsa_pem = pem; }
+        else if (k) O.EVP_PKEY_free(k);
+    }
+    bool ok = g_rsa != NULL;
+    mx_unlock(&g_load_mx);
+    return ok;
+}
+
+const char* tls_rsa_public_pem(void) { return rsa_ready() ? g_rsa_pem : NULL; }
+
+int tls_rsa_decrypt(const unsigned char* in, size_t n, unsigned char* out, size_t cap) {
+    if (!rsa_ready()) return -1;
+    void* ctx = O.EVP_PKEY_CTX_new(g_rsa, NULL);
+    if (!ctx) return -1;
+    size_t ol = cap;
+    int ok = O.EVP_PKEY_decrypt_init(ctx) == 1 && O.EVP_PKEY_CTX_set_rsa_padding(ctx, 4 /* RSA_PKCS1_OAEP_PADDING */) == 1 &&
+             O.EVP_PKEY_decrypt(ctx, out, &ol, in, n) == 1;
+    O.EVP_PKEY_CTX_free(ctx);
+    return ok ? (int)ol : -1;
 }
 
 // ── certificati ─────────────────────────────────────────────────
@@ -499,16 +558,14 @@ static bool raw_send(tls_sock fd, const char* p, size_t n) {
 #ifndef _WIN32
             if (w < 0 && errno == EINTR) continue;
             if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                fd_set wr; FD_ZERO(&wr); FD_SET(fd, &wr);
-                struct timeval tv = { 15, 0 };
-                if (select((int)fd + 1, NULL, &wr, NULL, &tv) <= 0) return false;
+                SvPoll pw = { fd, 2, 0 };
+                if (sv_poll(&pw, 1, 15000) <= 0) return false;
                 continue;
             }
 #else
             if (w < 0 && WSAGetLastError() == WSAEWOULDBLOCK) {
-                fd_set wr; FD_ZERO(&wr); FD_SET(fd, &wr);
-                struct timeval tv = { 15, 0 };
-                if (select((int)fd + 1, NULL, &wr, NULL, &tv) <= 0) return false;
+                SvPoll pw = { fd, 2, 0 };
+                if (sv_poll(&pw, 1, 15000) <= 0) return false;
                 continue;
             }
 #endif
@@ -527,11 +584,8 @@ static bool ssl_send_all(SSL* s, tls_sock fd, const char* p, size_t n) {
         if (w > 0) { p += w; n -= (size_t)w; continue; }
         int e = O.SSL_get_error(s, w);
         if (e != SSL_ERROR_WANT_WRITE && e != SSL_ERROR_WANT_READ) return false;
-        fd_set rd, wr;
-        FD_ZERO(&rd); FD_ZERO(&wr);
-        if (e == SSL_ERROR_WANT_WRITE) FD_SET(fd, &wr); else FD_SET(fd, &rd);
-        struct timeval tv = { 15, 0 };
-        if (select((int)fd + 1, &rd, &wr, NULL, &tv) <= 0) return false;
+        SvPoll pw = { fd, (short)(e == SSL_ERROR_WANT_WRITE ? 2 : 1), 0 };
+        if (sv_poll(&pw, 1, 15000) <= 0) return false;
     }
     return true;
 }
@@ -545,19 +599,7 @@ static int ssl_recv_some(SSL* s, char* buf, int n) {
     return -1;
 }
 
-static tls_sock connect_inner(int port) {
-    tls_sock fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == BAD_SOCK) return BAD_SOCK;
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET;
-    a.sin_port = htons((unsigned short)port);
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (connect(fd, (struct sockaddr*)&a, sizeof(a)) != 0) { sock_close(fd); return BAD_SOCK; }
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
-    return fd;
-}
+static tls_sock connect_inner(int port) { return sv_inner_connect(port, false); }   // vedi h2.h
 
 // HTTP/1.1 su TLS: byte decifrati <-> server interno
 static void bridge_h1(SSL* s, tls_sock cfd, tls_sock ifd, atomic_int* stop) {
@@ -572,12 +614,8 @@ static void bridge_h1(SSL* s, tls_sock cfd, tls_sock ifd, atomic_int* stop) {
             if (r == 0) break;
             if (!raw_send(ifd, buf, (size_t)r)) return;
         }
-        fd_set rd;
-        FD_ZERO(&rd);
-        FD_SET(cfd, &rd);
-        FD_SET(ifd, &rd);
-        struct timeval tv = { 0, 200000 };
-        int r = select((int)(cfd > ifd ? cfd : ifd) + 1, &rd, NULL, NULL, &tv);
+        SvPoll pv[2] = { { cfd, 1, 0 }, { ifd, 1, 0 } };        // poll: descrittori oltre 1024 ammessi
+        int r = sv_poll(pv, 2, 200);
         if (r < 0) {
 #ifndef _WIN32
             if (errno == EINTR) continue;
@@ -585,12 +623,12 @@ static void bridge_h1(SSL* s, tls_sock cfd, tls_sock ifd, atomic_int* stop) {
             return;
         }
         if (r == 0) continue;
-        if (FD_ISSET(cfd, &rd)) {
+        if (pv[0].got & 1) {
             int g = ssl_recv_some(s, buf, sizeof(buf));
             if (g < 0) return;
             if (g > 0 && !raw_send(ifd, buf, (size_t)g)) return;
         }
-        if (FD_ISSET(ifd, &rd)) {
+        if (pv[1].got & 1) {
             int g = (int)recv(ifd, buf, sizeof(buf), 0);
             if (g <= 0) return;
             if (!ssl_send_all(s, cfd, buf, (size_t)g)) return;

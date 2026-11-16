@@ -12,6 +12,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include "sv_alloc.h"
 #ifndef _WIN32
   #include <fcntl.h>
   #include <unistd.h>
@@ -120,18 +121,22 @@ static bool native_ok(const uint8_t stored[20], const uint8_t scramble[20], cons
 }
 
 
-#define HASH_ROUNDS 20000
+// ── hash delle password ─────────────────────────────────────────
+// Formato attuale: "$p2$<giri>$<64 hex>" = PBKDF2-HMAC-SHA256(password, sale, giri), 32 byte. I giri sono
+// scritti nell'hash: si possono alzare senza rendere illeggibili gli hash vecchi, che si rifanno al primo login
+// riuscito (auth_hash_is_current). Formato precedente (fino alla 1.3): 64 hex senza prefisso = SHA-256 ripetuto
+// 20 000 volte, ancora accettato.
 
-// hash della password: SHA-256(sale + password), poi ripetuto (rallenta i tentativi a forza bruta)
-static void password_hash(const char* salt_hex, const char* pw, char out[65]) {
+#define LEGACY_ROUNDS 20000
+
+static void legacy_hash(const char* salt_hex, const char* pw, char out[65]) {
     size_t sl = strlen(salt_hex), pl = strlen(pw);
-    uint8_t* buf = malloc(sl + pl + 32);
+    uint8_t* buf = sv_malloc(sl + pl + 32);
     uint8_t d[32];
-    if (!buf) { out[0] = '\0'; return; }
     memcpy(buf, salt_hex, sl);
     memcpy(buf + sl, pw, pl);
     auth_sha256(buf, sl + pl, d);
-    for (int i = 1; i < HASH_ROUNDS; i++) {
+    for (int i = 1; i < LEGACY_ROUNDS; i++) {
         memcpy(buf, d, 32);
         memcpy(buf + 32, salt_hex, sl);
         auth_sha256(buf, 32 + sl, d);
@@ -139,6 +144,88 @@ static void password_hash(const char* salt_hex, const char* pw, char out[65]) {
     free(buf);
     hex(d, 32, out);
 }
+
+// SHA-256 incrementale (per HMAC: chiave e messaggio senza copie)
+typedef struct { uint32_t h[8]; uint8_t buf[64]; size_t bl; uint64_t n; } Sha256;
+static void s256_init(Sha256* c) {
+    static const uint32_t H0[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
+    memcpy(c->h, H0, sizeof(H0));
+    c->bl = 0;
+    c->n = 0;
+}
+static void s256_update(Sha256* c, const void* data, size_t n) {
+    const uint8_t* p = data;
+    c->n += n;
+    while (n) {
+        size_t k = 64 - c->bl < n ? 64 - c->bl : n;
+        memcpy(c->buf + c->bl, p, k);
+        c->bl += k; p += k; n -= k;
+        if (c->bl == 64) { sha_block(c->h, c->buf); c->bl = 0; }
+    }
+}
+static void s256_final(Sha256* c, uint8_t out[32]) {
+    uint64_t bits = c->n * 8;
+    uint8_t pad = 0x80;
+    s256_update(c, &pad, 1);
+    uint8_t z = 0;
+    while (c->bl != 56) s256_update(c, &z, 1);
+    uint8_t L[8];
+    for (int i = 0; i < 8; i++) L[i] = (uint8_t)(bits >> (56 - 8 * i));
+    s256_update(c, L, 8);
+    for (int i = 0; i < 8; i++) { out[i * 4] = (uint8_t)(c->h[i] >> 24); out[i * 4 + 1] = (uint8_t)(c->h[i] >> 16); out[i * 4 + 2] = (uint8_t)(c->h[i] >> 8); out[i * 4 + 3] = (uint8_t)c->h[i]; }
+}
+
+// PBKDF2-HMAC-SHA256 (RFC 8018) con un solo blocco d'uscita (32 byte). Gli stati interno ed esterno di HMAC
+// (chiave XOR ipad / opad) si calcolano una volta: ogni giro costa due compressioni di SHA-256
+void auth_pbkdf2_sha256(const void* pw, size_t pl, const void* salt, size_t sl, unsigned iter, uint8_t out[32]) {
+    uint8_t key[64] = {0};
+    if (pl > 64) auth_sha256(pw, pl, key);
+    else memcpy(key, pw, pl);
+    uint8_t ipad[64], opad[64];
+    for (int i = 0; i < 64; i++) { ipad[i] = key[i] ^ 0x36; opad[i] = key[i] ^ 0x5c; }
+    Sha256 ci, co;
+    s256_init(&ci); s256_update(&ci, ipad, 64);
+    s256_init(&co); s256_update(&co, opad, 64);
+    Sha256 c = ci;
+    s256_update(&c, salt, sl);
+    static const uint8_t one[4] = { 0, 0, 0, 1 };
+    s256_update(&c, one, 4);
+    uint8_t u[32], t[32];
+    s256_final(&c, u);
+    c = co; s256_update(&c, u, 32); s256_final(&c, u);
+    memcpy(t, u, 32);
+    for (unsigned k = 1; k < iter; k++) {
+        c = ci; s256_update(&c, u, 32); s256_final(&c, u);
+        c = co; s256_update(&c, u, 32); s256_final(&c, u);
+        for (int i = 0; i < 32; i++) t[i] ^= u[i];
+    }
+    memcpy(out, t, 32);
+    memset(key, 0, sizeof(key));
+    memset(ipad, 0, sizeof(ipad));
+    memset(opad, 0, sizeof(opad));
+    memset(u, 0, sizeof(u));
+}
+
+static void password_hash(const char* salt_hex, const char* pw, char out[AUTH_HASH_MAX]) {
+    uint8_t d[32];
+    char h[65];
+    auth_pbkdf2_sha256(pw, strlen(pw), salt_hex, strlen(salt_hex), AUTH_PBKDF2_ITER, d);
+    hex(d, 32, h);
+    snprintf(out, AUTH_HASH_MAX, "$p2$%u$%s", (unsigned)AUTH_PBKDF2_ITER, h);
+    memset(d, 0, sizeof(d));
+}
+
+// giri di un hash "$p2$N$..." (0 = formato vecchio o non valido)
+static unsigned hash_iter(const char* hash, const char** hexpart) {
+    if (strncmp(hash, "$p2$", 4)) return 0;
+    char* e;
+    unsigned long it = strtoul(hash + 4, &e, 10);
+    if (*e != '$' || strlen(e + 1) != 64 || it < 1000 || it > 50000000ul) return 0;
+    if (hexpart) *hexpart = e + 1;
+    return (unsigned)it;
+}
+
+bool auth_hash_is_current(const char* hash) { return hash_iter(hash, NULL) >= AUTH_PBKDF2_ITER; }
 
 static bool random_salt(char out[33]) {
     uint8_t r[16];
@@ -164,7 +251,10 @@ static bool random_salt(char out[33]) {
 
 typedef struct { char db[64], table[64]; unsigned privs; } Grant;
 // native: SHA1(SHA1(password)) in esadecimale, per il login col protocollo MySQL (mysql_native_password)
-typedef struct { char name[64], salt[33], hash[65], native[41]; bool admin; Grant* g; int ng; } User;
+// sha2: SHA256(SHA256(password)) per l'accesso veloce di caching_sha2_password, SOLO in memoria (come MySQL:
+// si riempie a ogni verifica riuscita della password in chiaro e si svuota al riavvio)
+typedef struct { char name[64], salt[33], hash[AUTH_HASH_MAX], native[41]; bool admin; Grant* g; int ng;
+                 uint8_t sha2[32]; bool has_sha2; } User;
 
 static User* g_users;
 static int   g_nusers;
@@ -199,7 +289,7 @@ static bool save_users(void) {
 }
 
 static User* add_user(const char* name) {
-    User* nu = realloc(g_users, sizeof(User) * (size_t)(g_nusers + 1));
+    User* nu = sv_realloc(g_users, sizeof(User) * (size_t)(g_nusers + 1));
     if (!nu) return NULL;
     g_users = nu;
     User* u = &g_users[g_nusers++];
@@ -215,16 +305,16 @@ bool auth_init(const char* data_dir) {
     auth_shutdown();
     g_auth_err[0] = '\0';
     snprintf(g_path, sizeof(g_path), "%.570s/users.dat", data_dir ? data_dir : ".");
-    FILE* f = fopen(g_path, "r");
+    FILE* f = fopen(g_path, "r" SV_FE);
     if (!f) {
         // salvataggio interrotto fra il file temporaneo (completo, con fsync) e la sostituzione
         char tmp[620];
         snprintf(tmp, sizeof(tmp), "%s.tmp", g_path);
-        FILE* t = fopen(tmp, "r");
+        FILE* t = fopen(tmp, "r" SV_FE);
         if (!t) return true;                     // nessun utente
         fclose(t);
         if (sv_replace_file(tmp, g_path) != 0) { snprintf(g_auth_err, sizeof(g_auth_err), "cannot rename %.200s", tmp); return false; }
-        f = fopen(g_path, "r");
+        f = fopen(g_path, "r" SV_FE);
         if (!f) return true;
     }
     char line[512];
@@ -233,21 +323,21 @@ bool auth_init(const char* data_dir) {
     while (fgets(line, sizeof(line), f)) {
         if (end_count >= 0) { if (line[0] != '\n' && line[0] != '#') after_end = true; continue; }
         if (sscanf(line, "end %d", &end_count) == 1) continue;
-        char a[64], b[64], c[80], d[80];
+        char a[64], b[64], c[AUTH_HASH_MAX], d[80];
         int adm;
         unsigned pr;
         d[0] = '\0';
-        int nf = sscanf(line, "user %63s %63s %79s %d %79s", a, b, c, &adm, d);
+        int nf = sscanf(line, "user %63s %63s %95s %d %79s", a, b, c, &adm, d);
         if (nf >= 4) {
             User* u = find_user(a) ? NULL : add_user(a);
             if (!u) continue;
             snprintf(u->salt, sizeof(u->salt), "%.32s", b);
-            snprintf(u->hash, sizeof(u->hash), "%.64s", c);
+            snprintf(u->hash, sizeof(u->hash), "%s", c);
             if (nf == 5 && strlen(d) == 40) snprintf(u->native, sizeof(u->native), "%.40s", d);
             u->admin = adm != 0;
         } else if (sscanf(line, "grant %63s %63s %79s %u", a, b, c, &pr) == 4) {
             User* u = find_user(a);
-            Grant* ng = u ? realloc(u->g, sizeof(Grant) * (size_t)(u->ng + 1)) : NULL;
+            Grant* ng = u ? sv_realloc(u->g, sizeof(Grant) * (size_t)(u->ng + 1)) : NULL;
             if (!ng) continue;
             u->g = ng;
             snprintf(ng[u->ng].db, 64, "%.63s", b);
@@ -294,27 +384,80 @@ int auth_login_native(const char* user, const uint8_t scramble[20], const uint8_
 }
 
 bool auth_login(const char* user, const char* password) {
-    char salt[33], hash[65];
+    char salt[33], hash[AUTH_HASH_MAX];
     return auth_user_secret(user, salt, hash) && auth_password_matches(salt, hash, password);
 }
 
-bool auth_user_secret(const char* user, char salt[33], char hash[65]) {
+bool auth_user_secret(const char* user, char salt[33], char hash[AUTH_HASH_MAX]) {
     User* u = find_user(user);
     if (!u) return false;
     memcpy(salt, u->salt, 33);
-    memcpy(hash, u->hash, 65);
+    memcpy(hash, u->hash, AUTH_HASH_MAX);
     return true;
 }
 
 bool auth_password_matches(const char* salt, const char* hash, const char* password) {
-    if (!password) return false;
+    if (!password || !salt || !hash) return false;
+    const char* want;
     char h[65];
-    password_hash(salt, password, h);
-    // confronto a tempo costante
-    unsigned diff = 0;
-    for (int i = 0; i < 64; i++) diff |= (unsigned)(h[i] ^ hash[i]);
-    return diff == 0 && h[0];
+    unsigned it = hash_iter(hash, &want);
+    if (it) {
+        uint8_t d[32];
+        auth_pbkdf2_sha256(password, strlen(password), salt, strlen(salt), it, d);
+        hex(d, 32, h);
+        memset(d, 0, sizeof(d));
+    } else if (strlen(hash) == 64) {
+        legacy_hash(salt, password, h);
+        want = hash;
+    } else return false;
+    unsigned diff = 0;                            // confronto a tempo costante
+    for (int i = 0; i < 64; i++) diff |= (unsigned)(h[i] ^ want[i]);
+    memset(h, 0, sizeof(h));
+    return diff == 0;
 }
+
+void auth_sha2_stage2(const char* password, uint8_t out[32]) {
+    uint8_t s1[32];
+    auth_sha256(password, strlen(password), s1);
+    auth_sha256(s1, 32, out);
+    memset(s1, 0, sizeof(s1));
+}
+
+// dopo una verifica riuscita della password in chiaro: si ricorda SHA256(SHA256(pw)) per caching_sha2 e, se
+// l'hash è di un formato o di un numero di giri vecchio, lo si rifà (solo se nel frattempo non è cambiato)
+bool auth_password_verified(const char* user, const char* salt, const char* hash, const char* password) {
+    User* u = find_user(user);
+    if (!u || strcmp(u->salt, salt) || strcmp(u->hash, hash)) return false;
+    auth_sha2_stage2(password, u->sha2);
+    u->has_sha2 = true;
+    if (auth_hash_is_current(u->hash)) return false;
+    password_hash(u->salt, password, u->hash);
+    save_users();
+    return true;
+}
+
+// caching_sha2_password, accesso veloce: risposta = SHA256(pw) XOR SHA256(SHA256(SHA256(pw)) + nonce).
+// 1 = giusta, 0 = sbagliata, -2 = SHA256(SHA256(pw)) non in memoria: serve l'accesso completo
+int auth_login_sha2(const char* user, const uint8_t nonce[20], const uint8_t* resp, size_t rlen) {
+    User* u = find_user(user);
+    if (!u || !u->has_sha2) return -2;            // utente sconosciuto: stesso percorso (nessun indizio dai tempi)
+    return auth_sha2_check(u->sha2, nonce, resp, rlen) ? 1 : 0;
+}
+
+bool auth_sha2_check(const uint8_t stage2[32], const uint8_t nonce[20], const uint8_t* resp, size_t rlen) {
+    if (rlen != 32) return false;
+    uint8_t buf[52], x[32], cand[32], chk[32];
+    memcpy(buf, stage2, 32);
+    memcpy(buf + 32, nonce, 20);
+    auth_sha256(buf, 52, x);
+    for (int i = 0; i < 32; i++) cand[i] = resp[i] ^ x[i];
+    auth_sha256(cand, 32, chk);
+    unsigned diff = 0;
+    for (int i = 0; i < 32; i++) diff |= (unsigned)(chk[i] ^ stage2[i]);
+    return diff == 0;
+}
+
+bool auth_has_native(const char* user) { User* u = find_user(user); return u && u->native[0]; }
 
 unsigned long auth_users_version(void) { return g_users_version; }   // cambia a ogni modifica degli utenti
 
@@ -383,20 +526,20 @@ static void privs_text(unsigned p, char* out, size_t n) {
 // ── risultati ───────────────────────────────────────────────────
 
 static QueryResult* res_new(int ncols, const char* const* names) {
-    QueryResult* r = calloc(1, sizeof(QueryResult));
+    QueryResult* r = sv_calloc(1, sizeof(QueryResult));
     if (!r) return NULL;
     r->success = true;
     if (ncols) {
-        r->col_names = calloc((size_t)ncols, sizeof(char*));
-        r->col_types = calloc((size_t)ncols, sizeof(char*));
+        r->col_names = sv_calloc((size_t)ncols, sizeof(char*));
+        r->col_types = sv_calloc((size_t)ncols, sizeof(char*));
         r->num_cols = ncols;
-        for (int i = 0; i < ncols && r->col_names && r->col_types; i++) { r->col_names[i] = strdup(names[i]); r->col_types[i] = strdup("TEXT"); }
+        for (int i = 0; i < ncols && r->col_names && r->col_types; i++) { r->col_names[i] = sv_strdup(names[i]); r->col_types[i] = sv_strdup("TEXT"); }
     }
     return r;
 }
 
 static void res_row(QueryResult* r, const char* const* v) {
-    Row* rows = realloc(r->rows, sizeof(Row) * (size_t)(r->num_rows + 1));
+    Row* rows = sv_realloc(r->rows, sizeof(Row) * (size_t)(r->num_rows + 1));
     if (!rows) return;
     r->rows = rows;
     if (db_row_set(&r->rows[r->num_rows], r->num_cols, v, NULL)) r->num_rows++;
@@ -486,7 +629,7 @@ static void set_grant(User* u, const char* db, const char* table, unsigned add, 
             return;
         }
     if (!add) return;
-    Grant* ng = realloc(u->g, sizeof(Grant) * (size_t)(u->ng + 1));
+    Grant* ng = sv_realloc(u->g, sizeof(Grant) * (size_t)(u->ng + 1));
     if (!ng) return;
     u->g = ng;
     snprintf(ng[u->ng].db, 64, "%s", db);
@@ -581,7 +724,20 @@ bool auth_statement(const void* tokens, const char* session_user, const char* cu
             *out = res_new(0, NULL);
             return true;
         }
-        if (!word(&c, "IDENTIFIED") || !word(&c, "BY") || !tk(&c) || tk(&c)->type != TOK_STRING) {
+        // IDENTIFIED [WITH plugin] BY 'password': mysql_native_password conserva anche SHA1(SHA1(pw)) per i client
+        // MySQL che non conoscono caching_sha2_password (è un hash veloce senza sale: solo se chiesto)
+        bool want_native = false;
+        if (!word(&c, "IDENTIFIED")) { *out = res_err("Expected IDENTIFIED BY 'password'%s", ""); return true; }
+        if (word(&c, "WITH")) {
+            char plugin[64];
+            if (!name(&c, plugin, sizeof(plugin))) { *out = res_err("Expected an authentication plugin after WITH%s", ""); return true; }
+            if (!strcasecmp(plugin, "mysql_native_password")) want_native = true;
+            else if (strcasecmp(plugin, "caching_sha2_password") && strcasecmp(plugin, "sha256_password")) {
+                *out = res_err("Unknown authentication plugin '%.63s' (use caching_sha2_password or mysql_native_password)", plugin);
+                return true;
+            }
+        }
+        if (!word(&c, "BY") || !tk(&c) || tk(&c)->type != TOK_STRING) {
             *out = res_err("Expected IDENTIFIED BY 'password'%s", ""); return true;
         }
         snprintf(pw, sizeof(pw), "%s", tk(&c)->text);
@@ -596,11 +752,16 @@ bool auth_statement(const void* tokens, const char* session_user, const char* cu
         if (!us) { *out = res_err("Out of memory%s", ""); return true; }
         memcpy(us->salt, salt, sizeof(us->salt));
         password_hash(us->salt, pw, us->hash);
-        uint8_t s1[20], s2[20];
-        auth_sha1(pw, strlen(pw), s1);
-        auth_sha1(s1, 20, s2);
-        hex(s2, 20, us->native);
-        memset(s1, 0, sizeof(s1));
+        auth_sha2_stage2(pw, us->sha2);
+        us->has_sha2 = true;
+        us->native[0] = '\0';
+        if (want_native) {
+            uint8_t s1[20], s2[20];
+            auth_sha1(pw, strlen(pw), s1);
+            auth_sha1(s1, 20, s2);
+            hex(s2, 20, us->native);
+            memset(s1, 0, sizeof(s1));
+        }
         memset(pw, 0, sizeof(pw));
         *out = save_users() ? res_new(0, NULL) : res_err("Cannot write the users file%s", "");
         return true;

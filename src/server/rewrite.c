@@ -1,6 +1,7 @@
 /*
 SCOPO: i .htaccess dei siti (vedi rewrite.h).
 */
+#include "common.h"
 #include "rewrite.h"
 #include "../query/regex.h"
 #include "json.h"
@@ -128,7 +129,7 @@ static SvRegex* glob_re(const char* g) {
 static HtFile* ht_load(const char* dir, const char* url, char* err, size_t errsz) {
     char path[4200];
     snprintf(path, sizeof(path), "%s/.htaccess", dir);
-    FILE* f = fopen(path, "rb");
+    FILE* f = fopen(path, "rb" SV_FE);
     if (!f) return NULL;
     HtFile* h = calloc(1, sizeof(HtFile));
     if (!h) { fclose(f); return NULL; }
@@ -260,7 +261,11 @@ static HtFile* ht_load(const char* dir, const char* url, char* err, size_t errsz
                 else if (isdigit((unsigned char)v[0])) r.redirect = atoi(v);
                 if (r.redirect < 300 || r.redirect > 399) r.redirect = 302;
             }
-            if (has_flag(fl, "S", v, sizeof(v)) || has_flag(fl, "skip", v, sizeof(v))) r.skip = atoi(v);
+            // S=n salta le n regole seguenti: n negativo (o assurdo) tornerebbe indietro fuori dall'elenco
+            if (has_flag(fl, "S", v, sizeof(v)) || has_flag(fl, "skip", v, sizeof(v))) {
+                long sk = strtol(v, NULL, 10);
+                r.skip = sk < 0 ? 0 : sk > 10000 ? 10000 : (int)sk;
+            }
             if (npend) {
                 r.conds = malloc(sizeof(Cond) * (size_t)npend);
                 if (r.conds) { memcpy(r.conds, pending, sizeof(Cond) * (size_t)npend); r.nconds = npend; }
@@ -466,9 +471,11 @@ static int load_levels(const RwRequest* rq, const char* path, HtFile** lv, char*
 
 void rw_apply(const RwRequest* rq, RwResult* out) {
     memset(out, 0, sizeof(*out));
-    char path[2048], query[2048];
-    snprintf(path, sizeof(path), "%s", rq->path);
-    snprintf(query, sizeof(query), "%s", rq->query ? rq->query : "");
+    char path[RW_PATH_MAX], query[RW_QUERY_MAX];
+    bool too_long = false;                             // un valore che non entra: 414, mai troncato (P2.3)
+#define RW_PUT(buf, ...) do { if ((size_t)snprintf(buf, sizeof(buf), __VA_ARGS__) >= sizeof(buf)) too_long = true; } while (0)
+    RW_PUT(path, "%s", rq->path);
+    RW_PUT(query, "%s", rq->query ? rq->query : "");
     bool changed_any = false;
     HtFile* lv[MAX_LEVELS];
     int n = 0;
@@ -483,8 +490,8 @@ void rw_apply(const RwRequest* rq, RwResult* out) {
             if (!strncmp(path, h->url, ul)) rel = path + ul;
             else if (!strncmp(path, h->url, ul - 1) && path[ul - 1] == '\0') rel = "";
             while (*rel == '/') rel++;
-            char relbuf[2048];
-            snprintf(relbuf, sizeof(relbuf), "%s", rel);
+            char relbuf[RW_PATH_MAX];
+            RW_PUT(relbuf, "%s", rel);
             Ctx c;
             memset(&c, 0, sizeof(c));
             c.rq = rq;
@@ -507,7 +514,7 @@ void rw_apply(const RwRequest* rq, RwResult* out) {
                     if (r->redirect) {                  // "-" con R: ridirige allo stesso indirizzo
                         out->action = RW_REDIRECT;
                         out->status = r->redirect;
-                        snprintf(out->location, sizeof(out->location), "%s%s%s", path, query[0] ? "?" : "", query);
+                        RW_PUT(out->location, "%s%s%s", path, query[0] ? "?" : "", query);
                         goto done;
                     }
                     if (r->last || r->end) { stop = r->end; break; }
@@ -518,29 +525,28 @@ void rw_apply(const RwRequest* rq, RwResult* out) {
                 expand(&c, r->subst, &s);
                 const char* sub = s.data ? s.data : "";
                 bool absolute = !strncasecmp(sub, "http://", 7) || !strncasecmp(sub, "https://", 8);
-                char np[4096], nq[4200];
+                char np[RW_PATH_MAX], nq[RW_QUERY_MAX];
                 const char* qm = strchr(sub, '?');
                 size_t pl = qm ? (size_t)(qm - sub) : strlen(sub);
-                if (absolute) snprintf(np, sizeof(np), "%.*s", (int)pl, sub);
-                else if (sub[0] == '/') snprintf(np, sizeof(np), "%.*s", (int)pl, sub);
-                else snprintf(np, sizeof(np), "%s%.*s", h->has_base ? h->base : h->url, (int)pl, sub);
+                if (absolute) RW_PUT(np, "%.*s", (int)pl, sub);
+                else if (sub[0] == '/') RW_PUT(np, "%.*s", (int)pl, sub);
+                else RW_PUT(np, "%s%.*s", h->has_base ? h->base : h->url, (int)pl, sub);
                 if (qm) {
-                    if (r->qsa && query[0]) snprintf(nq, sizeof(nq), "%s%s%s", qm + 1, qm[1] ? "&" : "", query);
-                    else snprintf(nq, sizeof(nq), "%s", qm + 1);
-                } else snprintf(nq, sizeof(nq), "%s", r->qsd ? "" : query);
+                    if (r->qsa && query[0]) RW_PUT(nq, "%s%s%s", qm + 1, qm[1] ? "&" : "", query);
+                    else RW_PUT(nq, "%s", qm + 1);
+                } else RW_PUT(nq, "%s", r->qsd ? "" : query);
                 free(s.data);
                 if (absolute || r->redirect) {
                     out->action = RW_REDIRECT;
                     out->status = r->redirect ? r->redirect : 302;
-                    snprintf(out->location, sizeof(out->location), "%s%s%s", np, nq[0] ? "?" : "", nq);
+                    RW_PUT(out->location, "%s%s%s", np, nq[0] ? "?" : "", nq);
                     goto done;
                 }
-                char dec[2048];
+                char dec[RW_PATH_MAX];
                 pct_decode(np, strlen(np), dec, sizeof(dec));
                 if (strcmp(dec, path) || strcmp(nq, query)) { changed = true; changed_any = true; }
-                snprintf(path, sizeof(path), "%s", dec);
-                nq[sizeof(query) - 1] = '\0';                 // QUERY_STRING al massimo 2047 byte
-                memcpy(query, nq, strlen(nq) + 1);
+                RW_PUT(path, "%s", dec);
+                RW_PUT(query, "%s", nq);
                 c.path = path;
                 c.query = query;
                 if (r->last || r->end) { stop = r->end; break; }
@@ -548,7 +554,7 @@ void rw_apply(const RwRequest* rq, RwResult* out) {
                 rel = path;
                 if (!strncmp(path, h->url, ul)) rel = path + ul;
                 while (*rel == '/') rel++;
-                snprintf(relbuf, sizeof(relbuf), "%s", rel);
+                RW_PUT(relbuf, "%s", rel);
                 i += r->skip;
             }
         }
@@ -576,9 +582,11 @@ void rw_apply(const RwRequest* rq, RwResult* out) {
     }
     if (changed_any) {
         out->action = RW_REWRITE;
-        snprintf(out->path, sizeof(out->path), "%s", path);
-        snprintf(out->query, sizeof(out->query), "%s", query);
+        RW_PUT(out->path, "%s", path);
+        RW_PUT(out->query, "%s", query);
     }
 done:
+    if (too_long) out->action = RW_TOO_LONG;
+#undef RW_PUT
     for (int i = 0; i < n; i++) ht_free(lv[i]);
 }

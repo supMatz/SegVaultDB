@@ -39,6 +39,8 @@ SCOPO: protocollo di rete di MySQL (client/server protocol 4.1) per segvault-ser
 #define MW_STATUS_IN_TRANS          0x0001
 #define MW_STATUS_AUTOCOMMIT        0x0002
 #define MW_STATUS_MORE_RESULTS      0x0008
+#define MW_STATUS_CURSOR_EXISTS     0x0040
+#define MW_STATUS_LAST_ROW_SENT     0x0080
 
 // comandi
 #define MW_COM_QUIT        0x01
@@ -51,6 +53,7 @@ SCOPO: protocollo di rete di MySQL (client/server protocol 4.1) per segvault-ser
 #define MW_COM_STMT_SEND_LONG_DATA 0x18
 #define MW_COM_STMT_CLOSE  0x19
 #define MW_COM_STMT_RESET  0x1a
+#define MW_COM_STMT_FETCH  0x1c
 #define MW_COM_RESET_CONNECTION 0x1f
 #define MW_COM_PROCESS_KILL 0x0c
 #define MW_COM_STATISTICS  0x09
@@ -81,6 +84,10 @@ void mw_ok(MwOut* o, uint64_t affected, uint64_t insert_id, unsigned status, con
 void mw_err(MwOut* o, unsigned code, const char* sqlstate, const char* msg);
 void mw_eof(MwOut* o, unsigned status);
 void mw_auth_switch(MwOut* o, const uint8_t scramble[20]);
+void mw_auth_switch_to(MwOut* o, const char* plugin, const uint8_t scramble[20]);
+// AuthMoreData (0x01 + dati): caching_sha2_password manda 0x03 (accesso veloce riuscito), 0x04 (serve la
+// password in chiaro) o la chiave pubblica RSA
+void mw_auth_more(MwOut* o, const void* data, size_t n);
 // variabili che rispecchiano la configurazione del server (have_ssl, max_connections)
 void mw_set_config(bool ssl, int max_connections);
 // risultato in formato testo: colonne, EOF, righe, EOF (status: con MORE_RESULTS se ne seguono altri)
@@ -112,13 +119,17 @@ char* mw_with_nulls(const char* sql);                     // i '?' sostituiti da
 void mw_prepare_ok(MwOut* o, uint32_t id, int nparams, const QueryResult* meta, const char* db, unsigned status);
 // risultato in formato binario (risposta a COM_STMT_EXECUTE)
 void mw_resultset_binary(MwOut* o, const QueryResult* r, const char* db, unsigned status);
+// cursore (COM_STMT_EXECUTE con CURSOR_TYPE_READ_ONLY): solo colonne ed EOF con CURSOR_EXISTS; poi
+// mw_cursor_fetch manda fino a count righe da *pos (formato binario) e l'EOF (LAST_ROW_SENT alla fine)
+void mw_cursor_open(MwOut* o, const QueryResult* r, const char* db, unsigned status);
+void mw_cursor_fetch(MwOut* o, const QueryResult* r, int* pos, uint32_t count, unsigned status);
 // valore di un parametro arrivato a pezzi con COM_STMT_SEND_LONG_DATA
 typedef struct { char* p; size_t n; bool set; } MwLongData;
 // p, n: il pacchetto COM_STMT_EXECUTE dopo comando e id; types (2 byte per parametro) e
 // types_set restano fra un EXECUTE e l'altro; ld: NULL o un valore per parametro.
 // Restituisce l'SQL con i valori (da liberare) o NULL con il motivo in err
 char* mw_bind_execute(const char* sql, const uint8_t* p, size_t n, int nparams, uint8_t* types,
-                      bool* types_set, MwLongData* ld, char* err, size_t en);
+                      bool* types_set, MwLongData* ld, char*** lits_out, char* err, size_t en);
 
 // SET [SESSION] autocommit = 0 | 1 (anche @@session.autocommit, ON / OFF): 0 o 1, -1 se non è questo
 int mw_set_autocommit(const char* sql);

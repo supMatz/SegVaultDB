@@ -61,7 +61,7 @@ transazioni, trigger).
 | **Vincoli** | `PRIMARY KEY` (anche composta), `UNIQUE`, `NOT NULL`, `CHECK`, `FOREIGN KEY` con `ON DELETE` / `ON UPDATE` `CASCADE`, `SET NULL`, `SET DEFAULT`, `RESTRICT` |
 | **Storage** | Heap file a pagine da 4 KB con slot directory e free-space map; indici in memoria (anche su più colonne): tabella hash per le uguaglianze, chiavi ordinate per gli intervalli |
 | **Buffer pool** | 1/8 della RAM (4-512 MB, `--cache-size` / `SET GLOBAL cache_size`), tabella hash per la ricerca, sostituzione **CLOCK**; statistiche con `SHOW STATUS` |
-| **Ottimizzatore** | Pushdown delle selezioni, hash join (anche per `FROM a, b WHERE a.x = b.y`), accesso con indice per uguaglianza o per intervallo (scelto solo se conviene), subquery decorrelate per chiave; `EXPLAIN` con stime alla System R e `EXPLAIN ANALYZE` con le righe reali |
+| **Ottimizzatore** | Pushdown delle selezioni, hash join (anche per `FROM a, b WHERE a.x = b.y`), accesso con indice per uguaglianza o per intervallo (scelto solo se conviene: un valore che copre più di un quarto della tabella si legge con una scansione), ordine dei join interni scelto per costo, subquery decorrelate per chiave; statistiche delle colonne con `ANALYZE TABLE` (valori distinti, NULL, istogramma); `EXPLAIN` con le stime, `EXPLAIN ANALYZE` con le righe reali, `EXPLAIN FORMAT=JSON` |
 | **Transazioni** | Write-Ahead Log con undo/redo, `BEGIN` (o `START TRANSACTION`) / `COMMIT` / `ROLLBACK`, `SAVEPOINT` (`ROLLBACK TO [SAVEPOINT]`), recovery dopo un crash (anche con più transazioni aperte), `CHECKPOINT` (anche automatico) |
 | **Concorrenza** | Più transazioni aperte insieme (sessioni HTTP, connessioni MySQL, editor): lock di tabella S / X a due fasi, deadlock riconosciuti (errore MySQL 1213), timeout (1205); **le letture non aspettano mai le scritture** (MVCC: versione confermata) |
 | **Basi di dati attive** | Trigger `BEFORE` / `AFTER`, `FOR EACH ROW` / `FOR EACH STATEMENT`, `NEW` / `OLD`, `WHEN`, `SET NEW.col`, `SIGNAL`, `IF`; stored procedure (`CREATE PROCEDURE`, `CALL`) |
@@ -80,11 +80,12 @@ installazione (i font sono dentro l'eseguibile):
 
 | Sistema | App desktop (editor SQL + server) | Solo server |
 |---|---|---|
-| Windows 10 / 11 | [segvault.exe](https://github.com/supMatz/SegVaultDB/raw/main/bin/windows-x86_64/segvault.exe) | [segvault-server.exe](https://github.com/supMatz/SegVaultDB/raw/main/bin/windows-x86_64/segvault-server.exe) |
-| Linux x86-64 | [segvault](https://github.com/supMatz/SegVaultDB/raw/main/bin/linux-x86_64/segvault) | [segvault-server](https://github.com/supMatz/SegVaultDB/raw/main/bin/linux-x86_64/segvault-server) |
+| Windows 10 / 11 | [segvault.exe](https://github.com/supMatz/SegVaultDB/releases/latest/download/segvault.exe) | [segvault-server.exe](https://github.com/supMatz/SegVaultDB/releases/latest/download/segvault-server.exe) |
+| Linux x86-64 | [segvault](https://github.com/supMatz/SegVaultDB/releases/latest/download/segvault) | [segvault-server](https://github.com/supMatz/SegVaultDB/releases/latest/download/segvault-server) |
 
-Gli stessi file sono allegati a ogni [release](https://github.com/supMatz/SegVaultDB/releases) e
-nella cartella [`bin/`](bin/README.md) (requisiti e dettagli). Per compilare dai sorgenti: sotto.
+I link puntano all'ultima [release](https://github.com/supMatz/SegVaultDB/releases), che allega anche
+`SHA256SUMS` (`sha256sum -c SHA256SUMS` verifica i file scaricati); requisiti e dettagli in
+[`bin/README.md`](bin/README.md). Il repository non contiene eseguibili. Per compilare dai sorgenti: sotto.
 
 ## Avvio rapido
 
@@ -96,8 +97,8 @@ make                        # ./segvault (app desktop) e ./segvault-server
 ./segvault-server           # il server senza finestra (servizi, container)
 ```
 
-Su Windows: `segvault.exe` e `segvault-server.exe` (i font sono inclusi; `make dist` aggiorna gli
-eseguibili in `bin/`). La cartella dati viene creata se manca e contiene:
+Su Windows: `segvault.exe` e `segvault-server.exe` (i font sono inclusi; `make dist` prepara in `dist/`
+gli eseguibili e i pacchetti da allegare alla release). La cartella dati viene creata se manca e contiene:
 
 | File | Contenuto |
 |---|---|
@@ -247,7 +248,7 @@ La cartella [`examples/`](examples/) contiene script pronti da aprire nell'edito
 **Basi di Dati 1** — modello relazionale e SQL: tutto il linguaggio di interrogazione dei corsi (compresi gli operatori insiemistici e le interrogazioni annidate con la logica a tre valori di SQL: `NOT IN` con un `NULL` non è mai vero, `ALL` su un insieme vuoto è vero), viste, vincoli di integrità di dominio, di tupla, di chiave e referenziali, con controllo prima di ogni scrittura: uno statement che viola un vincolo non modifica nulla.
 
 **Basi di Dati 2** — come funziona un DBMS:
-- `EXPLAIN` mostra il piano: scansione sequenziale o accesso con indice, filtri anticipati, hash join o nested loop, aggregazione, ordinamento, con le **stime delle righe secondo le selettività di default di System R** (1/10 per `=`, 1/3 per un intervallo). `EXPLAIN ANALYZE` esegue la query e affianca le righe reali di ogni passo, il numero di esecuzioni delle subquery correlate e i tempi.
+- `EXPLAIN` mostra il piano: scansione sequenziale o accesso con indice, filtri anticipati, hash join o nested loop, aggregazione, ordinamento, con le **stime delle righe**: dalle statistiche di `ANALYZE TABLE` (valori distinti, frazione di NULL, istogramma equi-depth a 16 fasce, salvate in `segvault.stats`), e senza statistiche con le selettività di default di System R (1/10 per `=`, 1/3 per un intervallo). Un join solo interno fra 3 o più tabelle si esegue nell'ordine che costa meno (prima la tabella più selettiva), comunque sia scritto; `SELECT *` mantiene le colonne nell'ordine scritto. `EXPLAIN FORMAT=JSON` restituisce lo stesso piano in una riga JSON. `EXPLAIN ANALYZE` esegue la query e affianca le righe reali di ogni passo, il numero di esecuzioni delle subquery correlate e i tempi.
 - `SHOW STATUS` riporta richieste al buffer pool, hit, miss, hit ratio, sostituzioni (CLOCK), pagine scritte, dimensione del log e checkpoint; `SHOW INDEXES FROM t` gli indici e se sono già stati costruiti.
 - Transazioni con WAL: ogni modifica viene scritta nel log prima delle pagine; `ROLLBACK` usa le immagini precedenti (undo), dopo un crash le transazioni completate vengono rifatte (redo) e quelle aperte annullate. `CHECKPOINT` scrive le pagine e svuota il log.
 - Trigger con la semantica dei DBMS reali: i `BEFORE` vedono e possono cambiare la riga prima dei controlli dei vincoli, gli `AFTER` possono attivare altri trigger; se un trigger fallisce lo statement viene annullato per intero.
@@ -666,7 +667,7 @@ LIMIT n [OFFSET m]   |   OFFSET m ROWS FETCH FIRST n ROWS ONLY;
 
 | Costrutto | Esempio |
 |---|---|
-| Operatori | `+ - * / %`, `DIV`, `= <> != < > <= >=`, `<=>` (uguale anche fra NULL), `AND OR NOT XOR`, `&& \|\| !` (in modalità MySQL `\|\|` è OR, altrimenti concatena), bit a bit `& \| ^ ~ << >>`, `IS [NOT] TRUE / FALSE / UNKNOWN`, `IS [NOT] DISTINCT FROM`, valori di riga `(a, b) = (1, 2)` e `(a, b) IN ((1, 2), (3, 4))`, `AND OR NOT` (logica a tre valori), `IS [NOT] NULL`, `[NOT] LIKE 'a%_'` (senza distinzione maiuscole/minuscole; `ESCAPE '!'` rende letterali `%` e `_`: `LIKE '100!%' ESCAPE '!'`), `[NOT] BETWEEN`, `[NOT] IN (lista)`; `/` fra interi dà un decimale (`7 / 2` = 3.5, come MySQL), la divisione per zero dà `NULL` |
+| Operatori | `+ - * / %`, `DIV`, `= <> != < > <= >=`, `<=>` (uguale anche fra NULL), `AND OR NOT XOR`, `&& \|\| !` (in modalità MySQL `\|\|` è OR, altrimenti concatena), bit a bit `& \| ^ ~ << >>`, `IS [NOT] TRUE / FALSE / UNKNOWN`, `IS [NOT] DISTINCT FROM`, valori di riga `(a, b) = (1, 2)` e `(a, b) IN ((1, 2), (3, 4))`, `AND OR NOT` (logica a tre valori), `IS [NOT] NULL`, `[NOT] LIKE 'a%_'` (senza distinzione maiuscole/minuscole; `ESCAPE '!'` rende letterali `%` e `_`: `LIKE '100!%' ESCAPE '!'`), `[NOT] BETWEEN`, `[NOT] IN (lista)`; `/` fra interi dà un numero con la virgola (`7 / 2` = 3.5; MySQL stamperebbe 3.5000), fra decimali la scala del dividendo + 4 (`3.0 / 2` = 1.50000, come MySQL), la divisione per zero dà `NULL` |
 | Aggregati | `COUNT(*)`, `COUNT([DISTINCT] x)`, `SUM`, `AVG`, `MIN`, `MAX` (anche su espressioni), `GROUP_CONCAT(x ORDER BY y SEPARATOR ', ')`, `STRING_AGG(x, ', ' ORDER BY y)`, `LISTAGG(x, ', ') WITHIN GROUP (ORDER BY y)`, `STDDEV` / `STDDEV_POP` / `STDDEV_SAMP` / `VARIANCE` / `VAR_POP` / `VAR_SAMP`, `BIT_AND` / `BIT_OR` / `BIT_XOR`, `BOOL_AND` / `BOOL_OR` / `EVERY`, `JSON_ARRAYAGG`, `JSON_OBJECTAGG`; `COUNT(*) FILTER (WHERE ...)`; con `ROLLUP` / `CUBE` / `GROUPING SETS` i subtotali e `GROUPING(x)` |
 | Subquery | `x IN (SELECT ...)`, `NOT IN`, `EXISTS`, `NOT EXISTS`, `x > ALL (SELECT ...)`, `x = ANY / SOME (...)`, subquery scalari `(SELECT MAX(voto) FROM esame)` in `SELECT`, `WHERE`, `HAVING`, `SET`; correlate a qualunque profondità |
 | Insiemi | `UNION [ALL]`, `INTERSECT`, `EXCEPT` (`INTERSECT` lega più degli altri), `ORDER BY` / `LIMIT` sul risultato |
@@ -696,7 +697,7 @@ CHECKPOINT;                    -- pagine modificate su disco e log svuotato
 VACUUM;                        -- recupera le pagine delle righe grandi non più usate (fuori da una transazione)
 BACKUP TO '/percorso/backup';  -- copia coerente di tutti i dati (database e utenti) in una cartella nuova
 CHECK TABLE t1, t2;            -- legge ogni riga e controlla chiavi primarie, UNIQUE, NOT NULL e chiavi esterne
-ANALYZE TABLE t;               -- conta le righe (statistiche dell'ottimizzatore)
+ANALYZE TABLE t;               -- statistiche dell'ottimizzatore: righe, valori distinti, NULL, istogramma
 OPTIMIZE TABLE t;              -- statistiche, indici ricostruiti e VACUUM;  REPAIR TABLE t: statistiche e indici
 ```
 
@@ -793,7 +794,7 @@ funzioni (Sakila) si importano per intero.
 | `DATE` | `AAAA-MM-GG`, controllata |
 | `DATETIME` | `AAAA-MM-GG HH:MM:SS`, controllata |
 | `BLOB` | Dati binari |
-| `DECIMAL(p, s)` | Numero decimale (conservato come testo, confrontato come numero) |
+| `DECIMAL(p, s)` | Numero decimale **esatto** fino a 65 cifre (come MySQL: `0.10 + 0.20 = 0.30` è vero, `SUM` e `AVG` non perdono cifre e non usano mai l'esponente; scala del risultato: la maggiore per `+ -`, la somma per `*`, quella del dividendo + 4 per `/`; `ROUND` / `TRUNCATE` esatti). Anche i letterali con la virgola (`0.10`) sono decimali; quelli con l'esponente (`1e5`) sono double |
 
 ### Limiti
 
@@ -899,8 +900,13 @@ formato binario con i tipi giusti (interi, decimali, date, `NULL`), anche `send_
 non diventano mai codice SQL. **Transazioni come in MySQL:** `START TRANSACTION`, `COMMIT` /
 `ROLLBACK` (anche `WORK`), e `SET autocommit = 0` (il default di Python e JDBC con
 `setAutoCommit(false)`): la prima modifica apre la transazione, che resta aperta fino a `COMMIT` o
-`ROLLBACK`; un `COMMIT` senza niente da confermare non è un errore. Limiti: niente TLS; gli utenti
-creati prima della 1.0.3 devono reimpostare la password (`ALTER USER u IDENTIFIED BY '...'`).
+`ROLLBACK`; un `COMMIT` senza niente da confermare non è un errore. **Login:** `caching_sha2_password`
+(quello dei client MySQL 8 e 9) e, per i client vecchi, `mysql_native_password`, solo per gli utenti creati
+con `CREATE USER u IDENTIFIED WITH mysql_native_password BY '...'`. Il primo login di un utente dopo
+l'avvio passa la password su TLS (`--https`) o sul socket Unix, altrimenti cifrata con la chiave RSA del
+server (PHP `mysqli` / PDO e PyMySQL la chiedono da soli; il client `mysql` vuole `--get-server-public-key`);
+i successivi usano l'accesso veloce. Gli utenti creati prima della 1.0.3 devono reimpostare la password
+(`ALTER USER u IDENTIFIED BY '...'`).
 
 ```php
 $db = new mysqli('127.0.0.1', 'anna', 'segreta1', 'shop', 3306);
@@ -1386,7 +1392,37 @@ La CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) compila su Ubuntu
 
 ## Prestazioni
 
-`make bench` crea uno schema universitario con 10.000 studenti, 50 corsi e 100.000 esami e misura le query tipiche (Linux, un core):
+**Confronto con SQLite** (`make bench`: gli stessi scenari con lo stesso SQL, sullo stesso disco, la migliore
+di 3 esecuzioni; valori più alti = meglio; MariaDB non era installato sulla macchina di prova). La tabella è
+generata da `make bench-readme`; `make bench` la confronta con `bench/baseline.json` e segnala uno scenario
+che peggiora di oltre il 15 % rispetto a SQLite misurato nella stessa esecuzione.
+
+<!-- bench:start (generated by bench/compare.py: do not edit by hand) -->
+SegVault 1.3.0 · SQLite 3.54.1 (in-process, WAL) · MariaDB: not run · 16 CPUs · scale 1
+
+| Scenario | What is measured | Unit | SegVault | SQLite | SegVault / SQLite |
+|---|---|---|---:|---:|---:|
+| `bulk_load` | INSERT in blocks of 500 rows, one transaction | rows/s | 761 k | 1,316 k | 0.58× |
+| `point_lookup` | SELECT by primary key, SQL text each time | queries/s | 198 k | 216 k | 0.92× |
+| `point_lookup_prepared` | the same, prepared once (bound integer) | queries/s | 417 k | 369 k | 1.13× |
+| `range_scan` | 1000-row ranges on the primary key | rows/s | 3,272 k | 9,697 k | 0.34× |
+| `join_group` | JOIN of both tables + filter + GROUP BY | queries/s | 33.3 | 17.8 | 1.87× |
+| `scan_aggregate` | full scan + GROUP BY | queries/s | 46.0 | 29.4 | 1.56× |
+| `update_heavy` | UPDATE by primary key, 100 per transaction | updates/s | 58.9 k | 31.2 k | 1.89× |
+| `commit_full` | single-row INSERT in autocommit, synchronous = FULL | commits/s | 1.1 k | 1.0 k | 1.09× |
+| `commit_normal` | single-row INSERT in autocommit, synchronous = NORMAL | commits/s | 158 k | 31.7 k | 4.98× |
+| `commit_off` | single-row INSERT in autocommit, synchronous = OFF | commits/s | 168 k | 44.6 k | 3.78× |
+| `rollback` | BEGIN; INSERT 10 rows; ROLLBACK on the loaded database | rollbacks/s | 186.5 | 90.5 k | 0.002× |
+| `readers_1` | 1 concurrent readers (point SELECT), own connection each | ops/s | 254 k | 228 k | 1.11× |
+| `readers_4` | 4 concurrent readers (point SELECT), own connection each | ops/s | 876 k | 697 k | 1.26× |
+| `readers_16` | 16 concurrent readers (point SELECT), own connection each | ops/s | 1,353 k | 2,623 k | 0.52× |
+| `writers_1` | 1 concurrent writers (point UPDATE, autocommit), own connection each | ops/s | 111 k | 26.3 k | 4.22× |
+| `writers_4` | 4 concurrent writers (point UPDATE, autocommit), own connection each | ops/s | 103 k | 25.6 k | 4.01× |
+| `cold_start` | close and reopen the loaded database, first query | starts/s | 70.3 | 312.7 | 0.22× |
+| `pdo_point_lookup` | PHP PDO over the MySQL protocol, prepared point lookups | queries/s | 36.8 k | n/a | — |
+<!-- bench:end -->
+
+**Query tipiche** (`make bench_sql && ./bench_sql 100000`): uno schema universitario con 10.000 studenti, 50 corsi e 100.000 esami (Linux, un core):
 
 | Operazione | Tempo |
 |---|---|
@@ -1462,11 +1498,10 @@ SegVaultDB/
 ├── clients/                   # Client dell'API: segvault.ts, segvault.js, segvault.py
 ├── docs/API.md                # Riferimento dell'API HTTP/JSON
 ├── examples/                  # Script per i corsi e web/ (web app d'esempio)
-├── tests/                     # test_sql, test_examples, test_server, test_btree
-├── test_engine.c              # Test del motore
-├── bench/bench.c              # Benchmark
+├── tests/                     # test_engine, test_sql, test_server, test_durability, … e fuzz/
+├── bench/                     # suite.c + compare.py (confronto con SQLite, baseline), bench.c (query tipiche)
 ├── assets/fonts/              # JetBrains Mono e Fira Sans (licenza OFL), inclusi negli eseguibili
-├── bin/                       # Eseguibili pronti per Windows e Linux (make dist)
+├── bin/README.md              # Dove scaricare gli eseguibili (allegati alle release, make dist → dist/)
 ├── .github/workflows/ci.yml   # CI
 └── Makefile
 ```
@@ -1497,7 +1532,7 @@ make lib           # libsegvault.a: il motore da incorporare in un'app C/C++ (he
 make windows       # segvault.exe e segvault-server.exe (cross-compilazione con MinGW-w64)
 make test          # test (vedi Affidabilità e test)
 make test-asan     # test con AddressSanitizer + UndefinedBehaviorSanitizer
-make bench         # benchmark su 100.000 righe
+make bench         # benchmark confrontato con SQLite (tabella + controllo delle regressioni)
 make clean
 ```
 

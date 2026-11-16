@@ -1,0 +1,133 @@
+{
+  "segvault": "1.3.0",
+  "sqlite": "3.54.1",
+  "scale": 0.25,
+  "cpus": 16,
+  "scenarios": [
+    {
+      "name": "bulk_load",
+      "unit": "rows/s",
+      "what": "INSERT in blocks of 500 rows, one transaction",
+      "segvault": 745575.1,
+      "sqlite": 1509093.2
+    },
+    {
+      "name": "point_lookup",
+      "unit": "queries/s",
+      "what": "SELECT by primary key, SQL text each time",
+      "segvault": 198969.6,
+      "sqlite": 244856.8
+    },
+    {
+      "name": "point_lookup_prepared",
+      "unit": "queries/s",
+      "what": "the same, prepared once (bound integer)",
+      "segvault": 411478.3,
+      "sqlite": 453698.5
+    },
+    {
+      "name": "range_scan",
+      "unit": "rows/s",
+      "what": "1000-row ranges on the primary key",
+      "segvault": 3317439.9,
+      "sqlite": 10232827.5
+    },
+    {
+      "name": "join_group",
+      "unit": "queries/s",
+      "what": "JOIN of both tables + filter + GROUP BY",
+      "segvault": 132.4,
+      "sqlite": 99.0
+    },
+    {
+      "name": "scan_aggregate",
+      "unit": "queries/s",
+      "what": "full scan + GROUP BY",
+      "segvault": 181.8,
+      "sqlite": 148.0
+    },
+    {
+      "name": "update_heavy",
+      "unit": "updates/s",
+      "what": "UPDATE by primary key, 100 per transaction",
+      "segvault": 61105.7,
+      "sqlite": 58432.6
+    },
+    {
+      "name": "commit_full",
+      "unit": "commits/s",
+      "what": "single-row INSERT in autocommit, synchronous = FULL",
+      "segvault": 1188.6,
+      "sqlite": 1058.5
+    },
+    {
+      "name": "commit_normal",
+      "unit": "commits/s",
+      "what": "single-row INSERT in autocommit, synchronous = NORMAL",
+      "segvault": 150178.4,
+      "sqlite": 33030.1
+    },
+    {
+      "name": "commit_off",
+      "unit": "commits/s",
+      "what": "single-row INSERT in autocommit, synchronous = OFF",
+      "segvault": 160122.8,
+      "sqlite": 45664.4
+    },
+    {
+      "name": "rollback",
+      "unit": "rollbacks/s",
+      "what": "BEGIN; INSERT 10 rows; ROLLBACK on the loaded database",
+      "segvault": 217.4,
+      "sqlite": 87891.8
+    },
+    {
+      "name": "readers_1",
+      "unit": "ops/s",
+      "what": "1 concurrent readers (point SELECT), own connection each",
+      "segvault": 253394.0,
+      "sqlite": 262838.0
+    },
+    {
+      "name": "readers_4",
+      "unit": "ops/s",
+      "what": "4 concurrent readers (point SELECT), own connection each",
+      "segvault": 884716.0,
+      "sqlite": 562788.0
+    },
+    {
+      "name": "readers_16",
+      "unit": "ops/s",
+      "what": "16 concurrent readers (point SELECT), own connection each",
+      "segvault": 1367674.0,
+      "sqlite": 2631298.0
+    },
+    {
+      "name": "writers_1",
+      "unit": "ops/s",
+      "what": "1 concurrent writers (point UPDATE, autocommit), own connection each",
+      "segvault": 112772.0,
+      "sqlite": 39710.0
+    },
+    {
+      "name": "writers_4",
+      "unit": "ops/s",
+      "what": "4 concurrent writers (point UPDATE, autocommit), own connection each",
+      "segvault": 103006.0,
+      "sqlite": 23808.0
+    },
+    {
+      "name": "cold_start",
+      "unit": "starts/s",
+      "what": "close and reopen the loaded database, first query",
+      "segvault": 98.8,
+      "sqlite": 490.7
+    },
+    {
+      "name": "pdo_point_lookup",
+      "unit": "queries/s",
+      "what": "PHP PDO over the MySQL protocol, prepared point lookups",
+      "segvault": 36637.6
+    }
+  ]
+}

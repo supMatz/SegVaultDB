@@ -3,6 +3,7 @@ SCOPO: programmi CGI (vedi cgi.h).
        stdin e stderr del programma sono file temporanei (niente blocchi tra pipe piene), stdout una pipe
        letta con un limite di tempo: oltre, il processo viene terminato.
 */
+#include "common.h"
 #include "cgi.h"
 
 #include <ctype.h>
@@ -39,7 +40,7 @@ bool cgi_is_script(const char* path, size_t len) {
 // interprete dalla prima riga "#!" (interp + un argomento facoltativo); "" se manca
 static void shebang(const char* script, char* interp, size_t in, char* arg, size_t an) {
     interp[0] = arg[0] = '\0';
-    FILE* f = fopen(script, "rb");
+    FILE* f = fopen(script, "rb" SV_FE);
     if (!f) return;
     char line[512];
     if (fgets(line, sizeof(line), f) && line[0] == '#' && line[1] == '!') {
@@ -277,15 +278,28 @@ int cgi_exec(const char* script, const char* const* env, const char* body, size_
     DWORD w;
     if (body_len) WriteFile(hin, body, (DWORD)body_len, &w, NULL);
     SetFilePointer(hin, 0, NULL, FILE_BEGIN);
-    STARTUPINFOA si;
+    // il figlio eredita SOLO i tre handle di stdin / stdout / stderr (P2.10): PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    // non ogni handle ereditabile del processo (file del database, socket in ascolto)
+    STARTUPINFOEXA si;
     PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = hin;
-    si.hStdOutput = wr;
-    si.hStdError = her;
-    BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, eb.data, sl ? dir : NULL, &si, &pi);
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = hin;
+    si.StartupInfo.hStdOutput = wr;
+    si.StartupInfo.hStdError = her;
+    HANDLE inherit[3] = { hin, wr, her };
+    SIZE_T asz = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &asz);
+    si.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, asz);
+    BOOL attr = si.lpAttributeList && InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &asz) &&
+                UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, sizeof(inherit), NULL, NULL);
+    BOOL ok = attr && CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, eb.data,
+                                     sl ? dir : NULL, &si.StartupInfo, &pi);
+    if (si.lpAttributeList) {
+        if (attr) DeleteProcThreadAttributeList(si.lpAttributeList);
+        HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+    }
     CloseHandle(wr);
     free(eb.data);
     int rc = 0;

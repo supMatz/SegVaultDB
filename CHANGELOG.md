@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+**Security**
+- Passwords: PBKDF2-HMAC-SHA256 with the iteration count stored in the hash (100 000); older hashes are
+  redone on the next successful login.
+- MySQL protocol: `caching_sha2_password` (MySQL 8 / 9 clients), with full authentication over TLS, the Unix
+  socket or the server's RSA key; `mysql_native_password` only for users created `IDENTIFIED WITH
+  mysql_native_password`.
+- Wrong passwords: after 5 in a row for one user from one address, each new attempt waits 1, 2, 4 … s
+  (up to 5 minutes).
+- Windows: data folder and engine files get an owner-only ACL.
+
+**Performance**
+- MySQL prepared statements are parsed once: each `COM_STMT_EXECUTE` writes the values into the parsed tree
+  (point lookups 2× faster in the engine); the tree is redone after a schema change.
+
+**Exact numbers**
+- `DECIMAL` values, literals with a decimal point and integers beyond 64 bits are exact decimals (up to 81
+  digits) with MySQL's scale rules: `0.10 + 0.20 = 0.30`, `SUM` / `AVG` of `DECIMAL(20,2)` without loss or
+  exponent, `ROUND` / `TRUNCATE` exact; results are typed `DECIMAL` (MySQL `NEWDECIMAL`).
+- `BIGINT UNSIGNED` up to 18446744073709551615.
+
+**Optimizer**
+- `ANALYZE TABLE` collects column statistics (distinct values, NULL fraction, 16-bucket histogram), kept in
+  `segvault.stats`; estimates use them. Inner joins of 3+ tables run in the cheapest order whatever the
+  written order; an index lookup on a value that covers over a quarter of the table becomes a scan;
+  `num_rows` stays exact after `ROLLBACK`; `EXPLAIN FORMAT=JSON`.
+
+**HTTP API**
+- `max_rows` + cursor pagination on `/query`; `big_ints: "string"`; `GET /api/v1/metrics` (Prometheus);
+  engine counters (buffer pool, log, lock waits, deadlocks, open transactions) also in MySQL `SHOW STATUS`.
+
+**Web server**
+- Request bodies over 1 MB are written to an unlinked temporary file as they arrive (server memory stays
+  flat during large uploads); `--max-body` (default 128 MB) also sets PHP's `post_max_size` /
+  `upload_max_filesize`; bodies slower than 1 KB/s are cut; at most 32 connections per remote address
+  (`--max-per-address`); `--max-header-size`.
+
 ## 1.3.0 — 2026-11-15
 
 Fixes from the code audit of 1.2.0 (details and tests for each item in `TODO.md`).

@@ -1,6 +1,7 @@
 /*
 SCOPO: client FastCGI e gruppo di processi php-cgi (vedi fastcgi.h).
 */
+#include "common.h"
 #include "fastcgi.h"
 
 #include <errno.h>
@@ -56,6 +57,9 @@ SCOPO: client FastCGI e gruppo di processi php-cgi (vedi fastcgi.h).
   #define PATH_SEP ':'
   #define PHP_CGI_NAME "php-cgi"
   extern char** environ;
+#endif
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0                  // Windows / macOS: nessun flag (Windows non eredita i socket: P2.10)
 #endif
 
 // tipi dei record FastCGI
@@ -168,7 +172,7 @@ static sock_t connect_tcp(const char* host, int port) {
     char ps[16];
     snprintf(ps, sizeof(ps), "%d", port);
     if (getaddrinfo(host, ps, &hints, &res) != 0 || !res) return BAD_SOCK;
-    sock_t fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    sock_t fd = socket(res->ai_family, res->ai_socktype | SOCK_CLOEXEC, res->ai_protocol);
     if (fd != BAD_SOCK && connect(fd, res->ai_addr, (int)res->ai_addrlen) != 0) { sock_close(fd); fd = BAD_SOCK; }
     freeaddrinfo(res);
     if (fd != BAD_SOCK) {
@@ -185,7 +189,7 @@ static sock_t connect_unix(const char* path) {
     a.sun_family = AF_UNIX;
     if (strlen(path) >= sizeof(a.sun_path)) return BAD_SOCK;
     strcpy(a.sun_path, path);
-    sock_t fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    sock_t fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd != BAD_SOCK && connect(fd, (struct sockaddr*)&a, sizeof(a)) != 0) { close(fd); fd = BAD_SOCK; }
     return fd;
 }
@@ -193,7 +197,7 @@ static sock_t connect_unix(const char* path) {
 
 // una porta TCP libera su 127.0.0.1 (il sistema ne sceglie una, poi la si lascia a php-cgi)
 static int free_port(void) {
-    sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    sock_t fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd == BAD_SOCK) return 0;
     struct sockaddr_in a;
     memset(&a, 0, sizeof(a));
@@ -685,13 +689,18 @@ bool fcgi_find_php_cgi(char* out, size_t outsz) {
         snprintf(out, outsz, "%s/php/" PHP_CGI_NAME, exe_dir);
         if (is_file(out)) return true;
     }
-    snprintf(out, outsz, "php/" PHP_CGI_NAME);
-    if (is_file(out)) return true;
+    // niente percorsi relativi alla cartella corrente (P2.10): né "php/php-cgi" né voci del PATH come "."
+    // o vuote, che farebbero partire il php-cgi di chiunque possa scrivere nella cartella da cui si avvia
     const char* path = getenv("PATH");
     while (path && *path) {
         const char* e = strchr(path, PATH_SEP);
         size_t l = e ? (size_t)(e - path) : strlen(path);
-        if (l > 0 && l < 900) {
+#ifdef _WIN32
+        bool absolute = l >= 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/');
+#else
+        bool absolute = l >= 1 && path[0] == '/';
+#endif
+        if (absolute && l < 900) {
             snprintf(out, outsz, "%.*s/" PHP_CGI_NAME, (int)l, path);
             if (is_file(out)) return true;
         }
@@ -766,9 +775,9 @@ bool fcgi_php_ini(const char* php_cgi, bool create, char* path, size_t pathsz) {
     char src[1200];
     snprintf(src, sizeof(src), "%s/php.ini-development", dir);
     snprintf(ext, sizeof(ext), "%s/ext", dir);
-    FILE* out = fopen(path, "wb");
+    FILE* out = fopen(path, "wb" SV_FE);
     if (!out) return false;
-    FILE* in = fopen(src, "rb");
+    FILE* in = fopen(src, "rb" SV_FE);
     if (in) {                                    // copia, con le estensioni presenti attive
         char line[4096];
         while (fgets(line, sizeof(line), in)) {

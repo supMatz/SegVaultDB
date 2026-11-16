@@ -265,6 +265,17 @@ static char* gunzip(const char* dir, const char* data, size_t n, size_t* out_n) 
     return o.buf ? o.buf : calloc(1, 1);
 }
 
+// memoria anonima del processo (heap, non cache dei file), -1 se non si sa
+static long rss_anon_kb(void) {
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256];
+    long v = -1;
+    while (fgets(line, sizeof(line), f)) if (!strncmp(line, "RssAnon:", 8)) { v = atol(line + 8); break; }
+    fclose(f);
+    return v;
+}
+
 static void* run_server(void* s) { sv_server_run((SvServer*)s); return NULL; }
 
 typedef struct { int port; int ok; } Par;
@@ -287,18 +298,29 @@ static SvServer* start(SvServerConfig* cfg, pthread_t* th) {
 static void stop(SvServer* s, pthread_t th) { sv_server_stop(s); pthread_join(th, NULL); sv_server_free(s); }
 
 int main(int argc, char** argv) {
-    if (argc == 3 && !strcmp(argv[1], "-b")) {          // modalità "php-cgi -b 127.0.0.1:PORTA"
-        const char* c = strrchr(argv[2], ':');
-        int lfd = argv[2][0] == '/' ? fake_listen_unix(argv[2]) : fake_listen(c ? atoi(c + 1) : 0);
-        if (argv[2][0] == '/') {                         // chi ha avviato il processo lo annota per il test
+    // modalità "php-cgi [-d k=v]... -b 127.0.0.1:PORTA | -b /percorso.sock": "-b" è sempre il penultimo
+    // argomento, qualunque "-d" il server aggiunga prima
+    if (argc >= 3 && !strcmp(argv[argc - 2], "-b")) {
+        const char* bind_arg = argv[argc - 1];
+        const char* c = strrchr(bind_arg, ':');
+        int lfd = bind_arg[0] == '/' ? fake_listen_unix(bind_arg) : fake_listen(c ? atoi(c + 1) : 0);
+        if (bind_arg[0] == '/') {                        // chi ha avviato il processo lo annota per il test
             const char* rec = getenv("SV_FAKE_PHP_BIND");
             FILE* f = rec ? fopen(rec, "a") : NULL;
-            if (f) { fprintf(f, "%s\n", argv[2]); fclose(f); }
+            if (f) { fprintf(f, "%s\n", bind_arg); fclose(f); }
         }
         if (lfd < 0) return 1;
         fake_loop(lfd);
         return 0;
     }
+    // protezione dalla ricorsione: questo eseguibile fa da finto php-cgi per i server che avvia; se un figlio
+    // arriva qui (argomenti non riconosciuti) non deve rilanciare l'intera suite, che avvierebbe altri figli
+    // all'infinito (una fork bomb che esaurisce la memoria)
+    if (getenv("SV_TEST_PHP_CHILD")) {
+        fprintf(stderr, "test_php: started as a child with unexpected arguments (argc=%d), refusing to recurse\n", argc);
+        return 3;
+    }
+    setenv("SV_TEST_PHP_CHILD", "1", 1);
     signal(SIGPIPE, SIG_IGN);
     char self[1024];
     ssize_t sl = readlink("/proc/self/exe", self, sizeof(self) - 1);
@@ -812,6 +834,9 @@ int main(int argc, char** argv) {
         snprintf(d, sizeof(d), "%s/private/open", w2); mkdir(d, 0755);
         put(d, ".htaccess", "Require all granted\n");
         put(d, "ok.txt", "aperto");
+        snprintf(d, sizeof(d), "%s/skipneg", w2); mkdir(d, 0755);   // trovato dal fuzzer (P3.3): S= negativo
+        put(d, ".htaccess", "RewriteEngine On\nRewriteRule ^x - [S=-9]\nRewriteRule ^x$ y.txt [L]\n");
+        put(d, "y.txt", "ipsilon");
         snprintf(d, sizeof(d), "%s/files", w2); mkdir(d, 0755);
         put(d, ".htaccess", "Options -Indexes +FollowSymLinks\n");
         put(d, "a.txt", "a");
@@ -885,6 +910,9 @@ int main(int argc, char** argv) {
         r = req(port, "GET", "/private/open/ok.txt", NULL, NULL);
         CHECK(r.status == 200 && !strcmp(r.body, "aperto"), "deeper Require all granted: %d", r.status);
         rfree(&r);
+        r = req(port, "GET", "/skipneg/x", NULL, NULL);
+        CHECK(r.status == 200 && has(&r, "ipsilon"), "RewriteRule [S=-9] skips nothing (was: read before the rule list): %d", r.status);
+        rfree(&r);
         r = req(port, "GET", "/files/", NULL, NULL);
         CHECK(r.status != 200 || !has(&r, "a.txt"), "Options -Indexes: %d %s", r.status, r.body);
         rfree(&r);
@@ -924,6 +952,40 @@ int main(int argc, char** argv) {
         r = req(sv_server_port(s), "POST", "/real.php?q=7", "Content-Type: application/x-www-form-urlencoded\r\n", "p=ok");
         CHECK(r.status == 200 && hdr(&r, "X-Real: 1") && has(&r, "sum=5 m=POST q=7 p=ok"), "real php-cgi (%s): %d %s", php, r.status, r.body);
         rfree(&r);
+        // P2.4: un solo limite per gli upload: post_max_size e upload_max_filesize di PHP seguono --max-body
+        put(www, "limits.php", "<?php echo ini_get('post_max_size'), ' ', ini_get('upload_max_filesize');");
+        r = req(sv_server_port(s), "GET", "/limits.php", NULL, NULL);
+        CHECK(r.status == 200 && has(&r, "128M 128M"), "PHP upload limits follow the server's (128 MB): %d %s", r.status, r.body);
+        rfree(&r);
+        {   // P2.4: un upload da 100 MB arriva a PHP con la configurazione predefinita, e il server non lo tiene in
+            // memoria (corpo su file temporaneo): la memoria anonima del processo non cresce di 100 MB
+            put(www, "up.php", "<?php $f = $_FILES['f'] ?? null; echo 'err=', $f ? $f['error'] : -1, ' size=', $f ? $f['size'] : -1, ';';");
+            size_t big = 100u << 20;
+            const char* pre = "--XyZ\r\nContent-Disposition: form-data; name=\"f\"; filename=\"big.bin\"\r\n"
+                              "Content-Type: application/octet-stream\r\n\r\n";
+            const char* post = "\r\n--XyZ--\r\n";
+            size_t cl = strlen(pre) + big + strlen(post);
+            char head[300];
+            int hl = snprintf(head, sizeof(head), "POST /up.php HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+                              "Content-Type: multipart/form-data; boundary=XyZ\r\nContent-Length: %zu\r\n\r\n", cl);
+            long anon0 = rss_anon_kb();
+            int fd = connect_to(sv_server_port(s));
+            wr(fd, head, (size_t)hl);
+            wr(fd, pre, strlen(pre));
+            static char blk[1 << 16];
+            for (size_t i = 0; i < sizeof(blk); i++) blk[i] = (char)(i * 7 + 3);
+            for (size_t sent = 0; sent < big; sent += sizeof(blk)) wr(fd, blk, sizeof(blk));
+            wr(fd, post, strlen(post));
+            long anon1 = rss_anon_kb();
+            char all[8192];
+            size_t al = 0;
+            ssize_t g;
+            while (al < sizeof(all) - 1 && (g = recv(fd, all + al, sizeof(all) - 1 - al, 0)) > 0) al += (size_t)g;
+            all[al] = 0;
+            close(fd);
+            CHECK(strstr(all, " 200 ") && strstr(all, "err=0 size=104857600;"), "100 MB upload to PHP: %.300s", all);
+            CHECK(anon0 < 0 || anon1 - anon0 < 40 * 1024, "100 MB upload does not grow anonymous memory: %ld -> %ld KB", anon0, anon1);
+        }
         // Server-Sent Events: il primo evento arriva subito, prima che lo script finisca
         put(www, "sse.php", "<?php header('Content-Type: text/event-stream'); header('Cache-Control: no-cache');"
                             "while (ob_get_level()) ob_end_flush(); echo \"data: uno\\n\\n\"; flush(); usleep(800000); echo \"data: due\\n\\n\";");

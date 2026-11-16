@@ -21,6 +21,9 @@ not executed; **[verify-win]** = Windows-only, needs a run on Windows.
 
 `[ ]` to do · `[~]` in progress · `[x]` done.
 
+**Status 2026-11-16 (in progress towards 1.4):** also closed P1.1, P1.5, P1.7, P2.5, P2.14, P2.15; P1.11 partly
+done; still open P1.6, P1.10 (part), P1.11 (part), P2.8 (part), P3.9.
+
 **Status after v1.3.0 (2026-11-15):** fixed `[x]` P0.1-P0.12 (Windows parts verified under wine), P1.2, P1.3, P1.4, P1.8, P1.12, P2.1, P2.9, P2.11, P2.13, P3.1, P3.4, P3.7;
 partly done `[~]` P1.5, P1.10, P2.2, P2.3, P2.4, P2.6, P2.7, P2.8,
 P2.10, P2.12, P3.2, P3.3, P3.5. Every item has a **Fixed / Done** note with what changed and the test that covers it.
@@ -330,7 +333,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
 
 ## P1 — Core Engine Performance & ACID Architecture
 
-- [ ] **P1.1 `[ENGINE]` WAL format v2: record checksum + LSN, page LSN + page checksum, compensation records, fuzzy checkpoints**
+- [~] **P1.1 `[ENGINE]` WAL format v2: record checksum + LSN, page LSN + page checksum, compensation records, fuzzy checkpoints**
   - **Where:** `src/tx/wal.c:22-56` (23-byte header: no CRC, no LSN, no length trailer, no file header);
     `src/storage/page.h:25-32` (12-byte page header: no LSN, no checksum); `src/tx/wal.c:137-175` (redo idempotence
     relies on "slots are only appended"); `src/bridge/db_api.c:169-176,243-245` (checkpoint only when
@@ -349,6 +352,53 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
   - **Done when:** the P3.1 harness passes with crashes injected at every write of a 10-transaction interleaved
     workload; corrupting one byte anywhere in log or data file is reported, never applied; a transaction left open
     for an hour no longer stops the log from shrinking.
+  - **Also (found by P3.6):** `ROLLBACK` = `wal_flush` (fsync) + `bp_flush_all` (every dirty page) + undo on the
+    file + `ABORT` + `wal_flush` (fsync): ~5 ms on disk, 186 rollbacks/s against SQLite's 90 000/s. With page
+    LSNs the undo can work on buffer-pool pages and the `ABORT` needs no `fsync` (recovery undoes a
+    transaction without `COMMIT` anyway). Target: `rollback` in `make bench` within 10× of SQLite.
+  - **Done (log v2, 2026-11-15):** new log format (`src/tx/wal.h`): a 48-byte file header (`SVWAL2`, version,
+    page size, base LSN, start of the contiguous records, CRC-32C) and records `len | crc32c | lsn | type | tx |
+    page | slot | dlen | olen | data | old` (CRC-32C over everything after the CRC, `src/storage/crc32c.h`).
+    The LSN is the record's logical position and never goes back (a checkpoint keeps counting), so BEGIN /
+    savepoint / CLR references stay valid across checkpoints. Reading tells the two failures apart: a bad record
+    with nothing valid after it is an interrupted write (dropped, and recovery cuts it off before appending its
+    CLRs — before, CLRs could land after a half-written record); a bad record followed by valid ones, or a bad
+    header, is a damaged log: recovery stops with "the transaction log is damaged at byte N … nothing was
+    applied", the log is left as it was. v1 logs (23-byte header, no CRC) are still recovered. **Fuzzy
+    checkpoint:** with transactions open, the checkpoint (pages + catalog on disk) rewrites the log keeping
+    only the records of the open transactions ("carried", with their old LSNs, indexed on open), so the log
+    shrinks however long a transaction stays open; `CHECKPOINT` is allowed inside a transaction; automatic
+    checkpoints with open transactions only when the log has doubled since the last one. Tests in
+    `tests/test_durability.c`: with a transaction open across 60 000 inserts the log stays < 20 MB and the
+    transaction is undone correctly by `ROLLBACK` and, after a crash, by recovery from the carried records; a
+    flipped byte in the header or in the middle of the log is refused and the log left unchanged, one in the
+    last record drops only that insert; **power cut at every write** of 10 transactions interleaved over 3
+    sessions: every committed transaction whole, the one committing whole or absent, the others absent.
+    `db_set_checkpoint_bytes()` sets the threshold.
+  - **Done (pages, 2026-11-16):** data-file **format 2**: page header 24 bytes with `lsn` (8) and `crc` (CRC-32C of
+    the page, set by `page_write`, checked on every read — `page_validate`; hardware `crc32` instruction when the
+    CPU has SSE 4.2); page 0 is a file header (`SVDATA2`, format, page size, the LSN a new log starts from).
+    **Migration on open** (`src/storage/page_migrate.c`): a 1.3 file is copied to `segvault.db.v1`, converted in
+    place (rows stay in the same slots — data moves 12 bytes, pages are compacted when needed and, only if a page is
+    completely full and no log has to be recovered, the largest row moves to a new page of the chain), overflow
+    chains are rewritten with the new chunk size and the stub replaced in place, the old chain pages go to the free
+    list; an interrupted conversion restarts from the copy, which is removed at the end. Every logged change stamps
+    the page with its record's LSN (`bp_note_lsn`; CLRs too), and **redo applies a record only if the page LSN is
+    older** (plus the old slot checks). **Torn pages:** before a page that existed at the last checkpoint is
+    written to the data file, its full image goes into the log and the log is synced (one `fsync` for a whole
+    flush); pages created since the last full flush need no image (the log has every record since they were empty);
+    recovery puts an image back when the page on disk fails its CRC or is older, and a page rebuilt from empty
+    always takes its next image. Overflow pages (immutable) get no image. **ROLLBACK and ROLLBACK TO work on the
+    buffer-pool pages** (`wal_undo_tx_cache`): CLRs in the log buffer, no page flush, no `fsync`, and the `ABORT`
+    record need not be durable (a crash before it leaves a transaction without `COMMIT`, which recovery undoes,
+    redoing the CLRs); only the touched tables lose their in-memory indexes. The log reader uses a 4 MB read window
+    (a checkpoint with open transactions scanned the log record by record: `update_heavy` had dropped to 23 k/s, now
+    47 k/s); recovery cuts and reports an incomplete last record. Tests (`tests/test_durability.c`): a real 1.3.0
+    database (`tests/fixtures/format1-v1.3.0.tar.gz`: 2 572 rows, 5 rows of 20-100 KB, pages filled to the byte)
+    opens with identical results, accepts writes, survives a restart, and also upgrades after an interrupted
+    conversion; a flipped byte in a data page is reported as damaged; half-zeroed pages after a crash are repaired —
+    new pages from the log, old pages from their images; crash at every page and log write of ROLLBACK and of
+    recovery. `bench`: rollback 137/s → see below.
 
 - [x] **P1.2 `[PERF]` `ROLLBACK` costs O(database), not O(transaction)** — [code]
   - **Where:** `src/bridge/db_api.c:1225-1245`, `:1278-1304`; `src/tx/wal.c:329-414` (reads the log from offset 0
@@ -404,7 +454,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     mode (0 / grouped / one per commit). **Not done:** leader / follower group commit with the engine lock
     released while waiting (needs P1.7's lock rework); the 16-thread throughput benchmark.
 
-- [~] **P1.5 `[ENGINE]` Space is never reclaimed: dead slots, dropped tables and old overflow chains** — [reproduced]
+- [x] **P1.5 `[ENGINE]` Space is never reclaimed: dead slots, dropped tables and old overflow chains** — [reproduced]
   - **Where:** `src/storage/page.c:42-75` (`page_insert` always appends a slot; `SV_MAX_SLOTS` = 1021);
     `src/table/heap.c:381-387` (`heap_update` = delete + insert); `src/table/overflow.h:5-8` (chains immutable,
     never reused); `src/bridge/db_api.c:206-241` (`do_vacuum` frees only unreferenced overflow pages and scans the
@@ -426,6 +476,24 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     file by < 8 MB (20 MB before), 20 × (CREATE, 150 rows, DROP) by < 6 MB. **Still open (needs P1.1's page LSN
     for redo idempotence):** reusing dead slots / updating in place, a persistent free-page list, size-class
     bins, `VACUUM FULL`.
+  - **Done (with the page LSN of P1.1, 2026-11-16):** **UPDATE in place**: the new row takes the same slot when it fits
+    in the page (counting what compaction recovers) — `LOG_UPDATE` now means "same slot", redo replaces the slot
+    content under the page-LSN rule, undo uses a new `CLR_REPLACE`; otherwise delete + insert as before. **Space
+    freed at once**: an overflow chain replaced or deleted (also the chain of a large row inserted by a transaction
+    that rolls back), and every page of a dropped table with the chains of its rows, go back to the free list as soon
+    as the change that abandoned them is durable in the log (`ready` LSN ≤ `synced_lsn`: until then a crash could
+    bring back the row that uses them); with ≥ 64 KB waiting and `synchronous = NORMAL` the log is synced at the
+    end of the statement so the next one reuses them. A freed page is written `FREE` with the current LSN and a
+    reused page keeps it, so redo skips every record of its previous life. A heap page is never written before the
+    overflow chains it points to (`ov_unsynced`: one data `fsync` in between). **`VACUUM FULL`**: every table
+    rewritten into compact pages taking the lowest free pages first (two passes), old pages freed, free pages at
+    the end of the file cut off. Measured (`tests/test_overflow.c`): 2 000 rows + ten full-table UPDATEs → file
+    +0 %; 20 × (DROP, CREATE, 500 inserts) → +0 % after the first round (before: 2.09 MB); 1 000 updates of a 100 KB
+    row → ≤ +300 KB (one copy of the row in flight; before: +5 MB per 50); VACUUM FULL after deleting 90 % of a
+    table shrinks the file and keeps every row. **Not done:** reusing dead slot entries for new inserts (4 bytes per
+    deleted row stay in the page directory: a reused slot would need per-slot commit state for the snapshot reads
+    of other transactions), the free list still lives in `segvault.free` (rebuilt by VACUUM if lost), no
+    size-class bins (the free-space map scan with its hint stays).
 
 - [ ] **P1.6 `[ENGINE]` Indexes exist only in memory; the on-disk B+tree is dead code**
   - **Where:** `src/index/btree.c` (319 lines, `uint64_t` keys, unique only, no delete rebalancing, not WAL-logged)
@@ -440,7 +508,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
   - **Done when:** cold start on a 1 GB database answers a primary-key lookup with ≤ 4 page reads; `EXPLAIN` shows
     the index; crash tests cover a split in progress.
 
-- [ ] **P1.7 `[CONCURRENCY]` Table locks for plain reads cause upgrade deadlocks; waits are polled; writers can starve** — [code]
+- [x] **P1.7 `[CONCURRENCY]` Table locks for plain reads cause upgrade deadlocks; waits are polled; writers can starve** — [code]
   - **Where:** `src/bridge/db_api.c:841-878` (every `SELECT` takes `LK_S` on its tables, kept to `COMMIT`,
     `:976-978`); `:916-962` (`acquire_locks`: sleep 3 ms, drop and retake the engine lock);
     `src/bridge/locks.c:154-177` (no queue: whoever polls first wins), `:25-29,168-169` (`LkWait.req[32]` truncates
@@ -457,6 +525,24 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     Longer term: row-level write locks.
   - **Done when:** the two-session read-then-write test commits both; a writer behind 8 overlapping readers
     acquires its lock in bounded time; idle waiters consume no CPU.
+  - **Fixed:** a plain `SELECT` (also `SHOW` / `EXPLAIN`, not `FOR UPDATE` / `FOR SHARE` / `LOCK IN SHARE
+    MODE`) inside a transaction releases at the end of the statement the table `S` locks it took
+    (`lk_modes` before, `lk_release_reads` after; locks held before the statement, `X` locks and the global
+    `*` lock stay): reads are READ COMMITTED (the committed version through the existing snapshot when
+    another transaction writes the table), documented in `locks.h`. The lock manager (`src/bridge/locks.c`,
+    rewritten) queues waiters FIFO with a ticket: a new request that is compatible with the holders still
+    waits behind an earlier conflicting waiter (a lock the owner already holds, and an `S → X` conversion,
+    never queue); the wait set is the whole request (no 32-entry truncation); deadlock detection walks the
+    whole wait-for graph — conflicting holders and conflicting waiters ahead in the queue — with a visited set
+    instead of a depth-limited DFS. Waits sleep on a condition variable (pthread with `CLOCK_MONOTONIC`, Windows
+    `SleepConditionVariableSRW`) woken by every release; a 200 ms cap only re-checks the timeout and the cancel
+    flag. The engine's wait hook is now a pair (`db_set_lock_wait_hooks(leave, enter)`): the server gives up its
+    turn for the whole sleep instead of a 2 ms nap per retry; both 20 ms "enter a session" polling loops in the
+    server sleep on `db_session_wait` (woken when a session leaves the engine). Tests in
+    `tests/test_sessions.c`: two sessions `BEGIN; SELECT …; UPDATE …` both commit (B waits for A, no 1213); a
+    writer behind 8 readers looping `BEGIN; SELECT … FOR SHARE; 15 ms; COMMIT` gets its lock in a few ms (limit
+    2 s); a waiter that times out after 1 s uses < 60 ms of CPU. **Not done (longer term in the item):**
+    row-level write locks; a per-transaction (REPEATABLE READ) snapshot — needs multi-version rows.
 
 - [x] **P1.8 `[PERF]` Uncommitted-change tracking is quadratic and heavy** — [code]
   - **Where:** `src/bridge/db_api.c:596-642` (`TxChange` = 184 bytes per changed row, with database and table
@@ -476,7 +562,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     row back" — every slot appended and then undone kept its 4 directory bytes; the undo (and the CLR redo) now
     pop the trailing slot it deletes (`page_pop_slot`).
 
-- [ ] **P1.9 `[ENGINE]` Exact numerics: `DECIMAL` is computed as `double`, `BIGINT UNSIGNED` stops at 2⁶³−1** — [reproduced]
+- [x] **P1.9 `[ENGINE]` Exact numerics: `DECIMAL` is computed as `double`, `BIGINT UNSIGNED` stops at 2⁶³−1** — [reproduced]
   - **Where:** `src/catalog/schema.c:9-19` (`DECIMAL` stored as text), `src/table/tuple.c:200-216`; arithmetic and
     aggregates in `src/query/executor.c`.
   - **Why:** `SUM` over `DECIMAL(20,2)` prints `1.23456789012346e+16`; `SUM(0.10, 0.20) = 0.30` is false;
@@ -486,6 +572,26 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     columns; never print a `DECIMAL` in exponent form.
   - **Done when:** the three cases above match MySQL 8 output; a property test compares 10 000 random decimal
     expressions against Python's `decimal`.
+  - **Done:** `src/query/decimal.c` — fixed-point decimal, base-10⁹ limbs (up to 81 digits), add / sub / mul /
+    div (scale of the dividend + 4) / mod / round half away from zero / truncate / compare, never an exponent.
+    The executor's value gains `is_dec` (exact text + a `double` for float contexts; every place that builds
+    a value by hand sets it): `DECIMAL` columns, literals with a decimal point but no exponent and integer
+    literals beyond 64 bits (the parser keeps their text) are decimals; `+ - * / %` with decimal and integer
+    operands stay exact (with a `double` operand they are `double`, as in MySQL); comparisons, `GROUP BY` /
+    `DISTINCT` keys (1.50 = 1.5) and hashes are exact; `SUM` / `AVG` (also as window functions) keep an exact
+    accumulator (`AVG` scale + 4); `ROUND` / `TRUNCATE` of a decimal are exact (`ROUND(150.000, 2)` = 150.00,
+    an integer stays an integer, D at most 30); exact results are typed `DECIMAL`, so the MySQL protocol sends
+    `NEWDECIMAL` text instead of a `double`. `BIGINT UNSIGNED`: values up to 2⁶⁴ − 1 are accepted, kept in the 64
+    bits and read back without sign (`ev_from_col`), negatives refused also on the fast integer insert path.
+    The three cases: `SUM` over `DECIMAL(20,2)` = `12345678901234567.90`, `0.10 + 0.20 = 0.30` → 1,
+    `18446744073709551615` stored and returned. Property test `tests/test_decimal.c` + `tests/check_decimal.py`
+    (in `make test`, and 3000 under ASan in `make test-asan`): 10 000 random `+ - * /`, `ROUND`, `<` and
+    `SUM` over a `DECIMAL(30,8)` column, all equal to Python's `decimal` with MySQL's rules. Test expectations
+    changed to MySQL's (`9.0`, `18.20`, `8100.00`, `2.500000000000000000000000000000`, `DECIMAL` type of `a * 1.5`).
+    **Deliberate difference:** integer / integer and `AVG` of integers stay `double` (`7 / 2` = 3.5; MySQL
+    prints 3.5000), so existing results do not all change; `DECIMAL` without a scale keeps the digits it was
+    given (MySQL would round to `DECIMAL(10,0)`). **Not done:** an index lookup by a literal above 2⁶³ on a
+    `BIGINT UNSIGNED` column finds nothing (the index keys use the signed bits).
 
 - [~] **P1.10 `[PERF]` Buffer pool: fixed 4 MB, one latch held across disk I/O, three syscalls per new page**
   - **Where:** `include/common.h:41` (`SV_BUFFER_POOL_CAP 1024`), `src/bridge/db_api.c:128`;
@@ -504,10 +610,16 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     `db_set_cache_size()`, `SET GLOBAL cache_size = MB` at run time (`bp_resize`, administrators only, not inside
     a transaction), `@@cache_size`; new heap pages and chain links are no longer flushed eagerly (two page writes
     per new page — `LOG_LINK` lets recovery recreate them). Test in `tests/test_durability.c`.
-    **Still open:** bucket latches with I/O outside the latch, atomic pin counts, 64-page file extension, the
-    8-reader scaling benchmark (bulk insert did not change on tmpfs: 122 ms for 110 k rows).
+    Then (2026-11-15): the pool is split into up to 16 partitions by page id (`BpPart`: own latch, frames, hash,
+    CLOCK hand, statistics; `bp_stats` sums them), a missing page is read from disk **outside** the latch (frame
+    marked `loading`, pinned; others asking for that page wait for it alone), dirty write-backs go through one
+    `wmx` (the WAL's `before_write` is not reentrant), the flush sorts with an explicit `DirtyRef` array (no
+    global comparator context). Measured: 8 readers doing full scans of a 65 MB table with a 16 MB cache went
+    from 1.8× to 4.1× over one reader. **Still open:** ≥ 5× (pin / unpin still take the partition latch; atomic
+    pins not done), 64-page file extension (tried caching the file end: overflow pages extend the file too,
+    so it reused pages — reverted), a scaling test in the suite.
 
-- [ ] **P1.11 `[ENGINE]` Catalog: 1.71 GB fixed struct, raw struct dumps on disk, full rewrite + 2 `fsync`s per DDL**
+- [~] **P1.11 `[ENGINE]` Catalog: 1.71 GB fixed struct, raw struct dumps on disk, full rewrite + 2 `fsync`s per DDL**
   - **Where:** `src/catalog/schema.h:88-148` (`sizeof(Catalog)` = 1 834 562 576 bytes, `Database` = 27.3 MB,
     `TableSchema` = 62.7 KB; limits 64 databases / 256 tables / 64 columns / 16 indexes / 16 constraints /
     64 views, routines, triggers; 64 KB per body); `src/catalog/schema.c:311-324` (`catalog_drop_db` `memmove`s
@@ -521,6 +633,16 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     explicit little-endian field encoding with per-record version tags; raise or remove the limits.
   - **Done when:** `CREATE TABLE` with 300 columns and a database with 2 000 tables work; 1 000 `CREATE TABLE`
     statements run in under a second; process RSS at start is below 20 MB.
+  - **Partly done (2026-11-16):** no more fixed arrays: databases, tables (`TableSchema**`, one allocation per table,
+    so a pointer stays valid when others are added or dropped), views, routines and triggers are growable lists;
+    table columns live outside the struct (`schema_new` / `schema_dup` / `schema_assign`; executor work schemas
+    keep them in the same block); `SV_MAX_COLUMNS` 1024, no table / database / routine / trigger limit; the
+    parser's column lists (CREATE TABLE, SELECT list, INSERT column list) and the planner's output columns and
+    USING map are dynamic too (`SelectPlan` no longer carries 1024-entry arrays). Catalog **format v6**: every
+    field written explicitly (fixed-width little-endian integers, length-prefixed strings), independent of
+    struct layout; v1-v5 files are still read and rewritten as v6. **Still open:** DDL still saves the whole
+    catalog with `fsync` (the "1 000 CREATE TABLE in under a second" target needs catalog changes logged in the
+    WAL), and the tests for 300 columns / 2 000 tables / start-up RSS.
 
 - [x] **P1.12 `[SECURITY]` Overflow stubs are recognised by their content** — [code]
   - **Where:** `src/table/overflow.c:7,25-33` (`ov_is_stub`: any 24-byte slot starting with `FF 00 "SVOVF1"` and
@@ -534,7 +656,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     written through an overflow chain (`heap_insert`, `ov_slot_put`, `ov_slot_revive`), so a slot with the stub
     shape is always a real stub; v1.2 files open unchanged. Test in `tests/test_overflow.c` (fails without the fix).
 
-- [ ] **P1.13 `[ENGINE]` Optimizer estimates are fixed constants; there are no column statistics** — [code]
+- [x] **P1.13 `[ENGINE]` Optimizer estimates are fixed constants; there are no column statistics** — [code]
   - **Where:** `src/query/executor.c:7869-7887` (`cond_selectivity`: `=` 0.1, range 1/3, `LIKE` 0.1, anything else
     0.5), `:8000` (non-unique index lookup = `num_rows * 0.1`), `:8024-8034` (join cardinality from those numbers);
     `src/catalog/schema.h:96` (`num_rows` "approximate", refreshed only by `ANALYZE` / `OPTIMIZE`,
@@ -550,6 +672,28 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
   - **Done when:** on a skewed table the plan switches between index and scan at the right threshold, a 3-table
     join picks the same order regardless of how the query is written, and `EXPLAIN ANALYZE` estimates stay
     within 2× of actual rows on the benchmark schema.
+  - **Done:** `ANALYZE TABLE` collects per column the distinct count, NULL fraction and, for numeric columns,
+    min / max and a 16-bucket equi-depth histogram (`src/query/stats.c`, collected with internal queries in
+    `analyze_columns`), kept in memory and in `DATA/segvault.stats` (text, written atomically, a damaged file
+    means "no statistics"; the catalog itself is P1.11). Estimates (`cond_selectivity`) use them: `col = v` from
+    the histogram (a frequent value spans whole buckets, so skew shows), ranges by interpolation in the
+    buckets, `IS NULL` from the NULL fraction, equi-joins `|R|·|S| / max(distinct)`; without statistics the
+    System R defaults as before. Index or scan: an equality lookup on a non-unique index counts the key's rows
+    in the in-memory index first and scans instead when they are over a quarter of the table (the same rule
+    as ranges), and `EXPLAIN` shows that choice and the real count. Join order: an inner-only join of 3-8
+    base tables (no `USING` / `NATURAL` / `LATERAL` / derived tables / CTEs) moves its `ON` conditions into
+    `WHERE` and runs in a greedy cost order (smallest filtered table first, then the equi-joined table giving
+    the smallest intermediate result; ties by name), so every way of writing it gives the same plan; `SELECT *`
+    is expanded first in the written order, so result columns and their names do not change. `num_rows` is
+    exact after `ROLLBACK` / `ROLLBACK TO` (each undone insert / delete counts back; before, rolled-back rows
+    stayed counted until the next `ANALYZE`, also across restarts). `EXPLAIN [ANALYZE] FORMAT=JSON` returns the
+    plan as one JSON row. Found on the way: `EXPLAIN` applied the selectivity of a range or key condition
+    twice when the index had already counted it. Tests in `tests/test_sql.c`: skewed table → scan for the
+    common value, index for a rare one; histogram estimate 714 vs 715 real; a 3-table join written three
+    ways → the same plan; `EXPLAIN ANALYZE` estimates within 2× at every step (125 / 100, 2500 / 2000);
+    `SELECT *` columns after the reorder; exact row count after a rolled-back insert + delete; JSON plan.
+    **Not done:** statistics are not refreshed automatically (only by `ANALYZE`); string columns get distinct
+    count and NULL fraction but no histogram; joins with outer joins keep the written order.
 
 ---
 
@@ -571,9 +715,16 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     of a `SET` before applying `FOREIGN_KEY_CHECKS`, so mysqldump's
     `SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0` saves 1 and the closing
     `SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS` turns checks back on (before: they stayed off for the session).
-    Tests in `tests/test_server.c` (MySQL protocol). **Not done:** warning count for unknown system variables.
+    Tests in `tests/test_server.c` (MySQL protocol). Then: a `SET` that names an unknown system variable is
+    answered with an OK carrying one warning, and `SHOW WARNINGS` returns `Warning | 1193 | Unknown system
+    variable '…'` until the next statement (known families — `character_set_*`, `collation_*`, `sql_*`, `net_*`,
+    `innodb_*`, `transaction_*`, `NAMES`, … — stay silent). Found on the way: `SET @@session.x = …` was taken for
+    a user variable (the `@@` check looked at one `@` at a time) and sent to the engine; `SET [GLOBAL]
+    synchronous` / `cache_size` and `SELECT @@synchronous` / `@@cache_size` / `@@foreign_key_checks` were
+    answered by the protocol layer without effect or with an empty value — they now reach the engine. Tests in
+    `tests/test_server.c`.
 
-- [~] **P2.2 `[NET]` Server-side prepared statements re-parse on every execute and run reads at `PREPARE` time** — [code]
+- [x] **P2.2 `[NET]` Server-side prepared statements re-parse on every execute and run reads at `PREPARE` time** — [code]
   - **Where:** `src/server/server.c:3218-3253` (`my_prepare` executes read-only statements with `NULL` parameters
     to learn the columns), `:3255-3266`; `src/server/mysql_wire.c:728-773` (`mw_bind_execute` splices literals into
     the text); same model in `src/server/server.c:457-517` (`bind_params`) and `src/bridge/db_api.c:1030-1067`.
@@ -586,9 +737,29 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     prepared and executed once advances the sequence by one; prepared point lookups get ≥ 2× throughput.
   - **Done:** `COM_STMT_PREPARE` no longer runs the `SELECT`: `db_describe()` resolves the columns in a
     describe-only executor mode (tables look empty, no row for `FROM`-less selects or table functions, `NEXTVAL` /
-    `SETVAL` / user functions inert, no locks). **Still open:** parse once with parameter nodes, plan cache.
+    `SETVAL` / user functions inert, no locks). Then: the lexer has a `?` token (`TOK_PARAM`) that the parser
+    accepts only between `parser_params_begin` / `_end`, which list every node made for a `?` (copies made while
+    parsing included, freed ones removed); `DbPrepared` (`db_prepared_new` / `_exec`) keeps tokens + tree of a
+    single `SELECT` / `INSERT` / `UPDATE` / `DELETE` and at each execute writes the typed values into those
+    nodes (`EXPR_INT` / `FLOAT` / `STRING` / `NULL`, strings unescaped by the lexer exactly as in the text);
+    `COM_STMT_EXECUTE` builds it at the first execute and uses it (the text with the values is still made for
+    the log and the audit). The tree is re-parsed when `g_schema_gen` changed — bumped by every statement that
+    is not a row read / write and by `ROLLBACK` — or after an engine restart. Everything else falls back to the
+    text with the values: other statement kinds, a `?` that did not become a node, and a `?` that the executor
+    re-parses from a stored text fragment (multi-table `UPDATE` / `DELETE` conditions: recognised by its error,
+    the statement is then marked text-only). Engine counters `db_prepared_counts`. Tests in
+    `tests/test_server.c`: three executes = one parse + three tree runs; typed values with quotes, `\\`,
+    comment markers, `?`, `NULL`, negatives, `INT64_MAX`; `DROP` + `CREATE` with other columns between two
+    executes → one re-parse, right value; prepared `NEXTVAL` advances once; a multi-table `UPDATE` with `?`
+    falls back and works; 3000 prepared lookups checked. **Measured:** in the engine a point lookup goes from
+    5.11 to 2.53 µs (2.02×, in-process probe); over the MySQL socket 40.1 → 37.7 µs (1.06×), because one
+    loopback round trip through the thread-per-connection server costs ~35 µs — that cost is P2.5. Found on
+    the way: the test client sent header and payload in two `send` calls without `TCP_NODELAY`, so every
+    query of `tests/test_server.c` waited 40 ms for the delayed ACK. **Not done:** SQL-level `PREPARE` /
+    `EXECUTE` and the HTTP API's `params` still splice values into the text (rare in practice; their parse is
+    a small part of the request).
 
-- [~] **P2.3 `[NET]` HTTP request limits truncate silently** — [code]
+- [x] **P2.3 `[NET]` HTTP request limits truncate silently** — [code]
   - **Where:** `src/server/server.c:165-202` (`Request.query[2048]`, `auth[512]`, `content_type[128]`,
     `path[2048]`), `:2513` (`%4095s` target), `:2519` (`snprintf` into `query`), `:1583` (`QUERY_STRING` for PHP),
     `:2527-2532` (no check on header-name syntax; `Name : value` is ignored here but forwarded by the proxy,
@@ -604,9 +775,13 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     longer → 414; `Authorization` (now 4 KB), `Content-Type`, `Host`, `Origin`, `Range`, session id that do not
     fit → 431; a header line without `:` or whose name is not an RFC 9110 token → 400. Tests in
     `tests/test_php.c` (6 KB query string reaches PHP intact, 9 KB → 414, `Transfer-Encoding : chunked` → 400).
-    **Still open:** pointer + length into the request buffer instead of fixed copies; configurable limits.
+    Then: the header limit is configurable (`--max-header-size KB`, default 64 KB, minimum 4 KB; a header block
+    that arrives in one piece but is over the limit also gets 431 — before, only one that kept growing did).
+    Test in `tests/test_web.c` (9 KB of headers with an 8 KB limit → 431). Fixed copies stay: each field now
+    has room for its whole limit, so nothing is cut short any more and a pointer + length rewrite would change
+    nothing a client can see.
 
-- [~] **P2.4 `[NET]` No overall request deadline; bodies are buffered whole, allocated before they arrive** — [code]
+- [x] **P2.4 `[NET]` No overall request deadline; bodies are buffered whole, allocated before they arrive** — [code]
   - **Where:** `src/server/server.c:2469-2479` (per-`recv` timeout only, `IDLE_TIMEOUT_MS` 15 s), `:2581-2604`
     (`fill` grows the buffer to `Content-Length` up front), `:2860` (whole body before routing), `:3829`
     (64 connection slots); `src/server/fastcgi.c:715-717` (zero-config PHP sets `post_max_size=256M` while
@@ -620,10 +795,23 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     declare large bodies; a 100 MB upload to PHP succeeds with the default configuration.
   - **Done:** request headers must be complete within 10 s of their first byte (`HEADER_DEADLINE_MS`, 408 and
     close; test in `tests/test_web.c`); `fill` grows the buffer with the data received (at most doubling), no
-    longer to the declared `Content-Length` up front. **Still open:** minimum body rate, streaming bodies to
-    FastCGI / proxy, per-address connection cap, one upload-limit setting shared with PHP.
+    longer to the declared `Content-Length` up front. Then: a body that arrives slower than 1 KB/s after the first
+    10 s closes the connection (`MIN_BODY_RATE`); non-local addresses get at most 32 connections at once
+    (`--max-per-address`, loopback and the Unix socket are exempt); `--max-body` (default now 128 MB) also sets
+    PHP's `post_max_size` / `upload_max_filesize` through `-d`, so there is one upload limit; a body over 1 MB
+    is written to an already-unlinked temporary file as it arrives (`spool_body`, `mkostemp` + `O_CLOEXEC`, on
+    Windows `FILE_FLAG_DELETE_ON_CLOSE`) and FastCGI, CGI, the proxy and the API read it from a read-only
+    mapping, so the server's own memory stays flat. Tests: `tests/test_web.c` (slow body closed; a 5 MB body to
+    a CGI program arrives whole and a pipelined request after it is answered), `tests/test_php.c` (a 100 MB
+    multipart upload reaches the real `php-cgi` with the default configuration while the process's anonymous
+    memory grows by less than 40 MB). **Not done:** chunked request bodies are still collected in memory (up to
+    `--max-body`); the per-address cap is not tested (the test client is always on loopback).
+    Found on the way: the fake `php-cgi` of `tests/test_php.c` recognised only `-b ADDR` as its whole command
+    line; once the server added `-d` options, every child re-ran the whole suite and started more children (a
+    fork bomb that exhausted the memory of the machine). It now finds `-b` as the second-to-last argument and
+    refuses to recurse (`SV_TEST_PHP_CHILD`).
 
-- [ ] **P2.5 `[NET]` Connection architecture: one thread per connection, TLS and HTTP/2 through loopback sockets**
+- [x] **P2.5 `[NET]` Connection architecture: one thread per connection, TLS and HTTP/2 through loopback sockets**
   - **Where:** `src/server/server.c:3445-3454` (detached thread per connection), `:3974-4053` (accept loop with
     `select` and a 200 ms tick), `:2907-2927` (TLS bridge preface `SVTLS <secret> ip port`);
     `src/server/h2.c:416-429,442-513` (every HTTP/2 stream opens a new loopback HTTP/1.1 connection),
@@ -636,8 +824,22 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     engine and PHP calls.
   - **Done when:** `h2load -n 20000 -c 50 -m 32` against a static file completes without 503s and the process
     holds < 100 threads.
+  - **Fixed:** the TLS bridge and every HTTP/2 stream reach the HTTP server **in process**: the server registers
+    a connector for its port (`sv_inner_register`, `src/server/h2.h`) that makes a `socketpair` and hands the
+    server end to `serve_connection` — no TCP connect / accept, no connection slot, no loopback port. A TLS
+    HTTP/1.1 connection (long-lived keep-alive) keeps its own thread; HTTP/2 streams (one request each) go to a
+    fixed pool of 24 workers with an 8 192-entry queue (queue full → that stream gets 503). `select` is gone
+    from every per-connection loop (h2 event loop, TLS bridge, TLS writes, reverse proxy, WebSocket pipe, SMTP):
+    `sv_poll` (poll / WSAPoll) has no `FD_SETSIZE` limit. Measured with 50 curl clients × 32 concurrent HTTP/2
+    streams × 400 requests (curl stands in for h2load, not installed): 20 000 × 200, 0.43 s, at most 75 threads;
+    the v1.3.0 server on the same load answered 1 538 × 503, 17 985 failed and then aborted (fortify
+    `FD_SET` overflow past descriptor 1024). The same load is now a check in `tests/test_tls.c` (all 200, < 100
+    threads, `sv_process_threads`). **Not done:** plain HTTP/1.1 and MySQL connections still have one thread
+    each (the accept loop itself uses `select` on its ≤ 7 listening sockets, which is safe); epoll / IOCP
+    readiness for idle keep-alive connections; Windows has no `socketpair`, so there the bridge still uses a
+    loopback TCP connection (through the same pool-less path as before).
 
-- [~] **P2.6 `[SECURITY]` Credentials: slow hash under the engine lock, fast unsalted copy on disk, world-readable files**
+- [x] **P2.6 `[SECURITY]` Credentials: slow hash under the engine lock, fast unsalted copy on disk, world-readable files**
   - **Where:** `src/bridge/db_api.c:1886-1891` (`db_login` holds the exclusive engine lock while
     `password_hash` runs 20 000 SHA-256 rounds, `src/bridge/auth.c:122-140`); `auth.c:552-555` (also stores
     `SHA1(SHA1(password))` for `mysql_native_password`); `auth.c:175-194` (`fopen "w"` → 0644);
@@ -659,10 +861,30 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     the HTTP login cache is keyed by `db_users_version()` so any user / grant change drops it (test: old password
     refused right after `ALTER USER`); data file, WAL, catalog, `users.dat`, free list, sequences and the audit log
     are created `0600` (existing data file `fchmod`ed), the data directory and backup folders `0700` (test:
-    `tests/test_durability.c`). **Still open:** PBKDF2 with stored iterations, `caching_sha2_password` and an
-    opt-in native hash, per-account back-off, owner-only ACL on Windows.
+    `tests/test_durability.c`). Then: hashes are PBKDF2-HMAC-SHA256 with the iteration count stored in the hash
+    (`$p2$100000$<hex>`; `auth_pbkdf2_sha256` checked against the RFC 7914 vectors); an old-format hash is
+    still accepted and redone on the next successful login (`auth_password_verified`, under the lock, only if
+    salt and hash have not changed meanwhile). MySQL protocol: `caching_sha2_password` — fast path from
+    `SHA256(SHA256(pw))` kept **only in memory** (filled by any successful password check, emptied by a
+    restart, like MySQL), full path with the password in clear text only over TLS or the Unix socket,
+    otherwise encrypted with the server's RSA key (generated in memory at first use through the OpenSSL that
+    TLS already loads; OAEP); `mysql_native_password` is used only for users created `IDENTIFIED WITH
+    mysql_native_password` (the unsalted `SHA1(SHA1(pw))` is no longer written for everyone; existing users
+    keep theirs until their password is changed); `COM_CHANGE_USER` goes through the same code. Back-off:
+    after 5 wrong passwords in a row for one user from one address each new attempt waits 1, 2, 4 … s, up to
+    5 minutes, refused without computing the hash (HTTP 429 + `Retry-After`, MySQL 1045 with the wait); a
+    success clears it. Windows: the data folder gets a protected ACL (current user + SYSTEM, inherited by new
+    files) and existing engine files and every `sv_fopen_private` file get the same (`src/platform/win_acl.c`).
+    Tests: `tests/test_auth.c` (PBKDF2 vectors, file format, old hash accepted and upgraded, `IDENTIFIED WITH`
+    plugins), `tests/test_server.c` (after a restart: sha2 over TCP asks for full auth, full auth in clear text
+    over the Unix socket, then fast auth over TCP, wrong password, native client switched to sha2, native user
+    with no switch, root token both ways, **real PHP `mysqli` logging in through the RSA key over TCP**,
+    back-off), `tests/test_win.c` (ACL as SDDL on native Windows; wine keeps no ACLs, so it is skipped there).
+    Found on the way: after a full authentication the server also sent "fast auth OK" (0x03), which PHP
+    rejects — only seen with a real client. **Not verified:** the Windows ACL on real Windows (wine rebuilds
+    ACLs from Unix permissions; the check runs in the `windows-native` CI job).
 
-- [~] **P2.7 `[SECURITY]` Secrets and control characters reach the logs**
+- [x] **P2.7 `[SECURITY]` Secrets and control characters reach the logs**
   - **Where:** `src/server/server.c:725-755` (`audit_stmt` writes the statement with bound values, e.g.
     `CREATE USER … IDENTIFIED BY '…'`), `:3126-3133` + `:2642-2646` (MySQL statements to the ring log and stderr),
     `:2887-2889` (decoded request path printed raw); `:729-733` (anything starting with `SELECT` / `WITH` is
@@ -675,7 +897,11 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
   - **Done:** `one_line` (used for every log line: stderr, request ring log, audit) escapes bytes < 0x20 and 0x7f
     as `\xNN` and replaces the string after `IDENTIFIED … BY` / `PASSWORD` with `'***'`; request paths and proxy
     host / URI go through it on stderr; the audit file is created 0600. Test in `tests/test_server.c`.
-    **Still open:** audit by statement kind from the parser, periodic `fsync` of the audit file.
+    Then: what is a read is decided by the parser (`db_statement_is_read`: every statement a `SELECT` without
+    `INTO`, `SHOW` or `DESCRIBE`, no `@` assignment, no `NEXTVAL` / `SETVAL`, no user function call), so
+    `SELECT f()` with a writing `f` and `SELECT … INTO @v` are audited, and failed reads too (denied attempts);
+    the audit file is `fsync`ed at most one second after its last line, from the accept loop and only when
+    `exec_mx` is free (`audit_sync_tick`). Tests in `tests/test_server.c`.
 
 - [~] **P2.8 `[NET]` MySQL protocol completeness**
   - **Where:** `src/server/mysql_wire.c:50-57` (`mw_end`: payloads over 16 MB − 1 are not split, the length is
@@ -698,8 +924,15 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     connection's scramble, the session restarts, wrong password closes the connection like MySQL) and
     `COM_PROCESS_KILL` (P2.9) are implemented; a connection that stays silent for 10 minutes with a transaction
     open is closed and the transaction rolled back; `have_ssl` / `have_openssl` / `max_connections` reflect the
-    configuration. Tests in `tests/test_server.c`. **Still open:** `COM_STMT_FETCH` (cursors), column flags
-    from the catalog, streaming result sets (needs a cursor API instead of `QueryResult`).
+    configuration. Tests in `tests/test_server.c`. Then: column definitions carry `NOT_NULL`, `PRI_KEY`,
+    `UNIQUE_KEY`, `MULTIPLE_KEY`, `UNSIGNED` and `AUTO_INCREMENT` from the catalog (`db_column_flags`, for
+    columns the result maps to a base table; computed columns get none), in text and binary results and in
+    `COM_STMT_PREPARE`; `COM_STMT_EXECUTE` with a cursor type answers with the columns and an EOF carrying
+    `SERVER_STATUS_CURSOR_EXISTS`, and `COM_STMT_FETCH` sends the next N rows in binary form, then
+    `LAST_ROW_SENT` (error 1421 without an open cursor; `COM_STMT_RESET`, a new `EXECUTE` and `CLOSE` drop it).
+    Tests in `tests/test_server.c` (flags of a 5-column result; a cursor read 2 rows, then the rest).
+    **Still open:** streaming result sets with flat memory — the cursor serves a materialised `QueryResult`;
+    streaming needs the executor to hand rows out as it produces them.
 
 - [x] **P2.9 `[NET]` Only `SELECT` scans can be interrupted**
   - **Where:** `src/server/server.c:3991-3998` (watchdog → `db_request_cancel`), `src/bridge/db_api.c:150-163`,
@@ -719,7 +952,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     are listed and killed from another connection; the `DELETE` changes nothing. **Limit:** the write phase itself
     (applying already-selected rows) is not interrupted.
 
-- [~] **P2.10 `[SECURITY]` Child processes: PHP FastCGI port open to every local user; handles leak into children**
+- [x] **P2.10 `[SECURITY]` Child processes: PHP FastCGI port open to every local user; handles leak into children**
   - **Where:** `src/server/fastcgi.c:193-205,241-290` (`php-cgi -b 127.0.0.1:<free port>`; the port is chosen,
     closed, then given to the child); `src/server/cgi.c:288` (`CreateProcessA(..., bInheritHandles = TRUE)`);
     `src/platform/xlib.c:852-891` (`fork` + `xdg-open` without closing descriptors; no `O_CLOEXEC` anywhere in
@@ -738,8 +971,14 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     `mkdtemp` folder (0700), removed with the pool — no local TCP port any more (test in `tests/test_php.c`, also
     with the real `/usr/bin/php-cgi`); the GUI's `xdg-open` and file-chooser children close every descriptor
     above 2 before `exec` (CGI and FastCGI children already did); on Windows engine files are opened with
-    `_O_NOINHERIT`. **Still open:** `O_CLOEXEC` / `SOCK_CLOEXEC` on every descriptor, the Windows
-    `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` whitelist for CGI, the relative `php/php-cgi` lookup.
+    `_O_NOINHERIT`. Then: on POSIX every engine file is opened with `O_CLOEXEC` (`sv_open`), every `fopen` with
+    a literal mode gets glibc's `"e"` (`SV_FE`, 41 sites), every socket is created with `SOCK_CLOEXEC` and
+    accepted sockets get `FD_CLOEXEC` — so a child started by any path, not only the three that close
+    descriptors, inherits nothing; on Windows CGI programs are started with `STARTUPINFOEX` +
+    `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (only their stdin / stdout / stderr; FastCGI and the service already
+    pass `bInheritHandles = FALSE`); `php-cgi` is no longer searched as `php/php-cgi` relative to the current
+    folder, nor in relative or empty `PATH` entries. Test in `tests/test_web.c`: a CGI script lists
+    `/proc/$$/fd` and sees exactly `0 1 2`. **Not verified:** the Windows handle list (cross-compiled only).
 
 - [x] **P2.11 `[NET]` HTTP/2 input hardening**
   - **Where:** `src/server/h2.c:442-513` (`open_stream`: values are checked for CR / LF by `valid_field`
@@ -756,7 +995,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     RST_STREAM / PING / SETTINGS per second → `GOAWAY(ENHANCE_YOUR_CALM)`. New `tests/test_h2.c` drives
     `h2_serve` over a socketpair with hand-written frames (9 checks). **Not done:** an `h2spec` run.
 
-- [~] **P2.12 `[API]` HTTP API: unbounded results, 32-bit ids, no machine-readable metrics**
+- [x] **P2.12 `[API]` HTTP API: unbounded results, 32-bit ids, no machine-readable metrics**
   - **Where:** `src/server/server.c:554-583` (`result_json` builds the whole response in memory),
     `:580` and `src/bridge/db_api.h:84-85` (`int rows_affected`, `int last_insert_id`), `:2406-2414` (`/status`
     is the only runtime information); `src/bridge/db_api.c:1850-1874` (`db_engine_stats` is not exposed).
@@ -768,8 +1007,21 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     `promtool check metrics`.
   - **Done:** `QueryResult.rows_affected` / `last_insert_id` are `long long` end to end (engine, HTTP JSON,
     MySQL OK packet, audit, GUI); the `INT32_MAX` caps are gone. Test: `AUTO_INCREMENT = 3000000000` returns
-    `"last_insert_id":3000000000` (`tests/test_server.c`). **Still open:** `max_rows` + cursor pagination,
-    integers above 2⁵³ as strings, `/metrics`.
+    `"last_insert_id":3000000000` (`tests/test_server.c`). Then: `"max_rows": N` on `/query` (and `?max_rows=` on
+    saved endpoints) returns the first N rows with `"next"` + `"rows_left"`; the rest stays in a server-side
+    cursor (owner = the request's user, 5 minutes idle, 32 per server, oldest dropped when full), read with
+    `{"cursor": "…", "max_rows": N}` without touching the engine — one result computed once, so pages are
+    consistent; `"big_ints": "string"` returns integers beyond ±(2⁵³ − 1) as strings; `GET /api/v1/metrics` in
+    Prometheus text format 0.0.4: requests by service × status class, latency histogram per service,
+    connections, rows sent, buffer-pool frames / used / requests / hits / misses / evictions, pages written,
+    data-file and WAL size, WAL records, checkpoints, lock waits and deadlocks (new counters in `locks.c`),
+    open transactions; the engine numbers also appear in the MySQL `SHOW STATUS` under the MySQL / MariaDB
+    names. Tests in `tests/test_server.c`: 25 rows read in pages of 10/10/5 through the cursor, unknown
+    cursor → 404, `rows_left`, no cursor without `max_rows`, big integers both ways, every line of `/metrics`
+    checked against the text-format grammar with cumulative buckets and `+Inf` = `_count`, `SHOW STATUS`.
+    **Not done:** `promtool check metrics` itself was not run (not installed here; installing it was not
+    allowed); results are still materialised before the first page (the cursor bounds the response, not
+    the server's memory — that needs the streaming executor noted under P2.8).
 
 - [x] **P2.13 `[NET]` Listeners: IPv4 only, no Unix socket for MySQL**
   - **Where:** `src/server/server.c:3458-3477,3925-3951` (`AF_INET`, `inet_addr`).
@@ -785,7 +1037,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     `[::1]`, MySQL handshake over the socket. **Not verified:** a real `new mysqli('localhost')` (the PHP here
     has no mysqli extension); IPv6 for the MySQL and HTTPS ports.
 
-- [ ] **P2.14 `[GUI]` Engine calls on the UI thread** — [code]
+- [x] **P2.14 `[GUI]` Engine calls on the UI thread** — [code]
   - **Where:** `src/widgets/window.c:855,867,984,1828-1832,1867-1869,3087,3191,3337,3515,3646,4274` (direct
     `db_execute` from event handlers: table browsing, foreign-key navigation, grid edits, import steps). Only the
     editor's Run goes through a worker (`run_worker`, `:5580-5593`, started at `:5796`, cancellable at `:5687`).
@@ -796,8 +1048,21 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     thread as events; a visible "waiting for the database" state with Cancel; never block in an event handler.
   - **Done when:** with a session holding a write lock on a table, opening that table in the explorer keeps the
     window repainting and can be cancelled.
+  - **Fixed:** every statement the window runs from an event handler (table preview, foreign-key navigation,
+    grid edits and re-fetch, Designer apply, context-menu actions, import steps, dump, row counts, search and the
+    database report in `db_tools.c` through `dbt_set_exec`) goes through `ui_exec`: the statement runs in a worker
+    thread; after 150 ms a "Waiting for the database… Ns" box with Cancel appears and the window keeps
+    repainting (only the box over the last frame — the handler's state is half-built, so nothing else is drawn),
+    a resize is applied afterwards, closing the window cancels and quits after. Cancel / Esc sets the worker's
+    thread cancel flag, which now also stops a **lock wait** (`acquire_locks` → "Query cancelled while waiting
+    for a lock held by another session"; the same flag serves `KILL QUERY` on the server, which therefore
+    also interrupts a waiting statement now). Found on the way: the prepared-statement path did not check
+    the `LockSet` allocation. Test `tests/test_sessions.c`: another session holds a write lock, a statement
+    with the thread flag set after 200 ms returns "cancelled" in ~200 ms instead of 30 s, the table is usable
+    afterwards. **Not done:** a single queue/event model for all engine calls — catalog reads for the tree
+    (`db_list_*`) still run on the UI thread (they take the engine lock briefly, never a table lock).
 
-- [ ] **P2.15 `[GUI]` Text input and display scaling** — [code]
+- [x] **P2.15 `[GUI]` Text input and display scaling** — [code]
   - **Where:** `src/platform/xlib.c:538-548` (`XLookupString`: no input method, no compose or dead keys, Latin-1
     bytes for non-ASCII keys); `src/platform/win32.c` (no DPI-awareness call or manifest; text is drawn at fixed
     pixel sizes, `:481-492`); `src/widgets/settings.h:34-36` (font sizes 11-16 are the only scaling control).
@@ -808,6 +1073,24 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     overridable in Settings) applied to every metric in `src/widgets/theme.h`.
   - **Done when:** typing `è`, `ñ`, `ő` (dead key) and pasting CJK text round-trips through the editor into a
     table on both platforms; at 200 % scaling the UI is sharp and proportioned.
+  - **Fixed:** X11 opens an input method (`XOpenIM` / `XCreateIC`, `XFilterEvent`, focus forwarded with
+    `XSetICFocus`) in the user's `LC_CTYPE` only for the call, then restores the locale (numbers keep printing
+    with a dot); keys go through `Xutf8LookupString`, so dead keys, Compose and IMEs give UTF-8 text, decoded into
+    code points (invalid sequences dropped — never Latin-1 bytes) and queued so a multi-character commit (CJK)
+    arrives as consecutive `EVT_CHAR`s; without an IM the old `XLookupString` path stays. Scaling: one factor in
+    the platform layer (`platform_set_ui_scale`, `platform_ui_scale`): widgets keep drawing in logical 96-dpi
+    pixels, every primitive, clip, text size and bitmap is multiplied, text measurements / mouse / resize are
+    divided back, so fonts are rendered at the real size (sharp) and every metric in the widgets scales without
+    touching them. Automatic value: X11 `Xft.dpi` / 96 (or `SV_UI_SCALE`), Windows the monitor DPI with
+    per-monitor-v2 awareness (`SetProcessDpiAwarenessContext`, resolved at run time, falling back to
+    `SetProcessDpiAwareness` / `SetProcessDPIAware`) and `WM_DPICHANGED` when the window moves to another
+    monitor; Settings → Appearance → "Display scale" (Automatic, 100-300 %) overrides it. Test
+    `tests/test_platform.c` (in `make test`, skipped without an X display): synthetic key events for `è`, `ñ`,
+    dead double-acute + `o` → `ő`, dead acute + `e` → `é`, a queued CJK commit, invalid UTF-8; at 200 %
+    logical metrics stay within 1-2 px of 100 %, the physical font is twice as wide, a logical 10×10 rectangle
+    covers 20×20 physical pixels, `platform_read_pixels` and mouse coordinates are logical.
+    **Not verified:** the Windows side only cross-compiles (no high-DPI Windows run); a real IME (fcitx / ibus)
+    was not exercised, only Xlib's built-in compose.
 
 ---
 
@@ -831,7 +1114,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     catalog and users files, recovery memory, rollback cost, `synchronous`. **Not done:** a randomly interleaved
     multi-session workload checked against an in-memory oracle.
 
-- [~] **P3.2 `[TEST]` Sanitizer and platform coverage in CI**
+- [x] **P3.2 `[TEST]` Sanitizer and platform coverage in CI**
   - **Where:** `Makefile:187-191` (`test-tsan` covers `test_parallel` and `test_php` only), `:267-321`
     (`test-asan` omits `test_mysql`, `test_web`, `test_mail`, `test_tls`); `.github/workflows/ci.yml` (one Ubuntu
     job; the MinGW build is compiled but never run).
@@ -841,10 +1124,17 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
   - **Done when:** CI has the five jobs and a deliberately injected race / overflow fails each relevant one.
   - **Done:** `.github/workflows/ci.yml` gains a `sanitizers` job (`make test-tsan`, the durability suite and
     `test_h2` under ASan + UBSan), the Windows-only code run under wine (`make test-win`), a `-DDEBUG` compile
-    check and a non-blocking `cppcheck` job. **Still open:** native `windows-latest` / `macos-latest` jobs,
-    every suite under ASan in CI, object caching.
+    check and a non-blocking `cppcheck` job. Then: `make test-asan` covers every suite (added `test_mysql`,
+    `test_web`, `test_mail`, `test_tls`, `test_h2`, `test_durability` with fault injection) and runs in the
+    main CI job; `make test-tsan` adds `test_sessions`, `test_server` and `test_web` (0 TSan reports; one
+    `test_web` check compared the process name and failed only because of the `_tsan` suffix); CI gains a
+    `windows-native` job (MSYS2 UCRT64: `make test-win WIN_CC=gcc WIN_RUN=` runs the Windows-only suite
+    natively, then the native build) and a `macos` job (`segvault-server` + engine suites; the ELF-only
+    `-z relro` flags are skipped on Darwin). Object caching is not needed any more: the engine is compiled once
+    into `libsegvault.a` (P3.4). **Not verified:** the two new jobs have not run on GitHub's runners yet
+    (no push), so they are `continue-on-error` until they have.
 
-- [~] **P3.3 `[TEST]` Fuzzing of every parser that reads untrusted bytes**
+- [x] **P3.3 `[TEST]` Fuzzing of every parser that reads untrusted bytes**
   - **Where / targets:** `lexer_tokenize` + `parser_parse` (`src/query`), `parse_head` and `read_chunked`
     (`src/server/server.c:2508-2573,2661-2697`), `mw_parse_login` and `mw_bind_execute`
     (`src/server/mysql_wire.c:241-260,728-773`), `hpack_decode` and the frame loop (`src/server/h2.c:236-299,722-800`),
@@ -861,9 +1151,21 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     foreign keys, views, triggers). It found two real bugs, both fixed with regression tests in
     `tests/test_sql.c`: a heap over-read freeing an incomplete `SET` in a routine (`parse_trig_stmt`) and a
     stack overflow in `decimal_round` for `DECIMAL(10,200)` (the parser now refuses scales over 30, as MySQL).
-    Runs: millions of inputs per target, 5-minute runs of `exec` and `sql` clean. **Still open:** HTTP
-    (`parse_head`, `read_chunked` are static), HPACK, `.htaccess`, SMTP / MIME, regex and SQL/JSON targets; a
-    differential run against SQLite; the nightly CI job.
+    Runs: millions of inputs per target, 5-minute runs of `exec` and `sql` clean. Then, new targets: `http`
+    (the real server started in-process with API, static files and a `.htaccess`; each input is a connection
+    closed for writing, so `parse_head`, `read_chunked`, routing and the rewrite run as for a client), `h2`
+    (frames + HPACK through an `H2Io` on a socketpair, streams going to that server), `smtp` (a whole session,
+    then the mail panel's message / HTML / raw / part pages: the MIME reader), `htaccess` (mutated rules on
+    fixed requests through `rw_apply`), `regex`, `sqljson`, and `diff`: random SQL over the common subset
+    (arithmetic, `CASE`, `COALESCE`, `NULLIF`, comparisons, `BETWEEN`, `IN` with `NULL`, `EXISTS`, `GROUP BY`
+    aggregates) run on SegVault and on SQLite, results compared as multisets. Every target then ran **10
+    minutes under ASan + UBSan**: two real bugs found and fixed — `RewriteRule … [S=-9]` (a negative skip moved
+    the rule index before the array: heap read; now clamped to ≥ 0, test in `tests/test_php.c`) and
+    `INTERVAL '1844674407370955161' SECOND` (signed overflow in `mydt_add`, undefined behaviour; now `NULL`, test
+    in `tests/test_sql.c`); after the fixes all 13 targets ran 10 minutes clean (`diff`: 475 730 queries
+    compared, 0 differences). New `.github/workflows/fuzz.yml`: every night each target for 10 minutes with
+    a new seed, crash input / differences kept as artifacts. **Not done:** libFuzzer / coverage guidance (no
+    clang here: the mutator is blind, so the corpus is the built-in seeds, not a cached corpus).
 
 - [x] **P3.4 `[DX]` Build system**
   - **Where:** `Makefile:20` (flags), `:147-263` (each test target recompiles the 600 KB `executor.c` and the whole
@@ -887,7 +1189,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     **Not done:** `-Wvla` (two deliberate VLAs remain: function arguments in `executor.c`), per-config library
     builds (release / asan / tsan), `-fcf-protection`.
 
-- [~] **P3.5 `[REPO]` Repository hygiene**
+- [x] **P3.5 `[REPO]` Repository hygiene**
   - **Where:** `test_sessions_tsan` (2.1 MB ELF tracked at the root since `45ae544`, not in `.gitignore`, not in
     `make clean`); `bin/linux-x86_64/*`, `bin/windows-x86_64/*` (five executables re-committed per release;
     `.git` is already 65 MB); `test_engine.c` at the root while every other test is in `tests/`.
@@ -896,15 +1198,40 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     to `tests/`.
   - **Done when:** a fresh clone contains no executable; the release workflow attaches assets and checksums.
   - **Done:** `test_sessions_tsan` deleted from the tree (the deletion still has to be committed), `*_tsan` in
-    `.gitignore` and in `make clean`. **Still open:** release-only executables, moving `test_engine.c`.
+    `.gitignore` and in `make clean`. Then: the five executables under `bin/linux-x86_64` and
+    `bin/windows-x86_64` are no longer tracked (`git rm --cached`; they are attached to every release, which
+    already had them as assets); `make dist` writes executables, packages and `SHA256SUMS` to `dist/`
+    (ignored) instead of `bin/`; new `.github/workflows/release.yml` builds, tests and attaches `dist/*` to the
+    release when a `v*` tag is pushed; README and `bin/README.md` link to
+    `releases/latest/download/<file>` and explain `sha256sum -c`; `test_engine.c` moved to
+    `tests/test_engine.c`. Old history still carries the binaries (rewriting history is not worth breaking
+    every clone). **Not done:** a signature next to `SHA256SUMS` (needs a signing key the project does not have).
 
-- [ ] **P3.6 `[BENCH]` Reproducible benchmarks with a baseline**
+- [x] **P3.6 `[BENCH]` Reproducible benchmarks with a baseline**
   - **Where:** `bench/bench.c` (91 lines: one schema, in-process only), `Makefile:354-358`.
   - **Do:** scenarios — bulk load, point lookup, range scan, join, update-heavy, commit rate by `synchronous`
     mode, rollback cost (P1.2), cold start, 1-16 concurrent readers and writers, PDO over the MySQL protocol —
     each also run against SQLite (in-process) and MariaDB (protocol) with the same SQL; JSON output; a CI job
     that fails on a > 15 % regression against the stored baseline.
   - **Done when:** `make bench` prints a comparison table and the README's performance section is generated from it.
+  - **Done:** `bench/suite.c` runs the same scenarios with the same SQL on SegVault (through `db_execute` /
+    `db_prepared_exec`) and on SQLite (in-process, WAL, `synchronous` set per connection): bulk load, point
+    lookup (text and prepared), range scan, join + `GROUP BY`, full-scan aggregate, update-heavy, commit rate
+    with `synchronous` FULL / NORMAL / OFF, `ROLLBACK` cost, cold start, 1 / 4 / 16 concurrent readers and
+    1 / 4 writers, and PHP PDO over the MySQL protocol against a `segvault-server` it starts; every value is
+    "higher = better" in JSON. Data goes to `BENCH_DIR` (default `build-bench/`), never `/tmp`: on tmpfs
+    `fsync` is free and the first run showed 226 000 "durable" commits/s. `bench/compare.py` (standard
+    library only) keeps the best of 3 runs, prints the table, rewrites the README section between markers
+    (`make bench-readme`), stores baselines (`make bench-baseline`: `bench/baseline.json`, `baseline-quick.json`)
+    and fails on a regression: the gate compares SegVault / SQLite measured in the same run with the same
+    ratio in the baseline, so a slower machine does not count as a regression (absolute-only scenarios such as
+    PDO only warn). `make bench` = full run + check; `make bench-check` = quick run for CI (new `bench` job,
+    uploads the JSON). Two quick checks in a row on the same PC passed (no false alarm). **Found:** a
+    `ROLLBACK` costs ~5 ms on disk (186/s against SQLite's 90 000/s): two `fsync`s of the log plus a flush of
+    every dirty page, because the undo works on the data file — added to P1.1, which gives the undo page LSNs
+    to work in the buffer pool; a cold start costs ~14 ms (the 1.7 GB catalog struct, P1.11). **Not done:**
+    MariaDB is not installed here (the column is ready: `mariadb` values are read and shown); the CI gate is
+    `continue-on-error` until a baseline recorded on GitHub's runners is stored (no push yet).
 
 - [x] **P3.7 `[DOCS]` Document the real guarantees and limits**
   - **Where:** `README.md` (reliability and architecture sections), `docs/API.md`.
@@ -920,13 +1247,27 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     `CONTRIBUTING.md`, `CHANGELOG.md`, `README.en.md`; README durability table and buffer-pool line updated.
     **Not done:** generating every number from a test or `_Static_assert`.
 
-- [ ] **P3.8 `[DX]` Allocation-failure policy**
+- [x] **P3.8 `[DX]` Allocation-failure policy**
   - **Where:** unchecked results, e.g. `src/tx/wal.c:9`, `src/tx/transaction.c:5`, `src/table/tuple.c:8`,
     `src/bridge/db_api.c:1311-1387,1447-1461,1506-1518`, `src/server/server.c:793`.
   - **Do:** choose one rule — "engine allocations go through `sv_xalloc`, which reports and fails the statement
     via a `longjmp`-free error path" — and apply it; add an allocation-failure sweep to the harness (fail the
     N-th `malloc` for N = 1…k on the SQL test corpus).
   - **Done when:** the sweep completes with no crash and no leak under ASan.
+  - **Fixed (rule chosen: out of memory = controlled stop):** `include/sv_alloc.h` — every engine allocation
+    (397 call sites in `src/catalog`, `storage`, `table`, `index`, `query`, `tx`, `bridge`, plus `SV_ALLOC` /
+    `SV_ALLOC_N` everywhere) goes through `sv_malloc` / `sv_calloc` / `sv_realloc` / `sv_strdup` /
+    `sv_strndup`, which print "out of memory" and `abort()` instead of returning `NULL`; committed data is
+    already in the log, so the next start recovers it. Sizes that come from the data keep a real error path
+    with `sv_try_*`: the log reads of recovery and rollback (`wal.c`, 11 sites), the WAL buffer, the
+    1.7 GB catalog (`catalog_create` / `catalog_load` → "out of memory" error at start). A `longjmp`-free
+    error path for all 400 sites was rejected: unexecuted error branches are where corruption hides.
+    Sweep in `tests/test_durability.c` (`-DSV_FAULT_INJECTION` → `sv_fi_alloc_fail`): a workload of start,
+    30 inserts, update, `COMMIT`, open `DELETE` is run with the N-th allocation failing for ~400 N spread over
+    its ~10 000 allocations (`SV_OOM_ALL=1`: every N; 1 658 points checked once, all clean); each child must end
+    normally or by `SIGABRT` from the handler, never another signal, and after the restart the 600 committed
+    rows are intact, the open `DELETE` is gone and the `UPDATE` is whole. Under ASan the suite runs in
+    `make test-asan`. Rule documented in `CONTRIBUTING.md`.
 
 - [ ] **P3.9 `[AUDIT]` Finish the code audit of the modules that were only spot-checked**
   - **Where:** `src/query/parser.c` (5 122 lines) and `src/query/executor.c` (11 959 lines: constraint and

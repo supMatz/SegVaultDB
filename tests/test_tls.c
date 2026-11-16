@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -51,6 +52,18 @@ static void put(const char* path, const char* content) {
 }
 
 static void* run_server(void* s) { sv_server_run((SvServer*)s); return NULL; }
+
+// numero massimo di thread del processo mentre gira il carico
+static atomic_int g_thr_max, g_thr_stop;
+static void* thread_monitor(void* a) {
+    (void)a;
+    while (!atomic_load(&g_thr_stop)) {
+        int n = sv_process_threads();
+        if (n > atomic_load(&g_thr_max)) atomic_store(&g_thr_max, n);
+        usleep(20 * 1000);
+    }
+    return NULL;
+}
 
 int main(void) {
     if (system("curl --version 2>/dev/null | grep -q HTTP2") != 0) { printf("test_tls: curl with HTTP/2 not found, skipped\n"); return 0; }
@@ -180,6 +193,28 @@ int main(void) {
     o = run(a);
     CHECK(strstr(o, "HTTPS + HTTP/2"), "dashboard: %.200s", o);
     free(o);
+
+    // P2.5: carico come "h2load -c 50 -m 32": 50 client HTTP/2 con 32 stream ciascuno, 20 000 richieste;
+    // nessun 503 e meno di 100 thread nel processo (gli stream vanno al pool fisso, in memoria)
+    if (sv_process_threads() > 0) {
+        atomic_store(&g_thr_stop, 0);
+        atomic_store(&g_thr_max, 0);
+        pthread_t mon;
+        pthread_create(&mon, NULL, thread_monitor, NULL);
+        char cmd[1600];
+        snprintf(cmd, sizeof(cmd), "cd '%s' && for c in $(seq 50); do curl -s --max-time 60 --cacert '%s' --http2 -Z --parallel-max 32 "
+                 "-w '%%{http_code} %%{http_version}\\n' -o /dev/null 'https://shop.localhost:%d/index.html?[1-400]' > load.$c 2>/dev/null & done; wait; "
+                 "cat load.* | sort | uniq -c; rm -f load.*", tmp, g_ca, hp);
+        FILE* pp = popen(cmd, "r");
+        char ob[4096];
+        size_t on = pp ? fread(ob, 1, sizeof(ob) - 1, pp) : 0;
+        ob[on] = 0;
+        if (pp) pclose(pp);
+        atomic_store(&g_thr_stop, 1);
+        pthread_join(mon, NULL);
+        CHECK(strstr(ob, "20000 200 2") != NULL, "20000 HTTP/2 requests on 50 connections, all 200: [%s]", ob);
+        CHECK(atomic_load(&g_thr_max) < 100, "threads under load: %d", atomic_load(&g_thr_max));
+    }
 
     // la riga segreta del ponte: sbagliata, la connessione si chiude senza rispondere
     {

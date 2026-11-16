@@ -21,6 +21,8 @@ SCOPO: righe più grandi di una pagina. Una riga serializzata oltre OV_INLINE_MA
 #define PAGE_FLAG_OVERFLOW 0x08       // pagina di una catena di overflow
 #define OV_MAX_ROW      (64u << 20)   // riga serializzata massima (64 MB)
 
+// stub di una catena (OV_STUB_LEN byte): conversione del formato del file (page_migrate.c)
+void ov_make_stub(uint8_t* s, uint32_t total, uint32_t first, uint32_t npages);
 // lo slot contiene uno stub? (total = lunghezza della riga, first = prima pagina)
 bool ov_is_stub(const uint8_t* d, size_t n, uint32_t* total, uint32_t* first);
 

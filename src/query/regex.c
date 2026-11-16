@@ -11,6 +11,7 @@ SCOPO: motore di espressioni regolari a backtracking (vedi regex.h).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "sv_alloc.h"
 
 typedef enum { RN_CHAR, RN_ANY, RN_CLASS, RN_BOL, RN_EOL, RN_GROUP, RN_ALT, RN_SEQ, RN_REPEAT } RNType;
 
@@ -40,7 +41,7 @@ typedef struct {
 } RParse;
 
 static RNode* rn_new(RNType t) {
-    RNode* n = calloc(1, sizeof(RNode));
+    RNode* n = sv_calloc(1, sizeof(RNode));
     if (n) n->type = t;
     return n;
 }
@@ -53,7 +54,7 @@ static void rn_free(RNode* n) {
 }
 
 static bool rn_add(RNode* n, RNode* k) {
-    RNode** nk = realloc(n->kids, sizeof(RNode*) * (size_t)(n->nkids + 1));
+    RNode** nk = sv_realloc(n->kids, sizeof(RNode*) * (size_t)(n->nkids + 1));
     if (!nk) return false;
     n->kids = nk;
     n->kids[n->nkids++] = k;
@@ -238,7 +239,7 @@ SvRegex* sv_regex_compile(const char* pattern, bool icase, char* err, size_t err
     RNode* root = parse_alt(&r);
     if (!r.failed && *r.p) rfail(&r, "unbalanced )");
     if (r.failed || !root) { rn_free(root); if (!r.failed) rfail(&r, "out of memory"); return NULL; }
-    SvRegex* re = malloc(sizeof(SvRegex));
+    SvRegex* re = sv_malloc(sizeof(SvRegex));
     if (!re) { rn_free(root); rfail(&r, "out of memory"); return NULL; }
     re->root = root;
     re->icase = icase;

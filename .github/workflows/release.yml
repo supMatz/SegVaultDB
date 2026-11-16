@@ -1,0 +1,48 @@
+name: Release assets
+
+# Pubblicando un tag vX.Y.Z (o a mano, con il nome del tag) compila gli eseguibili con `make dist`
+# e li allega alla release di quel tag insieme a SHA256SUMS. Il repository non contiene eseguibili.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag della release (es. v1.4.0)'
+        required: true
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  dist:
+    runs-on: ubuntu-24.04          # glibc 2.39: gli eseguibili Linux girano su glibc 2.38+ come documentato
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libx11-dev libxft-dev libxrender-dev libfontconfig1-dev \
+            mingw-w64 libarchive-tools
+
+      - name: Build and test
+        run: make -j"$(nproc)" all && make test
+
+      - name: Package (dist/)
+        run: make -j"$(nproc)" dist
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "SegVault ${TAG#v}" --notes "SegVault ${TAG#v}"
+          gh release upload "$TAG" dist/* --clobber
