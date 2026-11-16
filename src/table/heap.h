@@ -19,6 +19,9 @@ typedef struct {
 } HeapFile;
 
 HeapFile* heap_open(BufferPool* bp, uint32_t root_page_id, uint32_t num_pages);
+// solo per heap_get (letture per RID, P1.6): niente mappa dello spazio libero, nessuna pagina letta all'apertura.
+// Non usarlo per inserire né per scandire la tabella
+HeapFile* heap_open_read(BufferPool* bp, uint32_t root_page_id, uint32_t num_pages);
 int heap_insert(HeapFile* hf, Tuple* t, TableSchema* schema, RID* out_rid);
 Tuple* heap_get(HeapFile* hf, RID rid, TableSchema* schema);
 int heap_delete(HeapFile* hf, RID rid);

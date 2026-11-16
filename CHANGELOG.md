@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**Storage engine**
+- Indexes on disk: at clean shutdown and on `CHECKPOINT`, the in-memory index of each indexed column becomes a
+  read-only B+tree in the data file (catalog format v7). After a restart a primary-key or unique lookup reads
+  2-3 pages instead of scanning the whole table to rebuild the index (20 000-row table: 3 pages instead of
+  ~1 600). The first write to a table drops its trees (logged before the row, so a crash never uses a stale
+  tree); `ALTER` / `TRUNCATE` / `VACUUM FULL` make them unusable; damaged index pages fall back to the table.
+  `EXPLAIN` shows "B+tree on disk".
+
 **Performance**
 - Table scans copy only the text columns the query still uses after its read-time filters, and a
   single-table `LIMIT` without `ORDER BY` / grouping stops reading at `OFFSET + LIMIT` rows

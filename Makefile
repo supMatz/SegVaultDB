@@ -71,7 +71,7 @@ ENGINE_SRCS = \
 	src/table/tuple.c \
 	src/table/heap.c \
 	src/table/overflow.c \
-	src/index/btree.c \
+	src/index/bptree.c \
 	src/query/lexer.c \
 	src/query/parser.c \
 	src/query/executor.c \
@@ -124,7 +124,7 @@ full: $(FULL_OBJS)
 	$(CC) $(CFLAGS) $(HARDEN_LDFLAGS) -o $(OUT) $(FULL_OBJS) $(LIBS)
 	@echo "=== Full build: $(OUT) ==="
 
-BTREE_TEST_SRCS = tests/test_btree.c src/index/btree.c src/storage/buffer_pool.c src/storage/page.c \
+BTREE_TEST_SRCS = tests/test_btree.c src/index/bptree.c src/storage/buffer_pool.c src/storage/page.c \
                   src/table/tuple.c src/catalog/schema.c
 
 SQL_TEST_SRCS = tests/test_sql.c $(ENGINE_SRCS)

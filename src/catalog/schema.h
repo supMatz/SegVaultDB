@@ -68,6 +68,7 @@ typedef struct {
 #define SV_MAX_CONSTRAINTS 16
 #define SV_MAX_KEY_COLS    8
 #define SV_CHECK_LEN       512
+#define SV_MAX_TREES       16     // indici su disco per tabella
 
 typedef enum { CONS_PRIMARY = 1, CONS_UNIQUE, CONS_FOREIGN, CONS_CHECK } ConstraintKind;
 // azione referenziale (ON DELETE / ON UPDATE)
@@ -112,6 +113,16 @@ typedef struct {
     uint64_t  auto_increment;  // AUTO_INCREMENT = n di CREATE TABLE (prossimo valore minimo; 0 = nessuno)
     // solo in memoria: impronta dell'ultima versione scritta nel log (catalog_delta)
     uint64_t  logsig;
+    // ── dal formato v7: indici su disco (P1.6) ──
+    // B+tree di sola lettura (src/index/bptree.c) scritti al checkpoint dall'indice in memoria di una colonna.
+    // Valido solo se la tabella ha ancora la radice tree_tabroot e la colonna lo stesso tipo e collation: la
+    // prima scrittura sulla tabella azzera ntrees (registrato nel log prima della riga)
+    int       ntrees;
+    uint16_t  tree_col[SV_MAX_TREES];
+    uint8_t   tree_type[SV_MAX_TREES];
+    uint8_t   tree_ci[SV_MAX_TREES];
+    uint32_t  tree_root[SV_MAX_TREES];
+    uint32_t  tree_tabroot[SV_MAX_TREES];
 } TableSchema;
 
 // -- definizione vista --

@@ -23,7 +23,8 @@ not executed; **[verify-win]** = Windows-only, needs a run on Windows.
 
 **Status 2026-11-16 (after 1.4.2):** closed P3.10 (CA name constraints); P1.14 partly done (column pruning,
 early stop at `LIMIT`); P3.9 advanced (executor write-path probes, `win32.c` launch / clipboard paths); still
-open P1.6 (on-disk B+tree: plan written in the item), P1.14 (pull-based executor and cursor API), P3.9
+open P1.6 (step 1 done: read-only B+trees written at shutdown / `CHECKPOINT`; step 2, maintained trees, open),
+P1.14 (pull-based executor and cursor API), P3.9
 (`parser.c`, most of `executor.c`, `src/widgets/*`, rest of `win32.c`).
 
 **Status after v1.3.0 (2026-11-15):** fixed `[x]` P0.1-P0.12 (Windows parts verified under wine), P1.2, P1.3, P1.4, P1.8, P1.12, P2.1, P2.9, P2.11, P2.13, P3.1, P3.4, P3.7;
@@ -497,7 +498,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     of other transactions), the free list still lives in `segvault.free` (rebuilt by VACUUM if lost), no
     size-class bins (the free-space map scan with its hint stays).
 
-- [ ] **P1.6 `[ENGINE]` Indexes exist only in memory; the on-disk B+tree is dead code**
+- [~] **P1.6 `[ENGINE]` Indexes exist only in memory; the on-disk B+tree is dead code**
   - **Where:** `src/index/btree.c` (319 lines, `uint64_t` keys, unique only, no delete rebalancing, not WAL-logged)
     is referenced only by `tests/test_btree.c`; real indexes are `MemIndex` in `src/query/executor.c:1303-1560`,
     built by scanning the table on first use and dropped by every rollback / `REPAIR` (`db_api.c:1242,1302,475`).
@@ -528,6 +529,30 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
        images (`LOG_PAGE_IMAGE` already exists) with the transaction's id so undo restores the before-image,
        splits and merges as a sequence of images in one atomic group; then the `MemIndex` becomes an optional
        cache. Remove `src/index/btree.c` once step 1 lands (or reuse its tests).
+  - **Step 1 done (2026-11-16):** `src/index/bptree.c` — read-only B+tree built bottom-up from sorted keys
+    (slotted pages, `PAGE_FLAG_INDEX` / `PAGE_FLAG_INNER`, leaf entries `key + RID list`, internal entries
+    `first key + child`), lookup and page walk; the old `src/index/btree.c` (unused `uint64_t` tree) is
+    removed and `tests/test_btree.c` now tests the new one (20 000 keys: 123 pages, ≤ 2 page reads per
+    lookup, absent keys, empty tree, too-long key refused with every page returned, non-index and damaged
+    pages reported as errors). At clean shutdown and on `CHECKPOINT` with no open transaction, every
+    in-memory index on one column of a table with ≥ 64 rows (no long keys, ≤ 600 rows per key) is written as
+    a tree; the catalog (format **v7**, `LOG_CATALOG` records v2; v6 files and v1 records still read) keeps
+    per table up to 16 trees with the table root, column type and collation they were built for, so a
+    rewritten table (`ALTER`, `TRUNCATE`) or a changed column never uses an old tree. The first logged row
+    change of a table drops its trees and logs the catalog change **before** the row record (recovery replays
+    it first); `VACUUM FULL` drops every tree; pages of dropped trees are freed after the next catalog save,
+    and `VACUUM` frees index pages that no tree in the catalog reaches (orphans of an interrupted shutdown,
+    dropped tables). A primary-key or unique lookup uses the tree when no in-memory index exists yet and
+    opens the table without its free-space map (which read the whole chain); `EXPLAIN` says
+    "B+tree on disk"; a tree that cannot be read (damaged page) falls back to the in-memory index. Tests
+    (`tests/test_durability.c` §10, a 20 000-row table of ~1 600 pages): after a restart a primary-key lookup
+    reads **3 pages** and builds no in-memory index; text keys; absent keys; a write sees the new value and
+    the next shutdown writes a new tree; a crash right after a delete and an insert (trees on disk, change
+    only in the log) never uses the old tree; `ALTER TABLE` lookups read the rewritten table; damaged index
+    pages fall back; `DROP TABLE` + `VACUUM` frees pages. **Not done (step 2):** trees are not maintained
+    by writes (a modified table goes back to building its in-memory index on the next lookup until the next
+    clean shutdown / `CHECKPOINT`); range scans and composite keys still use the in-memory index; trees are
+    not written by the automatic checkpoints (cost proportional to the table on write-heavy workloads).
 
 - [x] **P1.7 `[CONCURRENCY]` Table locks for plain reads cause upgrade deadlocks; waits are polled; writers can starve** — [code]
   - **Where:** `src/bridge/db_api.c:841-878` (every `SELECT` takes `LK_S` on its tables, kept to `COMMIT`,

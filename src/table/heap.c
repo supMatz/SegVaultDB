@@ -140,6 +140,16 @@ static HeapMeta* meta_build(BufferPool* bp, uint32_t root_page_id, uint32_t num_
     return m;
 }
 
+HeapFile* heap_open_read(BufferPool* bp, uint32_t root_page_id, uint32_t num_pages) {
+    HeapFile* hf = SV_ALLOC(HeapFile);
+    if (!hf) return NULL;
+    hf->bp           = bp;
+    hf->root_page_id = root_page_id;
+    hf->num_pages    = num_pages;
+    hf->last_page_id = root_page_id;
+    return hf;
+}
+
 HeapFile* heap_open(BufferPool* bp, uint32_t root_page_id, uint32_t num_pages) {
     HeapFile* hf = SV_ALLOC(HeapFile);
     if (!hf) return NULL;

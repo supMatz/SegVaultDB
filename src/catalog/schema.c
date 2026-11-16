@@ -268,10 +268,11 @@ void catalog_free(Catalog* c) {
 // salvataggio le riscrive nel formato v6.
 
 #define CAT_MAGIC   "SVCAT2\0\0"
-#define CAT_VERSION 6u   // v3: il flag "nullable" delle colonne è significativo (NOT NULL applicato)
+#define CAT_VERSION 7u   // v3: il flag "nullable" delle colonne è significativo (NOT NULL applicato)
                          // v4: vincoli (PRIMARY KEY composta, UNIQUE, FOREIGN KEY, CHECK) in coda a TableSchema
                          // v5: tipo SQL originale e flag delle colonne, colonne degli indici, collation
                          // v6: codifica esplicita, liste dinamiche (più di 64 colonne / 256 tabelle / 64 database)
+                         // v7: indici su disco (B+tree scritti al checkpoint) in coda a ogni tabella
 
 // ── formati precedenti ──
 // v5: la TableSchema di SegVault 1.3 (64 colonne dentro la struttura)
@@ -421,6 +422,7 @@ const char* catalog_load_error(void) { return g_load_err; }
 static void nul_end(char* s, size_t n) { s[n - 1] = '\0'; }
 
 static bool table_sane(TableSchema* t) {
+    if (t->ntrees < 0 || t->ntrees > SV_MAX_TREES) return false;
     if (t->num_columns < 0 || t->num_columns > SV_MAX_COLUMNS || t->num_indexes < 0 || t->num_indexes > SV_MAX_INDEXES ||
         t->num_constraints < 0 || t->num_constraints > SV_MAX_CONSTRAINTS) return false;
     nul_end(t->name, sizeof(t->name));
@@ -541,7 +543,15 @@ static void w_table(WBuf* w, const TableSchema* t) {
     }
     wb_str(w, t->collation);
     wb_u64(w, t->auto_increment);
+    wb_u32(w, (uint32_t)t->ntrees);                   // v7
+    for (int i = 0; i < t->ntrees; i++) {
+        wb_u32(w, t->tree_col[i]); wb_u8(w, t->tree_type[i]); wb_u8(w, t->tree_ci[i]);
+        wb_u32(w, t->tree_root[i]); wb_u32(w, t->tree_tabroot[i]);
+    }
 }
+
+// versione del formato che r_table sta leggendo (file del catalogo o record del log)
+static uint32_t g_rd_ver = 7;
 
 static bool r_table(RBuf* r, TableSchema* t) {
     rb_str(r, t->name, sizeof(t->name));
@@ -583,6 +593,19 @@ static bool r_table(RBuf* r, TableSchema* t) {
     }
     rb_str(r, t->collation, sizeof(t->collation));
     t->auto_increment = rb_u64(r);
+    t->ntrees = 0;
+    if (g_rd_ver >= 7) {
+        uint32_t nt = rb_u32(r);
+        if (r->bad || nt > SV_MAX_TREES) return false;
+        for (uint32_t i = 0; i < nt; i++) {
+            uint32_t col = rb_u32(r);
+            t->tree_type[i] = rb_u8(r); t->tree_ci[i] = rb_u8(r);
+            t->tree_root[i] = rb_u32(r); t->tree_tabroot[i] = rb_u32(r);
+            if (col >= SV_MAX_COLUMNS) return false;
+            t->tree_col[i] = (uint16_t)col;
+        }
+        t->ntrees = (int)nt;
+    }
     return !r->bad;
 }
 
@@ -708,7 +731,9 @@ Catalog* catalog_load(const char* path) {
                 memcpy(&got, tail + 4, 4);
                 crc_ok = got == want;
             } else if (ok) crc_ok = false;
+            g_rd_ver = version;
             if (ok && crc_ok) ok = load_v6(c, b, body, ndb, cur, next_page);
+            g_rd_ver = CAT_VERSION;
             free(b);
         } else if (ok) {
             migrate_nullable = version < 3u;
@@ -867,7 +892,7 @@ int catalog_save(Catalog* c, const char* path) {
 // viste, routine e trigger, CD_TABLE riempie la tabella con quel nome. Ogni operazione porta lo stato intero
 // dell'oggetto, non un cambiamento: rifarle due volte (log non ancora accorciato dopo un checkpoint) dà lo stesso
 // catalogo.
-#define CD_VERSION 1
+#define CD_VERSION 2      // 2: tabelle nel formato v7 (indici su disco); 1 (SegVault 1.4.0-1.4.2) si legge ancora
 #define CD_HDR     1
 #define CD_DB      2
 #define CD_TABLE   3
@@ -1040,17 +1065,20 @@ static bool cd_apply_table(Catalog* c, RBuf* r) {
 bool catalog_apply_delta(Catalog* c, const uint8_t* b, size_t n) {
     if (!c || !b || n < 1) return false;
     RBuf r = { b, n, 0, false };
-    if (rb_u8(&r) != CD_VERSION) return false;
+    uint8_t ver = rb_u8(&r);
+    if (ver != 1 && ver != CD_VERSION) return false;
+    g_rd_ver = ver == 1 ? 6 : CAT_VERSION;
     while (!r.bad && r.at < n) {
         uint8_t kind = rb_u8(&r);
         uint32_t len = rb_u32(&r);
-        if (r.bad || n - r.at < len) return false;
+        if (r.bad || n - r.at < len) { g_rd_ver = CAT_VERSION; return false; }
         RBuf s = { b + r.at, len, 0, false };
         r.at += len;
         bool ok = kind == CD_HDR ? cd_apply_hdr(c, &s) : kind == CD_DB ? cd_apply_db(c, &s)
                 : kind == CD_TABLE ? cd_apply_table(c, &s) : false;
-        if (!ok || s.bad) return false;
+        if (!ok || s.bad) { g_rd_ver = CAT_VERSION; return false; }
     }
+    g_rd_ver = CAT_VERSION;
     return !r.bad;
 }
 

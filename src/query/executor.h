@@ -6,7 +6,7 @@
 #include "../storage/buffer_pool.h"
 #include "../table/tuple.h"
 #include "../table/heap.h"
-#include "../index/btree.h"
+#include "../index/bptree.h"
 #include "../bridge/db_api.h"
 #include "../tx/wal.h"
 #include "parser.h"
@@ -93,6 +93,13 @@ bool executor_fk_checks(void);
 
 // tabella eliminata: la sua catena di pagine (root) non è più riferita dal catalogo (P1.5: il motore la libera)
 void executor_set_drop_hook(void (*hook)(uint32_t root));
+// indici su disco (P1.6): hook chiamato quando una scrittura azzera gli alberi di una tabella (il motore lo registra
+// nel log prima della riga); scrittura degli alberi al checkpoint; radici abbandonate da liberare; contatore
+void executor_set_tree_hook(void (*hook)(void));
+int  executor_trees_write(ExecCtx* ctx, uint64_t lsn);
+int  executor_trees_garbage(uint32_t** roots);
+void executor_trees_drop_all(Catalog* c);
+void executor_trees_count(Catalog* c);
 
 // VACUUM FULL: riscrive le righe della tabella in pagine nuove; NULL = fatto (radice e pagine in out_*)
 const char* executor_rebuild_table(ExecCtx* ctx, TableSchema* ts, uint32_t* out_root, uint32_t* out_pages);

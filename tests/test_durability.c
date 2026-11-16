@@ -157,6 +157,14 @@ static long long num(const char* sql) {
     db_result_free(r);
     return v;
 }
+static long long stat_num(const char* name) {               // valore numerico di SHOW STATUS
+    QueryResult* r = q("SHOW STATUS");
+    long long v = -1;
+    for (int i = 0; r && r->success && i < r->num_rows; i++)
+        if (!strcmp(r->rows[i].cells[0].value, name)) v = atoll(r->rows[i].cells[1].value);
+    db_result_free(r);
+    return v;
+}
 static void sh(const char* cmd) { if (system(cmd) != 0) { printf("command failed: %s\n", cmd); exit(1); } }
 
 #define BASE  "/tmp/sv_dur_base"
@@ -631,7 +639,13 @@ int main(void) {
         for (int i = 0; st1 && st1->success && i < st1->num_rows; i++)
             if (!strcmp(st1->rows[i].cells[0].value, "in_memory_indexes")) mi1 = atoi(st1->rows[i].cells[1].value);
         db_result_free(st1);
-        CHECK(mi0 >= 2 && mi1 >= 1 && mi1 >= mi0 - 1, "the index of the untouched table survives the rollbacks (%d -> %d)", mi0, mi1);
+        // (t ha il suo albero su disco dalla chiusura di BASE, P1.6: in memoria c'è solo l'indice di small)
+        bool t_tree = false;
+        QueryResult* ex = q("EXPLAIN SELECT v FROM t WHERE id = 77");
+        for (int i = 0; ex && ex->success && i < ex->num_rows; i++)
+            for (int j = 0; j < ex->num_cols; j++) if (!ex->rows[i].cells[j].is_null && strstr(ex->rows[i].cells[j].value, "B+tree on disk")) t_tree = true;
+        db_result_free(ex);
+        CHECK(mi0 >= 1 && mi1 >= mi0 - 1 && t_tree, "the index of the untouched table survives the rollbacks (%d -> %d, on-disk tree %d)", mi0, mi1, t_tree);
         CHECK(num("SELECT v FROM small WHERE id = 1") == 10 && num("SELECT COUNT(*) FROM small") == 3 &&
               num("SELECT COUNT(*) FROM small WHERE id = 1050") == 0 && num("SELECT v FROM t WHERE id = 77") == 77,
               "rows and indexes right after the rollbacks");
@@ -1207,6 +1221,120 @@ int main(void) {
         waitpid(pp, &ps, 0);
         CHECK(WIFEXITED(ps) && WEXITSTATUS(ps) == 0, "restart with 2 001 tables reads them back in under 20 MB of memory (exit %d)",
               WIFEXITED(ps) ? WEXITSTATUS(ps) : -1);
+    }
+
+    // ── 10. P1.6: indici su disco. Alla chiusura gli indici in memoria diventano B+tree; dopo il riavvio una ricerca
+    //        per chiave legge poche pagine e non ricostruisce l'indice; una scrittura li invalida (anche dopo una
+    //        caduta), ALTER li rende inutilizzabili, una pagina danneggiata fa ripiegare sulla lettura della tabella ──
+    {
+        #define TB BASE "_tree"
+        sh("rm -rf " TB " && mkdir -p " TB);
+        CHECK(db_init(TB), "init for the on-disk index tests");
+        ok("CREATE DATABASE d"); ok("USE d");
+        ok("CREATE TABLE big (id INT PRIMARY KEY, email VARCHAR(40) UNIQUE, pad VARCHAR(300))");
+        ok("BEGIN");
+        for (int i = 1; i <= 20000; i++) {
+            char q2[500];
+            snprintf(q2, sizeof(q2), "INSERT INTO big VALUES (%d, 'User%d@Example.com', '%0280d')", i, i, i);
+            ok(q2);
+        }
+        ok("COMMIT");
+        CHECK(num("SELECT LENGTH(pad) FROM big WHERE id = 777") == 280 && num("SELECT id FROM big WHERE email = 'User9@Example.com'") == 9,
+              "lookups build the in-memory indexes (id, email)");
+        db_shutdown();                                         // chiusura: gli alberi vanno su disco
+        CHECK(db_init(TB), "reopen with on-disk indexes");
+        ok("USE d");
+        long long m0 = stat_num("buffer_misses");
+        CHECK(num("SELECT id FROM big WHERE id = 15000") == 15000, "primary-key lookup after restart");
+        long long m1 = stat_num("buffer_misses");
+        CHECK(m1 - m0 <= 4 && stat_num("in_memory_indexes") == 0, "the lookup read %lld pages and built no in-memory index", m1 - m0);
+        printf("on-disk index: primary-key lookup after restart read %lld pages (table of 20 000 rows, ~1 600 pages)\n", m1 - m0);
+        CHECK(num("SELECT id FROM big WHERE email = 'User12345@Example.com'") == 12345, "text key through the on-disk index");
+        CHECK(num("SELECT COUNT(*) FROM big WHERE id = 20001") == 0 && num("SELECT COUNT(*) FROM big WHERE email = 'nobody'") == 0, "absent keys");
+        QueryResult* er = q("EXPLAIN SELECT * FROM big WHERE id = 42");
+        bool on_disk = false;
+        for (int i = 0; er && er->success && i < er->num_rows; i++)
+            for (int j = 0; j < er->num_cols; j++) if (!er->rows[i].cells[j].is_null && strstr(er->rows[i].cells[j].value, "B+tree on disk")) on_disk = true;
+        db_result_free(er);
+        CHECK(on_disk, "EXPLAIN shows the B+tree on disk");
+        // una scrittura invalida gli alberi: i valori nuovi si trovano
+        ok("UPDATE big SET email = 'changed@example.com' WHERE id = 5");
+        CHECK(num("SELECT id FROM big WHERE email = 'changed@example.com'") == 5 && num("SELECT COUNT(*) FROM big WHERE email = 'user5@example.com'") == 0,
+              "after a write the lookup sees the new value (tree invalidated)");
+        db_shutdown();
+        CHECK(db_init(TB), "reopen after the write");
+        ok("USE d");
+        CHECK(num("SELECT id FROM big WHERE email = 'changed@example.com'") == 5 && stat_num("in_memory_indexes") == 0,
+              "the tree written at the last shutdown has the new value");
+        db_shutdown();
+        // caduta subito dopo una scrittura: il recupero rifà l'azzeramento degli alberi, il valore nuovo si trova
+        pid_t cp = fork();
+        if (cp == 0) {
+            if (!db_init(TB)) _exit(2);
+            ok("USE d");
+            ok("SET GLOBAL synchronous = FULL");
+            if (!ok("DELETE FROM big WHERE id = 7") || !ok("INSERT INTO big VALUES (30000, 'late@example.com', 'x')")) _exit(4);
+            _exit(0);                                          // niente chiusura
+        }
+        int cst;
+        waitpid(cp, &cst, 0);
+        CHECK(WIFEXITED(cst) && WEXITSTATUS(cst) == 0, "writes before the crash");
+        CHECK(db_init(TB), "restart after a crash with trees on disk");
+        ok("USE d");
+        CHECK(num("SELECT COUNT(*) FROM big WHERE id = 7") == 0 && num("SELECT id FROM big WHERE email = 'late@example.com'") == 30000 &&
+              num("SELECT id FROM big WHERE id = 30000") == 30000, "after the crash the trees are not used: deleted and inserted rows seen");
+        db_shutdown();
+        // ALTER (tabella riscritta): l'albero non vale più
+        CHECK(db_init(TB), "reopen for ALTER");
+        ok("USE d");
+        CHECK(num("SELECT id FROM big WHERE id = 30000") == 30000, "tree rebuilt at the previous shutdown");
+        ok("ALTER TABLE big ADD COLUMN extra INT DEFAULT 3");
+        CHECK(num("SELECT extra FROM big WHERE id = 19999") == 3, "after ALTER TABLE the lookup reads the rewritten table");
+        db_shutdown();
+        // pagina della radice danneggiata: si ripiega sulla lettura della tabella
+        CHECK(db_init(TB), "reopen to damage a tree page");
+        ok("USE d");
+        CHECK(num("SELECT id FROM big WHERE id = 123") == 123, "lookup before the damage");
+        db_shutdown();
+        {
+            QueryResult* dummy = NULL; (void)dummy;
+            // la radice dell'albero di id: dal catalogo (EXPLAIN non la dice) — si danneggiano tutte le pagine d'indice
+            int fd = open(TB "/segvault.db", O_RDWR);
+            struct stat stt;
+            fstat(fd, &stt);
+            int damaged = 0;
+            for (off_t off = 4096; off + 4096 <= stt.st_size; off += 4096) {
+                unsigned char hdr[10];
+                if (pread(fd, hdr, sizeof(hdr), off) != (ssize_t)sizeof(hdr)) break;
+                uint16_t flags = (uint16_t)(hdr[8] | hdr[9] << 8);
+                if ((flags & 0x20) && !(flags & 0x10)) { unsigned char junk[16]; memset(junk, 0x77, sizeof(junk)); if (pwrite(fd, junk, sizeof(junk), off + 200)) {} damaged++; }
+            }
+            close(fd);
+            CHECK(damaged > 0, "index pages found on disk (%d)", damaged);
+        }
+        CHECK(db_init(TB), "reopen with damaged index pages");
+        ok("USE d");
+        CHECK(num("SELECT id FROM big WHERE id = 456") == 456 && num("SELECT id FROM big WHERE email = 'User888@Example.com'") == 888,
+              "a damaged tree falls back to the table");
+        // DROP TABLE e VACUUM: le pagine degli alberi tornano libere
+        db_shutdown();
+        CHECK(db_init(TB), "reopen for VACUUM");
+        ok("USE d");
+        ok("CREATE TABLE t2 (id INT PRIMARY KEY, v INT)");
+        ok("BEGIN");
+        for (int i = 1; i <= 5000; i++) { char q2[100]; snprintf(q2, sizeof(q2), "INSERT INTO t2 VALUES (%d, %d)", i, i); ok(q2); }
+        ok("COMMIT");
+        CHECK(num("SELECT v FROM t2 WHERE id = 4000") == 4000, "t2 indexed");
+        CHECK(ok("CHECKPOINT"), "CHECKPOINT writes the trees");
+        ok("DROP TABLE t2");
+        QueryResult* vr = q("VACUUM");
+        long long vfreed = vr && vr->success ? vr->rows_affected : -1;
+        db_result_free(vr);
+        CHECK(vfreed > 0, "VACUUM after DROP TABLE frees pages (%lld)", vfreed);
+        CHECK(num("SELECT id FROM big WHERE id = 20000") == 20000 && num("SELECT COUNT(*) FROM big") == 19999 + 1 - 0, "big intact after VACUUM");
+        db_shutdown();
+        sh("rm -rf " TB);
+        #undef TB
     }
 
     sh("rm -rf " BASE " " WORK " " CRASH);

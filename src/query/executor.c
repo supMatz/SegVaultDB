@@ -1745,6 +1745,149 @@ static void mi_on_delete(const char* db, TableSchema* ts, const Tuple* t, RID ri
     }
 }
 
+// ── alberi su disco (P1.6, passo 1) ─────────────────────────────
+// Al checkpoint finale (chiusura) e con CHECKPOINT, ogni indice in memoria di una colonna di una tabella con almeno
+// TREE_MIN_ROWS righe viene scritto come B+tree di sola lettura (src/index/bptree.c) e la sua radice va nel catalogo
+// (TableSchema.tree_*). Dopo un riavvio una ricerca per chiave legge radice e foglia (2-3 pagine) invece di
+// costruire l'indice leggendo tutta la tabella. La prima scrittura sulla tabella azzera i suoi alberi e il motore
+// lo registra nel log prima della riga (g_tree_hook); un albero vale solo se la tabella ha ancora la radice, e la
+// colonna il tipo e la collation, di quando è stato scritto (ALTER / TRUNCATE riscrivono la tabella). Le pagine
+// degli alberi abbandonati si liberano al checkpoint successivo (executor_trees_garbage), o con VACUUM.
+#define TREE_MIN_ROWS 64
+
+static void (*g_tree_hook)(void);
+void executor_set_tree_hook(void (*hook)(void)) { g_tree_hook = hook; }
+
+static uint32_t* g_tree_garbage;
+static int g_ntree_garbage, g_captree_garbage;
+static int g_trees_live;                    // tabelle del catalogo con alberi (0: nessun controllo in più)
+static _Thread_local unsigned g_stmt_gen;   // statement corrente (controllo del catalogo una volta per statement)
+static _Thread_local const TableSchema* g_tw_ts;
+static _Thread_local unsigned g_tw_gen;
+
+static void tree_garbage_add(uint32_t root) {
+    if (!root) return;
+    if (g_ntree_garbage == g_captree_garbage) {
+        int nc = g_captree_garbage ? g_captree_garbage * 2 : 16;
+        uint32_t* nv = sv_try_realloc(g_tree_garbage, sizeof(uint32_t) * (size_t)nc);
+        if (!nv) return;                                    // pagine perse fino a un VACUUM
+        g_tree_garbage = nv;
+        g_captree_garbage = nc;
+    }
+    g_tree_garbage[g_ntree_garbage++] = root;
+}
+
+static void trees_drop(TableSchema* ts) {
+    if (!ts || !ts->ntrees) return;
+    for (int i = 0; i < ts->ntrees; i++) tree_garbage_add(ts->tree_root[i]);
+    ts->ntrees = 0;
+    if (g_trees_live > 0) g_trees_live--;
+}
+
+// radici degli alberi abbandonati (la lista passa a chi chiama, da liberare dopo un salvataggio del catalogo)
+int executor_trees_garbage(uint32_t** roots) {
+    *roots = g_tree_garbage;
+    int n = g_ntree_garbage;
+    g_tree_garbage = NULL;
+    g_ntree_garbage = g_captree_garbage = 0;
+    return n;
+}
+
+void executor_trees_drop_all(Catalog* c) {
+    for (int d = 0; c && d < c->num_databases; d++)
+        for (int t = 0; t < c->databases[d].num_tables; t++) trees_drop(c->databases[d].tables[t]);
+    g_trees_live = 0;
+}
+
+void executor_trees_count(Catalog* c) {
+    g_trees_live = 0;
+    for (int d = 0; c && d < c->num_databases; d++)
+        for (int t = 0; t < c->databases[d].num_tables; t++) if (c->databases[d].tables[t]->ntrees) g_trees_live++;
+}
+
+// prima di registrare una modifica della tabella: i suoi alberi non valgono più
+static void trees_on_write(ExecCtx* ctx, TableSchema* ts) {
+    bool any = false;
+    if (ts->ntrees) { trees_drop(ts); any = true; }
+    if (g_trees_live > 0 && (g_tw_ts != ts || g_tw_gen != g_stmt_gen)) {      // ts copia di lavoro: quella del catalogo
+        g_tw_ts = ts;
+        g_tw_gen = g_stmt_gen;
+        Database* db = catalog_current_db(ctx->catalog);
+        TableSchema* c = db ? catalog_get_table(ctx->catalog, db->name, ts->name) : NULL;
+        if (c && c != ts && c->ntrees) { trees_drop(c); any = true; }
+    }
+    if (any && g_tree_hook) g_tree_hook();
+}
+
+// albero valido della colonna (-1 = nessuno)
+static int tree_for(const TableSchema* ts, int col) {
+    for (int i = 0; i < ts->ntrees; i++)
+        if (ts->tree_col[i] == col && ts->tree_root[i] && ts->tree_tabroot[i] == ts->root_page_id &&
+            ts->tree_type[i] == (uint8_t)ts->columns[col].type && ts->tree_ci[i] == (uint8_t)col_is_ci(ts, col)) return i;
+    return -1;
+}
+
+static bool mi_exists(const char* db, const char* table, const char* col) {
+    sv_rw_rd(&g_mi_lock);
+    bool f = false;
+    for (MemIndex* ix = g_mem_indexes; ix && !f; ix = ix->next)
+        f = !strcasecmp(ix->db, db) && !strcasecmp(ix->table, table) && !strcasecmp(ix->col, col);
+    sv_rw_rdunlock(&g_mi_lock);
+    return f;
+}
+
+// ricerca nell'albero su disco della colonna, se c'è e l'indice in memoria non è già costruito: 1 trovata / 0 assente
+// (*r malloc'd), -1 = nessun albero utilizzabile (si usa l'indice in memoria)
+static int tree_probe(ExecCtx* x, const char* db, TableSchema* ts, int col, const char* key, RID** r, int* n) {
+    *r = NULL;
+    *n = 0;
+    int ti = tree_for(ts, col);
+    if (ti < 0 || mi_exists(db, ts->name, ts->columns[col].name)) return -1;
+    if (heap_snapshot_active(ts->root_page_id)) return -1;
+    int f = bpt_lookup(x->bp, ts->tree_root[ti], key, r, n, NULL);
+    return f < 0 ? -1 : f;
+}
+
+typedef struct { const char* key; int list; } TreeKey;
+static int treekey_cmp(const void* a, const void* b) { return strcmp(((const TreeKey*)a)->key, ((const TreeKey*)b)->key); }
+
+// scrive gli alberi degli indici in memoria che non ne hanno uno valido (nessuna transazione aperta: gli indici
+// descrivono le righe confermate). Ritorna gli alberi scritti
+int executor_trees_write(ExecCtx* ctx, uint64_t lsn) {
+    int written = 0;
+    for (MemIndex* ix = g_mem_indexes; ix; ix = ix->next) {
+        if (ix->ncols != 1 || ix->has_long) continue;
+        TableSchema* ts = catalog_get_table(ctx->catalog, ix->db, ix->table);
+        if (!ts || ts->num_rows < TREE_MIN_ROWS) continue;
+        int col = ix->cols[0];
+        if (col < 0 || col >= ts->num_columns || tree_for(ts, col) >= 0) continue;
+        TreeKey* tk = sv_try_malloc(sizeof(TreeKey) * (size_t)(ix->nlists ? ix->nlists : 1));
+        BptEntry* e = sv_try_malloc(sizeof(BptEntry) * (size_t)(ix->nlists ? ix->nlists : 1));
+        if (!tk || !e) { free(tk); free(e); continue; }
+        int n = 0;
+        for (int i = 0; i < ix->nlists; i++) if (ix->lists[i].n > 0) tk[n++] = (TreeKey){ ix->lkeys[i], i };
+        qsort(tk, (size_t)n, sizeof(TreeKey), treekey_cmp);
+        for (int i = 0; i < n; i++) e[i] = (BptEntry){ tk[i].key, ix->lists[tk[i].list].r, ix->lists[tk[i].list].n };
+        uint32_t root = 0;
+        int rc = bpt_build(ctx->bp, e, n, lsn, &root, NULL);
+        free(tk);
+        free(e);
+        if (rc != SV_OK) continue;                          // chiave lunga o troppi doppioni: niente albero
+        int slot = -1;
+        for (int i = 0; i < ts->ntrees; i++) if (ts->tree_col[i] == col) slot = i;
+        if (slot >= 0) tree_garbage_add(ts->tree_root[slot]);   // albero vecchio (tabella riscritta)
+        else if (ts->ntrees < SV_MAX_TREES) { slot = ts->ntrees++; if (slot == 0) g_trees_live++; }
+        else { tree_garbage_add(root); continue; }
+        ts->tree_col[slot] = (uint16_t)col;
+        ts->tree_type[slot] = (uint8_t)ts->columns[col].type;
+        ts->tree_ci[slot] = (uint8_t)col_is_ci(ts, col);
+        ts->tree_root[slot] = root;
+        ts->tree_tabroot[slot] = ts->root_page_id;
+        written++;
+    }
+    return written;
+}
+
 // ═════════════════════════════════════════════════════════════════
 //  Sorgenti di righe (FROM / JOIN): tabelle o viste
 // ═════════════════════════════════════════════════════════════════
@@ -5271,6 +5414,7 @@ struct SelectPlan {
     ASTExpr*  probe_key[MAX_SOURCES];
     bool      probe_dyn[MAX_SOURCES];
     bool      used_index[MAX_SOURCES];
+    bool      used_tree[MAX_SOURCES];     // la ricerca per chiave ha usato l'albero su disco (P1.6)
     // scansione per intervallo con l'indice: colonna >, >=, <, <=, BETWEEN costanti
     int       range_col[MAX_SOURCES];
     ASTExpr*  range_lo[MAX_SOURCES];
@@ -7015,7 +7159,9 @@ static bool plan_load(SelectPlan* p) {
             }
         } else {
             S->loaded = true;
-            HeapFile* hf = heap_open(p->x->bp, S->ts->root_page_id, S->ts->num_pages);
+            // aperta prima senza la mappa delle pagine (che legge tutta la catena): una ricerca per chiave legge solo
+            // le pagine delle righe trovate; per l'intervallo e la scansione si riapre completa qui sotto
+            HeapFile* hf = heap_open_read(p->x->bp, S->ts->root_page_id, S->ts->num_pages);
             if (!hf) { snprintf(p->err, sizeof(p->err), "Failed to read table '%.64s'", S->table); return false; }
             int cap = 0;
             bool done = false;
@@ -7025,8 +7171,31 @@ static bool plan_load(SelectPlan* p) {
                 eval_expr(p->probe_key[s], &ec, &kv);
                 char key[KEY_BUF];
                 bool keyed = probe_text_ci(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key), col_is_ci(S->ts, p->probe_col[s]));
+                // albero su disco (P1.6): radice e foglia invece di costruire l'indice leggendo tutta la tabella
+                bool tree_answered = false;          // l'albero ha risposto (anche "troppe righe": si legge tutto)
+                if (keyed) {
+                    RID* tr = NULL;
+                    int tn = 0;
+                    int tf = tree_probe(p->x, S->db[0] ? S->db : db->name, S->ts, p->probe_col[s], key, &tr, &tn);
+                    if (tf >= 0) { p->probe_rows[s] = tn; tree_answered = true; }
+                    if (tf >= 0 && range_worth(S, tn)) {
+                        done = true;
+                        p->used_index[s] = true;
+                        p->used_tree[s] = true;
+                        for (int i = 0; i < tn; i++) {
+                            Tuple* t = heap_get(hf, tr[i], S->ts);
+                            if (!t) continue;
+                            p->st_scanned[s]++;
+                            cur[s] = t;
+                            if (!xv_all_true(f, &ec)) { tuple_free(t); continue; }
+                            if (!source_push(S, t, tr[i], &cap)) { tuple_free(t); free(tr); free(hf); snprintf(p->err, sizeof(p->err), "Out of memory"); return false; }
+                        }
+                        cur[s] = NULL;
+                    }
+                    free(tr);
+                }
                 // un valore che non diventa una chiave della colonna (testo contro numero, ...): si legge tutto
-                MemIndex* ix = keyed || kv.null ? mi_get(p->x, S->db[0] ? S->db : db->name, S->ts, p->probe_col[s]) : NULL;
+                MemIndex* ix = !done && !tree_answered && (keyed || kv.null) ? mi_get(p->x, S->db[0] ? S->db : db->name, S->ts, p->probe_col[s]) : NULL;
                 const RidList* l = ix && keyed ? mi_lookup(ix, key) : NULL;
                 if (ix) p->probe_rows[s] = l ? l->n : 0;
                 // un valore frequente (più di un quarto delle righe, come per gli intervalli): leggere tutte le
@@ -7044,6 +7213,11 @@ static bool plan_load(SelectPlan* p) {
                         if (!source_push(S, t, l->r[i], &cap)) { tuple_free(t); free(hf); snprintf(p->err, sizeof(p->err), "Out of memory"); return false; }
                     }
                 }
+            }
+            if (!done) {
+                free(hf);
+                hf = heap_open(p->x->bp, S->ts->root_page_id, S->ts->num_pages);
+                if (!hf) { snprintf(p->err, sizeof(p->err), "Failed to read table '%.64s'", S->table); return false; }
             }
             // scansione per intervallo con l'indice ordinato
             if (!done && p->range_col[s] >= 0) {
@@ -8727,6 +8901,11 @@ static long probe_count(SelectPlan* p, int s) {
     eval_expr(p->probe_key[s], &ec, &kv);
     char key[KEY_BUF];
     if (!probe_text_ci(&kv, S->ts->columns[p->probe_col[s]].type, key, sizeof(key), col_is_ci(S->ts, p->probe_col[s]))) return -1;
+    RID* tr = NULL;
+    int tn = 0;
+    int tf = tree_probe(p->x, S->db[0] ? S->db : db->name, S->ts, p->probe_col[s], key, &tr, &tn);
+    free(tr);
+    if (tf >= 0) { p->used_tree[s] = true; return tn; }
     MemIndex* ix = mi_get(p->x, S->db[0] ? S->db : db->name, S->ts, p->probe_col[s]);
     if (!ix) return -1;
     const RidList* l = mi_lookup(ix, key);
@@ -8765,7 +8944,8 @@ static double explain_arm(PlanOut* po, SelectPlan* p, const char* indent, int de
                 est = (double)found;                       // dopo il filtro restano le righe che l'indice ha contato
             } else {
                 est = found >= 0 ? (double)found : S->ts->columns[p->probe_col[s]].primary_key ? 1 : (double)S->ts->num_rows * 0.1;
-                snprintf(det, sizeof(det), "%.64s using %.64s.%.64s (in-memory index)", S->name, S->table, cn);
+                snprintf(det, sizeof(det), "%.64s using %.64s.%.64s (%s)", S->name, S->table, cn,
+                         p->used_tree[s] ? "B+tree on disk" : "in-memory index");
                 plan_row_a(po, indent, "Index lookup", det, est, po->analyze ? p->st_scanned[s] : -1);
             }
             // la condizione della ricerca è già nel conteggio: il filtro sotto non la ricalcola
@@ -9087,6 +9267,7 @@ static void change_notify(ExecCtx* ctx, uint8_t type, RID rid, RID nrid, const u
 }
 
 static void wal_log(ExecCtx* ctx, uint8_t type, RID rid, const Tuple* newt, const Tuple* oldt, TableSchema* ts) {
+    trees_on_write(ctx, ts);                       // gli alberi su disco della tabella non valgono più (P1.6)
     if (!ctx->wal) return;
     size_t nl = 0, ol = 0;
     uint8_t* ns = newt ? tuple_serialize((Tuple*)newt, ts, &nl) : NULL;
@@ -9100,6 +9281,7 @@ static void wal_log(ExecCtx* ctx, uint8_t type, RID rid, const Tuple* newt, cons
 }
 
 static void wal_log_move(ExecCtx* ctx, RID old_rid, RID new_rid, const Tuple* newt, const Tuple* oldt, TableSchema* ts) {
+    trees_on_write(ctx, ts);
     if (!ctx->wal) return;
     size_t nl = 0, ol = 0;
     uint8_t* ns = tuple_serialize((Tuple*)newt, ts, &nl);
@@ -12783,6 +12965,7 @@ static QueryResult* exec_returning(ExecCtx* ctx, ASTNode* stmt) {
 
 QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt) {
     if (g_run_depth == 0) heap_damage_clear();
+    g_stmt_gen++;
     g_run_depth++;
     g_select_total = -1;
     QueryResult* r = stmt->nret > 0 ? exec_returning(ctx, stmt) : executor_run_impl(ctx, stmt);

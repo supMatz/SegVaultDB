@@ -5,6 +5,7 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
        tramite l'API definita in db_api.h.
 */
 #include "db_api.h"
+#include "../index/bptree.h"
 #include "../table/binesc.h"
 #include "auth.h"
 #include "../catalog/schema.h"
@@ -63,12 +64,14 @@ static void on_table_dropped(uint32_t root);
 static void pf_stmt_end(void);
 static void pf_process(void);
 static void pf_ddl_saved(int how);
+static void on_trees_dropped(void);
 static void db_mutex_init(void) {
     sv_rw_init(&g_db_rw);
     lk_init();
     executor_set_change_hook(chg_hook);
     heap_set_abandon_hook(on_chain_abandoned);     // spazio liberato subito (P1.5)
     executor_set_drop_hook(on_table_dropped);
+    executor_set_tree_hook(on_trees_dropped);
 }
 static void db_lock(void)       { if (g_lock_depth++ == 0) sv_rw_wr(&g_db_rw); }
 static void db_unlock(void)     { if (--g_lock_depth == 0) sv_rw_wrunlock(&g_db_rw); }
@@ -240,6 +243,7 @@ static bool db_init_impl(const char* data_directory) {
     // Inizializza i componenti
     g_db.catalog = catalog_load(g_db.cat_path);
     catalog_mark_logged(g_db.catalog);                   // il prossimo DDL registra solo ciò che cambia
+    executor_trees_count(g_db.catalog);
     {                                                     // sequenze (CREATE SEQUENCE)
         char sp[600];
         snprintf(sp, sizeof(sp), "%s" SV_PATH_SEP "sequences.txt", data_directory);
@@ -316,6 +320,35 @@ bool db_cancel_requested(void) { return atomic_load(&g_cancel_requested) != 0; }
 
 static int64_t g_ckpt_kept;      // byte rimasti nel log dopo l'ultimo checkpoint (record delle transazioni aperte)
 
+// ── indici su disco (P1.6) ──
+// una scrittura ha azzerato gli alberi di una tabella: il catalogo cambiato va nel log prima della riga (lo stesso
+// log, in ordine: il recupero rifà prima l'azzeramento). Senza memoria per il record: catalogo salvato intero
+static void on_trees_dropped(void) {
+    if (!g_db.wal || io_failed()) return;
+    size_t n = 0;
+    uint8_t* rec = catalog_delta(g_db.catalog, &n);
+    if (rec) {
+        wal_write(g_db.wal, LOG_CATALOG, 0, 0, (SVRID){0, 0}, rec, (uint32_t)n, NULL, 0);
+        free(rec);
+    } else if (n == 1 && catalog_save(g_db.catalog, g_db.cat_path) == SV_OK) catalog_mark_logged(g_db.catalog);
+}
+
+static void free_tree_page(void* ctx, uint32_t page) { bp_free_page_now(g_db.bp, page, *(const uint64_t*)ctx); }
+
+// pagine degli alberi abbandonati: libere, da chiamare dopo un salvataggio del catalogo che non li nomina più
+static void trees_free_garbage(void) {
+    uint32_t* roots = NULL;
+    int n = executor_trees_garbage(&roots);
+    uint64_t lsn = (uint64_t)wal_size(g_db.wal);
+    for (int i = 0; i < n; i++) bpt_pages(g_db.bp, roots[i], free_tree_page, &lsn);
+    free(roots);
+}
+
+// alberi degli indici in memoria (CHECKPOINT, chiusura): solo senza transazioni aperte
+static void trees_write(void) {
+    if (g_open_tx == 0 && !io_failed() && g_db.wal) executor_trees_write(&g_db.exec_ctx, (uint64_t)wal_size(g_db.wal));
+}
+
 // Checkpoint: pagine e catalogo su disco, poi il log si accorcia. Senza transazioni aperte si svuota; con
 // transazioni aperte (P1.1) resta solo ciò che serve per annullarle (i loro record), così una transazione
 // dimenticata aperta non fa più crescere il log all'infinito né blocca il checkpoint
@@ -323,6 +356,8 @@ static bool do_checkpoint(void) {
     if (!g_db.initialized || io_failed()) return false;
     if (wal_flush(g_db.wal) != SV_OK || bp_flush_all(g_db.bp) != SV_OK) return false;
     if (catalog_save(g_db.catalog, g_db.cat_path) != SV_OK) return false;
+    catalog_mark_logged(g_db.catalog);
+    trees_free_garbage();                 // il catalogo salvato non nomina più gli alberi abbandonati
     bp_checkpoint_done(g_db.bp);          // prima di accorciare il log: da qui le pagine vecchie vogliono l'immagine
     uint64_t act[SV_MAX_TRANSACTIONS];
     int n = 0;
@@ -370,6 +405,7 @@ static void free_heap(uint32_t root, uint64_t lsn);
 // pagine vecchie libere (un arresto a metà lascia tabelle già compattate e altre com'erano)
 static bool do_vacuum_full(int* freed) {
     int f0 = 0;
+    executor_trees_drop_all(g_db.catalog);           // le righe cambiano posto: gli alberi su disco non valgono più
     if (!do_vacuum(&f0)) return false;
     for (int pass = 0; pass < 2; pass++) {
         bp_free_lowest_first(g_db.bp);
@@ -404,6 +440,12 @@ static bool do_vacuum_full(int* freed) {
     return do_checkpoint();
 }
 
+typedef struct { uint8_t* bits; uint32_t n; } TreeMarks;
+static void mark_tree_page(void* ctx, uint32_t page) {
+    TreeMarks* tm = ctx;
+    if (page < tm->n) tm->bits[page / 8] |= (uint8_t)(1u << (page % 8));
+}
+
 static bool do_vacuum(int* freed) {
     *freed = 0;
     if (!do_checkpoint()) return false;                 // log vuoto: nessun record nomina le pagine
@@ -423,11 +465,22 @@ static bool do_vacuum(int* freed) {
         }
     }
     heap_pages_bitmap = NULL;
+    // pagine degli alberi su disco del catalogo (P1.6); quelle degli alberi abbandonati si liberano qui sotto
+    uint8_t* treeu = sv_calloc((size_t)npages / 8 + 1, 1);
+    if (!treeu) { free(used); free(heapu); return false; }
+    TreeMarks tm = { treeu, npages };
+    for (int d = 0; d < g_db.catalog->num_databases; d++)
+        for (int t = 0; t < g_db.catalog->databases[d].num_tables; t++) {
+            TableSchema* ts = g_db.catalog->databases[d].tables[t];
+            for (int k = 0; k < ts->ntrees; k++) bpt_pages(g_db.bp, ts->tree_root[k], mark_tree_page, &tm);
+        }
+    { uint32_t* g = NULL; executor_trees_garbage(&g); free(g); }   // liberate qui (non due volte)
     // una catena interrotta (pagina danneggiata) farebbe sembrare libere le pagine dopo: niente VACUUM
     if (heap_damage(NULL, 0)) {
         heap_damage_clear();
         free(used);
         free(heapu);
+        free(treeu);
         fprintf(stderr, "[SegVault] VACUUM skipped: a table has a damaged page (run CHECK TABLE)\n");
         return false;
     }
@@ -440,7 +493,10 @@ static bool do_vacuum(int* freed) {
         // pagina di heap che nessuna tabella raggiunge più (tabella eliminata o troncata): anche lei riusabile
         bool heap_unused = !(p->flags & (PAGE_FLAG_OVERFLOW | PAGE_FLAG_FREE)) && (p->flags & PAGE_FLAG_CHAINED) &&
                            !(heapu[id / 8] & (1u << (id % 8)));
-        overflow_unused = overflow_unused || heap_unused;
+        // pagina di un albero su disco che il catalogo non nomina più (abbandonato, o scritto da un checkpoint caduto)
+        bool tree_unused = !(p->flags & (PAGE_FLAG_OVERFLOW | PAGE_FLAG_FREE | PAGE_FLAG_CHAINED)) && (p->flags & PAGE_FLAG_INDEX) &&
+                           !(treeu[id / 8] & (1u << (id % 8)));
+        overflow_unused = overflow_unused || heap_unused || tree_unused;
         bool was_free = (p->flags & PAGE_FLAG_FREE) != 0;
         if (overflow_unused) {
             p->flags = PAGE_FLAG_FREE;                  // anche il "successivo" della catena azzerato
@@ -452,6 +508,7 @@ static bool do_vacuum(int* freed) {
     }
     free(used);
     free(heapu);
+    free(treeu);
     atomic_store(&g_sv_abandoned_pages, 0);
     bp_flush_all(g_db.bp);
     sv_fsync(g_db.db_fd);
@@ -909,6 +966,7 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
         result = g_open_tx > 0 ? result_error("VACUUM is not allowed while a transaction is open")
                : (full ? do_vacuum_full(&freed) : do_vacuum(&freed)) ? result_ok(freed) : result_error("VACUUM failed");
     } else if (stmt->type == NODE_CHECKPOINT) {
+        trees_write();                                    // indici su disco (P1.6)
         result = do_checkpoint() ? result_ok(0) : result_error("Checkpoint failed");   // anche con transazioni aperte (P1.1)
     } else if (stmt->type == NODE_SAVEPOINT) {
         result = db_savepoint(stmt->savepoint.name) ? result_ok(0) : result_error("Failed to set savepoint");
@@ -2239,8 +2297,10 @@ static void db_shutdown_impl(void) {
     // di I/O non si scrive più niente (le pagine senza il loro log violerebbero la regola del WAL).
     bool clean = false;
     if (!io_failed()) {
+        trees_write();                                   // indici su disco per il prossimo avvio (P1.6)
         bool flushed = wal_flush(g_db.wal) == SV_OK && bp_flush_all(g_db.bp) == SV_OK;
         bool cat = catalog_save(g_db.catalog, g_db.cat_path) == SV_OK;
+        if (flushed && cat) trees_free_garbage();
         if (flushed) free_list_save();
         clean = flushed && cat && g_open_tx == 0;
         if (!clean) fprintf(stderr, "[SegVault] %s: the transaction log is kept, the next start recovers from it\n",
