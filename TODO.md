@@ -21,9 +21,10 @@ not executed; **[verify-win]** = Windows-only, needs a run on Windows.
 
 `[ ]` to do · `[~]` in progress · `[x]` done.
 
-**Status 2026-11-16 (in progress towards 1.4):** also closed P1.1, P1.5, P1.7, P1.10, P1.11, P2.5, P2.8 (its
-streaming part moved to the new P1.14), P2.14, P2.15; still open P1.6 (on-disk B+tree), P1.14 (streaming
-executor, found while measuring P1.10), P3.9 (audit of the remaining modules).
+**Status 2026-11-16 (after 1.4.2):** closed P3.10 (CA name constraints); P1.14 partly done (column pruning,
+early stop at `LIMIT`); P3.9 advanced (executor write-path probes, `win32.c` launch / clipboard paths); still
+open P1.6 (on-disk B+tree: plan written in the item), P1.14 (pull-based executor and cursor API), P3.9
+(`parser.c`, most of `executor.c`, `src/widgets/*`, rest of `win32.c`).
 
 **Status after v1.3.0 (2026-11-15):** fixed `[x]` P0.1-P0.12 (Windows parts verified under wine), P1.2, P1.3, P1.4, P1.8, P1.12, P2.1, P2.9, P2.11, P2.13, P3.1, P3.4, P3.7;
 partly done `[~]` P1.5, P1.10, P2.2, P2.3, P2.4, P2.6, P2.7, P2.8,
@@ -508,6 +509,25 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     in-memory accelerator. Either delete `src/index/btree.c` or evolve it into this.
   - **Done when:** cold start on a 1 GB database answers a primary-key lookup with ≤ 4 page reads; `EXPLAIN` shows
     the index; crash tests cover a split in progress.
+  - **Plan (2026-11-16, not started — needs a session of its own: an index that disagrees with its table is
+    silent data loss).** Two steps, the first already meeting the cold-start goal without touching the write
+    path:
+    1. *Checkpointed index snapshots.* At each checkpoint (and clean shutdown) every `MemIndex` that is
+       complete is written bottom-up as a read-only B+tree (no splits: keys are already sorted) — leaf pages
+       `[n][key len + key bytes (the existing `KEY_BUF` text, collation-folded)][RID list]`, internal pages
+       `[n][separator key][child page]`, page flag `PAGE_FLAG_INDEX`, page LSN = checkpoint LSN, pages from the
+       free list; the root goes into `Index.root_page_id` with the catalog save of the checkpoint, the old
+       tree's pages are freed after that save. On the first write to a table after a checkpoint, a
+       `LOG_CATALOG` record setting its roots to 0 is logged **before** the row records (so recovery also
+       sees the tree as stale), then the in-memory index is built as today. A lookup on a table whose root is
+       set reads root → leaf through the buffer pool (≤ 4 pages for 1 GB with 4 KB pages and short keys) and
+       never builds the `MemIndex`; `EXPLAIN` says "B+tree (on disk)". Crash cases to test: crash while the
+       tree is written (catalog still has the old root: new pages are orphans, freed by `VACUUM`), crash after
+       the "stale" record (fallback to the scan), torn index page (CRC: treated as stale).
+    2. *Maintained B+tree.* Inserts / deletes applied to the tree inside the transaction, logged as page
+       images (`LOG_PAGE_IMAGE` already exists) with the transaction's id so undo restores the before-image,
+       splits and merges as a sequence of images in one atomic group; then the `MemIndex` becomes an optional
+       cache. Remove `src/index/btree.c` once step 1 lands (or reuse its tests).
 
 - [x] **P1.7 `[CONCURRENCY]` Table locks for plain reads cause upgrade deadlocks; waits are polled; writers can starve** — [code]
   - **Where:** `src/bridge/db_api.c:841-878` (every `SELECT` takes `LK_S` on its tables, kept to `COMMIT`,
@@ -1412,6 +1432,15 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
       reservation (`SV_THREAD_STACK`; Windows took the executable's default of 1-2 MB, Linux `ulimit -s`).
       **Noted (usability):** a flat `a + b + c + …` of more than 128 terms is refused as "too complex" (the
       AST is a left-deep tree evaluated recursively) — generated SQL summing many columns can hit it.
+    - Executor write paths (probes with a 1 MB stack): an `ON DELETE / ON UPDATE CASCADE` chain of 20 000
+      self-referencing rows is deleted in 24 ms without recursion problems; two triggers inserting into each
+      other's table stop with "nested too deeply"; recursive CTEs, procedures and functions are bounded.
+    - `win32.c` (process launching, clipboard and text conversion paths read; the rest of the file not yet):
+      URLs and files are opened only for `https://` / local server addresses and existing regular files.
+      **Fixed:** a window title over 255 UTF-16 units left the converted buffer without a terminator; the
+      text-drawing buffer did not check `realloc`; a clipboard conversion returning 0 led to reading an
+      uninitialised byte. Linux `xlib.c` launch paths (`xdg-open`, zenity / kdialog via `execv`, descriptors
+      closed) are fine.
     - The fuzz harness (`tests/fuzz/fuzz.c`) had stopped working after P1.11 (a static `TableSchema` with no
       column storage: every target died at start-up under UBSan); fixed with `schema_new`.
 

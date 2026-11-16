@@ -421,7 +421,9 @@ PlatformWindow* platform_window_create(const char* title, int w, int h) {
     RegisterClassW(&wc);
 
     WCHAR wtitle[256];
-    MultiByteToWideChar(CP_UTF8, 0, title, -1, wtitle, 256);
+    // un titolo troppo lungo fa fallire la conversione (0) lasciando il buffer senza terminatore
+    if (MultiByteToWideChar(CP_UTF8, 0, title ? title : "", -1, wtitle, 256) <= 0) wtitle[0] = 0;
+    wtitle[255] = 0;
 
     // la dimensione richiesta è quella dell'area client
     RECT wr = {0, 0, w, h};
@@ -556,8 +558,10 @@ static int to_wide(const char* text, int len, WCHAR** out) {
     if (len < 0) len = (int)strlen(text);
     int need = MultiByteToWideChar(CP_UTF8, 0, text, len, NULL, 0);
     if (need + 1 > cap) {
+        WCHAR* nb = realloc(buf, (size_t)(need + 256) * sizeof(WCHAR));
+        if (!nb) { *out = buf; return 0; }           // senza memoria: niente testo (prima: scrittura su NULL)
+        buf = nb;
         cap = need + 256;
-        buf = realloc(buf, cap * sizeof(WCHAR));
     }
     int n = MultiByteToWideChar(CP_UTF8, 0, text, len, buf, cap);
     *out = buf;
@@ -1017,7 +1021,7 @@ char* platform_get_clipboard(PlatformWindow* win) {
         const WCHAR* w = GlobalLock(h);
         if (w) {
             int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
-            out = malloc(n);
+            out = n > 0 ? malloc((size_t)n) : NULL;          // 0 = conversione non riuscita: niente testo
             if (out) {
                 WideCharToMultiByte(CP_UTF8, 0, w, -1, out, n, NULL, NULL);
                 // rimuove i \r
