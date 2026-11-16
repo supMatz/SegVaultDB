@@ -240,7 +240,7 @@ FUZZ_TARGET ?= all
 FUZZ_SECS ?= 60
 FUZZ_SRCS = tests/fuzz/fuzz.c src/server/server.c src/server/json.c src/server/mysql_wire.c src/server/fastcgi.c src/server/proxy.c \
             src/server/mail.c src/server/rewrite.c src/server/cgi.c src/server/tls.c src/server/h2.c src/widgets/png_write.c \
-            src/widgets/sql_text.c $(ENGINE_SRCS)
+            src/widgets/sql_text.c src/widgets/csv_import.c $(ENGINE_SRCS)
 fuzz_sv: $(FUZZ_SRCS)
 	$(CC) -std=c11 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -I. $(BASE_INCLUDES) -o fuzz_sv $(FUZZ_SRCS) -lsqlite3 -lm -pthread -ldl
 

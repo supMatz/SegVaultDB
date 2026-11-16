@@ -1514,6 +1514,11 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
       functions were already cancellable (probed). **Noted:** `GET_LOCK` / `RELEASE_LOCK` / `IS_FREE_LOCK` are
       no-ops that always succeed (MySQL named locks are not implemented: applications that use them for
       mutual exclusion get none).
+    - `src/widgets/csv_import.c` (read in full; it parses files that come from outside): no memory defect —
+      numeric values are checked before being written unquoted, text values escape `'` and `\`. The column
+      limit was still 64 ("the engine's limit"): raised to 1 024 like the engine (P1.11). New fuzz target
+      `csv` (also in `.github/workflows/fuzz.yml`): 5.3 M inputs in 90 s, no sanitizer error.
+      `sql_text.c` statement splitting falls back to the heap past 64 statements (fine).
     - The fuzz harness (`tests/fuzz/fuzz.c`) had stopped working after P1.11 (a static `TableSchema` with no
       column storage: every target died at start-up under UBSan); fixed with `schema_new`.
 

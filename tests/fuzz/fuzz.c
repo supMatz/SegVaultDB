@@ -1,6 +1,6 @@
 // Fuzzer mutazionale (P3.3), senza libFuzzer: da compilare con -fsanitize=address,undefined (make fuzz).
 //   ./fuzz TARGET SECONDI [SEED]       TARGET: sql | json | login | page | catalog | exec | http | h2 | smtp |
-//                                       htaccess | regex | sqljson | diff | all
+//                                       htaccess | regex | sqljson | csv | diff | all
 // Parte da input validi (seed qui sotto), li muta (bit, byte, inserimenti, cancellazioni, incroci, parole
 // chiave) e li passa al parser. Un errore di memoria o un comportamento indefinito ferma tutto con il
 // rapporto del sanitizer; l'input che l'ha causato è in fuzz-crash.bin.
@@ -18,6 +18,7 @@
 #include "src/server/rewrite.h"
 #include "src/query/regex.h"
 #include "src/query/sqljson.h"
+#include "src/widgets/csv_import.h"
 #include <sqlite3.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -367,6 +368,21 @@ static void run_regex(void) {
     }
     sv_regex_free(re);
 }
+// CSV importato dall'app (P3.9): file che arrivano da fuori
+static const char* const CSV_SEEDS[] = {
+    "id,nome,prezzo\n1,\"Rossi, Mario\",12.5\n2,\"a \"\"b\"\"\",-3\n3,,1e5\n",
+    "\xef\xbb\xbf" "col;Città;x\r\n\"multi\nline\";è;+7\r\n",
+};
+static void run_csv(void) {
+    g_buf[g_n] = 0;
+    CsvImportInfo info;
+    char* sql = csv_to_sql((const char*)g_buf, "imp", true, 0, &info);
+    free(sql);
+    sql = csv_to_sql((const char*)g_buf, "imp", false, ';', &info);
+    free(sql);
+    char name[64];
+    csv_table_name_from_path((const char*)g_buf, name, sizeof(name));
+}
 static const char* const SJ_SEEDS[] = {
     "{\"a\": [1, 2.5e3, {\"b\": null, \"c\": \"\\u00e8\\n\"}], \"d\": true, \"e\": {\"f\": [[]]}}",
     "[{\"k\": \"v\"}, -0, 1e-400, \"\\ud83d\\ude00\", false]",
@@ -568,6 +584,7 @@ int main(int argc, char** argv) {
         { "htaccess", run_htaccess, 4000, NS(HTA_SEEDS),  NULL, 0, NS(HTTP_WORDS), false },
         { "regex",    run_regex,    200,  NS(RX_SEEDS),   NULL, 0, NULL, 0, false },
         { "sqljson",  run_sqljson,  4000, NS(SJ_SEEDS),   NULL, 0, NULL, 0, false },
+        { "csv",      run_csv,      8000, NS(CSV_SEEDS),  NULL, 0, NULL, 0, false },
         { "diff",     run_diff,     0,    NULL, 0, NULL, 0, NULL, 0, true },
     };
     T[2].bseed_n = login_n; T[3].bseed_n = page_n; T[4].bseed_n = cat_n; T[7].bseed_n = g_h2_seed_n;

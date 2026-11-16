@@ -6,7 +6,7 @@
 #include <errno.h>
 #include <limits.h>
 
-#define CSV_MAX_COLS   64      // limite del motore per INSERT
+#define CSV_MAX_COLS   1024    // come SV_MAX_COLUMNS (P1.11; prima 64)
 #define CSV_MAX_FIELD  500     // limite del motore per un valore
 
 typedef struct { char* p; size_t n, cap; bool ok; } Buf;

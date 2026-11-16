@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [sql, json, login, page, catalog, exec, http, h2, smtp, htaccess, regex, sqljson, diff]
+        target: [sql, json, login, page, catalog, exec, http, h2, smtp, htaccess, regex, sqljson, csv, diff]
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
