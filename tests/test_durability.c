@@ -375,8 +375,13 @@ int main(void) {
             close(pfd[0]);
             waitpid(pid, &st, 0);
         }
+#ifdef __SANITIZE_ADDRESS__
+        // sotto ASan la memoria liberata resta in quarantena (256 MB): il confronto non vale
+        CHECK(rss[0] > 0 && rss[1] > 0, "recovery of a %lld-byte log ran (memory not compared under ASan: %ld KB more)", (long long)ls.st_size, rss[0] - rss[1]);
+#else
         CHECK(rss[0] > 0 && rss[1] > 0 && rss[0] - rss[1] < 16 * 1024, "recovery of a %lld-byte log uses %ld KB more than a plain start (limit 16 MB)",
               (long long)ls.st_size, rss[0] - rss[1]);
+#endif
         CHECK(db_init(WORK), "reopen after the big recovery");
         ok("USE d");
         CHECK(num("SELECT COUNT(*) FROM big") == 60000 && num("SELECT COUNT(*) FROM hold") == 0, "big recovery: committed rows kept, open one undone");
@@ -983,7 +988,7 @@ int main(void) {
             if (WIFSIGNALED(st2) && WTERMSIG(st2) == SIGABRT) aborted++;
             if (!clean) { bad++; CHECK(0, "allocation failure %ld: child ended with status %d", k, st2); continue; }
             if (!db_init(WORK)) { bad++; CHECK(0, "restart after allocation failure %ld: %s", k, db_init_error()); continue; }
-            q("USE d");
+            ok("USE d");
             long long c = num("SELECT COUNT(*) FROM t WHERE id <= 600"), sum = num("SELECT SUM(v) FROM t WHERE id <= 600");
             long long extra = num("SELECT COUNT(*) FROM t WHERE id >= 100000");
             long long padx = num("SELECT COUNT(*) FROM t WHERE id >= 100000 AND pad = 'x'");

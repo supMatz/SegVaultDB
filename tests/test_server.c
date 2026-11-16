@@ -412,8 +412,9 @@ static void my_execute(My* m, uint32_t id, int np, const char* const* vals, char
             if (c) ol += (size_t)snprintf(out + ol, on - ol, "|");
             if (p[1 + (c + 2) / 8] & (1u << ((c + 2) % 8))) { ol += (size_t)snprintf(out + ol, on - ol, "NULL"); continue; }
             if (types[c] == 8) {
-                long long v = 0;
-                for (int b = 0; b < 8; b++) v |= (long long)p[pos + b] << (8 * b);
+                unsigned long long u = 0;
+                for (int b = 0; b < 8; b++) u |= (unsigned long long)p[pos + b] << (8 * b);
+                long long v = (long long)u;
                 pos += 8;
                 ol += (size_t)snprintf(out + ol, on - ol, "%lld", v);
             } else if (types[c] == 5) {
