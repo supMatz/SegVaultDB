@@ -62,7 +62,7 @@ static void on_chain_abandoned(uint32_t first, uint32_t total);
 static void on_table_dropped(uint32_t root);
 static void pf_stmt_end(void);
 static void pf_process(void);
-static void pf_ddl_saved(void);
+static void pf_ddl_saved(int how);
 static void db_mutex_init(void) {
     sv_rw_init(&g_db_rw);
     lk_init();
@@ -239,6 +239,7 @@ static bool db_init_impl(const char* data_directory) {
 
     // Inizializza i componenti
     g_db.catalog = catalog_load(g_db.cat_path);
+    catalog_mark_logged(g_db.catalog);                   // il prossimo DDL registra solo ciò che cambia
     {                                                     // sequenze (CREATE SEQUENCE)
         char sp[600];
         snprintf(sp, sizeof(sp), "%s" SV_PATH_SEP "sequences.txt", data_directory);
@@ -254,7 +255,7 @@ static bool db_init_impl(const char* data_directory) {
         if (g_db.bp) { bp_destroy(g_db.bp); g_db.bp = NULL; }
         if (g_db.wal) { wal_destroy(g_db.wal); g_db.wal = NULL; }
         free(g_db.txm); g_db.txm = NULL;
-        free(g_db.catalog); g_db.catalog = NULL;
+        catalog_free(g_db.catalog); g_db.catalog = NULL;
         sv_close(g_db.db_fd);
         return false;
     }
@@ -817,6 +818,35 @@ static bool proc_auth(const ASTNode* st, char* err, size_t errn) {
     return auth_check(g_session_user, st, cur_db_name(), err, errn);
 }
 
+// Modifica dello schema resa durevole (P1.11): gli oggetti del catalogo cambiati vanno nel log come un record
+// LOG_CATALOG (le pagine che usano, già nel log come LOG_LINK / righe, il recupero le ricrea). Prima: tutte le
+// pagine sporche su disco + il catalogo intero riscritto, due fsync a ogni CREATE TABLE. L'fsync del log segue
+// synchronous come le scritture in autocommit: FULL subito, NORMAL al più entro SYNC_NORMAL_MS (il record è già nel
+// file: un processo che cade non lo perde), OFF mai. 1 = nel log, 2 = catalogo salvato intero (log assente o
+// memoria esaurita per il record), 0 = errore
+static int ddl_durable(void) {
+    if (io_failed()) return 0;
+    size_t n = 0;
+    uint8_t* rec = g_db.wal ? catalog_delta(g_db.catalog, &n) : NULL;
+    if (!rec && n == 0 && g_db.wal) return 1;                    // niente di cambiato nel catalogo
+    if (rec) {
+        bool ok = wal_write(g_db.wal, LOG_CATALOG, 0, 0, (SVRID){0, 0}, rec, (uint32_t)n, NULL, 0) == SV_OK;
+        free(rec);
+        if (ok) {
+            double now = get_time_ms();
+            if (g_sync_mode == 2 || (g_sync_mode == 1 && now - g_last_sync >= SYNC_NORMAL_MS)) {
+                ok = wal_flush(g_db.wal) == SV_OK;
+                if (ok) g_last_sync = now;
+            } else ok = wal_write_buffer(g_db.wal) == SV_OK;
+        }
+        if (ok) return 1;
+        if (io_failed() || g_db.wal->failed) return 0;
+    }
+    bool ok = bp_flush_all(g_db.bp) == SV_OK && catalog_save(g_db.catalog, g_db.cat_path) == SV_OK;
+    if (ok) catalog_mark_logged(g_db.catalog);
+    return ok ? 2 : 0;
+}
+
 // esegue uno statement già analizzato (transazioni e CHECKPOINT gestiti qui)
 static QueryResult* exec_one_in(ASTNode* stmt) {
     QueryResult* result = NULL;
@@ -941,8 +971,7 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
             case NODE_DROP_DB: case NODE_DROP_TABLE: case NODE_DROP_VIEW: case NODE_DROP_INDEX:
             case NODE_ALTER_TABLE: case NODE_TRUNCATE: case NODE_CREATE_TRIGGER: case NODE_DROP_TRIGGER:
             case NODE_CREATE_PROCEDURE: case NODE_DROP_PROCEDURE:
-                bp_flush_all(g_db.bp);
-                if (catalog_save(g_db.catalog, g_db.cat_path) == SV_OK) pf_ddl_saved();
+                pf_ddl_saved(ddl_durable());
                 break;
             default: break;
         }
@@ -1803,8 +1832,12 @@ static void pf_stmt_end(void) {                // statement in autocommit conclu
     for (int i = 0; i < g_npf; i++) if (!g_pf[i].tx && g_pf[i].ready < 0 && !g_pf[i].heap) g_pf[i].ready = at;
 }
 
-static void pf_ddl_saved(void) {               // DROP TABLE su disco (catalogo salvato con fsync): subito
-    for (int i = 0; i < g_npf; i++) if (g_pf[i].heap && g_pf[i].ready < 0) g_pf[i].ready = 0;
+// DROP TABLE registrato (ddl_durable): le sue pagine si liberano quando il record è su disco (how = 1: dalla fine
+// del log; pf_process fa l'fsync subito se una tabella aspetta), o subito con il catalogo salvato intero (how = 2)
+static void pf_ddl_saved(int how) {
+    if (!how) return;
+    int64_t at = how == 2 ? 0 : wal_size(g_db.wal);
+    for (int i = 0; i < g_npf; i++) if (g_pf[i].heap && g_pf[i].ready < 0) g_pf[i].ready = at;
 }
 
 static void free_chain(uint32_t first, uint32_t total, uint64_t lsn) {

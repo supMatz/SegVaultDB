@@ -21,8 +21,8 @@ not executed; **[verify-win]** = Windows-only, needs a run on Windows.
 
 `[ ]` to do · `[~]` in progress · `[x]` done.
 
-**Status 2026-11-16 (in progress towards 1.4):** also closed P1.1, P1.5, P1.7, P2.5, P2.14, P2.15; P1.11 partly
-done; still open P1.6, P1.10 (part), P1.11 (part), P2.8 (part), P3.9.
+**Status 2026-11-16 (in progress towards 1.4):** also closed P1.1, P1.5, P1.7, P1.11, P2.5, P2.14, P2.15;
+still open P1.6, P1.10 (part), P2.8 (part), P3.9.
 
 **Status after v1.3.0 (2026-11-15):** fixed `[x]` P0.1-P0.12 (Windows parts verified under wine), P1.2, P1.3, P1.4, P1.8, P1.12, P2.1, P2.9, P2.11, P2.13, P3.1, P3.4, P3.7;
 partly done `[~]` P1.5, P1.10, P2.2, P2.3, P2.4, P2.6, P2.7, P2.8,
@@ -333,7 +333,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
 
 ## P1 — Core Engine Performance & ACID Architecture
 
-- [~] **P1.1 `[ENGINE]` WAL format v2: record checksum + LSN, page LSN + page checksum, compensation records, fuzzy checkpoints**
+- [x] **P1.1 `[ENGINE]` WAL format v2: record checksum + LSN, page LSN + page checksum, compensation records, fuzzy checkpoints**
   - **Where:** `src/tx/wal.c:22-56` (23-byte header: no CRC, no LSN, no length trailer, no file header);
     `src/storage/page.h:25-32` (12-byte page header: no LSN, no checksum); `src/tx/wal.c:137-175` (redo idempotence
     relies on "slots are only appended"); `src/bridge/db_api.c:169-176,243-245` (checkpoint only when
@@ -398,7 +398,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     opens with identical results, accepts writes, survives a restart, and also upgrades after an interrupted
     conversion; a flipped byte in a data page is reported as damaged; half-zeroed pages after a crash are repaired —
     new pages from the log, old pages from their images; crash at every page and log write of ROLLBACK and of
-    recovery. `bench`: rollback 137/s → see below.
+    recovery. `bench`: see the `rollback` row of the README table (`make bench-readme`).
 
 - [x] **P1.2 `[PERF]` `ROLLBACK` costs O(database), not O(transaction)** — [code]
   - **Where:** `src/bridge/db_api.c:1225-1245`, `:1278-1304`; `src/tx/wal.c:329-414` (reads the log from offset 0
@@ -619,7 +619,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     pins not done), 64-page file extension (tried caching the file end: overflow pages extend the file too,
     so it reused pages — reverted), a scaling test in the suite.
 
-- [~] **P1.11 `[ENGINE]` Catalog: 1.71 GB fixed struct, raw struct dumps on disk, full rewrite + 2 `fsync`s per DDL**
+- [x] **P1.11 `[ENGINE]` Catalog: 1.71 GB fixed struct, raw struct dumps on disk, full rewrite + 2 `fsync`s per DDL**
   - **Where:** `src/catalog/schema.h:88-148` (`sizeof(Catalog)` = 1 834 562 576 bytes, `Database` = 27.3 MB,
     `TableSchema` = 62.7 KB; limits 64 databases / 256 tables / 64 columns / 16 indexes / 16 constraints /
     64 views, routines, triggers; 64 KB per body); `src/catalog/schema.c:311-324` (`catalog_drop_db` `memmove`s
@@ -640,9 +640,30 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     parser's column lists (CREATE TABLE, SELECT list, INSERT column list) and the planner's output columns and
     USING map are dynamic too (`SelectPlan` no longer carries 1024-entry arrays). Catalog **format v6**: every
     field written explicitly (fixed-width little-endian integers, length-prefixed strings), independent of
-    struct layout; v1-v5 files are still read and rewritten as v6. **Still open:** DDL still saves the whole
-    catalog with `fsync` (the "1 000 CREATE TABLE in under a second" target needs catalog changes logged in the
-    WAL), and the tests for 300 columns / 2 000 tables / start-up RSS.
+    struct layout; v1-v5 files are still read and rewritten as v6.
+  - **Done (2026-11-16, second part):** DDL goes through the WAL. `catalog_delta` compares every database list,
+    per-database object list (tables, views, routines, triggers) and table with a 64-bit fingerprint of its last
+    logged form and returns only what changed, each object whole; the statement writes it as one `LOG_CATALOG`
+    record (tx 0) and syncs the log like an autocommit write (`synchronous`: FULL at once, NORMAL within 100 ms,
+    the record is already in the file so a process crash does not lose it). Recovery replays the records in order
+    on the catalog read from the file and saves it before removing the log; a checkpoint saves the whole catalog
+    and drops them. A dropped table's pages are freed once the record is durable. Found and fixed on the way:
+    the first page of a new table (and of an `ALTER` rewrite) was never logged — the old full flush hid it — now a
+    `LOG_LINK` with previous page 0; redo of a `LOG_LINK` on an older page left on disk (freed and reused) now
+    starts it empty instead of keeping the rows of its previous life; `TRUNCATE` deleted every row without a log
+    record (rows came back after a crash) — it now gives the table a new empty root page and frees the old chain
+    like `DROP TABLE`; `INSERT` still had 64-column arrays on the stack (a 300-column insert overflowed them:
+    found by the new test under ASan); keys and constraints are refused on columns beyond the 256th (their
+    positions are bytes in the catalog) instead of being truncated. Indexes and constraints of a catalog table
+    are growable allocations too (`schema_add_index` / `schema_add_constraint`): `TableSchema` is 448 bytes
+    instead of 29.7 KB. Tests (`tests/test_durability.c`): power cut at every write of a 14-statement DDL + DML
+    workload (CREATE / ALTER / CREATE INDEX / VIEW / RENAME / CREATE and DROP DATABASE / qualified CREATE /
+    DROP / TRUNCATE) — the schema after recovery is always the one after the confirmed statements, plus a second
+    restart; a crash in NORMAL mode with 22 DDL statements only in the log; `CREATE TABLE` with 300 columns and
+    a row in it; 2 000 tables in one database; 1 000 `CREATE TABLE` in ~290 ms (limit 2 s; before: 1.6 s on
+    tmpfs, 4.4 s on an NVMe btrfs disk); engine start with 2 001 tables +0.7 MB resident (limit 20 MB).
+    **Not done (deliberately):** the catalog is not stored in system tables inside the page file; DDL is
+    still not transactional (an implicit commit, as in MySQL).
 
 - [x] **P1.12 `[SECURITY]` Overflow stubs are recognised by their content** — [code]
   - **Where:** `src/table/overflow.c:7,25-33` (`ov_is_stub`: any 24-byte slot starting with `FF 00 "SVOVF1"` and

@@ -96,18 +96,22 @@ typedef struct {
     int       num_columns;
     int       cap_columns;
     uint8_t   own_columns;     // 1 = columns è un'allocazione a parte (catalogo), 0 = nello stesso blocco o nessuna
-    Index   indexes[SV_MAX_INDEXES];
-    int       num_indexes;
+    // indici e vincoli: come le colonne (P1.11: erano 16 + 16 dentro ogni struttura, 29 KB per tabella anche senza
+    // nessuno). Tabella del catalogo: allocazioni a parte che crescono (own_aux = 1, schema_add_index /
+    // schema_add_constraint); tabella di lavoro (schema_new): SV_MAX_INDEXES / SV_MAX_CONSTRAINTS posti nel blocco
+    uint8_t   own_aux;
+    Index*    indexes;
+    int       num_indexes, cap_indexes;
     uint32_t  root_page_id;    // prima pagina dell'heap file
     uint32_t  num_pages;       // numero di pagine allocate
     uint64_t  num_rows;        // numero di righe (approssimativo)
     char      comment[256];
-    // ── dal formato v4 del catalogo (i campi precedenti hanno la disposizione di prima) ──
-    int       num_constraints;
-    Constraint constraints[SV_MAX_CONSTRAINTS];
-    // ── dal formato v5 ──
+    int       num_constraints, cap_constraints;
+    Constraint* constraints;
     char      collation[40];   // DEFAULT COLLATE della tabella ("" = utf8mb4_general_ci)
     uint64_t  auto_increment;  // AUTO_INCREMENT = n di CREATE TABLE (prossimo valore minimo; 0 = nessuno)
+    // solo in memoria: impronta dell'ultima versione scritta nel log (catalog_delta)
+    uint64_t  logsig;
 } TableSchema;
 
 // -- definizione vista --
@@ -147,6 +151,7 @@ typedef struct {
     int              num_routines, cap_routines;
     TriggerSchema*   triggers;
     int              num_triggers, cap_triggers;
+    uint64_t         logsig;     // solo in memoria (catalog_delta): elenco delle tabelle, viste, routine, trigger
 } Database;
 
 // -- catalogo globale --
@@ -155,6 +160,7 @@ typedef struct {
     int         num_databases, cap_databases;
     int         current_db;      // Indice del database corrente (-1 = nessuno)
     uint32_t    next_page_id;    // Prossima page_id libera (globale)
+    uint64_t    logsig;          // solo in memoria (catalog_delta): elenco dei database
 } Catalog;
 
 // -- API --
@@ -202,8 +208,23 @@ TableSchema* schema_dup(const TableSchema* src, int extra);
 bool schema_assign(TableSchema* dst, const TableSchema* src);
 // una colonna in più (azzerata) in fondo; NULL se non c'è spazio (blocco fisso pieno o memoria)
 Column* schema_add_column(TableSchema* ts);
+// un indice / un vincolo in più (azzerato) in fondo; NULL oltre SV_MAX_INDEXES / SV_MAX_CONSTRAINTS o senza memoria
+Index* schema_add_index(TableSchema* ts);
+Constraint* schema_add_constraint(TableSchema* ts);
 // libera la memoria delle colonne di una tabella del catalogo (non la struttura)
 void schema_release(TableSchema* ts);
+
+// ── modifiche del catalogo nel log (P1.11) ──
+// Un DDL non riscrive più tutto il catalogo con due fsync: catalog_delta confronta ogni oggetto con l'impronta
+// dell'ultima versione registrata e restituisce (malloc'd, *n byte) solo ciò che è cambiato — l'elenco dei
+// database, per ogni database cambiato l'elenco delle sue tabelle con viste / routine / trigger, ogni tabella
+// cambiata per intero — da scrivere nel log come un record. NULL con *n = 0: niente di cambiato; NULL con
+// *n = 1: memoria esaurita (il chiamante salva il catalogo intero). catalog_mark_logged: tutte le impronte
+// aggiornate senza produrre niente (dopo il caricamento o un salvataggio completo).
+// catalog_apply_delta rifà un record sul catalogo in memoria (recupero dopo una caduta); false = record non valido
+uint8_t* catalog_delta(Catalog* c, size_t* n);
+void     catalog_mark_logged(Catalog* c);
+bool     catalog_apply_delta(Catalog* c, const uint8_t* b, size_t n);
 
 // ── oggetti nuovi in un database (le liste crescono) ──
 RoutineSchema* catalog_new_routine(Database* d);     // azzerata in fondo alla lista, NULL senza memoria

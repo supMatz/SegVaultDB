@@ -3,6 +3,7 @@
 #include "../table/heap.h"
 #include "../storage/page.h"
 #include "../storage/crc32c.h"
+#include "../catalog/schema.h"
 #include "platform_compat.h"
 #include <string.h>
 #include <stdio.h>
@@ -837,7 +838,19 @@ static int replay_link(int db_fd, const Rec* e) {
     Page* p = redo_page(db_fd, e->page, true);
     if (!p) return SV_ERR;
     if (redo_done(p, e)) page_free(p);
-    else if (redo_write_lsn(p, db_fd, e) != SV_OK) return SV_IO_ERROR;
+    else {
+        // il record dice "pagina appena allocata, vuota": una pagina più vecchia sul file (liberata e riusata, con il
+        // flag FREE e le righe della vita di prima, perché la sua riscrittura all'allocazione non era su disco)
+        // riparte vuota; i record successivi la riempiono
+        // (solo con il log v2: senza LSN nelle pagine non si sa se la pagina è più vecchia del record)
+        if (g_redo_lsn && (!(p->flags & PAGE_FLAG_CHAINED) || p->num_slots || (p->flags & (PAGE_FLAG_FREE | PAGE_FLAG_OVERFLOW)))) {
+            page_free(p);
+            if (!(p = page_create(e->page))) return SV_ERR;
+            p->flags |= PAGE_FLAG_CHAINED;
+            rebuilt_set(e->page, true);
+        }
+        if (redo_write_lsn(p, db_fd, e) != SV_OK) return SV_IO_ERROR;
+    }
     uint32_t prev = 0;
     if (e->data && e->dlen >= 4) memcpy(&prev, e->data, 4);
     if (!prev || prev == e->page) return SV_OK;
@@ -945,8 +958,8 @@ static TxInfo* tx_find(TxInfo* t, int n, uint64_t tx) {
 // ABORT); la seconda rifà i record uno alla volta; la terza rilegge su richiesta quelli da annullare.
 
 int wal_recovery(const char* log_path, const char* db_path, const char* cat_path, char* err, size_t errn) {
-    (void)cat_path;
     err[0] = '\0';
+    Catalog* cat = NULL;                 // catalogo del file con i record LOG_CATALOG rifatti (se ce ne sono)
     LogFile lf;
     char why[200] = "";
     int orc = lf_open(log_path, &lf, true, why, sizeof(why));
@@ -1066,6 +1079,14 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
         if (is_page_rec(e.type) || e.type == LOG_CLR || e.type == LOG_LINK || e.type == LOG_PAGE_IMAGE) {
             int rr = replay_entry(db_fd, &e);
             if (rr != SV_OK) { rc = rr; snprintf(err, errn, "cannot replay the transaction log (page %u)", e.page); }
+        } else if (e.type == LOG_CATALOG && cat_path) {
+            if (!cat && !(cat = catalog_load(cat_path))) {
+                rc = SV_ERR;
+                snprintf(err, errn, "cannot read the catalog to apply the schema changes in the log: %.200s", catalog_load_error());
+            } else if (!catalog_apply_delta(cat, e.data, e.dlen)) {
+                rc = SV_ERR;
+                snprintf(err, errn, "a schema change in the transaction log (byte %lld) cannot be applied", (long long)p2);
+            }
         }
         p2 = nx;
         rec_clear(&e);
@@ -1113,6 +1134,9 @@ int wal_recovery(const char* log_path, const char* db_path, const char* cat_path
     // il file dei dati su disco prima di eliminare il log (altrimenti una seconda caduta perderebbe tutto)
     if (rc == SV_OK && sv_fsync(db_fd) != 0) { rc = SV_IO_ERROR; snprintf(err, errn, "cannot sync the data file"); }
     if (db_fd >= 0) sv_close(db_fd);
+    // ... e il catalogo con le modifiche dello schema che c'erano solo nel log
+    if (rc == SV_OK && cat && catalog_save(cat, cat_path) != SV_OK) { rc = SV_IO_ERROR; snprintf(err, errn, "cannot write the recovered catalog"); }
+    catalog_free(cat);
     if (rc != SV_OK) return rc;
     if (remove(log_path) != 0) { snprintf(err, errn, "cannot remove the recovered transaction log"); return SV_IO_ERROR; }
     fsync_dir_of(log_path);

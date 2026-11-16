@@ -18,6 +18,7 @@
 #include <stdatomic.h>
 #include <math.h>
 #include <stdint.h>
+static int new_root_page(ExecCtx* ctx, uint32_t* pid);     // radice nuova registrata nel log (P1.11)
 #include <strings.h>
 #include <limits.h>
 #include <errno.h>
@@ -414,10 +415,9 @@ static QueryResult* exec_create_table_impl(ExecCtx* ctx, ASTNode* n) {
     TableSchema* saved = catalog_get_table(ctx->catalog, db->name, n->create_table.table_name);
     if (saved) {
         uint32_t pid;
-        if (bp_new_page(ctx->bp, &pid) == SV_OK) {
+        if (new_root_page(ctx, &pid) == SV_OK) {
             saved->root_page_id = pid;
             saved->num_pages = 1;
-            bp_unpin(ctx->bp, pid, false);
         }
         // KEY / INDEX / FULLTEXT di MySQL: indici (si cerca con la prima colonna)
         for (int k = 0; k < n->create_table.num_keys && saved->num_indexes < SV_MAX_INDEXES; k++) {
@@ -429,8 +429,8 @@ static QueryResult* exec_create_table_impl(ExecCtx* ctx, ASTNode* n) {
                 catalog_drop_table(ctx->catalog, db->name, saved->name);
                 return result_error_msg(msg);
             }
-            Index* ix = &saved->indexes[saved->num_indexes++];
-            memset(ix, 0, sizeof(*ix));
+            Index* ix = schema_add_index(saved);
+            if (!ix) { catalog_drop_table(ctx->catalog, db->name, saved->name); return result_error_msg("Out of memory"); }
             if (kd->name[0]) snprintf(ix->name, sizeof(ix->name), "%s", kd->name);
             else snprintf(ix->name, sizeof(ix->name), "%.63s", kd->cols[0]);
             for (int j = 0; j < saved->num_indexes - 1; j++)             // nomi automatici distinti (col, col_2, ...)
@@ -443,6 +443,15 @@ static QueryResult* exec_create_table_impl(ExecCtx* ctx, ASTNode* n) {
         }
     }
     return result_ok_msg(0);
+}
+
+// pagina radice nuova di una tabella, registrata nel log (LOG_LINK con pagina precedente 0): dopo una caduta il
+// recupero la ricrea vuota anche se non era mai arrivata su disco (P1.11: il DDL non scrive più tutte le pagine)
+static int new_root_page(ExecCtx* ctx, uint32_t* pid) {
+    if (bp_new_page(ctx->bp, pid) != SV_OK) return SV_FULL;
+    if (ctx->bp->on_link) ctx->bp->on_link(ctx->bp->on_link_ctx, 0, *pid);
+    bp_unpin(ctx->bp, *pid, true);
+    return SV_OK;
 }
 
 static void (*g_drop_hook)(uint32_t root);
@@ -537,8 +546,7 @@ static bool ident_in_text(const char* text, const char* name) {
 static const char* rewrite_rows(ExecCtx* ctx, TableSchema* ts, TableSchema* ns, const int* map, const char* def,
                                 int conv, char* cmsg, size_t cmsgn, uint32_t* out_root, uint32_t* out_pages) {
     uint32_t root;
-    if (bp_new_page(ctx->bp, &root) != SV_OK) return "Cannot allocate a page";
-    bp_unpin(ctx->bp, root, false);
+    if (new_root_page(ctx, &root) != SV_OK) return "Cannot allocate a page";
     HeapFile* nh = heap_open(ctx->bp, root, 1);
     HeapFile* oh = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
     HeapScan* scan = oh ? heap_scan_open(oh, ts) : NULL;
@@ -9628,6 +9636,10 @@ static const char* resolve_cols(const TableSchema* ts, char names[][64], int n, 
         int ci = catalog_get_col_index((TableSchema*)ts, names[k]);
         if (ci < 0) { snprintf(msg, mn, "Unknown column '%.64s' in the constraint", names[k]); return msg; }
         for (int j = 0; j < k; j++) if (out[j] == ci) { snprintf(msg, mn, "Column '%.64s' is listed twice in the constraint", names[k]); return msg; }
+        if (ci > 255) {                  // le posizioni dei vincoli sono byte (catalogo v6): mai troncate
+            snprintf(msg, mn, "Column '%.64s' is column %d: keys and constraints can use only the first 256 columns of a table", names[k], ci + 1);
+            return msg;
+        }
         out[k] = (uint8_t)ci;
     }
     return NULL;
@@ -9781,7 +9793,9 @@ static const char* add_constraint(ExecCtx* ctx, Database* db, TableSchema* ts, C
         if (fail) return fail;
     }
 
-    ts->constraints[ts->num_constraints++] = c;
+    Constraint* slot = schema_add_constraint(ts);
+    if (!slot) return "Too many constraints on the table (max 16)";
+    *slot = c;
     if (d->kind == CONS_PRIMARY)
         for (int k = 0; k < c.ncols; k++) { ts->columns[c.cols[k]].primary_key = true; ts->columns[c.cols[k]].nullable = false; }
     if (d->kind == CONS_UNIQUE && c.ncols == 1) ts->columns[c.cols[0]].unique = true;
@@ -10821,7 +10835,24 @@ static const char* gen_compute(ExecCtx* ctx, TableSchema* ts, Tuple* t, char* ms
     return NULL;
 }
 
+// buffer per colonna di exec_insert (P1.11: erano array di 64 sullo stack, una tabella più larga li sforava),
+// allocati dentro e liberati dal chiamante: la funzione ha molte uscite
+typedef struct {
+    int* map; char (*vals)[EV_STR_MAX + 1]; char (*now_buf)[24];
+    const char** text; bool* given; bool* direct; Value* dv;
+} InsScratch;
+
+static QueryResult* exec_insert_in(ExecCtx* ctx, ASTNode* n, InsScratch* S);
+
 static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
+    InsScratch S;
+    memset(&S, 0, sizeof(S));
+    QueryResult* r = exec_insert_in(ctx, n, &S);
+    free(S.map); free(S.vals); free(S.now_buf); free(S.text); free(S.given); free(S.direct); free(S.dv);
+    return r;
+}
+
+static QueryResult* exec_insert_in(ExecCtx* ctx, ASTNode* n, InsScratch* S) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
     TableSchema* ts = catalog_get_table(ctx->catalog, db->name, n->insert_stmt.table_name);
@@ -10835,10 +10866,17 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     int nc = ts->num_columns;
 
     // colonne indicate
-    int map[64];
     // VALUES () / DEFAULT VALUES: nessun valore, ogni colonna prende il suo default
     bool all_default = n->insert_stmt.num_cols == 0 && n->insert_stmt.num_values == 0 && !n->insert_stmt.select;
     int ncols = n->insert_stmt.num_cols > 0 ? n->insert_stmt.num_cols : all_default ? 0 : nc;
+    size_t ncap = (size_t)(nc > 0 ? nc : 1);
+    int* map = S->map = sv_malloc(sizeof(int) * (size_t)(ncols > 0 ? ncols : 1));   // colonne indicate
+    char (*now_buf)[24] = S->now_buf = sv_malloc(24 * ncap);   // DEFAULT CURRENT_TIMESTAMP della riga in costruzione
+    char (*vals)[EV_STR_MAX + 1] = S->vals = sv_malloc((EV_STR_MAX + 1) * ncap);   // testi della riga corrente
+    const char** text = S->text = sv_malloc(sizeof(char*) * ncap);
+    bool* given = S->given = sv_malloc(ncap);
+    bool* direct = S->direct = sv_malloc(ncap);           // numero già pronto (niente conversione in testo e ritorno)
+    Value* dv = S->dv = sv_malloc(sizeof(Value) * ncap);
     for (int i = 0; i < ncols; i++) {
         if (n->insert_stmt.num_cols == 0) { map[i] = i; continue; }
         int ci = catalog_get_col_index(ts, n->insert_stmt.columns[i]);
@@ -10891,7 +10929,6 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     for (int i = 0; i < nc; i++) if (ts->columns[i].auto_increment) { ai = i; break; }
     int64_t auto_next = 0;
     int64_t last_generated = 0;     // ultimo valore AUTO_INCREMENT generato (last_insert_id)
-    char now_buf[SV_MAX_COLUMNS][24];  // DEFAULT CURRENT_TIMESTAMP della riga in costruzione (una per colonna)
     if (ai >= 0) {
         MemIndex* ix = mi_get(ctx, db->name, ts, ai);
         if (!ix) { orows_free(&srows); return result_error_msg("Out of memory (AUTO_INCREMENT index)"); }
@@ -10906,15 +10943,12 @@ static QueryResult* exec_insert(ExecCtx* ctx, ASTNode* n) {
     ec.x = ctx;
     ec.outer = ctx->trig_eval;
     const char* fail = NULL;
-    static char vals[64][EV_STR_MAX + 1];   // testi della riga corrente
     char ai_buf[32];
 
     for (int r = 0; r < nrows && !fail; r++) {
-        const char* text[64];
-        bool given[64] = {0};
-        bool direct[64] = {0};                    // numero già pronto (niente conversione in testo e ritorno)
         static _Thread_local char fail_buf[200];
-        Value dv[64];
+        memset(given, 0, ncap);
+        memset(direct, 0, ncap);
         for (int i = 0; i < nc; i++) text[i] = NULL;
         for (int k = 0; k < ncols; k++) {
             EvalVal v;
@@ -11854,23 +11888,18 @@ static QueryResult* exec_truncate(ExecCtx* ctx, ASTNode* n) {
                  ts->name, ref->name, child->name);
         return result_error_msg(msg);
     }
-    // Delete all rows
-    HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
-    if (!hf) return result_error_msg("Failed to open heap");
-    int affected = 0;
-    HeapScan* scan = heap_scan_open(hf, ts);
-    if (!scan) { free(hf); return result_error_msg("Failed to scan"); }
-    RID rid;
-    Tuple* t;
-    while ((t = heap_scan_next(scan, &rid)) != NULL) {
-        heap_delete(hf, rid);
-        affected++;
-        tuple_free(t);
-    }
-    heap_scan_close(scan);
+    // P1.11: una pagina radice nuova e vuota (nel log), la catena vecchia liberata come quella di un DROP TABLE
+    // quando il record del catalogo è su disco. Prima: ogni riga cancellata senza record nel log (dopo una caduta
+    // tornavano) e un passaggio su tutta la tabella
+    uint32_t root, old_root = ts->root_page_id;
+    if (new_root_page(ctx, &root) != SV_OK) return result_error_msg("Cannot allocate a page");
+    int affected = ts->num_rows > (uint64_t)INT32_MAX ? INT32_MAX : (int)ts->num_rows;
+    ts->root_page_id = root;
+    ts->num_pages = 1;
     ts->num_rows = 0;
-    free(hf);
     mi_invalidate_table(db->name, ts->name);
+    heap_cache_forget(ctx->bp, old_root);
+    if (old_root && g_drop_hook) g_drop_hook(old_root);
     return result_ok_msg(affected);
 }
 

@@ -38,14 +38,62 @@ const char* datatype_name(DataType t) {
 
 // ── tabelle: memoria delle colonne ───────────────────────────────
 
+// blocco di una tabella di lavoro: struttura, indici, vincoli, colonne (offset allineati a 16)
+#define SN_AL(x) (((x) + 15) & ~(size_t)15)
+#define SN_IDX   SN_AL(sizeof(TableSchema))
+#define SN_CON   SN_AL(SN_IDX + sizeof(Index) * SV_MAX_INDEXES)
+#define SN_COL   SN_AL(SN_CON + sizeof(Constraint) * SV_MAX_CONSTRAINTS)
+
 TableSchema* schema_new(int cap) {
     if (cap < 0) cap = 0;
-    TableSchema* t = sv_try_calloc(1, sizeof(TableSchema) + sizeof(Column) * (size_t)cap);
-    if (!t) return NULL;
-    t->columns = cap ? (Column*)(t + 1) : NULL;
+    uint8_t* b = sv_try_calloc(1, SN_COL + sizeof(Column) * (size_t)cap);
+    if (!b) return NULL;
+    TableSchema* t = (TableSchema*)b;
+    t->columns = cap ? (Column*)(b + SN_COL) : NULL;
     t->cap_columns = cap;
     t->own_columns = 0;
+    t->indexes = (Index*)(b + SN_IDX);
+    t->cap_indexes = SV_MAX_INDEXES;
+    t->constraints = (Constraint*)(b + SN_CON);
+    t->cap_constraints = SV_MAX_CONSTRAINTS;
+    t->own_aux = 0;
     return t;
+}
+
+// almeno n posti in *arr (allocazione a parte: own_aux), al più max
+static bool aux_reserve(void** arr, int* cap, int n, int max, size_t elem, bool own) {
+    if (n <= *cap) return true;
+    if (!own || n > max) return false;
+    int nc = *cap ? *cap * 2 : 2;
+    while (nc < n) nc *= 2;
+    if (nc > max) nc = max;
+    void* nv = sv_try_realloc(*arr, elem * (size_t)nc);
+    if (!nv) return false;
+    memset((uint8_t*)nv + elem * (size_t)*cap, 0, elem * (size_t)(nc - *cap));
+    *arr = nv;
+    *cap = nc;
+    return true;
+}
+
+static bool reserve_indexes(TableSchema* t, int n) {
+    return aux_reserve((void**)&t->indexes, &t->cap_indexes, n, SV_MAX_INDEXES, sizeof(Index), t->own_aux);
+}
+static bool reserve_constraints(TableSchema* t, int n) {
+    return aux_reserve((void**)&t->constraints, &t->cap_constraints, n, SV_MAX_CONSTRAINTS, sizeof(Constraint), t->own_aux);
+}
+
+Index* schema_add_index(TableSchema* ts) {
+    if (!ts || !reserve_indexes(ts, ts->num_indexes + 1)) return NULL;
+    Index* x = &ts->indexes[ts->num_indexes++];
+    memset(x, 0, sizeof(*x));
+    return x;
+}
+
+Constraint* schema_add_constraint(TableSchema* ts) {
+    if (!ts || !reserve_constraints(ts, ts->num_constraints + 1)) return NULL;
+    Constraint* k = &ts->constraints[ts->num_constraints++];
+    memset(k, 0, sizeof(*k));
+    return k;
 }
 
 bool schema_assign(TableSchema* dst, const TableSchema* src) {
@@ -62,15 +110,29 @@ bool schema_assign(TableSchema* dst, const TableSchema* src) {
         dst->cap_columns = nc;
         dst->own_columns = 1;
     }
+    int ni = src->num_indexes > 0 ? src->num_indexes : 0, nk = src->num_constraints > 0 ? src->num_constraints : 0;
+    if (!reserve_indexes(dst, ni) || !reserve_constraints(dst, nk)) return false;
     Column* cols = dst->columns;
     int cap = dst->cap_columns;
-    uint8_t own = dst->own_columns;
+    uint8_t own = dst->own_columns, own_aux = dst->own_aux;
+    Index* idx = dst->indexes;
+    Constraint* con = dst->constraints;
+    int capi = dst->cap_indexes, capk = dst->cap_constraints;
     memmove(cols ? cols : (Column*)NULL, src->columns, sizeof(Column) * (size_t)n);   // prima delle altre: src può essere dst
+    if (ni) memmove(idx, src->indexes, sizeof(Index) * (size_t)ni);
+    if (nk) memmove(con, src->constraints, sizeof(Constraint) * (size_t)nk);
     *dst = *src;
     dst->columns = cols;
     dst->cap_columns = cap;
     dst->own_columns = own;
     dst->num_columns = n;
+    dst->own_aux = own_aux;
+    dst->indexes = idx;
+    dst->cap_indexes = capi;
+    dst->num_indexes = ni;
+    dst->constraints = con;
+    dst->cap_constraints = capk;
+    dst->num_constraints = nk;
     return true;
 }
 
@@ -103,12 +165,20 @@ void schema_release(TableSchema* ts) {
     ts->columns = NULL;
     ts->cap_columns = 0;
     ts->own_columns = 0;
+    if (ts->own_aux) {
+        free(ts->indexes);
+        free(ts->constraints);
+        ts->indexes = NULL;
+        ts->constraints = NULL;
+        ts->cap_indexes = ts->cap_constraints = 0;
+        ts->num_indexes = ts->num_constraints = 0;
+    }
 }
 
 // tabella del catalogo: struttura e colonne sue
 static TableSchema* table_alloc(void) {
     TableSchema* t = sv_try_calloc(1, sizeof(TableSchema));
-    if (t) t->own_columns = 1;
+    if (t) t->own_columns = t->own_aux = 1;
     return t;
 }
 
@@ -249,12 +319,12 @@ static bool table_from_v5(TableSchema* t, const TableSchemaV5* o) {
     memcpy(tmp->name, o->name, sizeof(tmp->name));
     memcpy(tmp->columns, o->columns, sizeof(Column) * (size_t)n);
     tmp->num_columns = n;
-    memcpy(tmp->indexes, o->indexes, sizeof(tmp->indexes));
-    tmp->num_indexes = o->num_indexes;
+    memcpy(tmp->indexes, o->indexes, sizeof(Index) * SV_MAX_INDEXES);
+    tmp->num_indexes = o->num_indexes >= 0 && o->num_indexes <= SV_MAX_INDEXES ? o->num_indexes : 0;
     tmp->root_page_id = o->root_page_id; tmp->num_pages = o->num_pages; tmp->num_rows = o->num_rows;
     memcpy(tmp->comment, o->comment, sizeof(tmp->comment));
-    tmp->num_constraints = o->num_constraints;
-    memcpy(tmp->constraints, o->constraints, sizeof(tmp->constraints));
+    tmp->num_constraints = o->num_constraints >= 0 && o->num_constraints <= SV_MAX_CONSTRAINTS ? o->num_constraints : 0;
+    memcpy(tmp->constraints, o->constraints, sizeof(Constraint) * SV_MAX_CONSTRAINTS);
     memcpy(tmp->collation, o->collation, sizeof(tmp->collation));
     tmp->auto_increment = o->auto_increment;
     bool ok = schema_assign(t, tmp);
@@ -489,7 +559,7 @@ static bool r_table(RBuf* r, TableSchema* t) {
         rb_str(r, c->sqltype, sizeof(c->sqltype)); c->flags = rb_u8(r);
     }
     uint32_t ni = rb_u32(r);
-    if (r->bad || ni > SV_MAX_INDEXES) return false;
+    if (r->bad || ni > SV_MAX_INDEXES || !reserve_indexes(t, (int)ni)) return false;
     t->num_indexes = (int)ni;
     for (uint32_t i = 0; i < ni; i++) {
         Index* x = &t->indexes[i];
@@ -500,7 +570,7 @@ static bool r_table(RBuf* r, TableSchema* t) {
     }
     t->root_page_id = rb_u32(r); t->num_pages = rb_u32(r); t->num_rows = rb_u64(r); rb_str(r, t->comment, sizeof(t->comment));
     uint32_t nk = rb_u32(r);
-    if (r->bad || nk > SV_MAX_CONSTRAINTS) return false;
+    if (r->bad || nk > SV_MAX_CONSTRAINTS || !reserve_constraints(t, (int)nk)) return false;
     t->num_constraints = (int)nk;
     for (uint32_t i = 0; i < nk; i++) {
         Constraint* k = &t->constraints[i];
@@ -516,10 +586,8 @@ static bool r_table(RBuf* r, TableSchema* t) {
     return !r->bad;
 }
 
-static void w_db(WBuf* w, const Database* d) {
-    wb_str(w, d->name);
-    wb_u32(w, (uint32_t)d->num_tables);
-    for (int t = 0; t < d->num_tables; t++) w_table(w, d->tables[t]);
+// viste, routine e trigger di un database (dopo le tabelle nel file; da soli nei record del log)
+static void w_db_objs(WBuf* w, const Database* d) {
     wb_u32(w, (uint32_t)d->num_views);
     for (int i = 0; i < d->num_views; i++) { wb_str(w, d->views[i].name); wb_str(w, d->views[i].definition); }
     wb_u32(w, (uint32_t)d->num_routines);
@@ -534,14 +602,14 @@ static void w_db(WBuf* w, const Database* d) {
     }
 }
 
-static bool r_db(RBuf* r, Database* d) {
-    rb_str(r, d->name, sizeof(d->name));
-    uint32_t nt = rb_u32(r);
-    if (r->bad || nt > SV_MAX_TABLES) return false;
-    for (uint32_t t = 0; t < nt; t++) {
-        TableSchema* ts = db_push_table(d, NULL);
-        if (!ts || !r_table(r, ts)) return false;
-    }
+static void w_db(WBuf* w, const Database* d) {
+    wb_str(w, d->name);
+    wb_u32(w, (uint32_t)d->num_tables);
+    for (int t = 0; t < d->num_tables; t++) w_table(w, d->tables[t]);
+    w_db_objs(w, d);
+}
+
+static bool r_db_objs(RBuf* r, Database* d) {
     uint32_t nv = rb_u32(r);
     if (r->bad || nv > (1u << 20) || !grow((void**)&d->views, &d->cap_views, (int)nv, sizeof(ViewSchema))) return false;
     for (uint32_t i = 0; i < nv; i++) { rb_str(r, d->views[i].name, sizeof(d->views[i].name)); rb_str(r, d->views[i].definition, sizeof(d->views[i].definition)); }
@@ -562,6 +630,17 @@ static bool r_db(RBuf* r, Database* d) {
     }
     d->num_triggers = (int)ng;
     return !r->bad;
+}
+
+static bool r_db(RBuf* r, Database* d) {
+    rb_str(r, d->name, sizeof(d->name));
+    uint32_t nt = rb_u32(r);
+    if (r->bad || nt > SV_MAX_TABLES) return false;
+    for (uint32_t t = 0; t < nt; t++) {
+        TableSchema* ts = db_push_table(d, NULL);
+        if (!ts || !r_table(r, ts)) return false;
+    }
+    return r_db_objs(r, d);
 }
 
 // file v6 già letto in memoria (dopo l'intestazione di 12 byte): i database
@@ -779,6 +858,202 @@ int catalog_save(Catalog* c, const char* path) {
     return SV_OK;
 }
 
+// ── modifiche del catalogo nel log (P1.11) ───────────────────────
+// Record: [versione 1] poi operazioni [tipo 1 byte][lunghezza 4][dati]:
+//   CD_HDR   next_page_id, numero di database, i loro nomi (in ordine)
+//   CD_DB    nome del database, numero di tabelle, i loro nomi (in ordine), viste / routine / trigger
+//   CD_TABLE nome del database, poi la tabella intera come nel file (w_table)
+// Si applicano in quest'ordine: CD_HDR crea / elimina database, CD_DB crea (vuote) / elimina tabelle e sostituisce
+// viste, routine e trigger, CD_TABLE riempie la tabella con quel nome. Ogni operazione porta lo stato intero
+// dell'oggetto, non un cambiamento: rifarle due volte (log non ancora accorciato dopo un checkpoint) dà lo stesso
+// catalogo.
+#define CD_VERSION 1
+#define CD_HDR     1
+#define CD_DB      2
+#define CD_TABLE   3
+
+// impronta a 64 bit, 8 byte per passo (si calcola su ogni tabella a ogni DDL: FNV byte per byte era il 70 % del
+// tempo di 1 000 CREATE TABLE). Serve solo a vedere se un oggetto è cambiato
+static uint64_t fnv64(const uint8_t* b, size_t n) {
+    uint64_t h = 0x9E3779B97F4A7C15ULL ^ (uint64_t)n;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t v;
+        memcpy(&v, b + i, 8);
+        h = (h ^ v) * 0xff51afd7ed558ccdULL;
+        h ^= h >> 32;
+    }
+    uint64_t v = 0;
+    memcpy(&v, b + i, n - i);
+    h = (h ^ v) * 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 29;
+    return h ? h : 1;                                  // 0 = "mai registrato"
+}
+
+static void cd_op(WBuf* out, uint8_t kind, const WBuf* body) {
+    if (!out) return;
+    wb_u8(out, kind);
+    wb_u32(out, (uint32_t)body->n);
+    wb_raw(out, body->b, body->n);
+}
+
+// confronta ogni oggetto con la sua impronta; out != NULL: scrive le operazioni di quelli cambiati
+static bool cd_scan(Catalog* c, WBuf* out) {
+    WBuf t = { NULL, 0, 0, false };
+    t.n = 0;
+    wb_u32(&t, c->next_page_id);
+    wb_u32(&t, (uint32_t)c->num_databases);
+    for (int d = 0; d < c->num_databases; d++) wb_str(&t, c->databases[d].name);
+    uint64_t h = t.oom ? 0 : fnv64(t.b, t.n);
+    if (h != c->logsig) { cd_op(out, CD_HDR, &t); c->logsig = h; }
+    for (int d = 0; d < c->num_databases && !t.oom; d++) {
+        Database* db = &c->databases[d];
+        t.n = 0;
+        wb_str(&t, db->name);
+        wb_u32(&t, (uint32_t)db->num_tables);
+        for (int i = 0; i < db->num_tables; i++) wb_str(&t, db->tables[i]->name);
+        w_db_objs(&t, db);
+        h = t.oom ? 0 : fnv64(t.b, t.n);
+        if (h != db->logsig) { cd_op(out, CD_DB, &t); db->logsig = h; }
+        for (int i = 0; i < db->num_tables && !t.oom; i++) {
+            TableSchema* ts = db->tables[i];
+            t.n = 0;
+            wb_str(&t, db->name);
+            size_t at = t.n;
+            w_table(&t, ts);
+            h = t.oom ? 0 : fnv64(t.b + at, t.n - at);
+            if (h != ts->logsig) { cd_op(out, CD_TABLE, &t); ts->logsig = h; }
+        }
+    }
+    bool ok = !t.oom && !(out && out->oom);
+    free(t.b);
+    return ok;
+}
+
+uint8_t* catalog_delta(Catalog* c, size_t* n) {
+    *n = 0;
+    if (!c) return NULL;
+    WBuf out = { NULL, 0, 0, false };
+    wb_u8(&out, CD_VERSION);
+    if (!cd_scan(c, &out)) { free(out.b); *n = 1; return NULL; }
+    if (out.n <= 1) { free(out.b); return NULL; }
+    *n = out.n;
+    return out.b;
+}
+
+void catalog_mark_logged(Catalog* c) { if (c) cd_scan(c, NULL); }
+
+static Database* cd_find_db(Catalog* c, const char* name) {
+    for (int i = 0; i < c->num_databases; i++) if (!strcmp(c->databases[i].name, name)) return &c->databases[i];
+    return NULL;
+}
+
+static bool cd_apply_hdr(Catalog* c, RBuf* r) {
+    uint32_t next_page = rb_u32(r), nd = rb_u32(r);
+    if (r->bad || nd > SV_MAX_DATABASES) return false;
+    Database* nv = sv_try_calloc(nd ? nd : 1, sizeof(Database));
+    bool* used = sv_try_calloc((size_t)c->num_databases + 1, 1);
+    if (!nv || !used) { free(nv); free(used); return false; }
+    char cur[SV_MAX_NAME_LEN] = "";
+    if (c->current_db >= 0 && c->current_db < c->num_databases) snprintf(cur, sizeof(cur), "%s", c->databases[c->current_db].name);
+    bool ok = true;
+    for (uint32_t i = 0; i < nd && ok; i++) {
+        char name[SV_MAX_NAME_LEN];
+        rb_str(r, name, sizeof(name));
+        if (r->bad) { ok = false; break; }
+        int at = -1;
+        for (int k = 0; k < c->num_databases; k++) if (!used[k] && !strcmp(c->databases[k].name, name)) { at = k; break; }
+        if (at >= 0) { nv[i] = c->databases[at]; used[at] = true; }
+        else snprintf(nv[i].name, sizeof(nv[i].name), "%s", name);
+    }
+    if (!ok) {                                       // niente toccato: le nuove sono vuote, le vecchie restano
+        free(nv); free(used);
+        return false;
+    }
+    for (int k = 0; k < c->num_databases; k++) if (!used[k]) db_clear(&c->databases[k]);
+    free(c->databases);
+    free(used);
+    c->databases = nv;
+    c->num_databases = c->cap_databases = (int)nd;
+    if (!nd) { c->cap_databases = 1; }
+    c->current_db = -1;
+    for (uint32_t i = 0; i < nd; i++) if (cur[0] && !strcmp(nv[i].name, cur)) c->current_db = (int)i;
+    c->next_page_id = next_page;
+    return true;
+}
+
+static bool cd_apply_db(Catalog* c, RBuf* r) {
+    char name[SV_MAX_NAME_LEN];
+    rb_str(r, name, sizeof(name));
+    Database* d = cd_find_db(c, name);
+    uint32_t nt = rb_u32(r);
+    if (r->bad || !d || nt > SV_MAX_TABLES) return false;
+    TableSchema** nv = sv_try_calloc(nt ? nt : 1, sizeof(TableSchema*));
+    bool* used = sv_try_calloc((size_t)d->num_tables + 1, 1);
+    bool ok = nv && used;
+    for (uint32_t i = 0; i < nt && ok; i++) {
+        char tn[SV_MAX_NAME_LEN];
+        rb_str(r, tn, sizeof(tn));
+        if (r->bad) { ok = false; break; }
+        int at = -1;
+        for (int k = 0; k < d->num_tables; k++) if (!used[k] && !strcmp(d->tables[k]->name, tn)) { at = k; break; }
+        if (at >= 0) { nv[i] = d->tables[at]; used[at] = true; }
+        else if ((nv[i] = table_alloc()) != NULL) snprintf(nv[i]->name, sizeof(nv[i]->name), "%s", tn);
+        else ok = false;
+    }
+    if (!ok) {
+        if (nv && used) for (uint32_t i = 0; i < nt; i++) {          // via solo quelle create qui
+            bool mine = nv[i] != NULL;
+            for (int k = 0; mine && k < d->num_tables; k++) if (d->tables[k] == nv[i]) mine = false;
+            if (mine) table_free(nv[i]);
+        }
+        free(nv); free(used);
+        return false;
+    }
+    for (int k = 0; k < d->num_tables; k++) if (!used[k]) table_free(d->tables[k]);
+    free(d->tables);
+    free(used);
+    d->tables = nv;
+    d->num_tables = (int)nt;
+    d->cap_tables = nt ? (int)nt : 0;
+    if (!nt) { free(nv); d->tables = NULL; }
+    if (!r_db_objs(r, d)) return false;
+    db_sane(d);
+    return true;
+}
+
+static bool cd_apply_table(Catalog* c, RBuf* r) {
+    char name[SV_MAX_NAME_LEN];
+    rb_str(r, name, sizeof(name));
+    Database* d = cd_find_db(c, name);
+    if (r->bad || !d) return false;
+    TableSchema* t = table_alloc();
+    if (!t) return false;
+    if (!r_table(r, t) || !table_sane(t)) { table_free(t); return false; }
+    for (int k = 0; k < d->num_tables; k++)
+        if (!strcmp(d->tables[k]->name, t->name)) { table_free(d->tables[k]); d->tables[k] = t; return true; }
+    if (!grow((void**)&d->tables, &d->cap_tables, d->num_tables + 1, sizeof(TableSchema*))) { table_free(t); return false; }
+    d->tables[d->num_tables++] = t;
+    return true;
+}
+
+bool catalog_apply_delta(Catalog* c, const uint8_t* b, size_t n) {
+    if (!c || !b || n < 1) return false;
+    RBuf r = { b, n, 0, false };
+    if (rb_u8(&r) != CD_VERSION) return false;
+    while (!r.bad && r.at < n) {
+        uint8_t kind = rb_u8(&r);
+        uint32_t len = rb_u32(&r);
+        if (r.bad || n - r.at < len) return false;
+        RBuf s = { b + r.at, len, 0, false };
+        r.at += len;
+        bool ok = kind == CD_HDR ? cd_apply_hdr(c, &s) : kind == CD_DB ? cd_apply_db(c, &s)
+                : kind == CD_TABLE ? cd_apply_table(c, &s) : false;
+        if (!ok || s.bad) return false;
+    }
+    return !r.bad;
+}
+
 Database* catalog_get_db(Catalog* c, const char* name) {
     if (!c || !name) return NULL;
     for (int i = 0; i < c->num_databases; i++)
@@ -917,7 +1192,9 @@ int catalog_add_index(Catalog* c, const char* db, const char* table, Index* idx)
     TableSchema* t = catalog_get_table(c, db, table);
     if (!t) return SV_NOT_FOUND;
     if (t->num_indexes >= SV_MAX_INDEXES) return SV_FULL;
-    t->indexes[t->num_indexes++] = *idx;
+    Index* slot = schema_add_index(t);
+    if (!slot) return SV_FULL;
+    *slot = *idx;
     return SV_OK;
 }
 

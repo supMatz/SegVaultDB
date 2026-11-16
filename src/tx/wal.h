@@ -35,6 +35,10 @@
 // file dei dati (doppia scrittura): se la scrittura della pagina si interrompe a metà (CRC sbagliato), il
 // recupero rimette l'immagine. page_id = la pagina
 #define LOG_PAGE_IMAGE 12
+// (P1.11) modifica del catalogo (DDL): data = record di catalog_delta (gli oggetti cambiati, ognuno per intero).
+// tx = 0, page = 0. Il recupero li rifà in ordine sul catalogo letto dal file e lo salva prima di eliminare il log;
+// un checkpoint salva il catalogo intero e non li porta nel log nuovo
+#define LOG_CATALOG    13
 
 typedef struct {
     uint32_t page_id;

@@ -1018,6 +1018,186 @@ int main(void) {
         unlink(WORK "_big");
     }
 
+    // ── 9. P1.11: il DDL va nel log (record LOG_CATALOG), non più catalogo intero + fsync. Caduta di corrente a
+    //       ogni scrittura di un carico di DDL e DML: dopo il recupero lo schema è quello dopo gli statement
+    //       confermati (quello in corso per intero o per niente) ──
+    {
+        static const char* steps[] = {
+            "CREATE TABLE a (id INT PRIMARY KEY, v INT)",
+            "INSERT INTO a VALUES (1, 1), (2, 2)",
+            "ALTER TABLE a ADD COLUMN w VARCHAR(20) DEFAULT 'x'",
+            "CREATE INDEX ia ON a (v)",
+            "CREATE VIEW va AS SELECT id FROM a",
+            "CREATE TABLE b (id INT)",
+            "INSERT INTO b VALUES (7)",
+            "RENAME TABLE b TO c",
+            "CREATE DATABASE e2",
+            "CREATE TABLE e2.x (id INT)",
+            "DROP TABLE c",
+            "DROP DATABASE e2",
+            "TRUNCATE TABLE a",
+            "INSERT INTO a (id, v) VALUES (5, 5)",
+        };
+        enum { NSTEP = (int)(sizeof(steps) / sizeof(steps[0])) };
+        // stato atteso dopo i primi p statement: righe di a (-1 = non c'è), colonna w, indice ia, vista va,
+        // righe di b, righe di c, database e2, tabella e2.x
+        static const int expect[NSTEP + 1][8] = {
+            { -1, 0, 0, 0, -1, -1, 0, 0 },
+            {  0, 0, 0, 0, -1, -1, 0, 0 },
+            {  2, 0, 0, 0, -1, -1, 0, 0 },
+            {  2, 1, 0, 0, -1, -1, 0, 0 },
+            {  2, 1, 1, 0, -1, -1, 0, 0 },
+            {  2, 1, 1, 1, -1, -1, 0, 0 },
+            {  2, 1, 1, 1,  0, -1, 0, 0 },
+            {  2, 1, 1, 1,  1, -1, 0, 0 },
+            {  2, 1, 1, 1, -1,  1, 0, 0 },
+            {  2, 1, 1, 1, -1,  1, 1, 0 },
+            {  2, 1, 1, 1, -1,  1, 1, 1 },
+            {  2, 1, 1, 1, -1, -1, 1, 1 },
+            {  2, 1, 1, 1, -1, -1, 0, 0 },
+            {  0, 1, 1, 1, -1, -1, 0, 0 },
+            {  1, 1, 1, 1, -1, -1, 0, 0 },
+        };
+        sh("rm -rf " BASE "_ddl && mkdir -p " BASE "_ddl");
+        if (db_init(BASE "_ddl")) { ok("CREATE DATABASE d"); db_shutdown(); }
+        int points = 0, ddl_done = 0, bad = 0;
+        for (int k = 1; k < 3000 && !ddl_done; k++) {
+            sh("rm -rf " WORK " && cp -r " BASE "_ddl " WORK);
+            remove(POWER_JOURNAL);
+            remove("/tmp/sv_dur_commits");
+            pid_t pp = fork();
+            if (pp == 0) {
+                if (!db_init(WORK)) _exit(2);
+                ok("USE d");
+                ok("SET GLOBAL synchronous = FULL");
+                g_power = true;
+                g_power_at = k;
+                for (int i = 0; i < NSTEP; i++) {
+                    if (!ok(steps[i])) { g_power = false; _exit(4); }
+                    FILE* cf = fopen("/tmp/sv_dur_commits", "a");
+                    if (cf) { fprintf(cf, "%d\n", i); fclose(cf); }
+                }
+                g_power = false;
+                _exit(3);
+            }
+            int ps;
+            waitpid(pp, &ps, 0);
+            if (WIFEXITED(ps) && WEXITSTATUS(ps) == 4) { CHECK(false, "DDL workload: a statement failed without a power cut (k=%d)", k); break; }
+            if (WIFEXITED(ps) && WEXITSTATUS(ps) == 3) ddl_done = 1;
+            power_restore();
+            int done = 0, x;
+            FILE* cf = fopen("/tmp/sv_dur_commits", "r");
+            while (cf && fscanf(cf, "%d", &x) == 1) done = x + 1;
+            if (cf) fclose(cf);
+            if (!db_init(WORK)) { bad++; CHECK(false, "DDL: restart after a power cut at write %d: %s", k, db_init_error()); continue; }
+            ok("USE d");
+            int got[8];
+            got[0] = (int)num("SELECT COUNT(*) FROM a");
+            got[1] = num("SELECT COUNT(w) FROM a") >= 0;
+            got[2] = 0;
+            QueryResult* ir = q("SHOW INDEX FROM a");
+            for (int i = 0; ir && ir->success && i < ir->num_rows; i++)
+                for (int j = 0; j < ir->num_cols; j++)
+                    if (!ir->rows[i].cells[j].is_null && !strcmp(ir->rows[i].cells[j].value, "ia")) got[2] = 1;
+            db_result_free(ir);
+            got[3] = num("SELECT COUNT(*) FROM va") >= 0;
+            got[4] = (int)num("SELECT COUNT(*) FROM b");
+            got[5] = (int)num("SELECT COUNT(*) FROM c");
+            got[6] = 0;
+            QueryResult* dr = q("SHOW DATABASES");
+            for (int i = 0; dr && dr->success && i < dr->num_rows; i++)
+                if (!dr->rows[i].cells[0].is_null && !strcmp(dr->rows[i].cells[0].value, "e2")) got[6] = 1;
+            db_result_free(dr);
+            got[7] = num("SELECT COUNT(*) FROM e2.x") >= 0;
+            bool match = !memcmp(got, expect[done], sizeof(got)) || (done < NSTEP && !memcmp(got, expect[done + 1], sizeof(got)));
+            if (!match) bad++;
+            CHECK(match, "DDL power cut at write %d: %d statements confirmed, schema {a=%d w=%d ia=%d va=%d b=%d c=%d e2=%d x=%d}",
+                  k, done, got[0], got[1], got[2], got[3], got[4], got[5], got[6], got[7]);
+            // il catalogo recuperato è stato salvato: un secondo avvio senza log vede lo stesso schema
+            db_shutdown();
+            if (db_init(WORK)) {
+                ok("USE d");
+                CHECK((int)num("SELECT COUNT(*) FROM a") == got[0], "DDL power cut at write %d: same schema after a second restart", k);
+                db_shutdown();
+            }
+            points++;
+            if (bad > 5) break;
+        }
+        CHECK(ddl_done, "the DDL workload eventually completes before the power cut");
+        printf("DDL power cut: %d points checked, %d bad\n", points, bad);
+    }
+
+    // ── 9b. synchronous = NORMAL: il DDL è nel file del log anche senza fsync, un processo che cade non lo perde ──
+    {
+        sh("rm -rf " WORK " && cp -r " BASE "_ddl " WORK);
+        pid_t pp = fork();
+        if (pp == 0) {
+            if (!db_init(WORK)) _exit(2);
+            ok("USE d");
+            for (int i = 0; i < 20; i++) { char sq[120]; snprintf(sq, sizeof(sq), "CREATE TABLE n%d (id INT, s VARCHAR(10))", i); if (!ok(sq)) _exit(4); }
+            if (!ok("DROP TABLE n3") || !ok("ALTER TABLE n4 ADD COLUMN z INT")) _exit(4);
+            _exit(0);                                         // niente db_shutdown: il catalogo sul file è quello di prima
+        }
+        int ps;
+        waitpid(pp, &ps, 0);
+        CHECK(WIFEXITED(ps) && WEXITSTATUS(ps) == 0, "DDL workload in NORMAL mode ran");
+        CHECK(db_init(WORK), "restart after a crash with DDL only in the log: %s", db_init_error());
+        ok("USE d");
+        CHECK(num("SELECT COUNT(*) FROM n0") == 0 && num("SELECT COUNT(*) FROM n19") == 0 && num("SELECT COUNT(*) FROM n3") == -1 &&
+              num("SELECT COUNT(z) FROM n4") == 0, "tables created, dropped and altered before the crash are recovered from the log");
+        db_shutdown();
+        sh("rm -rf " BASE "_ddl");
+    }
+
+    // ── 9c. P1.11: limiti del catalogo e costo del DDL — 300 colonne, 2 000 tabelle, 1 000 CREATE TABLE in meno di un
+    //        secondo (qui 2 s di margine), memoria del motore all'avvio ──
+    {
+        sh("rm -rf " WORK " && mkdir -p " WORK);
+        CHECK(db_init(WORK), "init for the catalog limits");
+        ok("CREATE DATABASE big");
+        ok("USE big");
+        static char wide[20000];
+        int at = snprintf(wide, sizeof(wide), "CREATE TABLE wide (id INT PRIMARY KEY");
+        for (int i = 1; i < 300; i++) at += snprintf(wide + at, sizeof(wide) - (size_t)at, ", c%d VARCHAR(10)", i);
+        snprintf(wide + at, sizeof(wide) - (size_t)at, ")");
+        CHECK(ok(wide), "CREATE TABLE with 300 columns");
+        CHECK(ok("INSERT INTO wide (id, c1, c299) VALUES (1, 'first', 'last')"), "row into the 300-column table");
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int made = 0;
+        for (int i = 0; i < 2000; i++) {
+            char sq[200];
+            snprintf(sq, sizeof(sq), "CREATE TABLE t%04d (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(50), price DECIMAL(10,2))", i);
+            if (ok(sq)) made++;
+            if (i == 999) clock_gettime(CLOCK_MONOTONIC, &t1);
+        }
+        double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+        CHECK(made == 2000, "2 000 tables in one database (%d created)", made);
+        CHECK(ms < 2000, "1 000 CREATE TABLE in %.0f ms", ms);
+        printf("1000 CREATE TABLE: %.0f ms\n", ms);
+        db_shutdown();
+        pid_t pp = fork();
+        if (pp == 0) {                                        // processo nuovo: memoria del solo avvio del motore
+            long before = 0, after = 0;
+            char line[256];
+            FILE* f = fopen("/proc/self/status", "r");
+            while (f && fgets(line, sizeof(line), f)) if (!strncmp(line, "VmRSS:", 6)) before = atol(line + 6);
+            if (f) fclose(f);
+            if (!db_init(WORK)) _exit(2);
+            f = fopen("/proc/self/status", "r");
+            while (f && fgets(line, sizeof(line), f)) if (!strncmp(line, "VmRSS:", 6)) after = atol(line + 6);
+            if (f) fclose(f);
+            ok("USE big");
+            bool good = num("SELECT COUNT(*) FROM t1999") == 0 && num("SELECT COUNT(*) FROM wide WHERE c299 = 'last'") == 1;
+            printf("engine start with 2 001 tables: +%ld KB resident\n", after - before);
+            _exit(!good ? 5 : after - before >= 20 * 1024 ? 6 : 0);
+        }
+        int ps;
+        waitpid(pp, &ps, 0);
+        CHECK(WIFEXITED(ps) && WEXITSTATUS(ps) == 0, "restart with 2 001 tables reads them back in under 20 MB of memory (exit %d)",
+              WIFEXITED(ps) ? WEXITSTATUS(ps) : -1);
+    }
+
     sh("rm -rf " BASE " " WORK " " CRASH);
     if (g_fail) { printf("durability tests: %d of %d FAILED\n", g_fail, g_tests); return 1; }
     printf("OK: %d/%d durability checks passed\n", g_tests, g_tests);
