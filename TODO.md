@@ -553,6 +553,11 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     by writes (a modified table goes back to building its in-memory index on the next lookup until the next
     clean shutdown / `CHECKPOINT`); range scans and composite keys still use the in-memory index; trees are
     not written by the automatic checkpoints (cost proportional to the table on write-heavy workloads).
+    Measured on a 130 000-row table: first lookup after opening 87 ms → 0.03 ms; the shutdown that writes the
+    tree takes 21 ms once (0.4 ms afterwards). `bench/suite.c`: `cold_start` now runs the same first query as
+    the SQLite variant (`SELECT COUNT(*)`) after one untimed reopen, new `cold_lookup` scenario (first
+    primary-key lookup after reopening: 60 000/s, SQLite 92 000/s); both baselines updated for these two
+    scenarios only (the scenario changed, so the 1.3 ratio no longer applies).
 
 - [x] **P1.7 `[CONCURRENCY]` Table locks for plain reads cause upgrade deadlocks; waits are polled; writers can starve** — [code]
   - **Where:** `src/bridge/db_api.c:841-878` (every `SELECT` takes `LK_S` on its tables, kept to `COMMIT`,

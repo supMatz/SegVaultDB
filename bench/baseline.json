@@ -119,9 +119,16 @@
     {
       "name": "cold_start",
       "unit": "starts/s",
-      "what": "close and reopen the loaded database, first query",
-      "segvault": 69.1,
-      "sqlite": 263.1
+      "what": "close and reopen the loaded database (after one untimed reopen), first query SELECT COUNT(*)",
+      "segvault": 146.8,
+      "sqlite": 2607.8
+    },
+    {
+      "name": "cold_lookup",
+      "unit": "lookups/s",
+      "what": "first primary-key lookup after reopening the database",
+      "segvault": 60731.9,
+      "sqlite": 91558.3
     },
     {
       "name": "pdo_point_lookup",

@@ -84,7 +84,8 @@ static bool sv_sync(Eng* e, const char* mode) { (void)e; return db_set_synchrono
 static bool sv_reopen(Eng* e) {
     db_shutdown();
     if (!db_init(e->dir)) die("reopen", db_init_error());
-    return sv_exec(e, "USE b");
+    sv_exec(e, "USE b");
+    return e->query(e, "SELECT COUNT(*) FROM s") == 1;     // la stessa prima query della variante SQLite
 }
 static void sv_close(Eng* e) { (void)e; db_shutdown(); }
 
@@ -301,11 +302,25 @@ static void rollbacks(Eng* e, int id) {
     put("rollback", "rollbacks/s", "BEGIN; INSERT 10 rows; ROLLBACK on the loaded database", id, n / ((now_ms() - t0) / 1000));
 }
 
-static void cold(Eng* e, int id) {
+static void cold(Eng* e, int id, int rows) {
     int n = 5;
+    // a regime: la prima chiusura dopo gli scenari precedenti scrive una volta gli indici su disco (SegVault 1.4.3,
+    // P1.6: ~20 ms per un indice di 130 000 righe), costo che la ricerca dopo la riapertura ripaga (cold_lookup)
+    e->reopen(e);
     double t0 = now_ms();
     for (int i = 0; i < n; i++) e->reopen(e);
     put("cold_start", "starts/s", "close and reopen the loaded database, first query", id, n / ((now_ms() - t0) / 1000));
+    // dopo la riapertura, la prima ricerca per chiave primaria (SegVault 1.4.3: albero su disco, P1.6)
+    double ms = 0;
+    for (int i = 0; i < n; i++) {
+        e->reopen(e);
+        char q[128];
+        snprintf(q, sizeof(q), "SELECT nome, citta FROM s WHERE id = %d", (int)((i * 7919LL + 13) % rows));
+        double a = now_ms();
+        if (e->query(e, q) != 1) die("cold lookup", q);
+        ms += now_ms() - a;
+    }
+    put("cold_lookup", "lookups/s", "first primary-key lookup after reopening the database", id, n / (ms / 1000));
 }
 
 // lettori e scrittori in parallelo: ognuno con la sua connessione (SQLite) o sessione (SegVault)
@@ -436,7 +451,7 @@ static void run_engine(bool lite) {
     commits(&e, id);
     rollbacks(&e, id);
     concurrent(&e, id, rows);
-    cold(&e, id);
+    cold(&e, id, rows);
     e.close(&e);
     char rm[300];
     snprintf(rm, sizeof(rm), "rm -rf %s", e.dir);
