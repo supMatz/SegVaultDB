@@ -734,7 +734,10 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     ~57 MB per execution: a freshly started process spends half of the scan in page faults of that arena, 8
     parallel scans meet on the process memory map (≈ 3.8× instead of ~7× with the pages cached), memory grows
     with the table (a `SELECT` over a 2 GB table needs > 2 GB), `LIMIT 10` on a big table still reads and copies
-    every row, and P2.8's "stream a 2 GB result with flat memory" cannot be done.
+    every row, and P2.8's "stream a 2 GB result with flat memory" cannot be done. `make bench` (2026-11-16):
+    `scan_aggregate` is 15 % slower relative to SQLite than in 1.3 (39 vs 46 queries/s); the same number was
+    measured at the start of the 1.4 audit session (`e9c4ee6`), so it comes from the earlier 1.4 work (page
+    format 2, decimals, statistics) — cause not isolated yet; check it first with this item.
   - **Do:** pull-based operators (open / next / close) for scan, filter, project, nested-loop and hash join,
     aggregate, sort, limit; copy only the columns a later operator uses (column pruning); aggregates and
     `COUNT(*)` consume rows straight from the page view; `LIMIT` without `ORDER BY` stops the scan; a cursor
