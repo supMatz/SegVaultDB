@@ -1453,8 +1453,8 @@ int main(void) {
         ok("INSERT INTO bigs VALUES (1, REPEAT('x', 1000))");
         for (int k = 0; k < 16; k++) { char q2[160]; snprintf(q2, sizeof(q2), "INSERT INTO bigs SELECT id + %d, pad FROM bigs", 1 << k); ok(q2); }
         db_shutdown();
-        long peak_kb[2] = { -1, -1 };
-        for (int mode = 0; mode < 2; mode++) {
+        long peak_kb[3] = { -1, -1, -1 };
+        for (int mode = 0; mode < 3; mode++) {
             int pfd[2];
             if (pipe(pfd) != 0) break;
             pid_t sp = fork();
@@ -1471,6 +1471,10 @@ int main(void) {
                         QueryResult* sr = db_execute_stream("SELECT id, pad FROM bigs WHERE id > 0", &sk);
                         if (!sr || !sr->success || !sr->streamed || sr->streamed_rows != rows) rows = -1;
                         db_result_free(sr);
+                    } else if (mode == 2) {                 // COUNT(*): contato durante la lettura
+                        QueryResult* cr = db_execute("SELECT COUNT(*) FROM bigs WHERE pad <> 'y'");
+                        rows = cr && cr->success && cr->num_rows == 1 ? atol(cr->rows[0].cells[0].value) : -1;
+                        db_result_free(cr);
                     } else {
                         QueryResult* mr = db_execute("SELECT id, pad FROM bigs WHERE id > 0");
                         rows = mr && mr->success ? mr->num_rows : -1;
@@ -1488,11 +1492,13 @@ int main(void) {
             close(pfd[0]);
             int st2;
             waitpid(sp, &st2, 0);
-            CHECK(v[0] == 65536, "%s: every row (%ld)", mode ? "materialised" : "streamed", v[0]);
+            CHECK(v[0] == 65536, "%s: every row (%ld)", mode == 0 ? "streamed" : mode == 1 ? "materialised" : "COUNT(*)", v[0]);
             peak_kb[mode] = v[1];
         }
         printf("SELECT of a 64 MB table: peak memory +%ld MB streamed, +%ld MB materialised\n", peak_kb[0] >> 10, peak_kb[1] >> 10);
         CHECK(peak_kb[0] >= 0 && peak_kb[0] < 32 * 1024 && peak_kb[1] > 2 * peak_kb[0], "streaming keeps memory flat (+%ld KB vs +%ld KB)", peak_kb[0], peak_kb[1]);
+        CHECK(peak_kb[2] >= 0 && peak_kb[2] < 32 * 1024, "COUNT(*) with a filter keeps memory flat (+%ld KB)", peak_kb[2]);
+        printf("COUNT(*) of the same table: +%ld MB\n", peak_kb[2] >> 10);
         sh("rm -rf " TS);
         #undef TS
     }

@@ -9278,6 +9278,66 @@ static QueryResult* rows_result(ExecCtx* ctx, SelectPlan* p, ASTNode* n, int dep
     return r;
 }
 
+// ── COUNT(*) in memoria costante (P1.14) ──
+// SELECT COUNT(*) FROM t [WHERE filtri della tabella]: le righe si contano durante la scansione, sulla vista della
+// pagina, senza copiarle (prima: ogni riga che passava il filtro copiata e tenuta fino alla fine)
+static bool plan_count_only(const SelectPlan* p) {
+    const ASTNode* n = p->n;
+    if (p->nsrc != 1 || p->src[0].is_view || p->src[0].lateral || p->compound || p->next_arm || p->correlated) return false;
+    if (!p->grouped || n->select_stmt.num_group || n->select_stmt.having || p->nwins || n->select_stmt.distinct) return false;
+    if (p->nout != 1 || p->resid.n || p->pre_dyn[0].n || p->probe_col[0] >= 0 || p->range_col[0] >= 0) return false;
+    if (n->select_stmt.num_order || n->select_stmt.calc_found) return false;
+    if (n->select_stmt.has_limit && (n->select_stmt.limit < 1 || n->select_stmt.offset != 0)) return false;
+    const ASTExpr* e = p->sel[0];
+    return e && e->type == EXPR_AGG && !strcmp(e->func, "COUNT") && !e->agg_distinct && !strcmp(e->col_name, "*");
+}
+
+static bool count_scan(SelectPlan* p, long long* out) {
+    Source* S = &p->src[0];
+    ExprVec* f = &p->pre_static[0];
+    HeapFile* hf = heap_open(p->x->bp, S->ts->root_page_id, S->ts->num_pages);
+    HeapScan* scan = hf ? heap_scan_open(hf, S->ts) : NULL;
+    Tuple* view = f->n ? tuple_create(S->ts->num_columns) : NULL;
+    size_t scap = SV_PAGE_SIZE + 64;
+    char* sbuf = f->n ? sv_malloc(scap) : NULL;
+    bool ok = scan && (!f->n || (view && sbuf));
+    Tuple* cur[MAX_SOURCES] = {0};
+    EvalCtx ec;
+    memset(&ec, 0, sizeof(ec));
+    ec.src = p->src; ec.nsrc = p->nsrc; ec.cur = cur; ec.x = p->x;
+    long long n = 0;
+    RID rid;
+    size_t len;
+    const uint8_t* data;
+    while (ok && (data = heap_scan_next_raw(scan, &rid, &len)) != NULL) {
+        p->st_scanned[0]++;
+        if (f->n) {
+            if (len + 64 > scap) {
+                char* nb = sv_realloc(sbuf, len + 64);
+                if (!nb) { ok = false; break; }
+                sbuf = nb;
+                scap = len + 64;
+            }
+            if (!tuple_view(view, data, len, S->ts, sbuf, scap)) continue;
+            cur[0] = view;
+            bool keep = xv_all_true(f, &ec);
+            cur[0] = NULL;
+            if (!keep) continue;
+        }
+        n++;
+    }
+    if (view) { for (int c = 0; c < view->num_values; c++) view->values[c].owns_str = false; tuple_free(view); }
+    free(sbuf);
+    if (scan) heap_scan_close(scan);
+    free(hf);
+    if (ec.err[0]) { snprintf(p->err, sizeof(p->err), "%s", ec.err); return false; }
+    if (sv_scan_cancelled()) { snprintf(p->err, sizeof(p->err), "Query cancelled"); return false; }
+    if (!ok) { snprintf(p->err, sizeof(p->err), "Out of memory while reading '%.64s'", S->table); return false; }
+    p->st_loaded[0] = n;
+    *out = n;
+    return true;
+}
+
 // ── risultati in streaming (P1.14) ──
 // Una SELECT di primo livello su una tabella sola, senza ordinamento, raggruppamenti, DISTINCT, finestre, LIMIT né
 // correlazioni, si esegue a blocchi di STREAM_BATCH righe lette: ogni blocco passa per la stessa pipeline e va al
@@ -9366,6 +9426,24 @@ static QueryResult* run_select_ex(ExecCtx* ctx, ASTNode* n, int depth, bool expl
     ExecRowSink* sink = depth == 0 ? g_stream_sink : NULL;
     g_stream_sink = NULL;                               // solo per lo statement principale
     if (sink && plan_streamable(p)) return stream_select(ctx, p, n, sink);
+    if (plan_count_only(p)) {
+        long long cnt = 0;
+        if (!count_scan(p, &cnt)) {
+            snprintf(err, sizeof(err), "%s", p->err[0] ? p->err : "Query failed");
+            plan_free(p);
+            return result_error_msg(err);
+        }
+        ORows crow = {0};
+        crow.ncols = 1;
+        OVal* o = orows_add(&crow);
+        EvalVal cv;
+        ev_int(&cv, cnt);
+        if (o) key_set(o, &cv);
+        QueryResult* cr = o ? rows_result(ctx, p, n, depth, &crow) : NULL;
+        orows_free(&crow);
+        plan_free(p);
+        return cr ? cr : result_error_msg("Out of memory");
+    }
     ORows rows = {0};
     if (!query_exec(p, ctx->trig_eval, 0, &rows)) {
         snprintf(err, sizeof(err), "%s", p->err[0] ? p->err : "Query failed");

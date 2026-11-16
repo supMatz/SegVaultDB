@@ -836,9 +836,12 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     129 MB table: peak memory **+23 MB** streamed instead of +425 MB. Tests: `tests/test_durability.c` §11
     (fresh process, 64 MB table: streamed peak below 32 MB and below half of the materialised one),
     `tests/test_server.c` (131 072 rows of 1 KB through the MySQL protocol, all received).
-    **Still open:** queries with `ORDER BY` / `GROUP BY` / joins / aggregates still materialise (pull-based
-    operators and an external sort are needed); `COUNT(*)` memory is O(rows); the prepared-statement (binary)
-    protocol, cursors and the HTTP API do not stream yet; the `scan_aggregate` regression is not isolated.
+    `SELECT COUNT(*) FROM t [WHERE …]` (one table, no grouping, no index probe) counts during the scan on the
+    page view without copying rows: +17 MB peak on the 129 MB table (the page cache), test in §11.
+    `scan_aggregate` is back within 15 % of the 1.3 ratio (`make bench`: 39.9 vs SQLite 29.3).
+    **Still open:** queries with `ORDER BY` / `GROUP BY` / joins / other aggregates still materialise
+    (pull-based operators and an external sort are needed); the prepared-statement (binary) protocol, cursors
+    and the HTTP API do not stream yet.
 
 ---
 
