@@ -9,6 +9,9 @@ docs/prompts/
 data/
 
 # IDE / editor
+TODO.md
+SECURITY.md
+CHANGELOG.md
 .vscode/
 .idea/
 *.swp

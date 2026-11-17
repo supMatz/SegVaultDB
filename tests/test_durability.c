@@ -1300,6 +1300,37 @@ int main(void) {
         CHECK(num("SELECT id FROM big WHERE id = 30000") == 30000, "tree rebuilt at the previous shutdown");
         ok("ALTER TABLE big ADD COLUMN extra INT DEFAULT 3");
         CHECK(num("SELECT extra FROM big WHERE id = 19999") == 3, "after ALTER TABLE the lookup reads the rewritten table");
+        // P1.15: scritture dopo un riavvio con gli alberi: l'indice in memoria parte dall'albero (pigro), niente
+        // lettura della tabella; duplicati e AUTO_INCREMENT controllati; alla chiusura l'albero nuovo unisce tutto
+        CHECK(num("SELECT id FROM big WHERE id = 1") == 1 && num("SELECT id FROM big WHERE email = 'User3@Example.com'") == 3,
+              "indexes of the rewritten table built");
+        ok("CREATE TABLE ai (id INT PRIMARY KEY AUTO_INCREMENT, v INT)");
+        ok("BEGIN");
+        for (int i = 0; i < 100; i++) ok("INSERT INTO ai (v) VALUES (1)");
+        ok("COMMIT");
+        db_shutdown();
+        CHECK(db_init(TB), "reopen for writes over on-disk indexes");
+        ok("USE d");
+        long long w0 = stat_num("buffer_misses");
+        CHECK(ok("INSERT INTO big (id, email, pad) VALUES (50001, 'new@example.com', 'p')"), "insert after restart");
+        CHECK(ok("UPDATE big SET email = 'upd@example.com' WHERE id = 1234"), "update after restart");
+        CHECK(ok("DELETE FROM big WHERE id = 4321"), "delete after restart");
+        CHECK(err_has("INSERT INTO big (id, email, pad) VALUES (50001, 'other@example.com', 'p')", "uplicate"), "duplicate primary key refused");
+        CHECK(err_has("INSERT INTO big (id, email, pad) VALUES (50002, 'User2000@Example.com', 'p')", "uplicate"), "duplicate unique value refused");
+        CHECK(num("SELECT id FROM big WHERE id = 50001") == 50001 && num("SELECT id FROM big WHERE email = 'upd@example.com'") == 1234 &&
+              num("SELECT COUNT(*) FROM big WHERE id = 4321") == 0 && num("SELECT COUNT(*) FROM big WHERE email = 'User1234@Example.com'") == 0 &&
+              num("SELECT id FROM big WHERE email = 'User1235@Example.com'") == 1235, "lookups see the writes");
+        long long w1 = stat_num("buffer_misses");
+        printf("on-disk index: 3 writes, 2 refused duplicates and 5 lookups after restart read %lld pages (table ~1 600)\n", w1 - w0);
+        CHECK(w1 - w0 < 200, "no full table scan after writes (%lld pages read)", w1 - w0);
+        CHECK(ok("INSERT INTO ai (v) VALUES (2)") && num("SELECT id FROM ai WHERE v = 2") == 101, "AUTO_INCREMENT continues from the tree's maximum");
+        db_shutdown();
+        CHECK(db_init(TB), "reopen after writes over on-disk indexes");
+        ok("USE d");
+        CHECK(num("SELECT id FROM big WHERE id = 50001") == 50001 && num("SELECT id FROM big WHERE email = 'upd@example.com'") == 1234 &&
+              num("SELECT COUNT(*) FROM big WHERE id = 4321") == 0 && num("SELECT id FROM big WHERE email = 'User17@Example.com'") == 17 &&
+              stat_num("in_memory_indexes") == 0, "the tree written at shutdown merges the base and the writes");
+        CHECK(ok("INSERT INTO ai (v) VALUES (3)") && num("SELECT id FROM ai WHERE v = 3") == 102, "AUTO_INCREMENT after the merged tree");
         db_shutdown();
         // pagina della radice danneggiata: si ripiega sulla lettura della tabella
         CHECK(db_init(TB), "reopen to damage a tree page");

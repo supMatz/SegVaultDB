@@ -92,6 +92,8 @@ void heap_scan_close(HeapScan* scan);
 // heap_damage: true se è successo dall'ultimo heap_damage_clear (messaggio in msg)
 void heap_damage_clear(void);
 bool heap_damage(char* msg, size_t n);
+// una pagina (anche non di heap: indici su disco) è illeggibile: lo statement in corso fallisce
+void heap_damage_note(uint32_t page, const char* what);
 
 // catene di overflow abbandonate (P1.5): first = prima pagina, total = byte della riga
 void heap_set_abandon_hook(void (*hook)(uint32_t first, uint32_t total));

@@ -547,6 +547,7 @@ static void w_table(WBuf* w, const TableSchema* t) {
     for (int i = 0; i < t->ntrees; i++) {
         wb_u32(w, t->tree_col[i]); wb_u8(w, t->tree_type[i]); wb_u8(w, t->tree_ci[i]);
         wb_u32(w, t->tree_root[i]); wb_u32(w, t->tree_tabroot[i]);
+        wb_u8(w, t->tree_hasmax[i]); wb_u64(w, (uint64_t)t->tree_max[i]);
     }
 }
 
@@ -601,6 +602,7 @@ static bool r_table(RBuf* r, TableSchema* t) {
             uint32_t col = rb_u32(r);
             t->tree_type[i] = rb_u8(r); t->tree_ci[i] = rb_u8(r);
             t->tree_root[i] = rb_u32(r); t->tree_tabroot[i] = rb_u32(r);
+            t->tree_hasmax[i] = rb_u8(r); t->tree_max[i] = (int64_t)rb_u64(r);
             if (col >= SV_MAX_COLUMNS) return false;
             t->tree_col[i] = (uint16_t)col;
         }

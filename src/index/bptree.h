@@ -38,6 +38,9 @@ int bpt_build(BufferPool* bp, const BptEntry* e, int n, uint64_t lsn, uint32_t* 
 // di indice): chi chiama ripiega sulla lettura della tabella. *reads = pagine lette (può essere NULL)
 int bpt_lookup(BufferPool* bp, uint32_t root, const char* key, RID** rids, int* n, int* reads);
 
+// ogni chiave con i suoi RID, in ordine di chiave (fn: false = basta). false se una pagina non si legge
+bool bpt_iterate(BufferPool* bp, uint32_t root, bool (*fn)(void* ctx, const char* key, const RID* rids, int n), void* ctx);
+
 // chiama fn per ogni pagina dell'albero (liberazione, VACUUM). false se una pagina non si legge
 bool bpt_pages(BufferPool* bp, uint32_t root, void (*fn)(void* ctx, uint32_t page), void* ctx);
 

@@ -123,6 +123,8 @@ typedef struct {
     uint8_t   tree_ci[SV_MAX_TREES];
     uint32_t  tree_root[SV_MAX_TREES];
     uint32_t  tree_tabroot[SV_MAX_TREES];
+    int64_t   tree_max[SV_MAX_TREES];      // massimo intero della colonna quando l'albero è stato scritto (AUTO_INCREMENT)
+    uint8_t   tree_hasmax[SV_MAX_TREES];
 } TableSchema;
 
 // -- definizione vista --

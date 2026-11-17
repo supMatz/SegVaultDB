@@ -19,6 +19,7 @@
 #include <math.h>
 #include <stdint.h>
 static int new_root_page(ExecCtx* ctx, uint32_t* pid);     // radice nuova registrata nel log (P1.11)
+static int tree_for(const TableSchema* ts, int col);        // albero su disco valido della colonna (P1.6)
 #include <strings.h>
 #include <limits.h>
 #include <errno.h>
@@ -1424,12 +1425,18 @@ typedef struct MemIndex {
     int       nord;
     bool      ord_ok;
     bool      has_long;     // qualche chiave è in forma lunga: niente scansioni per intervallo (l'ordine non vale)
+    // indice pigro (P1.15): base_root != 0 = le chiavi non in map stanno nell'albero su disco base_root (scritto
+    // all'ultimo checkpoint); in map ci sono solo le chiavi lette o cambiate da allora, con la lista intera dei RID
+    // (una lista vuota nasconde la chiave della base). Niente lettura della tabella per costruirlo
+    uint32_t  base_root;
+    BufferPool* bp;
     struct MemIndex* next;
 } MemIndex;
 
 // Protezione: la lista si legge / allunga con g_mi_lock; gli indici cambiano (insert / delete / free)
 // solo con il motore in esclusiva (db_lock), quando nessuna lettura parallela è in corso.
 static MemIndex* g_mem_indexes;
+static MemIndex* g_mi_zombies;          // tolti dalla lista con letture in parallelo possibili: liberati in esclusiva
 
 static void mi_free(MemIndex* ix) {
     sm_free(&ix->map);
@@ -1441,8 +1448,13 @@ static void mi_free(MemIndex* ix) {
     free(ix);
 }
 
+static void mi_free_zombies(void) {
+    while (g_mi_zombies) { MemIndex* nx = g_mi_zombies->next; mi_free(g_mi_zombies); g_mi_zombies = nx; }
+}
+
 void executor_invalidate_indexes(void) {
     heap_cache_clear();
+    mi_free_zombies();
     while (g_mem_indexes) {
         MemIndex* nx = g_mem_indexes->next;
         mi_free(g_mem_indexes);
@@ -1457,6 +1469,7 @@ void executor_invalidate_table(BufferPool* bp, const char* db, const char* table
 }
 
 static void mi_invalidate_table(const char* db, const char* table) {
+    mi_free_zombies();                                 // (motore in esclusiva: nessuna lettura in corso)
     MemIndex** pp = &g_mem_indexes;
     while (*pp) {
         MemIndex* ix = *pp;
@@ -1524,9 +1537,12 @@ static bool mi_add_key(MemIndex* ix, const char* key, RID rid) {
     return true;
 }
 
+static bool mi_fault_in(MemIndex* ix, const char* key);
+
 static bool mi_add_tuple(MemIndex* ix, const TableSchema* ts, const Tuple* t, RID rid) {
     char key[KEY_BUF];
     if (!tuple_key(ts, t, ix->cols, ix->ncols, key, sizeof(key))) return true;
+    if (ix->base_root && !mi_fault_in(ix, key)) return false;
     if (!mi_add_key(ix, key, rid)) return false;
     if (ix->ncols == 1) {
         int ci = ix->cols[0];
@@ -1543,6 +1559,7 @@ static bool mi_add_tuple(MemIndex* ix, const TableSchema* ts, const Tuple* t, RI
 static void mi_remove_tuple(MemIndex* ix, const TableSchema* ts, const Tuple* t, RID rid) {
     char key[KEY_BUF];
     if (!tuple_key(ts, t, ix->cols, ix->ncols, key, sizeof(key))) return;
+    if (ix->base_root && !mi_fault_in(ix, key)) return;
     SMSlot* s = sm_slot(&ix->map, key, false);
     if (!s || s->val < 0) return;
     RidList* l = &ix->lists[s->val];
@@ -1550,9 +1567,67 @@ static void mi_remove_tuple(MemIndex* ix, const TableSchema* ts, const Tuple* t,
         if (l->r[i].page_id == rid.page_id && l->r[i].slot_id == rid.slot_id) { l->r[i] = l->r[--l->n]; return; }
 }
 
+// alberi su disco trovati illeggibili (pagina danneggiata): non si usano più fino al riavvio (P1.15)
+#define BAD_ROOTS 64
+static atomic_uint g_bad_roots[BAD_ROOTS];
+static atomic_int g_nbad_roots;
+static void tree_mark_bad(uint32_t root) {
+    int k = atomic_fetch_add(&g_nbad_roots, 1);
+    if (k < BAD_ROOTS) atomic_store(&g_bad_roots[k], root);
+}
+static bool tree_is_bad(uint32_t root) {
+    int n = atomic_load(&g_nbad_roots);
+    for (int i = 0; i < n && i < BAD_ROOTS; i++) if (atomic_load(&g_bad_roots[i]) == root) return true;
+    return false;
+}
+
+// risultati delle ricerche nella base di un indice pigro: non si scrivono nell'indice (le letture in parallelo lo
+// condividono), restano validi per le MI_SCRATCH ricerche successive dello stesso thread
+#define MI_SCRATCH 8
+static _Thread_local RidList g_mi_scratch[MI_SCRATCH];
+static _Thread_local int g_mi_scratch_next;
+
 static const RidList* mi_lookup(MemIndex* ix, const char* key) {
     SMSlot* s = sm_slot(&ix->map, key, false);
-    return (s && s->val >= 0) ? &ix->lists[s->val] : NULL;
+    if (s && s->val >= 0) return &ix->lists[s->val];
+    if (!ix->base_root) return NULL;
+    RID* r = NULL;
+    int n = 0;
+    int f = bpt_lookup(ix->bp, ix->base_root, key, &r, &n, NULL);
+    if (f < 0) {                                   // lo statement fallisce; il prossimo ricostruisce l'indice dalla tabella
+        tree_mark_bad(ix->base_root);
+        heap_damage_note(ix->base_root, "an unreadable on-disk index (rebuilt from the table by the next statement)");
+        return NULL;
+    }
+    if (f == 0) return NULL;
+    RidList* out = &g_mi_scratch[g_mi_scratch_next];
+    g_mi_scratch_next = (g_mi_scratch_next + 1) % MI_SCRATCH;
+    free(out->r);
+    *out = (RidList){ r, n, n };
+    return out;
+}
+
+// prima di cambiare la chiave key di un indice pigro: la sua lista dalla base in map (motore in esclusiva)
+static bool mi_fault_in(MemIndex* ix, const char* key) {
+    if (!ix->base_root) return true;
+    SMSlot* s = sm_slot(&ix->map, key, false);
+    if (s && s->val >= 0) return true;
+    RID* r = NULL;
+    int n = 0;
+    int f = bpt_lookup(ix->bp, ix->base_root, key, &r, &n, NULL);
+    if (f < 0) {
+        tree_mark_bad(ix->base_root);
+        heap_damage_note(ix->base_root, "an unreadable on-disk index (rebuilt from the table by the next statement)");
+        return false;
+    }
+    bool ok = mi_add_key(ix, key, (RID){0, 0}) ;                   // crea la voce (con un RID provvisorio)
+    if (ok) {
+        RidList* l = &ix->lists[sm_slot(&ix->map, key, false)->val];
+        l->n = 0;                                                  // via il provvisorio
+        for (int i = 0; i < n && ok; i++) ok = mi_add_key(ix, key, r[i]);
+    }
+    free(r);
+    return ok;
 }
 
 // ── vista ordinata dell'indice: scansione per intervallo ──
@@ -1617,6 +1692,7 @@ static bool mi_range_locked(MemIndex* ix, bool numeric, const EvalVal* lo, const
 static bool mi_range(MemIndex* ix, bool numeric, const EvalVal* lo, const EvalVal* hi, RID** out, int* nout) {
     *out = NULL;
     *nout = 0;
+    if (ix->base_root) return false;                            // indice pigro: l'intervallo legge la tabella
     if (!numeric && ix->has_long) return false;                 // testi lunghi: l'ordine delle chiavi non vale
     // la vista ordinata si costruisce al primo uso: con più letture in parallelo, una alla volta
     sv_rw_wr(&g_mi_lock);
@@ -1695,8 +1771,17 @@ static MemIndex* mi_get_cols_locked(ExecCtx* ctx, const char* db, TableSchema* t
         if (w < 0 || (size_t)w >= sizeof(name) - len) return NULL;
         len += (size_t)w;
     }
-    for (MemIndex* ix = g_mem_indexes; ix; ix = ix->next)
-        if (!strcasecmp(ix->db, db) && !strcasecmp(ix->table, ts->name) && !strcasecmp(ix->col, name)) return ix;
+    for (MemIndex** pp = &g_mem_indexes; *pp; pp = &(*pp)->next) {
+        MemIndex* ix = *pp;
+        if (strcasecmp(ix->db, db) || strcasecmp(ix->table, ts->name) || strcasecmp(ix->col, name)) continue;
+        if (ix->base_root && tree_is_bad(ix->base_root)) {          // ricostruito qui sotto; liberato più tardi (una
+            *pp = ix->next;                                        // lettura in parallelo può ancora usarlo)
+            ix->next = g_mi_zombies;
+            g_mi_zombies = ix;
+            break;
+        }
+        return ix;
+    }
     MemIndex* ix = sv_calloc(1, sizeof(MemIndex));
     if (!ix) return NULL;
     snprintf(ix->db, sizeof(ix->db), "%s", db);
@@ -1704,6 +1789,16 @@ static MemIndex* mi_get_cols_locked(ExecCtx* ctx, const char* db, TableSchema* t
     snprintf(ix->col, sizeof(ix->col), "%s", name);
     memcpy(ix->cols, cols, sizeof(int) * (size_t)ncols);
     ix->ncols = ncols;
+    ix->bp = ctx->bp;
+    int ti = ncols == 1 ? tree_for(ts, cols[0]) : -1;
+    if (ti >= 0) {                                              // P1.15: l'albero su disco fa da base, niente lettura
+        ix->base_root = ts->tree_root[ti];
+        ix->has_max = ts->tree_hasmax[ti] != 0;
+        ix->max_int = ts->tree_max[ti];
+        ix->next = g_mem_indexes;
+        g_mem_indexes = ix;
+        return ix;
+    }
     HeapFile* hf = heap_open(ctx->bp, ts->root_page_id, ts->num_pages);
     HeapScan* scan = hf ? heap_scan_open(hf, ts) : NULL;
     bool ok = scan != NULL;
@@ -1784,13 +1879,47 @@ static void trees_drop(TableSchema* ts) {
     if (g_trees_live > 0) g_trees_live--;
 }
 
-// radici degli alberi abbandonati (la lista passa a chi chiama, da liberare dopo un salvataggio del catalogo)
+// radici degli alberi abbandonati (la lista passa a chi chiama, da liberare dopo un salvataggio del catalogo).
+// Quelle ancora base di un indice pigro in memoria (P1.15) restano in lista: le sue pagine servono ancora
 int executor_trees_garbage(uint32_t** roots) {
-    *roots = g_tree_garbage;
-    int n = g_ntree_garbage;
-    g_tree_garbage = NULL;
-    g_ntree_garbage = g_captree_garbage = 0;
+    uint32_t* out = sv_try_malloc(sizeof(uint32_t) * (size_t)(g_ntree_garbage ? g_ntree_garbage : 1));
+    if (!out) { *roots = NULL; return 0; }
+    int n = 0, k = 0;
+    for (int i = 0; i < g_ntree_garbage; i++) {
+        bool used = false;
+        for (MemIndex* ix = g_mem_indexes; ix && !used; ix = ix->next) used = ix->base_root == g_tree_garbage[i];
+        if (used) g_tree_garbage[k++] = g_tree_garbage[i];
+        else out[n++] = g_tree_garbage[i];
+    }
+    g_ntree_garbage = k;
+    *roots = out;
     return n;
+}
+
+// basi degli indici pigri in memoria (VACUUM non deve liberarne le pagine): n radici in *roots (malloc'd)
+int executor_lazy_roots(uint32_t** roots) {
+    int n = 0;
+    for (MemIndex* ix = g_mem_indexes; ix; ix = ix->next) if (ix->base_root) n++;
+    *roots = sv_try_malloc(sizeof(uint32_t) * (size_t)(n ? n : 1));
+    if (!*roots) return 0;
+    n = 0;
+    for (MemIndex* ix = g_mem_indexes; ix; ix = ix->next) if (ix->base_root) (*roots)[n++] = ix->base_root;
+    return n;
+}
+
+// indice pigro -> completo: le chiavi della base che non sono in map (P1.15). false = albero illeggibile o memoria
+static bool lazy_fill_cb(void* ctx, const char* key, const RID* rids, int n) {
+    MemIndex* ix = ctx;
+    SMSlot* s = sm_slot(&ix->map, key, false);
+    if (s && s->val >= 0) return true;                       // cambiata da allora: vale quella in memoria
+    for (int i = 0; i < n; i++) if (!mi_add_key(ix, key, rids[i])) return false;
+    return true;
+}
+static bool mi_materialize(MemIndex* ix) {
+    if (!ix->base_root) return true;
+    if (!bpt_iterate(ix->bp, ix->base_root, lazy_fill_cb, ix)) return false;
+    ix->base_root = 0;
+    return true;
 }
 
 void executor_trees_drop_all(Catalog* c) {
@@ -1822,7 +1951,7 @@ static void trees_on_write(ExecCtx* ctx, TableSchema* ts) {
 // albero valido della colonna (-1 = nessuno)
 static int tree_for(const TableSchema* ts, int col) {
     for (int i = 0; i < ts->ntrees; i++)
-        if (ts->tree_col[i] == col && ts->tree_root[i] && ts->tree_tabroot[i] == ts->root_page_id &&
+        if (ts->tree_col[i] == col && ts->tree_root[i] && ts->tree_tabroot[i] == ts->root_page_id && !tree_is_bad(ts->tree_root[i]) &&
             ts->tree_type[i] == (uint8_t)ts->columns[col].type && ts->tree_ci[i] == (uint8_t)col_is_ci(ts, col)) return i;
     return -1;
 }
@@ -1845,6 +1974,7 @@ static int tree_probe(ExecCtx* x, const char* db, TableSchema* ts, int col, cons
     if (ti < 0 || mi_exists(db, ts->name, ts->columns[col].name)) return -1;
     if (heap_snapshot_active(ts->root_page_id)) return -1;
     int f = bpt_lookup(x->bp, ts->tree_root[ti], key, r, n, NULL);
+    if (f < 0) tree_mark_bad(ts->tree_root[ti]);               // illeggibile: da qui l'indice si costruisce dalla tabella
     return f < 0 ? -1 : f;
 }
 
@@ -1861,6 +1991,7 @@ int executor_trees_write(ExecCtx* ctx, uint64_t lsn) {
         if (!ts || ts->num_rows < TREE_MIN_ROWS) continue;
         int col = ix->cols[0];
         if (col < 0 || col >= ts->num_columns || tree_for(ts, col) >= 0) continue;
+        if (ix->base_root && !mi_materialize(ix)) continue;     // pigro con modifiche: base + modifiche
         TreeKey* tk = sv_try_malloc(sizeof(TreeKey) * (size_t)(ix->nlists ? ix->nlists : 1));
         BptEntry* e = sv_try_malloc(sizeof(BptEntry) * (size_t)(ix->nlists ? ix->nlists : 1));
         if (!tk || !e) { free(tk); free(e); continue; }
@@ -1883,6 +2014,8 @@ int executor_trees_write(ExecCtx* ctx, uint64_t lsn) {
         ts->tree_ci[slot] = (uint8_t)col_is_ci(ts, col);
         ts->tree_root[slot] = root;
         ts->tree_tabroot[slot] = ts->root_page_id;
+        ts->tree_hasmax[slot] = ix->has_max;
+        ts->tree_max[slot] = ix->max_int;
         written++;
     }
     return written;

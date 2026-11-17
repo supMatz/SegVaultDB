@@ -112,6 +112,7 @@ int  executor_trees_write(ExecCtx* ctx, uint64_t lsn);
 int  executor_trees_garbage(uint32_t** roots);
 void executor_trees_drop_all(Catalog* c);
 void executor_trees_count(Catalog* c);
+int  executor_lazy_roots(uint32_t** roots);     // basi su disco degli indici pigri in memoria (P1.15)
 
 // VACUUM FULL: riscrive le righe della tabella in pagine nuove; NULL = fatto (radice e pagine in out_*)
 const char* executor_rebuild_table(ExecCtx* ctx, TableSchema* ts, uint32_t* out_root, uint32_t* out_pages);

@@ -231,3 +231,55 @@ bool bpt_pages(BufferPool* bp, uint32_t root, void (*fn)(void* ctx, uint32_t pag
     free(st);
     return ok;
 }
+
+// ── visita in ordine ────────────────────────────────────────────
+
+static int iter_page(BufferPool* bp, uint32_t pid, int depth, bool (*fn)(void*, const char*, const RID*, int), void* ctx) {
+    if (depth > 16) return -1;
+    Page* p = bp_fetch(bp, pid);
+    if (!p) return -1;
+    if (!(p->flags & PAGE_FLAG_INDEX)) { bp_unpin(bp, pid, false); return -1; }
+    int rc = 1;
+    if (p->flags & PAGE_FLAG_INNER) {
+        int ns = p->num_slots;
+        uint32_t* kids = sv_try_malloc(sizeof(uint32_t) * (size_t)(ns ? ns : 1));
+        if (!kids) { bp_unpin(bp, pid, false); return -1; }
+        for (int s = 0; s < ns; s++) {
+            const uint8_t *k, *rest;
+            uint16_t klen, restlen;
+            if (!slot_key(p, s, &k, &klen, &rest, &restlen) || restlen < 4) { rc = -1; break; }
+            kids[s] = get32(rest);
+        }
+        bp_unpin(bp, pid, false);                 // i figli si visitano senza tenere il padre
+        for (int s = 0; s < ns && rc == 1; s++) rc = iter_page(bp, kids[s], depth + 1, fn, ctx);
+        free(kids);
+        return rc;
+    }
+    char key[BPT_MAX_KEY + 1];
+    RID* r = NULL;
+    int cap = 0;
+    for (int s = 0; s < p->num_slots && rc == 1; s++) {
+        const uint8_t *k, *rest;
+        uint16_t klen, restlen;
+        if (!slot_key(p, s, &k, &klen, &rest, &restlen) || klen > BPT_MAX_KEY || restlen < 2) { rc = -1; break; }
+        int nr = get16(rest);
+        if (nr < 0 || (size_t)restlen < 2 + 6 * (size_t)nr) { rc = -1; break; }
+        if (nr > cap) {
+            RID* nv = sv_try_realloc(r, sizeof(RID) * (size_t)nr);
+            if (!nv) { rc = -1; break; }
+            r = nv;
+            cap = nr;
+        }
+        for (int i = 0; i < nr; i++) { r[i].page_id = get32(rest + 2 + 6 * i); r[i].slot_id = get16(rest + 2 + 6 * i + 4); }
+        memcpy(key, k, klen);
+        key[klen] = '\0';
+        if (!fn(ctx, key, r, nr)) rc = 0;
+    }
+    free(r);
+    bp_unpin(bp, pid, false);
+    return rc;
+}
+
+bool bpt_iterate(BufferPool* bp, uint32_t root, bool (*fn)(void* ctx, const char* key, const RID* rids, int n), void* ctx) {
+    return iter_page(bp, root, 0, fn, ctx) >= 0;
+}

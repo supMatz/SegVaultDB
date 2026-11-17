@@ -474,7 +474,13 @@ static bool do_vacuum(int* freed) {
             TableSchema* ts = g_db.catalog->databases[d].tables[t];
             for (int k = 0; k < ts->ntrees; k++) bpt_pages(g_db.bp, ts->tree_root[k], mark_tree_page, &tm);
         }
-    { uint32_t* g = NULL; executor_trees_garbage(&g); free(g); }   // liberate qui (non due volte)
+    {                                                    // basi degli indici pigri in memoria: ancora in uso
+        uint32_t* lr = NULL;
+        int nl = executor_lazy_roots(&lr);
+        for (int i = 0; i < nl; i++) bpt_pages(g_db.bp, lr[i], mark_tree_page, &tm);
+        free(lr);
+    }
+    { uint32_t* g = NULL; executor_trees_garbage(&g); free(g); }   // liberate qui (non due volte; quelle in uso restano)
     // una catena interrotta (pagina danneggiata) farebbe sembrare libere le pagine dopo: niente VACUUM
     if (heap_damage(NULL, 0)) {
         heap_damage_clear();

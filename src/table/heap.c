@@ -512,6 +512,7 @@ static void damage(uint32_t page, const char* what) {
 }
 
 void heap_damage_clear(void) { t_damage.set = false; }
+void heap_damage_note(uint32_t page, const char* what) { damage(page, what); }
 
 bool heap_damage(char* msg, size_t n) {
     if (!t_damage.set) return false;
