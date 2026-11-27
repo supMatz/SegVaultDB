@@ -217,6 +217,14 @@ void value_set_from_text(Value* v, DataType type, const char* text) {
         case SV_TYPE_BOOL:
             v->bool_val = strcmp(text, "1") == 0 || strcasecmp(text, "true") == 0;
             break;
+        case SV_TYPE_CHAR: {                    // CHAR: senza gli spazi finali, come li restituisce MySQL
+            size_t l = strlen(text);
+            while (l > 0 && text[l - 1] == ' ') l--;
+            v->str_val = sv_malloc(l + 1);
+            if (v->str_val) { memcpy(v->str_val, text, l); v->str_val[l] = '\0'; }
+            v->owns_str = v->str_val != NULL;
+            break;
+        }
         default:
             v->str_val = sv_strdup(text);
             v->owns_str = v->str_val != NULL;

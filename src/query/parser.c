@@ -1161,7 +1161,12 @@ static ASTExpr* parse_primary(ParserState* ps) {
             e = new_expr(EXPR_FLOAT);
             if (e) {
                 e->float_val = strtod(t.text, NULL);
-                if (!strpbrk(t.text, "eE") && strlen(t.text) < sizeof(e->col_name)) snprintf(e->col_name, sizeof(e->col_name), "%s", t.text);
+                if (!strpbrk(t.text, "eE") && strlen(t.text) + 1 < sizeof(e->col_name)) {
+                    // .5 -> 0.5 e 5. -> 5, come li mostra MySQL (prima il testo restava com'era scritto)
+                    snprintf(e->col_name, sizeof(e->col_name), "%s%s", t.text[0] == '.' ? "0" : "", t.text);
+                    size_t l = strlen(e->col_name);
+                    if (l > 1 && e->col_name[l - 1] == '.') e->col_name[l - 1] = '\0';
+                }
             }
             return e;
         case TOK_STRING:

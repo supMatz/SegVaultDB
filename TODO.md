@@ -2893,6 +2893,12 @@ Come è stata fatta: warning estesi di GCC 16 (`-Wnull-dereference -Wduplicated-
     mezzanotte. Ora il binder porta la costante alla forma della colonna (`temporal_literal`), quindi vale anche per
     le ricerche con gli indici, per `IN` e `BETWEEN`; i `VARCHAR` restano confronti fra testi, come in MySQL.
     **Resta:** contro un'espressione calcolata a ogni riga (`t = CURDATE()`) il confronto è ancora fra testi.
+  - **Corretto (dopo la 1.5.1):** `INSERT … VALUES (DEFAULT, …)` e `UPDATE … SET c = DEFAULT` davano "Unknown column
+    'DEFAULT'" (sintassi usata da ORM e dump): ora valgono il default della colonna, l'`AUTO_INCREMENT` o il
+    ricalcolo della colonna generata. Una colonna vera chiamata `` `default` `` resta una colonna.
+  - **Corretto (dopo la 1.5.1):** `CHAR(n)` conservava gli spazi finali (`LENGTH` di `'ab  '` = 4, `x = 'ab'` falso):
+    ora li toglie in scrittura come MySQL, e non contano per la lunghezza massima.
+  - **Corretto (dopo la 1.5.1):** `SELECT .5` mostrava `.5` e `SELECT 5.` mostrava `5.` (MySQL: `0.5`, `5`).
   - **Corretto:** `ORD('à')` dava 195 (il primo byte), MySQL 50080 (i byte del carattere).
   - **Aperto (minori):** un `DOUBLE` che trabocca (`1e308 * 10`, `EXP(1000)`) dà NULL invece dell'errore "DOUBLE value
     is out of range"; `-(-9223372036854775808)` e `ABS(-9223372036854775808)` danno un double invece dell'errore

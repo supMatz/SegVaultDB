@@ -360,6 +360,25 @@ int main(void) {
     t("SELECT id FROM tdt WHERE t BETWEEN '2024-01-15' AND '2024-02-01' ORDER BY id", "1;2");
     t("SELECT id FROM tdt WHERE s = '2024-02-01 00:00:00'", "");            // VARCHAR: confronto fra testi
     t("DROP TABLE tdt", "OK:0");
+    // DEFAULT in VALUES e in SET (prima "Unknown column 'DEFAULT'"); una colonna chiamata `default` resta una colonna
+    t("CREATE TABLE dfk (id INT PRIMARY KEY AUTO_INCREMENT, y VARCHAR(5) DEFAULT 'd', z INT NOT NULL DEFAULT 7, g INT GENERATED ALWAYS AS (z * 2) STORED)", "OK:0");
+    t("INSERT INTO dfk VALUES (DEFAULT, DEFAULT, DEFAULT, DEFAULT), (DEFAULT, 'a', 1, DEFAULT)", "OK:2");
+    t("SELECT id, y, z, g FROM dfk ORDER BY id", "1|d|7|14;2|a|1|2");
+    t("UPDATE dfk SET y = DEFAULT, z = DEFAULT, g = DEFAULT WHERE id = 2", "OK:1");
+    t("SELECT y, z, g FROM dfk WHERE id = 2", "d|7|14");
+    t("CREATE TABLE dfc (id INT, `default` INT)", "OK:0");
+    t("INSERT INTO dfc VALUES (1, 5)", "OK:1");
+    t("UPDATE dfc SET id = `default`", "OK:1");
+    t("SELECT id FROM dfc", "5");
+    t("DROP TABLE dfc", "OK:0");
+    t("DROP TABLE dfk", "OK:0");
+    // CHAR senza gli spazi finali, come MySQL
+    t("CREATE TABLE chs (id INT PRIMARY KEY, x CHAR(5), UNIQUE (x))", "OK:0");
+    t("INSERT INTO chs VALUES (1, 'ab  '), (2, 'abcde   ')", "OK:2");
+    t("SELECT CONCAT('[', x, ']'), LENGTH(x) FROM chs ORDER BY id", "[ab]|2;[abcde]|5");
+    t("INSERT INTO chs VALUES (3, 'ab')", "ERR:Duplicate");
+    t("DROP TABLE chs", "OK:0");
+    t("SELECT .5, -.5, 5., .5 + .25", "0.5|-0.5|5|0.75");                   // letterali come li mostra MySQL
     // GROUP BY per posizione come MySQL (prima un numero era una costante: un solo gruppo)
     t("CREATE TABLE gp (id INT PRIMARY KEY, g VARCHAR(5), v INT)", "OK:0");
     t("INSERT INTO gp VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'c', NULL)", "OK:4");

@@ -144,6 +144,8 @@ static QueryResult* exec_drop_table(ExecCtx* ctx, ASTNode* n);
 static const char* check_value(const Column* c, const char* v, char* msg, size_t n);
 
 // DEFAULT CURRENT_TIMESTAMP / NOW() / LOCALTIMESTAMP / CURRENT_DATE: valore calcolato a ogni INSERT
+static bool is_default_expr(const ASTExpr* e) { return e && e->type == EXPR_FUNC && !strcmp(e->func, "__DEFAULT"); }
+
 static bool default_is_now(const char* d) {
     return !strcasecmp(d, "CURRENT_TIMESTAMP") || !strcasecmp(d, "NOW") || !strcasecmp(d, "LOCALTIMESTAMP") ||
            !strcasecmp(d, "LOCALTIME") || !strcasecmp(d, "CURRENT_DATE") || !strcasecmp(d, "CURDATE") ||
@@ -1067,6 +1069,13 @@ static const char* check_value(const Column* c, const char* v, char* msg, size_t
             snprintf(msg, n, "Column '%s' expects TRUE, FALSE, 1 or 0, got '%.40s'", c->name, v);
             return msg;
         case SV_TYPE_VARCHAR: case SV_TYPE_CHAR:
+            if (c->type == SV_TYPE_CHAR && c->size > 0 && utf8_len(v) > c->size) {   // CHAR: gli spazi finali non contano
+                size_t l = strlen(v);
+                while (l > 0 && v[l - 1] == ' ') l--;
+                int chars = 0;
+                for (size_t i = 0; i < l; i++) if (((unsigned char)v[i] & 0xC0) != 0x80) chars++;
+                if (chars <= c->size) return NULL;
+            }
             if (c->size > 0 && utf8_len(v) > c->size) {
                 snprintf(msg, n, "Value too long for column '%s' (%d characters, maximum %d)", c->name, utf8_len(v), c->size);
                 return msg;
@@ -2420,7 +2429,7 @@ static const FuncDef FUNCS[] = {
     { "GET_LOCK", 2, 2 }, { "RELEASE_LOCK", 1, 1 }, { "IS_FREE_LOCK", 1, 1 }, { "IS_USED_LOCK", 1, 1 }, { "RELEASE_ALL_LOCKS", 0, 0 },
     { "ANY_VALUE", 1, 1 }, { "ISNULL", 1, 1 }, { "VALUES", 1, 1 },
     // operatori e variabili (dal parser)
-    { "__UVAR", 1, 1 }, { "__SYSVAR", 1, 1 }, { "__UASSIGN", 2, 2 }, { "__BITNOT", 1, 1 }, { "__COLLATE", 2, 2 }, { "__BITAND", 2, 2 },
+    { "__UVAR", 1, 1 }, { "__SYSVAR", 1, 1 }, { "__UASSIGN", 2, 2 }, { "__BITNOT", 1, 1 }, { "__COLLATE", 2, 2 }, { "__DEFAULT", 0, 0 }, { "__BITAND", 2, 2 },
     { "__BITOR", 2, 2 }, { "__BITXOR", 2, 2 }, { "__SHL", 2, 2 }, { "__SHR", 2, 2 }, { "__NSEQ", 2, 2 }, { "__XOR", 2, 2 },
     { "__PIPES", 2, 2 }, { "__ISTRUE", 1, 1 }, { "__ISFALSE", 1, 1 },
     // JSON (modifica e ricerca), testo, date
@@ -2532,6 +2541,15 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
             if (r < 0) {
                 snprintf(msg, sizeof(msg), "Column '%.64s' is ambiguous: qualify it with the table name", e->col_name);
                 bind_error(b, msg);
+                return;
+            }
+            // DEFAULT come valore di INSERT ... VALUES e di UPDATE ... SET col = DEFAULT (una colonna vera chiamata
+            // `default` resta una colonna: qui si arriva solo se non c'è)
+            if (!e->table_name[0] && !strcasecmp(e->col_name, "DEFAULT") && b->clause &&
+                (!strcmp(b->clause, "VALUES") || !strcmp(b->clause, "SET"))) {
+                e->type = EXPR_FUNC;
+                snprintf(e->func, sizeof(e->func), "__DEFAULT");
+                e->col_name[0] = '\0';
                 return;
             }
             // alias della SELECT (HAVING, ORDER BY, GROUP BY)
@@ -2874,6 +2892,7 @@ static bool eval_internal(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     const char* f = e->func;
     const size_t flen = strlen(f);                       // per FIS: confronti per lunghezza prima (CR-M2)
     if (f[0] != '_' || f[1] != '_') return false;
+    if (FIS("__DEFAULT")) { ev_null(out); return true; }   // DEFAULT fuori da VALUES / SET col = DEFAULT
     if (FIS("__UVAR"))   { uservar_get(e->args[0]->str_val, out); return true; }
     if (FIS("__SYSVAR")) {
         if (!strcasecmp(e->args[0]->str_val, "foreign_key_checks")) { ev_int(out, executor_fk_checks()); return true; }
@@ -11980,6 +11999,7 @@ static QueryResult* exec_insert_in(ExecCtx* ctx, ASTNode* n, InsScratch* S) {
         for (int i = 0; i < nc; i++) text[i] = NULL;
         for (int k = 0; k < ncols; k++) {
             EvalVal v;
+            if (!from_select && is_default_expr(n->insert_stmt.values[r * ncols + k])) continue;   // DEFAULT: come omessa
             if (from_select) ev_from_oval(&v, &orow(&srows, r)[k]);
             else eval_expr(n->insert_stmt.values[r * ncols + k], &ec, &v);
             if (ec.err[0]) { fail = ec.err; break; }
@@ -12193,7 +12213,9 @@ static QueryResult* exec_update_cols(ExecCtx* ctx, ASTNode* n, int* set_ci) {
     for (int k = 0; k < n->update_stmt.num_sets; k++) {
         set_ci[k] = catalog_get_col_index(ts, n->update_stmt.set_cols[k]);
         if (set_ci[k] < 0) return unknown_column_error(n->update_stmt.set_cols[k], "SET");
-        if (ts->columns[set_ci[k]].flags & COLF_GENERATED) {
+        const ASTExpr* sx = n->update_stmt.set_exprs[k];
+        bool to_default = is_default_expr(sx) || (sx->type == EXPR_COLUMN && !sx->table_name[0] && !strcasecmp(sx->col_name, "DEFAULT"));
+        if ((ts->columns[set_ci[k]].flags & COLF_GENERATED) && !to_default) {
             snprintf(msg, sizeof(msg), "The value specified for generated column '%.64s' in table '%.64s' is not allowed", ts->columns[set_ci[k]].name, ts->name);
             return result_error_msg(msg);
         }
@@ -12235,9 +12257,18 @@ static QueryResult* exec_update_cols(ExecCtx* ctx, ASTNode* n, int* set_ci) {
             int ci = set_ci[k];
             Column* c = &ts->columns[ci];
             EvalVal v;
-            eval_expr(n->update_stmt.set_exprs[k], &ec, &v);
-            if (ec.err[0]) { fail = ec.err; break; }
-            const char* text = ev_store_text(&v);
+            const char* text;
+            char dnow[40];
+            if (is_default_expr(n->update_stmt.set_exprs[k])) {             // SET col = DEFAULT
+                if (c->flags & COLF_GENERATED) continue;                       // la ricalcola gen_compute
+                if ((!c->default_val[0] && !c->has_default) || !strcasecmp(c->default_val, "NULL")) text = NULL;
+                else if (default_is_now(c->default_val)) { col_now_text(c->default_val, c->type, dnow, sizeof(dnow)); text = dnow; }
+                else text = c->default_val;
+            } else {
+                eval_expr(n->update_stmt.set_exprs[k], &ec, &v);
+                if (ec.err[0]) { fail = ec.err; break; }
+                text = ev_store_text(&v);
+            }
             if (!text && (!c->nullable || c->primary_key)) {
                 snprintf(msg, sizeof(msg), "Column '%.64s' cannot be NULL", c->name);
                 fail = msg;

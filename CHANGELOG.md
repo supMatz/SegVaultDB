@@ -7,6 +7,10 @@
 - `DATE` / `DATETIME` columns compared with strings as MySQL does: `created = '2024-02-01'` now finds midnight,
   `day = '2024-01-15 00:00:00'` finds the date, and `created > '2024-02-01'` no longer includes midnight (they were
   compared as plain text). Also with indexes, `IN` and `BETWEEN`.
+- `INSERT … VALUES (DEFAULT, …)` and `UPDATE … SET col = DEFAULT` work (they were "Unknown column 'DEFAULT'").
+- `CHAR(n)` drops trailing spaces as MySQL does (`'ab  '` was stored and compared with its spaces). Values stored
+  by older builds keep their spaces until they are written again (`UPDATE t SET c = c` rewrites them).
+- Decimal literals are shown as MySQL shows them: `SELECT .5` = `0.5`, `SELECT 5.` = `5`.
 
 ## 1.5.1 — 2026-11-27
 
