@@ -1620,8 +1620,13 @@ int main(void) {
             peak_kb[mode] = v[1];
         }
         printf("SELECT of a 64 MB table: peak memory +%ld MB streamed, +%ld MB materialised\n", peak_kb[0] >> 10, peak_kb[1] >> 10);
-        CHECK(peak_kb[0] >= 0 && peak_kb[0] < 32 * 1024 && peak_kb[1] > 2 * peak_kb[0], "streaming keeps memory flat (+%ld KB vs +%ld KB)", peak_kb[0], peak_kb[1]);
-        CHECK(peak_kb[2] >= 0 && peak_kb[2] < 32 * 1024, "COUNT(*) with a filter keeps memory flat (+%ld KB)", peak_kb[2]);
+#if defined(__SANITIZE_ADDRESS__)
+        const long flat_kb = 128 * 1024;            // ASan: la quarantena trattiene la memoria liberata (in CI +52 MB)
+#else
+        const long flat_kb = 32 * 1024;
+#endif
+        CHECK(peak_kb[0] >= 0 && peak_kb[0] < flat_kb && peak_kb[1] > 2 * peak_kb[0], "streaming keeps memory flat (+%ld KB vs +%ld KB)", peak_kb[0], peak_kb[1]);
+        CHECK(peak_kb[2] >= 0 && peak_kb[2] < flat_kb, "COUNT(*) with a filter keeps memory flat (+%ld KB)", peak_kb[2]);
         printf("COUNT(*) of the same table: +%ld MB\n", peak_kb[2] >> 10);
         sh("rm -rf " TS);
         #undef TS
