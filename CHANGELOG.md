@@ -9,7 +9,7 @@
   compared as plain text). Also with indexes, `IN` and `BETWEEN`.
 - `INSERT … VALUES (DEFAULT, …)` and `UPDATE … SET col = DEFAULT` work (they were "Unknown column 'DEFAULT'").
 - `CHAR(n)` drops trailing spaces as MySQL does (`'ab  '` was stored and compared with its spaces). Values stored
-  by older builds keep their spaces until they are written again (`UPDATE t SET c = c` rewrites them).
+  by older builds keep their spaces until they are written again.
 - Decimal literals are shown as MySQL shows them: `SELECT .5` = `0.5`, `SELECT 5.` = `5`.
 
 ## 1.5.1 — 2026-11-27
