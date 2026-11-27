@@ -5,9 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "harness.h"
 
-static int g_tests, g_fail;
-#define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
 
 static const char* DUMP =
 "-- MySQL dump 10.13  Distrib 8.0.36, for Linux (x86_64)\n"
@@ -135,6 +135,7 @@ static const char* indexes(const char* table) {
 }
 
 int main(void) {
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
     CHECK(mysql_looks_like_dump(DUMP) && !mysql_looks_like_dump("SELECT 1;"), "detection");
     MyImportStats st;
     char* sql = mysql_translate(DUMP, &st);
@@ -142,8 +143,8 @@ int main(void) {
     CHECK(sql && !strstr(sql, "LOCK TABLES") && strstr(sql, "CREATE TABLE `cliente`"), "cleaned:\n%s", sql ? sql : "");
     CHECK(st.skipped >= 5, "skipped SET/LOCK/...: %d", st.skipped);
 
-    if (system("rm -rf /tmp/sv_my_test && mkdir -p /tmp/sv_my_test") != 0) return 1;
-    if (!db_init("/tmp/sv_my_test")) return 1;
+    if (system("rm -rf sv_my_test && mkdir -p sv_my_test") != 0) return 1;
+    if (!db_init("sv_my_test")) return 1;
     QueryResult* q = db_execute("CREATE DATABASE shop"); db_result_free(q);
     q = db_execute("USE shop"); db_result_free(q);
     int len = (int)strlen(sql), errors = 0;
@@ -222,7 +223,7 @@ int main(void) {
     db_result_free(q);
     free(sql);
     db_shutdown();
-    if (system("rm -rf /tmp/sv_my_test")) {}
+    if (system("rm -rf sv_my_test")) {}
     if (g_fail) { printf("mysql import tests: %d of %d FAILED\n", g_fail, g_tests); return 1; }
     printf("OK: %d/%d mysql import checks passed\n", g_tests, g_tests);
     return 0;

@@ -65,11 +65,17 @@ static void rebuild_lines(TextBox* tb) {
     int need = 1;
     for (int i = 0; i < tb->text_len; i++) if (tb->text[i] == '\n') need++;
     if (need > tb->lines_cap) {
-        tb->lines_cap   = need + 256;
-        tb->line_starts = realloc(tb->line_starts, tb->lines_cap * sizeof(int));
+        int* nl = realloc(tb->line_starts, (size_t)(need + 256) * sizeof(int));
+        if (!nl) {                                   // senza memoria: si tengono le righe che ci stanno (CR-M4)
+            need = tb->lines_cap;
+            if (need < 1) return;
+        } else {
+            tb->line_starts = nl;
+            tb->lines_cap   = need + 256;
+        }
     }
     tb->line_starts[tb->num_lines++] = 0;
-    for (int i = 0; i < tb->text_len; i++)
+    for (int i = 0; i < tb->text_len && tb->num_lines < need; i++)
         if (tb->text[i] == '\n') tb->line_starts[tb->num_lines++] = i + 1;
 }
 
@@ -183,6 +189,7 @@ static void clear_redo(TextBox* tb) {
 }
 
 static void stack_push(TextSnapshot* stack, int* count, TextSnapshot s) {
+    if (!s.text) return;                           // istantanea non riuscita (memoria): passo non registrato
     if (*count == TEXTBOX_UNDO_CAP) {
         free(stack[0].text);
         memmove(stack, stack + 1, (TEXTBOX_UNDO_CAP - 1) * sizeof(TextSnapshot));
@@ -205,10 +212,13 @@ static void undo_push(TextBox* tb, int kind) {
 }
 
 static void restore_snapshot(TextBox* tb, TextSnapshot* s) {
+    if (!s->text) return;
     int len = (int)strlen(s->text);
     if (len + 1 > tb->text_cap) {
+        char* nt = realloc(tb->text, (size_t)len + 1024);
+        if (!nt) return;                           // il testo attuale resta com'è (CR-M4)
+        tb->text = nt;
         tb->text_cap = len + 1024;
-        tb->text = realloc(tb->text, tb->text_cap);
     }
     memcpy(tb->text, s->text, len + 1);
     tb->text_len   = len;

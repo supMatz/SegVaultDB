@@ -1,6 +1,8 @@
 #include "schema_model.h"
+#include "sql_quote.h"
 #include "../bridge/db_api.h"
 #include "../../include/common.h"
+#include "../platform_compat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +19,7 @@ int sm_col(const SmTable* t, const char* col) {
 }
 
 void sm_free(SchemaModel* m) {
+    for (int i = 0; m->t && i < m->nt; i++) free(m->t[i].cols);
     free(m->t);
     free(m->r);
     memset(m, 0, sizeof(*m));
@@ -60,9 +63,12 @@ bool sm_load(SchemaModel* m, const char* db) {
         int n = 0;
         ColumnInfo* cols = db_list_columns(db, tables->names[i], &n);
         if (!cols) continue;
-        SmTable* t = &m->t[m->nt++];
+        SmTable* t = &m->t[m->nt];
+        t->cols = calloc((size_t)(n ? n : 1), sizeof(SmCol));
+        if (!t->cols) { db_columns_free(cols, n); continue; }
+        m->nt++;
         snprintf(t->name, sizeof(t->name), "%.63s", tables->names[i]);
-        for (int c = 0; c < n && c < SM_MAX_COLS; c++) {
+        for (int c = 0; c < n; c++) {
             SmCol* sc = &t->cols[t->ncols++];
             snprintf(sc->name, sizeof(sc->name), "%.63s", cols[c].name);
             snprintf(sc->type, sizeof(sc->type), "%.63s", cols[c].type);
@@ -131,13 +137,15 @@ bool sm_load_positions(SchemaModel* m, const char* path) {
 }
 
 bool sm_save_positions(const SchemaModel* m, const char* path) {
-    FILE* f = fopen(path, "w" SV_FE);
+    char tmp[1200];
+    if ((size_t)snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= sizeof(tmp)) return false;
+    FILE* f = fopen(tmp, "w" SV_FE);
     if (!f) return false;
     fprintf(f, "# SegVault schema diagram: %s\n", m->db);
     if (m->view[0]) fprintf(f, "%s\n", m->view);
     for (int i = 0; i < m->nt; i++)
         if (m->t[i].placed) fprintf(f, "t %s %d %d\n", m->t[i].name, m->t[i].x, m->t[i].y);
-    return fclose(f) == 0;
+    return sv_fclose_replace(f, tmp, path);
 }
 
 // ── disposizione automatica ────────────────────────────────────
@@ -208,7 +216,9 @@ void sm_auto_layout(SchemaModel* m, bool all, int GAP_X, int GAP_Y) {
     // livello = lunghezza del cammino più lungo verso una tabella senza genitori (cicli limitati)
     int* level = calloc((unsigned)m->nt, sizeof(int));
     bool* done = calloc((unsigned)m->nt, sizeof(bool));
-    if (!level || !done) { free(level); free(done); return; }
+    int* order = malloc(sizeof(int) * (size_t)m->nt);      // tabelle di un livello (senza tetto: P3.11)
+    float* key = malloc(sizeof(float) * (size_t)m->nt);
+    if (!level || !done || !order || !key) { free(level); free(done); free(order); free(key); return; }
     for (int pass = 0; pass < m->nt; pass++) {
         bool changed = false;
         for (int k = 0; k < m->nr; k++) {
@@ -229,9 +239,8 @@ void sm_auto_layout(SchemaModel* m, bool all, int GAP_X, int GAP_Y) {
         for (int i = 0; i < m->nt; i++) if (level[i] == l && m->t[i].w > colw) colw = m->t[i].w;
         // ordine nella colonna: per la y media delle tabelle collegate già disposte (baricentro);
         // al primo livello prima le tabelle con più relazioni, in fondo quelle isolate
-        int order[512], n = 0;
-        float key[512];
-        for (int i = 0; i < m->nt && n < 512; i++) {
+        int n = 0;
+        for (int i = 0; i < m->nt; i++) {
             if (level[i] != l) continue;
             float sum = 0;
             int cnt = 0, deg = 0;
@@ -272,16 +281,11 @@ void sm_auto_layout(SchemaModel* m, bool all, int GAP_X, int GAP_Y) {
     }
     free(level);
     free(done);
+    free(order);
+    free(key);
 }
 
 // ── SQL ────────────────────────────────────────────────────────
-
-static char* dupf(const char* fmt, const char* a, const char* b, const char* c, const char* d, const char* e) {
-    size_t n = strlen(fmt) + strlen(a) + strlen(b) + strlen(c) + strlen(d) + strlen(e) + 1;
-    char* s = malloc(n);
-    if (s) snprintf(s, n, fmt, a, b, c, d, e);
-    return s;
-}
 
 // nome di vincolo libero nel database
 static void fk_name(const SchemaModel* m, const char* child, const char* parent, char* out, size_t n) {
@@ -295,24 +299,9 @@ static void fk_name(const SchemaModel* m, const char* child, const char* parent,
 }
 
 // testo che cresce (SQL di più statement)
-typedef struct { char* p; size_t n, cap; bool oom; } SBuf;
-
-static void sb_add(SBuf* b, const char* s) {
-    size_t n = strlen(s);
-    if (b->oom) return;
-    if (b->n + n + 1 > b->cap) {
-        size_t cap = b->cap ? b->cap * 2 : 256;
-        while (cap < b->n + n + 1) cap *= 2;
-        char* p = realloc(b->p, cap);
-        if (!p) { b->oom = true; return; }
-        b->p = p;
-        b->cap = cap;
-    }
-    memcpy(b->p + b->n, s, n + 1);
-    b->n += n;
-}
-
-static void sb_id(SBuf* b, const char* name) { sb_add(b, "`"); sb_add(b, name); sb_add(b, "`"); }
+typedef SvStrBuf SBuf;                                       // buffer comune (CR-B2)
+#define sb_add svsb_puts
+#define sb_id sql_ident_sb
 
 static char* sb_done(SBuf* b, char* err, size_t errn) {
     if (b->oom || !b->p) { free(b->p); if (err) snprintf(err, errn, "Out of memory"); return NULL; }
@@ -322,7 +311,7 @@ static char* sb_done(SBuf* b, char* err, size_t errn) {
 // colonne della chiave primaria di una tabella (posizioni); 0 se non ne ha
 static int pk_cols(const SmTable* t, int* out) {
     int n = 0;
-    for (int i = 0; i < t->ncols && n < 8; i++) if (t->cols[i].pk) out[n++] = i;
+    for (int i = 0; i < t->ncols && n < 16; i++) if (t->cols[i].pk) out[n++] = i;   // SV_MAX_KEY_COLS
     return n;
 }
 
@@ -347,7 +336,7 @@ char* sm_relation_sql(const SchemaModel* m, int child, const char* col, int pare
     if (child < 0 || child >= m->nt || parent < 0 || parent >= m->nt) { snprintf(err, errn, "Unknown table"); return NULL; }
     const SmTable* C = &m->t[child];
     const SmTable* P = &m->t[parent];
-    int pk[8];
+    int pk[16];
     int npk = pk_cols(P, pk);
     if (npk == 0) { snprintf(err, errn, "Table '%.60s' has no primary key to refer to", P->name); return NULL; }
     char cname[80];
@@ -390,10 +379,10 @@ char* sm_many_to_many_sql(const SchemaModel* m, int a, int b, char* table, size_
     if (a < 0 || a >= m->nt || b < 0 || b >= m->nt) { snprintf(err, errn, "Unknown table"); return NULL; }
     const SmTable* A = &m->t[a];
     const SmTable* B = &m->t[b];
-    int pa[8], pb[8];
+    int pa[16], pb[16];
     int na = pk_cols(A, pa), nb = pk_cols(B, pb);
     if (!na || !nb) { snprintf(err, errn, "Table '%.60s' has no primary key", !na ? A->name : B->name); return NULL; }
-    if (na + nb > 8) { snprintf(err, errn, "The keys are too large for a link table"); return NULL; }
+    if (na + nb > 16) { snprintf(err, errn, "The keys are too large for a link table (16 key columns at most)"); return NULL; }
     // nome della tabella di collegamento: a_b, senza ripetere una tabella esistente
     char base[64];
     snprintf(base, sizeof(base), "%.30s_%.30s", A->name, B->name);

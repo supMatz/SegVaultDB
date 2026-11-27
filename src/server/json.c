@@ -1,3 +1,4 @@
+#include "../../include/sv_strbuf.h"
 #include "json.h"
 #include <stdarg.h>
 #include <stdio.h>
@@ -240,15 +241,9 @@ const JsonVal* json_get(const JsonVal* obj, const char* key) {
 
 // ── scrittura ────────────────────────────────────────────────────
 
-static bool jb_reserve(JsonBuf* b, size_t extra) {
+static bool jb_reserve(JsonBuf* b, size_t extra) {          // crescita comune (sv_strbuf.h, CR-B2)
     if (b->oom) return false;
-    if (b->len + extra + 1 <= b->cap) return true;
-    size_t nc = b->cap ? b->cap : 1024;
-    while (nc < b->len + extra + 1) nc *= 2;
-    char* nd = realloc(b->data, nc);
-    if (!nd) { b->oom = true; return false; }
-    b->data = nd;
-    b->cap = nc;
+    if (svsb_grow(&b->data, &b->cap, b->len, extra, 0)) { b->oom = true; return false; }
     return true;
 }
 

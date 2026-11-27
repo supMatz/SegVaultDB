@@ -1,3 +1,4 @@
+#include "../../include/sv_strbuf.h"
 #include "sql_text.h"
 #include <ctype.h>
 #include <string.h>
@@ -220,26 +221,13 @@ int sql_word_list(SqlWordKind kind, const char* const** out) {
 
 #define SV_MIN_INT(a, b) ((a) < (b) ? (a) : (b))
 
-typedef struct { char* b; int len, cap; bool ok; } SBuf;
+typedef SvStrBuf SBuf;                                       // buffer comune (CR-B2; prima int: >2 GB traboccava)
+static void sb_put(SBuf* sb, const char* s, int n) { if (n > 0) svsb_put(sb, s, (size_t)n); }
 
-static void sb_put(SBuf* sb, const char* s, int n) {
-    if (!sb->ok) return;
-    if (sb->len + n + 1 > sb->cap) {
-        int cap = sb->cap * 2 + n + 64;
-        char* nb = realloc(sb->b, cap);
-        if (!nb) { sb->ok = false; return; }
-        sb->b = nb;
-        sb->cap = cap;
-    }
-    memcpy(sb->b + sb->len, s, n);
-    sb->len += n;
-    sb->b[sb->len] = '\0';
-}
-
-static char sb_last(const SBuf* sb) { return sb->len ? sb->b[sb->len - 1] : '\n'; }
+static char sb_last(const SBuf* sb) { return sb->n ? sb->p[sb->n - 1] : '\n'; }
 
 static void sb_trim_spaces(SBuf* sb) {
-    while (sb->len && sb->b[sb->len - 1] == ' ') sb->b[--sb->len] = '\0';
+    while (sb->n && sb->p[sb->n - 1] == ' ') sb->p[--sb->n] = '\0';
 }
 
 // va a capo (se non lo è già) e indenta
@@ -249,21 +237,21 @@ bool g_sql_format_lower  = false;  // parole chiave in minuscolo (Settings)
 static void sb_newline(SBuf* sb, int indent) {
     if (indent > 0) indent = g_sql_format_indent;
     sb_trim_spaces(sb);
-    if (sb->len && sb_last(sb) != '\n') sb_put(sb, "\n", 1);
+    if (sb->n && sb_last(sb) != '\n') sb_put(sb, "\n", 1);
     for (int i = 0; i < indent; i++) sb_put(sb, " ", 1);
 }
 
 // riga vuota di separazione tra istruzioni
 static void sb_blank_line(SBuf* sb) {
     sb_trim_spaces(sb);
-    if (!sb->len) return;
+    if (!sb->n) return;
     if (sb_last(sb) != '\n') sb_put(sb, "\n", 1);
-    if (sb->len < 2 || sb->b[sb->len - 2] != '\n') sb_put(sb, "\n", 1);
+    if (sb->n < 2 || sb->p[sb->n - 2] != '\n') sb_put(sb, "\n", 1);
 }
 
 static void sb_space(SBuf* sb) {
     char c = sb_last(sb);
-    if (c != ' ' && c != '\n' && sb->len) sb_put(sb, " ", 1);
+    if (c != ' ' && c != '\n' && sb->n) sb_put(sb, " ", 1);
 }
 
 static bool word_is(const char* w, int n, const char* kw) {
@@ -282,9 +270,10 @@ char* sql_format(const char* s, int len) {
                                            "SET", "UNION", "INTERSECT", "EXCEPT", "SELECT", NULL };
     static const char* const JOIN_MODS[] = { "LEFT", "RIGHT", "INNER", "OUTER", "CROSS", "FULL", "NATURAL", NULL };
 
-    SBuf sb = { malloc(len + 64), 0, len + 64, true };
-    if (!sb.b) return NULL;
-    sb.b[0] = '\0';
+    SBuf sb = {0};
+    svsb_reserve(&sb, (size_t)len + 64);               // prima: malloc non controllato (NULL con cap > 0)
+    if (!sb.p) return NULL;
+    sb.p[0] = '\0';
 
     int depth = 0, ct_depth = -1;          // profondità parentesi; lista colonne di CREATE TABLE
     int prev = TK_NONE;
@@ -307,7 +296,7 @@ char* sql_format(const char* s, int len) {
             int j = skip_quoted_or_comment(s, len, i);
             bool line = c == '-';
             if (stmt_break && src_nl) { sb_blank_line(&sb); stmt_break = false; }
-            else if (src_nl && sb.len && sb_last(&sb) != '\n') sb_newline(&sb, ct_depth >= 0 ? 4 : 0);
+            else if (src_nl && sb.n && sb_last(&sb) != '\n') sb_newline(&sb, ct_depth >= 0 ? 4 : 0);
             else sb_space(&sb);
             int e = j;
             while (e > i && (s[e - 1] == '\n' || s[e - 1] == '\r')) e--;
@@ -459,6 +448,6 @@ char* sql_format(const char* s, int len) {
     }
     sb_trim_spaces(&sb);
     if (len > 0 && s[len - 1] == '\n' && sb_last(&sb) != '\n') sb_put(&sb, "\n", 1);
-    if (!sb.ok) { free(sb.b); return NULL; }
-    return sb.b;
+    if (sb.oom) { svsb_free(&sb); return NULL; }
+    return sb.p;
 }

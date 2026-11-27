@@ -4,9 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "harness.h"
 
-static int g_tests, g_fail;
-#define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
 
 static char g_err[1100];
 
@@ -40,6 +40,7 @@ static bool has_row(const char* sql, const char* text) {
 }
 
 int main(void) {
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
     // SHA-256: vettori di prova standard
     uint8_t h[32];
     char hx[65];
@@ -54,8 +55,8 @@ int main(void) {
     for (int i = 0; i < 32; i++) snprintf(hx + i * 2, 3, "%02x", h[i]);
     CHECK(!strcmp(hx, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"), "sha256(448 bit)");
 
-    if (system("rm -rf /tmp/sv_auth_test && mkdir -p /tmp/sv_auth_test") != 0) return 1;
-    if (!db_init("/tmp/sv_auth_test")) return 1;
+    if (system("rm -rf sv_auth_test && mkdir -p sv_auth_test") != 0) return 1;
+    if (!db_init("sv_auth_test")) return 1;
     ok("CREATE DATABASE shop");
     ok("CREATE DATABASE hr");
     ok("USE shop");
@@ -89,8 +90,8 @@ int main(void) {
     CHECK(ok("GRANT ALL ON *.* TO capo WITH GRANT OPTION"), "admin");
     CHECK(!ok("GRANT FLY ON *.* TO anna") && strstr(g_err, "Expected privileges"), "bad privilege");
     CHECK(!ok("GRANT SELECT ON shop.* TO nessuno") && strstr(g_err, "does not exist"), "grant to unknown");
-    CHECK(has_row("SHOW GRANTS FOR anna", "GRANT SELECT ON shop.* TO anna") &&
-          has_row("SHOW GRANTS FOR anna", "INSERT, UPDATE ON shop.ordine"), "show grants");
+    CHECK(has_row("SHOW GRANTS FOR anna", "GRANT SELECT ON `shop`.* TO anna") &&
+          has_row("SHOW GRANTS FOR anna", "INSERT, UPDATE ON `shop`.`ordine`"), "show grants (names quoted as in MySQL)");
     CHECK(has_row("SHOW GRANTS FOR capo", "WITH GRANT OPTION"), "admin grant shown");
     CHECK(db_user_grant("anna", "shop", "*") == DB_PRIV_SELECT && db_user_grant("anna", "shop", "ordine") == (DB_PRIV_INSERT | DB_PRIV_UPDATE), "grant api");
 
@@ -215,17 +216,53 @@ int main(void) {
 
     // persistenza: utenti e permessi dopo il riavvio; il file non contiene le password in chiaro
     db_shutdown();
-    FILE* f = fopen("/tmp/sv_auth_test/users.dat", "r");
+    FILE* f = fopen("sv_auth_test/users.dat", "r");
     char buf[4096] = "";
     size_t n = f ? fread(buf, 1, sizeof(buf) - 1, f) : 0;
     buf[n] = '\0';
     if (f) fclose(f);
     CHECK(n > 0 && !strstr(buf, "nuova-pw") && !strstr(buf, "dora-pass"), "no clear-text passwords");
-    CHECK(db_init("/tmp/sv_auth_test"), "reopen");
+    CHECK(db_init("sv_auth_test"), "reopen");
     CHECK(db_login("anna", "nuova-pw") && db_login("dora", "dora-pass"), "logins after restart");
     db_set_user("anna");
     CHECK(ok("USE shop") && rows("SELECT * FROM ordine") == 2 && denied("DELETE FROM ordine"), "grants after restart");
     db_set_user(NULL);
+
+    // CR-C1: nomi con spazi, '%' e cifre in fondo non spostano i campi del file degli utenti. Prima
+    // GRANT SELECT ON shop.`t 127` tornava dopo il riavvio come ALL PRIVILEGES ON shop.t
+    CHECK(ok("USE shop") && ok("CREATE TABLE t (a INT)") && ok("CREATE TABLE `t 127` (a INT)") &&
+          ok("CREATE TABLE `50% off` (a INT)") && ok("CREATE DATABASE `my db`") &&
+          ok("CREATE USER mallory IDENTIFIED BY 'mallory-pw'") && ok("GRANT SELECT ON shop.`t 127` TO mallory") &&
+          ok("GRANT SELECT ON shop.`50% off` TO mallory") && ok("GRANT SELECT ON `my db`.* TO mallory"), "grants on odd names: %s", g_err);
+    db_shutdown();
+    CHECK(db_init("sv_auth_test"), "reopen (odd names)");
+    CHECK(has_row("SHOW GRANTS FOR mallory", "`shop`.`t 127`") && has_row("SHOW GRANTS FOR mallory", "`50% off`") &&
+          has_row("SHOW GRANTS FOR mallory", "`my db`.*") && !has_row("SHOW GRANTS FOR mallory", "ALL PRIVILEGES"),
+          "odd names survive a restart unchanged");
+    db_set_user("mallory");
+    CHECK(denied("INSERT INTO shop.t VALUES (1)") && denied("SELECT * FROM shop.t"), "no privileges on shop.t");
+    db_set_user(NULL);
+    db_shutdown();
+    {   // file della 1.5 con una riga ambigua: scartata, non reinterpretata
+        FILE* af = fopen("sv_auth_test/users.dat", "r");
+        char ab[16384] = "";
+        size_t an = af ? fread(ab, 1, sizeof(ab) - 2, af) : 0;
+        ab[an] = '\0';
+        if (af) fclose(af);
+        char* end = strstr(ab, "end ");
+        if (end) {
+            char tail[64];
+            snprintf(tail, sizeof(tail), "%s", end);
+            snprintf(end, sizeof(ab) - (size_t)(end - ab), "grant mallory shop t 127 1\n%s", tail);
+        }
+        af = fopen("sv_auth_test/users.dat", "w");
+        if (af) { fputs(ab, af); fclose(af); }
+    }
+    CHECK(db_init("sv_auth_test"), "reopen with an old ambiguous line");
+    CHECK(!has_row("SHOW GRANTS FOR mallory", "ALL PRIVILEGES") && !has_row("SHOW GRANTS FOR mallory", "`shop`.`t` "),
+          "ambiguous old line ignored");
+    CHECK(ok("DROP USER mallory") && ok("DROP TABLE shop.`t 127`") && ok("DROP TABLE shop.`50% off`") &&
+          ok("DROP TABLE shop.t") && ok("DROP DATABASE `my db`"), "cleanup: %s", g_err);
 
     // ── P2.6: PBKDF2-HMAC-SHA256 (vettori di RFC 7914 §11 e dei test di Python / OpenSSL) ──
     {
@@ -253,7 +290,7 @@ int main(void) {
     CHECK(db_user_has_native("nat") && !db_user_has_native("sha") && !db_user_has_native("anna"), "native hash only when asked");
     db_shutdown();
     {
-        FILE* uf = fopen("/tmp/sv_auth_test/users.dat", "r");
+        FILE* uf = fopen("sv_auth_test/users.dat", "r");
         char ub[8192] = "";
         size_t un = uf ? fread(ub, 1, sizeof(ub) - 1, uf) : 0;
         ub[un] = '\0';
@@ -272,15 +309,15 @@ int main(void) {
             char old[65];
             for (int i = 0; i < 32; i++) sprintf(old + 2 * i, "%02x", dg[i]);
             char cmd[600];
-            snprintf(cmd, sizeof(cmd), "sed -i 's/^user anna %s [^ ]*/user anna %s %s/' /tmp/sv_auth_test/users.dat", salt, salt, old);
+            snprintf(cmd, sizeof(cmd), "sed -i 's/^user anna %s [^ ]*/user anna %s %s/' sv_auth_test/users.dat", salt, salt, old);
             CHECK(system(cmd) == 0, "rewrite anna with an old hash");
         }
     }
-    CHECK(db_init("/tmp/sv_auth_test"), "reopen with an old hash");
+    CHECK(db_init("sv_auth_test"), "reopen with an old hash");
     CHECK(!db_login("anna", "sbagliata") && db_login("anna", "nuova-pw"), "old-format hash still accepted");
     db_shutdown();
     {
-        FILE* uf = fopen("/tmp/sv_auth_test/users.dat", "r");
+        FILE* uf = fopen("sv_auth_test/users.dat", "r");
         char ub[8192] = "";
         size_t un = uf ? fread(ub, 1, sizeof(ub) - 1, uf) : 0;
         ub[un] = '\0';
@@ -288,10 +325,10 @@ int main(void) {
         char* an = strstr(ub, "user anna ");
         CHECK(an && strstr(an, " $p2$100000$") && strstr(an, " $p2$") < strchr(an, '\n'), "old hash upgraded on login: %.120s", an ? an : "");
     }
-    CHECK(db_init("/tmp/sv_auth_test") && db_login("anna", "nuova-pw") && !db_login("anna", "segreta1"), "upgraded hash works");
+    CHECK(db_init("sv_auth_test") && db_login("anna", "nuova-pw") && !db_login("anna", "segreta1"), "upgraded hash works");
 
     db_shutdown();
-    if (system("rm -rf /tmp/sv_auth_test")) {}
+    if (system("rm -rf sv_auth_test")) {}
     if (g_fail) { printf("auth tests: %d of %d FAILED\n", g_fail, g_tests); return 1; }
     printf("OK: %d/%d auth checks passed\n", g_tests, g_tests);
     return 0;

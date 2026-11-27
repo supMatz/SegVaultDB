@@ -4,9 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "harness.h"
 
-static int g_tests, g_fail;
-#define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
 
 // esegue gli statement separati da ";\n"; false al primo errore
 static bool exec_all(const char* sql, char* err, size_t n) {
@@ -37,8 +37,9 @@ static int col(const DesignTable* t, const char* name) {
 }
 
 int main(void) {
-    if (system("rm -rf /tmp/sv_design_test && mkdir -p /tmp/sv_design_test") != 0) return 1;
-    if (!db_init("/tmp/sv_design_test")) return 1;
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
+    if (system("rm -rf sv_design_test && mkdir -p sv_design_test") != 0) return 1;
+    if (!db_init("sv_design_test")) return 1;
     db_result_free(db_execute("CREATE DATABASE d"));
     db_result_free(db_execute("USE d"));
     char err[400];
@@ -46,7 +47,7 @@ int main(void) {
     const char* const* types = design_types(&nt);
 
     // ── tabella nuova ──
-    DesignTable t;
+    static DesignTable t, bad, orig, cur, after, ix, k;   // grandi: fuori dallo stack
     design_new(&t);
     snprintf(t.name, sizeof(t.name), "cliente");
     design_add_column(&t);                                   // VARCHAR(100)
@@ -66,7 +67,7 @@ int main(void) {
     CHECK(!strcmp(scalar("SELECT citta FROM cliente"), "l'Aquila") && !strcmp(scalar("SELECT punti FROM cliente"), "10"), "defaults applied");
 
     // ── validazione ──
-    DesignTable bad = t;
+    bad = t;
     snprintf(bad.cols[1].name, 64, "email");
     CHECK(!design_sql(NULL, &bad, err, sizeof(err)) && strstr(err, "twice"), "duplicate column: %s", err);
     bad = t; bad.cols[1].size[0] = '\0';
@@ -75,7 +76,7 @@ int main(void) {
     CHECK(!design_sql(NULL, &bad, err, sizeof(err)), "bad table name");
 
     // ── modifica: ricarica, rinomina, cambia tipo, default, NOT NULL, UNIQUE, aggiungi, elimina, rinomina tabella ──
-    DesignTable orig, cur;
+
     CHECK(design_load(&orig, "d", "cliente"), "load");
     cur = orig;
     CHECK(cur.ncols == 5 && cur.cols[0].pk && cur.cols[0].autoinc && cur.cols[1].notnull && cur.cols[2].unique
@@ -94,7 +95,7 @@ int main(void) {
     CHECK(sql != NULL, "alter sql: %s", err);
     CHECK(sql && exec_all(sql, err, sizeof(err)), "alter runs: %s\n%s", err, sql ? sql : "");
     free(sql);
-    DesignTable after;
+
     CHECK(design_load(&after, "d", "clienti"), "renamed table");
     CHECK(col(&after, "citta") < 0 && col(&after, "nominativo") >= 0 && !strcmp(after.cols[col(&after, "nominativo")].size, "150"),
           "rename + type of nominativo");
@@ -131,7 +132,7 @@ int main(void) {
           "nothing applied after the failure");
 
     // indici: nella tabella nuova, aggiunto, mantenuto con la rinomina, tolto
-    DesignTable ix;
+
     design_new(&ix);
     snprintf(ix.name, 64, "ordine");
     design_add_column(&ix); snprintf(ix.cols[1].name, 64, "cliente"); ix.cols[1].index = true;
@@ -155,7 +156,7 @@ int main(void) {
     CHECK(design_load(&after, "d", "ordine") && !after.cols[col(&after, "cliente_id")].index, "index gone");
 
     // chiave composta
-    DesignTable k;
+
     memset(&k, 0, sizeof(k));
     snprintf(k.name, 64, "riga");
     design_add_column(&k); snprintf(k.cols[0].name, 64, "ordine"); k.cols[0].type = design_type_index("INT"); k.cols[0].pk = true;
@@ -164,8 +165,27 @@ int main(void) {
     CHECK(sql && strstr(sql, "PRIMARY KEY (`ordine`, `n`)") && exec_all(sql, err, sizeof(err)), "composite key: %s", sql ? sql : err);
     free(sql);
 
+    // tabella larga (come quelle importate da XAMPP): il designer le carica tutte e ne aggiunge altre
+    {
+        char ddl[4096];
+        int n = snprintf(ddl, sizeof(ddl), "CREATE TABLE larga (id INT PRIMARY KEY");
+        for (int i = 1; i < 100; i++) n += snprintf(ddl + n, sizeof(ddl) - (size_t)n, ", c%d INT", i);
+        snprintf(ddl + n, sizeof(ddl) - (size_t)n, ")");
+        db_result_free(db_execute(ddl));
+        CHECK(design_load(&orig, "d", "larga") && orig.ncols == 100 && !strcmp(orig.cols[99].name, "c99"),
+              "all 100 columns loaded: %d", orig.ncols);
+        cur = orig;
+        design_add_column(&cur);
+        snprintf(cur.cols[cur.ncols - 1].name, 64, "c100");
+        sql = design_sql(&orig, &cur, err, sizeof(err));
+        CHECK(sql && strstr(sql, "ADD COLUMN `c100`") && !strstr(sql, "DROP COLUMN") && exec_all(sql, err, sizeof(err)),
+              "add the 101st column: %s", sql ? sql : err);
+        free(sql);
+        CHECK(design_load(&after, "d", "larga") && after.ncols == 101, "101 columns after the change: %d", after.ncols);
+    }
+
     db_shutdown();
-    if (system("rm -rf /tmp/sv_design_test")) {}
+    if (system("rm -rf sv_design_test")) {}
     if (g_fail) { printf("table design tests: %d of %d FAILED\n", g_fail, g_tests); return 1; }
     printf("OK: %d/%d table design checks passed\n", g_tests, g_tests);
     return 0;

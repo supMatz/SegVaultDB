@@ -10,8 +10,12 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#define SV_HARNESS_TMP_ONLY
+#include "harness.h"
 
 static int tests = 0, failed = 0;
+static double now_ms_sql(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6; }
+#define CHECK_SQL(cond, ...) do { tests++; if (!(cond)) { failed++; printf("FAIL %d: ", tests); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 static void render(const QueryResult* r, char* out, size_t n) {
     size_t len = 0;
@@ -72,8 +76,8 @@ static double now_ms(void) {
 // poi il log viene troncato a metà dell'ultima voce (crash durante la scrittura).
 // Alla riapertura ci devono essere tutte le righe complete e nessun dato spazzatura.
 static void crash_recovery_test(void) {
-    const char* dir = "/tmp/sv_crash_test";
-    if (system("rm -rf /tmp/sv_crash_test && mkdir -p /tmp/sv_crash_test") != 0) return;
+    const char* dir = "sv_crash_test";
+    if (system("rm -rf sv_crash_test && mkdir -p sv_crash_test") != 0) return;
     pid_t pid = fork();                              // (il chiamante ha già chiuso il motore)
     if (pid == 0) {
         if (!db_init(dir)) _exit(2);
@@ -91,10 +95,10 @@ static void crash_recovery_test(void) {
     waitpid(pid, &st, 0);
     tests++;
     // tronca l'ultima voce del log a metà
-    FILE* f = fopen("/tmp/sv_crash_test/segvault.wal", "rb+");
+    FILE* f = fopen("sv_crash_test/segvault.wal", "rb+");
     long size = 0;
     if (f) { fseek(f, 0, SEEK_END); size = ftell(f); fclose(f); }
-    if (size > 10 && truncate("/tmp/sv_crash_test/segvault.wal", size - 10) != 0) size = 0;
+    if (size > 10 && truncate("sv_crash_test/segvault.wal", size - 10) != 0) size = 0;
     if (!size) { failed++; printf("FAIL: crash test setup (no log)\n"); return; }
 
     if (!db_init(dir)) { failed++; printf("FAIL: reopen after crash\n"); return; }
@@ -104,7 +108,7 @@ static void crash_recovery_test(void) {
     t("SELECT COUNT(*) FROM t WHERE v = 'changed'", "5");                // le UPDATE rifatte dal log
     t("INSERT INTO t VALUES (50, 'again')", "OK:1");
     db_shutdown();
-    if (system("rm -rf /tmp/sv_crash_test") != 0) { /* nulla */ }
+    if (system("rm -rf sv_crash_test") != 0) { /* nulla */ }
 }
 
 // testo lungo: n caratteri 'a'..'z' ripetuti, poi il suffisso (stringhe che differiscono solo alla fine)
@@ -140,8 +144,9 @@ static void origin(const char* sql, const char* expect) {
 }
 
 int main(void) {
-    if (system("rm -rf /tmp/sv_sql_test && mkdir -p /tmp/sv_sql_test") != 0) return 1;
-    if (!db_init("/tmp/sv_sql_test")) { printf("FAIL: db_init\n"); return 1; }
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
+    if (system("rm -rf sv_sql_test && mkdir -p sv_sql_test") != 0) return 1;
+    if (!db_init("sv_sql_test")) { printf("FAIL: db_init\n"); return 1; }
 
     t("CREATE DATABASE shop", "OK:0");
     t("USE shop", "OK:0");
@@ -150,7 +155,7 @@ int main(void) {
     t("CREATE TABLE n (id INT PRIMARY KEY, a INT, b INT, f FLOAT, s VARCHAR(20))", "OK:0");
     t("INSERT INTO n VALUES (1, 7, 2, 1.5, 'Hello'), (2, -3, 0, NULL, NULL), (3, NULL, 4, 2.25, 'abc')", "OK:3");
     t("SELECT a + b * 2, (a + b) * 2, a - -b, -a FROM n WHERE id = 1", "11|18|9|-7");
-    t("SELECT a / b, a / 0, 7 / 2 FROM n WHERE id = 1", "3.5|NULL|3.5");
+    t("SELECT a / b, a / 0, 7 / 2 FROM n WHERE id = 1", "3.5000|NULL|3.5000");   // intero / intero: DECIMAL scala 4, come MySQL
     t("SELECT a + NULL, NULL = NULL, a IS NULL FROM n WHERE id = 3", "NULL|NULL|1");
     t("SELECT 9223372036854775807 + 1 FROM n WHERE id = 1", "ERR:out of range");
     t("SELECT f * 2 FROM n ORDER BY id", "3;NULL;4.5");
@@ -341,7 +346,65 @@ int main(void) {
     t("SELECT DATABASE(), SCHEMA(), VERSION()", "shop|shop|8.0.35-SegVault");
     t("CREATE TABLE li (id INT PRIMARY KEY AUTO_INCREMENT, x INT)", "OK:0");
     t("INSERT INTO li (x) VALUES (1), (2)", "OK:2");
-    t("SELECT LAST_INSERT_ID()", "2");
+    t("SELECT LAST_INSERT_ID()", "1");                 // come MySQL: il PRIMO id generato dallo statement
+    t("INSERT INTO li (x) VALUES (3)", "OK:1");
+    t("SELECT LAST_INSERT_ID()", "3");
+    t("SELECT 1 FROM DUAL WHERE 1 = 1", "1");
+    // sottoquery scalare correlata senza righe: NULL (prima una stringa vuota, anche dentro COALESCE)
+    t("CREATE TABLE sqa (id INT PRIMARY KEY)", "OK:0");
+    t("CREATE TABLE sqb (id INT PRIMARY KEY, aid INT, y INT)", "OK:0");
+    t("INSERT INTO sqa VALUES (1), (2)", "OK:2");
+    t("INSERT INTO sqb VALUES (10, 1, 5)", "OK:1");
+    t("SELECT id, (SELECT MAX(y) FROM sqb WHERE sqb.aid = sqa.id), COALESCE((SELECT MAX(y) FROM sqb WHERE sqb.aid = sqa.id), -1) FROM sqa ORDER BY id",
+      "1|5|5;2|NULL|-1");
+    t("DROP TABLE sqa", "OK:0");
+    t("DROP TABLE sqb", "OK:0");
+    // BINARY x e x COLLATE nome come MySQL (prima BINARY era ignorato e COLLATE in un'espressione un errore)
+    t("SELECT 'ABC' LIKE BINARY 'abc', 'ABC' LIKE 'abc', 'ABC' LIKE 'abc' COLLATE utf8mb4_bin, BINARY 'a' = 'A', 'a' = 'A' COLLATE utf8mb4_general_ci",
+      "0|1|0|0|1");
+    // COLLATE sulla colonna (prima ignorata) e tipi dichiarati in SHOW CREATE TABLE / CREATE TABLE LIKE
+    t("CREATE TABLE ccol (id INT PRIMARY KEY, s VARCHAR(5) COLLATE utf8mb4_general_ci, n TINYINT, u INT UNSIGNED)", "OK:0");
+    t("INSERT INTO ccol VALUES (1, 'A', 1, 1), (2, 'a', 2, 2), (3, 'b', 3, 3)", "OK:3");
+    t("SELECT COUNT(*) FROM ccol WHERE s = 'a'", "2");
+    t("SELECT COUNT(*) FROM ccol WHERE s = BINARY 'a'", "1");
+    t("SELECT s FROM ccol ORDER BY s COLLATE utf8mb4_bin, id", "A;a;b");
+    t("CREATE TABLE ccol2 LIKE ccol", "OK:0");
+    t("INSERT INTO ccol2 (id, n) VALUES (1, 200)", "ERR:out of range");
+    t("INSERT INTO ccol2 (id, s) VALUES (2, 'X')", "OK:1");
+    t("SELECT COUNT(*) FROM ccol2 WHERE s = 'x'", "1");
+    t("SELECT column_type, collation_name FROM information_schema.columns WHERE table_name = 'ccol2' AND column_name IN ('s', 'n', 'u') ORDER BY ordinal_position",
+      "varchar(5)|utf8mb4_general_ci;tinyint|NULL;int unsigned|NULL");
+    t("DROP TABLE ccol2", "OK:0");
+    t("DROP TABLE ccol", "OK:0");
+    // limiti dei tipi interi su ogni percorso di scrittura (prima INSERT ... VALUES li saltava)
+    t("CREATE TABLE ir (n TINYINT, s SMALLINT UNSIGNED, u INT UNSIGNED)", "OK:0");
+    t("INSERT INTO ir (n) VALUES (200)", "ERR:out of range");
+    t("INSERT INTO ir (n) VALUES ('-129')", "ERR:out of range");
+    t("INSERT INTO ir (s) VALUES (65536)", "ERR:out of range");
+    t("INSERT INTO ir (u) VALUES (4294967296)", "ERR:out of range");
+    t("INSERT INTO ir VALUES (-128, 65535, 4294967295)", "OK:1");
+    t("UPDATE ir SET u = u + 1", "ERR:out of range");
+    t("SELECT * FROM ir", "-128|65535|4294967295");
+    t("DROP TABLE ir", "OK:0");
+    // COUNT(DISTINCT a, b) come MySQL: combinazioni distinte, righe con un NULL escluse
+    t("CREATE TABLE cd (id INT PRIMARY KEY, g VARCHAR(5), v INT)", "OK:0");
+    t("INSERT INTO cd VALUES (1, 'a', 10), (2, 'a', 10), (3, 'b', 30), (4, 'b', NULL), (5, NULL, 50), (6, 'a', 1)", "OK:6");
+    t("SELECT COUNT(DISTINCT g), COUNT(DISTINCT g, v), COUNT(DISTINCT v, g, id) FROM cd", "2|3|4");
+    t("SELECT g, COUNT(DISTINCT g, v) FROM cd WHERE g IS NOT NULL GROUP BY g ORDER BY g", "a|2;b|1");
+    t("SELECT SUM(DISTINCT v, g) FROM cd", "ERR:exactly one argument");
+    t("DROP TABLE cd", "OK:0");
+    t("SELECT ORD('a'), ORD('\xc3\xa0'), ASCII('\xc3\xa0'), ORD('')", "97|50080|195|0");
+    // CAST AS UNSIGNED come MySQL: i negativi modulo 2^64, il testo fino a 2^64 - 1
+    t("SELECT CAST(-1 AS UNSIGNED), CAST('-1' AS UNSIGNED), CAST('18446744073709551615' AS UNSIGNED), CAST(-1.5 AS SIGNED), CAST(1e30 AS SIGNED)",
+      "18446744073709551615|18446744073709551615|18446744073709551615|-2|9223372036854775807");
+    // INSERT(str, pos, len, new): funzione di testo di MySQL (CR-B9)
+    t("SELECT INSERT('Quadratic', 3, 4, 'What'), INSERT('Quadratic', -1, 4, 'What'), INSERT('Quadratic', 3, 100, 'What')",
+      "QuWhattic|Quadratic|QuWhat");
+    t("SELECT INSERT('\xc3\xa0" "bc', 2, 1, 'X'), INSERT('abc', 4, 1, 'z'), INSERT('abc', 3, 0, 'z'), INSERT(NULL, 1, 1, 'a')",
+      "\xc3\xa0" "Xc|abc|abzc|NULL");
+    t("CREATE VIEW vins AS SELECT INSERT(x, 1, 1, 'J') AS y FROM li", "OK:0");
+    t("SHOW CREATE VIEW vins", "vins|CREATE VIEW vins AS SELECT INSERT(x, 1, 1, 'J') AS y FROM li");
+    t("DROP VIEW vins", "OK:0");
     t("DROP TABLE li", "OK:0");
     // manutenzione delle tabelle (come MySQL / phpMyAdmin)
     t("CREATE TABLE mp (id INT PRIMARY KEY, nome VARCHAR(10) NOT NULL)", "OK:0");
@@ -381,6 +444,17 @@ int main(void) {
     t("SELECT id FROM n ORDER BY id LIMIT 1 OFFSET 1", "2");
     t("SELECT id FROM n ORDER BY id LIMIT 1, 2", "2;3");
     t("SELECT id FROM n ORDER BY id LIMIT 0", "");
+    // arrotondamenti come MySQL: a metà lontano dallo zero, anche sotto l'unità (prima ROUND(-0.5) = 1)
+    t("SELECT ROUND(-0.5), ROUND(-0.05, 1), ROUND(-0.4), ROUND(-1.5), ROUND(0 - 0.5)", "-1|-0.1|0|-2|-1");
+    t("SELECT FORMAT(0.5, 0), FORMAT(2.5, 0), FORMAT(1.005, 2), FORMAT(-0.5, 0), FORMAT(1234567.891, 2)", "1|3|1.01|-1|1,234,567.89");
+    // CR-A4: numeri oltre 2^31 (prima atoi a 32 bit): l'idioma di MySQL "dalla riga N alla fine"
+    t("SELECT id FROM n ORDER BY id LIMIT 1, 18446744073709551615", "2;3");
+    t("SELECT id FROM n ORDER BY id LIMIT 18446744073709551615 OFFSET 2", "3");
+    t("SELECT id FROM n ORDER BY id LIMIT 2147483648", "1;2;3");
+    t("SELECT id FROM n ORDER BY id LIMIT 4294967298", "1;2;3");
+    t("SELECT id FROM n ORDER BY id LIMIT 4294967297, 2", "");
+    t("SELECT id FROM n ORDER BY id OFFSET 1 ROWS FETCH FIRST 99999999999 ROWS ONLY", "2;3");
+    t("CREATE TABLE toolong (v VARCHAR(4294967297))", "ERR:Column length too big");
     t("SELECT ID, S FROM N WHERE Id = 1", "1|Hello");                   // nomi senza maiuscole/minuscole
     t("SELECT nope FROM n", "ERR:Unknown column 'nope'");
     t("SELECT id FROM n ORDER BY 9", "ERR:out of range");
@@ -394,7 +468,7 @@ int main(void) {
       "north|35.50;south|9.0;east|NULL");
     t("SELECT region, COUNT(*) AS n FROM sales GROUP BY region HAVING n > 1 ORDER BY region", "north|2;south|2");
     t("SELECT product, COUNT(DISTINCT region) FROM sales GROUP BY product ORDER BY product", "ink|2;pen|2");
-    t("SELECT UPPER(region) AS r, AVG(qty) FROM sales GROUP BY r ORDER BY r", "EAST|NULL;NORTH|6;SOUTH|3");
+    t("SELECT UPPER(region) AS r, AVG(qty) FROM sales GROUP BY r ORDER BY r", "EAST|NULL;NORTH|6.0000;SOUTH|3.0000");
     t("SELECT COUNT(*), SUM(qty), AVG(qty) FROM sales WHERE qty > 100", "0|NULL|NULL");
     t("SELECT region FROM sales GROUP BY region HAVING SUM(qty) >= 6 ORDER BY region", "north;south");
     t("SELECT SUM(qty) FROM sales WHERE SUM(qty) > 1", "ERR:not allowed in WHERE");
@@ -402,7 +476,7 @@ int main(void) {
     t("SELECT DISTINCT region, product FROM sales ORDER BY region, product", "east|ink;north|ink;north|pen;south|pen");
     t("SELECT * FROM sales ORDER BY price DESC, id LIMIT 2", "2|north|ink|2|10.25;5|east|ink|NULL|9.5");
     cols("SELECT region, COUNT(*), AVG(qty), MAX(price), SUM(qty) FROM sales GROUP BY region",
-         "region|COUNT(*)|AVG(qty)|MAX(price)|SUM(qty)", "VARCHAR|INT|FLOAT|DECIMAL|INT");
+         "region|COUNT(*)|AVG(qty)|MAX(price)|SUM(qty)", "VARCHAR|INT|DECIMAL|DECIMAL|INT");
 
     // ── JOIN ──
     t("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(20), city VARCHAR(20))", "OK:0");
@@ -716,7 +790,7 @@ int main(void) {
       "Anna;Bruno;Carla");
     t("SELECT nome, (SELECT COUNT(*) FROM esame e WHERE e.matricola = s.matricola) FROM studente s ORDER BY matricola",
       "Anna|3;Bruno|2;Carla|3;Dario|1;Elena|0");
-    t("SELECT nome, (SELECT AVG(voto) FROM esame e WHERE e.matricola = s.matricola) AS media FROM studente s WHERE matricola = 2", "Bruno|24");
+    t("SELECT nome, (SELECT AVG(voto) FROM esame e WHERE e.matricola = s.matricola) AS media FROM studente s WHERE matricola = 2", "Bruno|24.0000");
     t("SELECT matricola FROM esame GROUP BY matricola HAVING AVG(voto) > (SELECT AVG(voto) FROM esame) ORDER BY matricola", "1;3");
     t("SELECT (SELECT voto FROM esame)", "ERR:more than one row");
     t("SELECT (SELECT voto FROM esame WHERE voto > 100)", "NULL");
@@ -727,7 +801,7 @@ int main(void) {
     t("SELECT DISTINCT matricola FROM esame WHERE voto < ANY (SELECT voto FROM esame WHERE matricola = 4)", "2");
     t("SELECT COUNT(*) FROM esame WHERE voto > ALL (SELECT voto FROM esame WHERE matricola = 99)", "9");   // ALL su insieme vuoto: vero
     // tabelle derivate e WITH
-    t("SELECT AVG(n) FROM (SELECT matricola, COUNT(*) AS n FROM esame GROUP BY matricola) AS t", "2.25");
+    t("SELECT AVG(n) FROM (SELECT matricola, COUNT(*) AS n FROM esame GROUP BY matricola) AS t", "2.2500");   // AVG di interi: DECIMAL scala 4 (MySQL)
     t("SELECT MAX(n) FROM (SELECT COUNT(*) AS n FROM esame GROUP BY corso)", "3");
     t("WITH medie AS (SELECT matricola, AVG(voto) AS media FROM esame GROUP BY matricola) "
       "SELECT s.nome FROM studente s JOIN medie m ON m.matricola = s.matricola WHERE m.media >= 27 ORDER BY s.nome", "Anna;Carla");
@@ -748,7 +822,7 @@ int main(void) {
       "30|1|1;30|1|1;30|1|1;28|4|2;27|5|3;25|6|4;24|7|5;22|8|6;18|9|7");
     t("SELECT matricola, corso, SUM(voto) OVER (PARTITION BY matricola ORDER BY corso) FROM esame WHERE matricola = 1 ORDER BY corso",
       "1|AN1|25;1|BD1|55;1|BD2|83");
-    t("SELECT matricola, voto, AVG(voto) OVER (PARTITION BY matricola) FROM esame WHERE matricola = 2 ORDER BY voto", "2|18|24;2|30|24");
+    t("SELECT matricola, voto, AVG(voto) OVER (PARTITION BY matricola) FROM esame WHERE matricola = 2 ORDER BY voto", "2|18|24.0000;2|30|24.0000");
     t("SELECT COUNT(*) OVER () FROM esame LIMIT 1", "9");
     t("SELECT corso, voto, LAG(voto) OVER (PARTITION BY corso ORDER BY voto), LEAD(voto, 1, 0) OVER (PARTITION BY corso ORDER BY voto) "
       "FROM esame WHERE corso = 'BD1' ORDER BY voto", "BD1|18|NULL|27;BD1|27|18|30;BD1|30|27|0");
@@ -909,9 +983,11 @@ int main(void) {
     t("INSERT INTO studente (matricola, nome, anno_iscrizione) VALUES (10, 'Ugo', 1500)", "ERR:anno_iscrizione >= 2000");
     t("ALTER TABLE studente DROP COLUMN email", "OK:0");
     t("SELECT * FROM studente WHERE matricola = 1", "1|Anna|Milano|2024");
+    // DDL dentro una transazione: commit implicito prima, come MySQL (la modifica alla tabella resta dopo ROLLBACK)
     t("BEGIN", "OK:0");
-    t("ALTER TABLE studente ADD x INT", "ERR:inside a transaction");
+    t("ALTER TABLE studente ADD x INT", "OK:0");
     t("ROLLBACK", "OK:0");
+    t("ALTER TABLE studente DROP COLUMN x", "OK:0");
     t("ALTER TABLE corso RENAME COLUMN codice TO sigla", "OK:0");
     t("SELECT COUNT(*) FROM esame e JOIN corso c ON c.sigla = e.corso", "9");
     t("DELETE FROM studente WHERE matricola = 9", "OK:1");
@@ -1407,9 +1483,18 @@ int main(void) {
     t("UNLOCK TABLES", "OK:0");
     t("SHOW VARIABLES LIKE 'version_c%'", "version_comment|SegVault;version_compile_os|SegVault");
     // funzioni JSON, di testo e di date
-    t("SELECT JSON_SET('{\"a\":1}', '$.b', 2, '$.a', 'x')", "{\"a\":\"x\", \"b\": 2}");
-    t("SELECT JSON_INSERT('{\"a\":1}', '$.a', 5, '$.c', JSON_ARRAY(1, 2)), JSON_REPLACE('{\"a\":1}', '$.a', 9, '$.z', 1)", "{\"a\":1, \"c\": [1, 2]}|{\"a\":9}");
-    t("SELECT JSON_REMOVE('{\"a\":1,\"b\":[1,2,3]}', '$.b[1]', '$.a'), JSON_ARRAY_APPEND('[1,2]', '$', 3)", "{\"b\":[1,3]}|[1,2, 3]");
+    t("SELECT JSON_SET('{\"a\":1}', '$.b', 2, '$.a', 'x')", "{\"a\": \"x\", \"b\": 2}");
+    t("SELECT JSON_INSERT('{\"a\":1}', '$.a', 5, '$.c', JSON_ARRAY(1, 2)), JSON_REPLACE('{\"a\":1}', '$.a', 9, '$.z', 1)", "{\"a\": 1, \"c\": [1, 2]}|{\"a\": 9}");
+    t("SELECT JSON_REMOVE('{\"a\":1,\"b\":[1,2,3]}', '$.b[1]', '$.a'), JSON_ARRAY_APPEND('[1,2]', '$', 3)", "{\"b\": [1, 3]}|[1, 2, 3]");
+    // forma normalizzata di MySQL anche per JSON_EXTRACT, -> e CAST AS JSON (CR-B9)
+    t("SELECT JSON_EXTRACT('{\"a\":{\"x\":1,\"y\":[1,2]}}', '$.a'), '{\"a\" : [ 1,2 ]}' -> '$.a', CAST('{\"k\":\"p, q\"}' AS JSON)",
+      "{\"x\": 1, \"y\": [1, 2]}|[1, 2]|{\"k\": \"p, q\"}");
+    t("SELECT CAST('abc' AS JSON)", "ERR:Invalid JSON text");
+    t("SELECT JSON_ARRAY_INSERT('[\"a\", {\"b\": [1, 2]}, [3, 4]]', '$[1]', 'x', '$[100]', 'z', '$[2].b[0]', 0)",
+      "[\"a\", \"x\", {\"b\": [0, 1, 2]}, [3, 4], \"z\"]");
+    t("SELECT JSON_ARRAY_INSERT('{\"a\":1}', '$.a', 2)", "ERR:");
+    t("SELECT JSON_MERGE_PRESERVE('{ \"a\": 1, \"b\": 2 }', '{ \"a\": 3, \"c\": 4 }', '{ \"a\": 5 }'), JSON_MERGE('[1, 2]', '{\"id\": 47}'), JSON_MERGE_PRESERVE('1', 'true')",
+      "{\"a\": [1, 3, 5], \"b\": 2, \"c\": 4}|[1, 2, {\"id\": 47}]|[1, true]");
     t("SELECT JSON_KEYS('{\"a\":1,\"b\":2}'), JSON_CONTAINS('[1,2,3]', '2'), JSON_CONTAINS('{\"a\":1,\"b\":2}', '{\"a\":1}'), JSON_CONTAINS('[1]', '5')", "[\"a\", \"b\"]|1|1|0");
     t("SELECT JSON_CONTAINS_PATH('{\"a\":1}', 'one', '$.a', '$.z'), JSON_CONTAINS_PATH('{\"a\":1}', 'all', '$.a', '$.z')", "1|0");
     t("SELECT JSON_SEARCH('{\"x\":[\"ab\",\"cd\"]}', 'one', 'c%'), JSON_SEARCH('{\"x\":\"q\"}', 'one', 'z')", "\"$.x[1]\"|NULL");
@@ -1417,6 +1502,241 @@ int main(void) {
     t("SELECT INITCAP('ciao mondo'), SPLIT_PART('a,b,c', ',', 2), SPLIT_PART('a,b,c', ',', -1), TRANSLATE('abcd', 'ab', 'x'), CHR(65)", "Ciao Mondo|b|c|xcd|A");
     t("SELECT CONV('ff', 16, 10), CONV(255, 10, 2), SOUNDEX('Robert'), SOUNDEX('Rupert')", "255|11111111|R163|R163");
     t("SELECT OVERLAY('abcdef' PLACING 'XY' FROM 2 FOR 3), STARTS_WITH('ciao', 'ci'), REGEXP_COUNT('a1b22c333', '[0-9]+')", "aXYef|1|3");
+    {   // nomi degli oggetti nuovi: niente backtick né caratteri di controllo (la GUI, i dump e le statistiche
+        // mettono i nomi tra backtick: 'x`; DROP DATABASE ...' come nome di database usciva dalle virgolette)
+        t("CREATE DATABASE 'x`; DROP DATABASE rt; --'", "ERR:Invalid database name");
+        t("CREATE DATABASE ``", "ERR:Invalid database name");
+        t("CREATE DATABASE nm", "OK:0");
+        t("USE nm", "OK:0");
+        t("CREATE TABLE `a\nb` (id INT)", "ERR:Invalid table");
+        t("CREATE TABLE t1 (`c\td` INT)", "ERR:Invalid table, column");
+        t("CREATE TABLE t2 AS SELECT 1 AS 'p`q'", "ERR:Invalid table, column");
+        t("CREATE TABLE `x; DROP DATABASE rt; --` (id INT, `a b` INT)", "OK:0");   // legali come in MySQL
+        t("CREATE INDEX 'i`j' ON `x; DROP DATABASE rt; --` (id)", "ERR:Invalid index name");
+        t("ALTER TABLE `x; DROP DATABASE rt; --` RENAME COLUMN id TO `a\rb`", "ERR:Invalid column name");
+        t("ALTER TABLE `x; DROP DATABASE rt; --` ADD COLUMN `z\x01` INT", "ERR:Invalid column name");
+        t("ALTER TABLE `x; DROP DATABASE rt; --` RENAME TO `t\n`", "ERR:Invalid table name");
+        t("ALTER TABLE `x; DROP DATABASE rt; --` ADD CONSTRAINT `k\n` CHECK (id > 0)", "ERR:Invalid constraint name");
+        t("CREATE VIEW `v\n` AS SELECT 1", "ERR:Invalid view name");
+        t("CREATE SEQUENCE `s\n`", "ERR:Invalid sequence name");
+        t("CREATE PROCEDURE `p\n`() BEGIN SELECT 1; END", "ERR:Invalid procedure name");
+        t("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'nm'", "1");
+        t("USE rt", "OK:0");
+        t("DROP DATABASE nm", "OK:0");
+    }
+    {   // P3.12: chiavi fino a 16 colonne come MySQL (erano 8): PRIMARY KEY, UNIQUE, FOREIGN KEY, KEY
+        static char q[4000];
+        int k = snprintf(q, sizeof(q), "CREATE TABLE k16 (");
+        for (int i = 0; i < 16; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, "%sc%d INT", i ? ", " : "", i);
+        k += snprintf(q + k, sizeof(q) - (size_t)k, ", PRIMARY KEY (c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11)");
+        k += snprintf(q + k, sizeof(q) - (size_t)k, ", UNIQUE KEY uq (c0");
+        for (int i = 1; i < 16; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, ", c%d", i);
+        k += snprintf(q + k, sizeof(q) - (size_t)k, "), KEY kk (c15, c14, c13, c12, c11, c10, c9, c8, c7, c6))");
+        t(q, "OK:0");
+        t("INSERT INTO k16 VALUES (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16)", "OK:1");
+        t("INSERT INTO k16 VALUES (1,2,3,4,5,6,7,8,9,10,11,12,0,0,0,0)", "ERR:uplicate");     // PRIMARY KEY di 12 colonne
+        t("INSERT INTO k16 VALUES (1,2,3,4,5,6,7,8,9,10,11,99,13,14,15,16)", "OK:1");         // diversa all'11ª colonna
+        k = snprintf(q, sizeof(q), "CREATE TABLE f10 (id INT PRIMARY KEY");
+        for (int i = 0; i < 12; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, ", r%d INT", i);
+        k += snprintf(q + k, sizeof(q) - (size_t)k, ", FOREIGN KEY (r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11) REFERENCES k16 (c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11))");
+        t(q, "OK:0");
+        t("INSERT INTO f10 VALUES (1, 1,2,3,4,5,6,7,8,9,10,11,12)", "OK:1");
+        t("INSERT INTO f10 VALUES (2, 1,2,3,4,5,6,7,8,9,10,11,77)", "ERR:oreign");
+        k = snprintf(q, sizeof(q), "CREATE TABLE k17 (");
+        for (int i = 0; i < 17; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, "%sc%d INT", i ? ", " : "", i);
+        k += snprintf(q + k, sizeof(q) - (size_t)k, ", KEY (c0");
+        for (int i = 1; i < 17; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, ", c%d", i);
+        snprintf(q + k, sizeof(q) - (size_t)k, "))");
+        t(q, "ERR:Too many columns in the key (max 16)");
+        t("DROP TABLE f10", "OK:0");
+        t("DROP TABLE k16", "OK:0");
+    }
+    {   // P3.12: 20 indici e 20 chiavi esterne in un CREATE TABLE come quelli di mysqldump (erano 16 + 16); MERGE largo
+        static char q[30000];
+        t("CREATE TABLE par (id INT PRIMARY KEY)", "OK:0");
+        t("INSERT INTO par VALUES (1), (2)", "OK:2");
+        int k = snprintf(q, sizeof(q), "CREATE TABLE many (id INT PRIMARY KEY");
+        for (int i = 0; i < 20; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, ", f%d INT", i);
+        for (int i = 0; i < 20; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, ", KEY `ix%d` (`f%d`)", i, i);
+        for (int i = 0; i < 20; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, ", CONSTRAINT `fk%d` FOREIGN KEY (`f%d`) REFERENCES `par` (`id`)", i, i);
+        snprintf(q + k, sizeof(q) - (size_t)k, ")");
+        t(q, "OK:0");
+        t("SELECT COUNT(DISTINCT index_name) FROM information_schema.statistics WHERE table_name = 'many'", "21");
+        t("INSERT INTO many (id, f19) VALUES (1, 2)", "OK:1");
+        t("INSERT INTO many (id, f19) VALUES (2, 9)", "ERR:oreign");
+        k = snprintf(q, sizeof(q), "CREATE TABLE toomany (id INT");
+        for (int i = 0; i < 65; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, ", KEY (id)");
+        snprintf(q + k, sizeof(q) - (size_t)k, ")");
+        t(q, "ERR:Too many indexes (max 64)");
+        // MERGE: 40 colonne e 10 clausole WHEN (erano 32 e 8)
+        k = snprintf(q, sizeof(q), "CREATE TABLE mg (id INT PRIMARY KEY");
+        for (int i = 0; i < 40; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, ", m%d INT", i);
+        snprintf(q + k, sizeof(q) - (size_t)k, ")");
+        t(q, "OK:0");
+        k = snprintf(q, sizeof(q), "MERGE INTO mg USING par s ON mg.id = s.id");
+        for (int w = 0; w < 9; w++) k += snprintf(q + k, sizeof(q) - (size_t)k, " WHEN MATCHED AND s.id = %d THEN DELETE", 100 + w);
+        k += snprintf(q + k, sizeof(q) - (size_t)k, " WHEN NOT MATCHED THEN INSERT (id");
+        for (int i = 0; i < 40; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, ", m%d", i);
+        k += snprintf(q + k, sizeof(q) - (size_t)k, ") VALUES (s.id");
+        for (int i = 0; i < 40; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, ", %d", i);
+        snprintf(q + k, sizeof(q) - (size_t)k, ")");
+        t(q, "OK:2");
+        t("SELECT SUM(m39), COUNT(*) FROM mg", "78|2");
+        t("DROP TABLE mg", "OK:0");
+        t("DROP TABLE many", "OK:0");
+        t("DROP TABLE par", "OK:0");
+    }
+    {   // P3.12: ORDER BY con più di 8 espressioni, GROUP BY con più di 16; ROLLUP oltre 32 è un errore chiaro
+        static char q[8000];
+        t("CREATE TABLE og (a INT, b INT)", "OK:0");
+        t("INSERT INTO og VALUES (1, 2), (1, 1), (2, 5)", "OK:3");
+        int k = snprintf(q, sizeof(q), "SELECT a, b FROM og ORDER BY a DESC");
+        for (int i = 0; i < 20; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, ", a + %d", i);
+        snprintf(q + k, sizeof(q) - (size_t)k, ", b");
+        t(q, "2|5;1|1;1|2");
+        k = snprintf(q, sizeof(q), "SELECT a, COUNT(*) FROM og GROUP BY a");
+        for (int i = 0; i < 40; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, ", a * %d", i + 2);
+        snprintf(q + k, sizeof(q) - (size_t)k, " ORDER BY a");
+        t(q, "1|2;2|1");
+        k = snprintf(q, sizeof(q), "SELECT COUNT(*) FROM og GROUP BY a");
+        for (int i = 0; i < 40; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, ", a * %d", i + 2);
+        snprintf(q + k, sizeof(q) - (size_t)k, " WITH ROLLUP");
+        t(q, "ERR:up to 32 GROUP BY expressions");
+        t("SELECT a, b FROM og UNION ALL SELECT b, a FROM og ORDER BY 1, 2, 1, 2, 1, 2, 1, 2, 1, 2 LIMIT 2", "1|1;1|1");
+        t("DROP TABLE og", "OK:0");
+    }
+    {   // diario degli indici: un ROLLBACK riporta indietro gli indici in memoria invece di buttarli
+        t("CREATE TABLE ij (id INT PRIMARY KEY, u VARCHAR(10) UNIQUE, v INT)", "OK:0");
+        t("INSERT INTO ij VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)", "OK:3");
+        t("SELECT v FROM ij WHERE id = 2", "20");                     // indice costruito
+        t("BEGIN", "OK:0");
+        t("INSERT INTO ij VALUES (4, 'd', 40)", "OK:1");
+        t("DELETE FROM ij WHERE id = 1", "OK:1");
+        t("UPDATE ij SET id = 20, u = 'bb' WHERE id = 2", "OK:1");
+        t("SELECT v FROM ij WHERE id = 20", "20");
+        t("ROLLBACK", "OK:0");
+        t("SELECT COUNT(*) FROM ij WHERE id = 4", "0");                // aggiunta annullata
+        t("SELECT v FROM ij WHERE id = 1", "10");                     // cancellazione annullata
+        t("SELECT v FROM ij WHERE u = 'a'", "10");
+        t("SELECT v FROM ij WHERE id = 2", "20");                     // chiave cambiata e rimessa
+        t("SELECT COUNT(*) FROM ij WHERE id = 20", "0");
+        t("SELECT COUNT(*) FROM ij WHERE u = 'bb'", "0");
+        t("INSERT INTO ij VALUES (4, 'd', 41)", "OK:1");              // nessuna chiave fantasma rimasta
+        t("INSERT INTO ij VALUES (5, 'a', 50)", "ERR:uplicate");      // la chiave rimessa è viva
+        // ROLLBACK TO: solo le modifiche dopo il savepoint
+        t("BEGIN", "OK:0");
+        t("INSERT INTO ij VALUES (6, 'f', 60)", "OK:1");
+        t("SAVEPOINT s1", "OK:0");
+        t("INSERT INTO ij VALUES (7, 'g', 70)", "OK:1");
+        t("DELETE FROM ij WHERE id = 3", "OK:1");
+        t("ROLLBACK TO SAVEPOINT s1", "OK:0");
+        t("SELECT v FROM ij WHERE id = 6", "60");
+        t("SELECT COUNT(*) FROM ij WHERE id = 7", "0");
+        t("SELECT v FROM ij WHERE id = 3", "30");
+        t("COMMIT", "OK:0");
+        t("SELECT v FROM ij WHERE id = 6", "60");
+        // statement che fallisce a metà (la seconda riga è un duplicato): le righe già messe tornano indietro
+        t("INSERT INTO ij VALUES (8, 'h', 80), (1, 'zz', 0)", "ERR:uplicate");
+        t("SELECT COUNT(*) FROM ij WHERE id = 8", "0");
+        t("INSERT INTO ij VALUES (8, 'h', 80)", "OK:1");
+        // indice costruito dentro la transazione, dopo le modifiche: scartato al ROLLBACK (non ha diario)
+        // (una CALL segna la transazione come un DDL ma non fa commit implicito)
+        t("CREATE PROCEDURE ij_p() SELECT 1", "OK:0");
+        t("BEGIN", "OK:0");
+        t("INSERT INTO ij VALUES (9, 'i', 90)", "OK:1");
+        t("CALL ij_p()", "1");
+        t("SELECT id FROM ij WHERE v = 90", "9");
+        t("ROLLBACK", "OK:0");
+        t("SELECT COUNT(*) FROM ij WHERE id = 9", "0");
+        t("INSERT INTO ij VALUES (9, 'i', 91)", "OK:1");
+        t("DROP PROCEDURE ij_p", "OK:0");
+        // commit implicito: le righe scritte prima di un DDL restano anche dopo ROLLBACK (prima sparivano mentre la
+        // tabella nuova restava); BEGIN dentro una transazione fa commit e ne apre un'altra
+        t("BEGIN", "OK:0");
+        t("INSERT INTO ij VALUES (20, 't', 200)", "OK:1");
+        t("CREATE TABLE ij_dummy (x INT)", "OK:0");
+        t("INSERT INTO ij VALUES (21, 'u', 210)", "OK:1");
+        t("ROLLBACK", "OK:0");
+        t("SELECT COUNT(*) FROM ij WHERE id IN (20, 21)", "2");
+        t("BEGIN", "OK:0");
+        t("INSERT INTO ij VALUES (22, 'v', 220)", "OK:1");
+        t("BEGIN", "OK:0");
+        t("INSERT INTO ij VALUES (23, 'w', 230)", "OK:1");
+        t("ROLLBACK", "OK:0");
+        t("SELECT GROUP_CONCAT(id ORDER BY id) FROM ij WHERE id IN (22, 23)", "22");
+        t("BEGIN", "OK:0");
+        t("INSERT INTO ij VALUES (24, 'x', 240)", "OK:1");
+        t("CREATE TEMPORARY TABLE ij_tmp (x INT)", "OK:0");
+        t("ROLLBACK", "OK:0");
+        t("SELECT COUNT(*) FROM ij WHERE id = 24", "0");
+        t("DROP TABLE IF EXISTS ij_dummy", "OK:0");
+        t("DROP TABLE ij", "OK:0");
+    }
+    {   // riordino dei join (P1.13) con SELECT * su più di 8 colonne: l'espansione scriveva oltre la lista delle
+        // colonne (heap overflow, visto con ASan); oltre 64 colonne il riordino era saltato
+        static char q[300];
+        t("CREATE TABLE rb (id INT PRIMARY KEY, a1 INT, a2 INT, a3 INT, a4 INT, a5 INT, a6 INT)", "OK:0");
+        t("CREATE TABLE rm (id INT PRIMARY KEY, b1 INT, b2 INT, b3 INT, b4 INT, b5 INT, b6 INT)", "OK:0");
+        t("CREATE TABLE rs (id INT PRIMARY KEY, c1 INT, c2 INT, c3 INT, c4 INT, c5 INT, c6 INT)", "OK:0");
+        t("BEGIN", "OK:0");
+        for (int i = 0; i < 400; i++) { snprintf(q, sizeof(q), "INSERT INTO rb (id, a1) VALUES (%d, %d)", i, i); t(q, "OK:1"); }
+        for (int i = 0; i < 40; i++) { snprintf(q, sizeof(q), "INSERT INTO rm (id, b1) VALUES (%d, %d)", i, i); t(q, "OK:1"); }
+        t("INSERT INTO rs (id, c1) VALUES (1, 7), (2, 8)", "OK:2");
+        t("COMMIT", "OK:0");
+        t("ANALYZE TABLE rb, rm, rs", "#3");
+        t("SELECT * FROM rb JOIN rm ON rm.b1 = rb.a1 JOIN rs ON rs.c1 = rm.b1 WHERE rs.id = 1",
+          "7|7|NULL|NULL|NULL|NULL|NULL|7|7|NULL|NULL|NULL|NULL|NULL|1|7|NULL|NULL|NULL|NULL|NULL");
+        t("DROP TABLE rb", "OK:0"); t("DROP TABLE rm", "OK:0"); t("DROP TABLE rs", "OK:0");
+    }
+    {   // P3.12: più di 8 JOIN (WordPress meta_query, EAV di Magento); 61 tabelle come MySQL, la 62ª è un errore
+        static char q[20000];
+        t("CREATE TABLE jm (id INT PRIMARY KEY, k INT, v INT)", "OK:0");
+        t("INSERT INTO jm VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30)", "OK:3");
+        int k = snprintf(q, sizeof(q), "SELECT COUNT(*), SUM(t0.v) FROM jm t0");
+        for (int i = 1; i < 12; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, " JOIN jm t%d ON t%d.id = t0.id", i, i);
+        t(q, "3|60");
+        k = snprintf(q, sizeof(q), "SELECT t60.v FROM jm t0");
+        for (int i = 1; i < 61; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, " LEFT JOIN jm t%d ON t%d.id = t%d.id", i, i, i - 1);
+        snprintf(q + k, sizeof(q) - (size_t)k, " WHERE t0.id = 3");
+        t(q, "30");
+        k = snprintf(q, sizeof(q), "SELECT 1 FROM jm t0");
+        for (int i = 1; i < 62; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, " JOIN jm t%d ON 1", i);
+        t(q, "ERR:Too many JOINs (max 60)");
+        t("DROP TABLE jm", "OK:0");
+    }
+    {   // P3.12: 300 colonne aggiornate in un solo UPDATE / upsert (il tetto era 64 con 1024 colonne per tabella)
+        static char q[60000];
+        int k = snprintf(q, sizeof(q), "CREATE TABLE wide300 (id INT PRIMARY KEY");
+        for (int c = 1; c < 300; c++) k += snprintf(q + k, sizeof(q) - (size_t)k, ", c%d INT", c);
+        snprintf(q + k, sizeof(q) - (size_t)k, ")");
+        t(q, "OK:0");
+        t("INSERT INTO wide300 (id) VALUES (1)", "OK:1");
+        k = snprintf(q, sizeof(q), "UPDATE wide300 SET ");
+        for (int c = 1; c < 300; c++) k += snprintf(q + k, sizeof(q) - (size_t)k, "%sc%d = %d", c > 1 ? ", " : "", c, c);
+        snprintf(q + k, sizeof(q) - (size_t)k, " WHERE id = 1");
+        t(q, "OK:1");
+        t("SELECT c1, c64, c65, c299 FROM wide300", "1|64|65|299");
+        k = snprintf(q, sizeof(q), "INSERT INTO wide300 (id) VALUES (1) ON DUPLICATE KEY UPDATE ");
+        for (int c = 1; c < 300; c++) k += snprintf(q + k, sizeof(q) - (size_t)k, "%sc%d = c%d + 1", c > 1 ? ", " : "", c, c);
+        t(q, "OK:2");
+        t("SELECT c1, c65, c299 FROM wide300", "2|66|300");
+        k = snprintf(q, sizeof(q), "INSERT INTO wide300 (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET ");
+        for (int c = 1; c < 300; c++) k += snprintf(q + k, sizeof(q) - (size_t)k, "%sc%d = 0", c > 1 ? ", " : "", c);
+        t(q, "OK:2");
+        t("SELECT c1 + c150 + c299 FROM wide300", "0");
+        k = snprintf(q, sizeof(q), "UPDATE wide300 w JOIN wide300 v ON v.id = w.id SET ");   // multi-tabella: testi delle espressioni
+        for (int c = 1; c < 300; c++) k += snprintf(q + k, sizeof(q) - (size_t)k, "%sw.c%d = %d", c > 1 ? ", " : "", c, 7);
+        t(q, "OK:1");
+        t("SELECT c1, c299 FROM wide300", "7|7");
+        t("DROP TABLE wide300", "OK:0");
+    }
+    {   // P3.11: WITH RECURSIVE con più di 64 SELECT nell'unione (i passi dopo il 64° erano ignorati senza errore)
+        static char q[8192];
+        int k = snprintf(q, sizeof(q), "WITH RECURSIVE r(n) AS (SELECT 1");
+        for (int i = 2; i <= 70; i++) k += snprintf(q + k, sizeof(q) - (size_t)k, " UNION ALL SELECT %d", i);
+        k += snprintf(q + k, sizeof(q) - (size_t)k, " UNION ALL SELECT n + 1000 FROM r WHERE n < 70) SELECT COUNT(*), MAX(n) FROM r");
+        t(q, "139|1069");                     // 70 SELECT fissi + 69 passi (1001..1069)
+    }
     {   // P3.9: 100 000 parentesi annidate in una REGEXP facevano traboccare lo stack (il server cadeva)
         static char deep[200100];
         int k = snprintf(deep, sizeof(deep), "SELECT 'a' REGEXP '");
@@ -1426,6 +1746,20 @@ int main(void) {
         snprintf(deep + k, sizeof(deep) - (size_t)k, "'");
         t(deep, "ERR:nested parentheses");
         t("SELECT 'abc' REGEXP '((((a))))b', REGEXP_REPLACE('aXbXc', '(X)', '-')", "1|a-b-c");
+        // backtracking esponenziale: prima "nessuna corrispondenza" dopo 2 milioni di passi PER RIGA (38 s su 2 000
+        // righe con il motore bloccato); ora errore alla prima riga, come ER_REGEXP_TIME_OUT di MySQL
+        t("CREATE TABLE rxd (s VARCHAR(40))", "OK:0");
+        {
+            char ins[60000];
+            int ki = snprintf(ins, sizeof(ins), "INSERT INTO rxd VALUES ");
+            for (int i = 0; i < 1000; i++) ki += snprintf(ins + ki, sizeof(ins) - (size_t)ki, "%s('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')", i ? "," : "");
+            t(ins, "OK:1000");
+        }
+        double rx0 = now_ms_sql();
+        t("SELECT COUNT(*) FROM rxd WHERE s REGEXP '(a*)*b'", "ERR:Regular expression too expensive");
+        CHECK_SQL(now_ms_sql() - rx0 < 2000, "pathological REGEXP stops at the first row (%.0f ms)", now_ms_sql() - rx0);
+        t("SELECT COUNT(*) FROM rxd WHERE s REGEXP 'a+$'", "1000");          // dopo l'errore le scansioni ripartono
+        t("DROP TABLE rxd", "OK:0");
         // JSON_SEARCH: il LIKE era ricorsivo per carattere (stack) ed esponenziale con più %
         int k2 = snprintf(deep, sizeof(deep), "SELECT JSON_SEARCH('[\"");
         for (int i = 0; i < 90000; i++) deep[k2++] = 'a';
@@ -1625,7 +1959,7 @@ int main(void) {
     t("USE vinc", "OK:0");
     // i vincoli restano dopo un riavvio
     db_shutdown();
-    if (!db_init("/tmp/sv_sql_test")) { printf("FAIL: reopen\n"); return 1; }
+    if (!db_init("sv_sql_test")) { printf("FAIL: reopen\n"); return 1; }
     t("USE vinc", "OK:0");
     t("INSERT INTO esame VALUES (2, 'BD1', 30, 0)", "ERR:Duplicate entry '2-BD1'");
     t("INSERT INTO esame VALUES (9, 'BD1', 30, 0)", "ERR:Foreign key");
@@ -1649,7 +1983,7 @@ int main(void) {
 
     db_shutdown();
     crash_recovery_test();
-    if (system("rm -rf /tmp/sv_sql_test") != 0) { /* nulla */ }
+    if (system("rm -rf sv_sql_test") != 0) { /* nulla */ }
     printf("%s: %d/%d SQL tests passed\n", failed ? "FAIL" : "OK", tests - failed, tests);
     return failed ? 1 : 0;
 }

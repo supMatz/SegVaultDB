@@ -30,9 +30,9 @@ typedef struct {
     int    kind;                // 0 UPDATE, 1 DELETE, 2 INSERT
     bool   matched;
     char*  cond;                // AND ... (NULL = nessuna)
-    char   cols[32][64];        // UPDATE SET / INSERT (colonne)
-    char*  vals[32];
-    int    n;
+    char (*cols)[64];           // UPDATE SET / INSERT (colonne): liste dinamiche (P3.12: 32, e 2,3 KB per clausola)
+    char** vals;
+    int    n, ncols, cap;
     bool   has_cols;
 } MergeWhen;
 
@@ -103,10 +103,12 @@ typedef struct ASTExpr {
     struct ASTExpr** args;    // EXPR_FUNC / EXPR_AGG: argomenti
     int      nargs;
     bool     agg_distinct;    // COUNT(DISTINCT x)
+    int8_t   fmine;           // EXPR_FUNC: cache dell'executor (0 = da calcolare, 1 / -1 = nome in / fuori dall'elenco di
+                              // eval_mysql): prima 115 strcmp per riga per ogni funzione fuori elenco (CR-M2)
     char     func[32];        // EXPR_AGG / EXPR_FUNC: nome della funzione (maiuscolo)
     char     alias[64];       // SELECT ... AS alias
     // risoluzione fatta dall'executor prima di eseguire (EXPR_COLUMN):
-    //   > 0  sorgente * 1024 + colonna + 1      < 0  alias della SELECT numero -(bound + 1)
+    //   > 0  BOUND_MAKE(sorgente, colonna)      < 0  alias della SELECT numero -(bound + 1)
     int      bound;
     int      outer;           // EXPR_COLUMN: 0 = colonna di questa query, k = della query esterna di k livelli
     bool     rt_const;        // EXPR_COLUMN: variabile di una routine / NEW / OLD: costante per tutta la query
@@ -150,25 +152,25 @@ typedef struct {
 typedef struct {
     char     name[64];
     int      ncols;
-    char     cols[8][64];
+    char     cols[SV_MAX_KEY_COLS][64];
     bool     fulltext;
 } TableKeyDef;
-#define SV_MAX_KEY_DEFS 16
+#define SV_MAX_KEY_DEFS SV_MAX_INDEXES       // KEY / INDEX in CREATE TABLE (lista dinamica, P3.12)
 
 // vincolo di CREATE TABLE / ALTER TABLE ADD CONSTRAINT (di colonna o di tabella)
 typedef struct {
     char     name[64];               // CONSTRAINT nome ("" = generato)
     int      kind;                   // CONS_PRIMARY, CONS_UNIQUE, CONS_FOREIGN, CONS_CHECK (schema.h)
     int      ncols;
-    char     cols[8][64];
+    char     cols[SV_MAX_KEY_COLS][64];
     char     ref_table[64];
     int      nref;
-    char     ref_cols[8][64];        // vuoto: la chiave primaria della tabella riferita
+    char     ref_cols[SV_MAX_KEY_COLS][64];        // vuoto: la chiave primaria della tabella riferita
     int      on_delete, on_update;   // FkAction
     char     check[512];             // testo della condizione
 } ConstraintDef;
 
-#define SV_MAX_CONS_DEFS 16
+#define SV_MAX_CONS_DEFS SV_MAX_CONSTRAINTS  // vincoli in CREATE TABLE (lista dinamica, P3.12)
 
 // funzione-tabella in FROM: JSON_TABLE(doc, 'percorso' COLUMNS (...)), GENERATE_SERIES(da, a [, passo])
 enum { TFC_PATH, TFC_ORDINALITY, TFC_EXISTS, TFC_NESTED };
@@ -222,9 +224,14 @@ typedef struct {
 // operatori insiemistici fra SELECT
 enum { SETOP_NONE, SETOP_UNION, SETOP_INTERSECT, SETOP_EXCEPT };
 
-#define SV_MAX_ORDER   8
-#define SV_MAX_GROUP   16
-#define SV_MAX_SETS    64
+#define SV_MAX_JOINS   60          // come MySQL: 61 tabelle in una SELECT
+// ORDER BY / GROUP BY: liste dinamiche (P3.12: erano 8 e 16); il tetto ferma solo testi assurdi
+#define SV_MAX_ORDER   4096
+#define SV_MAX_GROUP   4096
+#define SV_MAX_GROUP_SETS 32        // ROLLUP / CUBE / GROUPING SETS: insiemi a bit su 32 espressioni
+// colonne in UPDATE ... SET / ON DUPLICATE KEY UPDATE / ON CONFLICT DO UPDATE: liste dinamiche (P3.12: erano 64
+// con 1024 colonne per tabella); il tetto ferma solo un testo assurdo (una colonna può comparire più volte)
+#define SV_MAX_SETS    (4 * SV_MAX_COLUMNS)
 enum { INS_NORMAL, INS_IGNORE, INS_REPLACE };
 
 typedef struct ASTNode {
@@ -256,10 +263,10 @@ typedef struct ASTNode {
             char       show_like[128];   // SHOW TABLES / DATABASES LIKE 'p'
             bool       has_show_like;
             ASTExpr*   where;
-            ASTExpr*   order_exprs[SV_MAX_ORDER];
-            bool       order_desc[SV_MAX_ORDER];
-            char       order_nulls[SV_MAX_ORDER];   // 0 = come MySQL (NULL primi in ASC), 'F' = NULLS FIRST, 'L' = NULLS LAST
-            int        num_order;
+            ASTExpr**  order_exprs;    // num_order (cap_order allocate, come order_desc / order_nulls)
+            bool*      order_desc;
+            char*      order_nulls;    // 0 = come MySQL (NULL primi in ASC), 'F' = NULLS FIRST, 'L' = NULLS LAST
+            int        num_order, cap_order;
             int        limit;
             int        offset;
             bool       has_limit;      // LIMIT presente (LIMIT 0 = nessuna riga)
@@ -268,11 +275,11 @@ typedef struct ASTNode {
             // SELECT ... INTO v1, @v2: i valori dell'unica riga vanno nelle variabili (routine o sessione)
             char       into[16][64];
             int        num_into;
-            ASTExpr*   group_exprs[SV_MAX_GROUP];
-            int        num_group;
+            ASTExpr**  group_exprs;    // num_group (cap_group allocate)
+            int        num_group, cap_group;
             ASTExpr*   having;
-            ASTJoin    joins[8];
-            int        num_joins;
+            ASTJoin*   joins;          // lista dinamica (P3.12: erano 8; il piano ne accetta MAX_SOURCES - 1 = 60)
+            int        num_joins, cap_joins;
             struct ASTNode* from_sub;  // FROM (SELECT ...) alias: tabella derivata
             TableFunc* from_tf;        // FROM JSON_TABLE(...) / GENERATE_SERIES(...) alias
             char       table_db[64];   // FROM db.tabella: il database della prima sorgente ("" = corrente)
@@ -293,23 +300,23 @@ typedef struct ASTNode {
             int        num_rows;
             struct ASTNode* select;    // INSERT INTO t [(colonne)] SELECT ...
             int        mode;           // INS_* (INSERT IGNORE, REPLACE)
-            char       dup_cols[SV_MAX_SETS][64];   // ON DUPLICATE KEY UPDATE col = espr, ...
-            ASTExpr*   dup_exprs[SV_MAX_SETS];
-            int        num_dup;
+            char     (*dup_cols)[64];  // ON DUPLICATE KEY UPDATE col = espr, ... (num_dup, cap_dup allocate)
+            ASTExpr**  dup_exprs;
+            int        num_dup, cap_dup;
             char       row_alias[64];  // VALUES (...) AS nuovo: nuovo.col = il valore proposto
         } insert_stmt;
         struct {
             char       table_name[64];
-            char       set_cols[SV_MAX_SETS][64];
-            ASTExpr*   set_exprs[SV_MAX_SETS];
-            int        num_sets;
+            char     (*set_cols)[64];  // num_sets colonne (cap_sets allocate, come set_exprs / set_tables / set_texts)
+            ASTExpr**  set_exprs;
+            int        num_sets, cap_sets;
             ASTExpr*   where;
             // MySQL: UPDATE con più tabelle (JOIN), alias, ORDER BY / LIMIT: tutto come testo SQL
             char*      multi_from;            // "t1 a JOIN t2 b ON ..." (NULL = forma semplice)
             char*      multi_where;           // condizione (NULL = nessuna)
             char*      order_limit;           // "ORDER BY ... LIMIT n" (NULL = nessuno)
-            char       set_tables[SV_MAX_SETS][64];   // a.col: "a" ("" = non qualificata)
-            char*      set_texts[SV_MAX_SETS];        // testo dell'espressione
+            char     (*set_tables)[64];       // a.col: "a" ("" = non qualificata)
+            char**     set_texts;                // testo dell'espressione (multi-tabella / ORDER BY)
         } update_stmt;
         struct {
             char       table_name[64];
@@ -331,10 +338,10 @@ typedef struct ASTNode {
             char       table_name[64];
             ColumnDef* columns;               // lista dinamica (P1.11: fino a SV_MAX_COLUMNS colonne)
             int        num_columns, cap_columns;
-            ConstraintDef cons[SV_MAX_CONS_DEFS];
-            int        num_cons;
-            TableKeyDef keys[SV_MAX_KEY_DEFS];
-            int        num_keys;
+            ConstraintDef* cons;              // num_cons (ast_cons_add): prima 16 dentro ogni ASTNode (27 KB)
+            int        num_cons, cap_cons;
+            TableKeyDef* keys;                // num_keys (ast_key_add)
+            int        num_keys, cap_keys;
             char       comment[256];          // COMMENT = '...'
             char       collation[40];         // [DEFAULT] COLLATE x / CHARSET x
             long long  auto_increment;        // AUTO_INCREMENT = n
@@ -376,7 +383,7 @@ typedef struct ASTNode {
         } drop_index;
         struct {
             char       view_name[64];
-            char       definition[SV_MAX_SQL_LEN];
+            char*      definition;     // malloc'd (fino a SV_MAX_SQL_LEN): prima 64 KB dentro ogni ASTNode
             bool       replace;        // CREATE OR REPLACE VIEW
             bool       alter;          // ALTER VIEW: la vista deve esistere
         } create_view;
@@ -397,7 +404,7 @@ typedef struct ASTNode {
             char       table_name[64];
             bool       before;
             char       event[16];
-            char       body[SV_MAX_SQL_LEN];
+            char*      body;           // malloc'd (fino a SV_MAX_SQL_LEN; anche il testo delle routine)
         } create_trigger;
         struct {
             char       name[64];
@@ -415,8 +422,8 @@ typedef struct ASTNode {
             char       target[64], talias[64], salias[64];
             char*      source;              // tabella o (subquery), con " AS alias[(colonne)]"
             char*      on;
-            MergeWhen  when[8];
-            int        nwhen;
+            MergeWhen* when;                // clausole WHEN (P3.12: erano 8 dentro il nodo, 18 KB)
+            int        nwhen, cap_when;
         } merge;
         struct {
             char       name[64];
@@ -544,5 +551,10 @@ void         trig_program_free(TrigProgram* p);
 bool ast_select_push(ASTNode* n, ASTExpr* e);
 bool ast_insert_push_col(ASTNode* n, char* name);
 ColumnDef* ast_create_new_col(ASTNode* n);          // azzerata in fondo, NULL se non c'è posto
+
+// un vincolo / un indice in più (azzerato) in un nodo CREATE TABLE; NULL oltre SV_MAX_CONS_DEFS / SV_MAX_KEY_DEFS o
+// senza memoria
+ConstraintDef* ast_cons_add(ASTNode* n);
+TableKeyDef*   ast_key_add(ASTNode* n);
 
 #endif

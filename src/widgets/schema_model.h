@@ -9,8 +9,6 @@ SCOPO: modello del diagramma dello schema (senza GUI): tabelle con le colonne, r
 #include <stdbool.h>
 #include <stddef.h>
 
-#define SM_MAX_COLS 64
-
 typedef struct {
     char name[64];
     char type[64];             // "INT", "VARCHAR(100)"
@@ -21,7 +19,7 @@ typedef struct {
 typedef struct {
     char  name[64];
     int   ncols;
-    SmCol cols[SM_MAX_COLS];
+    SmCol* cols;               // ncols colonne (malloc'd, liberate da sm_free)
     int   x, y, w, h;          // coordinate del diagramma (w, h calcolati da chi disegna)
     bool  placed;              // posizione letta dal file o scelta dall'utente
     bool  link;                // tabella di collegamento: la chiave primaria è fatta dalle colonne di

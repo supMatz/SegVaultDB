@@ -143,8 +143,8 @@ typedef struct {
     char table[64];            // tabella con la chiave esterna (figlia)
     char ref_table[64];        // tabella riferita (genitore)
     int  ncols;
-    char cols[8][64];          // colonne della figlia
-    char ref_cols[8][64];      // colonne riferite ("" = la chiave primaria del genitore)
+    char cols[16][64];         // colonne della figlia (SV_MAX_KEY_COLS)
+    char ref_cols[16][64];     // colonne riferite ("" = la chiave primaria del genitore)
     char on_delete[16];        // "NO ACTION", "CASCADE", ...
     char on_update[16];
 } ForeignKeyInfo;
@@ -186,6 +186,9 @@ typedef struct {
 } SessionInfo;
 
 // ── API principale ──
+// Stack: i thread che chiamano db_execute* devono avere almeno 512 KB di stack (verificato con le query più
+// annidate che il motore accetta); il server usa 8 MB, la GUI 16 MB. Con 256 KB una query annidata può
+// esaurire lo stack prima che il motore la rifiuti (CR-M1).
 
 // inizializzazione db engine
 bool db_init(const char* data_directory);
@@ -244,7 +247,7 @@ bool db_rollback_to(const char* name);
 // ── sessione ──
 SessionInfo* db_session_info(void); // void, perchè la funzione non accetta parametri, se lascio () ne accetta indeterminati -> bad practise
 void db_session_free(SessionInfo* s);
-const char* db_current_database(void);
+const char* db_current_database(void);   // copia del thread (4 buffer a rotazione), NULL se nessun database
 
 // ── utilities ──
 
@@ -255,6 +258,9 @@ char* db_get_foreign_keys(const char* db_name, const char* table);         // AL
 char* db_get_objects_sql(const char* db_name, int what);
 // copia coerente di tutti i dati in dir (cartella nuova o vuota); anche con l'istruzione BACKUP TO 'dir'
 bool db_backup(const char* dir, char* err, size_t errn);
+// cartella (con le sottocartelle) che lo statement SQL BACKUP TO non può usare: la registra il server web per
+// la sua radice e per i siti (on = false la toglie). Il backup da db_backup non ha questo limite (CR-B6)
+void db_backup_protect(const char* dir, bool on);
 // sostituisce i dati con quelli di un backup; i dati di prima restano in <dati>/before-restore
 bool db_restore(const char* dir, char* err, size_t errn);
 

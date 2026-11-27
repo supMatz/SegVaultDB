@@ -12,9 +12,9 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include "harness.h"
 
-static int g_tests, g_fail;
-#define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
 
 // ── lato server: l'I/O di h2_serve su un capo della socketpair ──
 static int io_recv(void* ssl, char* buf, int n) {
@@ -121,6 +121,7 @@ static bool rejected(const char* name, const char* value, bool pseudo_after) {
 }
 
 int main(void) {
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
     h2_set_enabled(true);
     CHECK(rejected("X-Upper", "1", false), "upper-case header name refused");
     CHECK(rejected("bad name", "1", false), "header name with a space refused");

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "sv_alloc.h"
+#include "sv_strbuf.h"
 
 static const char* ws(const char* p) { while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++; return p; }
 
@@ -233,22 +234,10 @@ char* sj_quote(const char* s) {
 // ── modifiche e ricerche (JSON_SET / INSERT / REPLACE / REMOVE / ARRAY_APPEND, JSON_KEYS, JSON_CONTAINS,
 //    JSON_SEARCH, JSON_PRETTY, JSON_DEPTH, JSON_MERGE_PATCH) ─────────────────────────────────────────
 
-typedef struct { char* d; size_t n, cap; bool err; } SjBuf;
-static void sb_put(SjBuf* b, const char* s, size_t n) {
-    if (b->err) return;
-    if (b->n + n + 1 > b->cap) {
-        size_t nc = b->cap ? b->cap * 2 : 256;
-        while (nc < b->n + n + 1) nc *= 2;
-        char* nd = sv_realloc(b->d, nc);
-        if (!nd) { b->err = true; return; }
-        b->d = nd; b->cap = nc;
-    }
-    memcpy(b->d + b->n, s, n);
-    b->n += n;
-    b->d[b->n] = '\0';
-}
-static void sb_puts(SjBuf* b, const char* s) { sb_put(b, s, strlen(s)); }
-static char* sb_done(SjBuf* b) { if (b->err) { free(b->d); return NULL; } if (!b->d) return sv_strdup(""); return b->d; }
+typedef SvStrBuf SjBuf;                                    // buffer comune (CR-B2)
+#define sb_put(b, s, n) svsb_put((b), (s), (n))
+#define sb_puts(b, s)   svsb_puts((b), (s))
+#define sb_done(b)      svsb_take(b)
 
 // ultimo passo del percorso: parent riceve il percorso senza l'ultimo passo
 static bool split_last(const char* path, char* parent, size_t pn, char* key, size_t kn, long* idx) {
@@ -325,7 +314,7 @@ static bool find_member(const char* c, const char* key, long idx, const char** v
     return false;
 }
 
-// op: 0 SET, 1 INSERT, 2 REPLACE, 3 REMOVE, 4 ARRAY_APPEND. NULL se documento o percorso non validi
+// op: 0 SET, 1 INSERT, 2 REPLACE, 3 REMOVE, 4 ARRAY_APPEND, 5 ARRAY_INSERT. NULL se documento o percorso non validi
 char* sj_modify(const char* doc, const char* path, const char* val, int op) {
     if (!sj_valid(doc)) return NULL;
     if (op == 4) {                                    // aggiunge in fondo all'array (un valore semplice diventa [v, nuovo])
@@ -357,8 +346,13 @@ char* sj_modify(const char* doc, const char* path, const char* val, int op) {
     const char* c; size_t cl;
     if (!sj_extract(doc, parent, &c, &cl)) return sv_strdup(doc);           // contenitore che non c'è: invariato
     const char *vs, *ve, *rs, *re;
+    if (op == 5 && (idx < 0 || *c != '[')) return idx < 0 ? NULL : sv_strdup(doc);   // ARRAY_INSERT: solo [n] di un array
     bool found = find_member(c, key, idx, &vs, &ve, &rs, &re);
     SjBuf b = {0};
+    if (found && op == 5) {                                                  // inserito prima dell'elemento n
+        sb_put(&b, doc, (size_t)(vs - doc)); sb_puts(&b, val); sb_puts(&b, ", "); sb_puts(&b, vs);
+        return sb_done(&b);
+    }
     if (found) {
         if (op == 1) return sv_strdup(doc);                                  // INSERT: c'è già
         if (op == 3) { sb_put(&b, doc, (size_t)(rs - doc)); sb_puts(&b, re); return sb_done(&b); }
@@ -387,11 +381,11 @@ char* sj_keys(const char* v, size_t len) {
     int n = 0;
     while (*m && *m != '}') {
         const char* ke = skip_string(m);
-        if (!ke) { free(b.d); return NULL; }
+        if (!ke) { free(b.p); return NULL; }
         if (n++) sb_puts(&b, ", ");
         sb_put(&b, m, (size_t)(ke - m));
         const char* e = skip_value(ws(ws(ke) + 1), 0);
-        if (!e) { free(b.d); return NULL; }
+        if (!e) { free(b.p); return NULL; }
         m = ws(e);
         if (*m == ',') m = ws(m + 1);
     }
@@ -513,6 +507,50 @@ static void pretty(SjBuf* b, const char* v, int ind) {
     sb_puts(b, "\n");
     for (int i = 0; i < ind; i++) sb_puts(b, " ");
     sb_put(b, &close, 1);
+}
+
+// forma normalizzata di MySQL: niente spazi superflui, ", " tra gli elementi e ": " dopo le chiavi
+static void normal_into(SjBuf* b, const char* v, const char* end) {
+    v = ws(v);
+    if (*v != '{' && *v != '[') {
+        const char* e = skip_value(v, 0);
+        if (!e || (end && e > end)) e = end ? end : v + strlen(v);
+        while (e > v && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\n' || e[-1] == '\r')) e--;
+        sb_put(b, v, (size_t)(e - v));
+        return;
+    }
+    bool obj = *v == '{';
+    char close = obj ? '}' : ']';
+    const char* m = ws(v + 1);
+    sb_put(b, v, 1);
+    int n = 0;
+    while (*m && *m != close) {
+        if (n++) sb_puts(b, ", ");
+        if (obj) {
+            const char* ke = skip_string(m);
+            if (!ke) return;
+            sb_put(b, m, (size_t)(ke - m));
+            sb_puts(b, ": ");
+            m = ws(ws(ke) + 1);
+        }
+        const char* e = skip_value(m, 0);
+        if (!e) return;
+        normal_into(b, m, e);
+        m = ws(e); if (*m == ',') m = ws(m + 1);
+    }
+    sb_put(b, &close, 1);
+}
+
+char* sj_normalize(const char* value, size_t len) {
+    char* t = malloc(len + 1);
+    if (!t) return NULL;
+    memcpy(t, value, len);
+    t[len] = '\0';
+    if (!sj_valid(t)) return t;                        // non JSON: lasciato com'è
+    SjBuf b = {0};
+    normal_into(&b, t, NULL);
+    free(t);
+    return sb_done(&b);
 }
 
 char* sj_pretty(const char* doc) {
@@ -647,6 +685,71 @@ static void merge(SjBuf* b, const char* a, const char* p) {
         m = ws(e); if (*m == ',') m = ws(m + 1);
     }
     sb_puts(b, "}");
+}
+
+// elementi di v (un valore che non è un array vale come [v]) aggiunti a un array in costruzione
+static void put_elems(SjBuf* b, const char* v, int* n) {
+    v = ws(v);
+    if (*v != '[') {
+        const char* e = skip_value(v, 0);
+        if (!e) return;
+        if ((*n)++) sb_puts(b, ", ");
+        sb_put(b, v, (size_t)(e - v));
+        return;
+    }
+    const char* m = ws(v + 1);
+    while (*m && *m != ']') {
+        const char* e = skip_value(m, 0);
+        if (!e) return;
+        if ((*n)++) sb_puts(b, ", ");
+        sb_put(b, m, (size_t)(e - m));
+        m = ws(e); if (*m == ',') m = ws(m + 1);
+    }
+}
+
+// JSON_MERGE_PRESERVE di MySQL: due oggetti uniscono i membri (chiavi doppie fuse ricorsivamente), altrimenti
+// i due valori diventano un array con gli elementi di entrambi
+static void preserve(SjBuf* b, const char* a, const char* p) {
+    a = ws(a); p = ws(p);
+    if (*a != '{' || *p != '{') {
+        int n = 0;
+        sb_puts(b, "[");
+        put_elems(b, a, &n);
+        put_elems(b, p, &n);
+        sb_puts(b, "]");
+        return;
+    }
+    sb_puts(b, "{");
+    int n = 0;
+    for (int side = 0; side < 2; side++) {
+        const char* m = ws((side ? p : a) + 1);
+        while (*m && *m != '}') {
+            const char* ke = skip_string(m);
+            if (!ke) return;
+            const char* v = ws(ws(ke) + 1);
+            const char* e = skip_value(v, 0);
+            if (!e) return;
+            char* k = sj_unquote(m, (size_t)(ke - m));
+            const char *vs, *ve, *rs, *re;
+            bool other = k && find_member(side ? a : p, k, -1, &vs, &ve, &rs, &re);
+            free(k);
+            if (!side || !other) {                     // le chiavi di p già in a sono state fuse al primo giro
+                if (n++) sb_puts(b, ", ");
+                sb_put(b, m, (size_t)(ke - m));
+                sb_puts(b, ": ");
+                if (other) preserve(b, v, vs); else sb_put(b, v, (size_t)(e - v));
+            }
+            m = ws(e); if (*m == ',') m = ws(m + 1);
+        }
+    }
+    sb_puts(b, "}");
+}
+
+char* sj_merge_preserve(const char* a, const char* p) {
+    if (!sj_valid(a) || !sj_valid(p)) return NULL;
+    SjBuf b = {0};
+    preserve(&b, a, p);
+    return sb_done(&b);
 }
 
 char* sj_merge_patch(const char* a, const char* p) {

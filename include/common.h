@@ -24,9 +24,9 @@ SCOPO: Header incluso da TUTTI i moduli del progetto.
 
 // versioni
 #define SV_VERSION_MAJOR 1
-#define SV_VERSION_MINOR 4
-#define SV_VERSION_PATCH 2
-#define SV_VERSION_STR  "1.4.2"
+#define SV_VERSION_MINOR 5
+#define SV_VERSION_PATCH 0
+#define SV_VERSION_STR  "1.5.0"
 #define SV_DOCS_URL     "https://github.com/supMatz/SegVaultDB/blob/main/README.md"   // Help > Online documentation
 #define SV_NAME         "SegVault"
 
@@ -37,11 +37,65 @@ SCOPO: Header incluso da TUTTI i moduli del progetto.
 #define SV_FULL      -3   // struttura piena (pagina, buffer, ecc. ..)
 #define SV_DUPLICATE -4  // elemento già esistente
 #define SV_IO_ERROR  -5 // errore di I/O su  disco 
+#define SV_BAD_NAME  -6 // nome non ammesso (sv_name_ok)
+
+// nome di un oggetto nuovo (database, tabella, colonna, indice, vincolo, vista, routine, trigger, sequenza):
+// non vuoto, senza backtick e senza caratteri di controllo. Così `nome` tra backtick è sempre un solo
+// identificatore e chi costruisce SQL dai nomi (GUI, dump, statistiche) non può essere portato fuori dalle
+// virgolette da un nome scelto da un altro utente (CREATE DATABASE 'x`; DROP ...' era accettato)
+static inline int sv_name_ok(const char* s) {
+    if (!s || !*s) return 0;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c < 0x20 || c == 0x7F || c == '`') return 0;
+    }
+    return 1;
+}
+// nome facoltativo: vuoto = scelto dal motore
+static inline int sv_name_ok_opt(const char* s) { return !s || !*s || sv_name_ok(s); }
+
+// nome come una sola parola nei file di testo del motore (utenti, statistiche): i byte <= ' ', '%' e 0x7F diventano
+// %XX. Prima i nomi con spazi spostavano i campi delle righe (CR-C1, CR-B5). out: almeno 3 * strlen(s) + 1 byte
+static inline void sv_name_encode(const char* s, char* out, size_t n) {
+    static const char HX[] = "0123456789ABCDEF";
+    size_t k = 0;
+    for (; *s && k + 4 <= n; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c <= ' ' || c == '%' || c == 0x7F) { out[k++] = '%'; out[k++] = HX[c >> 4]; out[k++] = HX[c & 15]; }
+        else out[k++] = (char)c;
+    }
+    if (n) out[k] = '\0';
+}
+
+static inline int sv_hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+// decodifica sul posto; false se la codifica è sbagliata, il nome è vuoto o non sta in max byte (NUL compreso)
+static inline bool sv_name_decode(char* s, size_t max) {
+    size_t k = 0;
+    for (const char* p = s; *p; p++) {
+        char c = *p;
+        if (c == '%') {
+            int h = sv_hexval(p[1]), l = h >= 0 ? sv_hexval(p[2]) : -1;
+            if (h < 0 || l < 0) return false;
+            c = (char)(h << 4 | l);
+            p += 2;
+            if (!c) return false;
+        }
+        s[k++] = c;
+    }
+    s[k] = '\0';
+    return k > 0 && k < max;
+}
 
 #define SV_MAX_DATABASES    100000   // max database (liste dinamiche dal formato v6 del catalogo)
 #define SV_MAX_TABLES       1000000  // max tabelle per db (liste dinamiche)
 #define SV_MAX_COLUMNS      1024 // max colonne per tabella (MySQL: 4096, InnoDB: 1017)
-#define SV_MAX_INDEXES      16   // max index per tabella
+#define SV_MAX_INDEXES      64   // max indici per tabella, come MySQL (P3.12: erano 16)
 #define SV_MAX_NAME_LEN     64   // max lunghezza nomi tabelle, colonne
 #define SV_MAX_SQL_LEN     65536 // max lunghezza di una query SQL
 #define SV_MAX_TEXT_BYTES  (16u << 20) // un testo al massimo (le righe grandi vanno in pagine di overflow)

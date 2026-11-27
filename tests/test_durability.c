@@ -15,9 +15,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <time.h>
+#include "harness.h"
 
-static int g_tests, g_fail;
-#define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
 
 // ── iniezione dei guasti ──
 // fail_*: la N-esima chiamata (da adesso) fallisce con EIO; exit_*: alla N-esima il processo finisce
@@ -32,7 +32,7 @@ static bool hit(long* c) { return *c > 0 && --*c == 0; }
 // stesso file non la rende definitiva. Alla g_power_at-esima scrittura il processo scrive il diario delle
 // scritture non definitive in POWER_JOURNAL e muore; power_restore() (nel genitore) le annulla dal fondo: sul
 // disco resta solo quello che un fsync aveva confermato, come dopo un'interruzione di corrente.
-#define POWER_JOURNAL "/tmp/sv_dur_power.journal"
+#define POWER_JOURNAL "sv_dur_power.journal"
 typedef struct { int fd; off_t off; size_t n; off_t oldsize; uint8_t* old; } PwEntry;
 static bool g_power;
 static long g_power_at;
@@ -177,10 +177,18 @@ static bool stream_begin(void* ud, const QueryResult* r) { (void)ud; return r->n
 static bool stream_rows(void* ud, const QueryResult* r) { *(long*)ud += r->num_rows; return true; }
 static void sh(const char* cmd) { if (system(cmd) != 0) { printf("command failed: %s\n", cmd); exit(1); } }
 
-#define BASE  "/tmp/sv_dur_base"
-#define WORK  "/tmp/sv_dur_work"
-#define CRASH "/tmp/sv_dur_crash"
+#define BASE  "sv_dur_base"
+#define WORK  "sv_dur_work"
+#define CRASH "sv_dur_crash"
 #define N 600
+
+// la copia dei dati di 1.3.0 (dal sorgente: il test gira in una cartella privata, CR-M9)
+static void sh_fixture(void) {
+    char cmd[1600];
+    snprintf(cmd, sizeof(cmd), "rm -rf " WORK " && mkdir -p " WORK " && tar -C " WORK " -xzf '%s'",
+             test_src("tests/fixtures/format1-v1.3.0.tar.gz"));
+    sh(cmd);
+}
 
 // stato atteso dopo ogni prova: le N righe confermate, nessuna duplicata, valori originali
 static void check_committed(const char* what, int k) {
@@ -189,6 +197,7 @@ static void check_committed(const char* what, int k) {
 }
 
 int main(void) {
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
     setvbuf(stdout, NULL, _IONBF, 0);
     sh("rm -rf " BASE " " WORK " " CRASH " && mkdir -p " BASE);
     if (!db_init(BASE)) { printf("init: %s\n", db_init_error()); return 1; }
@@ -496,7 +505,7 @@ int main(void) {
     //        grandi riscritte, pagine piene sistemate; una conversione interrotta riparte dalla copia .v1 ──
     {
         for (int interrupted = 0; interrupted < 2; interrupted++) {
-            sh("rm -rf " WORK " && mkdir -p " WORK " && tar -C " WORK " -xzf tests/fixtures/format1-v1.3.0.tar.gz");
+            sh_fixture();
             if (interrupted) {                                  // copia fatta, file dei dati rovinato a metà conversione
                 sh("cp " WORK "/segvault.db " WORK "/segvault.db.v1 && dd if=/dev/zero of=" WORK "/segvault.db bs=4096 seek=20 count=30 conv=notrunc 2>/dev/null");
             }
@@ -516,7 +525,7 @@ int main(void) {
             db_shutdown();
         }
         // un byte cambiato in una pagina del file dei dati: la pagina è rifiutata (CRC), mai letta come buona
-        sh("rm -rf " WORK " && mkdir -p " WORK " && tar -C " WORK " -xzf tests/fixtures/format1-v1.3.0.tar.gz");
+        sh_fixture();
         CHECK(db_init(WORK), "open for the page corruption test");
         db_shutdown();
         FILE* f = fopen(WORK "/segvault.db", "r+b");
@@ -664,8 +673,11 @@ int main(void) {
         ok("ROLLBACK TO a"); ok("COMMIT");
         CHECK(num("SELECT v FROM small WHERE id = 2") == 20 && num("SELECT v FROM small WHERE id = 4") == 40, "ROLLBACK TO keeps indexes right");
         // DDL nella transazione: ROLLBACK invalida tutto e resta corretto
-        ok("BEGIN"); ok("CREATE TABLE tmpx (id INT PRIMARY KEY)"); ok("INSERT INTO small VALUES (5, 50)"); ok("ROLLBACK");
+        // (un DDL fa commit implicito come in MySQL: la transazione resta segnata da una CALL, che non lo fa)
+        ok("CREATE PROCEDURE durp() SELECT 1");
+        ok("BEGIN"); ok("CALL durp()"); ok("INSERT INTO small VALUES (5, 50)"); ok("ROLLBACK");
         CHECK(num("SELECT COUNT(*) FROM small WHERE id = 5") == 0, "rollback with DDL");
+        ok("DROP PROCEDURE durp");
         check_committed("rollback scope", 0);
         db_shutdown();
     }
@@ -824,24 +836,24 @@ int main(void) {
                     snprintf(q2, sizeof(q2), "UPDATE t SET v = v + 1000000 WHERE id = %d", 100 + t2);
                     ok(q2);
                     if (ok("COMMIT")) {
-                        FILE* cf = fopen("/tmp/sv_dur_commits", "a");
+                        FILE* cf = fopen("sv_dur_commits", "a");
                         if (cf) { fprintf(cf, "%d\n", t2); fclose(cf); }
                     }
                 }
                 g_power = false;
                 _exit(3);
             }
-            remove("/tmp/sv_dur_commits");
+            remove("sv_dur_commits");
             int ps;
             waitpid(pp, &ps, 0);
             if (WIFEXITED(ps) && WEXITSTATUS(ps) == 3) pw_done = 1;
             power_restore();
             int committed = 0;
-            FILE* cf = fopen("/tmp/sv_dur_commits", "r");
+            FILE* cf = fopen("sv_dur_commits", "r");
             int x;
             while (cf && fscanf(cf, "%d", &x) == 1) committed = x + 1;
             if (cf) fclose(cf);
-            remove("/tmp/sv_dur_commits");
+            remove("sv_dur_commits");
             CHECK(db_init(WORK), "restart after a power cut at write %d: %s", k, db_init_error());
             ok("USE d");
             // transazioni confermate: le prime committed; quella in corso (se c'è) per intero o per niente
@@ -877,7 +889,7 @@ int main(void) {
         for (int k = 1; k < 4000 && !il_done; k++) {
             sh("rm -rf " WORK " && cp -r " BASE "_il " WORK);
             remove(POWER_JOURNAL);
-            remove("/tmp/sv_dur_commits");
+            remove("sv_dur_commits");
             pid_t pp = fork();
             if (pp == 0) {
                 if (!db_init(WORK)) _exit(2);
@@ -901,7 +913,7 @@ int main(void) {
                         case 3: snprintf(q, sizeof(q), "DELETE FROM s%d WHERE id = %d", j, 20 + t); ok(q); break;
                         case 4:
                             if (ok("COMMIT")) {
-                                FILE* cf = fopen("/tmp/sv_dur_commits", "a");
+                                FILE* cf = fopen("sv_dur_commits", "a");
                                 if (cf) { fprintf(cf, "%d\n", t); fclose(cf); }
                             }
                             break;
@@ -918,7 +930,7 @@ int main(void) {
             power_restore();
             bool reported[10] = { false };
             int nrep = 0, x;
-            FILE* cf = fopen("/tmp/sv_dur_commits", "r");
+            FILE* cf = fopen("sv_dur_commits", "r");
             while (cf && fscanf(cf, "%d", &x) == 1) if (x >= 0 && x < 10) { reported[x] = true; nrep++; }
             if (cf) fclose(cf);
             if (!db_init(WORK)) { bad++; CHECK(false, "interleaved: restart after a power cut at write %d: %s", k, db_init_error()); continue; }
@@ -1093,7 +1105,7 @@ int main(void) {
         for (int k = 1; k < 3000 && !ddl_done; k++) {
             sh("rm -rf " WORK " && cp -r " BASE "_ddl " WORK);
             remove(POWER_JOURNAL);
-            remove("/tmp/sv_dur_commits");
+            remove("sv_dur_commits");
             pid_t pp = fork();
             if (pp == 0) {
                 if (!db_init(WORK)) _exit(2);
@@ -1103,7 +1115,7 @@ int main(void) {
                 g_power_at = k;
                 for (int i = 0; i < NSTEP; i++) {
                     if (!ok(steps[i])) { g_power = false; _exit(4); }
-                    FILE* cf = fopen("/tmp/sv_dur_commits", "a");
+                    FILE* cf = fopen("sv_dur_commits", "a");
                     if (cf) { fprintf(cf, "%d\n", i); fclose(cf); }
                 }
                 g_power = false;
@@ -1115,7 +1127,7 @@ int main(void) {
             if (WIFEXITED(ps) && WEXITSTATUS(ps) == 3) ddl_done = 1;
             power_restore();
             int done = 0, x;
-            FILE* cf = fopen("/tmp/sv_dur_commits", "r");
+            FILE* cf = fopen("sv_dur_commits", "r");
             while (cf && fscanf(cf, "%d", &x) == 1) done = x + 1;
             if (cf) fclose(cf);
             if (!db_init(WORK)) { bad++; CHECK(false, "DDL: restart after a power cut at write %d: %s", k, db_init_error()); continue; }
@@ -1332,6 +1344,87 @@ int main(void) {
               stat_num("in_memory_indexes") == 0, "the tree written at shutdown merges the base and the writes");
         CHECK(ok("INSERT INTO ai (v) VALUES (3)") && num("SELECT id FROM ai WHERE v = 3") == 102, "AUTO_INCREMENT after the merged tree");
         db_shutdown();
+        // P1.15: coda della catena dal catalogo. Dopo un riavvio la prima scrittura parte dall'ultima pagina nota; la
+        // mappa dello spazio libero si completa un po' alla volta, poi lo spazio dei DELETE torna utilizzabile
+        {
+            #define TT BASE "_tail"
+            sh("rm -rf " TT " && mkdir -p " TT);
+            CHECK(db_init(TT), "init for the tail tests");
+            ok("CREATE DATABASE d"); ok("USE d");
+            ok("CREATE TABLE tl (id INT PRIMARY KEY, pad VARCHAR(300))");
+            ok("BEGIN");
+            for (int i = 1; i <= 6000; i++) { char q3[400]; snprintf(q3, sizeof(q3), "INSERT INTO tl VALUES (%d, '%0280d')", i, i); ok(q3); }
+            ok("COMMIT");
+            ok("DELETE FROM tl WHERE id <= 3000");                   // metà delle pagine con spazio libero
+            long long pages0 = num("SELECT data_length FROM information_schema.tables WHERE table_name = 'tl'");
+            db_shutdown();
+            CHECK(db_init(TT), "reopen with the tail in the catalog");
+            ok("USE d");
+            long long t0 = stat_num("buffer_misses");
+            CHECK(ok("INSERT INTO tl VALUES (100000, 'x')"), "first insert after restart");
+            long long t1 = stat_num("buffer_misses");
+            CHECK(t1 - t0 < 60, "the first insert after a restart read %lld pages (table ~500)", t1 - t0);
+            ok("BEGIN");
+            for (int i = 1; i <= 3000; i++) { char q3[400]; snprintf(q3, sizeof(q3), "INSERT INTO tl VALUES (%d, '%0280d')", 200000 + i, i); ok(q3); }
+            ok("COMMIT");
+            long long pages1 = num("SELECT data_length FROM information_schema.tables WHERE table_name = 'tl'");
+            CHECK(num("SELECT COUNT(*) FROM tl") == 6001 && num("SELECT id FROM tl WHERE id = 203000") == 203000 && num("SELECT id FROM tl WHERE id = 100000") == 100000,
+                  "rows inserted after the restart are all there");
+            CHECK(pages0 > 0 && pages1 <= pages0 + pages0 / 4, "deleted space reused once the free-space map completes: %lld -> %lld bytes", pages0, pages1);
+            // TRUNCATE: radice nuova, la coda salvata non vale più
+            db_shutdown();
+            CHECK(db_init(TT), "reopen before TRUNCATE");
+            ok("USE d");
+            CHECK(ok("TRUNCATE TABLE tl") && ok("INSERT INTO tl VALUES (1, 'a'), (2, 'b')"), "truncate and insert");
+            db_shutdown();
+            CHECK(db_init(TT), "reopen after TRUNCATE");
+            ok("USE d");
+            CHECK(ok("INSERT INTO tl VALUES (3, 'c')") && num("SELECT COUNT(*) FROM tl") == 3 && num("SELECT id FROM tl WHERE id = 2") == 2,
+                  "inserts after TRUNCATE + restart use the new chain");
+            // pagine aggiunte e arresto senza chiusura: la coda del catalogo è vecchia (si segue la catena)
+            db_shutdown();
+            pid_t tp = fork();
+            if (tp == 0) {
+                if (!db_init(TT)) _exit(2);
+                ok("USE d");
+                for (int i = 10; i < 400; i++) { char q3[400]; snprintf(q3, sizeof(q3), "INSERT INTO tl VALUES (%d, '%0280d')", i, i); ok(q3); }
+                _exit(0);                                          // niente db_shutdown: il catalogo ha la coda di prima
+            }
+            int tst = 0;
+            waitpid(tp, &tst, 0);
+            CHECK(db_init(TT), "recovery after appends without shutdown");
+            ok("USE d");
+            CHECK(ok("INSERT INTO tl VALUES (5000, 'z')") && num("SELECT COUNT(*) FROM tl") == 394 && num("SELECT id FROM tl WHERE id = 399") == 399 &&
+                  num("SELECT id FROM tl WHERE id = 5000") == 5000, "insert after recovery with a stale tail: %lld rows", num("SELECT COUNT(*) FROM tl"));
+            db_shutdown();
+            CHECK(db_init(TT), "reopen once more");
+            ok("USE d");
+            CHECK(num("SELECT COUNT(*) FROM tl") == 394, "nothing lost or duplicated across the restarts");
+            // chiave di 16 colonne (P3.12): il catalogo v8 scrive solo le colonne usate e le rilegge tutte
+            {
+                char q4[1200];
+                int k4 = snprintf(q4, sizeof(q4), "CREATE TABLE k16 (");
+                for (int i = 0; i < 16; i++) k4 += snprintf(q4 + k4, sizeof(q4) - (size_t)k4, "%sc%d INT", i ? ", " : "", i);
+                k4 += snprintf(q4 + k4, sizeof(q4) - (size_t)k4, ", UNIQUE KEY u16 (c0");
+                for (int i = 1; i < 16; i++) k4 += snprintf(q4 + k4, sizeof(q4) - (size_t)k4, ", c%d", i);
+                snprintf(q4 + k4, sizeof(q4) - (size_t)k4, "))");
+                CHECK(ok(q4) && ok("INSERT INTO k16 VALUES (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16)"), "16-column unique key created");
+                db_shutdown();
+                CHECK(db_init(TT), "reopen with a 16-column key in the catalog");
+                ok("USE d");
+                QueryResult* dr = q("INSERT INTO k16 VALUES (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16)");
+                CHECK(dr && !dr->success && strstr(dr->error, "uplicate"), "16-column key still enforced after restart: %s", dr ? dr->error : "null");
+                db_result_free(dr);
+                CHECK(ok("INSERT INTO k16 VALUES (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,17)") &&
+                      num("SELECT COUNT(DISTINCT seq_in_index) FROM information_schema.statistics WHERE table_name = 'k16'") == 16,
+                      "all 16 key columns read back");
+            }
+            db_shutdown();
+            #undef TT
+            CHECK(db_init(TB), "back to the tree tests");
+            ok("USE d");
+            db_shutdown();
+        }
         // pagina della radice danneggiata: si ripiega sulla lettura della tabella
         CHECK(db_init(TB), "reopen to damage a tree page");
         ok("USE d");

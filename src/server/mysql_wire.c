@@ -1,3 +1,4 @@
+#include "../../include/sv_strbuf.h"
 #include "mysql_wire.h"
 #include "../table/binesc.h"
 #include <ctype.h>
@@ -821,21 +822,9 @@ void mw_cursor_fetch(MwOut* o, const QueryResult* r, int* pos, uint32_t count, u
 
 // ── valori dei parametri ─────────────────────────────────────────
 
-typedef struct { char* p; size_t n, cap; bool oom; } Sb;
-static void sb_add(Sb* b, const char* s, size_t n) {
-    if (b->oom) return;
-    if (b->n + n + 1 > b->cap) {
-        size_t nc = b->cap ? b->cap * 2 : 256;
-        while (nc < b->n + n + 1) nc *= 2;
-        char* q = realloc(b->p, nc);
-        if (!q) { b->oom = true; return; }
-        b->p = q; b->cap = nc;
-    }
-    memcpy(b->p + b->n, s, n);
-    b->n += n;
-    b->p[b->n] = '\0';
-}
-static void sb_str(Sb* b, const char* s) { sb_add(b, s, strlen(s)); }
+typedef SvStrBuf Sb;                                         // buffer comune (CR-B2)
+#define sb_add svsb_put
+#define sb_str svsb_puts
 
 // byte arbitrari, anche 0x00 e 0xC0: nella forma interna del motore (binesc.h), che il lexer copia così com'è
 static bool sb_quoted(Sb* b, const uint8_t* s, size_t n) {

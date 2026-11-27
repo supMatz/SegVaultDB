@@ -305,8 +305,8 @@ typedef struct {
 typedef struct {
     JsonBuf text, html;
     bool    has_text, has_html;
-    MimeAtt att[64];
-    int     natt;
+    MimeAtt* att;                    // tutti gli allegati (P3.11: con att[64] quelli dopo il 64° sparivano)
+    int     natt, cap_att;
 } Mime;
 
 static void decode_body(JsonBuf* o, const char* p, size_t n, const char* enc, const char* charset) {
@@ -371,7 +371,14 @@ static void mime_walk(const char* p, size_t n, Mime* m, int depth) {
     } else if (!attachment && !strcmp(type, "text/html") && !m->has_html) {
         decode_body(&m->html, b, bn, cte, charset);
         m->has_html = true;
-    } else if (m->natt < 64) {
+    } else {
+        if (m->natt == m->cap_att) {
+            int nc = m->cap_att ? m->cap_att * 2 : 8;
+            MimeAtt* g = realloc(m->att, sizeof(MimeAtt) * (size_t)nc);
+            if (!g) return;                  // senza memoria l'allegato non si elenca (il messaggio .eml resta intero)
+            m->att = g;
+            m->cap_att = nc;
+        }
         MimeAtt* a = &m->att[m->natt++];
         a->p = b;
         a->n = bn;
@@ -381,7 +388,7 @@ static void mime_walk(const char* p, size_t n, Mime* m, int depth) {
     }
 }
 
-static void mime_free(Mime* m) { free(m->text.data); free(m->html.data); }
+static void mime_free(Mime* m) { free(m->text.data); free(m->html.data); free(m->att); }
 
 // ── archivio ────────────────────────────────────────────────────
 

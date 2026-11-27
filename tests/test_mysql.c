@@ -181,6 +181,11 @@ int main(void) {
     t("SELECT 'abc123' REGEXP '^[a-z]+[0-9]+$', 'abc' NOT REGEXP 'b', 'ABC' RLIKE 'b', REGEXP_LIKE('Abc', 'abc', 'c')", "1|0|1|0");
     t("SELECT REGEXP_REPLACE('x1y22z', '[0-9]+', '-'), REGEXP_SUBSTR('x1y22z', '[0-9]{2}'), REGEXP_INSTR('abc', 'c')", "x-y-z|22|3");
     t("SELECT 'a' REGEXP '('", "ERR:Invalid regular expression");
+    // regex in cache per thread (CR-B9): pattern che cambia a ogni riga, più dei posti in cache, e maiuscole/minuscole
+    t("SELECT SUM(CONCAT('k', x % 11) REGEXP CONCAT('^k', x % 11, '$')), SUM(REGEXP_LIKE('K', 'k', IF(x % 2, 'c', 'i'))) "
+      "FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 "
+      "UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10 UNION ALL SELECT 11 UNION ALL SELECT 12) g",
+      "12|6");
     t("SELECT TRIM(LEADING '0' FROM '00x0'), TRIM(TRAILING '0' FROM '00x0'), TRIM(BOTH 'x' FROM 'xxaxx'), TRIM('  s  '), POSITION('c' IN 'abcd')", "x0|00x|a|s|3");
     t("SELECT DATE_ADD('2026-02-15', INTERVAL 1 MONTH), DATE_ADD('2026-01-31', INTERVAL 1 MONTH), DATE_SUB('2026-03-01', INTERVAL 1 DAY)", "2026-03-15|2026-02-28|2026-02-28");
     t("SELECT '2026-11-13 08:00:00' + INTERVAL 2 HOUR, INTERVAL 1 DAY + '2026-12-31', DATE_ADD('2026-11-13 05:00:00', INTERVAL '1 1:30' DAY_MINUTE)", "2026-11-13 10:00:00|2027-01-01|2026-11-14 06:30:00");
@@ -229,6 +234,20 @@ int main(void) {
 
     // ── LIKE: \ protegge % e _ come in MySQL e PostgreSQL ──
     t("SELECT 'a_b' LIKE 'a\\_b', 'axb' LIKE 'a\\_b', '50%' LIKE '50\\%', 'a\\\\b' LIKE 'a\\\\\\\\b'", "1|0|1|1");
+
+    // ── lettere non ASCII: UPPER / LOWER, LIKE e collation _ci (prima solo ASCII: UPPER('città') = 'CITTà') ──
+    t("SELECT UPPER('città perché ÿ'), LOWER('ÀÈÉÌÒÙ ΑΒΓ ДЖ')", "CITTÀ PERCHÉ Ÿ|àèéìòù αβγ дж");
+    t("SELECT 'à' LIKE '_', 'àb' LIKE '_b', 'xày' LIKE '%À%'", "1|1|1");                 // _ è un carattere, non un byte
+    t("CREATE TABLE ci8 (k VARCHAR(20) PRIMARY KEY, n INT) COLLATE utf8mb4_unicode_ci", "OK:0");
+    t("INSERT INTO ci8 VALUES ('Città', 1), ('ÉCOLE', 2)", "OK:2");
+    t("SELECT n FROM ci8 WHERE k = 'CITTÀ'", "1");                                      // chiave primaria (indice)
+    t("SELECT n FROM ci8 WHERE k = 'école'", "2");
+    t("INSERT INTO ci8 VALUES ('città', 3)", "ERR:Duplicate");
+    t("SELECT LOWER(k), COUNT(*) FROM (SELECT k FROM ci8 UNION ALL SELECT 'CITTÀ') x GROUP BY k ORDER BY 1", "città|1;città|1;école|1");
+    t("SELECT n FROM ci8 WHERE k = 'citta'", "1");                                     // _ci di MySQL: anche senza accenti
+    t("INSERT INTO ci8 VALUES ('Ecole', 4)", "ERR:Duplicate");
+    t("SELECT COUNT(DISTINCT k), COUNT(*) FROM (SELECT k FROM ci8 UNION ALL SELECT k FROM ci8) x", "2|4");
+    t("SELECT UPPER('€ è 😀'), 'x€y' LIKE 'x_y', LENGTH(UPPER('€'))", "€ È 😀|1|3");      // caratteri di 3-4 byte intatti
 
     db_shutdown();
     char cmd[64];

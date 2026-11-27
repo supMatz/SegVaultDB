@@ -9,12 +9,14 @@ defaults:
   run:
     shell: bash   # -eo pipefail: un errore di make non viene nascosto da tee
 
+permissions:
+  contents: read   # nessun job scrive nel repository (CR-B7)
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -49,7 +51,7 @@ jobs:
         run: gcc -std=c11 -D_GNU_SOURCE -DDEBUG -fsyntax-only -Iinclude -Isrc -Isrc/catalog -Isrc/storage -Isrc/table -Isrc/index -Isrc/query -Isrc/tx -Isrc/bridge src/tx/wal.c src/bridge/db_api.c src/query/executor.c
 
       - name: Upload Windows build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: segvault-windows
           path: |
@@ -60,7 +62,7 @@ jobs:
   sanitizers:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -83,8 +85,8 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
-      - uses: msys2/setup-msys2@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c # v2
         with:
           msystem: UCRT64
           install: make mingw-w64-ucrt-x86_64-gcc
@@ -97,7 +99,7 @@ jobs:
     runs-on: macos-latest
     continue-on-error: true          # nuovo: informativo finché non è stabile sui runner
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build segvault-server and run the engine suites
         run: |
           make -j4 server
@@ -108,7 +110,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true          # informativo: non blocca le pull request
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install cppcheck
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cppcheck
       - name: cppcheck (engine and server)
@@ -121,12 +123,12 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libsqlite3-dev php-cli php-mysql
       - name: Benchmark against SQLite and the baseline
         run: make -j4 lib server bench_suite && make bench-check
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: bench-json

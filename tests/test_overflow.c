@@ -5,9 +5,9 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "harness.h"
 
-static int g_tests, g_fail;
-#define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
 
 static char g_err[1100];
 static bool ok(const char* sql) {
@@ -48,8 +48,9 @@ static bool text_ok(int id, size_t n, char c) {
 }
 
 int main(void) {
-    const char* dir = "/tmp/sv_ovf_test";
-    if (system("rm -rf /tmp/sv_ovf_test && mkdir -p /tmp/sv_ovf_test") != 0) return 1;
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
+    const char* dir = "sv_ovf_test";
+    if (system("rm -rf sv_ovf_test && mkdir -p sv_ovf_test") != 0) return 1;
     if (!db_init(dir)) return 1;
     ok("CREATE DATABASE o"); ok("USE o");
     ok("CREATE TABLE big (id INT PRIMARY KEY, body TEXT, tag VARCHAR(20))");
@@ -126,11 +127,11 @@ int main(void) {
     db_result_free(v);
     // (i 3 aggiornamenti da 2 MB superano la soglia del VACUUM automatico: gran parte è già libera)
     CHECK(freed > 0, "vacuum freed pages: %d", freed);
-    FILE* fd = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+    FILE* fd = fopen("sv_ovf_test/segvault.db", "rb");
     long before = 0, after = 0;
     if (fd) { fseek(fd, 0, SEEK_END); before = ftell(fd); fclose(fd); }
     for (int i = 0; i < 3; i++) ok("UPDATE big SET body = CONCAT(SUBSTR(body, 2), 'f') WHERE id = 6");
-    fd = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+    fd = fopen("sv_ovf_test/segvault.db", "rb");
     if (fd) { fseek(fd, 0, SEEK_END); after = ftell(fd); fclose(fd); }
     CHECK(after == before, "freed pages reused: file %ld -> %ld", before, after);
     CHECK(text_ok(6, (2u << 20) + 3, 'f') && text_ok(60, 200000, 'k') && text_ok(1, 80000, 'x'), "data intact after vacuum and reuse");
@@ -154,10 +155,10 @@ int main(void) {
         ok(q);
         free(q);
         long g_before = 0, g_after = 0;
-        FILE* fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+        FILE* fd2 = fopen("sv_ovf_test/segvault.db", "rb");
         if (fd2) { fseek(fd2, 0, SEEK_END); g_before = ftell(fd2); fclose(fd2); }
         for (int i = 0; i < 1000; i++) ok("UPDATE grow SET body = CONCAT(SUBSTR(body, 2), 'h') WHERE id = 1");
-        fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+        fd2 = fopen("sv_ovf_test/segvault.db", "rb");
         if (fd2) { fseek(fd2, 0, SEEK_END); g_after = ftell(fd2); fclose(fd2); }
         // 1000 riscritture da 100 KB = 100 MB se nulla tornasse riusabile. Dal P1.5 la catena vecchia torna libera
         // appena l'UPDATE è nel log su disco: resta al più una copia in volo della riga (~100 KB)
@@ -171,7 +172,7 @@ int main(void) {
             ok(ins);
             ok("DROP TABLE cyc");
         }
-        fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+        fd2 = fopen("sv_ovf_test/segvault.db", "rb");
         long cyc = 0;
         if (fd2) { fseek(fd2, 0, SEEK_END); cyc = ftell(fd2); fclose(fd2); }
         CHECK(cyc - g_after <= 16 * 4096, "20 x (CREATE, 150 rows, DROP): file %ld -> %ld (dropped pages reused at once)", g_after, cyc);
@@ -183,11 +184,11 @@ int main(void) {
             for (int i = 0; i < 2000; i++) l += snprintf(ins + l, sizeof(ins) - (size_t)l, "%s(%d, 'value %d with some padding text', %d)", i ? "," : "", i, i, i);
             ok(ins);
         }
-        fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+        fd2 = fopen("sv_ovf_test/segvault.db", "rb");
         long u0 = 0, u1 = 0;
         if (fd2) { fseek(fd2, 0, SEEK_END); u0 = ftell(fd2); fclose(fd2); }
         for (int k = 0; k < 10; k++) ok("UPDATE upd SET n = n + 1");
-        fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+        fd2 = fopen("sv_ovf_test/segvault.db", "rb");
         if (fd2) { fseek(fd2, 0, SEEK_END); u1 = ftell(fd2); fclose(fd2); }
         CHECK(u1 <= u0 + u0 / 10 && num("SELECT SUM(n) FROM upd") == 1999000 + 20000, "10 full-table UPDATEs: file %ld -> %ld (within 10%%)", u0, u1);
         ok("DROP TABLE upd");
@@ -201,11 +202,11 @@ int main(void) {
             ok(ins);
         }
         ok("DELETE FROM vf WHERE id % 10 <> 0");
-        fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+        fd2 = fopen("sv_ovf_test/segvault.db", "rb");
         long v0 = 0, v1 = 0;
         if (fd2) { fseek(fd2, 0, SEEK_END); v0 = ftell(fd2); fclose(fd2); }
         CHECK(ok("VACUUM FULL"), "VACUUM FULL: %s", g_err);
-        fd2 = fopen("/tmp/sv_ovf_test/segvault.db", "rb");
+        fd2 = fopen("sv_ovf_test/segvault.db", "rb");
         if (fd2) { fseek(fd2, 0, SEEK_END); v1 = ftell(fd2); fclose(fd2); }
         CHECK(v1 < v0 - (200L << 10), "VACUUM FULL shrinks the file: %ld -> %ld", v0, v1);
         CHECK(num("SELECT COUNT(*) FROM vf") == 120 && num("SELECT SUM(id) FROM vf") == 71400 &&
@@ -244,7 +245,7 @@ int main(void) {
         CHECK(num(q) == 1, "stub-shaped row verbatim after restart: %lld", num(q));
     }
     db_shutdown();
-    if (system("rm -rf /tmp/sv_ovf_test")) {}
+    if (system("rm -rf sv_ovf_test")) {}
     if (g_fail) { printf("overflow tests: %d of %d FAILED\n", g_fail, g_tests); return 1; }
     printf("OK: %d/%d overflow checks passed\n", g_tests, g_tests);
     free(up);

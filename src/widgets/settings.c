@@ -1,5 +1,6 @@
 #include "common.h"
 #include "settings.h"
+#include "platform_compat.h"
 #include "theme.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -201,7 +202,9 @@ bool settings_load(const char* path) {
 }
 
 bool settings_save(const char* path) {
-    FILE* f = fopen(path, "w" SV_FE);
+    char tmp[1100];
+    if ((size_t)snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= sizeof(tmp)) return false;
+    FILE* f = fopen(tmp, "w" SV_FE);                 // tmp + rename: una caduta a metà non azzera le impostazioni
     if (!f) return false;
     fprintf(f, "# SegVault settings (edited from Settings, Ctrl+,)\n");
     for (int i = 0; i < N(DEFS); i++) {
@@ -209,9 +212,7 @@ bool settings_save(const char* path) {
         if (d->kind == SET_CHOICE) fprintf(f, "%s=%s\n", d->key, d->choices[*d->value]);
         else                       fprintf(f, "%s=%d\n", d->key, *d->value);
     }
-    bool ok = !ferror(f);
-    fclose(f);
-    return ok;
+    return sv_fclose_replace(f, tmp, path);
 }
 
 int settings_tab_size(void)      { static const int T[] = {2, 4, 8}; return T[g_settings.tab_size % 3]; }

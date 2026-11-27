@@ -134,28 +134,10 @@ static void copy_text(ParserState* ps, char* dst, size_t cap, const char* src) {
     dst[n] = '\0';
 }
 
-// "tabella.colonna" in un campo di dimensione fissa, con lo stesso controllo
-static void copy_qualified(ParserState* ps, char* dst, size_t cap, const char* table, const char* col) {
-    if (strlen(table) + 1 + strlen(col) >= cap) {
-        copy_text(ps, dst, cap, "");
-        if (ps->result->success) {
-            snprintf(ps->result->error, sizeof(ps->result->error),
-                     "Qualified name too long (max %d characters): %.30s.%.30s", (int)cap - 1, table, col);
-            ps->result->success = false;
-        }
-        return;
-    }
-    size_t tl = strlen(table), cl = strlen(col);   // lunghezza già verificata sopra
-    memcpy(dst, table, tl);
-    dst[tl] = '.';
-    memcpy(dst + tl + 1, col, cl + 1);
-}
-
 static ASTNode* parse_select(ParserState* ps);
 static ASTNode* parse_query(ParserState* ps);
 static void free_node(ASTNode* n);
 void ast_node_free(ASTNode* n) { free_node(n); }
-static void parse_column_ref(ParserState* ps, ASTExpr* e);
 static bool parse_type_spec(ParserState* ps, ColumnDef* cd);
 static bool parse_target(ParserState* ps, char* out, size_t n);
 
@@ -731,7 +713,8 @@ static ASTExpr* parse_call(ParserState* ps) {
     }
     if (!match(ps, TOK_RPAREN)) parse_fail(ps, "Expected ')' to close the function call", peek(ps));
     int want = !strcmp(e->func, "JSON_OBJECTAGG") ? 2 : 1;
-    if (agg && e->nargs != (strcmp(e->col_name, "*") == 0 ? 0 : want))
+    bool count_multi = agg && e->agg_distinct && !strcmp(e->func, "COUNT") && e->nargs > 1;   // COUNT(DISTINCT a, b)
+    if (agg && !count_multi && e->nargs != (strcmp(e->col_name, "*") == 0 ? 0 : want))
         parse_fail(ps, want == 2 ? "JSON_OBJECTAGG takes a key and a value" : "Aggregate functions take exactly one argument", fn);
     if (!ps->result->success) { ast_expr_free(e); return NULL; }
     // aggregato FILTER (WHERE condizione): conta / somma solo le righe che la soddisfano
@@ -879,8 +862,9 @@ static ASTExpr* parse_special_form(ParserState* ps) {
             consume(ps); Token st = consume(ps); return mkstr(st.text);
         }
         if (!strcasecmp(w, "BINARY") && !next_is(ps, 1, TOK_COMMA) && !next_is(ps, 1, TOK_RPAREN) && !next_is(ps, 1, TOK_EOF)) {
-            consume(ps);
-            return parse_unary(ps);
+            consume(ps);                                     // BINARY x: confronti che distinguono maiuscole e minuscole
+            ASTExpr* v = parse_unary(ps);
+            return v ? mkfunc2("__COLLATE", v, mkstr("binary")) : NULL;
         }
         if (!strcasecmp(w, "INTERVAL") && !next_is(ps, 1, TOK_COMMA) && !next_is(ps, 1, TOK_RPAREN) && !next_is(ps, 1, TOK_EOF)) {
             consume(ps);
@@ -1227,6 +1211,7 @@ static ASTExpr* parse_primary(ParserState* ps) {
             break;
         case TOK_VALUES:                                         // VALUES(col) in ON DUPLICATE KEY UPDATE
         case TOK_TRUNCATE:                                       // TRUNCATE(x, d)
+        case TOK_INSERT:                                         // INSERT(str, pos, len, new)
             if (next_is(ps, 1, TOK_LPAREN)) return parse_call(ps);
             break;
         case TOK_IDENTIFIER: case TOK_LEFT: case TOK_RIGHT:   // LEFT(...)/RIGHT(...) sono funzioni
@@ -1339,6 +1324,12 @@ static ASTExpr* parse_unary(ParserState* ps) {
     else if (match(ps, TOK_PLUS)) e = parse_unary(ps);
     else if (match(ps, TOK_TILDE)) e = op_call(ps, "__BITNOT", parse_unary(ps), NULL);   // ~x
     else                          e = parse_primary(ps);
+    // x COLLATE nome (MySQL): la collation di x nei confronti, in LIKE e nell'ordinamento
+    while (e && ps->result->success && ident_is(ps, "COLLATE") && (next_is(ps, 1, TOK_IDENTIFIER) || next_is(ps, 1, TOK_STRING))) {
+        consume(ps);
+        Token cn = consume(ps);
+        e = mkfunc2("__COLLATE", e, mkstr(cn.text));
+    }
     ps->depth--;
     return depth_check(ps, e);
 }
@@ -1623,8 +1614,6 @@ static ASTExpr* parse_expr(ParserState* ps) {
     return depth_check(ps, elist_combine(&terms, OP_OR));
 }
 
-static ASTExpr* parse_condition(ParserState* ps) { return parse_expr(ps); }
-
 // identificatore con quel nome (parole come INNER/OUTER/CROSS non sono keyword del lexer)
 static bool ident_is(ParserState* ps, const char* word) {
     Token t = peek(ps);
@@ -1898,7 +1887,19 @@ static void parse_from_clause(ParserState* ps, ASTNode* n) {
         else if (ident_is(ps, "FULL"))  { consume(ps); if (ident_is(ps, "OUTER")) consume(ps); expect(ps, TOK_JOIN); jt = JOIN_FULL; }
         else { if (natural) parse_fail(ps, "Expected JOIN after NATURAL", peek(ps)); break; }
 
-        if (n->select_stmt.num_joins >= 8) { parse_fail(ps, "Too many JOINs (max 8)", peek(ps)); break; }
+        if (n->select_stmt.num_joins >= SV_MAX_JOINS) {
+            char m[60];
+            snprintf(m, sizeof(m), "Too many JOINs (max %d)", SV_MAX_JOINS);
+            parse_fail(ps, m, peek(ps));
+            break;
+        }
+        if (n->select_stmt.num_joins == n->select_stmt.cap_joins) {
+            int nc = n->select_stmt.cap_joins ? n->select_stmt.cap_joins * 2 : 4;
+            ASTJoin* g = sv_realloc(n->select_stmt.joins, sizeof(ASTJoin) * (size_t)nc);
+            if (!g) { parse_fail(ps, "Out of memory", peek(ps)); break; }
+            n->select_stmt.joins = g;
+            n->select_stmt.cap_joins = nc;
+        }
         ASTJoin* j = &n->select_stmt.joins[n->select_stmt.num_joins++];
         memset(j, 0, sizeof(ASTJoin));
         j->type = jt;
@@ -2030,8 +2031,8 @@ static ASTExpr* gs_rewrite(ASTExpr* e, ASTExpr** removed, int nr, ASTExpr** kept
 
 // tiene le espressioni di GROUP BY del bit mask (le altre vengono tolte e diventano NULL nell'elenco)
 static void gs_apply(ASTNode* n, uint32_t mask) {
-    ASTExpr* kept[SV_MAX_GROUP];
-    ASTExpr* removed[SV_MAX_GROUP];
+    ASTExpr* kept[SV_MAX_GROUP_SETS];               // (parse_group_by: al massimo SV_MAX_GROUP_SETS con gli insiemi)
+    ASTExpr* removed[SV_MAX_GROUP_SETS];
     int nk = 0, nr = 0;
     for (int j = 0; j < n->select_stmt.num_group; j++) {
         if (mask >> j & 1u) kept[nk++] = n->select_stmt.group_exprs[j];
@@ -2047,8 +2048,26 @@ static void gs_apply(ASTNode* n, uint32_t mask) {
 
 // GROUP BY con ROLLUP(...) / CUBE(...) / GROUPING SETS (...) / ... WITH ROLLUP: espressioni distinte in
 // group_exprs, insiemi (bit mask) in sets; false se è un GROUP BY normale
+// un'espressione in più in GROUP BY; false = errore già segnalato
+static bool group_room(ParserState* ps, ASTNode* n) {
+    if (n->select_stmt.num_group >= SV_MAX_GROUP) {
+        char m[64];
+        snprintf(m, sizeof(m), "Too many GROUP BY expressions (max %d)", SV_MAX_GROUP);
+        parse_fail(ps, m, peek(ps));
+        return false;
+    }
+    if (n->select_stmt.num_group < n->select_stmt.cap_group) return true;
+    int nc = n->select_stmt.cap_group ? n->select_stmt.cap_group * 2 : 4;
+    ASTExpr** g = sv_realloc(n->select_stmt.group_exprs, sizeof(ASTExpr*) * (size_t)nc);
+    if (!g) { parse_fail(ps, "Out of memory", peek(ps)); return false; }
+    n->select_stmt.group_exprs = g;
+    n->select_stmt.cap_group = nc;
+    return true;
+}
+
 static bool parse_group_by(ParserState* ps, ASTNode* n, uint32_t* sets, int* nsets) {
     *nsets = 0;
+    bool wide = false;                    // un'espressione oltre la 32ª: niente insiemi a bit (solo GROUP BY normale)
     uint32_t plain = 0;
     uint32_t base_sets[64];
     int nb = 0;
@@ -2056,8 +2075,10 @@ static bool parse_group_by(ParserState* ps, ASTNode* n, uint32_t* sets, int* nse
     #define G_ADD(ex, idx) do { int _f = -1; \
         for (int _j = 0; _j < n->select_stmt.num_group; _j++) if (expr_same(n->select_stmt.group_exprs[_j], ex)) { _f = _j; break; } \
         if (_f >= 0) { ast_expr_free(ex); idx = _f; } \
-        else if (n->select_stmt.num_group >= SV_MAX_GROUP || n->select_stmt.num_group >= 16) { ast_expr_free(ex); parse_fail(ps, "Too many GROUP BY expressions", peek(ps)); return false; } \
-        else { idx = n->select_stmt.num_group; n->select_stmt.group_exprs[n->select_stmt.num_group++] = ex; } } while (0)
+        else if (!group_room(ps, n)) { ast_expr_free(ex); return false; } \
+        else { idx = n->select_stmt.num_group; n->select_stmt.group_exprs[n->select_stmt.num_group++] = ex; } \
+        if (idx >= SV_MAX_GROUP_SETS) wide = true; } while (0)
+    #define G_BIT(ix) ((ix) < SV_MAX_GROUP_SETS ? 1u << (ix) : 0u)
     // prodotto degli insiemi delle parti (come lo standard: GROUP BY a, ROLLUP(b) = (a, b), (a))
     uint32_t acc[64] = { 0 };
     int nacc = 1;
@@ -2076,8 +2097,8 @@ static bool parse_group_by(ParserState* ps, ASTNode* n, uint32_t* sets, int* nse
             } while (match(ps, TOK_COMMA));
             if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')'", peek(ps)); return false; }
             if (cube && ni > 6) { parse_fail(ps, "CUBE supports up to 6 expressions", peek(ps)); return false; }
-            if (cube) for (int m = (1 << ni) - 1; m >= 0; m--) { uint32_t s = 0; for (int k = 0; k < ni; k++) if (m >> (ni - 1 - k) & 1) s |= 1u << idx[k]; part[np++] = s; }
-            else for (int k = ni; k >= 0; k--) { uint32_t s = 0; for (int q = 0; q < k; q++) s |= 1u << idx[q]; part[np++] = s; }
+            if (cube) for (int m = (1 << ni) - 1; m >= 0; m--) { uint32_t s = 0; for (int k = 0; k < ni; k++) if (m >> (ni - 1 - k) & 1) s |= G_BIT(idx[k]); part[np++] = s; }
+            else for (int k = ni; k >= 0; k--) { uint32_t s = 0; for (int q = 0; q < k; q++) s |= G_BIT(idx[q]); part[np++] = s; }
             special = true;
         } else if (ident_is(ps, "GROUPING") && peek2_ident(ps, "SETS")) {
             consume(ps); consume(ps);
@@ -2086,10 +2107,10 @@ static bool parse_group_by(ParserState* ps, ASTNode* n, uint32_t* sets, int* nse
                 uint32_t s = 0;
                 if (match(ps, TOK_LPAREN)) {
                     if (!match(ps, TOK_RPAREN)) {
-                        do { ASTExpr* g = parse_expr(ps); int ix; if (!g) return false; G_ADD(g, ix); s |= 1u << ix; } while (match(ps, TOK_COMMA));
+                        do { ASTExpr* g = parse_expr(ps); int ix; if (!g) return false; G_ADD(g, ix); s |= G_BIT(ix); } while (match(ps, TOK_COMMA));
                         if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')'", peek(ps)); return false; }
                     }
-                } else { ASTExpr* g = parse_expr(ps); int ix; if (!g) return false; G_ADD(g, ix); s |= 1u << ix; }
+                } else { ASTExpr* g = parse_expr(ps); int ix; if (!g) return false; G_ADD(g, ix); s |= G_BIT(ix); }
                 if (np >= 64) { parse_fail(ps, "Too many grouping sets (max 64)", peek(ps)); return false; }
                 part[np++] = s;
             } while (match(ps, TOK_COMMA));
@@ -2100,8 +2121,8 @@ static bool parse_group_by(ParserState* ps, ASTNode* n, uint32_t* sets, int* nse
             if (!g) return false;
             int ix;
             G_ADD(g, ix);
-            plain |= 1u << ix;
-            part[np++] = 1u << ix;
+            plain |= G_BIT(ix);
+            part[np++] = G_BIT(ix);
         }
         uint32_t nx[64];
         int nn = 0;
@@ -2114,16 +2135,25 @@ static bool parse_group_by(ParserState* ps, ASTNode* n, uint32_t* sets, int* nse
         nacc = nn;
     } while (ps->result->success && match(ps, TOK_COMMA));
     #undef G_ADD
+    #undef G_BIT
     if (ident_is(ps, "WITH") && peek2_ident(ps, "ROLLUP")) {   // GROUP BY a, b WITH ROLLUP (MySQL)
         consume(ps); consume(ps);
         if (special) { parse_fail(ps, "WITH ROLLUP cannot be combined with ROLLUP / CUBE / GROUPING SETS", peek(ps)); return false; }
         int ng = n->select_stmt.num_group;
+        if (ng > SV_MAX_GROUP_SETS) { wide = true; special = true; goto too_wide; }   // (acc ha 64 posti)
         nacc = 0;
         for (int k = ng; k >= 0; k--) acc[nacc++] = k == 32 ? 0xFFFFFFFFu : ((1u << k) - 1u);
         special = true;
     }
+too_wide:
     (void)plain; (void)base_sets; (void)nb;
     if (!special) return false;
+    if (wide) {
+        char m[100];
+        snprintf(m, sizeof(m), "ROLLUP / CUBE / GROUPING SETS support up to %d GROUP BY expressions", SV_MAX_GROUP_SETS);
+        parse_fail(ps, m, peek(ps));
+        return false;
+    }
     memcpy(sets, acc, sizeof(uint32_t) * (size_t)nacc);
     *nsets = nacc;
     return true;
@@ -2179,6 +2209,8 @@ static ASTNode* parse_select_core(ParserState* ps) {
             nx.type != TOK_LIMIT && nx.type != TOK_RPAREN && nx.type != TOK_UNION && nx.type != TOK_GROUP &&
             nx.type != TOK_HAVING && !ident_is(ps, "INTERSECT") && !ident_is(ps, "EXCEPT") && !ident_is(ps, "MINUS"))
             parse_fail(ps, "Expected FROM", nx);
+    } else if (ident_is(ps, "DUAL") && !next_is(ps, 1, TOK_DOT)) {
+        consume(ps);                                        // FROM DUAL (MySQL / Oracle): nessuna tabella
     } else {
         parse_from_clause(ps, n);
     }
@@ -2235,15 +2267,45 @@ static ASTNode* parse_select_core(ParserState* ps) {
 }
 
 // [ORDER BY ...] [LIMIT n [OFFSET m] | LIMIT m, n]
+// numero di righe di LIMIT / OFFSET / FETCH (CR-A4): prima atoi, che oltre INT_MAX troncava a 32 bit
+// (LIMIT 7, 18446744073709551615, l'idioma di MySQL per "fino alla fine", dava 0 righe). Oltre INT32_MAX il valore
+// si satura: per LIMIT vuol dire "senza limite", per OFFSET "oltre l'ultima riga" (nessuna tabella ne ha 2^31)
+static int row_count(const char* s) {
+    errno = 0;
+    char* end;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (end == s || s[0] == '-') return 0;
+    if (errno == ERANGE || v > (unsigned long long)INT32_MAX) return INT32_MAX;
+    return (int)v;
+}
+
 static void parse_order_limit(ParserState* ps, ASTNode* n) {
     if (ps->result->success && match(ps, TOK_ORDER)) {
         expect(ps, TOK_BY);
         do {
-            if (n->select_stmt.num_order >= SV_MAX_ORDER) { parse_fail(ps, "Too many ORDER BY expressions (max 8)", peek(ps)); break; }
+            if (n->select_stmt.num_order >= SV_MAX_ORDER) {
+                char m[64];
+                snprintf(m, sizeof(m), "Too many ORDER BY expressions (max %d)", SV_MAX_ORDER);
+                parse_fail(ps, m, peek(ps));
+                break;
+            }
+            if (n->select_stmt.num_order == n->select_stmt.cap_order) {
+                int nc = n->select_stmt.cap_order ? n->select_stmt.cap_order * 2 : 4;
+                ASTExpr** oe = sv_realloc(n->select_stmt.order_exprs, sizeof(ASTExpr*) * (size_t)nc);
+                if (oe) n->select_stmt.order_exprs = oe;
+                bool* od = oe ? sv_realloc(n->select_stmt.order_desc, sizeof(bool) * (size_t)nc) : NULL;
+                if (od) n->select_stmt.order_desc = od;
+                char* on = od ? sv_realloc(n->select_stmt.order_nulls, (size_t)nc) : NULL;
+                if (!on) { parse_fail(ps, "Out of memory", peek(ps)); break; }
+                n->select_stmt.order_nulls = on;
+                n->select_stmt.cap_order = nc;
+            }
             ASTExpr* o = parse_expr(ps);
             if (!o) break;
             int k = n->select_stmt.num_order++;
             n->select_stmt.order_exprs[k] = o;
+            n->select_stmt.order_desc[k] = false;
+            n->select_stmt.order_nulls[k] = 0;
             if (match(ps, TOK_DESC)) n->select_stmt.order_desc[k] = true;
             else match(ps, TOK_ASC);
             if (ident_is(ps, "NULLS") && (peek2_ident(ps, "FIRST") || peek2_ident(ps, "LAST"))) {   // NULLS FIRST | LAST
@@ -2255,14 +2317,14 @@ static void parse_order_limit(ParserState* ps, ASTNode* n) {
     // standard: OFFSET n {ROW | ROWS} [FETCH {FIRST | NEXT} [n] {ROW | ROWS} ONLY]
     if (ps->result->success && ident_is(ps, "OFFSET") && next_is(ps, 1, TOK_INTEGER)) {
         consume(ps);
-        n->select_stmt.offset = atoi(consume(ps).text);
+        n->select_stmt.offset = row_count(consume(ps).text);
         if (peek(ps).type == TOK_ROW || ident_is(ps, "ROWS")) consume(ps);
         if (!ident_is(ps, "FETCH")) { n->select_stmt.has_limit = true; n->select_stmt.limit = INT32_MAX; }
     }
     if (ps->result->success && ident_is(ps, "FETCH") && (peek2_ident(ps, "FIRST") || peek2_ident(ps, "NEXT"))) {
         consume(ps); consume(ps);
         int lim = 1;
-        if (peek(ps).type == TOK_INTEGER) lim = atoi(consume(ps).text);
+        if (peek(ps).type == TOK_INTEGER) lim = row_count(consume(ps).text);
         if (peek(ps).type == TOK_ROW || ident_is(ps, "ROWS")) consume(ps);
         if (!ident_is(ps, "ONLY")) { parse_fail(ps, "Expected ONLY after FETCH FIRST n ROWS (WITH TIES is not supported)", peek(ps)); return; }
         consume(ps);
@@ -2273,18 +2335,18 @@ static void parse_order_limit(ParserState* ps, ASTNode* n) {
     if (ps->result->success && match(ps, TOK_LIMIT)) {
         Token a = consume(ps);
         if (a.type != TOK_INTEGER || a.text[0] == '-') parse_fail(ps, "LIMIT expects a number >= 0", a);
-        n->select_stmt.limit = atoi(a.text);
+        n->select_stmt.limit = row_count(a.text);
         n->select_stmt.has_limit = true;
         if (match(ps, TOK_COMMA)) {
             Token b = consume(ps);
             if (b.type != TOK_INTEGER || b.text[0] == '-') parse_fail(ps, "LIMIT expects a number >= 0", b);
             n->select_stmt.offset = n->select_stmt.limit;
-            n->select_stmt.limit = atoi(b.text);
+            n->select_stmt.limit = row_count(b.text);
         } else if (ident_is(ps, "OFFSET")) {
             consume(ps);
             Token b = consume(ps);
             if (b.type != TOK_INTEGER || b.text[0] == '-') parse_fail(ps, "OFFSET expects a number >= 0", b);
-            n->select_stmt.offset = atoi(b.text);
+            n->select_stmt.offset = row_count(b.text);
         }
     }
     // FOR UPDATE / FOR SHARE [NOWAIT | SKIP LOCKED] / LOCK IN SHARE MODE: i lock li prende già la transazione
@@ -2377,6 +2439,52 @@ static ASTNode* parse_select(ParserState* ps) { return parse_query(ps); }
 static bool peek2_ident(ParserState* ps, const char* w);
 
 // [ON DUPLICATE KEY UPDATE col = espr {, col = espr}]
+
+// spazio per un'altra colonna in UPDATE ... SET (tutte le liste insieme); false = errore già segnalato
+static bool upd_set_room(ParserState* ps, ASTNode* n) {
+    int k = n->update_stmt.num_sets;
+    if (k >= SV_MAX_SETS) {
+        char m[80];
+        snprintf(m, sizeof(m), "Too many columns in SET (max %d)", SV_MAX_SETS);
+        parse_fail(ps, m, peek(ps));
+        return false;
+    }
+    if (k < n->update_stmt.cap_sets) return true;
+    int nc = n->update_stmt.cap_sets ? n->update_stmt.cap_sets * 2 : 8;
+    char (*c)[64] = sv_realloc(n->update_stmt.set_cols, sizeof(*c) * (size_t)nc);
+    if (c) n->update_stmt.set_cols = c;
+    ASTExpr** e = c ? sv_realloc(n->update_stmt.set_exprs, sizeof(ASTExpr*) * (size_t)nc) : NULL;
+    if (e) n->update_stmt.set_exprs = e;
+    char (*t)[64] = e ? sv_realloc(n->update_stmt.set_tables, sizeof(*t) * (size_t)nc) : NULL;
+    if (t) n->update_stmt.set_tables = t;
+    char** x = t ? sv_realloc(n->update_stmt.set_texts, sizeof(char*) * (size_t)nc) : NULL;
+    if (!x) { parse_fail(ps, "Out of memory", peek(ps)); return false; }
+    n->update_stmt.set_texts = x;
+    for (int i = n->update_stmt.cap_sets; i < nc; i++) x[i] = NULL;
+    n->update_stmt.cap_sets = nc;
+    return true;
+}
+
+// spazio per un'altra colonna in ON DUPLICATE KEY UPDATE / ON CONFLICT DO UPDATE
+static bool ins_dup_room(ParserState* ps, ASTNode* n, const char* what) {
+    int k = n->insert_stmt.num_dup;
+    if (k >= SV_MAX_SETS) {
+        char m[100];
+        snprintf(m, sizeof(m), "Too many columns in %s (max %d)", what, SV_MAX_SETS);
+        parse_fail(ps, m, peek(ps));
+        return false;
+    }
+    if (k < n->insert_stmt.cap_dup) return true;
+    int nc = n->insert_stmt.cap_dup ? n->insert_stmt.cap_dup * 2 : 8;
+    char (*c)[64] = sv_realloc(n->insert_stmt.dup_cols, sizeof(*c) * (size_t)nc);
+    if (c) n->insert_stmt.dup_cols = c;
+    ASTExpr** e = c ? sv_realloc(n->insert_stmt.dup_exprs, sizeof(ASTExpr*) * (size_t)nc) : NULL;
+    if (!e) { parse_fail(ps, "Out of memory", peek(ps)); return false; }
+    n->insert_stmt.dup_exprs = e;
+    n->insert_stmt.cap_dup = nc;
+    return true;
+}
+
 static void parse_on_duplicate(ParserState* ps, ASTNode* n) {
     // PostgreSQL / SQLite: ON CONFLICT [(colonne) | ON CONSTRAINT nome] DO NOTHING | DO UPDATE SET c = espr [, ...] [WHERE cond]
     // (EXCLUDED.c è il valore proposto): come INSERT IGNORE / ON DUPLICATE KEY UPDATE
@@ -2390,7 +2498,7 @@ static void parse_on_duplicate(ParserState* ps, ASTNode* n) {
         if (!match(ps, TOK_UPDATE) || !match(ps, TOK_SET)) { parse_fail(ps, "Expected DO UPDATE SET", peek(ps)); return; }
         snprintf(n->insert_stmt.row_alias, sizeof(n->insert_stmt.row_alias), "EXCLUDED");
         do {
-            if (n->insert_stmt.num_dup >= SV_MAX_SETS) { parse_fail(ps, "Too many columns in ON CONFLICT DO UPDATE", peek(ps)); return; }
+            if (!ins_dup_room(ps, n, "ON CONFLICT DO UPDATE")) return;
             Token c = consume(ps);
             if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", c); return; }
             if (!match(ps, TOK_EQ)) { parse_fail(ps, "Expected '='", peek(ps)); return; }
@@ -2423,7 +2531,7 @@ static void parse_on_duplicate(ParserState* ps, ASTNode* n) {
     consume(ps);
     if (!match(ps, TOK_KEY) || !match(ps, TOK_UPDATE)) { parse_fail(ps, "Expected ON DUPLICATE KEY UPDATE", peek(ps)); return; }
     do {
-        if (n->insert_stmt.num_dup >= SV_MAX_SETS) { parse_fail(ps, "Too many columns in ON DUPLICATE KEY UPDATE", peek(ps)); return; }
+        if (!ins_dup_room(ps, n, "ON DUPLICATE KEY UPDATE")) return;
         Token c = consume(ps);
         if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", c); return; }
         if (match(ps, TOK_DOT)) { c = consume(ps); if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", c); return; } }
@@ -2665,7 +2773,7 @@ static void parse_update(ParserState* ps, ASTNode* n) {
     }
     if (!match(ps, TOK_SET)) { parse_fail(ps, "Expected SET", peek(ps)); return; }
     do {
-        if (n->update_stmt.num_sets >= SV_MAX_SETS) { parse_fail(ps, "Too many columns in SET", peek(ps)); return; }
+        if (!upd_set_room(ps, n)) return;
         Token cn = consume(ps);
         if (cn.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name in SET", cn); return; }
         Token col = cn;
@@ -2683,6 +2791,7 @@ static void parse_update(ParserState* ps, ASTNode* n) {
         copy_text(ps, n->update_stmt.set_cols[k], sizeof(n->update_stmt.set_cols[k]), col.text);
         memcpy(n->update_stmt.set_tables[k], qual, sizeof(qual));
         n->update_stmt.set_exprs[k] = v;
+        n->update_stmt.set_texts[k] = NULL;
         if (n->update_stmt.multi_from) n->update_stmt.set_texts[k] = text_of(ps, vstart, ps->pos);
     } while (match(ps, TOK_COMMA));
     if (n->update_stmt.multi_from) { tail_texts(ps, &n->update_stmt.multi_where, &n->update_stmt.order_limit); return; }
@@ -2700,27 +2809,6 @@ static void parse_update(ParserState* ps, ASTNode* n) {
             ast_expr_format(n->update_stmt.set_exprs[k], buf, sizeof(buf));
             n->update_stmt.set_texts[k] = sv_strdup(buf);
         }
-    }
-}
-
-static void parse_column_ref(ParserState* ps, ASTExpr* e) {
-    Token t = consume(ps);
-    if (t.type == TOK_STAR) {
-        e->type = EXPR_STAR;
-        return;
-    }
-    e->type = EXPR_COLUMN;
-    if (peek(ps).type == TOK_DOT) {
-        copy_text(ps, e->table_name, sizeof(e->table_name), t.text);
-        consume(ps);
-        Token t2 = consume(ps);
-        if (t2.type == TOK_STAR) {
-            e->type = EXPR_STAR;
-        } else {
-            copy_text(ps, e->col_name, sizeof(e->col_name), t2.text);
-        }
-    } else {
-        copy_text(ps, e->col_name, sizeof(e->col_name), t.text);
     }
 }
 
@@ -3339,8 +3427,11 @@ static ASTNode* parse_create_procedure(ParserState* ps, ASTNode* n, bool is_func
     }
     routine_def_free(d);
     if (!ps->result->success) return n;
-    if (!tokens_text(ps, start, ps->pos, n->create_trigger.body, sizeof(n->create_trigger.body)))
-        parse_fail(ps, "Routine is too long", peek(ps));
+    char* body = sv_malloc(SV_MAX_SQL_LEN);
+    if (!body) { parse_fail(ps, "Out of memory", peek(ps)); return n; }
+    if (!tokens_text(ps, start, ps->pos, body, SV_MAX_SQL_LEN)) parse_fail(ps, "Routine is too long", peek(ps));
+    else if (!(n->create_trigger.body = sv_strdup(body))) parse_fail(ps, "Out of memory", peek(ps));
+    free(body);
     return n;
 }
 
@@ -3361,6 +3452,27 @@ static char* expr_text(ParserState* ps) {
     if (!e) return NULL;
     ast_expr_free(e);
     return text_dup(ps, st, ps->pos);
+}
+
+
+// spazio per need colonne / valori in una clausola WHEN di MERGE
+static bool merge_room(ParserState* ps, MergeWhen* w, int need) {
+    if (need <= w->cap) return true;
+    if (need > SV_MAX_COLUMNS) {
+        char m[64];
+        snprintf(m, sizeof(m), "Too many columns in MERGE (max %d)", SV_MAX_COLUMNS);
+        parse_fail(ps, m, peek(ps));
+        return false;
+    }
+    int nc = w->cap ? w->cap * 2 : 8;
+    while (nc < need) nc *= 2;
+    char (*c)[64] = sv_realloc(w->cols, sizeof(*c) * (size_t)nc);
+    if (c) w->cols = c;
+    char** v = c ? sv_realloc(w->vals, sizeof(char*) * (size_t)nc) : NULL;
+    if (!v) { parse_fail(ps, "Out of memory", peek(ps)); return false; }
+    w->vals = v;
+    w->cap = nc;
+    return true;
 }
 
 static void parse_merge(ParserState* ps, ASTNode* n) {
@@ -3404,8 +3516,16 @@ static void parse_merge(ParserState* ps, ASTNode* n) {
     n->merge.on = expr_text(ps);
     if (!n->merge.on) return;
     while (ps->result->success && match(ps, TOK_WHEN)) {
-        if (n->merge.nwhen >= 8) { parse_fail(ps, "Too many WHEN clauses (max 8)", peek(ps)); return; }
+        if (n->merge.nwhen >= 256) { parse_fail(ps, "Too many WHEN clauses (max 256)", peek(ps)); return; }
+        if (n->merge.nwhen == n->merge.cap_when) {
+            int nc = n->merge.cap_when ? n->merge.cap_when * 2 : 4;
+            MergeWhen* g = sv_realloc(n->merge.when, sizeof(MergeWhen) * (size_t)nc);
+            if (!g) { parse_fail(ps, "Out of memory", peek(ps)); return; }
+            n->merge.when = g;
+            n->merge.cap_when = nc;
+        }
         MergeWhen* w = &n->merge.when[n->merge.nwhen++];
+        memset(w, 0, sizeof(*w));
         bool not = match(ps, TOK_NOT);
         if (!ident_is(ps, "MATCHED")) { parse_fail(ps, "Expected MATCHED after WHEN", peek(ps)); return; }
         consume(ps);
@@ -3420,7 +3540,7 @@ static void parse_merge(ParserState* ps, ASTNode* n) {
             w->kind = 0;
             if (!match(ps, TOK_SET)) { parse_fail(ps, "Expected SET after UPDATE", peek(ps)); return; }
             do {
-                if (w->n >= 32) { parse_fail(ps, "Too many columns (max 32)", peek(ps)); return; }
+                if (!merge_room(ps, w, w->n + 1)) return;
                 Token c = consume(ps);
                 if (c.type == TOK_IDENTIFIER && match(ps, TOK_DOT)) c = consume(ps);      // t.col
                 if (c.type != TOK_IDENTIFIER || !match(ps, TOK_EQ)) { parse_fail(ps, "Expected column = value", c); return; }
@@ -3438,14 +3558,16 @@ static void parse_merge(ParserState* ps, ASTNode* n) {
                 int k = 0;
                 do {
                     Token c = consume(ps);
-                    if (c.type != TOK_IDENTIFIER || k >= 32) { parse_fail(ps, "Expected a column name", c); return; }
+                    if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", c); return; }
+                    if (!merge_room(ps, w, k + 1)) return;
                     copy_text(ps, w->cols[k++], 64, c.text);
+                    w->ncols = k;
                 } while (match(ps, TOK_COMMA));
                 if (!match(ps, TOK_RPAREN)) { parse_fail(ps, "Expected ')'", peek(ps)); return; }
             }
             if (!match(ps, TOK_VALUES) || !match(ps, TOK_LPAREN)) { parse_fail(ps, "Expected VALUES (...) after INSERT", peek(ps)); return; }
             do {
-                if (w->n >= 32) { parse_fail(ps, "Too many values (max 32)", peek(ps)); return; }
+                if (!merge_room(ps, w, w->n + 1)) return;
                 w->vals[w->n] = expr_text(ps);
                 if (!w->vals[w->n]) return;
                 w->n++;
@@ -3570,8 +3692,9 @@ static ASTNode* parse_create_trigger(ParserState* ps, ASTNode* n) {
     len = strlen(text);
     if (len) text[len++] = ' ';
     if (!tokens_text(ps, start, end, text + len, SV_MAX_SQL_LEN - len)) { free(text); parse_fail(ps, "Trigger is too long", peek(ps)); return n; }
-    copy_text(ps, n->create_trigger.body, sizeof(n->create_trigger.body), text);
+    n->create_trigger.body = sv_strdup(text);
     free(text);
+    if (!n->create_trigger.body) parse_fail(ps, "Out of memory", peek(ps));
     return n;
 }
 
@@ -3623,7 +3746,8 @@ static bool tokens_text(ParserState* ps, int from, int to, char* out, size_t cap
         bool tight = t->type == TOK_DOT || t->type == TOK_RPAREN || t->type == TOK_COMMA || t->type == TOK_SEMICOLON ||
                      (i > from && (ps->tokens->tokens[i - 1].type == TOK_DOT || ps->tokens->tokens[i - 1].type == TOK_LPAREN)) ||
                      (i > from && t->type == TOK_LPAREN && (ps->tokens->tokens[i - 1].type == TOK_IDENTIFIER ||
-                                                             ps->tokens->tokens[i - 1].type == TOK_LEFT || ps->tokens->tokens[i - 1].type == TOK_RIGHT));   // f(x)
+                                                             ps->tokens->tokens[i - 1].type == TOK_LEFT || ps->tokens->tokens[i - 1].type == TOK_RIGHT ||
+                                                             ps->tokens->tokens[i - 1].type == TOK_INSERT || ps->tokens->tokens[i - 1].type == TOK_TRUNCATE));   // f(x)
         if (di + pl + 2 >= cap) return false;
         if (di > 0 && !tight) out[di++] = ' ';
         memcpy(out + di, piece, pl);
@@ -3640,7 +3764,7 @@ static int parse_name_list(ParserState* ps, char names[][64], int max) {
     do {
         Token c = consume(ps);
         if (c.type != TOK_IDENTIFIER) { parse_fail(ps, "Expected a column name", c); return n; }
-        if (n >= max) { parse_fail(ps, "Too many columns in the key (max 8)", c); return n; }
+        if (n >= max) { char m[60]; snprintf(m, sizeof(m), "Too many columns in the key (max %d)", max); parse_fail(ps, m, c); return n; }
         copy_text(ps, names[n++], 64, c.text);
         // MySQL: prefisso dell'indice col(191) e direzione
         if (peek(ps).type == TOK_LPAREN && next_is(ps, 1, TOK_INTEGER) && next_is(ps, 2, TOK_RPAREN)) { consume(ps); consume(ps); consume(ps); }
@@ -3671,7 +3795,7 @@ static void parse_references(ParserState* ps, ConstraintDef* c) {
     // REFERENCES db.tabella (dump di MySQL Workbench): il database è quello della tabella creata
     if (peek(ps).type == TOK_DOT && next_is(ps, 1, TOK_IDENTIFIER)) { consume(ps); t = consume(ps); }
     copy_text(ps, c->ref_table, sizeof(c->ref_table), t.text);
-    if (peek(ps).type == TOK_LPAREN) c->nref = parse_name_list(ps, c->ref_cols, 8);
+    if (peek(ps).type == TOK_LPAREN) c->nref = parse_name_list(ps, c->ref_cols, SV_MAX_KEY_COLS);
     while (ps->result->success && peek(ps).type == TOK_ON) {
         consume(ps);
         if (match(ps, TOK_DELETE))      c->on_delete = parse_fk_action(ps);
@@ -3693,10 +3817,42 @@ static void parse_check(ParserState* ps, ConstraintDef* c) {
         parse_fail(ps, "CHECK condition is too long (max 511 characters)", peek(ps));
 }
 
-static ConstraintDef* new_cons(ParserState* ps, ASTNode* n) {
-    if (n->create_table.num_cons >= SV_MAX_CONS_DEFS) { parse_fail(ps, "Too many constraints (max 16)", peek(ps)); return NULL; }
+ConstraintDef* ast_cons_add(ASTNode* n) {
+    if (n->create_table.num_cons >= SV_MAX_CONS_DEFS) return NULL;
+    if (n->create_table.num_cons == n->create_table.cap_cons) {
+        int nc = n->create_table.cap_cons ? n->create_table.cap_cons * 2 : 4;
+        ConstraintDef* g = sv_realloc(n->create_table.cons, sizeof(ConstraintDef) * (size_t)nc);
+        if (!g) return NULL;
+        n->create_table.cons = g;
+        n->create_table.cap_cons = nc;
+    }
     ConstraintDef* c = &n->create_table.cons[n->create_table.num_cons++];
     memset(c, 0, sizeof(*c));
+    return c;
+}
+
+TableKeyDef* ast_key_add(ASTNode* n) {
+    if (n->create_table.num_keys >= SV_MAX_KEY_DEFS) return NULL;
+    if (n->create_table.num_keys == n->create_table.cap_keys) {
+        int nc = n->create_table.cap_keys ? n->create_table.cap_keys * 2 : 4;
+        TableKeyDef* g = sv_realloc(n->create_table.keys, sizeof(TableKeyDef) * (size_t)nc);
+        if (!g) return NULL;
+        n->create_table.keys = g;
+        n->create_table.cap_keys = nc;
+    }
+    TableKeyDef* k = &n->create_table.keys[n->create_table.num_keys++];
+    memset(k, 0, sizeof(*k));
+    return k;
+}
+
+static ConstraintDef* new_cons(ParserState* ps, ASTNode* n) {
+    ConstraintDef* c = ast_cons_add(n);
+    if (!c) {
+        char m[64];
+        if (n->create_table.num_cons >= SV_MAX_CONS_DEFS) snprintf(m, sizeof(m), "Too many constraints (max %d)", SV_MAX_CONS_DEFS);
+        else snprintf(m, sizeof(m), "Out of memory");
+        parse_fail(ps, m, peek(ps));
+    }
     return c;
 }
 
@@ -3718,7 +3874,7 @@ static bool parse_table_constraint(ParserState* ps, ConstraintDef* c) {
         expect(ps, TOK_KEY);
         c->kind = CONS_PRIMARY;
         skip_index_using(ps);
-        c->ncols = parse_name_list(ps, c->cols, 8);
+        c->ncols = parse_name_list(ps, c->cols, SV_MAX_KEY_COLS);
         skip_index_using(ps);
     } else if (ident_is(ps, "UNIQUE")) {
         consume(ps);
@@ -3729,13 +3885,13 @@ static bool parse_table_constraint(ParserState* ps, ConstraintDef* c) {
         }
         c->kind = CONS_UNIQUE;
         skip_index_using(ps);
-        c->ncols = parse_name_list(ps, c->cols, 8);
+        c->ncols = parse_name_list(ps, c->cols, SV_MAX_KEY_COLS);
         skip_index_using(ps);
     } else if (ident_is(ps, "FOREIGN")) {
         consume(ps);
         expect(ps, TOK_KEY);
         c->kind = CONS_FOREIGN;
-        c->ncols = parse_name_list(ps, c->cols, 8);
+        c->ncols = parse_name_list(ps, c->cols, SV_MAX_KEY_COLS);
         if (!ident_is(ps, "REFERENCES")) { parse_fail(ps, "Expected REFERENCES", peek(ps)); return true; }
         consume(ps);
         parse_references(ps, c);
@@ -3802,11 +3958,19 @@ static bool parse_type_spec(ParserState* ps, ColumnDef* cd) {
         } else {
             Token sz = consume(ps);
             if (sz.type != TOK_INTEGER) { parse_fail(ps, "Expected a size", sz); return false; }
-            cd->size = atoi(sz.text);
+            errno = 0;
+            unsigned long long szv = strtoull(sz.text, NULL, 10);
+            if (errno == ERANGE || szv > (unsigned long long)INT32_MAX) {   // prima atoi: VARCHAR(4294967297) = varchar(1)
+                parse_fail(ps, "Column length too big", sz);
+                return false;
+            }
+            cd->size = (int)szv;
             if (match(ps, TOK_COMMA)) {                    // DECIMAL(p, s)
                 Token sc = consume(ps);
                 if (sc.type != TOK_INTEGER) { parse_fail(ps, "Expected the number of decimal digits", sc); return false; }
-                cd->scale = atoi(sc.text);
+                errno = 0;
+                unsigned long long scv = strtoull(sc.text, NULL, 10);
+                cd->scale = errno == ERANGE || scv > 1000 ? 1000 : (int)scv;   // fuori scala: rifiutata sotto (> 30)
                 cd->has_scale = true;
                 if (cd->scale > 30 || cd->scale < 0) { parse_fail(ps, "Too big scale specified (the maximum is 30, as in MySQL)", sc); return false; }
                 if (cd->scale > cd->size && cd->size > 0) { parse_fail(ps, "The scale cannot be larger than the precision", sc); return false; }
@@ -3991,11 +4155,17 @@ static void parse_column_def(ParserState* ps, ASTNode* n) {
             if (cd->comment[0] != '\x01' && !(cd->flags & COLF_GENERATED)) copy_text(ps, cd->comment, sizeof(cd->comment), cm.text);
         } else if (ident_is(ps, "COLLATE") || ident_is(ps, "CHARSET") || ident_is(ps, "CHARACTER")) {
             bool cs = ident_is(ps, "CHARACTER");
+            bool coll = ident_is(ps, "COLLATE");
             consume(ps);
             if (cs && ident_is(ps, "SET")) consume(ps);
             else if (cs && peek(ps).type == TOK_SET) consume(ps);
             match(ps, TOK_EQ);
-            consume(ps);
+            Token cv = consume(ps);
+            if (coll && (cv.type == TOK_IDENTIFIER || cv.type == TOK_STRING)) {   // collation della colonna (prima ignorata)
+                size_t l = strlen(cv.text);
+                cd->flags &= (uint8_t)~(COLF_CI | COLF_BIN);
+                cd->flags |= l > 3 && !strcasecmp(cv.text + l - 3, "_ci") ? COLF_CI : COLF_BIN;
+            }
         } else if (ident_is(ps, "UNSIGNED") || ident_is(ps, "SIGNED") || ident_is(ps, "ZEROFILL") ||
                    ident_is(ps, "VISIBLE") || ident_is(ps, "INVISIBLE")) {
             if (ident_is(ps, "UNSIGNED")) cd->flags |= COLF_UNSIGNED;
@@ -4080,16 +4250,21 @@ static void parse_create_table(ParserState* ps, ASTNode* n) {
         if (peek(ps).type == TOK_KEY || peek(ps).type == TOK_INDEX || fulltext || spatial) {
             consume(ps);
             if ((fulltext || spatial) && (peek(ps).type == TOK_KEY || peek(ps).type == TOK_INDEX)) consume(ps);
-            if (n->create_table.num_keys >= SV_MAX_KEY_DEFS) { parse_fail(ps, "Too many indexes (max 16)", peek(ps)); return; }
-            TableKeyDef* k = &n->create_table.keys[n->create_table.num_keys];
-            memset(k, 0, sizeof(*k));
+            TableKeyDef* k = ast_key_add(n);
+            if (!k) {
+                char m[64];
+                if (n->create_table.num_keys >= SV_MAX_KEY_DEFS) snprintf(m, sizeof(m), "Too many indexes (max %d)", SV_MAX_KEY_DEFS);
+                else snprintf(m, sizeof(m), "Out of memory");
+                parse_fail(ps, m, peek(ps));
+                return;
+            }
             if (peek(ps).type == TOK_IDENTIFIER && !ident_is(ps, "USING")) { Token nm = consume(ps); copy_text(ps, k->name, sizeof(k->name), nm.text); }
             skip_index_using(ps);
-            k->ncols = parse_name_list(ps, k->cols, 8);
+            k->ncols = parse_name_list(ps, k->cols, SV_MAX_KEY_COLS);
             skip_index_using(ps);
             k->fulltext = fulltext;
             if (!ps->result->success) return;
-            if (!spatial) n->create_table.num_keys++;
+            if (spatial) n->create_table.num_keys--;              // SPATIAL: ignorato
             continue;
         }
         parse_column_def(ps, n);
@@ -4160,8 +4335,10 @@ static void parse_view_def(ParserState* ps, ASTNode* n) {
         consume(ps);
     }
     if (peek(ps).type != TOK_SEMICOLON && peek(ps).type != TOK_EOF) { parse_fail(ps, "Unexpected text in the view definition", peek(ps)); return; }
-    char* def = n->create_view.definition;
-    size_t cap = sizeof(n->create_view.definition);
+    size_t cap = SV_MAX_SQL_LEN;
+    char* def = sv_malloc(cap);
+    if (!def) { parse_fail(ps, "Out of memory", peek(ps)); return; }
+    def[0] = '\0';
     bool fits;
     if (cols_from >= 0) {
         size_t l = (size_t)snprintf(def, cap, "WITH %s ", n->create_view.view_name);
@@ -4172,6 +4349,8 @@ static void parse_view_def(ParserState* ps, ASTNode* n) {
         if (fits) fits = (size_t)snprintf(def + l, cap - l, ") SELECT * FROM %s", n->create_view.view_name) < cap - l;
     } else fits = tokens_text(ps, start, end, def, cap);
     if (!fits) parse_fail(ps, "View definition is too long (max 64 KB)", peek(ps));
+    else if (!(n->create_view.definition = sv_strdup(def))) parse_fail(ps, "Out of memory", peek(ps));
+    free(def);
 }
 
 // il token dopo quello corrente è la parola w?
@@ -5200,11 +5379,14 @@ static void free_node(ASTNode* n) {
             free_node(n->select_stmt.from_sub);
             tf_free(n->select_stmt.from_tf);
             for (int j = 0; j < n->select_stmt.num_joins; j++) tf_free(n->select_stmt.joins[j].tf);
+            free(n->select_stmt.joins);
             free_node(n->select_stmt.set_next);
             for (int j = 0; j < n->select_stmt.num_ctes; j++) free_node(n->select_stmt.ctes[j].node);
             free(n->select_stmt.ctes);
             for (int j = 0; j < n->select_stmt.num_group; j++) ast_expr_free(n->select_stmt.group_exprs[j]);
             for (int j = 0; j < n->select_stmt.num_order; j++) ast_expr_free(n->select_stmt.order_exprs[j]);
+            free(n->select_stmt.group_exprs);
+            free(n->select_stmt.order_exprs); free(n->select_stmt.order_desc); free(n->select_stmt.order_nulls);
             break;
         case NODE_INSERT:
             for (int j = 0; j < n->insert_stmt.num_cols; j++) free(n->insert_stmt.columns[j]);
@@ -5214,9 +5396,20 @@ static void free_node(ASTNode* n) {
             free(n->insert_stmt.values);
             free_node(n->insert_stmt.select);
             for (int j = 0; j < n->insert_stmt.num_dup; j++) ast_expr_free(n->insert_stmt.dup_exprs[j]);
+            free(n->insert_stmt.dup_exprs);
+            free(n->insert_stmt.dup_cols);
+            break;
+        case NODE_CREATE_VIEW:
+            free(n->create_view.definition);
+            break;
+        case NODE_CREATE_TRIGGER:
+        case NODE_CREATE_PROCEDURE:
+            free(n->create_trigger.body);
             break;
         case NODE_UPDATE:
             for (int j = 0; j < n->update_stmt.num_sets; j++) { ast_expr_free(n->update_stmt.set_exprs[j]); free(n->update_stmt.set_texts[j]); }
+            free(n->update_stmt.set_exprs); free(n->update_stmt.set_texts);
+            free(n->update_stmt.set_cols); free(n->update_stmt.set_tables);
             ast_expr_free(n->update_stmt.where);
             free(n->update_stmt.multi_from); free(n->update_stmt.multi_where); free(n->update_stmt.order_limit);
             break;
@@ -5232,6 +5425,8 @@ static void free_node(ASTNode* n) {
             break;
         case NODE_CREATE_TABLE:
             free(n->create_table.columns);
+            free(n->create_table.cons);
+            free(n->create_table.keys);
             free_node(n->create_table.as_select);
             break;
         case NODE_CALL:
@@ -5242,7 +5437,10 @@ static void free_node(ASTNode* n) {
             for (int w = 0; w < n->merge.nwhen; w++) {
                 free(n->merge.when[w].cond);
                 for (int j = 0; j < n->merge.when[w].n; j++) free(n->merge.when[w].vals[j]);
+                free(n->merge.when[w].vals);
+                free(n->merge.when[w].cols);
             }
+            free(n->merge.when);
             break;
         case NODE_SET:
             for (int j = 0; j < n->set_n; j++) ast_expr_free(n->set_exprs[j]);

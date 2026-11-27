@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#define SV_HARNESS_TMP_ONLY
+#include "harness.h"
 
 static int tests = 0, passed = 0;
 
@@ -81,8 +83,9 @@ static void test_csv(const char* label, const char* csv, const char* table, int 
 }
 
 int main(void) {
-    if (system("rm -rf /tmp/svtest && mkdir -p /tmp/svtest") != 0) { printf("FAIL: setup\n"); return 1; }
-    if (!db_init("/tmp/svtest")) { printf("FAIL: db_init\n"); return 1; }
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
+    if (system("rm -rf svtest && mkdir -p svtest") != 0) { printf("FAIL: setup\n"); return 1; }
+    if (!db_init("svtest")) { printf("FAIL: db_init\n"); return 1; }
 
     test_sql("CREATE DATABASE", "CREATE DATABASE testdb", -1);
     test_sql("USE", "USE testdb", -1);
@@ -192,6 +195,10 @@ int main(void) {
     test_sql("CSV empty -> NULL", "SELECT * FROM clienti WHERE citta IS NULL", 1);
     test_sql("CSV float column", "SELECT * FROM clienti WHERE amount > 5", 2);
     test_sql("DROP TABLE clienti", "DROP TABLE clienti", -1);
+    // intestazioni che sono parole riservate: i nomi vanno tra backtick (prima CREATE TABLE falliva)
+    test_csv("CSV keyword headers", "order,select,date\n1,a,2024-01-02\n2,b,2024-03-04\n", "order", 2);
+    test_value("CSV keyword column", "SELECT `select` FROM `order` WHERE `order` = 2", "b");
+    test_sql("DROP TABLE order", "DROP TABLE `order`", -1);
 
     // NOT NULL, tipi e modificatori in minuscolo
     test_sql("create lowercase", "create table lc (id int primary key auto_increment, name varchar(20) not null, note text)", -1);

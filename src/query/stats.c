@@ -4,6 +4,7 @@ SCOPO: statistiche delle colonne (vedi stats.h).
 #include "stats.h"
 #include "platform_compat.h"
 #include "sv_alloc.h"
+#include "common.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,10 +70,14 @@ bool stats_save(const char* path) {
     fprintf(f, "# SegVault optimizer statistics (ANALYZE TABLE): rebuilt by ANALYZE, safe to delete\n");
     for (int i = 0; i < g_n; i++) {
         const TableStats* t = &g_t[i];
-        fprintf(f, "table %s %s %.17g %d\n", t->db[0] ? t->db : "-", t->table, t->rows, t->ncols);
+        char edb[3 * 64], etb[3 * 64], ecol[3 * 64];       // nomi codificati: uno spazio non sposta i campi (CR-B5)
+        sv_name_encode(t->db, edb, sizeof(edb));
+        sv_name_encode(t->table, etb, sizeof(etb));
+        fprintf(f, "table %s %s %.17g %d\n", t->db[0] ? edb : "-", etb, t->rows, t->ncols);
         for (int c = 0; c < t->ncols; c++) {
             const ColStats* s = &t->cols[c];
-            fprintf(f, "col %s %.17g %.17g %d %.17g %.17g", s->name, s->ndv, s->null_frac, s->numeric ? 1 : 0, s->min, s->max);
+            sv_name_encode(s->name, ecol, sizeof(ecol));
+            fprintf(f, "col %s %.17g %.17g %d %.17g %.17g", ecol, s->ndv, s->null_frac, s->numeric ? 1 : 0, s->min, s->max);
             for (int k = 0; k <= STATS_BUCKETS; k++) fprintf(f, " %.17g", s->hist[k]);
             fputc('\n', f);
         }
@@ -92,37 +97,48 @@ bool stats_load(const char* path) {
     TableStats cur;
     memset(&cur, 0, sizeof(cur));
     int want = 0;
-    bool ok = true;
+    bool bad = false;                            // tabella corrente illeggibile: scartata lei sola (CR-B5)
+    bool all_ok = true;
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
         if (!strncmp(line, "table ", 6)) {
-            if (cur.cols && cur.ncols == want) stats_put(&cur);
+            if (!bad && cur.cols && cur.ncols == want) stats_put(&cur);
             free(cur.cols);
             memset(&cur, 0, sizeof(cur));
-            if (sscanf(line, "table %63s %63s %lf %d", cur.db, cur.table, &cur.rows, &want) != 4 || want < 0 || want > 4096) { ok = false; break; }
-            if (!strcmp(cur.db, "-")) cur.db[0] = '\0';
+            bad = false;
+            char edb[3 * 64], etb[3 * 64];
+            int used = 0;
+            if (sscanf(line, "table %191s %191s %lf %d%n", edb, etb, &cur.rows, &want, &used) != 4 || want < 0 || want > 4096 ||
+                strspn(line + used, " \r\n") != strlen(line + used) ||
+                (strcmp(edb, "-") && !sv_name_decode(edb, sizeof(cur.db))) || !sv_name_decode(etb, sizeof(cur.table))) {
+                bad = true; all_ok = false; continue;
+            }
+            snprintf(cur.db, sizeof(cur.db), "%.63s", strcmp(edb, "-") ? edb : "");
+            snprintf(cur.table, sizeof(cur.table), "%.63s", etb);
             cur.cols = sv_calloc((size_t)(want ? want : 1), sizeof(ColStats));
-        } else if (!strncmp(line, "col ", 4) && cur.cols && cur.ncols < want) {
+        } else if (!strncmp(line, "col ", 4) && !bad && cur.cols && cur.ncols < want) {
             ColStats* s = &cur.cols[cur.ncols];
+            char ecol[3 * 64];
             int num = 0, used = 0;
-            if (sscanf(line, "col %63s %lf %lf %d %lf %lf%n", s->name, &s->ndv, &s->null_frac, &num, &s->min, &s->max, &used) < 6) { ok = false; break; }
+            if (sscanf(line, "col %191s %lf %lf %d %lf %lf%n", ecol, &s->ndv, &s->null_frac, &num, &s->min, &s->max, &used) < 6 ||
+                !sv_name_decode(ecol, sizeof(s->name))) { bad = true; all_ok = false; continue; }
+            snprintf(s->name, sizeof(s->name), "%.63s", ecol);
             s->numeric = num != 0;
             const char* p = line + used;
-            for (int k = 0; k <= STATS_BUCKETS; k++) {
+            for (int k = 0; k <= STATS_BUCKETS && !bad; k++) {
                 char* e;
                 s->hist[k] = strtod(p, &e);
-                if (e == p) { ok = false; break; }
+                if (e == p) bad = true;
                 p = e;
             }
-            if (!ok) break;
+            if (bad) { all_ok = false; continue; }
             cur.ncols++;
         }
     }
-    if (ok && cur.cols && cur.ncols == want) stats_put(&cur);
+    if (!bad && cur.cols && cur.ncols == want) stats_put(&cur);
     free(cur.cols);
     fclose(f);
-    if (!ok) stats_clear();                      // file danneggiato: niente statistiche (solo stime peggiori)
-    return ok;
+    return all_ok;                               // false: almeno una tabella scartata (solo stime peggiori per lei)
 }
 
 // ── stime ────────────────────────────────────────────────────────

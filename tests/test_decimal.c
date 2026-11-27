@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#define SV_HARNESS_TMP_ONLY
+#include "harness.h"
 
 static uint64_t g = 0x9e3779b97f4a7c15ULL;
 static uint64_t rnd(void) { g ^= g << 13; g ^= g >> 7; g ^= g << 17; return g; }
@@ -22,8 +24,9 @@ static void num(char* out, int max_int, int max_frac) {
 int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s OUT [N]\n", argv[0]); return 2; }
     int n = argc > 2 ? atoi(argv[2]) : 10000;
-    if (system("rm -rf /tmp/sv_dec_test && mkdir -p /tmp/sv_dec_test") != 0 || !db_init("/tmp/sv_dec_test")) { printf("init failed\n"); return 1; }
-    FILE* f = fopen(argv[1], "w");
+    FILE* f = fopen(argv[1], "w");                        // il file dei risultati resta nella cartella di partenza
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
+    if (system("rm -rf sv_dec_test && mkdir -p sv_dec_test") != 0 || !db_init("sv_dec_test")) { printf("init failed\n"); if (f) fclose(f); return 1; }
     if (!f) return 1;
     static const char* const OPS[] = { "+", "-", "*", "/", "ROUND", "<", "SUM" };
     int bad = 0;
@@ -59,7 +62,7 @@ int main(int argc, char** argv) {
     }
     fclose(f);
     db_shutdown();
-    if (system("rm -rf /tmp/sv_dec_test")) {}
+    if (system("rm -rf sv_dec_test")) {}
     if (bad) { printf("decimal: %d statements failed\n", bad); return 1; }
     return 0;
 }

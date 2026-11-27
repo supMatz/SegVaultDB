@@ -101,8 +101,8 @@ QueryResult* dbt_search(const char* db, const char* needle, int limit, int* tabl
         // chiave della riga: le colonne della chiave primaria ("id=3"), altrimenti il numero della riga
         int n = 0;
         ColumnInfo* cols = db_list_columns(db, tables->names[t], &n);
-        int pk[8], npk = 0;
-        for (int c = 0; c < r->num_cols && npk < 8; c++)
+        int pk[16], npk = 0;                            // SV_MAX_KEY_COLS
+        for (int c = 0; c < r->num_cols && npk < 16; c++)
             for (int k = 0; k < n; k++)
                 if (cols[k].primary_key && !strcasecmp(cols[k].name, r->col_names[c])) pk[npk++] = c;
         db_columns_free(cols, n);

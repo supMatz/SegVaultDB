@@ -23,6 +23,12 @@ PHP sites. This page states what each protection covers, so that nobody relies o
 * **Saved endpoints** (`api_endpoints`) run with the privileges of their *definer*, a column the engine fills
   with the session user on every write. `public` is honoured only for endpoints saved by an administrator.
   Only administrators can change the structure of `api_endpoints`.
+* **The admin API answers only on the server's own address** (since 1.5). Pages of hosted sites
+  (`NAME.localhost`, `*.test`, `--site` names) cannot use `/api/v1/query` and the other admin endpoints in the
+  open setup, whatever their `Origin`: on a site's address they need `--token` or `--users`. Before 1.5 any
+  JavaScript served by SegVault (a plugin, an npm bundle, an XSS) could run SQL as root.
+* **New names cannot break out of quoting**: database, table, column and user names with a backtick or a control
+  character are refused (since 1.5); the desktop app quotes every name it writes into SQL.
 
 ## Files
 
@@ -31,6 +37,11 @@ PHP sites. This page states what each protection covers, so that nobody relies o
 * `users.dat` stores a salted, iterated SHA-256 of each password and, for the MySQL protocol,
   `SHA1(SHA1(password))` (what `mysql_native_password` needs). Anyone who can read the file can try to crack
   the second form much faster: keep the file private.
+* The web server never serves SegVault's own files (`segvault.*`, `users.dat`, `sequences.txt`), in any folder.
+* SQL `BACKUP TO` refuses folders inside the data folder and, while the web server runs, inside its `www`
+  folder or a site's folder (symlinks resolved), so a backup cannot land where it would be served. Backups made
+  from the desktop app choose their folder freely.
+* Logins are throttled per client address (1 024 tracked addresses; loopback exempt).
 * PHP runs as `php-cgi` processes listening on Unix sockets inside a private `0700` folder (POSIX); on Windows
   they use a port of `127.0.0.1`.
 

@@ -52,8 +52,7 @@ def expected(op, a, b, k):
     if op == "*":
         return fixed(A * B, min(scale(a) + scale(b), 30))
     if op == "/":
-        if "." not in a and "." not in b:   # due interi: SegVault resta nel double ("%.15g"), MySQL darebbe scala 4
-            return "%.15g" % (int(a) / int(b))
+        # anche due interi: DECIMAL con scala 0 + 4, come MySQL (CR-M14; prima SegVault restava nel double)
         return fixed(A / B, min(scale(a) + 4, 30))
     raise ValueError(op)
 

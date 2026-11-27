@@ -21,10 +21,9 @@
 #include <unistd.h>
 #include <netinet/tcp.h>
 #include <ctype.h>
+#include "harness.h"
 
-static int g_fail = 0, g_count = 0;
 
-#define CHECK(cond, ...) do { g_count++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 typedef struct { int status; char* body; JsonVal* json; } Resp;
 
@@ -531,6 +530,32 @@ static const char* err_msg(const Resp* r) {
 
 static void* run_server(void* s) { sv_server_run((SvServer*)s); return NULL; }
 
+// "Authorization: Basic ..." per user:pass
+static void basic_hdr(char* out, size_t n, const char* user, const char* pass) {
+    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char in[200], b64[200];
+    int l = snprintf(in, sizeof(in), "%s:%s", user, pass), k = 0;
+    for (int i = 0; i < l; i += 3) {
+        unsigned v = (unsigned char)in[i] << 16 | (i + 1 < l ? (unsigned char)in[i + 1] << 8 : 0) | (i + 2 < l ? (unsigned char)in[i + 2] : 0);
+        b64[k++] = T[v >> 18 & 63]; b64[k++] = T[v >> 12 & 63];
+        b64[k++] = i + 1 < l ? T[v >> 6 & 63] : '=';
+        b64[k++] = i + 2 < l ? T[v & 63] : '=';
+    }
+    b64[k] = '\0';
+    snprintf(out, n, "Content-Type: application/json\r\nAuthorization: Basic %s\r\n", b64);
+}
+
+typedef struct { int port; int i; } FakeLogin;
+static void* fake_login(void* a) {                   // un login sbagliato con un nome sempre diverso
+    FakeLogin* f = a;
+    char u[32], h[300];
+    snprintf(u, sizeof(u), "fake%d", f->i);
+    basic_hdr(h, sizeof(h), u, "x");
+    Resp r = request(f->port, "POST", "/api/v1/query", h, "{\"sql\":\"SELECT 1\"}");
+    resp_free(&r);
+    return NULL;
+}
+
 // ── concorrenza: più client che scrivono insieme ──
 static int g_port;
 static volatile int g_waiter_done, g_waiter_count = -1;
@@ -593,6 +618,7 @@ static void check_packet_split(void) {
 }
 
 int main(void) {
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
     check_packet_split();
     signal(SIGPIPE, SIG_IGN);
     char dir[] = "/tmp/svserverXXXXXX";
@@ -748,7 +774,7 @@ int main(void) {
         const JsonVal* rs1 = json_get(r.json, "results");
         const JsonVal* li1 = rs1 && rs1->count == 3 ? json_get(&rs1->items[1], "last_insert_id") : NULL;
         const JsonVal* li2 = rs1 && rs1->count == 3 ? json_get(&rs1->items[2], "last_insert_id") : NULL;
-        CHECK(li1 && li1->number == 2 && li2 && li2->number == 3, "last_insert_id: %s", r.body);
+        CHECK(li1 && li1->number == 1 && li2 && li2->number == 3, "last_insert_id (first id of the statement, as MySQL): %s", r.body);
     }
     resp_free(&r);
     // P0.8: byte 0x00 attraverso l'API HTTP (parametro "\u0000" e risultato "\u0000")
@@ -1183,9 +1209,9 @@ int main(void) {
         q = db_execute("USE t"); db_result_free(q);
         q = db_execute("CREATE USER boss IDENTIFIED BY 'boss-pass'"); db_result_free(q);
         q = db_execute("GRANT ALL ON *.* TO boss WITH GRANT OPTION"); db_result_free(q);
-        remove("/tmp/sv_audit_test.log");
+        remove("sv_audit_test.log");
         SvServerConfig cfg3 = { .port = 0, .token = "tok3", .default_db = "t", .quiet = true, .require_login = true,
-                                .audit_file = "/tmp/sv_audit_test.log" };
+                                .audit_file = "sv_audit_test.log" };
         SvServer* s3 = sv_server_start(&cfg3, err, sizeof(err));
         int port3 = s3 ? sv_server_port(s3) : 0;
         pthread_t th3;
@@ -1204,6 +1230,24 @@ int main(void) {
         c = cell_at(&r, 0, 0, 0);
         CHECK(resp_ok(&r) && c && c->number == 3, "anna reads p: %s", r.body);
         resp_free(&r);
+        {   // P3.11: con 64 voci, 64 login sbagliati con nomi inventati facevano uscire dalla tabella l'utente bloccato
+            // e il suo conto ripartiva da zero (tentativi senza attesa all'infinito)
+            q = db_execute("CREATE USER lk IDENTIFIED BY 'lk-pass'"); db_result_free(q);
+            char lh[300];
+            basic_hdr(lh, sizeof(lh), "lk", "wrong");
+            for (int i = 0; i < 5; i++) { r = request(port3, "POST", "/api/v1/query", lh, "{\"sql\":\"SELECT 1\"}"); resp_free(&r); }
+            basic_hdr(lh, sizeof(lh), "lk", "lk-pass");
+            r = request(port3, "POST", "/api/v1/query", lh, "{\"sql\":\"SELECT 1\"}");
+            CHECK(r.status == 429, "lk blocked after 5 failures: %d", r.status);
+            resp_free(&r);
+            pthread_t ft[80];
+            FakeLogin fl[80];
+            for (int i = 0; i < 80; i++) { fl[i] = (FakeLogin){ port3, i }; pthread_create(&ft[i], NULL, fake_login, &fl[i]); }
+            for (int i = 0; i < 80; i++) pthread_join(ft[i], NULL);
+            r = request(port3, "POST", "/api/v1/query", lh, "{\"sql\":\"SELECT 1\"}");
+            CHECK(r.status == 429, "still blocked after 80 failures with other names: %d", r.status);
+            resp_free(&r);
+        }
         r = request(port3, "POST", "/api/v1/query", hdr, "{\"sql\":\"DELETE FROM p\"}");
         CHECK(!resp_ok(&r) && strstr(err_msg(&r), "Access denied"), "anna cannot delete: %s", r.body);
         resp_free(&r);
@@ -1297,7 +1341,7 @@ int main(void) {
         resp_free(&r);
         if (s3) { sv_server_stop(s3); pthread_join(th3, NULL); sv_server_free(s3); }
         // registro di audit: le modifiche (anche rifiutate) con utente e client, non le letture
-        FILE* af = fopen("/tmp/sv_audit_test.log", "r");
+        FILE* af = fopen("sv_audit_test.log", "r");
         char audit[8192] = "";
         size_t an = af ? fread(audit, 1, sizeof(audit) - 1, af) : 0;
         audit[an] = '\0';
@@ -1308,7 +1352,7 @@ int main(void) {
         CHECK(strstr(audit, "CREATE USER zed IDENTIFIED BY '***'") && !strstr(audit, "s3cret") && !strstr(audit, "''pw"),
               "audit: password redacted: %s", audit);
         CHECK(!strchr(audit, 0x1b) && strstr(audit, "a\\x1b[2Jb"), "audit: control bytes escaped");
-        remove("/tmp/sv_audit_test.log");
+        remove("sv_audit_test.log");
     }
 
     // ── protocollo MySQL (quarto server: --mysql-port con utenti) ──
@@ -1327,7 +1371,7 @@ int main(void) {
         db_shutdown();
         CHECK(db_init(dir), "restart before the MySQL login tests: %s", db_init_error());
         SvServerConfig cfg4 = { .port = 0, .token = "tok4", .quiet = true, .require_login = true, .mysql = true, .mysql_port = 0,
-                                .mysql_socket = "/tmp/sv_test_mysql.sock" };
+                                .mysql_socket = "sv_test_mysql.sock" };
         SvServer* s4 = sv_server_start(&cfg4, err, sizeof(err));
         int mp = s4 ? sv_server_mysql_port(s4) : 0;
         pthread_t th4;
@@ -1337,14 +1381,14 @@ int main(void) {
             struct sockaddr_un ua;
             memset(&ua, 0, sizeof(ua));
             ua.sun_family = AF_UNIX;
-            snprintf(ua.sun_path, sizeof(ua.sun_path), "/tmp/sv_test_mysql.sock");
+            snprintf(ua.sun_path, sizeof(ua.sun_path), "sv_test_mysql.sock");
             uint8_t hs[64] = {0};
             struct timeval tvu = { 3, 0 };
             setsockopt(uf, SOL_SOCKET, SO_RCVTIMEO, &tvu, sizeof(tvu));
             bool okc = uf >= 0 && connect(uf, (struct sockaddr*)&ua, sizeof(ua)) == 0;
             ssize_t gn = okc ? recv(uf, hs, sizeof(hs), 0) : -1;
             struct stat sst;
-            CHECK(okc && gn > 5 && hs[4] == 10 && stat("/tmp/sv_test_mysql.sock", &sst) == 0 && (sst.st_mode & 077) == 0,
+            CHECK(okc && gn > 5 && hs[4] == 10 && stat("sv_test_mysql.sock", &sst) == 0 && (sst.st_mode & 077) == 0,
                   "MySQL handshake over the Unix socket (owner-only): %zd", gn);
             if (uf >= 0) close(uf);
             int f6 = socket(AF_INET6, SOCK_STREAM, 0);
@@ -1375,7 +1419,7 @@ int main(void) {
             struct sockaddr_un ua;
             memset(&ua, 0, sizeof(ua));
             ua.sun_family = AF_UNIX;
-            snprintf(ua.sun_path, sizeof(ua.sun_path), "/tmp/sv_test_mysql.sock");
+            snprintf(ua.sun_path, sizeof(ua.sun_path), "sv_test_mysql.sock");
             struct timeval tvu = { 10, 0 };
             setsockopt(uf, SOL_SOCKET, SO_RCVTIMEO, &tvu, sizeof(tvu));
             m.fd = connect(uf, (struct sockaddr*)&ua, sizeof(ua)) == 0 ? uf : -1;
@@ -1818,7 +1862,7 @@ int main(void) {
         if (s4) { sv_server_stop(s4); pthread_join(th4, NULL); sv_server_free(s4); }
 
         // servizi accesi e spenti con il server in funzione; le query MySQL e le email nel registro
-        SvServerConfig cfg5 = { .port = 0, .token = "tok5", .quiet = true, .mysql_port = 0, .mail_port = 0, .mail_dir = "/tmp/sv_svc_mail" };
+        SvServerConfig cfg5 = { .port = 0, .token = "tok5", .quiet = true, .mysql_port = 0, .mail_port = 0, .mail_dir = "sv_svc_mail" };
         SvServer* s5 = sv_server_start(&cfg5, err, sizeof(err));
         pthread_t th5;
         pthread_create(&th5, NULL, run_server, s5);
@@ -1864,7 +1908,7 @@ int main(void) {
         CHECK(nle == 1 && !strcmp(le[0].svc, "api"), "API requests tagged: %s", nle ? le[0].svc : "");
         resp_free(&r);
         sv_server_stop(s5); pthread_join(th5, NULL); sv_server_free(s5);
-        if (system("rm -rf /tmp/sv_svc_mail")) {}
+        if (system("rm -rf sv_svc_mail")) {}
     }
 
     sv_server_stop(s);
@@ -1877,7 +1921,7 @@ int main(void) {
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
     if (system(cmd)) {}
-    if (g_fail) { printf("server tests: %d of %d checks FAILED\n", g_fail, g_count); return 1; }
-    printf("OK: %d/%d server checks passed\n", g_count, g_count);
+    if (g_fail) { printf("server tests: %d of %d checks FAILED\n", g_fail, g_tests); return 1; }
+    printf("OK: %d/%d server checks passed\n", g_tests, g_tests);
     return 0;
 }

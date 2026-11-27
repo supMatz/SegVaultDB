@@ -22,6 +22,13 @@ HeapFile* heap_open(BufferPool* bp, uint32_t root_page_id, uint32_t num_pages);
 // solo per heap_get (letture per RID, P1.6): niente mappa dello spazio libero, nessuna pagina letta all'apertura.
 // Non usarlo per inserire né per scandire la tabella
 HeapFile* heap_open_read(BufferPool* bp, uint32_t root_page_id, uint32_t num_pages);
+// ultima pagina nota della catena (P1.15): suggerimento dal catalogo all'avvio, perché la prima scrittura dopo un
+// riavvio non legga tutta la tabella per costruire la mappa dello spazio libero. heap_tail_of: quella da salvare
+// (dalla mappa, o il suggerimento non ancora usato; 0 = ignota). heap_tail_forget: catena liberata
+void     heap_tail_hint(BufferPool* bp, uint32_t root, uint32_t tail);
+void     heap_tail_forget(BufferPool* bp, uint32_t root);
+uint32_t heap_tail_of(BufferPool* bp, uint32_t root);
+void     heap_tail_reset(void);
 int heap_insert(HeapFile* hf, Tuple* t, TableSchema* schema, RID* out_rid);
 Tuple* heap_get(HeapFile* hf, RID rid, TableSchema* schema);
 int heap_delete(HeapFile* hf, RID rid);
@@ -85,6 +92,8 @@ bool sv_cancel_now(void);         // annullamento o scadenza, controllati subito
 void sv_scan_set_cancel(atomic_int* flag);
 // solo il flag di questo thread (non quello globale della GUI): per le attese di un lock
 bool sv_thread_cancelled(void);
+void sv_scan_abort(const char* why);   // statement già fallito con questo errore: le scansioni si fermano (NULL = no)
+const char* sv_scan_abort_why(void);   // errore che ha fermato le scansioni (NULL = nessuno)
 void heap_scan_close(HeapScan* scan);
 
 // Una scansione di questo thread ha trovato una pagina illeggibile o danneggiata, una catena di overflow

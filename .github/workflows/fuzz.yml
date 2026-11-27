@@ -12,6 +12,9 @@ on:
         description: "seconds per target"
         default: "600"
 
+permissions:
+  contents: read   # nessun job scrive nel repository (CR-B7)
+
 jobs:
   fuzz:
     runs-on: ubuntu-latest
@@ -20,7 +23,7 @@ jobs:
       matrix:
         target: [sql, json, login, page, catalog, exec, http, h2, smtp, htaccess, regex, sqljson, csv, diff]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libsqlite3-dev
       - name: Build the fuzzer (ASan + UBSan)
@@ -29,7 +32,7 @@ jobs:
         run: |
           mkdir -p work && cd work
           ../fuzz_sv ${{ matrix.target }} ${{ github.event.inputs.seconds || '600' }} ${{ github.run_number }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
         with:
           name: fuzz-${{ matrix.target }}

@@ -2,6 +2,7 @@
 #include "platform_compat.h"
 #include "overflow.h"
 #include "sv_alloc.h"
+#include "../platform_lock.h"
 
 // limite di sicurezza contro catene corrotte (cicli)
 #define HEAP_MAX_CHAIN SV_MAX_PAGE_ID
@@ -30,22 +31,83 @@ struct HeapMeta {
     uint32_t*   hkeys;      // tabella hash page_id -> indice (0 = vuoto: la pagina 0 non è mai di dati)
     uint32_t*   hvals;
     uint32_t    hcap;
+    // mappa parziale (P1.15): costruita dall'ultima pagina nota (heap_tail_hint) invece di leggere tutta la catena;
+    // walk = prossima pagina da visitare dall'inizio della catena, qualche pagina a ogni INSERT finché la mappa
+    // non è completa (poi i buchi lasciati dai DELETE tornano utilizzabili)
+    bool        partial;
+    uint32_t    walk;
     struct HeapMeta* next;
 };
 
 static HeapMeta* g_heaps;
+// Le letture parallele (db_execute_readonly, lock del motore in lettura) aprono le tabelle insieme: la ricerca e
+// l'aggiunta di una mappa a g_heaps passano da questo lock (CR-A1). Le modifiche delle mappe esistenti e la loro
+// rimozione avvengono solo con il motore in esclusiva, quando nessun lettore è dentro.
+static SvRwLock g_heaps_lock = SV_RWLOCK_INIT;
+
+// ultima pagina nota della catena di ogni tabella (dal catalogo all'avvio, o dalla mappa scartata): una catena si
+// libera solo intera e con lei la sua radice (heap_tail_forget), una pagina non esce mai da metà catena; quindi
+// una coda registrata con la sua radice è sempre una pagina della catena (al più non l'ultima: si segue next)
+typedef struct { BufferPool* bp; uint32_t root, tail; } TailHint;
+static TailHint* g_tails;
+static int       g_ntails, g_captails;
+
+static int tail_find(BufferPool* bp, uint32_t root) {
+    for (int i = 0; i < g_ntails; i++) if (g_tails[i].bp == bp && g_tails[i].root == root) return i;
+    return -1;
+}
+
+void heap_tail_hint(BufferPool* bp, uint32_t root, uint32_t tail) {
+    if (!root || !tail) return;
+    int i = tail_find(bp, root);
+    if (i < 0) {
+        if (g_ntails == g_captails) {
+            int nc = g_captails ? g_captails * 2 : 64;
+            TailHint* g = sv_try_realloc(g_tails, sizeof(TailHint) * (size_t)nc);
+            if (!g) return;                       // (solo un suggerimento)
+            g_tails = g;
+            g_captails = nc;
+        }
+        i = g_ntails++;
+    }
+    g_tails[i] = (TailHint){ bp, root, tail };
+}
+
+void heap_tail_forget(BufferPool* bp, uint32_t root) {
+    int i = tail_find(bp, root);
+    if (i >= 0) g_tails[i] = g_tails[--g_ntails];
+}
+
+void heap_tail_reset(void) { free(g_tails); g_tails = NULL; g_ntails = g_captails = 0; }
 
 static void meta_free(HeapMeta* m) {
     free(m->pages); free(m->freeb); free(m->hkeys); free(m->hvals); free(m);
 }
 
 void heap_cache_clear(void) {
-    while (g_heaps) { HeapMeta* n = g_heaps->next; meta_free(g_heaps); g_heaps = n; }
+    while (g_heaps) {
+        HeapMeta* n = g_heaps->next;
+        heap_tail_hint(g_heaps->bp, g_heaps->root, g_heaps->last);   // la coda resta nota (la catena non cambia)
+        meta_free(g_heaps);
+        g_heaps = n;
+    }
 }
 
 void heap_cache_forget(BufferPool* bp, uint32_t root_page_id) {
     for (HeapMeta** pp = &g_heaps; *pp; pp = &(*pp)->next)
-        if ((*pp)->bp == bp && (*pp)->root == root_page_id) { HeapMeta* m = *pp; *pp = m->next; meta_free(m); return; }
+        if ((*pp)->bp == bp && (*pp)->root == root_page_id) {
+            HeapMeta* m = *pp;
+            *pp = m->next;
+            heap_tail_hint(bp, m->root, m->last);
+            meta_free(m);
+            return;
+        }
+}
+
+uint32_t heap_tail_of(BufferPool* bp, uint32_t root_page_id) {
+    for (HeapMeta* m = g_heaps; m; m = m->next) if (m->bp == bp && m->root == root_page_id) return m->last;
+    int i = tail_find(bp, root_page_id);
+    return i >= 0 ? g_tails[i].tail : 0;
 }
 
 static bool meta_hash_put(HeapMeta* m, uint32_t pid, uint32_t idx) {
@@ -79,7 +141,8 @@ static int64_t meta_index(const HeapMeta* m, uint32_t pid) {
     return -1;
 }
 
-static bool meta_append(HeapMeta* m, uint32_t pid, uint16_t freeb) {
+// set_last = false: pagina trovata dalla visita della catena (prima della coda), non la nuova ultima
+static bool meta_add(HeapMeta* m, uint32_t pid, uint16_t freeb, bool set_last) {
     if (m->npages >= m->cap) {
         uint32_t nc = m->cap ? m->cap * 2 : 16;
         uint32_t* np = sv_realloc(m->pages, sizeof(uint32_t) * nc);
@@ -94,8 +157,56 @@ static bool meta_append(HeapMeta* m, uint32_t pid, uint16_t freeb) {
     m->pages[m->npages] = pid;
     m->freeb[m->npages] = freeb;
     m->npages++;
-    m->last = pid;
+    if (set_last) m->last = pid;
     return true;
+}
+
+static bool meta_append(HeapMeta* m, uint32_t pid, uint16_t freeb) { return meta_add(m, pid, freeb, true); }
+
+// mappa parziale: visita fino a budget pagine della catena dall'inizio; completa quando arriva a una pagina già
+// nella mappa (la coda) o alla fine
+static void meta_walk(HeapMeta* m, int budget) {
+    uint32_t pid = m->walk;
+    for (int k = 0; k < budget && m->partial; k++) {
+        if (!pid || meta_index(m, pid) >= 0) { m->partial = false; break; }
+        Page* p = bp_fetch(m->bp, pid);
+        if (!p) { m->partial = false; break; }               // (pagina illeggibile: la mappa resta com'è)
+        uint32_t next = page_next(p);
+        uint16_t fb = page_usable_space(p);
+        bp_unpin(m->bp, pid, false);
+        if (!meta_add(m, pid, fb, false)) { m->partial = false; break; }
+        pid = next;
+    }
+    m->walk = pid;
+}
+
+// mappa parziale dalla coda nota: la coda (controllata: pagina dati della catena) e le pagine dopo di lei
+static HeapMeta* meta_from_tail(BufferPool* bp, uint32_t root_page_id, uint32_t tail) {
+    Page* p = bp_fetch(bp, tail);
+    if (!p) return NULL;
+    bool ok = (p->flags & PAGE_FLAG_CHAINED) && !(p->flags & (PAGE_FLAG_FREE | PAGE_FLAG_OVERFLOW));
+    bp_unpin(bp, tail, false);
+    if (!ok) return NULL;
+    HeapMeta* m = sv_try_calloc(1, sizeof(HeapMeta));
+    if (!m) return NULL;
+    m->bp = bp;
+    m->root = root_page_id;
+    m->partial = true;
+    m->walk = root_page_id;
+    for (uint32_t pid = tail, guard = 0; pid && guard < HEAP_MAX_CHAIN; guard++) {
+        if (meta_index(m, pid) >= 0) break;
+        Page* q = bp_fetch(bp, pid);
+        if (!q) break;
+        uint32_t next = page_next(q);
+        uint16_t fb = page_usable_space(q);
+        bp_unpin(bp, pid, false);
+        if (!meta_append(m, pid, fb)) { meta_free(m); return NULL; }
+        pid = next;
+    }
+    if (!m->npages) { meta_free(m); return NULL; }
+    m->next = g_heaps;
+    g_heaps = m;
+    return m;
 }
 
 // apre la catena (convertendo il formato contiguo precedente) e costruisce la mappa
@@ -160,12 +271,25 @@ HeapFile* heap_open(BufferPool* bp, uint32_t root_page_id, uint32_t num_pages) {
     if (root_page_id == 0) return hf;
 
     HeapMeta* m = NULL;
+    sv_rw_rd(&g_heaps_lock);
     for (HeapMeta* x = g_heaps; x; x = x->next)
         if (x->bp == bp && x->root == root_page_id) { m = x; break; }
-    if (!m) m = meta_build(bp, root_page_id, num_pages);
+    sv_rw_rdunlock(&g_heaps_lock);
+    if (!m) {
+        // costruzione con il lock esclusivo, ripetendo la ricerca: un altro lettore può averla appena aggiunta
+        sv_rw_wr(&g_heaps_lock);
+        for (HeapMeta* x = g_heaps; x; x = x->next)
+            if (x->bp == bp && x->root == root_page_id) { m = x; break; }
+        if (!m) {                                      // dalla coda nota se c'è: niente lettura di tutta la catena
+            int ti = tail_find(bp, root_page_id);
+            if (ti >= 0 && g_tails[ti].tail != root_page_id) m = meta_from_tail(bp, root_page_id, g_tails[ti].tail);
+        }
+        if (!m) m = meta_build(bp, root_page_id, num_pages);
+        sv_rw_wrunlock(&g_heaps_lock);
+    }
     if (m) {
         hf->meta = m;
-        hf->num_pages = m->npages;
+        hf->num_pages = m->partial && num_pages > m->npages ? num_pages : m->npages;
         hf->last_page_id = m->last;
         return hf;
     }
@@ -221,14 +345,15 @@ int heap_insert(HeapFile* hf, Tuple* t, TableSchema* schema, RID* out_rid) {
     if (m) {
         // 1. l'ultima pagina (caso tipico: tabella che cresce)
         // 2. una pagina con un buco abbastanza grande (dopo DELETE)
-        int64_t li = (int64_t)m->npages - 1;
+        if (m->partial) meta_walk(m, 16);              // mappa parziale: si completa un po' alla volta
+        int64_t li = meta_index(m, m->last);           // (non sempre in fondo all'elenco: vedi meta_walk)
         if (li >= 0 && m->freeb[li] >= need) {
             int slot = try_page(hf, m->pages[li], li, data, data_len, NULL);
             if (slot >= 0) { if (out_rid) *out_rid = (RID){m->pages[li], (uint16_t)slot}; free(data); return SV_OK; }
         }
-        while (m->hint + 1 < m->npages && m->freeb[m->hint] < FSM_MIN_USEFUL) m->hint++;
-        for (uint32_t i = m->hint; i + 1 < m->npages; i++) {
-            if (m->freeb[i] < need) continue;
+        while (m->hint < m->npages && ((int64_t)m->hint == li || m->freeb[m->hint] < FSM_MIN_USEFUL)) m->hint++;
+        for (uint32_t i = m->hint; i < m->npages; i++) {
+            if ((int64_t)i == li || m->freeb[i] < need) continue;
             int slot = try_page(hf, m->pages[i], i, data, data_len, NULL);
             if (slot >= 0) { if (out_rid) *out_rid = (RID){m->pages[i], (uint16_t)slot}; free(data); return SV_OK; }
         }
@@ -485,15 +610,25 @@ static _Thread_local atomic_int* t_cancel;          // annullamento di questa co
 void sv_scan_set_cancel(atomic_int* flag) { t_cancel = flag; }
 bool sv_thread_cancelled(void) { return t_cancel && atomic_load(t_cancel); }
 
+// lo statement di questo thread ha già un errore che lo farà fallire (per ora: una regex oltre il limite di passi):
+// le scansioni si fermano invece di rifare il lavoro su ogni riga rimasta. Azzerato a ogni nuovo statement
+static _Thread_local bool t_abort;
+static _Thread_local char t_abort_why[200];
+void sv_scan_abort(const char* why) {
+    t_abort = why != NULL;
+    snprintf(t_abort_why, sizeof(t_abort_why), "%s", why ? why : "");
+}
+const char* sv_scan_abort_why(void) { return t_abort ? t_abort_why : NULL; }
+
 // lo stesso controllo, con la scadenza guardata a ogni chiamata (attese lunghe: SLEEP)
 bool sv_cancel_now(void) {
-    if (atomic_load(&g_sv_scan_cancel)) return true;
+    if (t_abort || atomic_load(&g_sv_scan_cancel)) return true;
     if (t_cancel && atomic_load(t_cancel)) return true;
     return g_scan_deadline > 0 && sv_get_time_ms() > g_scan_deadline;
 }
 
 bool sv_scan_cancelled(void) {
-    if (atomic_load(&g_sv_scan_cancel)) return true;
+    if (t_abort || atomic_load(&g_sv_scan_cancel)) return true;
     if (t_cancel && atomic_load(t_cancel)) return true;
     if (g_scan_deadline > 0 && (++g_scan_ticks & 255) == 0 && sv_get_time_ms() > g_scan_deadline) {
         g_scan_ticks = 255;                  // da qui in poi si controlla ogni volta

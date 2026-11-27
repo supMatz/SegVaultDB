@@ -18,9 +18,8 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "harness.h"
 
-static int g_fail = 0, g_count = 0;
-#define CHECK(cond, ...) do { g_count++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 static int connect_to(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -127,6 +126,7 @@ static const char* MULTI =
 
 int main(int argc, char** argv) {
     if (argc >= 3 && !strcmp(argv[1], "--sendmail")) return mail_sendmail_main(atoi(argv[2]), argc - 3, argv + 3);
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
     char self[1024];
     ssize_t sl = readlink("/proc/self/exe", self, sizeof(self) - 1);
     self[sl > 0 ? sl : 0] = 0;
@@ -278,6 +278,33 @@ int main(int argc, char** argv) {
     r = http(port, "DELETE", "/.segvault/mail/api/messages", NULL);
     CHECK(r.status == 200 && sv_server_mail_count(s) == 0, "delete all: %d", r.status);
     free(r.body);
+    {   // P3.11: 70 allegati in un messaggio (con att[64] gli ultimi 6 sparivano dall'elenco e non si scaricavano)
+        int fd2 = connect_to(mport);
+        char last2[512];
+        CHECK(smtp_reply(fd2, last2, sizeof(last2)) == 220, "greeting 2: %s", last2);
+        CHECK(cmd(fd2, "HELO t\r\n", last2, sizeof(last2)) == 250 && cmd(fd2, "MAIL FROM:<a@x.test>\r\n", last2, sizeof(last2)) == 250 &&
+              cmd(fd2, "RCPT TO:<b@x.test>\r\n", last2, sizeof(last2)) == 250 && cmd(fd2, "DATA\r\n", last2, sizeof(last2)) == 354, "envelope: %s", last2);
+        wr(fd2, "Subject: many\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n");
+        for (int i = 0; i < 70; i++) {
+            char part[200];
+            snprintf(part, sizeof(part), "--B\r\nContent-Type: text/csv\r\nContent-Disposition: attachment; filename=\"f%02d.csv\"\r\n\r\nn,%d\r\n", i, i);
+            wr(fd2, part);
+        }
+        CHECK(cmd(fd2, "--B--\r\n.\r\n", last2, sizeof(last2)) == 250, "70 attachments queued: %s", last2);
+        cmd(fd2, "QUIT\r\n", last2, sizeof(last2));
+        close(fd2);
+        r = http(port, "GET", "/.segvault/mail/api/messages/latest", NULL);
+        CHECK(r.status == 200 && has(&r, "\"name\":\"f69.csv\""), "70th attachment listed: %.200s", r.body);
+        int id = 0;
+        const char* ip = r.body ? strstr(r.body, "\"id\":") : NULL;
+        if (ip) id = atoi(ip + 5);
+        free(r.body);
+        char url[80];
+        snprintf(url, sizeof(url), "/.segvault/mail/%d/att/69", id);
+        r = http(port, "GET", url, NULL);
+        CHECK(r.status == 200 && r.len == 4 && !memcmp(r.body, "n,69", 4), "70th attachment download: %d %s [%.40s]", r.status, url, r.body ? r.body : "");
+        free(r.body);
+    }
     sv_server_stop(s);
     pthread_join(th, NULL);
     sv_server_free(s);
@@ -328,6 +355,6 @@ int main(int argc, char** argv) {
     char rm[400];
     snprintf(rm, sizeof(rm), "rm -rf %s", tmp);
     if (system(rm)) {}
-    printf("test_mail: %d checks, %d failed\n", g_count, g_fail);
+    printf("test_mail: %d checks, %d failed\n", g_tests, g_fail);
     return g_fail ? 1 : 0;
 }

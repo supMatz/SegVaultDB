@@ -19,9 +19,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
+#include "harness.h"
 
-static int g_fail = 0, g_count = 0;
-#define CHECK(cond, ...) do { g_count++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 // ── finto php-cgi ───────────────────────────────────────────────
 
@@ -321,6 +320,7 @@ int main(int argc, char** argv) {
         return 3;
     }
     setenv("SV_TEST_PHP_CHILD", "1", 1);
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
     signal(SIGPIPE, SIG_IGN);
     char self[1024];
     ssize_t sl = readlink("/proc/self/exe", self, sizeof(self) - 1);
@@ -373,13 +373,13 @@ int main(int argc, char** argv) {
     // ── php-cgi avviati da SegVault (qui: questo eseguibile) ──
     {
         SvServerConfig cfg = { .port = 0, .static_dir = www, .quiet = true, .php_cgi = self, .php_workers = 3, .timeout_ms = 1000 };
-        remove("/tmp/sv_php_bind.txt");
-        setenv("SV_FAKE_PHP_BIND", "/tmp/sv_php_bind.txt", 1);
+        remove("sv_php_bind.txt");
+        setenv("SV_FAKE_PHP_BIND", "sv_php_bind.txt", 1);
         SvServer* s = start(&cfg, &th);
         int port = sv_server_port(s);
         CHECK(strstr(sv_server_php(s), "x3"), "describe: %s", sv_server_php(s));
         {   // P2.10: php-cgi ascolta su un socket Unix in una cartella 0700, non su una porta TCP
-            FILE* bf = fopen("/tmp/sv_php_bind.txt", "r");
+            FILE* bf = fopen("sv_php_bind.txt", "r");
             char bp[300] = "";
             if (bf) { if (!fgets(bp, sizeof(bp), bf)) bp[0] = 0; fclose(bf); }
             char* slash = strrchr(bp, '/');
@@ -387,7 +387,7 @@ int main(int argc, char** argv) {
             if (slash) *slash = '\0';
             CHECK(bp[0] == '/' && stat(bp, &ds) == 0 && S_ISDIR(ds.st_mode) && (ds.st_mode & 0777) == 0700,
                   "php-cgi bound to a Unix socket in a 0700 folder: '%s'", bp);
-            remove("/tmp/sv_php_bind.txt");
+            remove("sv_php_bind.txt");
         }
 
         r = req(port, "GET", "/echo.php?x=1&y=%20", "X-Test: abc\r\nProxy: http://evil\r\nUser-Agent: t/1\r\n", NULL);
@@ -834,6 +834,37 @@ int main(int argc, char** argv) {
         snprintf(d, sizeof(d), "%s/private/open", w2); mkdir(d, 0755);
         put(d, ".htaccess", "Require all granted\n");
         put(d, "ok.txt", "aperto");
+        snprintf(d, sizeof(d), "%s/many", w2); mkdir(d, 0755);      // P3.11: oltre 16 blocchi <Files> negati
+        {
+            char ht[2400] = "";
+            for (int i = 0; i < 20; i++) {
+                char blk[100];
+                snprintf(blk, sizeof(blk), "<Files \"f%02d.txt\">\n    Require all denied\n</Files>\n", i);
+                strcat(ht, blk);
+            }
+            put(d, ".htaccess", ht);
+            put(d, "f19.txt", "riservato");
+            put(d, "libero.txt", "pubblico");
+        }
+        snprintf(d, sizeof(d), "%s/conds", w2); mkdir(d, 0755);     // P3.11: oltre 32 RewriteCond prima della regola
+        {
+            char ht[4000] = "RewriteEngine On\n";
+            for (int i = 0; i < 39; i++) strcat(ht, "RewriteCond %{REQUEST_URI} x\n");
+            strcat(ht, "RewriteCond %{QUERY_STRING} ^k=1$\nRewriteRule ^x\\.txt$ - [F]\n");
+            // condizione con un modello non valido: la regola non scatta (né senza quella condizione) e tiene
+            // il suo posto: S=1 della regola prima salta lei, non la [F] dopo
+            strcat(ht, "RewriteCond %{QUERY_STRING} (aperta\nRewriteRule ^y\\.txt$ - [F]\n"
+                       "RewriteRule ^z\\.txt$ - [S=1]\nRewriteCond %{QUERY_STRING} (aperta\nRewriteRule ^z\\.txt$ - [L]\n"
+                       "RewriteRule ^z\\.txt$ - [F]\n");
+            put(d, ".htaccess", ht);
+            put(d, "x.txt", "ics");
+            put(d, "y.txt", "ipsilon");
+            put(d, "z.txt", "zeta");
+        }
+        snprintf(d, sizeof(d), "%s/unread", w2); mkdir(d, 0755);    // .htaccess che non si può leggere: cartella negata
+        put(d, ".htaccess", "Require all granted\n");
+        put(d, "u.txt", "nascosto");
+        { char hp[1400]; snprintf(hp, sizeof(hp), "%s/.htaccess", d); chmod(hp, 0); }
         snprintf(d, sizeof(d), "%s/skipneg", w2); mkdir(d, 0755);   // trovato dal fuzzer (P3.3): S= negativo
         put(d, ".htaccess", "RewriteEngine On\nRewriteRule ^x - [S=-9]\nRewriteRule ^x$ y.txt [L]\n");
         put(d, "y.txt", "ipsilon");
@@ -910,6 +941,29 @@ int main(int argc, char** argv) {
         r = req(port, "GET", "/app.txt", NULL, NULL);
         CHECK(r.status == 200 && !strcmp(r.body, "testo"), "other files allowed: %d", r.status);
         rfree(&r);
+        r = req(port, "GET", "/many/f19.txt", NULL, NULL);
+        CHECK(r.status == 403 && !has(&r, "riservato"), "20th <Files> deny block: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/many/libero.txt", NULL, NULL);
+        CHECK(r.status == 200 && !strcmp(r.body, "pubblico"), "file outside the deny blocks: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/conds/x.txt", NULL, NULL);
+        CHECK(r.status == 200 && !strcmp(r.body, "ics"), "40th RewriteCond false: rule must not fire: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/conds/x.txt?k=1", NULL, NULL);
+        CHECK(r.status == 403, "all 40 RewriteCond true: rule fires: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/conds/y.txt", NULL, NULL);
+        CHECK(r.status == 200 && !strcmp(r.body, "ipsilon"), "rule with a broken RewriteCond disabled, not unconditional: %d", r.status);
+        rfree(&r);
+        r = req(port, "GET", "/conds/z.txt", NULL, NULL);
+        CHECK(r.status == 403, "S=1 still counts the disabled rule: %d", r.status);
+        rfree(&r);
+        if (geteuid() != 0) {
+            r = req(port, "GET", "/unread/u.txt", NULL, NULL);
+            CHECK(r.status == 403 && !has(&r, "nascosto"), "unreadable .htaccess: directory denied: %d", r.status);
+            rfree(&r);
+        }
         r = req(port, "GET", "/private/secret.txt", NULL, NULL);
         CHECK(r.status == 403 && !has(&r, "password"), "Deny from all: %d", r.status);
         rfree(&r);
@@ -1047,7 +1101,7 @@ int main(int argc, char** argv) {
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
     if (system(cmd)) {}
-    if (g_fail) { printf("php tests: %d of %d checks FAILED\n", g_fail, g_count); return 1; }
-    printf("OK: %d/%d PHP checks passed\n", g_count, g_count);
+    if (g_fail) { printf("php tests: %d of %d checks FAILED\n", g_fail, g_tests); return 1; }
+    printf("OK: %d/%d PHP checks passed\n", g_tests, g_tests);
     return 0;
 }

@@ -232,12 +232,14 @@ bool dec_round(const Dec* a, int scale, Dec* out) {
     }
     // una sola volta, anche per una scala negativa (ROUND(14.5, -1) = 10, non 15 e poi 20)
     int drop = r.scale - scale, first;
+    bool neg = a->neg;                         // prima della divisione: -0.5 diventa una mantissa 0 senza segno, e
+                                               // ROUND(-0.5) dava 1 invece di -1 (ROUND(-0.05, 1) = 0.1)
     div_pow10(&r, drop, &first);
     r.scale = 0;
     if (first >= 5) {                          // a metà o oltre: lontano dallo zero
         Dec one;
         dec_from_u64(1, &one);
-        bool ovf = false, neg = r.neg;
+        bool ovf = false;
         r.neg = false;
         mag_add(&r, &one, &r, &ovf);
         if (ovf) return false;

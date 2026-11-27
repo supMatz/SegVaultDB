@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#define SV_HARNESS_TMP_ONLY
+#include "harness.h"
 
 static char* read_file(const char* path) {
     FILE* f = fopen(path, "rb");
@@ -23,13 +25,14 @@ static char* read_file(const char* path) {
 
 int main(int argc, char** argv) {
     bool verbose = argc > 1 && !strcmp(argv[1], "-v");
+    test_enter_tmpdir();                                  // cartella privata (CR-M9); gli esempi dal sorgente
     const char* files[] = { "examples/01_universita.sql", "examples/02_query_bd1.sql", "examples/03_vincoli.sql",
                             "examples/04_bd2_ottimizzazione.sql", "examples/05_bd2_transazioni_trigger.sql" };
-    if (system("rm -rf /tmp/sv_examples_test && mkdir -p /tmp/sv_examples_test") != 0) return 1;
-    if (!db_init("/tmp/sv_examples_test")) { printf("FAIL: db_init\n"); return 1; }
+    if (system("rm -rf sv_examples_test && mkdir -p sv_examples_test") != 0) return 1;
+    if (!db_init("sv_examples_test")) { printf("FAIL: db_init\n"); return 1; }
     int total = 0, failed = 0;
     for (size_t f = 0; f < sizeof(files) / sizeof(files[0]); f++) {
-        char* text = read_file(files[f]);
+        char* text = read_file(test_src(files[f]));
         if (!text) { printf("FAIL: cannot read %s\n", files[f]); failed++; continue; }
         int len = (int)strlen(text);
         SqlRange* r = malloc(sizeof(SqlRange) * (size_t)(len + 2));
@@ -70,7 +73,7 @@ int main(int argc, char** argv) {
         free(text);
     }
     db_shutdown();
-    if (system("rm -rf /tmp/sv_examples_test") != 0) { /* nulla */ }
+    if (system("rm -rf sv_examples_test") != 0) { /* nulla */ }
     printf("%s: %d/%d example statements behaved as documented\n", failed ? "FAIL" : "OK", total - failed, total);
     return failed ? 1 : 0;
 }

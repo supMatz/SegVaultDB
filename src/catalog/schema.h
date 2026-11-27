@@ -50,8 +50,12 @@ typedef struct {
 #define COLF_UNSIGNED      0x01   // UNSIGNED: niente valori negativi
 #define COLF_ON_UPDATE_NOW 0x02   // ON UPDATE CURRENT_TIMESTAMP
 #define COLF_GENERATED     0x04   // GENERATED ALWAYS AS (espressione): l'espressione sta in comment
+#define COLF_CI            0x08   // COLLATE ..._ci sulla colonna: confronti senza maiuscole (prevale sulla tabella)
+#define COLF_BIN           0x10   // COLLATE ..._bin / _cs sulla colonna: confronti byte per byte (prevale sulla tabella)
 
 // -- definizione indice --
+#define SV_MAX_KEY_COLS    16     // colonne di una chiave / di un indice, come MySQL (P3.12: erano 8)
+
 typedef struct {
     char     name[SV_MAX_NAME_LEN];
     char     col_name[SV_MAX_NAME_LEN];
@@ -61,12 +65,14 @@ typedef struct {
     // ── dal formato v5: tutte le colonne (col_name è la prima, quella usata per cercare) ──
     uint8_t  ncols;            // 0 = solo col_name (cataloghi precedenti)
     uint8_t  fulltext;         // FULLTEXT KEY
-    char     cols[8][SV_MAX_NAME_LEN];
+    char     cols[SV_MAX_KEY_COLS][SV_MAX_NAME_LEN];   // (P3.12: 16 come MySQL; nei cataloghi v5-v7 erano 8)
 } Index;
 
 // -- vincoli di integrità --
-#define SV_MAX_CONSTRAINTS 16
-#define SV_MAX_KEY_COLS    8
+#define SV_MAX_CONSTRAINTS 64     // come gli indici di MySQL (P3.12: erano 16); liste dinamiche dal formato v6
+#define SV_V5_INDEXES      16     // disposizione fissa dei cataloghi v4 / v5 (SegVault <= 1.3): non cambiare
+#define SV_V5_CONSTRAINTS  16
+#define SV_V5_KEY_COLS     8      // disposizione fissa dei cataloghi v4 / v5 e codifica v6 / v7: non cambiare
 #define SV_CHECK_LEN       512
 #define SV_MAX_TREES       16     // indici su disco per tabella
 
@@ -111,6 +117,9 @@ typedef struct {
     Constraint* constraints;
     char      collation[40];   // DEFAULT COLLATE della tabella ("" = utf8mb4_general_ci)
     uint64_t  auto_increment;  // AUTO_INCREMENT = n di CREATE TABLE (prossimo valore minimo; 0 = nessuno)
+    // dal formato v8 (P1.15): ultima pagina nota della catena e la radice a cui si riferisce (vale solo se è ancora
+    // quella della tabella): la prima scrittura dopo un riavvio non legge tutta la tabella (heap_tail_hint)
+    uint32_t  tail_page, tail_root;
     // solo in memoria: impronta dell'ultima versione scritta nel log (catalog_delta)
     uint64_t  logsig;
     // ── dal formato v7: indici su disco (P1.6) ──
@@ -214,6 +223,8 @@ int catalog_get_col_index(TableSchema* t, const char* col_name);
 // ── tabelle di lavoro e copie (P1.11) ──
 // schema_new: struttura e cap colonne in un solo blocco azzerato (free() la libera tutta)
 TableSchema* schema_new(int cap);
+// come schema_new con ni indici e nk vincoli nel blocco (schema_new: nessuno; una tabella di lavoro non cresce oltre)
+TableSchema* schema_new_aux(int cap, int ni, int nk);
 // copia profonda in un blocco nuovo con spazio per extra colonne in più
 TableSchema* schema_dup(const TableSchema* src, int extra);
 // dst prende tutti i campi di src, colonne comprese, tenendo la sua memoria per le colonne (cresce se è del

@@ -71,7 +71,7 @@ static const char* const EXEC_SEEDS[] = {
 };
 static const char* const SQL_WORDS[] = { "SELECT", "FROM", "WHERE", "(", ")", ",", "'", "\"", "`", "--", "/*", "*/", "\\",
     "JOIN", "ON", "UNION", "WITH", "OVER", "CASE", "END", "BEGIN", "(SELECT", "NULL", "IN", "LIMIT", ";", "@", "@@", "?", ":x",
-    "X'", "0x", "1e999", "-", "*", "JSON_TABLE(", "COLUMNS(", "PATH", "NESTED", "LATERAL", "RECURSIVE", "PARTITION BY" };
+    "X'", "0x", "1e999", "-", "*", "JSON_TABLE(", "COLUMNS(", "PATH", "NESTED", "LATERAL", "RECURSIVE", "PARTITION BY", "COLLATE", "utf8mb4_bin", "BINARY", "INSERT(", "COUNT(DISTINCT", "JSON_ARRAY_INSERT(", "JSON_MERGE_PRESERVE(" };
 static const char* const JSON_SEEDS[] = {
     "{\"sql\":\"SELECT ?\",\"params\":[1,\"a\\u0000b\",null,true,-2.5e3],\"database\":\"t\",\"rows\":\"objects\"}",
     "[{\"a\":[1,{\"b\":\"\\ud83d\\ude00\"}]},\"\\\\\\\"\",123456789012345678901234567890]",
@@ -400,11 +400,13 @@ static void run_sqljson(void) {
     char* pr = sj_pretty(doc); free(pr);
     char* se = sj_search(doc, true, "%e%"); free(se);
     char* mp = sj_merge_patch(doc, "{\"a\": null, \"z\": [1]}"); free(mp);
+    char* mv = sj_merge_preserve(doc, doc); free(mv);
+    char* nz = sj_normalize(doc, dl); free(nz);
     sj_contains(doc, dl, "{\"d\": true}", 11);
     for (size_t i = 0; i < sizeof(PATHS) / sizeof(PATHS[0]); i++) {
         const char* st; size_t len;
         sj_extract(doc, PATHS[i], &st, &len);
-        for (int op = 0; op < 4; op++) { char* m = sj_modify(doc, PATHS[i], "[1, \"x\"]", op); free(m); }
+        for (int op = 0; op < 6; op++) { char* m = sj_modify(doc, PATHS[i], "[1, \"x\"]", op); free(m); }
     }
 }
 

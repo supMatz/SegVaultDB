@@ -90,10 +90,11 @@ struct SchemaView {
     char confirm_text[2][200];
     Rect conf_rect, conf_ok, conf_cancel;
 
-    char dbs[64][64];
-    int  ndbs;
+    char (*dbs)[64];                   // tutti i database (P3.11: prima i primi 64)
+    int  ndbs, cap_dbs;
     bool db_menu;
-    int  db_hover;
+    int  db_hover;                     // riga del menu sotto il mouse
+    int  db_scroll, db_rows;           // prima riga mostrata, righe di database che il menu mostra
     Rect db_btn, db_menu_rect;
     LineEdit* newdb;
     LineEdit* exp_path;                // esportazione PNG
@@ -184,6 +185,7 @@ void schema_view_destroy(SchemaView* v) {
     free(v->sql);
     if (v->newdb) widget_destroy((Widget*)v->newdb);
     if (v->exp_path) widget_destroy((Widget*)v->exp_path);
+    free(v->dbs);
     free(v);
 }
 
@@ -229,7 +231,11 @@ void schema_view_sync(SchemaView* v) {
     v->invalid = false;
     v->ndbs = 0;
     NameList* dbs = db_list_databases();
-    for (int i = 0; dbs && i < dbs->count && v->ndbs < 64; i++) snprintf(v->dbs[v->ndbs++], 64, "%.63s", dbs->names[i]);
+    if (dbs && dbs->count > v->cap_dbs) {
+        char (*g)[64] = realloc(v->dbs, sizeof(v->dbs[0]) * (size_t)dbs->count);
+        if (g) { v->dbs = g; v->cap_dbs = dbs->count; }
+    }
+    for (int i = 0; dbs && i < dbs->count && v->ndbs < v->cap_dbs; i++) snprintf(v->dbs[v->ndbs++], 64, "%.63s", dbs->names[i]);
     if (dbs) db_namelist_free(dbs);
     bool exists = false;
     for (int i = 0; i < v->ndbs; i++) exists = exists || !strcmp(v->dbs[i], v->db);
@@ -848,24 +854,41 @@ static void draw_menu(SchemaView* v) {
     }
 }
 
+// righe del menu: db_rows database (da db_scroll) e in fondo "New database…"; r = riga, -1 = nessuna
+static int db_menu_row_db(const SchemaView* v, int r) { return r >= 0 && r < v->db_rows ? v->db_scroll + r : -1; }
+
 static void draw_db_menu(SchemaView* v) {
     if (!v->db_menu) return;
     PlatformWindow* win = v->win;
-    int n = v->ndbs + 1;
-    Rect m = { v->db_btn.x, v->db_btn.y + v->db_btn.h + 4, SV_MAX(v->db_btn.w, 220), n * 28 + 8 + 9 };
+    int top = v->db_btn.y + v->db_btn.h + 4;
+    int room = v->canvas.y + v->canvas.h - top - 8 - 8 - 9 - 28;   // spazio per le righe dei database
+    v->db_rows = SV_CLAMP(room / 28, 1, SV_MAX(1, v->ndbs));
+    if (!v->ndbs) v->db_rows = 0;
+    v->db_scroll = SV_CLAMP(v->db_scroll, 0, SV_MAX(0, v->ndbs - v->db_rows));
+    int n = v->db_rows + 1;
+    Rect m = { v->db_btn.x, top, SV_MAX(v->db_btn.w, 220), n * 28 + 8 + 9 };
     v->db_menu_rect = m;
     platform_fill_rect_rounded(win, (Rect){m.x - 2, m.y + 3, m.w + 4, m.h + 4}, ui_alpha(TH_BG, 170), 10);
     ui_round_box(win, m, TH_SURFACE_2, TH_BORDER_STRONG, 8);
     for (int i = 0; i < n; i++) {
-        int yy = m.y + 4 + i * 28 + (i == v->ndbs ? 9 : 0);
+        int d = db_menu_row_db(v, i);
+        bool is_new = i == v->db_rows;
+        int yy = m.y + 4 + i * 28 + (is_new ? 9 : 0);
         Rect it = { m.x + 4, yy, m.w - 8, 28 };
-        if (i == v->ndbs) platform_fill_rect(win, (Rect){m.x + 8, yy - 5, m.w - 16, 1}, TH_BORDER);
-        bool cur = i < v->ndbs && !strcmp(v->dbs[i], v->db);
+        if (is_new) platform_fill_rect(win, (Rect){m.x + 8, yy - 5, m.w - 16, 1}, TH_BORDER);
+        bool cur = d >= 0 && !strcmp(v->dbs[d], v->db);
         if (i == v->db_hover || cur) platform_fill_rect_rounded(win, it, cur ? TH_ACCENT_SOFT : TH_HOVER, 5);
-        const char* s = i < v->ndbs ? v->dbs[i] : "New database\xe2\x80\xa6";
-        if (i < v->ndbs) ui_icon_database(win, it.x + 14, it.y + 14, 12, TH_ICON_DB);
-        platform_draw_text_ex(win, s, -1, (Point){it.x + (i < v->ndbs ? 28 : 10), ui_text_y(win, it, TH_FONT_UI, FONT_UI)},
-                              cur ? TH_ACCENT_TEXT : i < v->ndbs ? TH_TEXT : TH_ACCENT_TEXT, TH_FONT_UI, FONT_UI);
+        const char* s = d >= 0 ? v->dbs[d] : "New database\xe2\x80\xa6";
+        if (d >= 0) ui_icon_database(win, it.x + 14, it.y + 14, 12, TH_ICON_DB);
+        platform_draw_text_ex(win, s, -1, (Point){it.x + (d >= 0 ? 28 : 10), ui_text_y(win, it, TH_FONT_UI, FONT_UI)},
+                              cur ? TH_ACCENT_TEXT : d >= 0 ? TH_TEXT : TH_ACCENT_TEXT, TH_FONT_UI, FONT_UI);
+        if (is_new && v->ndbs > v->db_rows) {                 // quanti sono e che si può scorrere
+            char more[64];
+            snprintf(more, sizeof(more), "%d-%d of %d \xc2\xb7 scroll", v->db_scroll + 1, v->db_scroll + v->db_rows, v->ndbs);
+            int mw = platform_measure_text_ex(win, more, -1, TH_FONT_SMALL, FONT_UI);
+            platform_draw_text_ex(win, more, -1, (Point){it.x + it.w - mw - 8, ui_text_y(win, it, TH_FONT_SMALL, FONT_UI)},
+                                  TH_TEXT_FAINT, TH_FONT_SMALL, FONT_UI);
+        }
     }
 }
 
@@ -1430,17 +1453,19 @@ SchemaViewAction schema_view_event(SchemaView* v, sEvent* evt) {
 
     // ── menu dei database ──
     if (v->db_menu) {
-        int n = v->ndbs + 1, hit = -1;
+        int n = v->db_rows + 1, hit = -1;
         for (int i = 0; i < n; i++) {
-            Rect it = { v->db_menu_rect.x + 4, v->db_menu_rect.y + 4 + i * 28 + (i == v->ndbs ? 9 : 0), v->db_menu_rect.w - 8, 28 };
+            Rect it = { v->db_menu_rect.x + 4, v->db_menu_rect.y + 4 + i * 28 + (i == v->db_rows ? 9 : 0), v->db_menu_rect.w - 8, 28 };
             if (in_rect(it, v->mx, v->my)) hit = i;
         }
         if (evt->type == EVT_MOUSE_MOVE) { v->db_hover = hit; return SCV_REDRAW; }
+        if (evt->type == EVT_MOUSE_WHEEL) { v->db_scroll -= evt->wheel_delta; return SCV_REDRAW; }   // clamp nel disegno
         if (evt->type == EVT_KEY_DOWN && evt->key == KEY_ESCAPE) { v->db_menu = false; return SCV_REDRAW; }
         if (evt->type == EVT_MOUSE_DOWN) {
             v->db_menu = false;
-            if (hit == v->ndbs) open_newdb(v);
-            else if (hit >= 0) schema_view_show_db(v, v->dbs[hit], NULL);
+            int d = db_menu_row_db(v, hit);
+            if (hit == v->db_rows) open_newdb(v);
+            else if (d >= 0) schema_view_show_db(v, v->dbs[d], NULL);
             return SCV_REDRAW;
         }
         return evt->type == EVT_MOUSE_UP ? SCV_NONE : SCV_REDRAW;
@@ -1562,7 +1587,12 @@ SchemaViewAction schema_view_event(SchemaView* v, sEvent* evt) {
     // ── click ──
     int x = v->mx, y = v->my;
     if (evt->mouse_button == SV_MOUSE_LEFT && y < v->canvas.y) {
-        if (in_rect(v->db_btn, x, y)) { v->db_menu = !v->db_menu; v->db_hover = -1; return SCV_REDRAW; }
+        if (in_rect(v->db_btn, x, y)) {
+            v->db_menu = !v->db_menu;
+            v->db_hover = -1;
+            for (int i = 0; i < v->ndbs; i++) if (!strcmp(v->dbs[i], v->db)) v->db_scroll = i;   // il corrente in vista
+            return SCV_REDRAW;
+        }
         if (in_rect(v->b_table, x, y)) return new_table_default(v);
         if (in_rect(v->b_newdb, x, y)) { open_newdb(v); return SCV_REDRAW; }
         if (in_rect(v->b_export, x, y)) { open_export(v); return SCV_REDRAW; }

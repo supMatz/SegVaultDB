@@ -16,9 +16,8 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include "harness.h"
 
-static int g_fail = 0, g_count = 0;
-#define CHECK(cond, ...) do { g_count++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 static char g_ca[600];
 
@@ -78,6 +77,7 @@ static void* thread_monitor(void* a) {
 }
 
 int main(void) {
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
     if (system("curl --version 2>/dev/null | grep -q HTTP2") != 0) { printf("test_tls: curl with HTTP/2 not found, skipped\n"); return 0; }
     char tmp[] = "/tmp/sv_tls_XXXXXX";
     if (!mkdtemp(tmp)) return 1;
@@ -340,6 +340,6 @@ int main(void) {
         CHECK(stat(cmd, &st2) == 0, "the old CA is kept as ca.crt.old");
     }
     if (system(rm)) {}
-    printf("test_tls: %d checks, %d failed\n", g_count, g_fail);
+    printf("test_tls: %d checks, %d failed\n", g_tests, g_fail);
     return g_fail ? 1 : 0;
 }

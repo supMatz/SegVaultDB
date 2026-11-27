@@ -96,6 +96,11 @@ void executor_set_drop_hook(void (*hook)(uint32_t root));
 // indici su disco (P1.6): hook chiamato quando una scrittura azzera gli alberi di una tabella (il motore lo registra
 // nel log prima della riga); scrittura degli alberi al checkpoint; radici abbandonate da liberare; contatore
 void executor_set_tree_hook(void (*hook)(void));
+// diario degli indici in memoria (ROLLBACK senza ricostruirli): sorgenti di sequenza / transazione, annullamento
+// per tabella dopo il ripristino delle pagine, voci da buttare a COMMIT / ROLLBACK [TO]
+void executor_set_tx_source(uint64_t (*seq)(void), uint64_t (*tx)(void));
+void executor_index_undo(BufferPool* bp, const char* db, const char* table, uint32_t root_page_id, uint64_t tx, uint64_t after);
+void executor_index_journal_drop(uint64_t tx, uint64_t after);
 // risultati in streaming (P1.14): per la prossima SELECT di primo livello di questo thread. begin riceve il primo
 // blocco (nomi e tipi delle colonne), rows ogni blocco (anche il primo); false = interrompere. La SELECT restituisce
 // allora un QueryResult senza righe con streamed = true e streamed_rows (se la query non si può fare a blocchi,

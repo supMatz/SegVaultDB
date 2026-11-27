@@ -206,17 +206,20 @@ int cgi_exec(const char* script, const char* const* env, const char* body, size_
 
 #else   // Windows
 
+int sv_win_trusted_path(const char* path);       // src/platform/win_acl.c (CR-M8)
+
 static bool find_exe(const char* name, char* out, size_t n) {
     char nm[300];
     snprintf(nm, sizeof(nm), "%s", base_of(name));
     if (!strchr(nm, '.')) strncat(nm, ".exe", sizeof(nm) - strlen(nm) - 1);
+    // SearchPathA guarda anche nella cartella corrente: il risultato vale solo se nessun altro utente lo controlla
     DWORD r = SearchPathA(NULL, nm, NULL, (DWORD)n, out, NULL);
-    if (r > 0 && r < n) return true;
+    if (r > 0 && r < n && sv_win_trusted_path(out)) return true;
     // /usr/bin/perl non esiste su Windows: le installazioni comuni
     static const char* const DIRS[] = { "C:\\Strawberry\\perl\\bin\\", "C:\\xampp\\perl\\bin\\", "C:\\Perl64\\bin\\", "C:\\Ruby33-x64\\bin\\" };
     for (size_t i = 0; i < sizeof(DIRS) / sizeof(DIRS[0]); i++) {
         snprintf(out, n, "%s%s", DIRS[i], nm);
-        if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return true;
+        if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES && sv_win_trusted_path(out)) return true;
     }
     return false;
 }

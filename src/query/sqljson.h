@@ -26,7 +26,9 @@ char*       sj_keys(const char* value, size_t len);                 // ["a", "b"
 bool        sj_contains(const char* target, size_t tl, const char* cand, size_t cl);
 int         sj_depth(const char* value);
 char*       sj_pretty(const char* doc);
+char*       sj_normalize(const char* value, size_t len);   // forma di MySQL: {"a": 1, "b": [1, 2]} (malloc)
 char*       sj_search(const char* doc, bool all, const char* pattern);   // NULL se nessuna corrispondenza
 char*       sj_merge_patch(const char* a, const char* patch);
+char*       sj_merge_preserve(const char* a, const char* p);   // JSON_MERGE_PRESERVE / JSON_MERGE
 
 #endif

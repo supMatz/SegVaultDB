@@ -6,6 +6,7 @@
 #include "../server/server.h"
 #include "../server/fastcgi.h"
 #include "../server/tls.h"
+#include "../platform_compat.h"      // prima di windows.h (come service.c): niente dichiarazioni doppie
 #ifndef _WIN32
 #include <unistd.h>
 #include <limits.h>
@@ -207,8 +208,8 @@ struct ServerPanel {
     int             log_filter;      // registro: 0 tutto, 1 web, 2 PHP, 3 API, 4 MySQL, 5 posta
     int             mail_count;
     // siti con nome da server.ini ("site.blog=/percorso" o "site.app=http://127.0.0.1:5173")
-    char            site_name[32][64];
-    char            site_target[32][1024];
+    // (senza tetto, P3.11: con 32 il pannello ne leggeva 32 e riscrivendo il file cancellava gli altri)
+    SvSite*         sites;           // name / target malloc'd (sites_free)
     int             n_sites;
     int             flash_hit;
     uint64_t        flash_until;
@@ -280,8 +281,11 @@ static bool token_load(ServerPanel* p, bool regenerate) {
         }
     }
     if (!sv_random_token(p->token, 24)) { p->token[0] = '\0'; return false; }
-    FILE* f = fopen(path, "wb" SV_FE);
-    if (f) { fprintf(f, "%s\n", p->token); fclose(f); }
+    // il token apre l'API: solo il proprietario lo legge (0600 / ACL protetta), scritto per intero o niente
+    char tmp[620];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE* f = sv_fopen_private(tmp, "wb");
+    if (f) { fprintf(f, "%s\n", p->token); sv_fclose_replace(f, tmp, path); }
     return true;
 }
 
@@ -290,37 +294,89 @@ static void web_path(ServerPanel* p, char* out, size_t n) {
     snprintf(out, n, "%s%s%s", p->data_dir, p->data_dir[0] ? "/" : "", "server.ini");
 }
 
-static void web_load(ServerPanel* p) {
-    char path[600], line[1200];
-    p->web_dir[0] = '\0';
-    p->php_cgi[0] = '\0';
+static void sites_free(ServerPanel* p) {
+    for (int i = 0; i < p->n_sites; i++) { free((char*)p->sites[i].name); free((char*)p->sites[i].target); }
+    free(p->sites);
+    p->sites = NULL;
     p->n_sites = 0;
-    web_path(p, path, sizeof(path));
-    FILE* f = fopen(path, "rb" SV_FE);
-    if (!f) return;
-    while (fgets(line, sizeof(line), f)) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (!strncmp(line, "web_folder=", 11)) snprintf(p->web_dir, sizeof(p->web_dir), "%.1000s", line + 11);
-        if (!strncmp(line, "php_cgi=", 8)) snprintf(p->php_cgi, sizeof(p->php_cgi), "%.1000s", line + 8);
-        char* eq = strchr(line, '=');
-        if (!strncmp(line, "site.", 5) && eq && eq - line > 5 && eq - line < 5 + 63 && p->n_sites < 32) {
-            snprintf(p->site_name[p->n_sites], sizeof(p->site_name[0]), "%.*s", (int)(eq - line - 5), line + 5);
-            snprintf(p->site_target[p->n_sites], sizeof(p->site_target[0]), "%.1000s", eq + 1);
-            p->n_sites++;
-        }
-    }
-    fclose(f);
 }
 
-static void web_save(ServerPanel* p) {
+#define WEB_INI_MAX (1 << 20)        // server.ini è una manciata di righe: oltre 1 MB non lo si tocca
+
+// tutto server.ini in memoria (terminato da '\0'); NULL se manca. *too_big: c'è ma non lo si legge
+static char* web_read(const char* path, bool* too_big) {
+    *too_big = false;
+    FILE* f = fopen(path, "rb" SV_FE);
+    if (!f) return NULL;
+    char* buf = malloc(WEB_INI_MAX + 1);
+    size_t n = buf ? fread(buf, 1, WEB_INI_MAX + 1, f) : 0;
+    bool err = !buf || ferror(f) || n > WEB_INI_MAX;
+    fclose(f);
+    if (err) { free(buf); *too_big = true; return NULL; }
+    buf[n] = '\0';
+    return buf;
+}
+
+static void web_load(ServerPanel* p) {
     char path[600];
+    p->web_dir[0] = '\0';
+    p->php_cgi[0] = '\0';
+    sites_free(p);
     web_path(p, path, sizeof(path));
-    FILE* f = fopen(path, "wb" SV_FE);
-    if (!f) return;
+    bool too_big;
+    char* buf = web_read(path, &too_big);
+    if (!buf) return;
+    int cap = 0;
+    for (char* line = buf; line && *line; ) {
+        char* nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        size_t l = strlen(line);
+        if (l && line[l - 1] == '\r') line[--l] = '\0';
+        if (!strncmp(line, "web_folder=", 11)) snprintf(p->web_dir, sizeof(p->web_dir), "%s", line + 11);
+        if (!strncmp(line, "php_cgi=", 8)) snprintf(p->php_cgi, sizeof(p->php_cgi), "%s", line + 8);
+        char* eq = strchr(line, '=');
+        if (!strncmp(line, "site.", 5) && eq && eq - line > 5) {
+            if (p->n_sites == cap) {
+                int nc = cap ? cap * 2 : 16;
+                SvSite* g = realloc(p->sites, sizeof(SvSite) * (size_t)nc);
+                if (!g) break;
+                p->sites = g; cap = nc;
+            }
+            char* name = malloc((size_t)(eq - line - 5) + 1);
+            char* target = strdup(eq + 1);
+            if (!name || !target) { free(name); free(target); break; }
+            memcpy(name, line + 5, (size_t)(eq - line - 5));
+            name[eq - line - 5] = '\0';
+            p->sites[p->n_sites].name = name;
+            p->sites[p->n_sites].target = target;
+            p->n_sites++;             // nome e indirizzo li controlla il server (errore visibile all'avvio)
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    free(buf);
+}
+
+// riscrive solo le chiavi del pannello (web_folder, php_cgi): le altre righe (siti, commenti, chiavi che il
+// pannello non conosce) restano come sono. Atomico: tmp + fsync + rename
+static void web_save(ServerPanel* p) {
+    char path[600], tmp[620];
+    web_path(p, path, sizeof(path));
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    bool too_big;
+    char* old = web_read(path, &too_big);
+    if (too_big) return;                                  // non si riscrive un file che non si è letto
+    FILE* f = fopen(tmp, "wb" SV_FE);
+    if (!f) { free(old); return; }
     fprintf(f, "web_folder=%s\n", p->web_dir);
     if (p->php_cgi[0]) fprintf(f, "php_cgi=%s\n", p->php_cgi);
-    for (int i = 0; i < p->n_sites; i++) fprintf(f, "site.%s=%s\n", p->site_name[i], p->site_target[i]);
-    fclose(f);
+    for (char* line = old; line && *line; ) {
+        char* nl = strchr(line, '\n');
+        size_t l = nl ? (size_t)(nl - line) : strlen(line);
+        if (strncmp(line, "web_folder=", 11) && strncmp(line, "php_cgi=", 8)) fprintf(f, "%.*s\n", (int)l, line);
+        line = nl ? nl + 1 : NULL;
+    }
+    free(old);
+    sv_fclose_replace(f, tmp, path);
 }
 
 static void save_settings(ServerPanel* p) {
@@ -401,13 +457,11 @@ bool server_panel_start(ServerPanel* p) {
             return false;
         }
     }
-    SvSite sites[32];
-    for (int i = 0; i < p->n_sites; i++) { sites[i].name = p->site_name[i]; sites[i].target = p->site_target[i]; }
     char mail_dir[600], cert_dir[600];
     snprintf(cert_dir, sizeof(cert_dir), "%s%scerts", p->data_dir, p->data_dir[0] ? "/" : "");
     snprintf(mail_dir, sizeof(mail_dir), "%s%smail", p->data_dir, p->data_dir[0] ? "/" : "");
     SvServerConfig cfg = {
-        .sites       = sites,
+        .sites       = p->sites,
         .n_sites     = p->n_sites,
         .dir_listing = true,
         .cgi         = g_settings.server_cgi != 0,
@@ -478,6 +532,7 @@ void server_panel_destroy(ServerPanel* p) {
     if (p->btn_copy) widget_destroy((Widget*)p->btn_copy);
     if (p->btn_editor) widget_destroy((Widget*)p->btn_editor);
     if (p->web_edit) widget_destroy((Widget*)p->web_edit);
+    sites_free(p);
     free(p);
 }
 
@@ -611,6 +666,10 @@ static void draw_toolbar(ServerPanel* p, int W) {
 
     // pulsanti: avvia / ferma, copia indirizzo (come Run e Run statement)
     int x = vr.x + vr.w + 24;
+    // i colori dei pulsanti si prendono dal tema quando si imposta lo stile: rifatto a ogni disegno, così seguono un
+    // cambio di tema (prima "Copy address" e "Open SQL editor" restavano neri nel tema chiaro)
+    if (p->btn_copy) button_set_style(p->btn_copy, p->btn_copy->style);
+    if (p->btn_editor) button_set_style(p->btn_editor, p->btn_editor->style);
     Button* t = p->btn_toggle;
     if (t) {
         button_set_label(t, running ? "Stop server" : "Start server");

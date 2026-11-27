@@ -1,4 +1,5 @@
 #include "grid_edit.h"
+#include "sql_quote.h"
 #include "../table/binesc.h"
 #include <ctype.h>
 #include <stdio.h>
@@ -8,35 +9,13 @@
 
 // ── testo che cresce ────────────────────────────────────────────
 
-typedef struct { char* p; size_t n, cap; bool oom; } GBuf;
+typedef SvStrBuf GBuf;                                       // buffer comune (CR-B2)
+#define gb_add svsb_put
+#define gb_str svsb_puts
+#define gb_done svsb_take
 
-static void gb_add(GBuf* b, const char* s, size_t n) {
-    if (b->oom) return;
-    if (b->n + n + 1 > b->cap) {
-        size_t cap = b->cap ? b->cap * 2 : 256;
-        while (cap < b->n + n + 1) cap *= 2;
-        char* p = realloc(b->p, cap);
-        if (!p) { b->oom = true; return; }
-        b->p = p;
-        b->cap = cap;
-    }
-    memcpy(b->p + b->n, s, n);
-    b->n += n;
-    b->p[b->n] = '\0';
-}
-static void gb_str(GBuf* b, const char* s) { gb_add(b, s, strlen(s)); }
-
-static char* gb_done(GBuf* b) {
-    if (b->oom) { free(b->p); return NULL; }
-    return b->p ? b->p : strdup("");
-}
-
-// nome tra backtick: funziona anche con parole riservate
-static void gb_ident(GBuf* b, const char* name) {
-    gb_str(b, "`");
-    gb_str(b, name);
-    gb_str(b, "`");
-}
+// nome tra backtick: funziona anche con parole riservate (un nome con backtick rende il buffer non valido)
+#define gb_ident sql_ident_sb
 
 // 'testo' con apici raddoppiati e backslash raddoppiati (il lexer tratta \ come escape)
 static void gb_quoted(GBuf* b, const char* s) {
@@ -58,13 +37,13 @@ void grid_edit_analyze(GridEdit* ge, const QueryResult* r) {
     memset(ge, 0, sizeof(*ge));
     ge->r = r;
     ge->row_table = -1;
-    for (int c = 0; c < 64; c++) ge->col_table[c] = -1;
+    for (int c = 0; c < GE_MAX_COLS; c++) ge->col_table[c] = -1;
     if (!r || !r->success || r->num_cols == 0) { snprintf(ge->why, sizeof(ge->why), "No result to edit"); return; }
     if (!r->col_tables) {
         snprintf(ge->why, sizeof(ge->why), "Read-only: the rows come from GROUP BY, DISTINCT, UNION or a view");
         return;
     }
-    if (r->num_cols > 64) { snprintf(ge->why, sizeof(ge->why), "Read-only: too many columns"); return; }
+    if (r->num_cols > GE_MAX_COLS) { snprintf(ge->why, sizeof(ge->why), "Read-only: more than %d columns", GE_MAX_COLS); return; }
     snprintf(ge->db, sizeof(ge->db), "%s", r->source_db);
 
     for (int c = 0; c < r->num_cols; c++) {
@@ -121,7 +100,7 @@ bool grid_edit_any(const GridEdit* ge) {
 }
 
 bool grid_edit_cell_ok(const GridEdit* ge, int col) {
-    if (!ge->r || col < 0 || col >= ge->r->num_cols || col >= 64) return false;
+    if (!ge->r || col < 0 || col >= ge->r->num_cols || col >= GE_MAX_COLS) return false;
     int t = ge->col_table[col];
     return t >= 0 && ge->t[t].key_ok;
 }
@@ -167,7 +146,7 @@ static void gb_value(GBuf* b, const char* type, const char* v) {
 
 char* grid_edit_literal(const GridEdit* ge, int col, const char* value) {
     GBuf b = {0};
-    gb_value(&b, col >= 0 && col < 64 ? ge->col_type[col] : "", value ? value : "");
+    gb_value(&b, col >= 0 && col < GE_MAX_COLS ? ge->col_type[col] : "", value ? value : "");
     return gb_done(&b);
 }
 
@@ -243,7 +222,7 @@ char* grid_edit_insert_sql(const GridEdit* ge, const char* const* values, const 
     GBuf b = {0};
     gb_str(&b, "INSERT INTO ");
     gb_ident(&b, ge->t[t].name);
-    for (int c = 0; c < ge->r->num_cols && c < 64; c++) {
+    for (int c = 0; c < ge->r->num_cols && c < GE_MAX_COLS; c++) {
         if (!set[c] || ge->col_table[c] != t) continue;
         gb_str(&b, n++ ? ", " : " (");
         gb_ident(&b, ge->r->col_columns[c]);
@@ -255,7 +234,7 @@ char* grid_edit_insert_sql(const GridEdit* ge, const char* const* values, const 
     }
     gb_str(&b, ") VALUES (");
     n = 0;
-    for (int c = 0; c < ge->r->num_cols && c < 64; c++) {
+    for (int c = 0; c < ge->r->num_cols && c < GE_MAX_COLS; c++) {
         if (!set[c] || ge->col_table[c] != t) continue;
         if (n++) gb_str(&b, ", ");
         if (nulls[c]) gb_str(&b, "NULL");
@@ -270,7 +249,7 @@ char* grid_edit_fetch_sql(const GridEdit* ge, int t, const char* const* key_vals
     GBuf b = {0};
     gb_str(&b, "SELECT ");
     int n = 0;
-    for (int c = 0; c < ge->r->num_cols && c < 64; c++) {
+    for (int c = 0; c < ge->r->num_cols && c < GE_MAX_COLS; c++) {
         if (ge->col_table[c] != t) continue;
         if (n++) gb_str(&b, ", ");
         gb_ident(&b, ge->r->col_columns[c]);

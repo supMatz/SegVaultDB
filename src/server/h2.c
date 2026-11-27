@@ -353,13 +353,15 @@ static bool hpack_decode(DynTable* d, size_t max_table, const uint8_t* p, size_t
         }
         if (ok) {
             if (k == cap) { cap *= 2; Hdr* nv = realloc(v, sizeof(Hdr) * (size_t)cap); if (!nv) { ok = false; } else v = nv; }
-            if (ok && k < 512) {
+            if (ok && k >= 512) ok = false;    // troppe intestazioni: blocco rifiutato (prima le oltre 512 sparivano)
+            if (ok) {
                 // il nome resta com'è: HTTP/2 vuole nomi in minuscolo e uno in maiuscolo rende la richiesta
                 // malformata (open_stream la rifiuta); troppo lungo = non valido, mai troncato
                 if (strlen(nm) >= sizeof(v[k].name)) snprintf(v[k].name, sizeof(v[k].name), "\x01");
                 else snprintf(v[k].name, sizeof(v[k].name), "%s", nm);
                 v[k].value = strdup(val ? val : "");
-                k++;
+                if (!v[k].value) ok = false;
+                else k++;
             }
             if (ok && add) dyn_add(d, nm, strlen(nm), val ? val : "", val ? strlen(val) : 0);
         }

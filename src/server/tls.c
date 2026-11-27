@@ -28,7 +28,9 @@ SCOPO: HTTPS con OpenSSL caricato all'avvio (vedi tls.h).
   #define sock_close closesocket
   #define SEND_FLAGS 0
   typedef HMODULE lib_t;
-  static lib_t lib_open(const char* n) { return LoadLibraryA(n); }
+  // percorso completo; le DLL da cui dipende si cercano nella sua cartella, non nella cartella corrente (CR-M8)
+  static lib_t lib_open(const char* n) { return LoadLibraryExA(n, NULL, LOAD_WITH_ALTERED_SEARCH_PATH); }
+  int sv_win_trusted_path(const char* path);     // src/platform/win_acl.c
   static void* lib_sym(lib_t l, const char* n) { return (void*)GetProcAddress(l, n); }
   static void lib_close(lib_t l) { FreeLibrary(l); }
   typedef CRITICAL_SECTION tls_mx;
@@ -215,18 +217,30 @@ static bool openssl_load(char* err, size_t errsz) {
     DWORD n = GetModuleFileNameA(NULL, dir, sizeof(dir));
     if (n > 0 && n < sizeof(dir)) { char* sl = strrchr(dir, '\\'); if (sl) *sl = '\0'; else dir[0] = '\0'; }
     static const char* const V[] = { "4", "3" };
-    static const char* const SUB[] = { "", "\\php", "" };
+    static const char* const SUB[] = { "", "\\php" };
     for (int k = 0; k < 2 && !found; k++)
-        for (int d = 0; d < 3 && !found; d++) {
+        for (int d = 0; d < 2 && !found; d++) {
+            if (!dir[0]) continue;
             char a[1200], b[1200];
-            if (d < 2 && dir[0]) {
-                snprintf(a, sizeof(a), "%s%s\\libssl-%s-x64.dll", dir, SUB[d], V[k]);
-                snprintf(b, sizeof(b), "%s%s\\libcrypto-%s-x64.dll", dir, SUB[d], V[k]);
-            } else if (d == 2) {
-                snprintf(a, sizeof(a), "libssl-%s-x64.dll", V[k]);
-                snprintf(b, sizeof(b), "libcrypto-%s-x64.dll", V[k]);
-            } else continue;
+            snprintf(a, sizeof(a), "%s%s\\libssl-%s-x64.dll", dir, SUB[d], V[k]);
+            snprintf(b, sizeof(b), "%s%s\\libcrypto-%s-x64.dll", dir, SUB[d], V[k]);
             found = load_pair(a, b);
+        }
+    // poi le cartelle assolute del PATH, solo se nessun altro utente le controlla (CR-M8: prima LoadLibraryA per nome,
+    // che cerca anche nella cartella corrente)
+    const char* path = getenv("PATH");
+    for (int k = 0; k < 2 && !found && path; k++)
+        for (const char* q = path; q && *q && !found; ) {
+            const char* e = strchr(q, ';');
+            size_t l = e ? (size_t)(e - q) : strlen(q);
+            if (l >= 3 && l < 900 && q[1] == ':' && (q[2] == '\\' || q[2] == '/')) {
+                char a[1200], b[1200];
+                snprintf(a, sizeof(a), "%.*s\\libssl-%s-x64.dll", (int)l, q, V[k]);
+                snprintf(b, sizeof(b), "%.*s\\libcrypto-%s-x64.dll", (int)l, q, V[k]);
+                if (GetFileAttributesA(a) != INVALID_FILE_ATTRIBUTES && sv_win_trusted_path(a) && sv_win_trusted_path(b))
+                    found = load_pair(a, b);
+            }
+            q = e ? e + 1 : NULL;
         }
 #elif defined(__APPLE__)
     static const char* const P[][2] = { { "libssl.3.dylib", "libcrypto.3.dylib" },

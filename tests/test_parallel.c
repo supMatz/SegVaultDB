@@ -8,9 +8,9 @@
 #include <stdint.h>
 #include <time.h>
 #include <unistd.h>
+#include "harness.h"
 
-static int g_tests, g_fail;
-#define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
 
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 static void run(const char* sql) { QueryResult* r = db_execute(sql); if (!r || !r->success) printf("setup: %s -> %s\n", sql, r ? r->error : "null"); db_result_free(r); }
@@ -33,6 +33,20 @@ static void* reader(void* arg) {
         else if (!r || !r->success || r->num_rows != 1) atomic_fetch_add(&g_bad, 1);
         db_result_free(r);
         atomic_fetch_add(&g_done_reads, 1);
+    }
+    return NULL;
+}
+
+// letture a freddo (CR-A1): ogni thread legge le tre tabelle in un ordine diverso
+static void* cold_reader(void* arg) {
+    static const char* const Q[] = { "SELECT COUNT(*), SUM(v) FROM big WHERE v >= 0", "SELECT SUM(x) FROM w WHERE x >= 0",
+                                     "SELECT COUNT(*) FROM sc WHERE v >= 0" };
+    int k = (int)(intptr_t)arg;
+    for (int i = 0; i < 3; i++) {
+        bool refused;
+        QueryResult* r = db_execute_readonly(Q[(k + i) % 3], "p", NULL, 0, &refused);
+        if (!refused && (!r || !r->success)) atomic_fetch_add(&g_bad, 1);
+        db_result_free(r);
     }
     return NULL;
 }
@@ -121,9 +135,29 @@ static void scan_rounds(int n) {
 }
 static void* scan_reader(void* arg) { (void)arg; scan_rounds(3); return NULL; }
 
+// CR-M1: SELECT a FROM deep WHERE a IN (SELECT a FROM deep WHERE a IN (...)) con 1..30 livelli
+typedef struct { int answered, refused; } DeepRun;
+static void* deep_reader(void* arg) {
+    DeepRun* d = arg;
+    for (int n = 1; n <= 30; n++) {
+        char q[4096];
+        size_t k = 0;
+        for (int i = 0; i < n; i++) k += (size_t)snprintf(q + k, sizeof(q) - k, "SELECT a FROM deep WHERE a IN (");
+        k += (size_t)snprintf(q + k, sizeof(q) - k, "SELECT a FROM deep");
+        for (int i = 0; i < n; i++) q[k++] = ')';
+        q[k] = '\0';
+        QueryResult* r = db_execute(q);
+        if (r && r->success && r->num_rows == 2) d->answered++;
+        else if (r && !r->success) d->refused++;
+        db_result_free(r);
+    }
+    return NULL;
+}
+
 int main(void) {
-    if (system("rm -rf /tmp/sv_par_test && mkdir -p /tmp/sv_par_test") != 0) return 1;
-    if (!db_init("/tmp/sv_par_test")) return 1;
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
+    if (system("rm -rf sv_par_test && mkdir -p sv_par_test") != 0) return 1;
+    if (!db_init("sv_par_test")) return 1;
     run("CREATE DATABASE p"); run("USE p");
     run("CREATE TABLE big (id INT PRIMARY KEY, k INT, v INT)");
     run("CREATE TABLE w (id INT PRIMARY KEY, x INT)");
@@ -233,7 +267,7 @@ int main(void) {
         }
         run("COMMIT");
         db_shutdown();                                          // a freddo: motore riaperto, cache vuota
-        CHECK(db_init("/tmp/sv_par_test"), "reopen for the scaling test");
+        CHECK(db_init("sv_par_test"), "reopen for the scaling test");
         run("USE p");
         run("SET GLOBAL cache_size = 16");
         long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
@@ -254,8 +288,45 @@ int main(void) {
         if (ncpu >= 8 && !getenv("CI")) CHECK(speed >= 2.5, "8 readers do at least 2.5x the work of one (%.2fx)", speed);
     }
 
+    // CR-A1: subito dopo un riavvio, lettori paralleli prima di qualunque lettura da un thread solo: le mappe delle
+    // tabelle si costruiscono insieme (sotto make test-tsan una race su g_heaps comparirebbe qui)
+    {
+        db_shutdown();
+        CHECK(db_init("sv_par_test"), "reopen for the cold parallel test");
+        atomic_store(&g_bad, 0);
+        atomic_store(&g_refused, 0);
+        pthread_t cth[8];
+        for (int i = 0; i < 8; i++) pthread_create(&cth[i], NULL, cold_reader, (void*)(intptr_t)i);
+        for (int i = 0; i < 8; i++) pthread_join(cth[i], NULL);
+        CHECK(atomic_load(&g_bad) == 0, "cold parallel reads all correct (%d bad)", atomic_load(&g_bad));
+    }
+
+    // CR-M1: con lo stack minimo documentato (512 KB, db_api.h) le sottoquery annidate fino al limite del motore e
+    // oltre rispondono o vengono rifiutate, senza esaurire lo stack (prima: crash a 14 livelli con 1 MB)
+    {
+        QueryResult* dq = db_execute("CREATE TABLE deep (a INT)");
+        db_result_free(dq);
+        dq = db_execute("INSERT INTO deep VALUES (1), (2)");
+        db_result_free(dq);
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+#if defined(__SANITIZE_ADDRESS__)
+        size_t stack = 4u << 20;                         // ASan: frame molto più grandi, il limite vale per la build normale
+#else
+        size_t stack = 512u << 10;
+#endif
+        pthread_attr_setstacksize(&at, stack);
+        DeepRun dr = { 0, 0 };
+        pthread_t dt;
+        CHECK(pthread_create(&dt, &at, deep_reader, &dr) == 0, "thread with a small stack");
+        pthread_join(dt, NULL);
+        pthread_attr_destroy(&at);
+        CHECK(dr.answered + dr.refused == 30 && dr.answered >= 5, "nested subqueries on a %u KB stack: %d answered, %d refused",
+              (unsigned)(stack >> 10), dr.answered, dr.refused);
+    }
+
     db_shutdown();
-    if (system("rm -rf /tmp/sv_par_test")) {}
+    if (system("rm -rf sv_par_test")) {}
     if (g_fail) { printf("parallel tests: %d of %d FAILED\n", g_fail, g_tests); return 1; }
     printf("OK: %d/%d parallel checks passed\n", g_tests, g_tests);
     return 0;

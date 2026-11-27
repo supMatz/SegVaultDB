@@ -1,4 +1,6 @@
+#include "../../include/sv_strbuf.h"
 #include "csv_import.h"
+#include "sql_quote.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,22 +11,9 @@
 #define CSV_MAX_COLS   1024    // come SV_MAX_COLUMNS (P1.11; prima 64)
 #define CSV_MAX_FIELD  500     // limite del motore per un valore
 
-typedef struct { char* p; size_t n, cap; bool ok; } Buf;
-
-static void put(Buf* b, const char* s, size_t n) {
-    if (!b->ok) return;
-    if (b->n + n + 1 > b->cap) {
-        size_t cap = b->cap * 2 + n + 4096;
-        char* p = realloc(b->p, cap);
-        if (!p) { b->ok = false; return; }
-        b->p = p;
-        b->cap = cap;
-    }
-    memcpy(b->p + b->n, s, n);
-    b->n += n;
-    b->p[b->n] = '\0';
-}
-static void puts_(Buf* b, const char* s) { put(b, s, strlen(s)); }
+typedef SvStrBuf Buf;                                        // buffer comune (CR-B2)
+#define put svsb_put
+#define puts_ svsb_puts
 
 // ── lettura dei record ───────────────────────────────────────────
 
@@ -51,7 +40,7 @@ static void record_clear(Record* r) {
 static bool read_record(Reader* rd, Record* rec) {
     record_clear(rec);
     if (!*rd->s) return false;
-    Buf field = { NULL, 0, 0, true };
+    Buf field = {0};
     bool quoted = false, in_q = false;
     for (;;) {
         char c = *rd->s;
@@ -76,7 +65,7 @@ static bool read_record(Reader* rd, Record* rec) {
                 free(field.p);
                 rec->too_many = true;
             }
-            field = (Buf){ NULL, 0, 0, true };
+            field = (Buf){0};
             quoted = false;
             if (c == rd->delim) { rd->s++; continue; }
             if (c == '\r') rd->s++;
@@ -209,6 +198,8 @@ char* csv_to_sql(const char* csv, const char* table, bool create_table, char del
     if (!info) info = &dummy;
     memset(info, 0, sizeof(*info));
     if (!csv || !table || !table[0]) { snprintf(info->error, sizeof(info->error), "Missing CSV text or table name"); return NULL; }
+    char qtable[SQL_IDENT_MAX];                  // nomi tra backtick: anche "order", "select" o "date" come intestazione
+    if (!sql_ident(qtable, sizeof(qtable), table)) { snprintf(info->error, sizeof(info->error), "Invalid table name"); return NULL; }
     if ((unsigned char)csv[0] == 0xEF && (unsigned char)csv[1] == 0xBB && (unsigned char)csv[2] == 0xBF) csv += 3;  // BOM
 
     Reader rd = { csv, delimiter ? delimiter : detect_delimiter(csv), 1 };
@@ -269,10 +260,10 @@ char* csv_to_sql(const char* csv, const char* table, bool create_table, char del
     }
     record_clear(&rec);
 
-    Buf b = { NULL, 0, 0, true };
+    Buf b = {0};
     char line[256];
     if (create_table) {
-        snprintf(line, sizeof(line), "CREATE TABLE %.200s (", table);
+        snprintf(line, sizeof(line), "CREATE TABLE %s (", qtable);
         puts_(&b, line);
         for (int c = 0; c < nc; c++) {
             const char* t;
@@ -286,21 +277,21 @@ char* csv_to_sql(const char* csv, const char* table, bool create_table, char del
                     if (n) { snprintf(vb, sizeof(vb), "VARCHAR(%d)", n); t = vb; } else t = "TEXT";
                 }
             }
-            snprintf(line, sizeof(line), "%s\n    %.63s %.31s", c ? "," : "", names[c], t);
+            snprintf(line, sizeof(line), "%s\n    `%.63s` %.31s", c ? "," : "", names[c], t);
             puts_(&b, line);
         }
         puts_(&b, "\n);\n");
     }
 
     // seconda passata: INSERT
-    Buf head = { NULL, 0, 0, true };
-    snprintf(line, sizeof(line), "INSERT INTO %.200s (", table);
+    Buf head = {0};
+    snprintf(line, sizeof(line), "INSERT INTO %s (", qtable);
     puts_(&head, line);
-    for (int c = 0; c < nc; c++) { if (c) puts_(&head, ", "); puts_(&head, names[c]); }
+    for (int c = 0; c < nc; c++) { if (c) puts_(&head, ", "); puts_(&head, "`"); puts_(&head, names[c]); puts_(&head, "`"); }
     puts_(&head, ") VALUES (");
     rd.s = data_start;
     rd.line = data_line;
-    while (head.ok && read_record(&rd, &rec)) {
+    while (!head.oom && read_record(&rd, &rec)) {
         if (blank_record(&rec)) continue;
         puts_(&b, head.p);
         for (int c = 0; c < nc; c++) {
@@ -314,7 +305,7 @@ char* csv_to_sql(const char* csv, const char* table, bool create_table, char del
     }
     record_clear(&rec);
     free(head.p);
-    if (!b.ok || !head.ok) {
+    if (b.oom || head.oom) {
         free(b.p);
         snprintf(info->error, sizeof(info->error), "Out of memory");
         return NULL;

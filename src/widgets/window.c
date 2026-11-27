@@ -17,6 +17,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <sys/stat.h>
+#include "platform_compat.h"
+#include "sql_quote.h"
 #include <errno.h>
 #include <time.h>
 #include <stdatomic.h>
@@ -222,13 +225,26 @@ static char* read_text_file(const char* path, bool* truncated) {
     return buf;
 }
 
+// salvataggio atomico (file accanto + fsync + rename): disco pieno o caduta a metà lasciano il file di prima,
+// non uno troncato. Un collegamento simbolico si scrive sul posto (il rename sostituirebbe il link)
 static bool write_text_file(const char* path, const char* text) {
-    FILE* f = fopen(path, "wb" SV_FE);
-    if (!f) return false;
     size_t n = strlen(text);
+    char tmp[1200];
+    bool in_place = (size_t)snprintf(tmp, sizeof(tmp), "%s.sv-tmp", path) >= sizeof(tmp);
+#ifndef _WIN32
+    struct stat st;
+    bool have = lstat(path, &st) == 0;
+    if (have && S_ISLNK(st.st_mode)) in_place = true;
+#endif
+    FILE* f = fopen(in_place ? path : tmp, "wb" SV_FE);
+    if (!f) return false;
     bool ok = fwrite(text, 1, n, f) == n;
-    if (fclose(f) != 0) ok = false;
-    return ok;
+    if (in_place) return (fclose(f) == 0) && ok;
+#ifndef _WIN32
+    if (have) (void)fchmod(fileno(f), st.st_mode & 07777);   // stessi permessi del file sostituito
+#endif
+    if (!ok) { fclose(f); remove(tmp); return false; }
+    return sv_fclose_replace(f, tmp, path);
 }
 
 // espande "~/" e toglie gli spazi ai bordi
@@ -420,9 +436,7 @@ static void saved_write(AppWindow* app) {
     if (!f) return;
     fprintf(f, "-- SegVault saved queries (Query > Saved queries)\n");
     for (int i = 0; i < app->saved_count; i++) fprintf(f, SAVED_MARK "%s\n%s\n", app->saved[i].name, app->saved[i].sql);
-    bool ok = fclose(f) == 0;
-    remove(path);
-    if (ok) rename(tmp, path);
+    sv_fclose_replace(f, tmp, path);                 // (remove + rename lasciava un istante senza file)
 }
 
 static void saved_load(AppWindow* app) {
@@ -858,17 +872,19 @@ static void on_tree_select(TreeNode* node, void* ud) {
 typedef struct {
     const char*  sql;
     QueryResult* res;
+    void       (*fn)(void* arg);     // ui_call: lavoro qualsiasi (backup, lettura di un file...) al posto di sql
+    void*        arg;
     atomic_int   done;
     atomic_int   cancel;
 } UiExec;
 
 static AppWindow* s_ui_app;          // finestra principale (per ui_exec delle funzioni senza app)
-static atomic_int s_ui_waits;        // attese mostrate (per i test)
 
 static void ui_exec_worker(void* arg) {
     UiExec* u = (UiExec*)arg;
     db_set_thread_cancel(&u->cancel);
-    u->res = db_execute(u->sql);
+    if (u->fn) u->fn(u->arg);
+    else u->res = db_execute(u->sql);
     db_set_thread_cancel(NULL);
     atomic_store(&u->done, 1);
 }
@@ -900,21 +916,67 @@ static void ui_wait_draw(AppWindow* app, int win_w, int win_h, uint64_t since, b
     platform_present(win);
 }
 
+// esegue u (statement o funzione) in un thread mentre la finestra resta viva (ridisegno, Esc / Annulla)
+static void ui_wait_for(UiExec* u);
+
 static QueryResult* ui_exec(const char* sql) {
     AppWindow* app = s_ui_app;
     if (!app || !app->win) return db_execute(sql);
     UiExec* u = calloc(1, sizeof(UiExec));
     if (!u) return db_execute(sql);
     u->sql = sql;
+    ui_wait_for(u);
+    QueryResult* r = u->res;
+    free(u);
+    return r;
+}
+
+// lavoro lungo che non deve fermare l'interfaccia (CR-A3: backup, restore, lettura e traduzione dei file di import).
+// fn gira in un altro thread: non tocca widget né stato della finestra, solo i dati di arg
+static void ui_call(void (*fn)(void* arg), void* arg) {
+    AppWindow* app = s_ui_app;
+    UiExec* u = app && app->win ? calloc(1, sizeof(UiExec)) : NULL;
+    if (!u) { fn(arg); return; }
+    u->fn = fn;
+    u->arg = arg;
+    ui_wait_for(u);
+    free(u);
+}
+
+typedef struct { const char* path; char* err; size_t errn; bool backup, ok; } BackupJob;
+static void backup_job(void* a) {
+    BackupJob* j = a;
+    j->ok = j->backup ? db_backup(j->path, j->err, j->errn) : db_restore(j->path, j->err, j->errn);
+}
+
+// lettura di un file intero in un thread (CR-A3)
+static char* read_whole_file(const char* path, size_t* out_len);
+typedef struct { const char* path; char* data; size_t len; int err; } ReadJob;
+static void read_job(void* a) {
+    ReadJob* j = a;
+    errno = 0;
+    j->data = read_whole_file(j->path, &j->len);
+    j->err = j->data ? 0 : (errno ? errno : EIO);
+}
+static char* ui_read_file(const char* path, size_t* out_len) {
+    ReadJob j = { path, NULL, 0, 0 };
+    ui_call(read_job, &j);
+    if (out_len) *out_len = j.len;
+    errno = j.err;
+    return j.data;
+}
+
+static void ui_wait_for(UiExec* u) {
+    AppWindow* app = s_ui_app;
     PlatformThread* t = platform_thread_start(ui_exec_worker, u);
-    if (!t) { free(u); return db_execute(sql); }
+    if (!t) { ui_exec_worker(u); return; }
     uint64_t t0 = platform_time_ms(), last_draw = 0;
     bool shown = false, cancelling = false;
     int pend_w = 0, pend_h = 0, cur_w = app->win_w, cur_h = app->win_h;
     while (!atomic_load(&u->done)) {
         uint64_t now = platform_time_ms();
         bool redraw = false;
-        if (!shown && now - t0 >= 150) { shown = true; redraw = true; atomic_fetch_add(&s_ui_waits, 1); }
+        if (!shown && now - t0 >= 150) { shown = true; redraw = true; }
         sEvent ev;
         while (platform_poll_event(app->win, &ev)) {
             switch (ev.type) {
@@ -946,19 +1008,15 @@ static QueryResult* ui_exec(const char* sql) {
         platform_wait_event(app->win, 15);
     }
     platform_thread_join(t);
-    QueryResult* r = u->res;
-    free(u);
     if (pend_w > 0 && pend_h > 0) app_window_resize(app, pend_w, pend_h);
-    return r;
 }
-
-int app_window_ui_waits(void) { return atomic_load(&s_ui_waits); }
 
 static bool use_database(AppWindow* app, const char* db) {
     const char* cur = db_current_database();
     if (cur && strcmp(cur, db) == 0) return true;
-    char sql[256];
-    snprintf(sql, sizeof(sql), "USE `%.200s`;", db);
+    char sql[SQL_IDENT_MAX + 8], q[SQL_IDENT_MAX];
+    if (!sql_ident(q, sizeof(q), db)) return false;          // nome che non si può scrivere tra backtick
+    snprintf(sql, sizeof(sql), "USE %s;", q);
     QueryResult* r = ui_exec(sql);
     bool ok = r && r->success;
     if (r) db_result_free(r);
@@ -969,8 +1027,10 @@ static bool use_database(AppWindow* app, const char* db) {
 // anteprima dei dati di una tabella o vista nella griglia (pagina SQL)
 static void preview_table(AppWindow* app, const char* db, const char* table) {
     if (db) use_database(app, db);
-    char sql[256];
-    snprintf(sql, sizeof(sql), "SELECT * FROM %.120s LIMIT 200;", table);
+    char sql[256], q[SQL_IDENT_MAX];
+    // tra backtick: un nome con spazi o ';' è legale e non deve diventare SQL
+    if (!sql_ident(q, sizeof(q), table)) snprintf(sql, sizeof(sql), "SELECT 'This name has a backtick or a control character' AS error");
+    else snprintf(sql, sizeof(sql), "SELECT * FROM %s LIMIT 200;", q);
     QueryResult* r = ui_exec(sql);
     char msg[256], meta[128];
     app->page = PAGE_SQL;
@@ -1084,8 +1144,9 @@ static bool fk_follow(AppWindow* app, bool parent, bool run) {
     if (!target[0] || !tcol[0]) return false;
     if (!run) return true;
     char* lit = export_sql_literal(cell);
-    char sql[1400];
-    snprintf(sql, sizeof(sql), "SELECT * FROM `%.63s` WHERE `%.63s` = %.1000s LIMIT 200;", target, tcol, lit ? lit : "NULL");
+    char sql[1400], qt[SQL_IDENT_MAX], qc[SQL_IDENT_MAX];
+    if (!sql_ident(qt, sizeof(qt), target) || !sql_ident(qc, sizeof(qc), tcol) || (lit && strlen(lit) > 1000)) { free(lit); return false; }
+    snprintf(sql, sizeof(sql), "SELECT * FROM %s WHERE %s = %s LIMIT 200;", qt, qc, lit ? lit : "NULL");
     free(lit);
     if (db) use_database(app, db);
     QueryResult* r = ui_exec(sql);
@@ -1418,7 +1479,9 @@ static void bar_submit(AppWindow* app, bool shift, bool ctrl) {
             if (!pl) { in->error = true; return; }
             if (busy_guard(app)) return;
             bool backup = app->bar_mode == BAR_BACKUP;
-            bool ok = backup ? db_backup(path, err, sizeof(err)) : db_restore(path, err, sizeof(err));
+            BackupJob bj = { path, err, sizeof(err), backup, false };
+            ui_call(backup_job, &bj);                  // fuori dal thread dell'interfaccia (CR-A3)
+            bool ok = bj.ok;
             if (ok) snprintf(msg, sizeof(msg), backup ? "Backup written to %.900s" : "Data restored from %.900s (previous data in before-restore)", path);
             else snprintf(msg, sizeof(msg), "%s failed: %.600s", backup ? "Backup" : "Restore", err);
             set_status(app, ok ? STATUS_OK : STATUS_ERROR, msg, "");
@@ -1463,11 +1526,13 @@ static bool bar_is_file_mode(BarMode m) {
     return m == BAR_OPEN || m == BAR_SAVE_AS || m == BAR_EXPORT || m == BAR_IMPORT_CSV || m == BAR_RUN_FILE || m == BAR_DUMP;
 }
 
+#ifndef _WIN32                                        // su Windows la finestra è modale (nessun thread)
 static void file_pick_worker(void* arg) {
     FilePick* p = (FilePick*)arg;
     p->result = platform_file_dialog(NULL, p->kind, p->title, p->filter, p->initial, p->out, sizeof(p->out));
     atomic_store(&p->done, 1);
 }
+#endif
 
 static void file_pick_finish(AppWindow* app) {
     FilePick* p = &g_pick;
@@ -1861,21 +1926,8 @@ static Cell* grid_cell(AppWindow* app) {
 static const char* cell_text(const Cell* c) { return c->is_null ? "NULL" : c->value; }
 
 // buffer di testo che cresce
-typedef struct { char* p; size_t n, cap; } SBuf;
-
-static void sb_add(SBuf* b, const char* s) {
-    size_t n = strlen(s);
-    if (b->n + n + 1 > b->cap) {
-        size_t cap = SV_MAX(b->cap * 2, b->n + n + 256);
-        char* p = realloc(b->p, cap);
-        if (!p) return;
-        b->p = p;
-        b->cap = cap;
-    }
-    memcpy(b->p + b->n, s, n);
-    b->n += n;
-    b->p[b->n] = '\0';
-}
+typedef SvStrBuf SBuf;   // buffer comune (CR-B2); oom: un pezzo è andato perso e i successivi sono ignorati
+#define sb_add svsb_puts
 
 // valore della cella come letterale SQL ('testo' con apici raddoppiati, numeri così come sono)
 static char* sql_literal(const Cell* c) {
@@ -1899,7 +1951,7 @@ static void copy_and_report(AppWindow* app, const char* text, const char* what) 
 static bool gedit_editing(const AppWindow* app) { return app->edit_src >= 0; }
 
 static void draft_free_vals(AppWindow* app) {
-    for (int c = 0; c < 64; c++) { free(app->draft_vals[c]); app->draft_vals[c] = NULL; }
+    for (int c = 0; c < GE_MAX_COLS; c++) { free(app->draft_vals[c]); app->draft_vals[c] = NULL; }
     memset(app->draft_set, 0, sizeof(app->draft_set));
     memset(app->draft_null, 0, sizeof(app->draft_null));
 }
@@ -1920,7 +1972,7 @@ static void gedit_refresh(AppWindow* app) {
     tv->col_editable = NULL;
     if (app->job || app->showing_history || !tv->result || tv->result->num_cols == 0) return;
     grid_edit_analyze(&app->gedit, tv->result);
-    for (int c = 0; c < tv->result->num_cols && c < 64; c++) app->gedit_cols[c] = grid_edit_cell_ok(&app->gedit, c);
+    for (int c = 0; c < tv->result->num_cols && c < GE_MAX_COLS; c++) app->gedit_cols[c] = grid_edit_cell_ok(&app->gedit, c);
     tv->col_editable = app->gedit_cols;
 }
 
@@ -1931,21 +1983,23 @@ static QueryResult* gedit_exec(AppWindow* app, const char* sql) {
     const char* cur = db_current_database();
     if (cur) snprintf(prev, sizeof(prev), "%s", cur);
     bool switched = app->gedit.db[0] && strcmp(prev, app->gedit.db) != 0;
-    char use[96];
-    if (switched) { snprintf(use, sizeof(use), "USE `%.60s`", app->gedit.db); db_result_free(ui_exec(use)); }
+    // il nome intero tra backtick (con %.60s un nome lungo diventava un altro database e la modifica finiva
+    // su una tabella omonima di quello); se il USE non riesce la modifica non parte
+    if (switched && !use_database(app, app->gedit.db)) return NULL;
     uint64_t t0 = platform_time_ms();
     QueryResult* r = ui_exec(sql);
     double ms = (double)(platform_time_ms() - t0);
-    if (switched && prev[0]) { snprintf(use, sizeof(use), "USE `%.60s`", prev); db_result_free(ui_exec(use)); }
+    if (switched && prev[0]) use_database(app, prev);
     history_add(app, sql, r && r->success, r ? r->rows_affected : 0, ms);
     return r;
 }
 
 // sostituisce i valori della riga src (vals[c] = NULL per NULL); i tipi restano quelli della riga
 static void result_set_row(QueryResult* r, int src, const char* const* vals) {
+    if (r->num_cols > GE_MAX_COLS) return;           // (la griglia è in sola lettura oltre GE_MAX_COLS)
     Row* row = &r->rows[src];
-    CellType types[64];
-    for (int c = 0; c < r->num_cols && c < 64; c++)
+    CellType types[GE_MAX_COLS];
+    for (int c = 0; c < r->num_cols && c < GE_MAX_COLS; c++)
         types[c] = c < row->num_cells && row->cells[c].type != CELL_TYPE_NULL ? row->cells[c].type : CELL_TYPE_STRING;
     Row nr = {0};
     if (!db_row_set(&nr, r->num_cols, vals, types)) return;
@@ -1970,17 +2024,16 @@ static bool gedit_refetch(AppWindow* app, int src, int t, const char* const* key
     const char* cur = db_current_database();
     if (cur) snprintf(prev, sizeof(prev), "%s", cur);
     bool switched = app->gedit.db[0] && strcmp(prev, app->gedit.db) != 0;
-    char use[96];
-    if (switched) { snprintf(use, sizeof(use), "USE `%.60s`", app->gedit.db); db_result_free(ui_exec(use)); }
+    if (switched && !use_database(app, app->gedit.db)) { free(sql); return false; }
     QueryResult* fr = ui_exec(sql);
-    if (switched && prev[0]) { snprintf(use, sizeof(use), "USE `%.60s`", prev); db_result_free(ui_exec(use)); }
+    if (switched && prev[0]) use_database(app, prev);
     free(sql);
     bool ok = fr && fr->success && fr->num_rows == 1;
     if (ok) {
-        const char* vals[64];
+        const char* vals[GE_MAX_COLS];
         const Row* old = &r->rows[src];
         int k = 0;
-        for (int c = 0; c < r->num_cols && c < 64; c++) {
+        for (int c = 0; c < r->num_cols && c < GE_MAX_COLS; c++) {
             if (app->gedit.col_table[c] == t) {
                 const Cell* fc = &fr->rows[0].cells[k++];
                 vals[c] = fc->is_null ? NULL : fc->value;
@@ -2057,7 +2110,7 @@ static bool draft_save(AppWindow* app);
 // colonna modificabile successiva (dir = +1 / -1) nella riga in modifica, -1 se non c'è
 static int edit_next_col(AppWindow* app, int c, int dir) {
     int n = app->results->result->num_cols;
-    for (int k = c + dir; k >= 0 && k < n && k < 64; k += dir) if (app->gedit_cols[k]) return k;
+    for (int k = c + dir; k >= 0 && k < n && k < GE_MAX_COLS; k += dir) if (app->gedit_cols[k]) return k;
     return -1;
 }
 
@@ -2068,8 +2121,8 @@ static void draft_store(AppWindow* app, int c, const char* text, bool is_null) {
     app->draft_vals[c] = is_null ? NULL : strdup(text);
     app->draft_set[c] = true;
     app->draft_null[c] = is_null;
-    const char* vals[64];
-    for (int k = 0; k < r->num_cols && k < 64; k++) vals[k] = app->draft_set[k] && !app->draft_null[k] ? app->draft_vals[k] : NULL;
+    const char* vals[GE_MAX_COLS];
+    for (int k = 0; k < r->num_cols && k < GE_MAX_COLS; k++) vals[k] = app->draft_set[k] && !app->draft_null[k] ? app->draft_vals[k] : NULL;
     result_set_row(r, app->draft_src, vals);
 }
 
@@ -2161,7 +2214,7 @@ static void draft_add(AppWindow* app) {
     Row* nr = realloc(r->rows, sizeof(Row) * (size_t)(r->num_rows + 1));
     if (!nr) return;
     r->rows = nr;
-    const char* vals[64] = {0};
+    const char* vals[GE_MAX_COLS] = {0};
     if (!db_row_set(&r->rows[r->num_rows], r->num_cols, vals, NULL)) return;
     app->draft_src = r->num_rows++;
     draft_free_vals(app);
@@ -2175,7 +2228,7 @@ static void draft_add(AppWindow* app) {
     }
     tv->selected_row = vr;
     int first = -1;
-    for (int c = 0; c < r->num_cols && c < 64 && first < 0; c++)
+    for (int c = 0; c < r->num_cols && c < GE_MAX_COLS && first < 0; c++)
         if (app->gedit_cols[c] && c != app->gedit.t[app->gedit.row_table].auto_col) first = c;
     tv->selected_col = first >= 0 ? first : 0;
     tv->base.state = WIDGET_STATE_FOCUSED;
@@ -3293,8 +3346,9 @@ static void confirm_open(AppWindow* app, const char* db, char* sql, bool drop_db
 }
 
 static long long count_rows(const char* table) {
-    char sql[200];
-    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM `%.120s`", table);
+    char sql[200], q[SQL_IDENT_MAX];
+    if (!sql_ident(q, sizeof(q), table)) return -1;
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM %s", q);
     QueryResult* r = ui_exec(sql);
     long long n = r && r->success && r->num_rows ? atoll(r->rows[0].cells[0].value) : -1;
     db_result_free(r);
@@ -3325,9 +3379,9 @@ static void confirm_table_action(AppWindow* app, const char* db, const char* tab
         snprintf(app->conf_btn, sizeof(app->conf_btn), "Drop table");
         snprintf(app->conf_done, sizeof(app->conf_done), "Table %.60s dropped", table);
     } else {
-        size_t len = strlen(table) + 32;
-        sql = malloc(len);
-        if (sql) snprintf(sql, len, "TRUNCATE TABLE `%s`", table);
+        char q[SQL_IDENT_MAX];
+        sql = sql_ident(q, sizeof(q), table) ? malloc(SQL_IDENT_MAX + 32) : NULL;
+        if (sql) snprintf(sql, SQL_IDENT_MAX + 32, "TRUNCATE TABLE %s", q);
         snprintf(app->conf_title, sizeof(app->conf_title), "Empty table %.60s?", table);
         snprintf(app->conf_text, sizeof(app->conf_text), "All its %s are deleted; the structure stays.", rows);
         snprintf(app->conf_btn, sizeof(app->conf_btn), "Empty");
@@ -3340,9 +3394,9 @@ static void confirm_drop_db(AppWindow* app, const char* db) {
     NameList* t = db_list_tables(db);
     int n = t ? t->count : 0;
     if (t) db_namelist_free(t);
-    size_t len = strlen(db) + 32;
-    char* sql = malloc(len);
-    if (sql) snprintf(sql, len, "DROP DATABASE %s", db);
+    char q[SQL_IDENT_MAX];
+    char* sql = sql_ident(q, sizeof(q), db) ? malloc(SQL_IDENT_MAX + 32) : NULL;   // il nome tra backtick: mai SQL
+    if (sql) snprintf(sql, SQL_IDENT_MAX + 32, "DROP DATABASE %s", q);
     snprintf(app->conf_title, sizeof(app->conf_title), "Drop database %.60s?", db);
     snprintf(app->conf_text, sizeof(app->conf_text), "Its %d table%s and all their data are deleted. This cannot be undone.", n, n == 1 ? "" : "s");
     snprintf(app->conf_btn, sizeof(app->conf_btn), "Drop database");
@@ -3557,8 +3611,9 @@ static void ctx_run(AppWindow* app, int a) {
             TreeNode* t = tree_sel_table(app);
             const char* d = sel ? find_db_name(sel) : NULL;
             if (!t || !d) break;
-            char sql[200];
-            snprintf(sql, sizeof(sql), "%s TABLE `%.63s`.`%.63s`;", a == CTX_TBL_CHECK ? "CHECK" : a == CTX_TBL_ANALYZE ? "ANALYZE" : "OPTIMIZE", d, t->label);
+            char sql[200], qd[SQL_IDENT_MAX], qt[SQL_IDENT_MAX];
+            if (!sql_ident(qd, sizeof(qd), d) || !sql_ident(qt, sizeof(qt), t->label)) break;
+            snprintf(sql, sizeof(sql), "%s TABLE %s.%s;", a == CTX_TBL_CHECK ? "CHECK" : a == CTX_TBL_ANALYZE ? "ANALYZE" : "OPTIMIZE", qd, qt);
             char* text = strdup(sql);
             if (text) run_text(app, text, 0, false, a == CTX_TBL_CHECK ? "Checking the table\xe2\x80\xa6" : "Table maintenance\xe2\x80\xa6");
             break;
@@ -3739,8 +3794,9 @@ static void ctx_run(AppWindow* app, int a) {
         case CTX_TREE_SELECT_SQL: {
             TreeNode* t = tree_sel_table(app);
             if (!t) break;
-            char sql[256];
-            snprintf(sql, sizeof(sql), "SELECT *\nFROM %.120s\nLIMIT 100;", t->label);
+            char sql[256], q[SQL_IDENT_MAX];
+            if (!sql_ident(q, sizeof(q), t->label)) break;           // frammento che poi si esegue: il nome tra backtick
+            snprintf(sql, sizeof(sql), "SELECT *\nFROM %s\nLIMIT 100;", q);
             insert_snippet(app, sql);
             break;
         }
@@ -3748,8 +3804,9 @@ static void ctx_run(AppWindow* app, int a) {
             TreeNode* t = tree_sel_table(app);
             const char* d = t ? find_db_name(t) : NULL;
             if (!d || !use_database(app, d)) break;
-            char sql[256];
-            snprintf(sql, sizeof(sql), "SHOW CREATE TABLE %.120s", t->label);
+            char sql[256], q[SQL_IDENT_MAX];
+            if (!sql_ident(q, sizeof(q), t->label)) break;
+            snprintf(sql, sizeof(sql), "SHOW CREATE TABLE %s", q);
             QueryResult* r = ui_exec(sql);
             if (r && r->success && r->num_rows > 0 && r->num_cols > 1 && !r->rows[0].cells[1].is_null) {
                 editor_append(app, r->rows[0].cells[1].value);
@@ -4272,7 +4329,7 @@ static char* read_whole_file(const char* path, size_t* out_len) {
     char* buf = malloc(cap);
     while (buf) {
         if (n + 1 >= cap) {
-            if (cap >= ((size_t)256 << 20)) { free(buf); buf = NULL; break; }
+            if (cap >= ((size_t)256 << 20)) { free(buf); buf = NULL; errno = EFBIG; break; }
             char* nb = realloc(buf, cap * 2);
             if (!nb) { free(buf); buf = NULL; break; }
             buf = nb;
@@ -4280,9 +4337,14 @@ static char* read_whole_file(const char* path, size_t* out_len) {
         }
         size_t got = fread(buf + n, 1, cap - 1 - n, f);
         n += got;
-        if (got == 0) break;
+        if (got == 0) {                       // fine del file o errore di lettura: un errore non è un file più corto
+            if (ferror(f)) { free(buf); buf = NULL; errno = EIO; }
+            break;
+        }
     }
+    int saved = errno;
     fclose(f);
+    errno = saved;
     if (!buf) return NULL;
     buf[n] = '\0';
     if (out_len) *out_len = n;
@@ -4299,10 +4361,16 @@ static bool table_exists(const char* name) {
     return found;
 }
 
+typedef struct { const char* csv; const char* table; bool create; char* sql; CsvImportInfo info; } CsvJob;
+static void csv_job(void* a) { CsvJob* j = a; j->sql = csv_to_sql(j->csv, j->table, j->create, 0, &j->info); }
+
+typedef struct { const char* sql; MyImportStats st; char* out; } MyJob;
+static void mysql_job(void* a) { MyJob* j = a; j->out = mysql_translate(j->sql, &j->st); }
+
 static bool import_csv(AppWindow* app, const char* path) {
     const char* db = db_current_database();
     if (!db || !db[0]) { set_status(app, STATUS_ERROR, "Select a database first (USE name;) to import into", ""); return true; }
-    char* csv = read_whole_file(path, NULL);
+    char* csv = ui_read_file(path, NULL);
     if (!csv) {
         char msg[1200];
         snprintf(msg, sizeof(msg), "Cannot read %s: %s", path, strerror(errno));
@@ -4312,8 +4380,10 @@ static bool import_csv(AppWindow* app, const char* path) {
     char table[64];
     csv_table_name_from_path(path, table, sizeof(table));
     bool exists = table_exists(table);
-    CsvImportInfo info;
-    char* sql = csv_to_sql(csv, table, !exists, 0, &info);
+    CsvJob cj = { csv, table, !exists, NULL, {0} };
+    ui_call(csv_job, &cj);                             // conversione di tutto il file fuori dal thread della UI
+    CsvImportInfo info = cj.info;
+    char* sql = cj.sql;
     free(csv);
     if (!sql) {
         char msg[400];
@@ -4330,7 +4400,7 @@ static bool import_csv(AppWindow* app, const char* path) {
 static bool g_next_run_import;          // il prossimo run_text viene da un file (dump / script)
 
 static bool run_file(AppWindow* app, const char* path) {
-    char* sql = read_whole_file(path, NULL);
+    char* sql = ui_read_file(path, NULL);
     if (!sql) {
         char msg[1200];
         snprintf(msg, sizeof(msg), "Cannot read %s: %s", path, strerror(errno));
@@ -4339,8 +4409,9 @@ static bool run_file(AppWindow* app, const char* path) {
     }
     char label[300];
     if (mysql_looks_like_dump(sql)) {           // dump di MySQL / MariaDB / phpMyAdmin: tradotto prima
-        MyImportStats st;
-        char* tr = mysql_translate(sql, &st);
+        MyJob mj = { sql, {0}, NULL };
+        ui_call(mysql_job, &mj);                       // traduzione del dump fuori dal thread della UI
+        char* tr = mj.out;
         if (tr) {
             free(sql);
             sql = tr;
@@ -4356,21 +4427,29 @@ static bool run_file(AppWindow* app, const char* path) {
     return true;
 }
 
-// script SQL con struttura e dati di tutte le tabelle del database corrente
-static bool dump_database(AppWindow* app, const char* path) {
-    const char* db = db_current_database();
-    if (!db || !db[0]) { set_status(app, STATUS_ERROR, "No database selected", ""); return true; }
-    char dbname[128];
-    snprintf(dbname, sizeof(dbname), "%s", db);
+// costruzione e scrittura del dump in un thread (CR-A3): solo chiamate al motore e al file, niente widget
+typedef struct {
+    const char* path;
+    char        dbname[128], qdb[SQL_IDENT_MAX];
+    char        failed[128];                         // tabella che non si è potuta leggere: niente dump a metà
+    bool        oom, written;
+    int         tables, rows, werr;
+} DumpJob;
+
+static void dump_job(void* arg) {
+    DumpJob* j = arg;
     SBuf b = {0};
     char when[32], line[512];
+    const char* dbname = j->dbname;
+    const char* qdb = j->qdb;
     now_str(when, sizeof(when));
-    snprintf(line, sizeof(line), "-- SegVault dump of database %s, %s\n\nCREATE DATABASE %s;\nUSE %s;\n\n", dbname, when, dbname, dbname);
+    snprintf(line, sizeof(line), "-- SegVault dump of database %s, %s\n\nCREATE DATABASE %s;\nUSE %s;\n\n", qdb, when, qdb, qdb);
     sb_add(&b, line);
     NameList* nl = db_list_tables(dbname);
-    int tables = 0, rows = 0;
-    for (int i = 0; nl && i < nl->count; i++) {
+    for (int i = 0; nl && i < nl->count && !j->failed[0]; i++) {
         const char* t = nl->names[i];
+        char qt[SQL_IDENT_MAX];
+        if (!sql_ident(qt, sizeof(qt), t)) { snprintf(j->failed, sizeof(j->failed), "%s", t); break; }
         char* create = db_get_create_statement_nofk(dbname, t);   // le FOREIGN KEY alla fine
         if (create) {
             sb_add(&b, create);
@@ -4378,11 +4457,12 @@ static bool dump_database(AppWindow* app, const char* path) {
             sb_add(&b, cl && create[cl - 1] == ';' ? "\n" : ";\n");
             db_free_string(create);
         }
-        snprintf(line, sizeof(line), "SELECT * FROM %s", t);
-        QueryResult* r = ui_exec(line);
+        snprintf(line, sizeof(line), "SELECT * FROM %s", qt);
+        QueryResult* r = db_execute(line);            // già nel thread del lavoro (annullabile con Esc)
+        if (!r || !r->success) snprintf(j->failed, sizeof(j->failed), "%s", t);
         if (r && r->success) {
             for (int k = 0; k < r->num_rows; k++) {
-                snprintf(line, sizeof(line), "INSERT INTO %s VALUES (", t);
+                snprintf(line, sizeof(line), "INSERT INTO %s VALUES (", qt);
                 sb_add(&b, line);
                 for (int c = 0; c < r->rows[k].num_cells; c++) {
                     char* lit = export_sql_literal(&r->rows[k].cells[c]);
@@ -4391,12 +4471,12 @@ static bool dump_database(AppWindow* app, const char* path) {
                     free(lit);
                 }
                 sb_add(&b, ");\n");
-                rows++;
+                j->rows++;
             }
         }
         db_result_free(r);
         sb_add(&b, "\n");
-        tables++;
+        j->tables++;
     }
     // chiavi esterne dopo i dati di tutte le tabelle: lo script si ricarica in qualunque ordine
     for (int i = 0; nl && i < nl->count; i++) {
@@ -4404,18 +4484,48 @@ static bool dump_database(AppWindow* app, const char* path) {
         if (fk && fk[0]) sb_add(&b, fk);
         db_free_string(fk);
     }
-    db_namelist_free(nl);
     // viste dopo le tabelle; trigger dopo i dati (non devono scattare durante il ripristino); procedure
-    for (int w = 0; w < 3; w++) {
+    for (int w = 0; w < 3 && !j->failed[0]; w++) {
         char* objs = db_get_objects_sql(dbname, w);
+        if (!objs) b.oom = true;
         if (objs && objs[0]) { sb_add(&b, "\n"); sb_add(&b, objs); }
         db_free_string(objs);
     }
-    bool ok = b.p && write_text_file(path, b.p);
+    db_namelist_free(nl);
+    j->oom = b.oom;
+    if (!j->failed[0] && !b.oom) {                    // un dump incompleto scritto come riuscito è peggio di nessun dump
+        errno = 0;
+        j->written = b.p && write_text_file(j->path, b.p);
+        j->werr = errno;
+    }
     free(b.p);
+}
+
+// script SQL con struttura e dati di tutte le tabelle del database corrente
+static bool dump_database(AppWindow* app, const char* path) {
+    const char* db = db_current_database();
+    if (!db || !db[0]) { set_status(app, STATUS_ERROR, "No database selected", ""); return true; }
+    DumpJob* j = calloc(1, sizeof(DumpJob));
+    if (!j) { set_status(app, STATUS_ERROR, "Out of memory", ""); return false; }
+    j->path = path;
+    snprintf(j->dbname, sizeof(j->dbname), "%s", db);
+    // ogni nome tra backtick: il dump si riesegue, un nome come "x; DROP DATABASE y; --" non deve diventare SQL
+    // (né andare a capo nel commento della prima riga)
+    if (!sql_ident(j->qdb, sizeof(j->qdb), j->dbname)) {
+        free(j);
+        set_status(app, STATUS_ERROR, "Cannot dump", "the database name has a backtick or a control character");
+        return true;
+    }
+    ui_call(dump_job, j);
     char msg[1300];
-    if (ok) snprintf(msg, sizeof(msg), "Dump of %s: %d table%s, %d rows written to %s", dbname, tables, tables == 1 ? "" : "s", rows, path);
-    else    snprintf(msg, sizeof(msg), "Cannot write %s: %s", path, strerror(errno));
+    bool ok = !j->failed[0] && !j->oom && j->written;
+    if (j->failed[0] || j->oom)
+        snprintf(msg, sizeof(msg), "Dump not written: %s%.200s", j->failed[0] ? "cannot read table " : "out of memory", j->failed);
+    else if (ok)
+        snprintf(msg, sizeof(msg), "Dump of %s: %d table%s, %d rows written to %s", j->dbname, j->tables, j->tables == 1 ? "" : "s", j->rows, path);
+    else
+        snprintf(msg, sizeof(msg), "Cannot write %s: %s", path, strerror(j->werr ? j->werr : EIO));
+    free(j);
     set_status(app, ok ? STATUS_OK : STATUS_ERROR, msg, "");
     return ok;
 }
@@ -6096,7 +6206,7 @@ void app_window_destroy(AppWindow* app) {
     uv_destroy(app->uv);
     free(app->conf_sql);
     schema_view_destroy(app->schema);
-    for (int c = 0; c < 64; c++) free(app->draft_vals[c]);
+    for (int c = 0; c < GE_MAX_COLS; c++) free(app->draft_vals[c]);
     free(app);
 }
 
@@ -6206,10 +6316,12 @@ void app_window_save_session(AppWindow* app) {
     join_path(path, sizeof(path), app->data_dir, SESSION_TEXT);
     write_text_file(path, textbox_get_text(app->editor));
     join_path(path, sizeof(path), app->data_dir, SESSION_META);
-    FILE* f = fopen(path, "wb" SV_FE);
+    char tmp[1110];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE* f = fopen(tmp, "wb" SV_FE);
     if (!f) return;
     fprintf(f, "file=%s\ncursor=%d\nmodified=%d\nfont=%d\ntheme=%s\nsidebar=%d\n",
             app->file_path, app->editor->cursor_pos, app->modified ? 1 : 0, app->editor->font_size,
             theme_get(theme_current())->name, app->sidebar_w);
-    fclose(f);
+    sv_fclose_replace(f, tmp, path);
 }

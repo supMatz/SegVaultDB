@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#define SV_HARNESS_TMP_ONLY
+#include "harness.h"
 
 #define N 20000
 
@@ -21,7 +23,8 @@ static int g_pages;
 static void count_page(void* ctx, uint32_t pid) { (void)ctx; (void)pid; g_pages++; }
 
 int main(void) {
-    const char* path = "/tmp/sv_bptree_test.db";
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
+    const char* path = "sv_bptree_test.db";
     remove(path);
     int fd = sv_open(path, SV_O_RDWR | SV_O_CREAT | SV_O_TRUNC, 0600);
     if (fd < 0) { printf("cannot open %s\n", path); return 1; }

@@ -1,3 +1,4 @@
+#include "../../include/sv_strbuf.h"
 #include "result_export.h"
 #include "../table/binesc.h"
 #include "grid_edit.h"
@@ -8,23 +9,10 @@
 #include <strings.h>
 #include <ctype.h>
 
-typedef struct { char* p; size_t n, cap; bool ok; } Buf;
-
-static void put(Buf* b, const char* s, size_t n) {
-    if (!b->ok) return;
-    if (b->n + n + 1 > b->cap) {
-        size_t cap = b->cap * 2 + n + 1024;
-        char* p = realloc(b->p, cap);
-        if (!p) { b->ok = false; return; }
-        b->p = p;
-        b->cap = cap;
-    }
-    memcpy(b->p + b->n, s, n);
-    b->n += n;
-    b->p[b->n] = '\0';
-}
-static void puts_(Buf* b, const char* s) { put(b, s, strlen(s)); }
-static void putc_(Buf* b, char c) { put(b, &c, 1); }
+typedef SvStrBuf Buf;                                        // buffer comune (CR-B2)
+#define put svsb_put
+#define puts_ svsb_puts
+#define putc_ svsb_putc
 
 static const char* const EXT[]   = { "csv", "tsv", "json", "md", "html", "sql", "xlsx", "pdf" };
 static const char* const NAMES[] = { "CSV", "TSV", "JSON", "Markdown", "HTML", "SQL INSERT", "Excel XLSX", "PDF" };
@@ -58,6 +46,20 @@ static bool is_num_cell(const Cell* c) {
 }
 
 // nome di colonna senza il prefisso "tabella."
+// `nome` per l'SQL esportato: un alias del risultato può contenere qualunque cosa, e il lexer non ha
+// escape per il backtick dentro `...`: backtick e caratteri di controllo diventano '_'
+static void put_ident(Buf* b, const char* name, size_t len) {
+    puts_(b, "`");
+    char tmp[2];
+    tmp[1] = '\0';
+    for (size_t i = 0; i < len && name[i]; i++) {
+        unsigned char c = (unsigned char)name[i];
+        tmp[0] = (c < 0x20 || c == 0x7F || c == '`') ? '_' : (char)c;
+        puts_(b, tmp);
+    }
+    puts_(b, "`");
+}
+
 static const char* short_name(const char* n) {
     const char* dot = n ? strrchr(n, '.') : NULL;
     return dot ? dot + 1 : (n ? n : "");
@@ -162,7 +164,7 @@ char* export_result(const TableView* tv, ExportFormat f, const ExportOptions* op
     int nc = r->num_cols, nr = table_view_row_count(tv);
     ExportOptions def = { ',', true, false, true, "my_table" };
     if (!opt) opt = &def;
-    Buf b = { NULL, 0, 0, true };
+    Buf b = {0};
     const char* nl = opt->json_pretty ? "\n" : "";
 
     switch (f) {
@@ -253,14 +255,25 @@ char* export_result(const TableView* tv, ExportFormat f, const ExportOptions* op
             break;
 
         case EXPORT_SQL: {
-            char head[1024];
-            int n = snprintf(head, sizeof(head), "INSERT INTO %s (", opt->table && opt->table[0] ? opt->table : "my_table");
-            for (int c = 0; c < nc && n < (int)sizeof(head) - 80; c++)
-                n += snprintf(head + n, sizeof(head) - n, "%s%s", c ? ", " : "", short_name(r->col_names[c]));
-            snprintf(head + n, sizeof(head) - n, ") VALUES (");
+            // intestazione di ogni INSERT: tutte le colonne, tra backtick (prima 1 KB fisso: con molte colonne le
+            // ultime sparivano e l'INSERT aveva più valori che colonne; un nome come "order" non era quotato)
+            Buf head = {0};
+            puts_(&head, "INSERT INTO ");
+            const char* tn = opt->table && opt->table[0] ? opt->table : "my_table";
+            const char* dot = strchr(tn, '.');                  // "db.tabella": due nomi
+            if (dot) { put_ident(&head, tn, (size_t)(dot - tn)); puts_(&head, "."); put_ident(&head, dot + 1, strlen(dot + 1)); }
+            else put_ident(&head, tn, strlen(tn));
+            puts_(&head, " (");
+            for (int c = 0; c < nc; c++) {
+                if (c) puts_(&head, ", ");
+                const char* cn = short_name(r->col_names[c]);
+                put_ident(&head, cn, strlen(cn));
+            }
+            puts_(&head, ") VALUES (");
+            if (head.oom) { free(head.p); b.oom = true; break; }
             for (int i = 0; i < nr; i++) {
                 const Row* row = &r->rows[table_view_source_row(tv, i)];
-                puts_(&b, head);
+                puts_(&b, head.p);
                 for (int c = 0; c < nc && c < row->num_cells; c++) {
                     char* lit = export_sql_literal(&row->cells[c]);
                     if (c) puts_(&b, ", ");
@@ -269,12 +282,13 @@ char* export_result(const TableView* tv, ExportFormat f, const ExportOptions* op
                 }
                 puts_(&b, ");\n");
             }
+            free(head.p);
             break;
         }
         default:
             break;
     }
-    if (!b.ok) { free(b.p); return NULL; }
+    if (b.oom) { free(b.p); return NULL; }
     if (!b.p) b.p = calloc(1, 1);
     return b.p;
 }

@@ -52,7 +52,7 @@ transazioni, trigger).
 | Caratteristica | Dettagli |
 |---|---|
 | **Linguaggio** | C11, zero dipendenze per il motore e per il server |
-| **Versione** | 1.4.2 |
+| **Versione** | 1.5.0 |
 | **Server di sviluppo** | Web + **PHP** (FastCGI, senza configurazione), un sito per cartella su `NOME.localhost`, **HTTPS + HTTP/2** con una CA locale, **reverse proxy** con WebSocket (Vite, Next.js, Django, Rails), `.htaccess` (`mod_rewrite`), **CGI** (Perl, Python, Ruby), **cattura delle email** (SMTP + pagina web + API), cruscotto, servizi accesi e spenti uno per uno, icona nell'area di notifica, servizio all'avvio |
 | **App desktop** | Win32 / GDI (Windows) · Xlib/X11 + Xft (Linux); all'avvio si sceglie **editor SQL** o **server API** |
 | **Server API** | `segvault-server` (o il pannello dell'app): HTTP/JSON, parametri `?` contro la SQL injection, sessioni con transazioni su più richieste, utenti e permessi (`GRANT`), token, CORS, limite di tempo, registro e monitor delle richieste, audit, backup pianificati; anche il **protocollo di rete MySQL** (PHP, Python, Java senza modifiche) |
@@ -62,7 +62,7 @@ transazioni, trigger).
 | **Storage** | Heap file a pagine da 4 KB con slot directory e free-space map; indici in memoria (anche su più colonne): tabella hash per le uguaglianze, chiavi ordinate per gli intervalli |
 | **Buffer pool** | 1/8 della RAM (4-512 MB, `--cache-size` / `SET GLOBAL cache_size`), tabella hash per la ricerca, sostituzione **CLOCK**; statistiche con `SHOW STATUS` |
 | **Ottimizzatore** | Pushdown delle selezioni, hash join (anche per `FROM a, b WHERE a.x = b.y`), accesso con indice per uguaglianza o per intervallo (scelto solo se conviene: un valore che copre più di un quarto della tabella si legge con una scansione), ordine dei join interni scelto per costo, subquery decorrelate per chiave; statistiche delle colonne con `ANALYZE TABLE` (valori distinti, NULL, istogramma); `EXPLAIN` con le stime, `EXPLAIN ANALYZE` con le righe reali, `EXPLAIN FORMAT=JSON` |
-| **Transazioni** | Write-Ahead Log con undo/redo, `BEGIN` (o `START TRANSACTION`) / `COMMIT` / `ROLLBACK`, `SAVEPOINT` (`ROLLBACK TO [SAVEPOINT]`), recovery dopo un crash (anche con più transazioni aperte), `CHECKPOINT` (anche automatico) |
+| **Transazioni** | Write-Ahead Log con undo/redo, `BEGIN` (o `START TRANSACTION`) / `COMMIT` / `ROLLBACK`, `SAVEPOINT` (`ROLLBACK TO [SAVEPOINT]`), commit implicito prima di un DDL o di un nuovo `BEGIN` come in MySQL (le tabelle `TEMPORARY` no), recovery dopo un crash (anche con più transazioni aperte), `CHECKPOINT` (anche automatico) |
 | **Concorrenza** | Più transazioni aperte insieme (sessioni HTTP, connessioni MySQL, editor): lock di tabella S / X a due fasi, deadlock riconosciuti (errore MySQL 1213), timeout (1205); **le letture non aspettano mai le scritture** (MVCC: versione confermata) |
 | **Basi di dati attive** | Trigger `BEFORE` / `AFTER`, `FOR EACH ROW` / `FOR EACH STATEMENT`, `NEW` / `OLD`, `WHEN`, `SET NEW.col`, `SIGNAL`, `IF`; stored procedure (`CREATE PROCEDURE`, `CALL`) |
 | **Testi e righe grandi** | Testi fino a 16 MB, righe fino a 64 MB: una riga oltre 2 KB va in pagine di overflow (anche dopo `ROLLBACK`, riavvio e crash) |
@@ -74,7 +74,7 @@ transazioni, trigger).
 ## Download
 
 **Pacchetto completo** (eseguibili, script di avvio, sito d'esempio, README; su Windows `get-php.cmd`
-scarica PHP): `SegVault-1.4.2-windows-x86_64.zip` e `SegVault-1.4.2-linux-x86_64.tar.gz` nelle
+scarica PHP): `SegVault-1.5.0-windows-x86_64.zip` e `SegVault-1.5.0-linux-x86_64.tar.gz` nelle
 [release](https://github.com/supMatz/SegVaultDB/releases). Oppure **un solo file**, senza
 installazione (i font sono dentro l'eseguibile):
 
@@ -285,7 +285,7 @@ lo ferma e torna all'editor.
 ┌──────────────────────────────────────────────────────────────────────┐
 │ File  Edit  View  Query  Import  Export  Settings  Help   untitled.sql│
 ├──────────────────────────────────────────────────────────────────────┤
-│ ◆ SegVault v1.4.2 [▶ Run F5] [Run statement] │ [Commit] [Rollback] │ [Format]   ● Sky  ▤ db │
+│ ◆ SegVault v1.5.0 [▶ Run F5] [Run statement] │ [Commit] [Rollback] │ [Format]   ● Sky  ▤ db │
 ├────────────┬─────────────────────────────────────────────────────────┤
 │ EXPLORER ⟳ │  editor SQL (numeri di riga, highlighting, completamento)│
 │  ▸ uni     │                                                         │
@@ -293,7 +293,7 @@ lo ferma e torna all'editor.
 │            │  RESULTS ● Query OK            filtro    12 rows  History│
 │            │  griglia dei risultati (schede se più SELECT)           │
 ├────────────┴─────────────────────────────────────────────────────────┤
-│ ● SegVault engine 1.4.2  ▤ uni  script.sql         Ln 3, Col 7  F1 Shortcuts│
+│ ● SegVault engine 1.5.0  ▤ uni  script.sql         Ln 3, Col 7  F1 Shortcuts│
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -478,7 +478,7 @@ delle richieste al posto dei risultati.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ ◆ SegVault v1.4.2 [■ Stop server F5] [Copy address]  ● Running · port 8484 [Open SQL editor]│
+│ ◆ SegVault v1.5.0 [■ Stop server F5] [Copy address]  ● Running · port 8484 [Open SQL editor]│
 ├────────────────┬─────────────────────────────────────────────────────┤
 │ SERVER         │ REQUESTS ● 4 requests · up 1m   All Web PHP API MySQL Mail │
 │ ADDRESS        │ time     service client    method path / query     status ms │
@@ -497,7 +497,7 @@ delle richieste al posto dei risultati.
 │ START WITH THE COMPUTER                                              │
 │ TRY IT  curl … │                                                     │
 ├────────────────┴─────────────────────────────────────────────────────┤
-│ ● SegVault engine 1.4.2  API server running  this computer only    F5 Start / Stop│
+│ ● SegVault engine 1.5.0  API server running  this computer only    F5 Start / Stop│
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -681,10 +681,10 @@ LIMIT n [OFFSET m]   |   OFFSET m ROWS FETCH FIRST n ROWS ONLY;
 | `WITH RECURSIVE` | `WITH RECURSIVE sotto AS (SELECT id FROM persona WHERE id = 1 UNION SELECT p.id FROM persona p JOIN sotto s ON p.capo = s.id) SELECT ...` — con `UNION` i cicli terminano; una ricorsione senza fine viene fermata dopo 1000 passi |
 | Funzioni finestra | `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `PERCENT_RANK()`, `CUME_DIST()`, `NTILE(n)`, `LAG(x [, k [, def]])`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE(x, n)`, finestre con nome (`OVER w` ... `WINDOW w AS (...)`), `COUNT/SUM/AVG/MIN/MAX(...)` con `OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS \| RANGE BETWEEN ... AND ...])`: frame con `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`, `UNBOUNDED FOLLOWING`; con `RANGE` la distanza è sul valore (`RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING`, sulle date `RANGE INTERVAL 7 DAY PRECEDING`: medie mobili) |
 | `CASE` | `CASE WHEN voto >= 28 THEN 'alto' ELSE 'basso' END`, `CASE cfu WHEN 6 THEN ... END` |
-| Funzioni | Testo: `UPPER`, `LOWER`, `INITCAP`, `LENGTH`, `CHAR_LENGTH`, `TRIM`, `CONCAT`, `CONCAT_WS`, `SUBSTRING`, `LEFT`, `RIGHT`, `REPLACE`, `REVERSE`, `LPAD`, `RPAD`, `LOCATE`, `INSTR`, `SPLIT_PART`, `SUBSTRING_INDEX`, `TRANSLATE`, `OVERLAY(s PLACING r FROM n FOR m)`, `STARTS_WITH`, `SOUNDEX`, `REGEXP_LIKE` / `REPLACE` / `SUBSTR` / `INSTR` / `COUNT`, `CHR`, `ASCII`, `HEX`, `MD5`, `SHA2`, `TO_BASE64`, ...; numeri: `ABS`, `ROUND`, `TRUNCATE`, `FLOOR`, `CEIL`, `MOD`, `POWER`, `SQRT`, `EXP`, `LN`, `LOG`, `SIN` ... `ATAN2`, `CONV`, `BIN`, `RAND`, `GREATEST`, `LEAST`; date: `NOW`, `CURDATE`, `DATE_FORMAT`, `STR_TO_DATE`, `DATE_ADD` / `DATE_SUB` / `+ INTERVAL n DAY`, `DATEDIFF`, `TIMESTAMPDIFF`, `EXTRACT`, `DATE_PART`, `DATE_TRUNC`, `LAST_DAY`, `DAYNAME`, `WEEK`, ...; altro: `COALESCE`, `IFNULL`, `NULLIF`, `IF`, `CAST`, `UUID`, `MAKE_SET`, `EXPORT_SET` |
+| Funzioni | Testo: `UPPER`, `LOWER`, `INITCAP`, `LENGTH`, `CHAR_LENGTH`, `TRIM`, `CONCAT`, `CONCAT_WS`, `SUBSTRING`, `LEFT`, `RIGHT`, `REPLACE`, `INSERT(s, pos, n, nuovo)`, `REVERSE`, `LPAD`, `RPAD`, `LOCATE`, `INSTR`, `SPLIT_PART`, `SUBSTRING_INDEX`, `TRANSLATE`, `OVERLAY(s PLACING r FROM n FOR m)`, `STARTS_WITH`, `SOUNDEX`, `REGEXP_LIKE` / `REPLACE` / `SUBSTR` / `INSTR` / `COUNT`, `CHR`, `ASCII`, `HEX`, `MD5`, `SHA2`, `TO_BASE64`, ...; numeri: `ABS`, `ROUND`, `TRUNCATE`, `FLOOR`, `CEIL`, `MOD`, `POWER`, `SQRT`, `EXP`, `LN`, `LOG`, `SIN` ... `ATAN2`, `CONV`, `BIN`, `RAND`, `GREATEST`, `LEAST`; date: `NOW`, `CURDATE`, `DATE_FORMAT`, `STR_TO_DATE`, `DATE_ADD` / `DATE_SUB` / `+ INTERVAL n DAY`, `DATEDIFF`, `TIMESTAMPDIFF`, `EXTRACT`, `DATE_PART`, `DATE_TRUNC`, `LAST_DAY`, `DAYNAME`, `WEEK`, ...; altro: `COALESCE`, `IFNULL`, `NULLIF`, `IF`, `CAST`, `UUID`, `MAKE_SET`, `EXPORT_SET` |
 | Full-text | `WHERE MATCH(titolo, testo) AGAINST('basi dati')` con punteggio di pertinenza (`ORDER BY MATCH(...) AGAINST(...) DESC`); `IN BOOLEAN MODE`: `+obbligatoria -esclusa prefis* "frase esatta"`. Senza distinzione maiuscole/minuscole, anche con lettere accentate; senza indice (legge ogni riga) |
 | Nomi qualificati | `SELECT * FROM shop.prodotto`, `INSERT INTO shop.prodotto ...`, `DROP TABLE shop.vecchia`, `shop.prodotto.nome`, senza cambiare il database corrente (`USE`); anche più database nella stessa istruzione, come MySQL: `SELECT ... FROM shop.prodotto p JOIN uni.ordine o ON ...`, `INSERT INTO copia SELECT * FROM archivio.vecchi` (le tabelle senza database sono quelle del corrente; con gli utenti i permessi servono su ogni database nominato) |
-| JSON | Su colonne di testo, come MySQL: `JSON_VALID(doc)`, `JSON_EXTRACT(doc, '$.cliente.nome')` (percorsi `$`, `.chiave`, `."con spazi"`, `[n]`; `NULL` se il percorso manca), `doc->'$.tag[0]'` (= `JSON_EXTRACT`), `doc->>'$.nome'` (senza virgolette, = `JSON_UNQUOTE(JSON_EXTRACT(...))`), `JSON_UNQUOTE`, `JSON_TYPE`, `JSON_LENGTH(doc [, percorso])`, `JSON_OBJECT('a', 1, 'b', x)`, `JSON_ARRAY(1, 'z', NULL)`, modifiche `JSON_SET` / `JSON_INSERT` / `JSON_REPLACE` / `JSON_REMOVE` / `JSON_ARRAY_APPEND` / `JSON_MERGE_PATCH`, ricerche `JSON_CONTAINS` / `JSON_CONTAINS_PATH` / `JSON_SEARCH` / `JSON_KEYS`, `JSON_DEPTH`, `JSON_PRETTY`, `JSON_QUOTE`. Esempio: `SELECT id FROM ordine WHERE dati->>'$.stato' = 'pagato'` |
+| JSON | Su colonne di testo, come MySQL: `JSON_VALID(doc)`, `JSON_EXTRACT(doc, '$.cliente.nome')` (percorsi `$`, `.chiave`, `."con spazi"`, `[n]`; `NULL` se il percorso manca), `doc->'$.tag[0]'` (= `JSON_EXTRACT`), `doc->>'$.nome'` (senza virgolette, = `JSON_UNQUOTE(JSON_EXTRACT(...))`), `JSON_UNQUOTE`, `JSON_TYPE`, `JSON_LENGTH(doc [, percorso])`, `JSON_OBJECT('a', 1, 'b', x)`, `JSON_ARRAY(1, 'z', NULL)`, modifiche `JSON_SET` / `JSON_INSERT` / `JSON_REPLACE` / `JSON_REMOVE` / `JSON_ARRAY_APPEND` / `JSON_ARRAY_INSERT` / `JSON_MERGE_PATCH` / `JSON_MERGE_PRESERVE` (= `JSON_MERGE`), risultati nella forma normalizzata di MySQL (`{"a": 1, "b": [1, 2]}`, anche per `CAST(... AS JSON)`), ricerche `JSON_CONTAINS` / `JSON_CONTAINS_PATH` / `JSON_SEARCH` / `JSON_KEYS`, `JSON_DEPTH`, `JSON_PRETTY`, `JSON_QUOTE`. Esempio: `SELECT id FROM ordine WHERE dati->>'$.stato' = 'pagato'` |
 
 Un alias nasconde il nome della tabella, come in SQL standard: in `... FROM esame e2 WHERE e2.corso = esame.corso` il secondo `esame` è la query esterna.
 Con `SELECT DISTINCT`, `ORDER BY` può usare solo ciò che la query restituisce (una colonna, un alias, una posizione o la stessa espressione), come in MySQL e PostgreSQL: altrimenti l'ordine non sarebbe definito e la query viene rifiutata.
@@ -706,6 +706,10 @@ OPTIMIZE TABLE t;              -- statistiche, indici ricostruiti e VACUUM;  REP
 
 Le stesse operazioni sono nel menu della tabella nell'albero (*Check / Analyze / Optimize table*);
 il risultato ha le colonne di MySQL (`Table`, `Op`, `Msg_type`, `Msg_text`).
+
+Lo statement SQL `BACKUP TO` non scrive dentro la cartella dei dati né, mentre il server web è acceso, dentro la
+sua cartella `www` o quella di un sito (anche attraverso link simbolici): lì il server servirebbe database e
+`users.dat`. Il backup dall'app (*File → Backup*) sceglie la cartella liberamente.
 
 Un backup è una cartella di dati completa: si apre direttamente (`segvault-server /percorso/backup`)
 o si ripristina dall'app (*File → Restore backup*; i dati sostituiti restano in `before-restore`).
@@ -1364,19 +1368,39 @@ make test          # tutti i test
 make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitizer (anche i memory leak)
 ```
 
-| Suite | Cosa verifica |
-|---|---|
-| `test_btree` | B+Tree sotto stress contro un modello di riferimento: inserimenti, aggiornamenti, cancellazioni e scansioni ordinate, con un buffer pool piccolo che costringe a riscrivere e rileggere le pagine |
-| `test_engine` (128) | Motore: pagine, heap, catalogo, WAL e recovery, import CSV |
-| `test_sql` (1164) | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, procedure, viste, transazioni, crash e recovery, testi lunghi, JSON, full-text, 100 transazioni di fila |
-| `test_examples` (166) | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
-| `test_grid_edit` (22) | Modifica dei dati nella griglia: analisi dei risultati, `UPDATE` / `INSERT` / `DELETE` generati ed eseguiti, chiavi composte, join, apici e backslash, letterali di export e dump |
-| `test_php` (86) | PHP via FastCGI con un php-cgi finto (e quello vero se installato): variabili CGI, `PATH_INFO`, `index.php`, URL belli, redirect e cookie, sorgente mai mostrato, processi riavviati dopo un crash o un timeout, richieste in parallelo, php-fpm esterno, prefisso dell'API spostato o spento, corpi *chunked* (anche malformati), sito statico (gzip verificato con `gzip`, `Range`, `304`, `/.well-known`, `404.html`, tipi MIME) |
-| `test_server` (115) | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici, utenti e permessi, audit, protocollo MySQL (login, permessi, errori, più istruzioni, transazioni) |
-| `test_export` (9) | Export XLSX (zip con CRC giusti, parti XML complete, numeri, testo con caratteri speciali, NULL) e PDF (xref, pagine, testo WinAnsi) |
-| `test_backup` (29) | `BACKUP TO`, apertura della copia, ripristino sui dati in uso (con i dati precedenti conservati), righe grandi, viste, procedure e utenti |
-| `test_durability` | Guasti iniettati (`write`, `pwrite`, `fsync`, `pread` che falliscono o fermano il processo): `COMMIT` con fsync fallito, log pieno, arresto a ogni scrittura di un `ROLLBACK` e del recupero, recupero di un log grande con poca memoria, pagine danneggiate, catalogo e utenti troncati, `synchronous` |
-| `test_h2` | HTTP/2 a livello di frame: intestazioni malformate, *rapid reset*, PING a raffica |
+| Suite | Controlli | Cosa verifica |
+|---|---:|---|
+| `test_btree` | 40 011 | B+Tree sotto stress contro un modello di riferimento: inserimenti, aggiornamenti, cancellazioni e scansioni ordinate, con un buffer pool piccolo che costringe a riscrivere e rileggere le pagine |
+| `test_engine` | 131 | Motore: pagine, heap, catalogo, WAL e recovery, import CSV |
+| `test_sql` | 2 170 | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, procedure, viste, transazioni, crash e recovery, testi lunghi, JSON, full-text, 100 transazioni di fila |
+| `test_mysql` | 152 | Compatibilità con MySQL: il dialetto delle applicazioni PHP (WordPress, Laravel, ...), funzioni di testo, date, JSON e `REGEXP` |
+| `test_examples` | 166 | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
+| `test_server` | 258 | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici, utenti e permessi, audit, protocollo MySQL (login, permessi, errori, più istruzioni, transazioni) |
+| `test_web` | 66 | Server web come ambiente di sviluppo: siti per nome (virtual host automatici e `--site`), cruscotto, elenco dei file, reverse proxy verso un dev server (con WebSocket), file del formato SegVault mai serviti, `BACKUP TO` che non scrive nelle cartelle servite |
+| `test_mail` | 53 | Cattura delle email: SMTP, archivio, MIME, pagine e API web, client `sendmail` e `mail()` di un php-cgi vero (se installato) |
+| `test_tls` | 37 | HTTPS e HTTP/2 con curl e la CA locale (saltato senza curl o OpenSSL) |
+| `test_php` | 132 | PHP via FastCGI con un php-cgi finto (e quello vero se installato): variabili CGI, `PATH_INFO`, `index.php`, URL belli, redirect e cookie, sorgente mai mostrato, processi riavviati dopo un crash o un timeout, richieste in parallelo, php-fpm esterno, prefisso dell'API spostato o spento, corpi *chunked* (anche malformati), sito statico (gzip verificato con `gzip`, `Range`, `304`, `/.well-known`, `404.html`, tipi MIME) |
+| `test_grid_edit` | 27 | Modifica dei dati nella griglia: analisi dei risultati, `UPDATE` / `INSERT` / `DELETE` generati ed eseguiti, chiavi composte, join, apici e backslash, letterali di export e dump |
+| `test_table_design` | 33 | Designer delle tabelle: SQL `CREATE` / `ALTER` generato, eseguito sul motore e ricaricato dal catalogo |
+| `test_schema_model` | 52 | Diagramma dello schema: relazioni dal catalogo, SQL delle azioni eseguito sul motore, posizioni e layout |
+| `test_db_tools` | 19 | Ricerca in tutto il database e panoramica delle tabelle |
+| `test_png` | 12 | Encoder PNG: il flusso deflate si decomprime e ridà i dati, chunk e CRC corretti |
+| `test_auth` | 119 | Utenti e permessi: istruzioni di gestione, controllo degli statement, password, persistenza (anche GRANT su nomi con spazi dopo un riavvio) |
+| `test_sessions` | 73 | Sessioni: stato separato (database, utente, transazione, savepoint), un solo proprietario delle transazioni, recupero dopo un crash |
+| `test_parallel` | 31 | Letture parallele: correttezza, scalabilità, lettori a freddo dopo un riavvio, sottoquery annidate con 512 KB di stack |
+| `test_mysql_import` | 29 | Import di un dump di MySQL: traduzione nel dialetto di SegVault ed esecuzione sul motore |
+| `test_overflow` | 58 | Righe grandi: pagine di overflow (fino a 64 MB per riga, 16 MB per testo), transazioni, riavvio, crash |
+| `test_backup` | 39 | `BACKUP TO`, apertura della copia, ripristino sui dati in uso (con i dati precedenti conservati), righe grandi, viste, procedure e utenti |
+| `test_export` | 9 | Export XLSX (zip con CRC giusti, parti XML complete, numeri, testo con caratteri speciali, NULL) e PDF (xref, pagine, testo WinAnsi) |
+| `test_durability` | 557 | Guasti iniettati (`write`, `pwrite`, `fsync`, `pread` che falliscono o fermano il processo): `COMMIT` con fsync fallito, log pieno, arresto a ogni scrittura di un `ROLLBACK` e del recupero, recupero di un log grande con poca memoria, pagine danneggiate, catalogo e utenti troncati, `synchronous` |
+| `test_h2` | 9 | HTTP/2 a livello di frame: intestazioni malformate, *rapid reset*, PING a raffica |
+| `test_decimal` | 10 000 | 10 000 espressioni DECIMAL confrontate con il `decimal` di Python (regole di scala di MySQL) |
+| `test_platform` | 20 | Livello X11: metodo di input (XIM) e scala dell'interfaccia (si salta senza display) |
+| `test_strbuf` | 13 | Buffer di testo comune: crescita, limite, errore "appiccicoso", overflow di `size_t` |
+
+Ogni suite lavora in una cartella privata creata all'avvio (`mkdtemp` in `$TMPDIR` o `/tmp`) e cancellata alla
+fine: due esecuzioni insieme non si disturbano e dopo `make test` non resta nulla (`SV_TEST_KEEP=1` la conserva per
+guardarci dentro). L'infrastruttura comune è in `tests/harness.h`.
 
 **Quando una conferma è su disco** (`SET GLOBAL synchronous = ...`, o `--synchronous` del server):
 
@@ -1401,28 +1425,29 @@ generata da `make bench-readme`; `make bench` la confronta con `bench/baseline.j
 che peggiora di oltre il 15 % rispetto a SQLite misurato nella stessa esecuzione.
 
 <!-- bench:start (generated by bench/compare.py: do not edit by hand) -->
-SegVault 1.4.0 · SQLite 3.54.1 (in-process, WAL) · MariaDB: not run · 16 CPUs · scale 1
+SegVault 1.5.0 · SQLite 3.54.1 (in-process, WAL) · MariaDB: not run · 16 CPUs · scale 1
 
 | Scenario | What is measured | Unit | SegVault | SQLite | SegVault / SQLite |
 |---|---|---|---:|---:|---:|
-| `bulk_load` | INSERT in blocks of 500 rows, one transaction | rows/s | 738 k | 1,333 k | 0.55× |
-| `point_lookup` | SELECT by primary key, SQL text each time | queries/s | 224 k | 217 k | 1.04× |
-| `point_lookup_prepared` | the same, prepared once (bound integer) | queries/s | 497 k | 362 k | 1.37× |
-| `range_scan` | 1000-row ranges on the primary key | rows/s | 3,254 k | 9,456 k | 0.34× |
-| `join_group` | JOIN of both tables + filter + GROUP BY | queries/s | 31.3 | 17.5 | 1.79× |
-| `scan_aggregate` | full scan + GROUP BY | queries/s | 39.3 | 29.5 | 1.33× |
-| `update_heavy` | UPDATE by primary key, 100 per transaction | updates/s | 53.9 k | 32.2 k | 1.67× |
-| `commit_full` | single-row INSERT in autocommit, synchronous = FULL | commits/s | 1.2 k | 1.1 k | 1.12× |
-| `commit_normal` | single-row INSERT in autocommit, synchronous = NORMAL | commits/s | 168 k | 31.9 k | 5.26× |
-| `commit_off` | single-row INSERT in autocommit, synchronous = OFF | commits/s | 177 k | 43.6 k | 4.05× |
-| `rollback` | BEGIN; INSERT 10 rows; ROLLBACK on the loaded database | rollbacks/s | 1.2 k | 88.6 k | 0.014× |
-| `readers_1` | 1 concurrent readers (point SELECT), own connection each | ops/s | 257 k | 224 k | 1.15× |
-| `readers_4` | 4 concurrent readers (point SELECT), own connection each | ops/s | 895 k | 679 k | 1.32× |
-| `readers_16` | 16 concurrent readers (point SELECT), own connection each | ops/s | 1,351 k | 2,595 k | 0.52× |
-| `writers_1` | 1 concurrent writers (point UPDATE, autocommit), own connection each | ops/s | 118 k | 27.3 k | 4.32× |
-| `writers_4` | 4 concurrent writers (point UPDATE, autocommit), own connection each | ops/s | 102 k | 24.1 k | 4.25× |
-| `cold_start` | close and reopen the loaded database, first query | starts/s | 90.0 | 298.7 | 0.30× |
-| `pdo_point_lookup` | PHP PDO over the MySQL protocol, prepared point lookups | queries/s | 38.3 k | n/a | — |
+| `bulk_load` | INSERT in blocks of 500 rows, one transaction | rows/s | 664 k | 1,316 k | 0.50× |
+| `point_lookup` | SELECT by primary key, SQL text each time | queries/s | 258 k | 216 k | 1.19× |
+| `point_lookup_prepared` | the same, prepared once (bound integer) | queries/s | 420 k | 361 k | 1.16× |
+| `range_scan` | 1000-row ranges on the primary key | rows/s | 2,780 k | 8,786 k | 0.32× |
+| `join_group` | JOIN of both tables + filter + GROUP BY | queries/s | 29.9 | 17.3 | 1.73× |
+| `scan_aggregate` | full scan + GROUP BY | queries/s | 38.4 | 28.9 | 1.33× |
+| `update_heavy` | UPDATE by primary key, 100 per transaction | updates/s | 52.7 k | 31.7 k | 1.66× |
+| `commit_full` | single-row INSERT in autocommit, synchronous = FULL | commits/s | 1.2 k | 1.0 k | 1.13× |
+| `commit_normal` | single-row INSERT in autocommit, synchronous = NORMAL | commits/s | 176 k | 32.9 k | 5.35× |
+| `commit_off` | single-row INSERT in autocommit, synchronous = OFF | commits/s | 183 k | 44.9 k | 4.07× |
+| `rollback` | BEGIN; INSERT 10 rows; ROLLBACK on the loaded database | rollbacks/s | 15.5 k | 88.5 k | 0.18× |
+| `readers_1` | 1 concurrent readers (point SELECT), own connection each | ops/s | 326 k | 222 k | 1.47× |
+| `readers_4` | 4 concurrent readers (point SELECT), own connection each | ops/s | 1,124 k | 679 k | 1.65× |
+| `readers_16` | 16 concurrent readers (point SELECT), own connection each | ops/s | 1,280 k | 2,477 k | 0.52× |
+| `writers_1` | 1 concurrent writers (point UPDATE, autocommit), own connection each | ops/s | 125 k | 27.3 k | 4.56× |
+| `writers_4` | 4 concurrent writers (point UPDATE, autocommit), own connection each | ops/s | 106 k | 24.4 k | 4.34× |
+| `cold_start` | close and reopen the loaded database, first query | starts/s | 185.6 | 2.6 k | 0.072× |
+| `cold_lookup` | first primary-key lookup after reopening the database | lookups/s | 65.3 k | 92.2 k | 0.71× |
+| `pdo_point_lookup` | PHP PDO over the MySQL protocol, prepared point lookups | queries/s | 34.4 k | n/a | — |
 <!-- bench:end -->
 
 **Query tipiche** (`make bench_sql && ./bench_sql 100000`): uno schema universitario con 10.000 studenti, 50 corsi e 100.000 esami (Linux, un core):
@@ -1513,7 +1538,7 @@ SegVaultDB/
 
 | Costante | Valore | Significato |
 |---|---|---|
-| `SV_VERSION_STR` | `"1.4.2"` | Versione |
+| `SV_VERSION_STR` | `"1.5.0"` | Versione |
 | `SV_PAGE_SIZE` | `4096` | Dimensione di una pagina su disco |
 | `SV_BUFFER_POOL_CAP` | `1024` | Pagine nel buffer pool se la RAM non si legge (di norma 1/8 della RAM, `--cache-size`) |
 | `SV_MAX_DATABASES` | `100000` | Database (liste dinamiche dalla 1.4) |

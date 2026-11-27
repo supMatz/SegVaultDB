@@ -5,9 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "harness.h"
 
-static int g_tests, g_fail;
-#define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
 
 static QueryResult* q(const char* sql) {
     QueryResult* r = db_execute(sql);
@@ -26,8 +26,9 @@ static char* scalar(const char* sql) {
 }
 
 int main(void) {
-    if (system("rm -rf /tmp/sv_grid_test && mkdir -p /tmp/sv_grid_test") != 0) return 1;
-    if (!db_init("/tmp/sv_grid_test")) return 1;
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
+    if (system("rm -rf sv_grid_test && mkdir -p sv_grid_test") != 0) return 1;
+    if (!db_init("sv_grid_test")) return 1;
     run("CREATE DATABASE g");
     run("USE g");
     run("CREATE TABLE p (id INT PRIMARY KEY AUTO_INCREMENT, nome VARCHAR(40) NOT NULL, prezzo FLOAT, ok BOOL DEFAULT TRUE, `order` INT)");
@@ -37,7 +38,25 @@ int main(void) {
     run("CREATE TABLE nokey (x INT)");
     run("INSERT INTO nokey VALUES (1)");
     char err[256];
-    GridEdit ge;
+    static GridEdit ge;                       // ~200 KB
+
+    // tabella larga (P3.11: oltre 64 colonne la griglia era in sola lettura)
+    {
+        char ddl[4096];
+        int n = snprintf(ddl, sizeof(ddl), "CREATE TABLE larga (id INT PRIMARY KEY");
+        for (int c = 1; c < 100; c++) n += snprintf(ddl + n, sizeof(ddl) - (size_t)n, ", c%d INT", c);
+        snprintf(ddl + n, sizeof(ddl) - (size_t)n, ")");
+        run(ddl);
+        run("INSERT INTO larga (id, c99) VALUES (1, 5)");
+        QueryResult* wr = q("SELECT * FROM larga");
+        grid_edit_analyze(&ge, wr);
+        CHECK(grid_edit_cell_ok(&ge, 99) && !ge.why[0], "100-column table editable: %s", ge.why);
+        char* wsql = grid_edit_update_sql(&ge, &wr->rows[0], 99, "7", false, err, sizeof(err));
+        CHECK(wsql && !strcmp(wsql, "UPDATE `larga` SET `c99` = 7 WHERE `id` = 1"), "update of column 100: %s", wsql ? wsql : err);
+        run(wsql); free(wsql);
+        CHECK(!strcmp(scalar("SELECT c99 FROM larga"), "7"), "column 100 updated");
+        db_result_free(wr);
+    }
 
     // ── analisi ──
     QueryResult* r = q("SELECT * FROM p ORDER BY id");
@@ -154,7 +173,7 @@ int main(void) {
     db_result_free(r);
 
     db_shutdown();
-    if (system("rm -rf /tmp/sv_grid_test")) {}
+    if (system("rm -rf sv_grid_test")) {}
     if (g_fail) { printf("grid edit tests: %d of %d FAILED\n", g_fail, g_tests); return 1; }
     printf("OK: %d/%d grid edit checks passed\n", g_tests, g_tests);
     return 0;

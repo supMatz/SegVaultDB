@@ -17,7 +17,7 @@ else
 endif
 
 CC       = gcc
-CFLAGS   = -std=c11 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -D_FORTIFY_SOURCE=2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+CFLAGS   = -std=c11 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -D_FORTIFY_SOURCE=2 -Wall -Wextra -Wno-unused-parameter \
            -Wshadow -Wformat=2 -Wno-format-nonliteral -Wstrict-prototypes -g -O2
 # solo per gli eseguibili Linux (MinGW non li supporta tutti): canary sullo stack, PIE, RELRO completo
 HARDEN_CFLAGS  = -fstack-protector-strong -fPIE
@@ -131,7 +131,7 @@ SQL_TEST_SRCS = tests/test_sql.c $(ENGINE_SRCS)
 
 EXAMPLES_TEST_SRCS = tests/test_examples.c src/widgets/sql_text.c $(ENGINE_SRCS)
 
-test: test_engine test_btree test_sql test_mysql test_examples test_server test_web test_mail test_tls test_php test_grid_edit test_table_design test_schema_model test_db_tools test_png test_auth test_sessions test_parallel test_mysql_import test_overflow test_backup test_export test_durability test_h2 test_decimal test_platform
+test: test_engine test_btree test_sql test_mysql test_examples test_server test_web test_mail test_tls test_php test_grid_edit test_table_design test_schema_model test_db_tools test_png test_auth test_sessions test_parallel test_mysql_import test_overflow test_backup test_export test_durability test_h2 test_decimal test_platform test_strbuf
 	./test_btree
 	./test_engine
 	./test_sql
@@ -158,8 +158,12 @@ test: test_engine test_btree test_sql test_mysql test_examples test_server test_
 	./test_h2
 	./test_decimal build-test-decimal.txt 10000 && python3 tests/check_decimal.py build-test-decimal.txt
 	./test_platform
+	./test_strbuf
 
 # piattaforma X11 (metodo di input, scala): senza display si salta da solo
+test_strbuf: tests/test_strbuf.c include/sv_strbuf.h
+	$(CC) $(CFLAGS) -o test_strbuf tests/test_strbuf.c
+
 test_platform: tests/test_platform.c src/platform/xlib.c src/platform/fonts_embed.c src/platform/platform.h
 	$(CC) $(CFLAGS) $(INCLUDES) -o test_platform tests/test_platform.c src/platform/fonts_embed.c $(LIBS)
 
@@ -428,7 +432,7 @@ build-win/%.o: %.c
 	$(WIN_CC) $(CFLAGS) $(WIN_EXTRA) $(DEPFLAGS) $(BASE_INCLUDES) -c $< -o $@
 
 clean:
-	$(RM) $(FULL_OBJS) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql bench_suite test_decimal test_decimal_asan build-test-decimal.txt test_examples test_examples_asan
+	$(RM) $(FULL_OBJS) $(FULL_OBJS:.o=.d) $(OUT) test_engine test_engine_asan test_btree test_btree_asan test_sql test_sql_asan bench_sql bench_suite test_decimal test_decimal_asan test_strbuf build-test-decimal.txt test_examples test_examples_asan
 	$(RM) segvault-server segvault-server.exe libsegvault.a test_server test_server_asan test_web test_mail test_tls test_mysql test_php test_php_asan test_php_tsan test_grid_edit test_grid_edit_asan test_table_design test_table_design_asan test_schema_model test_schema_model_asan test_db_tools test_db_tools_asan test_png test_png_asan test_auth test_auth_asan test_sessions test_sessions_asan test_parallel test_parallel_asan test_parallel_tsan test_sessions_tsan test_mysql_import test_mysql_import_asan test_overflow test_overflow_asan test_backup test_backup_asan test_export test_export_asan test_durability test_durability_asan test_h2 test_h2_asan test_mysql_asan test_web_asan test_mail_asan test_tls_asan test_server_tsan test_web_tsan test_win.exe test_platform fuzz_sv
 	$(RM) -r obj build-win build-server build-dist dist
 

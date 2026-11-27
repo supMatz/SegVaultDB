@@ -9,11 +9,13 @@ SCOPO: modifica dei dati nella griglia dei risultati (come phpMyAdmin / DBeaver)
 #define GRID_EDIT_H
 
 #include "../bridge/db_api.h"
+#include "../../include/common.h"
 #include <stdbool.h>
 #include <stddef.h>
 
 #define GE_MAX_TABLES 8
-#define GE_MAX_KEY    8
+#define GE_MAX_COLS   SV_MAX_COLUMNS   // tutte le colonne che una tabella può avere (P3.11: prima 64, oltre sola lettura)
+#define GE_MAX_KEY    16           // = SV_MAX_KEY_COLS
 
 typedef struct {
     char name[64];
@@ -28,13 +30,13 @@ typedef struct {
     char    db[64];
     GeTable t[GE_MAX_TABLES];
     int     nt;
-    int     col_table[64];       // tabella di ogni colonna del risultato (-1 = calcolata)
-    char    col_type[64][64];    // tipo SQL della colonna di origine ("INT", "VARCHAR(20)", ...)
-    bool    col_nullable[64];
-    char    col_default[64][128];
+    int     col_table[GE_MAX_COLS];        // tabella di ogni colonna del risultato (-1 = calcolata)
+    char    col_type[GE_MAX_COLS][64];     // tipo SQL della colonna di origine ("INT", "VARCHAR(20)", ...)
+    bool    col_nullable[GE_MAX_COLS];
+    char    col_default[GE_MAX_COLS][128];
     int     row_table;           // l'unica tabella del risultato (-1 = più tabelle o nessuna)
     char    why[160];            // perché non si può modificare (vuoto se si può)
-} GridEdit;
+} GridEdit;                               // ~200 KB: sullo heap o static, non sullo stack
 
 // analizza il risultato (legge lo schema con db_list_columns: da chiamare con il motore libero)
 void grid_edit_analyze(GridEdit* ge, const QueryResult* r);

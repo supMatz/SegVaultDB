@@ -1,4 +1,5 @@
 #include "table_design.h"
+#include "sql_quote.h"
 #include "../bridge/db_api.h"
 #include <ctype.h>
 #include <stdio.h>
@@ -72,24 +73,9 @@ void design_add_column(DesignTable* t) {
 
 // ── SQL ─────────────────────────────────────────────────────────
 
-typedef struct { char* p; size_t n, cap; bool oom; } DBuf;
-
-static void db_add(DBuf* b, const char* s) {
-    size_t n = strlen(s);
-    if (b->oom) return;
-    if (b->n + n + 1 > b->cap) {
-        size_t cap = b->cap ? b->cap * 2 : 512;
-        while (cap < b->n + n + 1) cap *= 2;
-        char* p = realloc(b->p, cap);
-        if (!p) { b->oom = true; return; }
-        b->p = p;
-        b->cap = cap;
-    }
-    memcpy(b->p + b->n, s, n + 1);
-    b->n += n;
-}
-
-static void db_ident(DBuf* b, const char* name) { db_add(b, "`"); db_add(b, name); db_add(b, "`"); }
+typedef SvStrBuf DBuf;                                       // buffer comune (CR-B2)
+#define db_add svsb_puts
+#define db_ident sql_ident_sb
 
 static bool valid_name(const char* s) {
     if (!s[0] || strlen(s) > 63 || isdigit((unsigned char)s[0])) return false;

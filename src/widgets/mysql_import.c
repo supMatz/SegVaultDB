@@ -5,24 +5,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include "../../include/sv_strbuf.h"
 
-typedef struct { char* p; size_t n, cap; bool oom; } Buf;
-
-static void put(Buf* b, const char* s, size_t n) {
-    if (b->oom) return;
-    if (b->n + n + 1 > b->cap) {
-        size_t cap = b->cap ? b->cap * 2 : 4096;
-        while (cap < b->n + n + 1) cap *= 2;
-        char* p = realloc(b->p, cap);
-        if (!p) { b->oom = true; return; }
-        b->p = p;
-        b->cap = cap;
-    }
-    memcpy(b->p + b->n, s, n);
-    b->n += n;
-    b->p[b->n] = '\0';
-}
-static void puts_(Buf* b, const char* s) { put(b, s, strlen(s)); }
+typedef SvStrBuf Buf;                                        // buffer comune (CR-B2)
+#define put svsb_put
+#define puts_ svsb_puts
 
 bool mysql_looks_like_dump(const char* sql) {
     if (!sql) return false;

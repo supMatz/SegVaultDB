@@ -38,27 +38,35 @@ const char* datatype_name(DataType t) {
 
 // ── tabelle: memoria delle colonne ───────────────────────────────
 
-// blocco di una tabella di lavoro: struttura, indici, vincoli, colonne (offset allineati a 16)
+// blocco di una tabella di lavoro: struttura, indici, vincoli, colonne (offset allineati a 16). Indici e vincoli
+// solo quanti ne chiede chi la crea (P3.12: prima sempre 16 + 16, ~30 KB azzerati per ogni risultato intermedio,
+// vista, CTE o variabile di routine che non ne ha nessuno)
 #define SN_AL(x) (((x) + 15) & ~(size_t)15)
 #define SN_IDX   SN_AL(sizeof(TableSchema))
-#define SN_CON   SN_AL(SN_IDX + sizeof(Index) * SV_MAX_INDEXES)
-#define SN_COL   SN_AL(SN_CON + sizeof(Constraint) * SV_MAX_CONSTRAINTS)
+#define SN_CON(ni)     SN_AL(SN_IDX + sizeof(Index) * (size_t)(ni))
+#define SN_COL(ni, nk) SN_AL(SN_CON(ni) + sizeof(Constraint) * (size_t)(nk))
 
-TableSchema* schema_new(int cap) {
+TableSchema* schema_new_aux(int cap, int ni, int nk) {
     if (cap < 0) cap = 0;
-    uint8_t* b = sv_try_calloc(1, SN_COL + sizeof(Column) * (size_t)cap);
+    if (ni < 0) ni = 0;
+    if (nk < 0) nk = 0;
+    if (ni > SV_MAX_INDEXES) ni = SV_MAX_INDEXES;
+    if (nk > SV_MAX_CONSTRAINTS) nk = SV_MAX_CONSTRAINTS;
+    uint8_t* b = sv_try_calloc(1, SN_COL(ni, nk) + sizeof(Column) * (size_t)cap);
     if (!b) return NULL;
     TableSchema* t = (TableSchema*)b;
-    t->columns = cap ? (Column*)(b + SN_COL) : NULL;
+    t->columns = cap ? (Column*)(b + SN_COL(ni, nk)) : NULL;
     t->cap_columns = cap;
     t->own_columns = 0;
-    t->indexes = (Index*)(b + SN_IDX);
-    t->cap_indexes = SV_MAX_INDEXES;
-    t->constraints = (Constraint*)(b + SN_CON);
-    t->cap_constraints = SV_MAX_CONSTRAINTS;
+    t->indexes = ni ? (Index*)(b + SN_IDX) : NULL;
+    t->cap_indexes = ni;
+    t->constraints = nk ? (Constraint*)(b + SN_CON(ni)) : NULL;
+    t->cap_constraints = nk;
     t->own_aux = 0;
     return t;
 }
+
+TableSchema* schema_new(int cap) { return schema_new_aux(cap, 0, 0); }
 
 // almeno n posti in *arr (allocazione a parte: own_aux), al più max
 static bool aux_reserve(void** arr, int* cap, int n, int max, size_t elem, bool own) {
@@ -138,7 +146,7 @@ bool schema_assign(TableSchema* dst, const TableSchema* src) {
 
 TableSchema* schema_dup(const TableSchema* src, int extra) {
     if (!src) return NULL;
-    TableSchema* t = schema_new(src->num_columns + (extra > 0 ? extra : 0));
+    TableSchema* t = schema_new_aux(src->num_columns + (extra > 0 ? extra : 0), src->num_indexes, src->num_constraints);
     if (t && !schema_assign(t, src)) { free(t); return NULL; }
     return t;
 }
@@ -268,26 +276,64 @@ void catalog_free(Catalog* c) {
 // salvataggio le riscrive nel formato v6.
 
 #define CAT_MAGIC   "SVCAT2\0\0"
-#define CAT_VERSION 7u   // v3: il flag "nullable" delle colonne è significativo (NOT NULL applicato)
+#define CAT_VERSION 8u   // v3: il flag "nullable" delle colonne è significativo (NOT NULL applicato)
                          // v4: vincoli (PRIMARY KEY composta, UNIQUE, FOREIGN KEY, CHECK) in coda a TableSchema
                          // v5: tipo SQL originale e flag delle colonne, colonne degli indici, collation
                          // v6: codifica esplicita, liste dinamiche (più di 64 colonne / 256 tabelle / 64 database)
                          // v7: indici su disco (B+tree scritti al checkpoint) in coda a ogni tabella
+                         // v8: ultima pagina della catena (e sua radice) in coda a ogni tabella
 
 // ── formati precedenti ──
+// Index e Constraint come erano su disco fino alla v7 (8 colonne di chiave): solo per leggere i formati fissi v4 / v5
+typedef struct {
+    char     name[SV_MAX_NAME_LEN];
+    char     col_name[SV_MAX_NAME_LEN];
+    bool     unique;
+    char     type[16];
+    uint32_t root_page_id;
+    uint8_t  ncols;
+    uint8_t  fulltext;
+    char     cols[SV_V5_KEY_COLS][SV_MAX_NAME_LEN];
+} IndexV5;
+typedef struct {
+    char     name[SV_MAX_NAME_LEN];
+    uint8_t  kind, ncols, on_delete, on_update;
+    uint8_t  cols[SV_V5_KEY_COLS];
+    char     ref_table[SV_MAX_NAME_LEN];
+    char     ref_cols[SV_V5_KEY_COLS][SV_MAX_NAME_LEN];
+    char     check[SV_CHECK_LEN];
+} ConstraintV5;
+
+static void index_from_v5(Index* x, const IndexV5* o) {
+    memset(x, 0, sizeof(*x));
+    memcpy(x->name, o->name, sizeof(x->name)); memcpy(x->col_name, o->col_name, sizeof(x->col_name));
+    x->unique = o->unique; memcpy(x->type, o->type, sizeof(x->type)); x->root_page_id = o->root_page_id;
+    x->ncols = o->ncols <= SV_V5_KEY_COLS ? o->ncols : 0; x->fulltext = o->fulltext;
+    for (int k = 0; k < SV_V5_KEY_COLS; k++) memcpy(x->cols[k], o->cols[k], sizeof(x->cols[k]));
+}
+static void cons_from_v5(Constraint* c, const ConstraintV5* o) {
+    memset(c, 0, sizeof(*c));
+    memcpy(c->name, o->name, sizeof(c->name));
+    c->kind = o->kind; c->ncols = o->ncols <= SV_V5_KEY_COLS ? o->ncols : 0; c->on_delete = o->on_delete; c->on_update = o->on_update;
+    memcpy(c->cols, o->cols, SV_V5_KEY_COLS);
+    memcpy(c->ref_table, o->ref_table, sizeof(c->ref_table));
+    for (int k = 0; k < SV_V5_KEY_COLS; k++) memcpy(c->ref_cols[k], o->ref_cols[k], sizeof(c->ref_cols[k]));
+    memcpy(c->check, o->check, sizeof(c->check));
+}
+
 // v5: la TableSchema di SegVault 1.3 (64 colonne dentro la struttura)
 typedef struct {
     char      name[SV_MAX_NAME_LEN];
     Column    columns[64];
     int       num_columns;
-    Index     indexes[SV_MAX_INDEXES];
+    IndexV5   indexes[SV_V5_INDEXES];
     int       num_indexes;
     uint32_t  root_page_id;
     uint32_t  num_pages;
     uint64_t  num_rows;
     char      comment[256];
     int       num_constraints;
-    Constraint constraints[SV_MAX_CONSTRAINTS];
+    ConstraintV5 constraints[SV_V5_CONSTRAINTS];
     char      collation[40];
     uint64_t  auto_increment;
 } TableSchemaV5;
@@ -305,9 +351,9 @@ typedef struct {
 typedef struct {
     char name[SV_MAX_NAME_LEN];
     ColumnV4 columns[64]; int num_columns;
-    IndexV4 indexes[SV_MAX_INDEXES]; int num_indexes;
+    IndexV4 indexes[SV_V5_INDEXES]; int num_indexes;
     uint32_t root_page_id, num_pages; uint64_t num_rows; char comment[256];
-    int num_constraints; Constraint constraints[SV_MAX_CONSTRAINTS];
+    int num_constraints; ConstraintV5 constraints[SV_V5_CONSTRAINTS];
 } TableSchemaV4;
 
 // TableSchema fino alla v3: gli stessi campi della v4 senza i vincoli in coda
@@ -315,17 +361,17 @@ typedef struct {
 
 static bool table_from_v5(TableSchema* t, const TableSchemaV5* o) {
     int n = o->num_columns >= 0 && o->num_columns <= 64 ? o->num_columns : 0;
-    TableSchema* tmp = schema_new(n);
+    TableSchema* tmp = schema_new_aux(n, SV_V5_INDEXES, SV_V5_CONSTRAINTS);
     if (!tmp) return false;
     memcpy(tmp->name, o->name, sizeof(tmp->name));
     memcpy(tmp->columns, o->columns, sizeof(Column) * (size_t)n);
     tmp->num_columns = n;
-    memcpy(tmp->indexes, o->indexes, sizeof(Index) * SV_MAX_INDEXES);
-    tmp->num_indexes = o->num_indexes >= 0 && o->num_indexes <= SV_MAX_INDEXES ? o->num_indexes : 0;
+    for (int i = 0; i < SV_V5_INDEXES; i++) index_from_v5(&tmp->indexes[i], &o->indexes[i]);
+    tmp->num_indexes = o->num_indexes >= 0 && o->num_indexes <= SV_V5_INDEXES ? o->num_indexes : 0;
     tmp->root_page_id = o->root_page_id; tmp->num_pages = o->num_pages; tmp->num_rows = o->num_rows;
     memcpy(tmp->comment, o->comment, sizeof(tmp->comment));
-    tmp->num_constraints = o->num_constraints >= 0 && o->num_constraints <= SV_MAX_CONSTRAINTS ? o->num_constraints : 0;
-    memcpy(tmp->constraints, o->constraints, sizeof(Constraint) * SV_MAX_CONSTRAINTS);
+    tmp->num_constraints = o->num_constraints >= 0 && o->num_constraints <= SV_V5_CONSTRAINTS ? o->num_constraints : 0;
+    for (int i = 0; i < SV_V5_CONSTRAINTS; i++) cons_from_v5(&tmp->constraints[i], &o->constraints[i]);
     memcpy(tmp->collation, o->collation, sizeof(tmp->collation));
     tmp->auto_increment = o->auto_increment;
     bool ok = schema_assign(t, tmp);
@@ -348,9 +394,9 @@ static bool table_from_v4(TableSchema* t, const TableSchemaV4* o) {
         memcpy(c->default_val, oc->default_val, sizeof(c->default_val));
         memcpy(c->comment, oc->comment, sizeof(c->comment));
     }
-    v->num_indexes = o->num_indexes >= 0 && o->num_indexes <= SV_MAX_INDEXES ? o->num_indexes : 0;
-    for (int i = 0; i < SV_MAX_INDEXES; i++) {
-        Index* x = &v->indexes[i];
+    v->num_indexes = o->num_indexes >= 0 && o->num_indexes <= SV_V5_INDEXES ? o->num_indexes : 0;
+    for (int i = 0; i < SV_V5_INDEXES; i++) {
+        IndexV5* x = &v->indexes[i];
         const IndexV4* ox = &o->indexes[i];
         memcpy(x->name, ox->name, sizeof(x->name));
         memcpy(x->col_name, ox->col_name, sizeof(x->col_name));
@@ -360,7 +406,7 @@ static bool table_from_v4(TableSchema* t, const TableSchemaV4* o) {
     }
     v->root_page_id = o->root_page_id; v->num_pages = o->num_pages; v->num_rows = o->num_rows;
     memcpy(v->comment, o->comment, sizeof(v->comment));
-    v->num_constraints = o->num_constraints >= 0 && o->num_constraints <= SV_MAX_CONSTRAINTS ? o->num_constraints : 0;
+    v->num_constraints = o->num_constraints >= 0 && o->num_constraints <= SV_V5_CONSTRAINTS ? o->num_constraints : 0;
     memcpy(v->constraints, o->constraints, sizeof(v->constraints));
     bool ok = table_from_v5(t, v);
     free(v);
@@ -440,8 +486,8 @@ static bool table_sane(TableSchema* t) {
         nul_end(x->name, sizeof(x->name));
         nul_end(x->col_name, sizeof(x->col_name));
         nul_end(x->type, sizeof(x->type));
-        if (x->ncols > 8) return false;
-        for (int k = 0; k < 8; k++) nul_end(x->cols[k], sizeof(x->cols[k]));
+        if (x->ncols > SV_MAX_KEY_COLS) return false;
+        for (int k = 0; k < SV_MAX_KEY_COLS; k++) nul_end(x->cols[k], sizeof(x->cols[k]));
     }
     for (int i = 0; i < t->num_constraints; i++) {
         Constraint* k = &t->constraints[i];
@@ -529,16 +575,17 @@ static void w_table(WBuf* w, const TableSchema* t) {
         const Index* x = &t->indexes[i];
         wb_str(w, x->name); wb_str(w, x->col_name); wb_u8(w, x->unique ? 1 : 0); wb_str(w, x->type);
         wb_u32(w, x->root_page_id); wb_u8(w, x->ncols); wb_u8(w, x->fulltext);
-        for (int k = 0; k < 8; k++) wb_str(w, x->cols[k]);
+        for (int k = 0; k < x->ncols && k < SV_MAX_KEY_COLS; k++) wb_str(w, x->cols[k]);   // v8: solo ncols (erano 8 fisse)
     }
     wb_u32(w, t->root_page_id); wb_u32(w, t->num_pages); wb_u64(w, t->num_rows); wb_str(w, t->comment);
     wb_u32(w, (uint32_t)t->num_constraints);
     for (int i = 0; i < t->num_constraints; i++) {
         const Constraint* k = &t->constraints[i];
         wb_str(w, k->name); wb_u8(w, k->kind); wb_u8(w, k->ncols); wb_u8(w, k->on_delete); wb_u8(w, k->on_update);
-        wb_raw(w, k->cols, SV_MAX_KEY_COLS);
+        uint8_t nk = k->ncols <= SV_MAX_KEY_COLS ? k->ncols : SV_MAX_KEY_COLS;   // v8: ncols posizioni e nomi
+        wb_raw(w, k->cols, nk);
         wb_str(w, k->ref_table);
-        for (int j = 0; j < SV_MAX_KEY_COLS; j++) wb_str(w, k->ref_cols[j]);
+        for (int j = 0; j < nk; j++) wb_str(w, k->ref_cols[j]);
         wb_str(w, k->check);
     }
     wb_str(w, t->collation);
@@ -549,6 +596,7 @@ static void w_table(WBuf* w, const TableSchema* t) {
         wb_u32(w, t->tree_root[i]); wb_u32(w, t->tree_tabroot[i]);
         wb_u8(w, t->tree_hasmax[i]); wb_u64(w, (uint64_t)t->tree_max[i]);
     }
+    wb_u32(w, t->tail_page); wb_u32(w, t->tail_root);   // v8
 }
 
 // versione del formato che r_table sta leggendo (file del catalogo o record del log)
@@ -576,8 +624,11 @@ static bool r_table(RBuf* r, TableSchema* t) {
         Index* x = &t->indexes[i];
         rb_str(r, x->name, sizeof(x->name)); rb_str(r, x->col_name, sizeof(x->col_name)); x->unique = rb_u8(r) != 0;
         rb_str(r, x->type, sizeof(x->type)); x->root_page_id = rb_u32(r); x->ncols = rb_u8(r); x->fulltext = rb_u8(r);
-        for (int k = 0; k < 8; k++) rb_str(r, x->cols[k], sizeof(x->cols[k]));
-        if (x->ncols > 8) return false;
+        if (x->ncols > SV_MAX_KEY_COLS) return false;
+        memset(x->cols, 0, sizeof(x->cols));
+        int nslot = g_rd_ver >= 8 ? x->ncols : SV_V5_KEY_COLS;          // fino alla v7: 8 nomi sempre
+        for (int k = 0; k < nslot; k++) rb_str(r, x->cols[k], sizeof(x->cols[k]));
+        if (g_rd_ver < 8 && x->ncols > SV_V5_KEY_COLS) return false;
     }
     t->root_page_id = rb_u32(r); t->num_pages = rb_u32(r); t->num_rows = rb_u64(r); rb_str(r, t->comment, sizeof(t->comment));
     uint32_t nk = rb_u32(r);
@@ -586,11 +637,14 @@ static bool r_table(RBuf* r, TableSchema* t) {
     for (uint32_t i = 0; i < nk; i++) {
         Constraint* k = &t->constraints[i];
         rb_str(r, k->name, sizeof(k->name)); k->kind = rb_u8(r); k->ncols = rb_u8(r); k->on_delete = rb_u8(r); k->on_update = rb_u8(r);
-        rb_raw(r, k->cols, SV_MAX_KEY_COLS);
+        if (k->ncols > SV_MAX_KEY_COLS || (g_rd_ver < 8 && k->ncols > SV_V5_KEY_COLS)) return false;
+        int nslot = g_rd_ver >= 8 ? k->ncols : SV_V5_KEY_COLS;          // fino alla v7: 8 posizioni e 8 nomi sempre
+        memset(k->cols, 0, sizeof(k->cols));
+        memset(k->ref_cols, 0, sizeof(k->ref_cols));
+        rb_raw(r, k->cols, (size_t)nslot);
         rb_str(r, k->ref_table, sizeof(k->ref_table));
-        for (int j = 0; j < SV_MAX_KEY_COLS; j++) rb_str(r, k->ref_cols[j], sizeof(k->ref_cols[j]));
+        for (int j = 0; j < nslot; j++) rb_str(r, k->ref_cols[j], sizeof(k->ref_cols[j]));
         rb_str(r, k->check, sizeof(k->check));
-        if (k->ncols > SV_MAX_KEY_COLS) return false;
     }
     rb_str(r, t->collation, sizeof(t->collation));
     t->auto_increment = rb_u64(r);
@@ -608,6 +662,8 @@ static bool r_table(RBuf* r, TableSchema* t) {
         }
         t->ntrees = (int)nt;
     }
+    t->tail_page = t->tail_root = 0;
+    if (g_rd_ver >= 8) { t->tail_page = rb_u32(r); t->tail_root = rb_u32(r); }
     return !r->bad;
 }
 
@@ -849,7 +905,7 @@ Catalog* catalog_load(const char* path) {
     return c;
 }
 
-uint8_t* catalog_serialize(const Catalog* c, size_t* out_n) {
+static uint8_t* catalog_serialize(const Catalog* c, size_t* out_n) {
     WBuf w = { NULL, 0, 0, false };
     uint32_t version = CAT_VERSION, next_page = c->next_page_id;
     wb_raw(&w, CAT_MAGIC, 8);
@@ -894,7 +950,7 @@ int catalog_save(Catalog* c, const char* path) {
 // viste, routine e trigger, CD_TABLE riempie la tabella con quel nome. Ogni operazione porta lo stato intero
 // dell'oggetto, non un cambiamento: rifarle due volte (log non ancora accorciato dopo un checkpoint) dà lo stesso
 // catalogo.
-#define CD_VERSION 2      // 2: tabelle nel formato v7 (indici su disco); 1 (SegVault 1.4.0-1.4.2) si legge ancora
+#define CD_VERSION 3      // 3: tabelle nel formato v8; 2 (v7) e 1 (SegVault 1.4.0-1.4.2, v6) si leggono ancora
 #define CD_HDR     1
 #define CD_DB      2
 #define CD_TABLE   3
@@ -1068,8 +1124,8 @@ bool catalog_apply_delta(Catalog* c, const uint8_t* b, size_t n) {
     if (!c || !b || n < 1) return false;
     RBuf r = { b, n, 0, false };
     uint8_t ver = rb_u8(&r);
-    if (ver != 1 && ver != CD_VERSION) return false;
-    g_rd_ver = ver == 1 ? 6 : CAT_VERSION;
+    if (ver < 1 || ver > CD_VERSION) return false;
+    g_rd_ver = ver == 1 ? 6 : ver == 2 ? 7 : CAT_VERSION;
     while (!r.bad && r.at < n) {
         uint8_t kind = rb_u8(&r);
         uint32_t len = rb_u32(&r);
@@ -1094,6 +1150,7 @@ Database* catalog_get_db(Catalog* c, const char* name) {
 
 int catalog_add_db(Catalog* c, const char* name) {
     if (!c || !name) return SV_ERR;
+    if (!sv_name_ok(name)) return SV_BAD_NAME;
     if (c->num_databases >= SV_MAX_DATABASES) return SV_FULL;
     if (catalog_get_db(c, name)) return SV_DUPLICATE;
     Database* db = cat_push_db(c);
@@ -1159,6 +1216,10 @@ int catalog_add_table(Catalog* c, const char* db, TableSchema* schema) {
     if (d->num_tables >= SV_MAX_TABLES) return SV_FULL;
     if (catalog_get_table(c, db, schema->name)) return SV_DUPLICATE;
     if (catalog_get_view(c, db, schema->name)) return SV_DUPLICATE;   // stesso nome di una vista
+    if (!sv_name_ok(schema->name)) return SV_BAD_NAME;
+    for (int i = 0; i < schema->num_columns; i++) if (!sv_name_ok(schema->columns[i].name)) return SV_BAD_NAME;
+    for (int i = 0; i < schema->num_indexes; i++) if (!sv_name_ok_opt(schema->indexes[i].name)) return SV_BAD_NAME;
+    for (int i = 0; i < schema->num_constraints; i++) if (!sv_name_ok_opt(schema->constraints[i].name)) return SV_BAD_NAME;
 
     schema->root_page_id = c->next_page_id++;
     return db_push_table(d, schema) ? SV_OK : SV_FULL;
@@ -1195,6 +1256,7 @@ int catalog_add_view(Catalog* c, const char* db, ViewSchema* schema) {
     if (!d) return SV_NOT_FOUND;
     if (catalog_get_view(c, db, schema->name)) return SV_DUPLICATE;
     if (catalog_get_table(c, db, schema->name)) return SV_DUPLICATE;  // stesso nome di una tabella
+    if (!sv_name_ok(schema->name)) return SV_BAD_NAME;
     if (!grow((void**)&d->views, &d->cap_views, d->num_views + 1, sizeof(ViewSchema))) return SV_FULL;
     d->views[d->num_views++] = *schema;
     return SV_OK;
@@ -1222,6 +1284,7 @@ int catalog_add_index(Catalog* c, const char* db, const char* table, Index* idx)
     TableSchema* t = catalog_get_table(c, db, table);
     if (!t) return SV_NOT_FOUND;
     if (t->num_indexes >= SV_MAX_INDEXES) return SV_FULL;
+    if (!sv_name_ok_opt(idx->name)) return SV_BAD_NAME;
     Index* slot = schema_add_index(t);
     if (!slot) return SV_FULL;
     *slot = *idx;

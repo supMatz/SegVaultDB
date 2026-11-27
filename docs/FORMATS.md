@@ -57,16 +57,22 @@ directory `fsync`ed. Any read, memory or write error stops the start with the lo
 
 ## Catalog (`segvault.cat`)
 
-`"SVCAT2\0\0"`, `uint32` version (5), `int32` databases, `int32` current database, `uint32` next page, then
-per database its name and the raw `TableSchema` / `ViewSchema` / `RoutineSchema` / `TriggerSchema` structures
-(`src/catalog/schema.h`). Since 1.3 the file ends with `"CRC1"` + CRC-32 of everything before it; older files
-without the trailer are accepted. A catalog that is truncated, damaged or of a newer version stops the start:
-it is never replaced by an empty one. It is rewritten through `segvault.cat.tmp` and an atomic replacement.
+`"SVCAT2\0\0"`, `uint32` version (8 since 1.5; versions 2-7 written by older builds are read and upgraded), `int32` databases, `int32` current
+database, `uint32` next page, then per database its name and its tables, views, routines and triggers with an
+explicit field-by-field encoding (since v6; growable lists, no fixed-size structures). Columns carry
+`flags`: `0x01` UNSIGNED, `0x02` ON UPDATE CURRENT_TIMESTAMP, `0x04` generated, `0x08` own `_ci` collation,
+`0x10` own `_bin` collation (the last two since 1.5; older builds ignore them). v7 adds the on-disk B+tree roots,
+v8 the tail page and free-space hints of each table. Since 1.3 the file ends with `"CRC1"` + CRC-32 of
+everything before it; older files without the trailer are accepted. A catalog that is truncated, damaged or of a
+newer version stops the start: it is never replaced by an empty one. It is rewritten through `segvault.cat.tmp`
+and an atomic replacement; DDL between two rewrites is in the log (`LOG_CATALOG` records).
 
 ## `users.dat`
 
-Text: `user NAME SALT HASH ADMIN NATIVE` and `grant USER DB TABLE PRIVS` lines, then (since 1.3)
-`end N` with the number of users: a file whose count does not match stops the start.
+Text: `user NAME SALT HASH ADMIN NATIVE` lines and, since 1.5, `grantx USER DB TABLE PRIVS` lines with the database
+and table names encoded (they may contain spaces); then (since 1.3) `end N` with the number of users: a file whose
+count does not match stops the start. Older `grant` lines are still read when unambiguous and skipped otherwise,
+never reinterpreted. Builds before 1.5 do not read `grantx` lines: going back to one loses the grants.
 
 ## Durability
 
@@ -85,14 +91,13 @@ reports `SERIALIZABLE` for table-level writes; plain reads are committed-version
 
 | Limit | Value |
 |---|---|
-| databases | 64 |
-| tables per database | 256 |
-| columns per table | 64 |
-| indexes / constraints per table | 16 / 16 |
-| columns of a key | 8 |
-| views, routines, triggers per database | 64 each |
-| name length | 63 bytes |
-| SQL statement, view / routine body | 64 KB |
+| databases / tables per database | no fixed limit (growable lists; tested with 2 000 tables) |
+| columns per table | 1024 |
+| indexes and constraints per table | 64 |
+| columns of a key | 16 |
+| views, routines, triggers per database | no fixed limit |
+| name length | 63 bytes (no backtick or control characters in new names) |
+| SQL statement text kept in the catalog (view / routine / trigger body) | 64 KB |
 | one text value | 16 MB; a serialised row 64 MB |
 | page | 4096 bytes; up to 2²⁴ pages (64 GB) per data file |
 | HTTP request target / header field | 8 KB / see `server.c` (`Authorization` 4 KB), else 414 / 431 |

@@ -2,11 +2,12 @@
 SCOPO: motore di espressioni regolari a backtracking (vedi regex.h).
        Il pattern diventa un albero di nodi (alternative, sequenze, ripetizioni, classi); la ricerca
        prova ogni posizione di partenza. Un limite di passi impedisce che un pattern patologico
-       blocchi il server (in quel caso: nessuna corrispondenza).
+       blocchi il server: la ricerca risponde "nessuna corrispondenza" e sv_regex_take_limit() lo segnala.
 */
 #include "regex.h"
 
 #include <ctype.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -258,6 +259,39 @@ void sv_regex_free(SvRegex* re) {
     free(re);
 }
 
+// cache per thread delle regex compilate (CR-B9): una REGEXP con pattern costante non si ricompila a ogni riga.
+// Niente scritture nell'AST, che le letture parallele condividono; il distruttore libera tutto all'uscita del thread
+#define RX_CACHE 8
+typedef struct { char* pat; bool icase; SvRegex* re; } RxSlot;
+typedef struct { RxSlot slot[RX_CACHE]; unsigned next; } RxCache;
+static pthread_key_t g_rx_key;
+static pthread_once_t g_rx_once = PTHREAD_ONCE_INIT;
+
+static void rx_cache_free(void* p) {
+    RxCache* c = p;
+    for (int i = 0; i < RX_CACHE; i++) { free(c->slot[i].pat); sv_regex_free(c->slot[i].re); }
+    free(c);
+}
+static void rx_key_init(void) { pthread_key_create(&g_rx_key, rx_cache_free); }
+
+SvRegex* sv_regex_cached(const char* pattern, bool icase, char* err, size_t errn, bool* owned) {
+    *owned = false;
+    pthread_once(&g_rx_once, rx_key_init);
+    RxCache* c = pthread_getspecific(g_rx_key);
+    if (!c && (c = calloc(1, sizeof(*c))) && pthread_setspecific(g_rx_key, c) != 0) { free(c); c = NULL; }
+    if (c)
+        for (int i = 0; i < RX_CACHE; i++)
+            if (c->slot[i].re && c->slot[i].icase == icase && !strcmp(c->slot[i].pat, pattern)) return c->slot[i].re;
+    SvRegex* re = sv_regex_compile(pattern, icase, err, errn);
+    char* pc = re && c ? strdup(pattern) : NULL;
+    if (!pc) { *owned = re != NULL; return re; }           // senza posto in cache: la libera chi chiama
+    RxSlot* sl = &c->slot[c->next++ % RX_CACHE];              // la più vecchia lascia il posto
+    free(sl->pat);
+    sv_regex_free(sl->re);
+    sl->pat = pc; sl->icase = icase; sl->re = re;
+    return re;
+}
+
 // ── ricerca: continuazioni (cosa fare dopo un nodo) per il backtracking ──
 
 typedef struct Cont {
@@ -279,6 +313,13 @@ typedef struct {
 } MState;
 
 #define MAX_STEPS 2000000L
+// limite raggiunto durante una ricerca di questo thread: chi chiama lo deve sapere (prima "nessuna corrispondenza" in
+// silenzio, e una WHERE x REGEXP '(a*)*b' rifaceva 2 milioni di passi per ogni riga: 38 s su 2 000 righe con il
+// motore bloccato). Resta impostato finché sv_regex_take_limit() non lo legge
+static _Thread_local bool t_rx_limit;
+bool sv_thread_cancelled(void);                   // src/table/heap.c: KILL QUERY / tempo scaduto della connessione
+
+bool sv_regex_take_limit(void) { bool r = t_rx_limit; t_rx_limit = false; return r; }
 #define MAX_DEPTH 4000          // ricorsione massima (lo stack dei thread su Windows è di 1 MB)
 
 static bool single_char(const RNode* n) { return n->type == RN_CHAR || n->type == RN_ANY || n->type == RN_CLASS; }
@@ -339,7 +380,10 @@ static bool m_cont(MState* m, size_t pos, const Cont* k, size_t* end) {
 static bool m_node_in(MState* m, const RNode* n, size_t pos, const Cont* k, size_t* end);
 
 static bool m_node(MState* m, const RNode* n, size_t pos, const Cont* k, size_t* end) {
-    if (++m->steps > MAX_STEPS || m->depth >= MAX_DEPTH) { m->steps = MAX_STEPS + 1; return false; }
+    if (++m->steps > MAX_STEPS || m->depth >= MAX_DEPTH || ((m->steps & 8191) == 0 && sv_thread_cancelled())) {
+        m->steps = MAX_STEPS + 1;
+        return false;
+    }
     m->depth++;
     bool r = m_node_in(m, n, pos, k, end);
     m->depth--;
@@ -393,7 +437,7 @@ bool sv_regex_search(const SvRegex* re, const char* s, size_t from, size_t* star
     for (size_t p = from; p <= m.len; p++) {
         size_t e;
         if (m_node(&m, re->root, p, NULL, &e)) { *start = p; *end = e; return true; }
-        if (m.steps > MAX_STEPS) return false;
+        if (m.steps > MAX_STEPS) { t_rx_limit = true; return false; }
     }
     return false;
 }
@@ -410,7 +454,7 @@ bool sv_regex_search_caps(const SvRegex* re, const char* s, size_t from, size_t 
             for (int i = 1; i < ncaps; i++) if (caps[i][1] == (size_t)-1) caps[i][0] = (size_t)-1;
             return true;
         }
-        if (m.steps > MAX_STEPS) return false;
+        if (m.steps > MAX_STEPS) { t_rx_limit = true; return false; }
     }
     return false;
 }

@@ -4,9 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "harness.h"
 
-static int g_tests, g_fail;
-#define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
 
 static bool exec_all(const char* sql, char* err, size_t n) {
     char* copy = strdup(sql);
@@ -36,8 +36,9 @@ static int rel_between(const SchemaModel* m, const char* child, const char* pare
 }
 
 int main(void) {
-    const char* dir = "/tmp/sv_schema_test";
-    if (system("rm -rf /tmp/sv_schema_test && mkdir -p /tmp/sv_schema_test") != 0) return 1;
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
+    const char* dir = "sv_schema_test";
+    if (system("rm -rf sv_schema_test && mkdir -p sv_schema_test") != 0) return 1;
     if (!db_init(dir)) return 1;
     run("CREATE DATABASE u");
     run("USE u");
@@ -77,10 +78,10 @@ int main(void) {
 
     // posizioni salvate e rilette
     m.t[0].x = 777; m.t[0].y = 333;
-    CHECK(sm_save_positions(&m, "/tmp/sv_schema_test/pos.txt"), "save positions");
+    CHECK(sm_save_positions(&m, "sv_schema_test/pos.txt"), "save positions");
     SchemaModel m2;
     sm_load(&m2, "u");
-    CHECK(sm_load_positions(&m2, "/tmp/sv_schema_test/pos.txt"), "load positions");
+    CHECK(sm_load_positions(&m2, "sv_schema_test/pos.txt"), "load positions");
     int i0 = sm_find(&m2, m.t[0].name);
     CHECK(m2.t[i0].placed && m2.t[i0].x == 777 && m2.t[i0].y == 333, "position restored");
     char moved[64];
@@ -91,7 +92,7 @@ int main(void) {
     run("CREATE TABLE aula (id INT PRIMARY KEY, nome VARCHAR(20))");
     sm_free(&m);
     sm_load(&m, "u");
-    sm_load_positions(&m, "/tmp/sv_schema_test/pos.txt");
+    sm_load_positions(&m, "sv_schema_test/pos.txt");
     for (int i = 0; i < m.nt; i++) { m.t[i].w = 160; m.t[i].h = 100; }
     int au = sm_find(&m, "aula");
     CHECK(!m.t[au].placed, "new table not placed");
@@ -202,10 +203,10 @@ int main(void) {
 
     // stato della vista conservato nel file delle posizioni
     snprintf(m.view, sizeof(m.view), "v 1 0.800 -10.0 20.0");
-    sm_save_positions(&m, "/tmp/sv_schema_test/pos2.txt");
+    sm_save_positions(&m, "sv_schema_test/pos2.txt");
     sm_free(&m);
     sm_load(&m, "u");
-    sm_load_positions(&m, "/tmp/sv_schema_test/pos2.txt");
+    sm_load_positions(&m, "sv_schema_test/pos2.txt");
     CHECK(!strcmp(m.view, "v 1 0.800 -10.0 20.0"), "view line: '%s'", m.view);
 
     // tabella riferita da altre: prima le loro chiavi esterne, poi il DROP
@@ -217,8 +218,42 @@ int main(void) {
     CHECK(sm_find(&m, "studente") < 0 && rel_between(&m, "esame", "studente") < 0 && sm_find(&m, "esame") >= 0, "table dropped");
     sm_free(&m);
 
+    // tabella larga (come quelle importate da XAMPP): tutte le colonne nel diagramma, non solo le prime 64
+    {
+        char ddl[4096];
+        int n = snprintf(ddl, sizeof(ddl), "CREATE TABLE larga (id INT PRIMARY KEY");
+        for (int c = 1; c < 100; c++) n += snprintf(ddl + n, sizeof(ddl) - (size_t)n, ", c%d INT", c);
+        snprintf(ddl + n, sizeof(ddl) - (size_t)n, ")");
+        run("CREATE DATABASE w");
+        run("USE w");
+        run(ddl);
+        SchemaModel wm;
+        CHECK(sm_load(&wm, "w") && wm.nt == 1, "wide db loaded");
+        CHECK(wm.nt == 1 && wm.t[0].ncols == 100 && !strcmp(wm.t[0].cols[99].name, "c99") && wm.t[0].cols[0].pk,
+              "all 100 columns in the diagram: %d", wm.nt ? wm.t[0].ncols : -1);
+        sm_free(&wm);
+    }
+
+    // 600 tabelle senza chiavi esterne (tutte al livello 0): il layout le dispone tutte (P3.11: oltre 512 restavano in (0,0))
+    {
+        run("CREATE DATABASE tante");
+        run("USE tante");
+        for (int i = 0; i < 600; i++) { char q[80]; snprintf(q, sizeof(q), "CREATE TABLE t%03d (id INT PRIMARY KEY)", i); run(q); }
+        SchemaModel tm;
+        CHECK(sm_load(&tm, "tante") && tm.nt == 600, "600 tables loaded: %d", tm.nt);
+        for (int i = 0; i < tm.nt; i++) { tm.t[i].w = 120; tm.t[i].h = 60; }
+        sm_auto_layout(&tm, true, 40, 20);
+        int unplaced = 0, overlaps = 0;
+        for (int i = 0; i < tm.nt; i++) {
+            unplaced += !tm.t[i].placed;
+            if (i && tm.t[i].x == tm.t[0].x && tm.t[i].y == tm.t[0].y) overlaps++;
+        }
+        CHECK(unplaced == 0 && overlaps == 0, "all 600 tables placed: %d unplaced, %d on top of the first", unplaced, overlaps);
+        sm_free(&tm);
+    }
+
     db_shutdown();
-    if (system("rm -rf /tmp/sv_schema_test")) {}
+    if (system("rm -rf sv_schema_test")) {}
     if (g_fail) { printf("schema model tests: %d of %d FAILED\n", g_fail, g_tests); return 1; }
     printf("OK: %d/%d schema model checks passed\n", g_tests, g_tests);
     return 0;

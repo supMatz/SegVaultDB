@@ -17,9 +17,8 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include "harness.h"
 
-static int g_fail = 0, g_count = 0;
-#define CHECK(cond, ...) do { g_count++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 static int connect_to(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -234,6 +233,7 @@ static int free_port(void) {
 static void* run_server(void* s) { sv_server_run((SvServer*)s); return NULL; }
 
 int main(void) {
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
     char tmp[] = "/tmp/sv_web_XXXXXX";
     if (!mkdtemp(tmp)) return 1;
     char data[300], www[300], p[600];
@@ -249,6 +249,9 @@ int main(void) {
     snprintf(p, sizeof(p), "%s/blog/style.css", www); put(p, "body{color:red}");
     snprintf(p, sizeof(p), "%s/blog/conf.inc", www); put(p, "<?php $pw = 'inc-secret';");
     snprintf(p, sizeof(p), "%s/blog/page.phtml", www); put(p, "<?php $pw = 'phtml-secret';");
+    snprintf(p, sizeof(p), "%s/blog/bk", www); mkdir(p, 0755);                       // CR-B6: un BACKUP TO dentro un sito
+    snprintf(p, sizeof(p), "%s/blog/bk/users.dat", www); put(p, "user root salt hash 1 -");
+    snprintf(p, sizeof(p), "%s/blog/bk/segvault.db", www); put(p, "pages");
     snprintf(p, sizeof(p), "%s/lara", www); mkdir(p, 0755);
     snprintf(p, sizeof(p), "%s/lara/artisan", www); put(p, "#!/usr/bin/env php");
     snprintf(p, sizeof(p), "%s/lara/.env", www); put(p, "DB_PASSWORD=segreta");
@@ -488,10 +491,57 @@ int main(void) {
         free(r.body);
         close(fd);
     }
+    // CR-B6: i file del formato SegVault non si servono mai
+    r = get(port, "blog.localhost", "/bk/users.dat");
+    CHECK(r.status == 404 && !has(&r, "salt"), "users.dat not served: %d", r.status);
+    free(r.body);
+    r = get(port, "blog.localhost", "/bk/SEGVAULT.DB");
+    CHECK(r.status == 404, "segvault.db not served: %d", r.status);
+    free(r.body);
+    // CR-A2: le pagine di un sito non usano l'API di amministrazione (Origin == Host non basta), neppure senza Origin;
+    // dall'indirizzo del server (localhost) la modalità aperta resta com'era
+    {
+        static const char* const Q[] = {
+            "POST /api/v1/query HTTP/1.1\r\nHost: blog.localhost\r\nOrigin: http://blog.localhost\r\nContent-Type: application/json\r\n"
+            "Content-Length: 21\r\nConnection: close\r\n\r\n{\"sql\":\"SELECT 1\"}   ",
+            "POST /api/v1/query HTTP/1.1\r\nHost: blog.localhost\r\nContent-Type: application/json\r\n"
+            "Content-Length: 21\r\nConnection: close\r\n\r\n{\"sql\":\"SELECT 1\"}   ",
+            "POST /api/v1/query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+            "Content-Length: 21\r\nConnection: close\r\n\r\n{\"sql\":\"SELECT 1\"}   " };
+        static const int WANT[] = { 403, 403, 200 };
+        for (int i = 0; i < 3; i++) {
+            int fd = connect_to(port);
+            wr(fd, Q[i], strlen(Q[i]));
+            bool got = read_resp(fd, &r, false);
+            CHECK(got && r.status == WANT[i], "API query case %d: %d %s", i, r.status, r.body ? r.body : "");
+            free(r.body);
+            close(fd);
+        }
+    }
+
+    // CR-B6: BACKUP TO da SQL non scrive nelle cartelle servite (radice web e siti esterni); di nuovo sì a server fermo
+    {
+        char q[700];
+        snprintf(q, sizeof(q), "BACKUP TO '%s/blog/dump'", www);
+        QueryResult* br = db_execute(q);
+        CHECK(br && !br->success && strstr(br->error, "web server"), "no BACKUP TO into the web root: %s", br ? br->error : "");
+        db_result_free(br);
+        snprintf(q, sizeof(q), "BACKUP TO '%s/other/dump'", tmp);
+        br = db_execute(q);
+        CHECK(br && !br->success && strstr(br->error, "web server"), "no BACKUP TO into a site folder: %s", br ? br->error : "");
+        db_result_free(br);
+    }
 
     sv_server_stop(s);
     pthread_join(th, NULL);
     sv_server_free(s);
+    {
+        char q[700];
+        snprintf(q, sizeof(q), "BACKUP TO '%s/other/dump'", tmp);
+        QueryResult* br = db_execute(q);
+        CHECK(br && br->success, "BACKUP TO allowed once the server is stopped: %s", br ? br->error : "");
+        db_result_free(br);
+    }
 
     // ── senza elenco dei file e senza siti automatici ──
     SvServerConfig c2 = { .port = 0, .static_dir = www, .quiet = true, .no_auto_sites = true };
@@ -649,6 +699,6 @@ int main(void) {
     char cmd[400];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", tmp);
     if (system(cmd)) {}
-    printf("test_web: %d checks, %d failed\n", g_count, g_fail);
+    printf("test_web: %d checks, %d failed\n", g_tests, g_fail);
     return g_fail ? 1 : 0;
 }

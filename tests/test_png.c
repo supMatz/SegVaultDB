@@ -3,9 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "harness.h"
 
-static int g_tests, g_fail;
-#define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
 
 // ── decompressore minimo (solo blocchi con codici fissi, come quelli scritti) ──
 typedef struct { const uint8_t* p; size_t n, pos; int bit; } In;
@@ -69,6 +69,7 @@ static bool roundtrip(const uint8_t* data, size_t n, size_t* zsize) {
 static uint32_t rd32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
 
 int main(void) {
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
     CHECK(png_crc32((const uint8_t*)"123456789", 9) == 0xCBF43926u, "crc32 check value");
     CHECK(roundtrip((const uint8_t*)"", 0, NULL), "empty");
     const char* txt = "abracadabra abracadabra abracadabra, the quick brown fox";
@@ -120,9 +121,9 @@ int main(void) {
     CHECK(pix_ok, "pixels");
     free(raw);
     free(png);
-    CHECK(png_write_file("/tmp/sv_png_test.png", w, h, px), "write file");
+    CHECK(png_write_file("sv_png_test.png", w, h, px), "write file");
     CHECK(!png_write_file("/nonexistent_dir/x.png", w, h, px), "unwritable path");
-    remove("/tmp/sv_png_test.png");
+    remove("sv_png_test.png");
     free(px);
 
     if (g_fail) { printf("png tests: %d of %d FAILED\n", g_fail, g_tests); return 1; }

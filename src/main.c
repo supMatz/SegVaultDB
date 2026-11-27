@@ -24,12 +24,10 @@ static void on_quit_signal(int sig) { (void)sig; g_quit_requested = 1; }
 #ifdef _WIN32
     #include <windows.h> // per Sleep
     #include <direct.h>   // _mkdir su Windows
-    #define sleep_ms(ms) Sleep(ms)
 #else
     #include <sys/stat.h> // mkdir su Linux
     #include <sys/types.h>
     #include <unistd.h>   // usleep
-    #define sleep_ms(ms) usleep(ms * 1000) // generalizzazione sleep per windows e linux
 #endif
 
 // larghezza e altezza iniziale della finestra

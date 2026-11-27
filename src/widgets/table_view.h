@@ -13,7 +13,6 @@ SCOPO: griglia per mostrare i risultati delle query SQL.
 #include "widget.h"
 #include "../bridge/db_api.h"
 
-#define TABLE_VIEW_MAX_COLS  64
 #define TABLE_VIEW_ROW_H     28 // altezza righe
 #define TABLE_VIEW_HEADER_H  34 // altezza header colonne
 #define TABLE_VIEW_AUTOSIZE_SCAN_LIMIT 500 // righe max da scansionare per l'autosize
@@ -34,9 +33,10 @@ typedef struct {
     int hover_row;
 
     // colonne
-    int  col_widths[TABLE_VIEW_MAX_COLS];
+    int* col_widths;       // una per colonna del risultato (cols_cap allocate)
     bool needs_autosize;   // misura le colonne al prossimo draw (serve la finestra)
-    bool col_numeric[TABLE_VIEW_MAX_COLS]; // colonna con soli valori numerici (allineata a destra)
+    bool* col_numeric;     // colonna con soli valori numerici (allineata a destra)
+    int  cols_cap;
     int  rownum_w;         // larghezza colonna numeri di riga
     int  row_h;            // altezza delle righe (Settings: compatta / normale / ampia)
     bool show_rownum;      // colonna con i numeri di riga

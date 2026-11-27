@@ -4,9 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "harness.h"
 
-static int g_tests, g_fail;
-#define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
 
 static void run(const char* sql) {
     QueryResult* r = db_execute(sql);
@@ -20,8 +20,9 @@ static int find_row(const QueryResult* r, int col, const char* v) {
 }
 
 int main(void) {
-    if (system("rm -rf /tmp/sv_tools_test && mkdir -p /tmp/sv_tools_test") != 0) return 1;
-    if (!db_init("/tmp/sv_tools_test")) return 1;
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
+    if (system("rm -rf sv_tools_test && mkdir -p sv_tools_test") != 0) return 1;
+    if (!db_init("sv_tools_test")) return 1;
     run("CREATE DATABASE s");
     run("USE s");
     run("CREATE TABLE cliente (id INT PRIMARY KEY, nome VARCHAR(40), citta VARCHAR(40), nato DATE)");
@@ -92,7 +93,7 @@ int main(void) {
     db_result_free(r);
 
     db_shutdown();
-    if (system("rm -rf /tmp/sv_tools_test")) {}
+    if (system("rm -rf sv_tools_test")) {}
     if (g_fail) { printf("db tools tests: %d of %d FAILED\n", g_fail, g_tests); return 1; }
     printf("OK: %d/%d db tools checks passed\n", g_tests, g_tests);
     return 0;

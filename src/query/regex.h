@@ -17,6 +17,9 @@ typedef struct SvRegex SvRegex;
 // NULL + messaggio in err se il pattern non è valido
 SvRegex* sv_regex_compile(const char* pattern, bool icase, char* err, size_t errn);
 void     sv_regex_free(SvRegex* re);
+// come sv_regex_compile, da una piccola cache per thread: la regex resta valida fino alla prossima chiamata di
+// questo thread; *owned = true solo se non è entrata in cache (allora va liberata con sv_regex_free)
+SvRegex* sv_regex_cached(const char* pattern, bool icase, char* err, size_t errn, bool* owned);
 
 // prima corrispondenza in s a partire da from: true e [*start, *end) se trovata
 bool     sv_regex_search(const SvRegex* re, const char* s, size_t from, size_t* start, size_t* end);
@@ -24,5 +27,8 @@ bool     sv_regex_match(const SvRegex* re, const char* s);     // c'è una corri
 // come sv_regex_search, con i gruppi: caps[0] = tutta la corrispondenza, caps[i] = gruppo i
 // ((size_t)-1 se il gruppo non ha partecipato); ncaps = posti in caps (gruppi oltre: non registrati)
 bool     sv_regex_search_caps(const SvRegex* re, const char* s, size_t from, size_t caps[][2], int ncaps);
+// true se dall'ultima chiamata una ricerca di questo thread si è fermata al limite di passi (o per KILL QUERY): il
+// suo "nessuna corrispondenza" non è affidabile. Legge e azzera
+bool     sv_regex_take_limit(void);
 
 #endif

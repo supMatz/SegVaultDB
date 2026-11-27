@@ -90,3 +90,4 @@ bench_suite
 test_decimal
 build-test-decimal.txt
 test_platform
+test_strbuf

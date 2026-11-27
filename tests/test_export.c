@@ -4,9 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "harness.h"
 
-static int g_tests, g_fail;
-#define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
 
 static uint32_t rd32(const uint8_t* p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 static unsigned rd16(const uint8_t* p) { return (unsigned)p[0] | (unsigned)p[1] << 8; }
@@ -18,6 +18,7 @@ static bool has(const uint8_t* b, size_t n, const char* s) {
 }
 
 int main(void) {
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
     // risultato di prova: numeri, testo con caratteri speciali, NULL, molte righe (più pagine PDF)
     QueryResult r;
     memset(&r, 0, sizeof(r));

@@ -3,9 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "harness.h"
 
-static int g_tests, g_fail;
-#define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
 
 static char g_err[1100];
 static bool ok(const char* sql) {
@@ -23,12 +23,13 @@ static long long num(const char* sql) {
     return v;
 }
 
-#define DIR  "/tmp/sv_backup_test"
+#define DIR  "sv_backup_test"
 #define DATA DIR "/data"
 #define BK1  DIR "/bk1"
 #define BK2  DIR "/bk2"
 
 int main(void) {
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
     if (system("rm -rf " DIR " && mkdir -p " DATA) != 0) return 1;
     if (!db_init(DATA)) { printf("init failed\n"); return 1; }
     CHECK(ok("CREATE DATABASE shop") && ok("USE shop"), "setup");
@@ -48,6 +49,22 @@ int main(void) {
     CHECK(!ok("BACKUP DATABASE TO '" BK1 "'") && strstr(g_err, "already contains"), "existing backup not overwritten");
     CHECK(!ok("BACKUP TO '" DATA "'") && strstr(g_err, "data folder"), "not into the data folder");
     CHECK(!ok("BACKUP TO ''"), "empty folder name");
+    // cartelle servite dal server web e cartella dei dati sotto altri nomi (CR-B6)
+    CHECK(!ok("BACKUP TO '" DATA "/.'") && strstr(g_err, "data folder"), "data folder written as data/.: %s", g_err);
+    CHECK(!ok("BACKUP TO '" DATA "/sub/x'") && strstr(g_err, "data folder"), "not inside the data folder");
+    CHECK(system("mkdir -p " DIR "/www/blog && ln -sfn www " DIR "/link") == 0, "web folders");
+    db_backup_protect(DIR "/www", true);
+    CHECK(!ok("BACKUP TO '" DIR "/www/blog/bk'") && strstr(g_err, "web server"), "not inside a served folder: %s", g_err);
+    CHECK(!ok("BACKUP TO '" DIR "/link/new/bk'") && strstr(g_err, "web server"), "not through a symlink to it");
+    CHECK(!ok("BACKUP TO '" DIR "/elsewhere/../www/bk'") && strstr(g_err, "Invalid"), "no .. after a missing folder");
+    CHECK(!ok("BACKUP TO '" DIR "/www'"), "not the served folder itself");
+    CHECK(ok("BACKUP TO '" DIR "/wwwx'"), "a sibling with the same prefix is fine: %s", g_err);
+    db_backup_protect(DIR "/www", false);
+    CHECK(ok("BACKUP TO '" DIR "/www/blog/bk2'"), "allowed again once the server stops: %s", g_err);
+    char gerr[600];
+    db_backup_protect(DIR "/www", true);
+    CHECK(db_backup(DIR "/www/gui", gerr, sizeof(gerr)), "the GUI backup chooses its folder freely: %s", gerr);
+    db_backup_protect(DIR "/www", false);
 
     // modifiche dopo il backup
     CHECK(ok("DELETE FROM p WHERE id = 1") && ok("DROP VIEW v") && ok("CREATE TABLE dopo (id INT)"), "changes after backup");

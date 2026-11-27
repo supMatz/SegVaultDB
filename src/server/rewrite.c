@@ -7,6 +7,7 @@ SCOPO: i .htaccess dei siti (vedi rewrite.h).
 #include "json.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +35,7 @@ typedef struct {
     Cond*    conds;
     int      nconds;
     bool     last, end, qsa, qsd, chain, forbid, gone;
+    bool     disabled;               // modello o condizioni non caricati: non scatta mai, ma tiene il posto (S=, C)
     int      redirect;               // 0 = no
     int      skip;
 } Rule;
@@ -46,8 +48,8 @@ typedef struct {
     int      nrules;
     int      access;                 // 0 = non detto, 1 = negato, 2 = concesso
     int      listing;                // 0 = non detto, 1 = no (-Indexes), 2 = sì
-    SvRegex* deny_files[16];         // <Files> / <FilesMatch> con l'accesso negato
-    int      ndeny;
+    SvRegex** deny_files;            // <Files> / <FilesMatch> con l'accesso negato (senza tetto: P3.11)
+    int      ndeny, cap_deny;
     char     url[2048];              // cartella nel sito: "/" o "/sub/"
     char     dir[4096];              // cartella sul disco
 } HtFile;
@@ -63,6 +65,7 @@ static void ht_free(HtFile* h) {
     }
     free(h->rules);
     for (int i = 0; i < h->ndeny; i++) sv_regex_free(h->deny_files[i]);
+    free(h->deny_files);
     free(h);
 }
 
@@ -126,17 +129,29 @@ static SvRegex* glob_re(const char* g) {
     return sv_regex_compile(re, true, err, sizeof(err));
 }
 
-static HtFile* ht_load(const char* dir, const char* url, char* err, size_t errsz) {
+static void cond_free(Cond* c) { free(c->test); free(c->pat); sv_regex_free(c->re); }
+
+// *fail = true: il .htaccess c'è ma non si può valutare (illeggibile, memoria): chi chiama nega l'accesso
+static HtFile* ht_load(const char* dir, const char* url, char* err, size_t errsz, bool* fail) {
     char path[4200];
     snprintf(path, sizeof(path), "%s/.htaccess", dir);
     FILE* f = fopen(path, "rb" SV_FE);
-    if (!f) return NULL;
+    if (!f) {
+        // assente: nessuna regola; illeggibile (EACCES, EMFILE sotto carico...): le sue negazioni non si
+        // possono ignorare, quindi la cartella è negata (come Apache, che risponde 403/500)
+        if (errno != ENOENT && errno != ENOTDIR) {
+            *fail = true;
+            snprintf(err, errsz, "%.120s: %.60s", path, strerror(errno));
+        }
+        return NULL;
+    }
     HtFile* h = calloc(1, sizeof(HtFile));
-    if (!h) { fclose(f); return NULL; }
+    if (!h) { fclose(f); *fail = true; return NULL; }
     snprintf(h->url, sizeof(h->url), "%s", url);
     snprintf(h->dir, sizeof(h->dir), "%s", dir);
-    Cond pending[32];
-    int npend = 0;
+    Cond* pending = NULL;                     // RewriteCond in attesa della RewriteRule (senza tetto: P3.11)
+    int npend = 0, cap_pend = 0;
+    bool bad_cond = false;                    // una condizione persa: la regola non va applicata con meno condizioni
     int skip_depth = 0;                       // dentro un blocco da saltare
     int depth = 0;
     SvRegex* files_re = NULL;                 // dentro <Files>/<FilesMatch>
@@ -187,7 +202,16 @@ static HtFile* ht_load(const char* dir, const char* url, char* err, size_t errsz
         bool grant = (ac >= 3 && !strcasecmp(d, "Require") && !strcasecmp(av[1], "all") && !strcasecmp(av[2], "granted")) ||
                      (ac >= 3 && !strcasecmp(d, "Allow") && !strcasecmp(av[1], "from") && !strcasecmp(av[2], "all"));
         if (files_re) {
-            if (deny && h->ndeny < 16) { h->deny_files[h->ndeny++] = files_re; files_re = NULL; files_depth = -1; skip_depth = depth; }
+            if (deny) {
+                if (h->ndeny == h->cap_deny) {
+                    int nc = h->cap_deny ? h->cap_deny * 2 : 8;
+                    SvRegex** g = realloc(h->deny_files, sizeof(SvRegex*) * (size_t)nc);
+                    if (g) { h->deny_files = g; h->cap_deny = nc; }
+                }
+                if (h->ndeny < h->cap_deny) h->deny_files[h->ndeny++] = files_re;
+                else { sv_regex_free(files_re); h->access = 1; }   // senza memoria: meglio negare tutta la cartella
+                files_re = NULL; files_depth = -1; skip_depth = depth;
+            }
             continue;
         }
         if (deny) h->access = 1;
@@ -202,7 +226,12 @@ static HtFile* ht_load(const char* dir, const char* url, char* err, size_t errsz
             snprintf(h->base, sizeof(h->base), "%s%s", av[1], av[1][0] && av[1][strlen(av[1]) - 1] == '/' ? "" : "/");
             h->has_base = true;
         } else if (!strcasecmp(d, "RewriteCond") && ac >= 3) {
-            if (npend >= 32) continue;
+            if (npend == cap_pend) {
+                int nc = cap_pend ? cap_pend * 2 : 8;
+                Cond* g = realloc(pending, sizeof(Cond) * (size_t)nc);
+                if (!g) { bad_cond = true; continue; }
+                pending = g; cap_pend = nc;
+            }
             Cond* c = &pending[npend];
             memset(c, 0, sizeof(*c));
             const char* pat = av[2];
@@ -220,12 +249,14 @@ static HtFile* ht_load(const char* dir, const char* url, char* err, size_t errsz
             else if (*pat == '>' && pat[1] != '=') { c->kind = C_GT; pat++; }
             c->test = strdup(av[1]);
             c->pat = strdup(pat);
+            if (!c->test || !c->pat) { cond_free(c); bad_cond = true; continue; }
             if (c->kind == C_REGEX) {
                 char e[160];
                 c->re = sv_regex_compile(pat, c->nc, e, sizeof(e));
                 if (!c->re) {
-                    snprintf(err, errsz, "%.80s line %d: RewriteCond pattern: %.80s", path, lineno, e);
-                    free(c->test); free(c->pat);
+                    snprintf(err, errsz, "%.80s line %d: RewriteCond pattern (rule disabled): %.60s", path, lineno, e);
+                    cond_free(c);
+                    bad_cond = true;
                     continue;
                 }
             }
@@ -240,13 +271,17 @@ static HtFile* ht_load(const char* dir, const char* url, char* err, size_t errsz
             bool nc = has_flag(fl, "NC", NULL, 0) || has_flag(fl, "nocase", NULL, 0);
             char e[160];
             r.re = sv_regex_compile(pat, nc, e, sizeof(e));
-            if (!r.re) {
-                snprintf(err, errsz, "%.80s line %d: RewriteRule pattern: %.80s", path, lineno, e);
-                for (int k = 0; k < npend; k++) { free(pending[k].test); free(pending[k].pat); sv_regex_free(pending[k].re); }
-                npend = 0;
-                continue;
-            }
             r.subst = strdup(av[2]);
+            if (!r.re || bad_cond || !r.subst) {
+                // una regola con meno condizioni di quelle scritte farebbe un'altra cosa: resta come segnaposto
+                // che non scatta mai (S=n conta le regole, [C] lega la seguente)
+                if (!r.re) snprintf(err, errsz, "%.80s line %d: RewriteRule pattern: %.80s", path, lineno, e);
+                else if (!err[0]) snprintf(err, errsz, "%.80s line %d: RewriteRule disabled (a condition could not be loaded)", path, lineno);
+                r.disabled = true;
+                for (int k = 0; k < npend; k++) cond_free(&pending[k]);
+                npend = 0;
+                bad_cond = false;
+            }
             r.last = has_flag(fl, "L", NULL, 0) || has_flag(fl, "last", NULL, 0);
             r.end = has_flag(fl, "END", NULL, 0);
             r.qsa = has_flag(fl, "QSA", NULL, 0) || has_flag(fl, "qsappend", NULL, 0);
@@ -269,15 +304,21 @@ static HtFile* ht_load(const char* dir, const char* url, char* err, size_t errsz
             if (npend) {
                 r.conds = malloc(sizeof(Cond) * (size_t)npend);
                 if (r.conds) { memcpy(r.conds, pending, sizeof(Cond) * (size_t)npend); r.nconds = npend; }
+                else { for (int k = 0; k < npend; k++) cond_free(&pending[k]); r.disabled = true; }  // mai senza le sue condizioni
                 npend = 0;
             }
             Rule* nr = realloc(h->rules, sizeof(Rule) * (size_t)(h->nrules + 1));
-            if (!nr) { sv_regex_free(r.re); free(r.subst); free(r.conds); continue; }
+            if (!nr) {                        // una regola in meno sposterebbe S=n e [C]: cartella negata
+                sv_regex_free(r.re); free(r.subst); for (int k = 0; k < r.nconds; k++) cond_free(&r.conds[k]); free(r.conds);
+                *fail = true;
+                continue;
+            }
             h->rules = nr;
             h->rules[h->nrules++] = r;
         }
     }
-    for (int k = 0; k < npend; k++) { free(pending[k].test); free(pending[k].pat); sv_regex_free(pending[k].re); }
+    for (int k = 0; k < npend; k++) cond_free(&pending[k]);
+    free(pending);
     sv_regex_free(files_re);
     fclose(f);
     return h;
@@ -435,16 +476,18 @@ static void pct_decode(const char* in, size_t n, char* out, size_t outsz) {
     out[k] = '\0';
 }
 
-// i .htaccess delle cartelle del percorso, dalla radice in giù
-static int load_levels(const RwRequest* rq, const char* path, HtFile** lv, char* err, size_t errsz) {
+// i .htaccess delle cartelle del percorso, dalla radice in giù. *fail = true se uno non si è potuto leggere
+// o se sono più di MAX_LEVELS: chi chiama nega l'accesso invece di ignorarne le regole (P3.11)
+static int load_levels(const RwRequest* rq, const char* path, HtFile** lv, char* err, size_t errsz, bool* fail) {
     int n = 0;
     char dir[4200], url[2100];
     snprintf(dir, sizeof(dir), "%s", rq->root);
     snprintf(url, sizeof(url), "/");
     const char* p = path;
     for (;;) {
-        HtFile* h = ht_load(dir, url, err, errsz);
-        if (h && n < MAX_LEVELS) lv[n++] = h; else ht_free(h);
+        HtFile* h = ht_load(dir, url, err, errsz, fail);
+        if (h && n < MAX_LEVELS) lv[n++] = h;
+        else if (h) { ht_free(h); *fail = true; }
         while (*p == '/') p++;
         const char* e = strchr(p, '/');
         if (!e) break;                                   // l'ultimo pezzo è il file (o una cartella senza "/")
@@ -465,8 +508,9 @@ static int load_levels(const RwRequest* rq, const char* path, HtFile** lv, char*
         if (stat(d2, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR && dl + strlen(p) + 2 < sizeof(dir) && ul + strlen(p) + 2 < sizeof(url)) {
             char u2[2200];
             snprintf(u2, sizeof(u2), "%s%s/", url, p);
-            HtFile* h = ht_load(d2, u2, err, errsz);
-            if (h && n < MAX_LEVELS) lv[n++] = h; else ht_free(h);
+            HtFile* h = ht_load(d2, u2, err, errsz, fail);
+            if (h && n < MAX_LEVELS) lv[n++] = h;
+            else if (h) { ht_free(h); *fail = true; }
         }
     }
     return n;
@@ -485,7 +529,9 @@ void rw_apply(const RwRequest* rq, RwResult* out) {
     Ctx c;
     memset(&c, 0, sizeof(c));
     for (int pass = 0; pass < MAX_PASSES; pass++) {
-        n = load_levels(rq, path, lv, out->error, sizeof(out->error));
+        bool fail = false;
+        n = load_levels(rq, path, lv, out->error, sizeof(out->error), &fail);
+        if (fail) { out->action = RW_FORBIDDEN; goto done; }
         HtFile* h = NULL;                              // il .htaccess più profondo con le regole attive
         for (int i = n - 1; i >= 0 && !h; i--) if (lv[i]->engine && lv[i]->nrules) h = lv[i];
         bool changed = false, stop = false;
@@ -507,6 +553,7 @@ void rw_apply(const RwRequest* rq, RwResult* out) {
             for (int i = 0; i < h->nrules; i++) {
                 Rule* r = &h->rules[i];
                 if (chain_failed) { chain_failed = r->chain; continue; }      // resto della catena saltato
+                if (r->disabled) { chain_failed = r->chain; continue; }
                 bool m = sv_regex_search_caps(r->re, relbuf, 0, c.rcaps, NCAPS);
                 if (r->neg) { m = !m; for (int k = 0; k < NCAPS; k++) c.rcaps[k][0] = c.rcaps[k][1] = (size_t)-1; }
                 c.ctext = NULL;
@@ -580,7 +627,9 @@ void rw_apply(const RwRequest* rq, RwResult* out) {
     {
         if (changed_any) {                            // le cartelle del percorso finale
             for (int i = 0; i < n; i++) ht_free(lv[i]);
-            n = load_levels(rq, path, lv, out->error, sizeof(out->error));
+            bool fail = false;
+            n = load_levels(rq, path, lv, out->error, sizeof(out->error), &fail);
+            if (fail) { out->action = RW_FORBIDDEN; goto done; }
         }
         int access = 0;
         for (int i = 0; i < n; i++) {

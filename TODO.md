@@ -1,7 +1,102 @@
 # SegVaultDB — Engineering Roadmap
 
-Audit baseline: **v1.2.0** (`124ec1a`, branch `php-fastcgi`), audited 2026-11-14.
-All `file:line` anchors refer to that commit. The previous roadmap (XAMPP / UniServerZ parity) is
+## Stato attuale — versione 1.5.0 (non ancora rilasciata), aggiornato al 2026-11-27
+
+Versione nel codice: **1.5.0** (`include/common.h`); ultima release pubblicata: **v1.4.2** (2026-11-16). Tutto
+quello che segue la 1.4.2 è nel `CHANGELOG.md` sotto 1.5.0. `make test` (27 suite) e `make test-asan` verdi.
+
+**Code review 2026-11-26 (voci `CR-*`, in fondo al file):** corrette tutte le voci che erano difetti, compresa
+CR-B6 (`BACKUP TO` non scrive più nelle cartelle servite né in quella dei dati) e CR-B9 (`INSERT()`, JSON
+normalizzato, regex in cache); fatti anche CR-B2 (un solo buffer di testo, `include/sv_strbuf.h`) e CR-M9 (cartella
+privata per ogni suite, `tests/harness.h`) e CR-B10, i difetti trovati il 2026-11-27 con prove contro MySQL (commit
+implicito prima del DDL, sottoquery correlate che davano "" invece di NULL, `COLLATE` / `BINARY`, tipi persi da
+`SHOW CREATE TABLE` e dai dump, limiti di `TINYINT` / `INT UNSIGNED`, `CAST AS UNSIGNED`, `COUNT(DISTINCT a, b)`,
+`ORD`). Restano i refactoring strutturali, che non correggono difetti visibili:
+
+| Voce | Cosa resta |
+|---|---|
+| CR-M2 `[~]` | tabella `FuncDef` con puntatori a funzione al posto delle catene `FIS(...)` (oggi costano poco) |
+| CR-M5 `[ ]` | il motore è un singleton di processo (circa 100 variabili globali, nessun handle nell'API) |
+| CR-M6 `[ ]` | dividere `executor.c` (13 700 righe) e `window.c` / `AppWindow`; poi i test della logica di stato della finestra |
+| CR-M11 `[ ]` | confine GUI ↔ logica: un terzo di `src/widgets/` non è interfaccia; la GUI comanda il motore costruendo SQL |
+
+**Roadmap P0–P4 (audit dalla 1.2.0 in poi):** P0 tutto chiuso. Aperte:
+P1.14 `[~]` (streaming di `ORDER BY` / `GROUP BY` / join), P1.15 `[~]` (B+tree mantenuto dalle scritture),
+P1.17–P1.20 (statement serializzati nel server, lock per tabella, livello di isolamento dichiarato, group commit),
+P2.16 (64 connessioni in tutto), P3.9 `[~]` (audit riga per riga di `parser.c`, `executor.c`, widget, `win32.c`),
+P3.11 / P3.12 `[~]` (ultimi limiti fissi), P3.13 (client diversi da PHP), P3.14 (benchmark contro MariaDB),
+P4.1–P4.23 (parità di prodotto con XAMPP / UniServerZ / Laragon: eventi, binlog, più versioni di PHP, Xdebug,
+macOS, firma degli eseguibili, aggiornamenti, licenza, sicurezza predefinita, …).
+
+## Code review 2026-11-26 — riepilogo
+
+Revisione tecnica completa del working tree (`php-fastcgi` @ `3b66b31` + modifiche non committate): **24 voci nuove —
+1 critica, 5 alte, 11 medie, 7 basse** — nella sezione "Code review 2026-11-26 — audit tecnico completo" in fondo al
+file (ID `CR-*`, checkbox, `path:line`, perché è un problema, correzione). 5 voci sono confermate da una prova
+eseguita (programmi su `libsegvault.a`, ThreadSanitizer): CR-C1, CR-A1, CR-A4, CR-A5, CR-M1. Le altre seguono dal
+codice citato o da misure sul codice (warning del compilatore, conteggi); l'unico sospetto non provato (codice solo
+Windows) porta l'etichetta **[da verificare]**. Base: `make test` e `make test-asan` verdi su una copia dell'albero.
+
+**Stato 2026-11-26 (notte):** corrette 25 voci, tutte e 5 le priorità comprese — CR-C1, CR-A1, CR-A2, CR-A4,
+CR-A5, CR-M1, CR-M3, CR-M4, CR-M7, CR-M8 (da provare su Windows), CR-M10, CR-B1, CR-B3, CR-B4, CR-B5, CR-B7, CR-A3, e i nuovi CR-A6 (DoS con REGEXP), CR-M12
+(lettere accentate), CR-M13 (`LAST_INSERT_ID`), CR-M14 (divisione e `AVG` come MySQL), CR-M15 (`ROUND` / `FORMAT`),
+CR-B8 (`FROM DUAL`) — più
+due in parte: CR-M2 (smistamento delle funzioni 4-6 volte più veloce) e CR-B6 (resta la scelta sul percorso di
+`BACKUP TO`). Restano aperte: CR-M5, CR-M6, CR-M9, CR-M11, CR-B2 (refactoring strutturali) e la scelta sulla
+collation predefinita (CR-M12). Fuzzer (14 target, 60 s ciascuno) e confronto con SQLite: nessun errore. `make test` verde.
+
+**Stato 2026-11-27:** corrette anche CR-B6 e CR-B9 (più `JSON_ARRAY_INSERT` / `JSON_MERGE_PRESERVE` trovate strada
+facendo), CR-B2 (buffer unico, con due difetti trovati nelle vecchie copie) e CR-M9 (punti 1-3). Restano CR-M2 (in
+parte), CR-M5, CR-M6 e CR-M11.
+
+**Le 5 priorità da affrontare per prime**
+
+1. **CR-C1 — escalation di privilegi al riavvio.** `users.dat` salva i GRANT come parole separate da spazi, ma i nomi
+   di database e tabelle possono contenere spazi: ``GRANT SELECT ON shop.`t 255` `` torna dopo il riavvio come
+   `GRANT ALL PRIVILEGES ON shop.t` (provato), e ogni permesso su un nome con spazi sparisce. Codificare i nomi e
+   validare le righe al caricamento.
+2. **CR-A2 (con CR-B6) — l'API SQL di amministrazione risponde a ogni sito ospitato.** Il controllo `Origin == Host`
+   fa passare il JavaScript di qualunque pagina servita da SegVault (plugin, bundle npm, XSS), che nella configurazione
+   predefinita esegue SQL come root su tutti i database (e può mettere `users.dat` nella radice di un sito con
+   `BACKUP TO`). Servire l'API solo sull'host di amministrazione e con un segreto.
+3. **CR-A5 e CR-A1 — due race nel motore confermate da TSan.** `db_current_database()` restituisce un puntatore
+   dentro il catalogo dopo aver rilasciato il lock (use-after-free se un altro thread fa DDL: la GUI ospita il
+   server nello stesso processo); le letture parallele aggiungono senza lock elementi alla lista globale delle mappe
+   dell'heap.
+4. **CR-A4 — `LIMIT` / `OFFSET` oltre 2³¹.** `LIMIT 7, 18446744073709551615`, l'idioma che il manuale di MySQL
+   indica per "fino alla fine", restituisce 0 righe; `VARCHAR(4294967297)` diventa `varchar(1)`. Correzione piccola
+   (`strtoull` con controllo dell'overflow), impatto alto: risultati sbagliati senza errori.
+5. **CR-A3 — GUI ferma durante backup, restore e import.** Lettura e traduzione di un dump da centinaia di MB, e
+   il backup con il lock esclusivo del motore, girano sul thread dell'interfaccia, senza avanzamento né annullamento:
+   è il percorso più usato nelle classi.
+
+**Valutazione complessiva.** Progetto molto ambizioso: un motore SQL con WAL, B+tree e versioni confermate, HTTP/1.1
+e HTTP/2, TLS, protocollo MySQL, FastCGI e una GUI con widget propri, tutto in C. Per un sistema di questa ampiezza
+le pratiche di verifica sono sopra la media: 26 suite con circa 4 000 controlli, ASan/UBSan/TSan, fuzzing notturno,
+fault injection della durabilità, build Windows provata con wine, nessun warning con `-Wall -Wextra`. Anche la
+sicurezza è curata in molti punti: PBKDF2 e confronti a tempo costante, difesa dal DNS rebinding, file privati
+scritti in modo atomico, limiti di profondità e di dimensione. Quasi tutti i problemi trovati nascono da tre
+debolezze strutturali:
+(1) lo stato globale del motore, con le regole di locking scritte solo nei commenti (CR-M5, da cui CR-A1 e CR-A5);
+(2) formati e interfacce a testo senza escape (CR-C1, CR-B5, e la GUI che comanda il motore costruendo SQL, CR-M11);
+(3) file e funzioni troppo grandi per una revisione seria (CR-M6: `executor.c` da 13 660 righe, `window.c` da 6 255
+con una `AppWindow` di 116 campi, 17 funzioni oltre le 200 righe).
+Voto indicativo per area:
+
+| Area | Voto | Note |
+|---|---|---|
+| Motore | 7/10 | durabilità solida, concorrenza fragile |
+| Server | 7/10 | |
+| GUI | 5/10 | lavoro pesante sul thread dell'interfaccia, god object |
+| Test | 8/10 | |
+| Architettura e manutenibilità | 5/10 | |
+| Sicurezza | 6/10 | finché CR-C1 e CR-A2 restano aperte |
+
+---
+
+*Storico.* Audit baseline: **v1.2.0** (`124ec1a`, branch `php-fastcgi`), audited 2026-11-14. The P0–P3 items below
+came from that audit (P4 from the 1.5.0 review); their original `file:line` anchors refer to that commit, the
+"Fixed" notes to the code of the time. For the current state see "Stato attuale" at the top. The previous roadmap (XAMPP / UniServerZ parity) is
 complete and summarised at the bottom; its original text is `git show v1.2.0:TODO.md`.
 
 How the findings were obtained:
@@ -20,6 +115,24 @@ Status tags: **[reproduced]** = observed on a running build; **[code]** = follow
 not executed; **[verify-win]** = Windows-only, needs a run on Windows.
 
 `[ ]` to do · `[~]` in progress · `[x]` done.
+
+**Status 2026-11-24 — architecture review of v1.5.0 (new section P4, competitive matrix and v1.6 / v1.7 / v2.0
+roadmap at the top of P4):** new items — **P0: 0 · P1: 4** (P1.17–P1.20) **· P2: 1** (P2.16) **· P3: 2** (P3.13, P3.14)
+**· P4: 23** (P4.1–P4.23); "Review 2026 Update" notes added inside the open items P1.14, P1.15, P3.9 and P3.12
+(×3: leftover caps, 32-argument function calls that break WordPress `post__in` ordering, 63-byte identifiers).
+Baseline for the review: `make clean all test dist`, `make test-asan` and the MinGW build + wine tests all green on
+the 1.5.0 tree; probes in `/tmp/sv_audit_probe/` (outside the repository).
+
+**Status 2026-11-24:** P3.11 closed (all nine caps, plus `.htaccess` fail-open paths, atomic GUI config saves, a
+private `server.token`, HTTP/2 header drop) and two security findings fixed: **stored identifier injection** (GUI
+built GRANT / DROP / dump SQL from unquoted names; engine now refuses backticks and control characters in new
+names) and a **login-throttle bypass** (64-slot LRU eviction). P3.12 #1 done (300-column `UPDATE` / upsert).
+`make test`: everything green except `test_durability.c:1325` (P1.15 acceptance check, fails identically on
+HEAD `3b66b31`: writes after a restart with on-disk trees still scan the table — expected until P1.15 is done).
+
+**Status 2026-11-17:** new audit of hard-coded limits after the 1024-column change: P3.11 (caps that silently
+drop data, rules or rows — includes a fail-open `.htaccess` deny and `server.ini` sites being erased) and P3.12
+(engine limits below MySQL: 64-column `UPDATE`, 8 `JOIN`s, 16 indexes). GUI 64-column cap fixed.
 
 **Status 2026-11-16 (after 1.4.2):** closed P3.10 (CA name constraints); P1.14 partly done (column pruning,
 early stop at `LIMIT`); P3.9 advanced (executor write-path probes, `win32.c` launch / clipboard paths); still
@@ -563,7 +676,7 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     `EXPLAIN` shows the index, crash tests over a tree write in progress — bulk-built trees have no splits);
     the maintained tree (step 2) is **P1.15**.
 
-- [ ] **P1.15 `[ENGINE]` On-disk B+tree maintained by writes (P1.6 step 2)** — [code] · **Size:** XL · **Deps:** P1.6
+- [~] **P1.15 `[ENGINE]` On-disk B+tree maintained by writes (P1.6 step 2)** — [code] · **Size:** XL · **Deps:** P1.6
   - **Where:** `src/index/bptree.c` (read-only trees), `src/query/executor.c` (`MemIndex`, `trees_on_write`).
   - **Why:** after the first write a table goes back to its in-memory index (built by a full scan, memory outside
     the buffer pool, lost on every rollback of a write to the table) until the next clean shutdown or
@@ -576,6 +689,36 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
   - **Done when:** a table written after a restart keeps answering point and range lookups with ≤ 4 page reads
     and no full scan; power cut at every write of a split; RSS of a 10 M-row table with two indexes does not
     grow with the index size.
+  - **Progress 2026-11-24 — the remaining full scan is the free-space map, not the indexes.** Measured per
+    statement after a restart (20 000 rows, ~1 600 pages): the first `INSERT` reads **1 608 pages**, everything
+    after it 0–3. `heap_open` → `meta_build` walks the whole page chain to learn each page's free space and the
+    tail (`src/table/heap.c`); for a big imported table that stalls the first insert for seconds. A persisted
+    tail pointer is not safe as is: page headers carry no owner, so a stale tail (catalog older than the last
+    append, page freed and reused) could not be detected and inserts would land in another table's chain. Options:
+    (a) owner table id in the page header (data format 3) + tail in the catalog (v8), verified on use;
+    (b) persist the FSM itself at checkpoint as a compact run-length list. Also done here: on the first write the
+    table's on-disk trees are adopted as lazy in-memory indexes before being dropped (`trees_adopt`), so the other
+    indexes of the table keep answering from the tree plus an in-memory overlay instead of being rebuilt by a
+    scan. ~~`tests/test_durability.c:1325` still fails for the FSM reason above.~~
+  - **Fixed the same day (narrow form of option (a), no page-format change):** the safety argument needs only
+    the root, not an owner id. A heap chain is never shortened in the middle: it is freed whole, together with
+    its root (`free_heap`: DROP, and TRUNCATE / ALTER rewrite / VACUUM FULL, which all give the table a new
+    root). So "last known page + the root it belongs to" is always a page of that chain while the table still
+    has that root, at worst not the last one (`heap_insert` already follows `next` to the real end). Catalog
+    v8 stores `tail_page` / `tail_root` per table (`cat_save` takes them from the free-space map or the unused
+    hint; deltas v3, v2 / v1 records still read); at startup `tails_from_catalog` registers only hints whose
+    root is still the table's; `free_heap` forgets the hint and the map of a freed chain; the hinted page must
+    still be a chained data page. `heap_open` then builds a **partial** map from the tail (`meta_from_tail`),
+    and every `INSERT` visits 16 more pages from the head of the chain (`meta_walk`) until the map is
+    complete, after which space freed by `DELETE`s is reused again. Result: first `INSERT` after a restart reads
+    **22 pages instead of 1 608**; `tests/test_durability.c:1325` passes (30 pages for the whole sequence). New
+    tests (`tests/test_durability.c`, "P1.15: coda della catena"): first insert after restart < 60 pages on a
+    half-deleted table, deleted space reused (size within +25%), TRUNCATE + restart (stale root ignored),
+    390 appends then exit without shutdown + recovery (stale tail followed), counts stable across restarts.
+    Catalog v8 is not readable by builds with catalog v7 (unreleased 1.5 development builds and 1.4.x).
+    Still open in P1.15: the tree itself maintained by writes (overlay is in memory), composite / range scans
+    from the disk tree.
+  - **Review 2026 Update (v1.5.0):** first write after a restart no longer scans (FSM tail, catalog v8). Still open: the in-memory overlay of a table written since the last checkpoint grows with the changed keys (RSS), and after an unclean shutdown the trees are not trusted, so the first query on a multi-GB table rebuilds its indexes by a full scan — the "first page is slow after a crash" effect on big imported databases.
 
 - [x] **P1.7 `[CONCURRENCY]` Table locks for plain reads cause upgrade deadlocks; waits are polled; writers can starve** — [code]
   - **Where:** `src/bridge/db_api.c:841-878` (every `SELECT` takes `LK_S` on its tables, kept to `COMMIT`,
@@ -794,6 +937,32 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     **Not done:** statistics are not refreshed automatically (only by `ANALYZE`); string columns get distinct
     count and NULL fraction but no histogram; joins with outer joins keep the written order.
 
+- [x] **P1.16 `[PERF]` Profiling round 2026-11-24: rollback, parse-node size, join reordering** — [reproduced]
+  - **ROLLBACK rebuilt every in-memory index of the tables it touched.** `invalidate_after_cache_undo` called
+    `executor_invalidate_table`; the next statement re-read the whole table to rebuild the primary-key index
+    (gprof: 60% in `sm_slot` / `mi_add_key` for `BEGIN; INSERT 10 rows; ROLLBACK`). Bench `rollback`
+    **1.3 k → 48 k rollbacks/s** (SQLite 89 k; was 0.014×, now 0.55×). Fix: index journal in the executor
+    (`ij_note` / `executor_index_undo` / `executor_index_journal_drop`): every key added / removed inside a
+    transaction is recorded with db_api's change sequence and undone in reverse; an index built after the
+    point rolled back to (it contains undone rows with no journal) is discarded; OOM → old behaviour for that
+    transaction. The transaction's starting sequence is saved per session (`DbSession.tx_begin_seq`).
+    Tests: `tests/test_sql.c` (INSERT / DELETE / key-changing UPDATE rolled back, `ROLLBACK TO`, a statement
+    failing half way, index first built inside the transaction), `tests/test_sessions.c` (two sessions; the test
+    fails if the begin sequence is not per session).
+  - **`ASTNode` 66 KB → 3.3 KB** (see P3.12): inline 64 KB view / routine text, 36 KB `create_table`, 19 KB
+    `merge`. Bench vs baseline: `point_lookup` +42%, `point_lookup_prepared` +11–17%, `readers_1/4` +37–40%.
+  - **Heap overflow in `join_reorder` (P1.13) — memory safety, found with ASan.** Reordering a `SELECT *` over
+    joined tables expanded the star into up to 64 column nodes and `memcpy`d them into `select_stmt.columns`,
+    whose capacity is the written list (8 for `*`): any reorderable `SELECT *` over more than 8 columns in total
+    wrote past the heap block. Now a new list of the exact size replaces the old one (also lifts the 64-column
+    cut-off, and the reorder now considers up to 16 tables with 64-bit masks: `long` is 32 bits on Windows).
+    Test in `tests/test_sql.c` (3 tables × 7 columns after `ANALYZE`).
+  - **Measured, not changed:** `range_scan` 0.3× SQLite — removing the per-row re-check of exact integer bounds
+    gave nothing (gprof's per-call overhead had inflated `eval_expr`); the cost is fetching each row by RID and
+    materialising every cell as a string in `QueryResult` (P1.14 territory). `COUNT(*)` after a restart scans
+    the table (1.7 ms for 100 k rows): `num_rows` cannot answer it (it counts other sessions' uncommitted rows
+    and is not logged for recovery). Server idle footprint: 10 MB RSS, 1 thread, `/health` in 0.4 ms.
+
 - [~] **P1.14 `[PERF]` The executor materialises every row it reads; results are fully built before they are sent**
   - **Where:** `src/query/executor.c` `plan_load` (~`:7024-7070`): the scan path copies every row that passes the
     `WHERE` into the source's arena (`source_push`), all of them, before joins, aggregation or `LIMIT` run;
@@ -842,6 +1011,31 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     **Still open:** queries with `ORDER BY` / `GROUP BY` / joins / other aggregates still materialise
     (pull-based operators and an external sort are needed); the prepared-statement (binary) protocol, cursors
     and the HTTP API do not stream yet.
+  - **Review 2026 Update (v1.5.0):** `make bench` 2026-11-24: `range_scan` 0.29–0.33× SQLite. A trial that skipped the per-row re-check of exact integer range bounds gained nothing; the cost is the RID-by-RID heap fetch and turning every cell into a string in `QueryResult`. The binary protocol (`COM_STMT_EXECUTE`, cursors) and the HTTP API still materialise. Schedule after P1.17: streaming per connection pays off once connections run concurrently.
+
+- [ ] **P1.17 `[ENGINE]` One statement at a time server-wide: every MySQL-protocol command, and even the login, waits for any other running statement** — `[reproduced]` · **Size:** `XL` · **Deps:** `P1.18` (only for concurrent writers on one table)
+  - **Where:** `src/server/server.c:4427-4430` (`COM_QUERY`, `COM_STMT_PREPARE`, `COM_STMT_EXECUTE`, `COM_INIT_DB` all go through `my_enter`), `:3812-3822` (`my_enter` → `exec_begin`), `:758-764` (`exec_begin` locks `exec_mx`, declared at `:168` as "una richiesta alla volta sul motore"), `:4302-4304` (login takes `exec_mx` around `db_session_new`); `src/bridge/db_api.c:81-82` (`db_lock` = exclusive `g_db_rw` for every statement), `:2784-2795` (`db_session_enter`: one active session `g_active`, ~20 globals swapped by `session_save` / `session_load`). The only parallel read path, `db_execute_readonly` (`db_api.c:2907`), is used by the HTTP API alone (`server.c:961`).
+  - **Why:** reproduced on a 16-core machine with PHP 8.5.13 `mysqli` against `segvault-server --mysql-port 13306` (probe `/tmp/sv_audit_probe/q.php`): four concurrent CPU-bound `SELECT`s of 303 ms each completed at 0.30 / 0.61 / 0.92 / 1.22 s — fully serialized, and their *connect* alone waited 303–611 ms; four concurrent `SELECT SLEEP(1)` took 4 s; a `SELECT 1` sent 0.3 s into a 0.92 s `INSERT … SELECT` waited 621 ms to log in. A PHP site served by an 8-worker php-cgi pool therefore gets single-core database throughput, and one slow report query stalls every other page, new logins and the desktop editor (same engine lock, `db_api.c:81-82`). MariaDB/MySQL serve each connection in its own thread with row-level locking ("InnoDB employs Row-Level Locking", mariadb.com/kb/en/innodb-lock-modes/). The README comparison row "Letture che non aspettano le scritture (MVCC) ✅" (`README.md:153`) does not hold over the MySQL protocol.
+  - **Do:** (1) route read-only statements of a session with no open transaction — and, after P1.19, every consistent read — through the shared-lock path (`db_execute_readonly`, extended to prepared statements and cursors) without `exec_mx`; (2) replace the single swapped active session (`g_active` + `session_save/load`) with an explicit `DbSession*` carried in `ExecCtx`, so several sessions are inside the engine at once; (3) split `g_db_rw` into finer latches: catalog rwlock (DDL exclusive), per-table latch for heap / index structure changes, the existing buffer-pool partitions (P1.10), a WAL append mutex; (4) login never waits for the engine (`db_session_new` only allocates). Rejected: a process per connection (buffer pool and lock manager in shared memory, cross-process latches — much harder on Windows); one engine thread fed by a queue (still serial CPU).
+  - **Done when:** the probe (4 parallel 300 ms `SELECT`s) finishes in < 0.45 s on ≥ 4 cores and `SELECT 1` during a long write answers in < 5 ms; a new `tests/test_server.c` case with 8 concurrent MySQL connections; `make bench` gains wire scenarios (P3.14) with `mysql_readers_8` ≥ 5× `mysql_readers_1`; `make test-tsan` clean.
+
+- [ ] **P1.18 `[ENGINE]` Write locks are per table: two transactions changing different rows of the same table serialize (1205 after the lock timeout)** — `[reproduced]` · **Size:** `XL` · **Deps:** `P1.17`
+  - **Where:** `src/bridge/locks.c:65-70` (`LkEntry` keyed by database + table name), `:266` (`lk_acquire`), `src/bridge/db_api.c:1525-1536` (each statement acquires table locks, held to COMMIT); listed as a limit in `README.md:229-230`; P1.7 closed with "Longer term: row-level write locks".
+  - **Why:** probe `/tmp/sv_audit_probe/eng.c` (two in-process sessions, `db_set_lock_wait_timeout(1000)`): A `BEGIN; UPDATE t SET v = 1 WHERE id = 1`, then B `UPDATE t SET v = 2 WHERE id = 2` waited 1 000 ms and failed with "Lock wait timeout exceeded … (a table is in use by another session's open transaction)". Web workloads write different rows of the same hot table from many requests (PHP sessions in the database, carts, WooCommerce orders, Laravel's `jobs` table polled by queue workers). InnoDB "locks only the index record found" for a unique search (dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html).
+  - **Do:** row locks in the lock manager: table-level intention modes (IS / IX / S / X) plus a per-table hash of row locks keyed by primary-key value (by RID for tables without a key — `UPDATE` can move a row, `LOG_UPDATE_MOVE`); `UPDATE` / `DELETE` / `SELECT … FOR UPDATE` lock the rows they touch after the `WHERE` probe; escalate to a table X lock above ~5 000 row locks per statement; deadlock detection reuses the wait-for graph (`locks.c:215`). No gap locks under READ COMMITTED (as InnoDB); a unique check against an uncommitted insert waits on that row's lock. Rejected: page locks (every insert hits the tail page); commit-time write-write conflict detection only (PHP code does not retry transactions).
+  - **Done when:** `tests/test_sessions.c`: A and B update different rows of one table, both commit, B waits < 10 ms; same row → B waits until A commits; crossed rows → 1213; a duplicate key against an uncommitted insert waits for its outcome; bench `writers_4` on one table ≥ 3× `writers_1` once P1.17 lands.
+
+- [ ] **P1.19 `[ENGINE]` Isolation level is misreported (`@@transaction_isolation` = SERIALIZABLE) and `SET … ISOLATION LEVEL` is silently ignored; transactions only get READ COMMITTED** — `[reproduced]` · **Size:** `L` · **Deps:** `P1.18` (locking reads)
+  - **Where:** `src/query/executor.c:2779-2780` and `src/server/mysql_wire.c:379` (two hand-kept copies of the variable table, both `"transaction_isolation", "SERIALIZABLE"`); `src/query/parser.c:5014-5016` (every `SET` is accepted: "Si accettano tutte"); READ COMMITTED since P1.7 (plain `SELECT` releases its S locks at statement end; committed-version snapshot per statement).
+  - **Why:** probe `eng.c`: `SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ` → OK; `SELECT @@transaction_isolation` → `SERIALIZABLE`; inside one transaction A reads `v = 0`, B commits `v = 9`, A's second read returns `9` (non-repeatable read). MySQL and MariaDB default to REPEATABLE READ ("The default isolation level for InnoDB is REPEATABLE READ", dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html; same on mariadb.com/kb/en/set-transaction/). Code written for MySQL (read-check-write in a transaction, reports reading several tables as one snapshot) silently gets weaker guarantees, and anything that inspects the variable is told the strongest level. The two variable tables already disagree (`innodb_version` exists only in `mysql_wire.c:383`; probe: `SELECT @@innodb_version` fails in-process).
+  - **Do:** (1) now: one shared system-variable table; report `READ-COMMITTED`; `SET [SESSION | GLOBAL] TRANSACTION ISOLATION LEVEL` / `transaction_isolation = …` either takes effect or leaves a warning (`SHOW WARNINGS`); (2) REPEATABLE READ as snapshot isolation: take the committed-version snapshot at the transaction's first read and keep it to COMMIT (today `try_snapshot` is per statement); writes and `FOR UPDATE` read the latest committed row under row locks (InnoDB semantics); make it the default like MySQL once benchmarked. Rejected: true SERIALIZABLE with predicate / gap locks (cost; rarely used by MySQL applications).
+  - **Done when:** the probe returns `0` twice under REPEATABLE READ and `0` then `9` under READ COMMITTED; `@@transaction_isolation` follows `SET`; cases in `tests/test_sessions.c` and, over the wire, `tests/test_mysql.c`.
+
+- [ ] **P1.20 `[PERF]` No group commit: a `synchronous = FULL` COMMIT fsyncs the log while holding the engine's exclusive lock** — `[code]` · **Size:** `M` · **Deps:** `P1.17`
+  - **Where:** `src/bridge/db_api.c:2596-2600` (`db_commit` holds `db_lock`, exclusive `g_db_rw`), `:2066-2070` (COMMIT record + `wal_flush`), `src/tx/wal.c:162-174` (`wal_flush` → one `sv_fsync` per commit).
+  - **Why:** each committing session holds the whole engine for one fsync (bench `commit_full`: 1.2 k commits/s on NVMe, `make bench` 2026-11-24); on a laptop HDD, network share or encrypted volume (5–10 ms per fsync) that is 100–200 commits/s for the *whole server*, with every reader stalled meanwhile. Group commit (several transactions' records flushed by one fsync) is the standard remedy [not-verified: no MariaDB group-commit page fetched in this review].
+  - **Do:** after appending the COMMIT record, release the engine lock and wait on "flushed LSN ≥ my LSN"; the first waiter fsyncs once for everything appended so far and wakes the others (leader / follower). The transaction's locks are released only after its LSN is durable (strict 2PL kept). Rejected: weakening FULL (`synchronous = NORMAL` already offers that trade-off).
+  - **Done when:** a new bench scenario `commit_full_8` (8 sessions, FULL) reaches ≥ 4× `commit_full`; the crash-point tests of `tests/test_durability.c` pass with the shared flush.
 
 ---
 
@@ -1240,6 +1434,12 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     **Not verified:** the Windows side only cross-compiles (no high-DPI Windows run); a real IME (fcitx / ibus)
     was not exercised, only Xlib's built-in compose.
 
+- [ ] **P2.16 `[NET]` 64 connections in total for HTTP + MySQL + SMTP: 64 idle MySQL clients take every website down** — `[reproduced]` · **Size:** `M` · **Deps:** `none` (the event-loop part fits P1.17)
+  - **Where:** `src/server/server.c:5049` (`max_clients` defaults to 64, 256 with HTTPS), `:5076` (one `conns[]` table for every listener), `:4489-4512` (one thread per connection, 8 MB stack reservation each), `src/server/mysql_wire.c:383` (`@@max_connections` = that same budget).
+  - **Why:** probe `/tmp/sv_audit_probe/conns.php` against `segvault-server --mysql-port 13306`: the 65th MySQL connection fails with `1040 Too many connections`, and while 64 MySQL connections are open `GET /api/v1/health` answers `{"ok":false,"error":{"message":"too many connections"}}` — every site on the stack is down too. 64 is easy to reach locally: php-cgi pool + Laravel Horizon / queue workers + `PDO::ATTR_PERSISTENT` + an IDE with several tabs + browser keep-alive. MariaDB's default `max_connections` is 151 [not-verified: value read from a summarised page, mariadb.com/kb/en/server-system-variables/#max_connections].
+  - **Do:** separate budgets per listener (HTTP, MySQL, SMTP), MySQL default 151 like MariaDB; when the HTTP table is full, close the least recently used idle keep-alive connection instead of refusing the new request; `--max-connections` and a Settings field; idle connections should cost a small struct, not a thread with an 8 MB reservation — an epoll / IOCP loop parks idle sockets and hands ready requests to a worker pool (same shape as the HTTP/2 inner workers, P2.5). Rejected: only raising the constant (thread stacks and Windows commit charge grow with it).
+  - **Done when:** the probe opens 200 MySQL connections while HTTP still answers 200 OK; a `tests/test_server.c` case; limits documented in `docs/API.md`.
+
 ---
 
 ## P3 — Ecosystem, Testing, Benchmarks & Open-Source Polish
@@ -1417,7 +1617,14 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     rows are intact, the open `DELETE` is gone and the `UPDATE` is whole. Under ASan the suite runs in
     `make test-asan`. Rule documented in `CONTRIBUTING.md`.
 
-- [ ] **P3.9 `[AUDIT]` Finish the code audit of the modules that were only spot-checked**
+- [~] **P3.9 `[AUDIT]` Finish the code audit of the modules that were only spot-checked**
+  - **Pass 2026-11-24 (P3.11 / P3.12 work, ASan):** found and fixed the `join_reorder` heap overflow, the stored
+    identifier injection in the GUI, the login-throttle bypass, the `.htaccess` fail-open paths and the HTTP/2
+    header drop (see P3.11, P1.16). Grep of every unbounded `strcpy` / `strcat` / `sprintf` in `src/`: all
+    bounded by an earlier length check or an allocation sized from the inputs, except `service.c`
+    (`build_args`: an option with a value adds two entries but the loop reserved one — with exactly
+    `max - 2` entries the terminating NULL went one past the array; fixed). Still to read line by line: the
+    rest of `parser.c` / `executor.c`, `regex.c`, `sqljson.c`, widgets.
   - **Where:** `src/query/parser.c` (5 122 lines) and `src/query/executor.c` (11 959 lines: constraint and
     foreign-key enforcement, `ALTER TABLE` rewrite, trigger / routine interpreter, `MemIndex` maintenance on
     write, `sequences.txt` persistence at `:2295-2297`); `src/server/tls.c`, `mail.c`, `rewrite.c`, `proxy.c`,
@@ -1524,6 +1731,11 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
       `sql_text.c` statement splitting falls back to the heap past 64 statements (fine).
     - The fuzz harness (`tests/fuzz/fuzz.c`) had stopped working after P1.11 (a static `TableSchema` with no
       column storage: every target died at start-up under UBSan); fixed with `schema_new`.
+  - **Review 2026 Update (v1.5.0 spot audit):**
+    - *GUI thread still takes the engine lock directly* — `[code]`: `update_session` runs after every statement and calls `update_completions` (`src/widgets/window.c:151-161`, `107-128`), which lists every database, table and column through `db_list_*` on the UI thread; so do `refresh_tree` (`:760-779`), the Designer sync in the draw path (`:5632` → `src/widgets/schema_view.c:233,253`, `sm_load`) and the users panel (`src/widgets/users_view.c:98,104`). Each call takes the exclusive `g_db_rw` (`src/bridge/db_api.c:2632-2671`). The work itself is cheap (probe `/tmp/sv_audit_probe/comp.c`: 2 000 tables / 20 000 columns rebuilt in 9.5 ms), but while the server runs a long statement (P1.17) the window freezes until it ends. Fix with P1.17: catalog reads under a shared catalog latch, or through `ui_exec` like the editor's queries.
+    - *Recursion and size guards hold* — `[reproduced]`, probe `/tmp/sv_audit_probe/deep.c`: deleting the root of a 20 000-row self-referencing `ON DELETE CASCADE` chain (21 ms, no stack growth), a trigger inserting into its own table ("nested too deeply"), an unbounded `WITH RECURSIVE` (stops at 1 000 steps / 1 000 000 rows), 100 000 nested parentheses and 20 000 nested scalar subqueries ("more than 128 nested levels"), 5 000 nested derived tables, 200 000 nested JSON arrays — all refused cleanly, no crash. Note: MySQL caps cascades at 15 levels [not-verified]; SegVault is more permissive.
+    - *Windows platform layer* — `[code]`: per-monitor DPI v2 with fallbacks and `WM_DPICHANGED` handling (`src/platform/win32.c:82-112`, `334`) — fine.
+    - *Nightly fuzzing is failing* — `[reproduced in CI]`: the scheduled `fuzz` workflow of 2026-11-24 (run 45394474620, target `exec`, seed = run number 8) failed with LeakSanitizer "66 728 byte(s) leaked in 3 allocation(s)" from `parse_select_core` (an `ASTNode` of a nested `SELECT` arm, `src/query/parser.c` via `parse_query`, `db_execute_impl`). The saved `fuzz-crash.bin` (a mangled `MERGE` / upsert) is only the last input — it does not leak on the current tree (replayed under ASan: lexer error, no leak) — so the leaking input is one of the earlier ones in that run. A leak per malformed statement grows a long-running server's memory under hostile or buggy clients. Re-run of the same target and seed on the 1.5.0 tree: see the note below.
 
 - [x] **P3.10 `[SECURITY]` Constrain the local certificate authority** — [code]
   - **Where:** `src/server/tls.c` `make_cert` (CA: `basicConstraints CA:TRUE, pathlen:0`, no `nameConstraints`),
@@ -1554,6 +1766,425 @@ system tables, statistics), P2.5, P2.14, P2.15, P3.6, P3.8, P3.9 and the open pa
     recognised and `tls_renew_ca` replaces it keeping the old files. **Not verified:** which browsers enforce
     name constraints on a user-added root (OpenSSL does; the `--trust-ca` stores were not exercised).
 
+- [~] **P3.11 `[ARCH]` Hard-coded caps that silently drop data, rules or rows** — audit 2026-11-17 — all findings fixed 2026-11-24, plus two security findings (identifier injection, login throttle bypass)
+  - **Root cause:** fixed-size arrays sized for "nobody will ever have more than N" with a `&& n < N` guard in the
+    loop that fills them. The guard keeps memory safe but discards everything past N **without telling anyone**.
+    Raising an engine limit (P1.11: 1024 columns, dynamic table / database lists) does not raise these copies,
+    so every such cap is a latent bug that appears exactly when a real (migrated XAMPP) project is opened.
+  - **Rule for new code:** a cap is either (a) dynamic, (b) equal to the engine limit it mirrors (use the
+    `SV_MAX_*` constant, never a literal), or (c) enforced with a visible error / "N more" note. Never a silent
+    `&& n < 64` in a filling loop.
+  - **Findings** (each [code] unless marked):
+    1. **`.htaccess` deny rules dropped — security, fail-open.** `src/server/rewrite.c:49` `deny_files[16]`,
+       `:190` `if (deny && h->ndeny < 16)`. From the 17th `<Files>` / `<FilesMatch>` block with
+       `Require all denied` / `Deny from all` on, the rule is ignored and the file is **served**. Big
+       WordPress / plugin `.htaccess` files reach this. Do: dynamic list; on allocation failure deny the whole
+       directory (fail closed). [reproduced] — **Fixed 2026-11-17:** `deny_files` grows (doubling from 8); if
+       it cannot grow, the whole directory is denied. Test `tests/test_php.c`: 20 `<Files>` deny blocks, the
+       20th file gets 403 (was 200), a file outside the blocks still 200.
+       **Same file — fixed 2026-11-24:** `Cond pending[32]` dropped `RewriteCond` lines past 32, so the rule fired
+       with fewer conditions than written. Now dynamic. Reading the file further found four more fail-open paths,
+       all fixed: (a) a `RewriteCond` with a pattern our regex engine rejects was dropped and its rule fired
+       **unconditionally** for that condition; (b) `malloc` failure for `r.conds` kept the rule with no conditions;
+       (c) an `.htaccess` that exists but cannot be opened (`EACCES`, or `EMFILE` on a busy server) was treated
+       as absent, so its `Require all denied` was ignored; (d) directories past `MAX_LEVELS` (32) were dropped.
+       Now: a rule whose pattern or conditions cannot all be loaded stays in the list as a **disabled
+       placeholder** (never fires, keeps its slot so `S=n` and `[C]` still count it); (c), (d) and an OOM while
+       growing the rule list deny the directory (403, as Apache answers 403/500). Tests in `tests/test_php.c`:
+       40 conditions with the 40th false (was 403, now 200) and true (403); broken condition (rule not fired);
+       `S=1` over a disabled rule; `chmod 000 .htaccess` → 403.
+    2. **Named sites deleted from `server.ini` — config loss.** `src/widgets/server_view.c:210`
+       `site_name[32]`, `:306` reads at most 32 `site.NAME=` lines, `:322` `web_save` rewrites the file with only
+       those, `:404` `SvSite sites[32]`. The CLI accepts 64 (`src/server/main.c:196,254`). Changing the web
+       folder or PHP path in the GUI erases sites 33+. Do: one shared limit (or dynamic), and rewrite the file by
+       replacing only the keys the panel owns, keeping unknown lines.
+       **Fixed 2026-11-24:** the panel keeps every `site.NAME=` line (dynamic `SvSite*`, passed straight to the
+       server, which validates names and copies them); `web_save` rewrites only `web_folder=` / `php_cgi=` and
+       copies every other line verbatim, through tmp + `fsync` + rename (new `sv_fclose_replace` in
+       `src/platform_compat.h`); a `server.ini` over 1 MB or unreadable is never rewritten.
+       **Found while there, fixed:** the GUI wrote `server.token` (the HTTP API token) with plain `fopen`, i.e.
+       0644 / inherited ACL — now `sv_fopen_private` + atomic replace. `settings.ini`, saved queries
+       (`remove` + `rename` left a moment with no file), the session files, the ER positions and **the user's
+       own `.sql` files saved from the editor** were truncated in place, so a crash or full disk mid-save left
+       an empty / cut file; all now written to a sibling file and swapped in (editor save keeps the file mode
+       and writes symlinks in place).
+    3. **ER diagram: tables piled at (0,0)** — [reproduced]. `src/widgets/schema_model.c:236`
+       `int order[512]; float key[512]` in `sm_auto_layout`: tables past 512 in one level are never placed.
+       600 tables without foreign keys (typical MyISAM schema from XAMPP, WordPress multisite): 88 tables stay
+       stacked at the origin, also after "Arrange". **Fixed 2026-11-17:** `order` / `key` allocated for
+       `m->nt` tables. Test `tests/test_schema_model.c`: 600 tables, all placed (was 88 unplaced).
+    4. **Users panel hides table grants.** `src/widgets/users_view.c:297,329,502` show and hit-test only the
+       first 4 table-level grants, no "N more" line (the database list has one); the others cannot be seen or
+       revoked from the GUI. Fetch is capped at `UV_MAX_TG` = 64 (`:14`) as well.
+       **Fixed 2026-11-24:** users, databases and table grants are dynamic (`UV_MAX_USERS` 128 and `UV_MAX_DBS`
+       64 were silent caps too, and the user list did not scroll: users past the panel height were invisible);
+       the table-grant section scrolls with a "1-4 of N" header; the user list scrolls and follows the
+       selection. **Security finding while there — stored identifier injection, fixed:** the panel built
+       `GRANT … ON %s.* TO u` / `REVOKE ALL ON %s.%s` from database / table names **without quoting** and ran
+       them with `exec_statements` (several statements, as the GUI administrator). The engine accepts
+       ``CREATE DATABASE `x.* TO bob; DROP DATABASE victim; GRANT SELECT ON y` ``, so any user with `CREATE`
+       (a web app's MySQL account) could make the admin's next click on that row run `DROP DATABASE`
+       [reproduced: the name is stored and the generated text parses as three statements]. Same class
+       elsewhere: `DROP DATABASE %s` (confirm dialog), the editor snippets `SELECT * FROM %s` / `SHOW CREATE
+       TABLE %s` (run by the user's next Run-all), the GUI dump (`CREATE DATABASE %s; USE %s;` and
+       `INSERT INTO %s` — a re-imported dump ran the name), `db_get_objects_sql` (views / triggers / routines in
+       dumps), `SHOW GRANTS` output (replayed by user-copy scripts), CSV import and SQL export (also broke on
+       keyword names such as `order`). And the backtick-quoted sites were not safe either: a **string literal is
+       accepted as a name** (`CREATE DATABASE 'q`x'`, `CREATE INDEX 'i`j'`, CTAS aliases), so a name could hold
+       a backtick and close the quotes; backtick names could hold newlines (breaking `-- comment` lines in
+       dumps). Fix, two layers: (1) engine — `sv_name_ok` (`include/common.h`): a new database / table /
+       column / index / constraint / view / sequence / trigger / routine name must be non-empty, without
+       backtick or control characters, checked in the executor DDL paths (create, CTAS, ADD / RENAME COLUMN,
+       RENAME TO, ADD CONSTRAINT) and again in `catalog_add_db/table/view/index` (`SV_BAD_NAME`); existing
+       objects stay addressable. (2) GUI — every generated statement goes through `sql_ident`
+       (`src/widgets/sql_quote.h`), which refuses names it cannot quote; dumps refuse to write a partial file
+       (a table that cannot be read or an OOM used to produce a "successful" truncated dump). `SHOW GRANTS`
+       quotes names like MySQL. The MySQL wire `USE` (handshake / `COM_CHANGE_USER` / `COM_INIT_DB`) used
+       `%.63s`: a longer name was cut and the session landed in another database — now whole or rejected
+       (`my_use_db`). The grid-edit `USE \`%.60s\`` had the same truncation, so an edit could hit the
+       same-named table of another database; now it aborts if the `USE` fails. Tests: `tests/test_sql.c` (name
+       rules on every DDL path; `x; DROP …` stays a legal quoted name), `tests/test_auth.c` (quoted `SHOW
+       GRANTS`), `tests/test_engine.c` (CSV with `order,select,date` headers). Not unit-tested: the GUI call
+       sites (no harness for `window.c` / `users_view.c`); reviewed line by line.
+    5. **ER diagram database menu: first 64 databases only.** `src/widgets/schema_view.c:232`
+       (`v->dbs[64]`); the engine allows 100 000. **Fixed 2026-11-24:** dynamic list; the menu shows as many
+       rows as fit under the button, scrolls with the wheel ("1-20 of 300 · scroll"), opens on the current DB.
+    6. **`SHOW PROCESSLIST` over the MySQL protocol: 256 rows max.** `src/server/server.c:3851`
+       `Row rows[256]` (plus ~430 KB of `buf` on the stack); the HTTPS default for `max_clients` is 256
+       (`server.c:5003`), so a busy server truncates the list an admin uses to find what to `KILL`.
+       **Fixed 2026-11-24:** rows and text buffers on the heap, one per `max_clients`.
+    7. **Recursive CTE: only the first 64 `UNION` arms.** `src/query/executor.c:5921` `ASTNode* arms[64]`;
+       arms past 64 are ignored (rare, but a wrong result, not an error). **Fixed 2026-11-24:** arms counted and
+       allocated; test in `tests/test_sql.c` (70 anchors + a recursive arm: 139 rows).
+    8. **Mail catcher: 64 attachments per message.** `src/server/mail.c:308,374` — the rest disappear.
+       **Fixed 2026-11-24:** dynamic list; `tests/test_mail.c` sends 70 and downloads the 70th.
+    9. **Grid editing: read-only above 64 columns.** `src/widgets/grid_edit.h:31-34`, `window.h:216-221`,
+       `window.c:1947,1980,2071` (`types[64]`, `vals[64]`). Not silent ("Read-only: too many columns"), and every
+       access is guarded by `grid_edit_cell_ok`, but a 100-column table from XAMPP cannot be edited in the grid.
+       The `window.c` stack arrays read past 64 if that guard is ever relaxed: make them `num_cols`-sized
+       together with `GridEdit`. **Fixed 2026-11-24:** `GE_MAX_COLS` = `SV_MAX_COLUMNS` for `GridEdit`, the
+       draft-row arrays and the `window.c` buffers (one constant, rule (b)); `result_set_row` refuses wider
+       results; the window-teardown loop freed only 64 draft values (leak). Test: a 100-column table edited at
+       column 100 in `tests/test_grid_edit.c`.
+    10. **Login throttling bypass — security, found by the "done when" grep.** `src/server/server.c`
+       `login_fail[64]`, LRU by (user, address): alternating password guesses for `root` with 64 invented user
+       names evicted `root`'s entry, so its back-off never started (unlimited guesses at full speed)
+       [reproduced: the new test logs in with 200 on the old code]. **Fixed 2026-11-24:** 1024 slots
+       (`LOGIN_SLOTS`); a new entry never evicts one that is still making someone wait while a non-blocking one
+       exists; a second counter per address alone (`LOGIN_FREE_FAILS_ADDR` = 20) for non-loopback clients
+       (loopback is exempt: every local app shares 127.0.0.1 and one misconfigured app must not lock the others
+       out); a successful login clears only its own pair. Test: `tests/test_server.c` (blocked user stays 429
+       after 80 failures under other names).
+  - **Already fixed (2026-11-17):** result grid, Designer and ER model were capped at 64 columns
+    (`TABLE_VIEW_MAX_COLS`, `DESIGN_MAX_COLS`, `SM_MAX_COLS`) and showed only the first 64 of a wide table
+    without a word; at the cap `design_add_column` did nothing, so naming the "new" column renamed column 64
+    (`RENAME COLUMN c63 TO c100`, seen in the test). Now: grid widths allocated per result, ER columns
+    allocated per table, Designer = `SV_MAX_COLUMNS`. Tests: 100-column tables in `tests/test_table_design.c`
+    (load all, add the 101st) and `tests/test_schema_model.c`.
+  - **Done when:** every finding above is dynamic or reports the cap; a grep for `&& [a-z_]+ < [0-9]+` in filling
+    loops under `src/widgets`, `src/server`, `src/bridge` finds only bounded, documented cases.
+  - **Grep 2026-11-24, remaining hits (all bounded on purpose):** chart series 64 / 400 sampled rows and export
+    column-width sampling (1000 / 2000 rows: widths only, every row is written); primary-key columns 8
+    (`db_tools.c`, `schema_model.c`: = `SV_MAX_KEY_COLS`, see P3.12); PHP pool refs 8, FastCGI argv 76,
+    MIME nesting 12; settings rows 32 per section (UI);
+    `EXECUTE … USING` 64 variables (P3.12 #5, loud). One more silent cap found by the grep and fixed: HTTP/2
+    `hpack_decode` (`src/server/h2.c`) dropped every header after the 512th of a block (the request went on
+    without them); now the block is refused (`GOAWAY`), like HTTP/1's 431, and a failed `strdup` no longer
+    leaves a NULL value.
+
+- [~] **P3.12 `[ARCH]` Engine limits still sized for the pre-1.5 world (loud, but below MySQL)** — audit 2026-11-17 (1 fixed 2026-11-24)
+  - **Why it matters:** these fail with an error, so no data is lost, but they turn a working XAMPP project
+    (dump import, ORM query, WordPress plugin) into "Too many …" on the first run. Several are the same
+    literal 64 that P1.11 removed for columns.
+  - **Findings** (limit here → MySQL / MariaDB):
+    1. `UPDATE … SET` and `ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO UPDATE`: **64 columns**
+       (`SV_MAX_SETS`, `src/query/parser.h:227`; checks `parser.c:2393,2426,2668`) → no limit. A table can now
+       have 1024 columns but cannot be fully updated or upserted in one statement (Laravel `upsert`, Doctrine
+       full-entity `UPDATE`). **Fixed 2026-11-24:** `set_cols / set_exprs / set_tables / set_texts` and
+       `dup_cols / dup_exprs` are heap lists grown by `upd_set_room` / `ins_dup_room` (the fixed arrays also made
+       every `ASTNode` ~12 KB larger, since they sit in the node union); `SV_MAX_SETS` = 4 × `SV_MAX_COLUMNS`
+       only stops absurd text and is named in the message. Executor: `exec_update` allocates the column-index
+       array, the upsert's temporary UPDATE node borrows the insert's names, multi-table UPDATE gives each target
+       a slice of one buffer. Tests (`tests/test_sql.c`): a 300-column table updated, upserted with `ON DUPLICATE
+       KEY UPDATE` and `ON CONFLICT DO UPDATE`, and updated through a self-`JOIN`, each in one statement.
+    2. `JOIN`s per `SELECT`: **8** (`parser.h:274` `joins[8]`, `parser.c:1901`) → 61. WordPress `meta_query`
+       with several clauses self-joins `wp_postmeta` once per clause; Magento EAV queries exceed 8 joins.
+       **Fixed 2026-11-24:** 61 tables as in MySQL (`SV_MAX_JOINS` 60). `joins` is a heap list; the plan's
+       ~22 per-source arrays (`Source` alone is 1.3 KB) are carved from one block sized to the query's real
+       table count (`plan_alloc_src`) instead of a fixed `MAX_SOURCES` in every plan — a 2-table query
+       allocates less than before, not more; source masks widened to `uint64_t`. Tests: a 12-way self-join, a
+       61-table `LEFT JOIN` chain, and the 62nd table refused with the limit in the message.
+    3. Indexes per table: **16** (`SV_MAX_INDEXES`, `include/common.h:44`, `schema.c:1224`;
+       `SV_MAX_KEY_DEFS` `parser.h:156`) → 64. Constraints per table: **16** (`SV_MAX_CONSTRAINTS`,
+       `SV_MAX_CONS_DEFS`). Columns per key: **8** (`SV_MAX_KEY_COLS`, `src/catalog/schema.h:69`) → 16.
+       Dumps of schemas with many indexes / foreign keys fail at `CREATE TABLE`. `SV_MAX_KEY_COLS` is part of
+       the catalog format (`schema.c:539,589` write/read fixed 8 slots): raising it needs a catalog version.
+       **Fixed 2026-11-24 (indexes and constraints):** 64 indexes and 64 constraints per table (formats v6/v7
+       already store the counts, so no format change; the v4/v5 loaders use frozen `SV_V5_*` = 16 so old
+       catalogs still migrate). Work tables (`schema_new`: derived tables, CTEs, `information_schema`, routine
+       variables) no longer carry 16 + 16 index / constraint slots (~30 KB zeroed each time); only `CREATE
+       TABLE` reserves constraint slots (`schema_new_aux`), `schema_dup` exactly the source's. The ENUM check
+       constraint was silently skipped when the constraint list was full — now an error. `CREATE TABLE`
+       constraint / key lists are heap (`ast_cons_add`, `ast_key_add`). Tests: a mysqldump-style table with 20
+       `KEY`s and 20 `FOREIGN KEY`s (enforced, and kept across two restarts and a `CHECKPOINT`); 65 keys
+       refused. **Key columns 8 → 16 done 2026-11-24:** `SV_MAX_KEY_COLS` 16 (`Index.cols`, `Constraint.cols/ref_cols`,
+       parser key / FK lists, `KEY_BUF` 4096 so a 16-part key never falls back to "not indexed", `MemIndex.col`,
+       FK info in `db_api.h`, GUI grid-edit / ER / db-tools buffers); catalog v8 writes only `ncols` key
+       columns, v6 / v7 keep reading 8 fixed slots, v4 / v5 use frozen `IndexV5` / `ConstraintV5` (layout
+       still checked by the `TableSchemaV5` static assert). Tests: 12-column PK, enforced 16-column UNIQUE,
+       12-column FK, 17 refused. **To do:** a restart test for a 16-column key (v8 variable encoding).
+    4. `ORDER BY`: **8** expressions (`SV_MAX_ORDER`, `parser.c:2242`); `GROUP BY` / `ROLLUP`: **16**
+       (`SV_MAX_GROUP`, `parser.c:2059,2073`; `:2059` also tests the literal `16` twice) → no limit.
+       **Fixed 2026-11-24:** heap lists (cap 4096, named in the message); `ROLLUP` / `CUBE` / `GROUPING SETS`
+       keep 32-bit set masks and say "up to 32" instead of shifting past bit 31 (`WITH ROLLUP` over 64
+       expressions would also have overrun the 64-entry set array). The compound-query `corder` is allocated
+       per plan instead of a fixed array. Tests: 22-key `ORDER BY`, 41-expression `GROUP BY`, the ROLLUP error,
+       10-key `ORDER BY` on a `UNION`.
+    5. `MERGE`: 8 `WHEN` clauses, 32 columns / values in the `INSERT` branch (`parser.c:3407,3423,3448`)
+       (**fixed 2026-11-24:** heap lists, 256 clauses / 1024 columns; the `INSERT` column list now uses its own
+       count instead of the value count);
+       stored routines: 32 parameters, `CALL` 32 arguments (`parser.c:3255,3526`); window functions per query 16
+       (`executor.c:5707`); `EXECUTE … USING` 64 variables (`src/bridge/db_api.c:1608`).
+    6. Misleading messages: table-function alias column list `alias(c1, …)` allows 8 names
+       (`parser.c:1849`, `parser.h:193`) and the `MERGE` insert column list 32 (`parser.c:3441`), but both
+       report "Expected a column name" instead of the limit.
+    7. Silent optimisation cut-offs (correct results, slower plans): join reordering skips `SELECT *` that
+       expands past 64 columns (`executor.c:6941`) and queries with 128+ conjuncts (`executor.c:6845`).
+  - **Side effect worth more than the limits — `ASTNode` 66 KB → 3.3 KB (fixed 2026-11-24):** every parse
+    node (each `SELECT`, subquery, expression statement, routine statement, prepared statement) is one union, and
+    `create_view.definition` / `create_trigger.body` were inline `char[SV_MAX_SQL_LEN]` (64 KB), `create_table`
+    held 16 `ConstraintDef` + 16 `TableKeyDef` (36 KB) and `merge` 8 × 2.3 KB. Every node was `calloc`ed and
+    zeroed at 66 KB; a routine body of 100 statements held 6.6 MB of AST. All those are heap now (view / routine
+    text sized to its length).
+  - **Do:** make the parser lists dynamic (as P1.11 did for column lists), tie every remaining cap to one named
+    constant with the MySQL value where cheap (JOIN 61, indexes 64, key columns 16 with a catalog bump), and
+    put the limit in every "Too many" message. List the remaining limits in `docs/` next to the P3.7 limits.
+  - **Done when:** a 300-column table can be updated / upserted in one statement, a 12-way self-join and a
+    table with 20 indexes and 20 foreign keys import from a mysqldump, and `tests/test_sql.c` covers each new
+    limit and its message.
+  - **Review 2026 Update (v1.5.0):** items 1-5 done in 1.5.0 (61 tables, 64 indexes / constraints, 16 key columns, dynamic ORDER / GROUP / SET / MERGE lists). Remaining caps, all loud: `MATCH` 16 columns (`src/query/parser.c:1291`), `SELECT … INTO` 16 variables (`:1989`), table-function columns 16 (`:2384`), routine parameters / `CALL` arguments 32 (`:3361`, `:3666`), `CHECK / ANALYZE / OPTIMIZE TABLE` 16 tables (`:4801`), `DROP TABLE a, b, …` 16 tables (`:4984` — a multisite cleanup script dropping 20 tables fails), `JOIN … USING` 8 columns and trigger `UPDATE OF` 8 columns (`src/query/parser.h:204,513`); join reordering considers ≤ 16 tables and ≤ 128 conjuncts (`src/query/executor.c:6995,7017`).
+  - **Review 2026 Update (v1.5.0) — function calls take at most 32 arguments, which breaks WordPress `post__in` ordering** — `[reproduced]`: `MAX_FUNC_ARGS 32` (`src/query/parser.c:705`, checked at `:725`; argument arrays allocated at that size at `:722,753,1065,1114,1210,1288,1379`). Probe `/tmp/sv_audit_probe/fargs.c`: `SELECT ID FROM wp_posts WHERE ID IN (…40 ids…) ORDER BY FIELD(wp_posts.ID, …40 ids…)` → "Too many function arguments"; also `JSON_OBJECT` with 20 key / value pairs, `COALESCE` with 41 arguments, `GREATEST` with 40. WordPress core builds that exact clause with one argument per requested post and no batching (`WP_Query::parse_orderby`: `"FIELD({$wpdb->posts}.ID," . implode( ',', array_map( 'absint', $this->query_vars['post__in'] ) ) . ')'`, same for `post_parent__in` / `post_name__in`; github.com/WordPress/wordpress-develop, `src/wp-includes/class-wp-query.php`), so any hand-picked list of more than 31 posts or products fails. **Do:** grow the argument array by doubling (as the other lists in 1.5.0) with a limit far above MySQL practice (e.g. 65 535, the prepared-statement placeholder limit), keep `FIELD` / `ELT` / `JSON_OBJECT` / `COALESCE` / `CONCAT` / `GREATEST` / `LEAST` working at that size; **Done when:** `tests/test_mysql.c` runs the WordPress clause with 500 ids and `JSON_OBJECT` with 100 pairs. Long `IN (…)` lists (10 000 values) and `OR` chains (1 000 terms) already work (probe `inlist.c`).
+  - **Review 2026 Update (v1.5.0) — identifiers stop at 63 bytes (MySQL: 64 characters; aliases 256)** — `[reproduced]`: names live in `char[SV_MAX_NAME_LEN]` with `SV_MAX_NAME_LEN 64` counting the NUL (`include/common.h:61`), checked by `copy_text` (`src/query/parser.c:128`). Probe `/tmp/sv_audit_probe/ident64.c`: a 64-character table name and a 64-character column name → "Name or value too long (max 63 characters)"; a 100-character column alias (quoted or not) → same error. MySQL counts identifier length in characters (64) and allows 256-character column aliases, so dumps with maximal names (generated index / constraint names cut to exactly 64) and ORMs emitting long aliases fail here, and non-ASCII names (`città_…`) hit the byte limit even sooner. Long names are rejected, never truncated (no aliasing — checked). **Do:** decouple the on-disk legacy layouts (`SV_V5_*` style constant for v4 / v5 structs) and raise the in-memory name buffers to 64 characters × 4 bytes + NUL (catalog v8 already length-prefixes strings); column aliases in result metadata as heap strings up to 256 characters. **Done when:** `tests/test_mysql.c` creates 64-character ASCII and 64-character accented table / column / index names and selects a 256-character alias.
+
+- [ ] **P3.13 `[COMPAT]` Client compatibility is only tested with PHP: no `mysql` CLI / `mysqldump`, JDBC, Node `mysql2`, Python drivers, phpMyAdmin or Adminer in CI** — `[code]` · **Size:** `M` · **Deps:** `none`
+  - **Where:** `tests/test_server.c:1384-1400` (PHP `mysqli`, the only third-party client in the suites) and the in-repo C client of `tests/test_server.c`; `.github/workflows/ci.yml` installs only `build-essential php-cgi`.
+  - **Why:** `README.md:130` advertises the MySQL protocol for "PHP, Node, Python, Java, client mysql", but none of those is exercised; this review could not run them either (no `mysql`, `mysqldump`, `mariadb`, Java, Node `mysql2`, `pymysql` or `mysql.connector` on the review machine) [not-verified]. Each driver has its own handshake and protocol paths (RSA for `caching_sha2_password`, `CLIENT_DEPRECATE_EOF`, binary protocol, `COM_STMT_FETCH` cursors, `CLIENT_LOCAL_FILES`, which the server does not advertise: `src/server/mysql_wire.h:23-35`).
+  - **Do:** a `compat` CI job: `mysql-client` (CLI + `mysqldump` → import round trip of the test database), Node 22 + `mysql2` (prepared + pooled), Python `PyMySQL`, `mysql-connector-python` and an SQLAlchemy ORM smoke test, Java single-file programs with MariaDB Connector/J and MySQL Connector/J, PHP `PDO_MYSQL` with emulated and native prepares, and a crawl of Adminer 4.8 and phpMyAdmin 5.2 pages that fails on any SQL error text. Rejected: one Docker image per tool (slow; no Windows story).
+  - **Done when:** the job is green on every push and generates the driver matrix in `docs/API.md`.
+
+- [ ] **P3.14 `[PERF]` No benchmark against MariaDB over the wire: in-process numbers hide the protocol path (P1.17 is invisible to `make bench`)** — `[code]` · **Size:** `M` · **Deps:** `P3.13`
+  - **Where:** `bench/suite.c` (SegVault in-process vs SQLite; the only wire scenario `pdo_point_lookup` is absolute and not gated, `bench/compare.py`), `bench/baseline.json`.
+  - **Why:** the product competes with XAMPP's MariaDB 10.11.19 and Laragon's MySQL, but no benchmark runs either; `readers_16` uses in-process sessions, so the server-wide serialization of P1.17 (4 × 300 ms queries → 1.2 s over the wire) never shows up.
+  - **Do:** `make bench-wire`: start `segvault-server` and MariaDB 10.11 (same minor as XAMPP 8.5.13) from a pinned tarball; one C driver speaking the protocol directly (reuse the `tests/test_server.c` client) with N connections; scenarios: PK lookup at 1 / 8 / 32 connections, 1 000-row range, autocommit INSERT (SegVault `synchronous = FULL` vs `innodb_flush_log_at_trx_commit = 1`), 8 connections updating different rows of one table, a 12-query WordPress-like page, import of a 100 MB dump; p50 / p99 latency and throughput; the same ±15 % gate as `bench/compare.py`. Rejected: sysbench (needs libmysqlclient + Lua, Linux only).
+  - **Done when:** `make bench-wire` writes the README table; a weekly CI job keeps a baseline.
+
+---
+
+## P4 — Product parity and beyond (XAMPP / UniServerZ / Laragon)
+
+Review 2026-11-24 of **v1.5.0** (tree at the 1.5.0 version bump, `make clean all test dist`, `make test-asan` and the
+Windows build all green on that tree). Competitor facts come from the vendors' pages read on 2026-11-24:
+XAMPP 8.3.37 / 8.4.28 / 8.5.13 (apachefriends.org/blog/new_xampp_20261120.html, apachefriends.org/download.html,
+apachefriends.org/faq_windows.html); Uniform Server ZeroXV 15.0.2 (sourceforge.net/projects/miniserver/ and its
+ZeroXV Modules listing — uniformserver.com answered HTTP 403); Laragon 8.x (github.com/leokhoa/laragon/releases/tag/8.0.0,
+laragon.org/, laragon.org/docs/quick-app, /multi-version, /mailpit, /auto-ssl, /quick-share, laragon.org/pricing).
+Probes live in `/tmp/sv_audit_probe/` (outside the repository).
+
+### Competitive matrix — SegVaultDB v1.5.0 vs. XAMPP (8.x) vs. UniServerZ (v15) vs. Laragon (v8)
+
+Cells: `✓` = yes, `Partial`, `✗` = no; "n/d" = not documented on the vendor pages read (treat as `✗` / unknown, `[not-verified]`).
+
+| Capability | **SegVaultDB 1.5.0** | XAMPP 8.3.37 / 8.4.28 / 8.5.13 | UniServerZ 15.0.2 | Laragon 8.x |
+|---|---|---|---|---|
+| **DB — engine** | own C engine, MySQL dialect + wire protocol | MariaDB 10.11.19 | MySQL 8.4.1 or MariaDB 10.11.8 module | MySQL (Quick-add lists 8.4 / 9.1), PostgreSQL optional |
+| DB — concurrent queries over the MySQL protocol | ✗ one statement at a time server-wide (P1.17) | ✓ thread per connection | ✓ | ✓ |
+| DB — row-level locking | ✗ table locks (P1.18) | ✓ InnoDB | ✓ InnoDB | ✓ InnoDB |
+| DB — isolation | Partial: READ COMMITTED only, reports SERIALIZABLE (P1.19) | ✓ REPEATABLE READ default | ✓ | ✓ |
+| DB — FK cascades / triggers / routines / CTE / window / JSON | ✓ (probed: cascades, trigger recursion guard, CTE guard) | ✓ | ✓ | ✓ |
+| DB — FULLTEXT | Partial: per-row scan, relevance always 1 (P4.3) | ✓ ranked, boolean mode | ✓ | ✓ |
+| DB — spatial | ✗ type accepted, no `ST_*` (P4.2) | ✓ geometry types / constructors | ✓ | ✓ |
+| DB — EVENT scheduler | ✗ (P4.1) | ✓ | ✓ | ✓ |
+| DB — binlog / point-in-time recovery | ✗ (P4.4) | ✓ | ✓ | ✓ |
+| DB — MySQL-size limits | Partial: 61 joins / 64 indexes / 16 key parts ✓; 32 function args, 63-byte names (P3.12) | ✓ | ✓ | ✓ |
+| DB — default connection budget | 64 shared with HTTP + SMTP (P2.16) | 151 [not-verified] | 151 [not-verified] | 151 [not-verified] |
+| DB — admin UI | ✓ native editor, designer, ER, charts, users | phpMyAdmin 5.2.3 | phpMyAdmin / Adminer | n/d on pages read |
+| DB — backup / restore | ✓ `BACKUP TO`, scheduled, GUI buttons | n/d | ✓ MySQLAutoBackup | ✓ MySQL auto backup |
+| DB — large dump import / export | Partial: 256 MB cap, whole file in RAM (P4.6) | ✓ server-side tools | ✓ | ✓ |
+| **Web — PHP versions** | 1 per server; `get-php.cmd` takes latest 8.5 / 8.4 / 8.3, unverified (P4.7) | 1 per installer | 7.0–8.3, global switch | global switch, newest auto-added |
+| Web — per-site PHP version | ✗ (P4.7) | ✗ | ✗ | n/d |
+| Web — Xdebug toggle | ✗ (P4.8) | n/d | n/d | n/d |
+| Web — automatic virtual hosts | ✓ `NAME.localhost` / `NAME.test`, no hosts file | ✗ manual `httpd-vhosts` | n/d | ✓ `*.test` |
+| Web — trusted HTTPS per site | ✓ local CA with name constraints, one-click trust | n/d (port 443 only) | n/d | Partial: self-signed, manual "Add to Trust Store" |
+| Web — HTTP/2, reverse proxy for Vite / Next (WebSocket) | ✓ / ✓ | n/d / ✗ manual | n/d / ✗ | n/d / n/d |
+| Web — Node / Python / Go runtimes and workers | ✗ proxy only, no process manager (P4.10) | ✗ | ✗ | ✓ multi-version |
+| Web — Redis-compatible cache | ✗ (P4.11) | ✗ | ✗ | n/d |
+| Web — mail catcher | ✓ SMTP + web UI + JSON API; no live updates / release (P4.14) | Partial: Mercury MTA (Windows) | n/d | ✓ Mailpit |
+| Web — public sharing tunnel | ✗ (P4.12) | ✗ | ✗ | ✓ ngrok "Quick share" |
+| **DX — footprint / install** | ✓ single exe (server 1.4 MB, GUI 3.4 MB on Windows), PHP separate | installer / zip, full Apache + MariaDB + Perl + Tomcat bundle | 52.7 MB self-extractor, portable | installer, portable folder |
+| DX — one-click apps | ✗ (P4.9) | ✗ | ✗ | ✓ WordPress / Laravel / Symfony / Drupal |
+| DX — migration from another stack | ✗ (P4.13) | — | — | — |
+| DX — updates | ✗ (P4.19) | n/d | n/d | Partial: paid tiers only |
+| DX — GUI language | English only (P4.15) | n/d | n/d | n/d |
+| DX — accessibility / HiDPI | ✗ screen readers (P4.16) / ✓ per-monitor DPI v2 + UI scale | n/d / n/d | n/d / n/d | n/d / ✓ "full High DPI" |
+| **Security — network exposure** | ✓ 127.0.0.1; LAN refused without token; DNS-rebinding and Origin checks | n/d | n/d | n/d |
+| Security — DB login by default | ✗ open mode: any local user is root (P4.21) | ✗ security console to set passwords | n/d (users report no root password) | ✗ empty root password |
+| Security — signed binaries / SBOM | ✗ (P4.18) | n/d (FAQ on antivirus false positives) | ✗ SHA1 sums only | ✓ code-signed since 8.0 |
+| Security — telemetry | ✓ none in code; not yet verifiable (P4.23) | n/d | n/d | n/d |
+| **Ops — crash / power-loss safety** | ✓ WAL v2, page CRC, double write, fault-injection suite | ✓ InnoDB | ✓ InnoDB | ✓ InnoDB |
+| Ops — platforms | Windows, Linux | Windows, Linux x64, macOS arm64 | Windows 64-bit | Windows |
+| Ops — licence / price | ✗ no licence file (P4.20) | free | free | free non-commercial; commercial $49 / year or $149 lifetime |
+
+### Execution roadmap — v1.6 → v1.7 → v2.0
+
+**v1.6 — Stability & core engine.** P1.19 (report the real isolation level first: a one-day fix that stops tools being misled), P3.12 rest (32 function arguments — WordPress `post__in`; 64-character names), P2.16, **P1.17**, **P1.18**, P1.20, P1.15, P1.14, P3.9, P3.13, P3.14, P4.5, plus two non-engine prerequisites: P4.20 (licence) and P4.18 (signing).
+*Why this order:* every ecosystem feature of v1.7 multiplies concurrent database clients (per-site PHP pools, workers, queue runners, a Redis-backed app still hitting MySQL), so the server-wide serialization (P1.17) is the root bottleneck; row locks (P1.18) only pay once statements run concurrently, and group commit (P1.20) only once commits can overlap. P2.16 is cheap and removes the "64 idle connections take every site down" failure before connection counts grow. P3.13 / P3.14 come with the engine work because they are how the engine change is proven (driver matrix, MariaDB wire benchmark). The licence and signing are prerequisites with no code dependency: distribution channels and SmartScreen reputation take time to build, and the v2.0 updater and macOS notarization reuse the signing pipeline.
+
+**v1.7 — Ecosystem & framework parity.** P4.21 (secure default credentials) → P4.7 (side-by-side and per-site PHP) → P4.8 (Xdebug) → P4.9 (Quick App), P4.10 (process manager) → P4.12 (sharing), P4.11 (Redis), P4.14 (mail), P4.6 (streaming import / export) → P4.13 (migration wizard), P4.22 (ports), and the SQL parity items P4.1 (events, needs P1.17's multi-session engine for its scheduler thread), P4.3 (full-text index, persisted like the P1.15 trees), P4.2 (spatial).
+*Why this order:* Quick App must write real credentials into `wp-config.php` / `.env`, so the default-auth change comes first; Xdebug and Quick App build on the per-version PHP pools; sharing reuses the process manager; the migration wizard needs both the streaming importer and the wire client of P3.13.
+
+**v2.0 — Commercial polish & scale.** P4.19 (auto-update, on the v1.6 signing pipeline), P4.17 (macOS: server first, then the Cocoa GUI), P4.15 (Italian / English) → P4.16 (accessibility, labels from the string table), P4.4 phases 2–3 (archived WAL for point-in-time restore, then a row-event stream), P4.23 (verifiable zero telemetry, together with the update check it must cover).
+*Why this order:* these widen the market (Mac users, public-sector buyers, teams) but depend on a stable engine and the v1.7 feature set; localisation must precede accessibility because screen-reader labels come from the same string table.
+
+### Items
+
+- [ ] **P4.1 `[COMPAT]` No EVENT scheduler (`CREATE EVENT`, `SHOW EVENTS`, `@@event_scheduler`)** — `[reproduced]` · **Size:** `M` · **Deps:** `P1.17`
+  - **Where:** missing — `src/query/parser.c:5100` (`SHOW` rejects `EVENTS`), the `CREATE` dispatch in `parser.c` has no `EVENT` branch; `information_schema.EVENTS` exists only as an empty 3-column stub (`src/query/executor.c:6374`); planned in `README.md:817,1671`.
+  - **Why:** probe `eng.c`: `CREATE EVENT e1 ON SCHEDULE EVERY 1 MINUTE DO …` → "Unexpected token: e1"; `SHOW EVENTS` → parse error; `SELECT @@event_scheduler` → unknown variable. MariaDB and MySQL schedule SQL with `CREATE EVENT` and the `event_scheduler` variable (mariadb.com/kb/en/events/); dumps made with `mysqldump --events` and apps that purge old rows with events (WordPress plugins, Matomo [not-verified]) fail on import or silently stop cleaning up.
+  - **Do:** catalog object (name, `AT` / `EVERY` + `STARTS` / `ENDS`, `ON COMPLETION [NOT] PRESERVE`, `ENABLE` / `DISABLE`, definer, body stored like a routine); one scheduler thread in the engine sleeping until the next due time, running each body as its definer in its own session (needs P1.17 to not block clients); `event_scheduler` ON / OFF; `ALTER` / `DROP EVENT`, `SHOW EVENTS`, `SHOW CREATE EVENT`, full `information_schema.EVENTS`; dump / import (`/*!50106 CREATE EVENT … */`). Rejected: delegating to OS cron / Task Scheduler (not portable, no SQL semantics, breaks the single-binary model).
+  - **Done when:** `tests/test_sql.c` with an injectable clock: an `EVERY 1 SECOND` event inserts rows, `AT` + `ON COMPLETION NOT PRESERVE` drops itself, events survive a restart; a mysqldump with `--events` imports (`tests/test_mysql_import.c`).
+
+- [ ] **P4.2 `[COMPAT]` Spatial types are accepted but have no functions or indexes (`POINT` column OK, `ST_*` unknown, `SPATIAL KEY` dropped)** — `[reproduced]` · **Size:** `L` · **Deps:** `none`
+  - **Where:** `src/query/parser.c:4270` (`SPATIAL` keys discarded: "SPATIAL: ignorato"); no geometry type or `ST_*` function in `src/query/executor.c`.
+  - **Why:** probe `eng.c`: `CREATE TABLE g (id INT PRIMARY KEY, p POINT NOT NULL, SPATIAL KEY (p))` → OK, then `SELECT ST_AsText(ST_GeomFromText('POINT(1 2)'))` → "Unknown function 'ST_ASTEXT'", `ST_Distance_Sphere(POINT(…), POINT(…))` → unknown function. MariaDB provides geometry types and constructors such as `POINT`, `ST_BUFFER`, `ST_AsGeoJSON` (mariadb.com/docs/server/reference/sql-statements/geometry-constructors/geometry-constructors.md); `ST_Distance_Sphere` and SPATIAL indexes on MariaDB [not-verified: page not fetched]. Store-locator / delivery-zone plugins and Laravel spatial packages need at least points, WKT / WKB I/O, distance and bounding-box search.
+  - **Do:** a `GEOMETRY` family stored as MySQL internal WKB (4-byte SRID + WKB) so the wire protocol returns the same bytes as MySQL; functions in two steps: (a) `ST_GeomFromText` / `ST_AsText` / `ST_AsGeoJSON` / `ST_X` / `ST_Y` / `ST_SRID` / `ST_Distance` / `ST_Distance_Sphere` / `MBRContains` / `ST_Within` for points and polygons; (b) an R-tree (or quadtree over the existing B+tree code) for `SPATIAL` indexes. Rejected: linking GEOS (C++ runtime, breaks the zero-dependency single binary).
+  - **Done when:** `tests/test_sql.c` covers WKT round trips, `ST_Distance_Sphere` against known city distances (±0.1 %), and a 100 000-point bounding-box query that reads < 1 % of the rows with an `EXPLAIN` showing the spatial index.
+
+- [ ] **P4.3 `[COMPAT]` `FULLTEXT` is a per-row filter: full table scan and a relevance that is always 1** — `[reproduced]` · **Size:** `L` · **Deps:** `P1.15` (index persistence)
+  - **Where:** `src/query/executor.c:4779-4800` (`MATCH_AGAINST` evaluated per row), `:3211` (`ft_score`: term matching without document frequencies); `FULLTEXT KEY` parsed but builds no inverted index.
+  - **Why:** probe `eng.c` on 3 documents: `MATCH(body) AGAINST('database')` returned score `1` for both matching rows (no ranking), `EXPLAIN` shows "Table scan" + "Filter WHERE MATCH_AGAINST(…)"; boolean mode (`+database -embedded`) works. MariaDB "calculates a relevance for each result" in natural-language and boolean modes (mariadb.com/kb/en/full-text-index-overview/). WordPress search plugins and Laravel Scout's database engine sort by relevance; on a 100 000-post table every search is a full scan of the text.
+  - **Do:** an inverted index per `FULLTEXT KEY` (token → posting list of RIDs with term frequency) maintained by `mi_on_insert` / `mi_on_delete` like the other in-memory indexes and written at checkpoint like the B+trees; BM25-style scoring with MySQL's stopword list and `ft_min_word_len` semantics; `IN BOOLEAN MODE` operators over postings; planner uses the index when `MATCH` is in `WHERE`. Rejected: n-gram trigram LIKE acceleration (does not give MySQL's relevance order).
+  - **Done when:** relevance order on a fixed corpus matches MariaDB's order for the top 10 of 20 test queries (corpus + expected lists in `tests/fixtures/`); a 100 000-row search reads < 2 % of the pages (`EXPLAIN ANALYZE`).
+
+- [ ] **P4.4 `[COMPAT]` No binary log: no replication source, no point-in-time recovery, `@@log_bin` / `SHOW MASTER STATUS` fail** — `[reproduced]` · **Size:** `XL` · **Deps:** `P1.17`
+  - **Where:** missing — `src/query/parser.c:5100` rejects `SHOW BINARY LOGS` / `SHOW MASTER STATUS`; `@@log_bin`, `@@server_id`, `@@binlog_format` unknown (`executor.c:2772-2790`); the WAL (`src/tx/wal.c`) is physical (page / row images by RID), not a logical change stream.
+  - **Why:** probe `eng.c`: all three statements error. MariaDB's binary log "contains a record of all changes to the databases" and is used "for replication and point-in-time recovery" (mariadb.com/kb/en/binary-log/). For a local stack the realistic needs are (a) point-in-time restore after a bad migration ("undo the last 10 minutes"), (b) CDC feeds for local dev of Debezium-style consumers, (c) tools that probe `@@log_bin` before dumping [not-verified which ones abort].
+  - **Do:** phase 1 — answer the variables (`log_bin = OFF`, `server_id = 1`) and `SHOW MASTER STATUS` empty, so tools proceed; phase 2 — keep archived WAL segments after checkpoints (opt-in, size-capped) + `RESTORE … TO '2026-11-24 10:00'` replaying from the last `BACKUP TO`; phase 3 — a logical row-event stream (ROW format) over the MySQL replication protocol (`COM_BINLOG_DUMP`). Rejected: statement-based binlog (non-deterministic functions, diverges).
+  - **Done when:** phase 1: the probe statements answer like a MySQL with `log_bin=OFF`; phase 2: `tests/test_backup.c` restores to a timestamp between two transactions exactly.
+
+- [ ] **P4.5 `[COMPAT]` Admin tools see gaps: `information_schema` does not list itself, 9 of its tables are missing, `SHOW STATUS LIKE` fails, `@@sql_mode` is empty** — `[reproduced]` · **Size:** `M` · **Deps:** `none`
+  - **Where:** `src/query/executor.c:6340-6380` (virtual `information_schema` tables), `:2772-2790` (system variables), `src/query/parser.c:5100` (`SHOW` forms).
+  - **Why:** probe `eng.c`: `SELECT table_name FROM information_schema.tables WHERE table_schema = 'information_schema'` → 0 rows (DBeaver / HeidiSQL / Workbench browse that schema [not-verified: tools not installed here]); missing `COLLATION_CHARACTER_SET_APPLICABILITY`, `SCHEMA_PRIVILEGES`, `TABLE_PRIVILEGES`, `COLUMN_PRIVILEGES`, `GLOBAL_STATUS`, `FILES`, `INNODB_TRX`, `KEYWORDS`, `ST_GEOMETRY_COLUMNS`; `SHOW STATUS LIKE 'Threads_connected'` → "Unexpected token: LIKE"; `@@sql_mode` = '' (MySQL 8 default is strict, so apps tested on SegVault can break on MySQL with strict-mode errors and vice versa); `@@max_connections` = 64. phpMyAdmin / Adminer were not run in this review (no PHP copy of them available offline) [not-verified].
+  - **Do:** generate `information_schema` rows for its own tables; add the missing tables (privileges from `src/bridge/auth.c`, `GLOBAL_STATUS` from `db_engine_stats`, `KEYWORDS` from the lexer table); `SHOW [GLOBAL | SESSION] STATUS [LIKE …]`; an honest `sql_mode` (e.g. `STRICT_TRANS_TABLES,NO_ZERO_DATE,…` matching the actual checks) and per-session `SET sql_mode` that toggles the strict / lenient behaviours already implemented; a CI job that runs Adminer and phpMyAdmin's own test pages against `segvault-server` (P3.13).
+  - **Done when:** `tests/test_mysql.c` asserts each listed statement; Adminer 4.8 and phpMyAdmin 5.2 open every page of a sample database without a SQL error (scripted with PHP's built-in client in CI).
+
+- [ ] **P4.6 `[UX]` SQL dump import and export are whole-file in memory: import capped at 256 MB with ≥ 2× the file in RAM, export holds the entire dump; no CLI / `SOURCE` / `LOAD DATA`** — `[code]` · **Size:** `M` · **Deps:** `none`
+  - **Where:** `src/widgets/window.c:4291-4303` (`read_whole_file`: grows a buffer to the whole file and gives up at 256 MB), `:4355-4379` (`run_file`: whole text → `mysql_translate` makes a second full copy → `run_text`); export: `dump_database` (`:4383`) appends every table's `CREATE` and every row as `INSERT` text to one in-memory `SBuf` (`:4391`, rows read with `SELECT * FROM t` materialised per table, `:4410`) and writes the file only at the end; `src/server/main.c` has no import option; the parser has no `LOAD DATA` (grep `LOAD DATA` in `src/query/parser.c`, `src/bridge/db_api.c`: none) and the wire does not advertise `CLIENT_LOCAL_FILES` (`src/server/mysql_wire.h:23-35`).
+  - **Why:** WordPress / WooCommerce / Magento dumps of 0.5–5 GB are routine when moving a site to a local stack; above 256 MB the GUI reports "Cannot read … : <strerror(errno)>" with an unrelated errno, below it peak memory is file × 2 plus results. XAMPP users import with `mysql < dump.sql` or phpMyAdmin (streaming on the server side) — SegVault has neither a client nor `LOAD DATA`.
+  - **Do:** a streaming importer: 1 MB reads, a statement splitter state machine (strings, comments, `/*! */`, `DELIMITER`) shared with `mysql_translate` per statement; worker thread with progress (bytes / total, statements, rows / s), cancel, stop-or-skip on error, resume from byte offset; `.sql.gz` via a small inflate (no zlib dependency) ; `segvault-server --import FILE [--database DB]`; `LOAD DATA [LOCAL] INFILE` with `CLIENT_LOCAL_FILES` on the wire. Rejected: memory-mapping the file (still 2× after translation; 32-bit address limits irrelevant but Windows mapping of > 4 GB files on FAT/USB sticks fails).
+  - **Done when:** a generated 2 GB dump imports with RSS < 150 MB and a progress bar, and the GUI dump of a 2 GB database writes the file with RSS < 150 MB (rows streamed per block, P1.14 single-table streaming already exists); `tests/test_mysql_import.c` checks that the streaming splitter fed one byte at a time yields the same statements as the whole-file splitter.
+
+- [ ] **P4.7 `[PHP]` One PHP for every site: no side-by-side versions, no per-site version, and `get-php.cmd` installs an unverified "latest"** — `[code]` · **Size:** `L` · **Deps:** `P2.16`
+  - **Where:** `src/server/server.h:48-49` (one `php_cgi` or one `php_fcgi` per server), `:17-23` (`SvSite` = name + target only), `src/server/fastcgi.c:452` (silent cap of 36 `-d` overrides per pool), `:714-716` (auto-detection knows `C:\xampp\php` and `C:\UniServerZ\core\php83`, not Laragon), `packaging/windows/get-php.cmd:10-13` (first of 8.5 / 8.4 / 8.3 that downloads, `…-latest.zip`, no SHA-256 check); documented limit `README.md:229-230`.
+  - **Why:** XAMPP ships one PHP per installer (8.3.37, 8.4.28, 8.5.13 are separate downloads, apachefriends.org/download.html); UniServerZ switches 7.0–8.3 globally (SourceForge feature list); Laragon switches globally from "Menu > PHP > Version" and auto-adds the newest PHP (laragon.org/docs/multi-version; release 8.0.0). None documents a per-project version — real projects need it (a legacy WordPress on 8.2/8.3 next to a Laravel 12 app on 8.5; PHP 8.2 security support ends 31 Dec 2026 [not-verified: third-party guide forgekit.tools]).
+  - **Do:** `php/<version>/` directories; one FastCGI pool per installed version, started lazily by the first request that needs it; per-site choice (`site.NAME.php = 8.3` in `server.ini`, a `.php-version` file in the site folder, a dropdown in the GUI); a runtime manager that downloads official builds (windows.php.net zips verified against the SHA-256 in `releases.json`; on Linux, distro `php-cgi` binaries found on `PATH` per version) and refuses unverified files; per-version `php.ini` generated with the usual extensions. Rejected: a single global switch (restart, breaks parallel projects).
+  - **Done when:** two sites on different PHP versions answer concurrently (`tests/test_php.c` with two fake php-cgi binaries reporting their version); a tampered download is rejected.
+
+- [ ] **P4.8 `[PHP]` No Xdebug integration: no toggle, no IDE configuration** — `[code]` · **Size:** `S` · **Deps:** `P4.7`
+  - **Where:** missing (no `xdebug` anywhere in `src/`); pools already pass `-d` options (`src/server/fastcgi.c:452-463`).
+  - **Why:** step debugging is the most requested PHP dev feature; XAMPP, UniServerZ and Laragon document no one-click toggle on the pages read (manual `php.ini` editing) [competitor: not documented].
+  - **Do:** detect the extension next to each PHP version (`php_xdebug*.dll` / `xdebug.so`), per-site toggle that restarts only that site's pool with `-d zend_extension=xdebug -d xdebug.mode=debug -d xdebug.start_with_request=trigger -d xdebug.client_port=9003`; "Copy VS Code launch.json / PhpStorm path mapping" for the site; optional download of the matching DLL (PHP version / NTS / x64) with hash check. Rejected: Xdebug always on (2–3× slower requests [not-verified]).
+  - **Done when:** turning it on for one site leaves other sites' pools untouched (fake php-cgi records its `-d` flags in `tests/test_php.c`); documented in `docs/API.md`.
+
+- [ ] **P4.9 `[UX]` No "Quick App": WordPress / Laravel / Symfony / Drupal must be installed by hand** — `[competitor: laragon.org/docs/quick-app]` · **Size:** `M` · **Deps:** `P4.7`, `P4.21`
+  - **Where:** missing (no scaffolding code in `src/widgets/` or `src/server/`).
+  - **Why:** Laragon's Quick app creates WordPress, Laravel (composer and zip), Symfony, Drupal or a blank project, the database and a pretty URL in one click, with user-defined recipes in `usr/sites.conf` (laragon.org/docs/quick-app); XAMPP and UniServerZ document nothing comparable. SegVault already has the pieces (folder sites on `NAME.localhost`, HTTPS, PHP pools, SQL engine) but not the workflow.
+  - **Do:** recipes in a JSON file (download URL + checksum source, post-steps): WordPress (`latest.tar.gz` + checksum from the official API, `wp-config.php` with a dedicated DB user and random salts), Laravel / Symfony (`composer create-project` when Composer is present, else a verified `composer.phar`), Drupal, blank; create database + user (strong random password), write `.env`, open `https://NAME.localhost`; progress and log in the GUI. Rejected: bundling the applications (package size, stale versions).
+  - **Done when:** a scripted run creates a WordPress site whose install page answers 200 and whose `wp-config.php` connects; the Laravel recipe reaches the welcome page when Composer is available.
+
+- [ ] **P4.10 `[OPS]` Dev servers and workers are not managed: `--site app=5173` proxies to a process the user must start** — `[code]` · **Size:** `M` · **Deps:** `none`
+  - **Where:** `src/server/server.c` named sites with a proxy target (`Site.phost` / `pport`, set up around `:5046-5070`); `README.md:133` (`--site app=5173` → Vite / Next.js); no process supervision besides php-cgi (`src/server/fastcgi.c`).
+  - **Why:** Laravel + Vite projects need `npm run dev`, `php artisan queue:work`, `schedule:work` running next to the site; Laragon manages Node.js, Python, Ruby and Go versions (laragon.org/docs/multi-version). Today SegVault users keep extra terminals open and the proxy shows 502 when they forget.
+  - **Do:** per-site `procs` (command, cwd, env, restart policy, expected port) started / stopped with the site, logs into the existing per-service log view, crash-restart with backoff, children killed with SegVault (Windows Job Objects, POSIX process groups); port auto-assignment + proxy registration. Rejected: bundling Node / Python runtimes (size; users already have nvm / pyenv).
+  - **Done when:** a test supervises a fake dev server: proxy routes to it, a crash is restarted, stop kills the whole process tree (Linux and wine).
+
+- [ ] **P4.11 `[COMPAT]` No Redis-compatible cache / queue** — `[code]` · **Size:** `L` · **Deps:** `none`
+  - **Where:** missing (no RESP server in `src/server/`).
+  - **Why:** Laravel projects commonly configure Redis for cache, sessions and queues (Horizon requires it), WordPress uses Redis object-cache plugins; XAMPP and UniServerZ ship no Redis; Laragon's Redis is not mentioned on the pages read [not-verified].
+  - **Do:** a built-in RESP2 server on 127.0.0.1:6379 (strings with `EX` / `PX`, hashes, lists with `BLPOP` / `BRPOP`, sets, sorted sets basics, `EXPIRE` / `TTL`, `SELECT`, `FLUSHDB`, pub/sub, `INFO`, `MULTI` / `EXEC`), in memory with optional snapshot at shutdown, shown as a service in the panel. Rejected: bundling Redis / Valkey binaries (no official Windows builds; licence changes of recent Redis releases [not-verified]).
+  - **Done when:** phpredis and Predis smoke tests plus Laravel cache / queue tests pass against it in CI.
+
+- [ ] **P4.12 `[NET]` No public sharing (tunnel) for webhooks and phone testing** — `[competitor: laragon.org/docs/quick-share]` · **Size:** `S` · **Deps:** `P4.10`
+  - **Where:** missing.
+  - **Why:** Laragon's Quick share exposes a project through ngrok ("Menu > www > Share", own authtoken, region choice, QR code; laragon.org/docs/quick-share). Payment / OAuth webhooks and mobile testing need a public URL.
+  - **Do:** manage `cloudflared` quick tunnels (no account) or ngrok (authtoken) as supervised processes (P4.10), rewrite the `Host` header to `NAME.localhost`, force a token on the API while shared, optional basic auth, a visible "shared" banner and one-click stop. Rejected: running our own relay service (infrastructure and abuse handling).
+  - **Done when:** "Share site" yields a public URL that serves the site while `/api/v1/*` answers 401 without the token.
+
+- [ ] **P4.13 `[UX]` No migration from XAMPP / Laragon / UniServerZ (sites, virtual hosts, PHP settings, databases)** — `[code]` · **Size:** `L` · **Deps:** `P4.6`, `P3.13`
+  - **Where:** missing; only PHP auto-detection looks at `C:\xampp\php` and `C:\UniServerZ\core\php83` (`src/server/fastcgi.c:714`).
+  - **Why:** the target users already have projects in `htdocs` / `www`, virtual hosts in `httpd-vhosts.conf`, tuned `php.ini`, and data in InnoDB files that SegVault cannot read.
+  - **Do:** detect installations; import site folders (reference, not copy), virtual hosts → `site.NAME` entries, key `php.ini` settings, and databases by starting their `mysqld` / `mariadbd` if needed and pulling a logical dump over the MySQL protocol with a built-in client (reuse the `tests/test_server.c` client code) streamed into the importer of P4.6; a report of unsupported objects (events, spatial columns, full-text indexes, `VIRTUAL` columns). Rejected: reading InnoDB files directly.
+  - **Done when:** against a MariaDB 10.11 with sakila and a WordPress database, the wizard migrates both with equal row counts and the WordPress site loads.
+
+- [ ] **P4.14 `[UX]` Mail catcher below Mailpit: no live updates, no release to a real SMTP server, no checks** — `[code]` · **Size:** `S` · **Deps:** `none`
+  - **Where:** `src/server/mail.c` (SMTP capture, web page with search at `:701`, JSON API); no SSE / WebSocket, relay or retention code in the file (grep).
+  - **Why:** Laragon bundles Mailpit, wired into PHP and the dashboard (laragon.org/docs/mailpit; release 8.0.0); XAMPP ships Mercury (a real MTA, Windows only, apachefriends.org/download.html).
+  - **Do:** a Server-Sent Events stream for new messages (the server already streams SSE for PHP); "release" of a message to a configured SMTP relay (STARTTLS); HTML and link checks done locally; retention by count / size with pruning; raw / headers / HTML / text tabs. Rejected: embedding Mailpit (Go binary, second UI).
+  - **Done when:** `tests/test_mail.c`: an SSE event arrives within 100 ms of the end of `DATA`; release delivers to a local sink.
+
+- [ ] **P4.15 `[UX]` The desktop app is English-only (no Italian), while docs and release notes are Italian** — `[code]` · **Size:** `M` · **Deps:** `none`
+  - **Where:** user-visible strings are literals in `src/widgets/*.c` (e.g. `src/widgets/server_view.c` "Start server", "Copy address", "Open SQL editor"); no language setting in `src/widgets/settings.c` (grep `language` / `locale`: none).
+  - **Why:** the README and every release note are Italian and the users include Italian schools, but menus, dialogs and errors are English. Laragon, XAMPP and UniServerZ localisation was not verified [not-verified].
+  - **Do:** a string table with IDs (`tr(S_SERVER_START)`), Italian and English catalogs compiled in (no gettext dependency, single binary), language from the OS locale with an override in Settings; CI check that draw / status calls receive `tr()` results, plus a pseudo-localised build (+40 % length) to catch truncation in the hand-made layouts.
+  - **Done when:** every visible string comes from the table; the Italian build passes a screenshot walk-through of all panels without truncation.
+
+- [ ] **P4.16 `[UX]` No accessibility layer: screen readers see an empty window** — `[code]` · **Size:** `L` · **Deps:** `P4.15`
+  - **Where:** custom-drawn widgets (`src/widgets/*`, `src/platform/xlib.c`, `src/platform/win32.c`); no UI Automation / MSAA / AT-SPI code (grep `UIAutomation`, `IAccessible`, `at-spi`: none).
+  - **Why:** schools and public bodies must buy accessible software (EU accessibility rules for public procurement [not-verified]); a blind student cannot use the SQL editor or read result grids. Native-control UIs (XAMPP's control panel) get basic accessibility from the OS [not-verified].
+  - **Do:** a Windows UI Automation provider in the platform layer for the main widgets (editor as TextPattern, result grid as GridPattern / TablePattern, buttons as Invoke, tree as ExpandCollapse); AT-SPI2 on Linux later; a keyboard-only audit (focus order, visible focus ring) and a high-contrast theme. Labels come from the P4.15 string table.
+  - **Done when:** NVDA reads editor text, grid cells and buttons; a keyboard-only walk-through script of every panel passes.
+
+- [ ] **P4.17 `[PLATFORM]` No macOS build (XAMPP ships macOS arm64)** — `[code]` · **Size:** `XL` · **Deps:** `P4.18`
+  - **Where:** the GUI platform layer exists only for X11 and Win32 (`Makefile:9-12`, `src/platform/{xlib,win32}.c`); the server code already has `__APPLE__` branches (`src/server/service.c:170,249`, `src/server/tls.c:231,834`) and the Makefile a Darwin linker branch (`Makefile:25-27`), never built in CI (`.github/workflows/ci.yml` uses Ubuntu only); `README.md:229-231` "Nessuna versione nativa per macOS".
+  - **Why:** XAMPP 8.x supports macOS on Apple silicon (apachefriends.org/download.html); a large share of web developers use Macs; UniServerZ and Laragon are Windows-only.
+  - **Do:** phase 1: build and run the engine / server suites on a `macos-14` runner (arm64), ship `segvault-server` for macOS; phase 2: a Cocoa platform layer (NSWindow, CoreText, CGContext) implementing `src/platform/platform.h`, app bundle, notarization (P4.18), `launchd` service. Rejected: requiring XQuartz.
+  - **Done when:** macOS CI green for the engine / server suites; the GUI app runs on arm64 and passes `tests/test_platform.c` equivalents.
+
+- [ ] **P4.18 `[OPS]` Release binaries are unsigned (SmartScreen / antivirus warnings), no SBOM or provenance** — `[code]` · **Size:** `S` · **Deps:** `none`
+  - **Where:** `.github/workflows/release.yml:36-48` (build, `make dist`, upload; no signing step); `dist/SHA256SUMS` only.
+  - **Why:** an unsigned `segvault.exe` downloaded from GitHub triggers "Windows protected your PC" and antivirus heuristics; Laragon 8 binaries and installer are code-signed (github.com/leokhoa/laragon/releases/tag/8.0.0); XAMPP's FAQ deals with antivirus false positives instead (apachefriends.org/faq_windows.html).
+  - **Do:** Authenticode (OV certificate or Azure Trusted Signing) with `osslsigncode` in the Linux release job (MinGW build) and an RFC 3161 timestamp; GitHub artifact attestations (SLSA provenance) and an SPDX SBOM; macOS signing / notarization with P4.17. Rejected: self-signed certificates (no SmartScreen reputation).
+  - **Done when:** `osslsigncode verify` passes on every `.exe` in the release job and the attestation verifies with `gh attestation verify`.
+
+- [ ] **P4.19 `[OPS]` No update mechanism (engine, GUI or PHP runtimes)** — `[code]` · **Size:** `M` · **Deps:** `P4.18`, `P4.7`
+  - **Where:** missing; the binaries contain no outbound URL at all (grep of `src/` finds only XML namespace URIs), which also backs the zero-telemetry claim.
+  - **Why:** local stacks stay on old PHP / OpenSSL for years; Laragon offers auto update to licensed users only (laragon.org/pricing: free tier "No auto update"); XAMPP and UniServerZ document none.
+  - **Do:** opt-in check at start (one GET of an Ed25519-signed manifest, public key in the binary, no identifiers sent), download + verify + atomic swap at next start with automatic rollback if the new binary fails its self-test; same channel for PHP security releases (P4.7); portable mode off by default. Rejected: silent background updates; an updater service running as admin.
+  - **Done when:** tests against a local manifest server: valid update applies, tampered manifest / binary rejected, failed self-test rolls back.
+
+- [ ] **P4.20 `[DOCS]` No licence file: the README says "educational project" while the engine reports `@@license = MIT`** — `[code]` · **Size:** `S` · **Deps:** `none`
+  - **Where:** no `LICENSE` / `COPYING` in the repository root; `README.md:1680-1682` ("Progetto a scopo didattico: puoi studiarlo, farne un fork ed estenderlo"); `@@license = MIT` in `src/query/executor.c:2784` and `src/server/mysql_wire.c:380`; fonts under OFL (`assets/fonts/OFL-*.txt`); PHP downloaded by `packaging/windows/get-php.cmd` (PHP License).
+  - **Why:** without a licence nobody has the legal right to redistribute or use the software commercially; package managers (winget, Chocolatey) and schools' procurement require one; the contradictory signals are worse than either choice.
+  - **Do:** pick the model (permissive MIT / Apache-2.0, or AGPL-3.0 + commercial licence for a paid edition), add `LICENSE` and a `NOTICE` (fonts OFL, OpenSSL Apache-2.0 when bundled, PHP License for downloaded runtimes), make `@@license` and the About box match; CLA or DCO if dual licensing.
+  - **Done when:** `LICENSE` + `NOTICE` exist, `SELECT @@license` and the README agree.
+
+- [ ] **P4.21 `[SECURITY]` Open by default: any local process or OS user logs in as root (MySQL protocol and HTTP API) without a password** — `[code]` · **Size:** `M` · **Deps:** `none`
+  - **Where:** `src/server/server.c:3692` (`open_mode`: no token and no `--users` → "qualunque nome entra come root", comment above); `src/widgets/server_view.c` (`token_required`: only LAN / CORS / explicit option turn the token on).
+  - **Why:** on shared machines (school labs, terminal servers, multi-user Linux) every OS user can read and change every database and call the API; competitors are similar — Laragon's default root password is empty (laragon.org docs), XAMPP points users to a security console (apachefriends.org/faq_windows.html) — so a secure default is a differentiator, not just parity.
+  - **Do:** generate a strong root password at first start (0600 file in the data folder, shown and copyable in the GUI, injected into Quick App configs, P4.9); keep open mode as an explicit choice; on Linux accept the owning OS user without a password over the Unix socket via peer credentials (`SO_PEERCRED`); per-OS-user default data folder.
+  - **Done when:** a fresh data folder refuses anonymous root logins from another OS user; peer authentication covered in `tests/test_server.c`.
+
+- [ ] **P4.22 `[UX]` Port conflicts are diagnosed but not resolved** — `[code]` · **Size:** `S` · **Deps:** `none`
+  - **Where:** busy-port diagnosis (`README.md:156`: "Porta occupata: chi la usa"); `--port 0` = any free port (`src/server/main.c:130`); no automatic fallback in the GUI (`src/widgets/server_view.c`).
+  - **Why:** port 80 / 443 / 3306 / 8080 taken by IIS, Skype, another MySQL service or Docker is the classic first-run failure of local stacks [not-verified as the #1 cause].
+  - **Do:** on bind failure offer "use the next free port" (8485…, 3307…, 1026…), persist it, update dashboard and site URLs and the generated app configs; if the holder is an older SegVault, offer to stop it.
+  - **Done when:** a test holds 8484 and 3306; the GUI flow picks 8485 / 3307, persists them, and sites answer.
+
+- [ ] **P4.23 `[SECURITY]` Zero telemetry is true but not verifiable: no test or published statement proves it** — `[code]` · **Size:** `S` · **Deps:** `P4.19` (the update check must stay opt-in)
+  - **Where:** `src/` contains no outbound URL except XML namespace URIs (`src/widgets/export_bin.c:143-149`, `src/server/service.c:181`); the only outbound connections are user-configured proxy targets (`src/server/proxy.c`) and `get-php.cmd` (`packaging/windows/get-php.cmd:12`); no privacy statement in `README.md`.
+  - **Why:** "no telemetry" is a selling point for schools and companies (GDPR, data-protection officers) only if it can be checked; competitors publish no such guarantee on the pages read [competitor: not documented].
+  - **Do:** a CI job that runs `segvault-server` and the GUI (Xvfb) through the test suites under `strace -f -e trace=connect,sendto` (Linux) and fails on any non-loopback address that the test did not configure; a short privacy statement (what is never sent; what the opt-in update check of P4.19 sends: nothing but the GET); `--offline` switch that disables every outbound feature at once.
+  - **Done when:** the CI job is green and the README states the guarantee with a link to the job.
+
 ---
 
 ## Completed milestones (v1.0 → v1.2.0)
@@ -1576,3 +2207,723 @@ Condensed from the previous roadmap; every item below shipped and is covered by 
 - **Control panel:** services started and stopped individually, per-service log, tray icon, start at login,
   `--install-service`, busy-port diagnosis, portable packages, zero-config PHP.
 - **Extras:** mail catcher (SMTP, MIME, web page, JSON API), CGI programs (Perl, Python, Ruby).
+
+---
+
+## Code review 2026-11-26 — audit tecnico completo (working tree `php-fastcgi` @ `3b66b31` + modifiche non committate)
+
+Riepilogo, 5 priorità e valutazione complessiva: **in cima al file** (sezione "Code review 2026-11-26 — riepilogo").
+Le voci già presenti nella roadmap (P1.14, P1.15, P1.17–P1.20, P2.16, P3.9, P3.12, P4.x) non sono ripetute: dove
+un problema nuovo le tocca, la voce rimanda al loro numero.
+
+Come è stata fatta: warning estesi di GCC 16 (`-Wnull-dereference -Wduplicated-* -Wlogical-op -Wstack-usage=65536
+-Wunused-function -Wmissing-prototypes -Wformat-truncation=2 …`), `gcc -fanalyzer` su ogni file C di `src/`
+(37 segnalazioni, verificate a mano una per una), test e sanitizer su una copia dello scratchpad (dentro
+`systemd-run` con `MemoryMax` / `TasksMax`), lettura del codice. ID delle voci: `CR-C*` critico, `CR-A*` alto,
+`CR-M*` medio, `CR-B*` basso. **[da verificare]** = sospetto non ancora confermato da una prova.
+
+### Critico
+
+- [x] **CR-C1 · I GRANT su nomi con spazi si corrompono al riavvio: un `GRANT SELECT` diventa `ALL PRIVILEGES` su
+  un'altra tabella** — `src/bridge/auth.c:280` (scrittura: `"grant %s %s %s %u\n"` senza escape),
+  `:338` (lettura: `sscanf(line, "grant %63s %63s %79s %u", …)`), `include/common.h:46-53` (`sv_name_ok` ammette lo
+  spazio nei nomi di database e tabelle) · **confermato con una prova**
+  - **Problema:** `users.dat` salva ogni permesso come parole separate da spazi, ma i nomi di database e di
+    tabella possono contenere spazi (`` CREATE TABLE `t 255` `` è accettato). Al caricamento `%s` si ferma al
+    primo spazio e il resto del nome diventa il campo successivo. Prova con `libsegvault.a`:
+    ```
+    GRANT SELECT ON shop.`t 255` TO bob;  GRANT SELECT ON shop.`order items` TO bob;  GRANT SELECT ON `my db`.* TO bob;
+    SHOW GRANTS FOR bob   → i tre GRANT SELECT
+    -- db_shutdown(); db_init()
+    SHOW GRANTS FOR bob   → GRANT ALL PRIVILEGES ON `shop`.`t` TO bob        (gli altri due spariti)
+    ```
+    La riga `grant bob shop t 255 1` viene letta come tabella `t`, privilegi `255` (tutti i bit, `AUTH_ALL` = 0x7F).
+  - **Perché è critico:** è un'escalation di privilegi persistente. Chi può creare una tabella con un nome scelto
+    da lui (`` `orders 127` ``) e ottenere un permesso qualsiasi su di essa (anche solo `SELECT`, concesso da un
+    amministratore ignaro) ha `ALL PRIVILEGES` sulla tabella vera `orders` dopo il primo riavvio del server.
+    In più, ogni permesso su un database o una tabella con uno spazio nel nome sparisce in silenzio al riavvio
+    (utenti che perdono l'accesso dopo un aggiornamento o un riavvio della macchina).
+  - **Correzione:** (1) scrivere i nomi in una forma senza ambiguità (percent-encoding come per `sequences.txt`,
+    oppure campi separati da TAB con escape) e alzare la versione del file; (2) al caricamento rifiutare le righe
+    con campi in più, privilegi fuori da `AUTH_ALL`, o nomi che non rispettano `sv_name_ok`, e segnalare il file
+    come danneggiato invece di applicarle; (3) test di regressione in `tests/test_auth.c` con nomi che contengono
+    spazi, `%`, `*` e cifre finali, verificati dopo un riavvio.
+    ```c
+    static void put_name(FILE* f, const char* s) {          // spazi, '%' e controlli codificati: %20 %25 …
+        for (; *s; s++) {
+            unsigned char c = (unsigned char)*s;
+            if (c <= ' ' || c == '%' || c == 0x7F) fprintf(f, "%%%02X", c); else fputc(c, f);
+        }
+    }
+    // caricamento: sscanf con %n per verificare che la riga sia finita, poi decodifica e controllo dei bit
+    if (sscanf(line, "grant %63s %190s %190s %u%n", a, b, c, &pr, &end) == 4 && line[end] == '\n'
+        && (pr & ~AUTH_ALL) == 0 && name_decode(b) && name_decode(c)) { … }
+    ```
+  - **Corretto (2026-11-26):** `users.dat` scrive i permessi come righe `grantx` con i nomi codificati (`sv_name_encode`, `include/common.h`); le vecchie righe `grant` si leggono solo se hanno esattamente quattro campi e privilegi dentro `AUTH_ALL`, altrimenti vengono scartate con un avviso (mai reinterpretate). Test in `tests/test_auth.c`: GRANT su `` `t 127` ``, `` `50% off` `` e `` `my db`.* `` uguali dopo il riavvio, nessun permesso su `shop.t`, una riga ambigua della 1.5 ignorata.
+
+### Alto
+
+- [x] **CR-A1 · Race sulla cache delle mappe dell'heap tra letture parallele** — `src/table/heap.c:259-281`
+  (`heap_open`), `:202-203` (`meta_from_tail`), `:244-245` (`meta_build`), `:41`, `:47` (`g_heaps`, `g_tails`) ·
+  **confermato con ThreadSanitizer**
+  - **Problema:** `db_execute_readonly` (`src/bridge/db_api.c:2908-2991`) esegue più SELECT insieme con il lock del
+    motore preso **in lettura**. Ogni scansione passa da `heap_open` (`executor.c:5447`, `7677`, `9609`), che
+    cerca la mappa dello spazio libero nella lista globale `g_heaps` e, se manca, la costruisce e la aggancia in
+    testa (`m->next = g_heaps; g_heaps = m;`) senza alcun mutex. Due lettori sulla stessa tabella (o su tabelle
+    diverse) scrivono e leggono la lista insieme. Prova (programma di prova fuori dal repository: 4 tabelle da 3 000
+    righe, `db_shutdown` + `db_init`, 8 thread di `SELECT SUM(v)` con `db_execute_readonly`) → 6 data race
+    di TSan: `heap_open heap.c:269/270/278` contro `meta_from_tail heap.c:202/203` (stesso lock `M0` in lettura).
+    `make test-tsan` non lo vede perché `test_parallel` fa prima gli INSERT nello stesso processo, quindi le
+    mappe esistono già quando partono i lettori.
+  - **Perché è grave:** è un comportamento indefinito nel cuore del motore. In pratica: (1) mappe doppie per
+    la stessa radice; `heap_cache_forget` (`heap.c:91-102`) ne toglie solo la prima, così dopo un TRUNCATE o un
+    DROP resta una mappa vecchia che, se quella pagina torna radice di un'altra tabella, risulta valida per una
+    catena diversa; (2) su CPU a ordinamento debole (Windows ARM, il futuro macOS arm64 di P4.17) un lettore può
+    vedere `g_heaps = m` prima dei campi di `m`; (3) mappe perse (leak). Il nuovo codice P1.15 (`meta_from_tail`,
+    non committato) allarga la finestra: ora la mappa si costruisce anche da una coda nota, quindi in più punti.
+  - **Correzione:** le letture non hanno bisogno della mappa dello spazio libero, che serve solo agli INSERT.
+    Separare le due cose: una `heap_open_scan()` per i lettori che non tocca `g_heaps` e segue solo la catena;
+    la mappa si costruisce soltanto in `heap_insert`, che gira sempre con il lock esclusivo. In alternativa,
+    un `SvRwLock g_heaps_lock` con ricerca in lettura e inserimento in scrittura, ripetendo la ricerca dopo
+    aver preso il lock:
+    ```c
+    sv_rw_rd(&g_heaps_lock);  m = meta_find(bp, root);  sv_rw_rdunlock(&g_heaps_lock);
+    if (!m) {
+        HeapMeta* nm = meta_build_detached(bp, root, num_pages);   // costruita fuori dalla lista
+        sv_rw_wr(&g_heaps_lock);
+        m = meta_find(bp, root);                                   // un altro thread l'ha già messa?
+        if (!m && nm) { nm->next = g_heaps; g_heaps = m = nm; nm = NULL; }
+        sv_rw_wrunlock(&g_heaps_lock);
+        if (nm) meta_free(nm);
+    }
+    ```
+    Test: aggiungere a `test-tsan` il caso "riavvio, poi N lettori in parallelo prima di qualunque scrittura".
+  - **Corretto (2026-11-26):** `g_heaps_lock` (`SvRwLock`) in `heap.c`: ricerca in lettura, costruzione con il lock esclusivo ripetendo la ricerca. La prova TSan (8 tipi di query a freddo) non segnala più nulla; nuovo caso "riavvio + 8 lettori a freddo" in `tests/test_parallel.c` (verde sotto TSan).
+
+- [x] **CR-A2 · Ogni sito ospitato può usare l'API SQL di amministrazione: il controllo `Origin` considera "stessa
+  origine" qualunque `Host` servito** — `src/server/server.c:2501-2512` (`origin_problem`), `:2752-2757`
+  (`route`: l'API risponde su ogni host, anche con PHP), `:2801-2826` (nessuna autenticazione senza token)
+  - **Problema:** `origin_problem` accetta una richiesta del browser se `Origin` è `http(s)://` + l'header `Host`
+    della richiesta stessa. Ma lo stesso processo serve anche i siti e i vhost (`shop.localhost`, `*.test`,
+    cartelle di `www/`), e `route` lascia a SegVault i percorsi `/api/v1/{query,sessions,databases,…}` su
+    **ogni** host (`:2757` toglie al sito solo i percorsi che non sono dell'API). Quindi il JavaScript di una
+    qualunque pagina locale (un plugin WordPress, un bundle npm di un progetto, una XSS in un'app in sviluppo,
+    la pagina di uno studente sul server della classe) può fare
+    `fetch('/api/v1/query', {method:'POST', body:'{"sql":"DROP DATABASE wordpress"}'})`: `Origin` e `Host`
+    coincidono, il controllo passa, e senza `--token` / `--users` (la configurazione predefinita)
+    l'istruzione gira come root su **tutti** i database.
+  - **Perché è grave:** P4.21 copre i processi e gli utenti locali; qui l'attaccante è codice che gira nel browser
+    dentro un'origine che il server stesso considera fidata. Resta aperto anche dopo P4.21 se la password di
+    root protegge solo il protocollo MySQL. Un ambiente di sviluppo esegue per definizione codice di terzi.
+  - **Correzione:** (1) servire l'API solo sull'host di amministrazione (`localhost` / `127.0.0.1` / un nome
+    dedicato come `segvault.localhost`) e rispondere 404 sugli host dei siti; (2) non contare `Origin == Host` come
+    fidato quando quell'host è un sito; (3) chiedere sempre un segreto che le pagine dei siti non possono
+    conoscere: un token per istanza (file `0600`, già presente come `server.token`) in `Authorization`, oppure
+    un cookie `HttpOnly; SameSite=Strict` emesso solo dalla dashboard sull'host di amministrazione.
+    ```c
+    static bool admin_host(const SvServer* s, const Request* rq) {
+        return !rq->site[0] && is_loopback_host(rq->host);   // nessun sito / vhost risolto per questo Host
+    }
+    ...
+    if (api && !admin_host(s, rq) && !bearer) { json_error(rs, 404, "not found"); return; }
+    ```
+    Test in `tests/test_web.c`: richiesta con `Host: shop.localhost` e `Origin: http://shop.localhost` a
+    `/api/v1/query` → 404/401, la stessa da `Host: localhost` con il token → 200.
+  - **Corretto (2026-11-26):** `origin_problem` non considera più fidata la stessa origine sugli host dei siti (`rq->site` valorizzato); sugli host dei siti l'API risponde 403 senza `--token` / `--users` (con credenziali funziona come prima). L'host principale (localhost, `--static`) è invariato. Test in `tests/test_web.c` (POST `/api/v1/query` da `blog.localhost` con e senza `Origin` → 403, da `localhost` → 200).
+
+- [x] **CR-A3 · GUI: backup, restore, lettura e traduzione dei file di import girano sul thread dell'interfaccia** —
+  `src/widgets/window.c:1439` (`db_backup` / `db_restore` chiamati dal gestore della barra), `:4291-4312`
+  (`read_whole_file`, fino a 256 MB), `:4325-4352` (`import_csv`: lettura + `csv_to_sql` di tutto il file),
+  `:4355-4372` (`run_file`: lettura + `mysql_translate` del dump intero), `:4383-…` (`dump_database`: formattazione
+  di tutte le righe in `INSERT` sul thread della UI, dopo `ui_exec`)
+  - **Problema:** solo l'esecuzione degli statement passa da un worker (`ui_exec`, `run_worker`). Il backup e il
+    restore di tutto il database, la lettura di un file da 200 MB, la conversione CSV → SQL e la traduzione di un
+    dump phpMyAdmin girano direttamente nel gestore dell'evento: la finestra non si ridisegna, non risponde e non
+    ha un "Annulla" per secondi o minuti (su Windows dopo 5 s compare "Non risponde"). Il backup prende anche il
+    lock esclusivo del motore per tutta la copia, quindi blocca insieme GUI e siti.
+    (Diverso da P3.9 "GUI thread still takes the engine lock", che riguarda le letture del catalogo, e da P4.6, che
+    riguarda la memoria.)
+  - **Perché è un problema:** è il percorso tipico della classe che importa un dump (segnalazione del
+    2026-11-14): sembra un crash, e chiudere la finestra a metà di un restore è il modo più rapido per
+    ritrovarsi con dati incompleti.
+  - **Correzione:** stesso schema di `ui_exec`, generalizzato: un `ui_job(fn, arg, label)` che esegue `fn` in un
+    thread con avanzamento (`atomic` byte letti / righe scritte) e annullamento, e che a fine lavoro manda un
+    evento alla finestra; backup, restore, import (lettura + traduzione) e dump diventano job. Per i file grandi,
+    lettura a blocchi in streaming invece di `read_whole_file` (vedi P4.6).
+    ```c
+    typedef struct { void (*fn)(void* arg, UiProgress* p); void* arg; UiProgress prog; atomic_int done, cancel; } UiJob;
+    static bool ui_job(AppWindow* app, UiJob* j, const char* label);   // modale come ui_exec, con barra e Annulla
+    ```
+  - **In parte (2026-11-26):** nuovo `ui_call(fn, arg)` in `window.c` (stesso ciclo modale di `ui_exec`): backup e restore, lettura dei file (`ui_read_file`), conversione CSV → SQL e traduzione dei dump MySQL girano in un thread mentre la finestra si ridisegna. **Resta:** `dump_database` formatta ancora le righe sul thread della UI (le SELECT passano già da `ui_exec`); l'avanzamento è il riquadro "Waiting…" generico, senza percentuale.
+  - **Completato (2026-11-26):** anche il dump del database (`dump_job`) ora si costruisce e si scrive nel thread del lavoro; la finestra resta viva e Esc annulla le SELECT del dump.
+
+- [x] **CR-A4 · `LIMIT` / `OFFSET` oltre 2³¹ danno risultati sbagliati in silenzio; `VARCHAR(4294967297)` diventa
+  `varchar(1)`** — `src/query/parser.c:2317`, `:2324`, `:2335`, `:2341`, `:2346` (`atoi` in `int limit/offset`,
+  `parser.h:268-269`), `:3978` / `:3982` (dimensione e scala della colonna con `atoi`) · **confermato con una prova**
+  - **Problema:** i numeri vengono convertiti con `atoi` in un `int`: oltre `INT_MAX` il risultato è indefinito
+    (glibc: `(int)strtol`, quindi troncato a 32 bit). Prova su una tabella con le righe 1…10:
+    `LIMIT 7, 18446744073709551615` → **0 righe** (MySQL: 8, 9, 10); `LIMIT 18446744073709551615 OFFSET 7` → 0 righe;
+    `LIMIT 2147483648` → 0 righe (MySQL: tutte); `LIMIT 4294967298` → 2 righe; `LIMIT 4294967300, 2` → righe 5 e 6
+    (MySQL: nessuna). `CREATE TABLE s (v VARCHAR(4294967297))` va a buon fine e `information_schema` dice
+    `varchar(1)`.
+  - **Perché è grave:** `LIMIT offset, 18446744073709551615` è l'idioma che il manuale di MySQL indica per "dalla
+    riga N alla fine" ed è quello che generano gli ORM per un `OFFSET` senza `LIMIT` (per esempio Doctrine
+    DBAL): la pagina "tutti i risultati dopo i primi N" torna vuota senza alcun errore. La colonna da 1 carattere
+    tronca o rifiuta dati che l'utente crede di poter salvare.
+  - **Correzione:** un helper unico per i letterali interi del parser che usa `strtoull` e controlla l'overflow;
+    `limit` / `offset` a 64 bit, con i valori oltre `INT64_MAX` portati a "illimitato"; dimensioni delle colonne
+    oltre il massimo ammesso → errore come MySQL (1074 "Column length too big").
+    ```c
+    static bool tok_u64(const Token* t, uint64_t* out) {
+        errno = 0; char* end;
+        unsigned long long v = strtoull(t->text, &end, 10);
+        if (errno == ERANGE || *end || t->text[0] == '-') return false;
+        *out = v; return true;
+    }
+    ...
+    uint64_t v; if (!tok_u64(&a, &v)) { parse_fail(ps, "LIMIT value out of range", a); return; }
+    n->select_stmt.limit = v > INT64_MAX ? INT64_MAX : (int64_t)v;
+    ```
+    Test in `tests/test_sql.c` con i sette casi qui sopra (e lo stesso per `UPDATE … LIMIT` / `DELETE … LIMIT`).
+  - **Corretto (2026-11-26):** `row_count()` in `parser.c` (`strtoull`, saturazione a `INT32_MAX`: "senza limite" per LIMIT, "oltre la fine" per OFFSET) per LIMIT / OFFSET / FETCH; dimensioni di colonna oltre `INT32_MAX` → "Column length too big". Test in `tests/test_sql.c` (7 casi).
+
+- [x] **CR-A5 · `db_current_database()` restituisce un puntatore dentro il catalogo dopo aver rilasciato il lock:
+  use-after-free con DDL concorrente** — `src/bridge/db_api.c:3221-3226` e `:2303-2307` (`return db->name`),
+  `src/catalog/schema.c:247` (`grow` → `realloc` dell'array `databases`), `:1170` (`memmove` in `catalog_drop_db`);
+  chiamanti: 16 in `src/widgets/window.c` (per esempio `:114`, `:145`, `:152-156` in `update_session`, `:4384`), 13 in
+  `src/server/server.c`, 1 in `src/widgets/schema_view.c`; simile: `db_session_user()` `:3033` (buffer globale
+  letto senza lock) · **confermato con ThreadSanitizer**
+  - **Problema:** la funzione prende il lock del motore, prende `catalog_current_db(...)->name` e lo restituisce dopo
+    `db_unlock()`. Il nome vive dentro `Catalog.databases`, un array di strutture che `CREATE DATABASE` rialloca e
+    `DROP DATABASE` compatta. Se un altro thread esegue DDL (la GUI ospita nello stesso processo il server HTTP e
+    MySQL, "modalità API server"), il chiamante legge memoria liberata o il nome di un altro database. Prova: un
+    thread ripete `db_current_database()` + `strlen`, un altro alterna `DROP DATABASE` del primo database e
+    `CREATE DATABASE` → TSan segnala 3 race: con `realloc` (`schema.c:205`, l'array vecchio viene liberato), con
+    `memmove` (`schema.c:1170`), con `strncpy` (`schema.c:1158`).
+  - **Perché è grave:** nella GUI il puntatore viene poi usato per decidere su quale database lavorare
+    (`update_session` → `schema_view_show_db(app->schema, db, …)`, `dump_database` → `snprintf(dbname, …, db)`):
+    nel caso migliore un crash, nel peggiore un'azione (dump, Designer, `USE`) sul database sbagliato.
+  - **Correzione:** l'API non deve mai restituire memoria del motore oltre il lock. Copia nel buffer del chiamante:
+    ```c
+    // db_api.h
+    bool db_current_database_copy(char* out, size_t n);   // false se nessun database
+    // db_api.c
+    bool db_current_database_copy(char* out, size_t n) {
+        db_lock();
+        const char* r = db_current_database_impl();
+        bool ok = r && snprintf(out, n, "%s", r) < (int)n;
+        db_unlock();
+        if (!ok && n) out[0] = '\0';
+        return ok;
+    }
+    ```
+    e sostituire le 30 chiamate; lo stesso per `db_session_user()`. Test: la prova qui sopra in `make test-tsan`.
+  - **Corretto (2026-11-26):** `db_current_database()` copia il nome sotto il lock in quattro buffer del thread a rotazione (stessa firma, nessun chiamante da cambiare); `db_session_user()` copia sotto il lock. Test TSan in `tests/test_sessions.c` (lettore + DDL concorrente).
+
+- [x] **CR-A6 · Una `REGEXP` con backtracking esponenziale bloccava il server per minuti (e rispondeva "nessuna
+  corrispondenza")** — `src/query/regex.c` (`MAX_STEPS` 2·10⁶ per ricerca, poi `false`), `src/query/executor.c`
+  (`REGEXP_LIKE` / `REPLACE` / `SUBSTR` / `INSTR` / `COUNT`) · trovato da questa revisione (il fuzzer `regex` faceva solo
+  4 600 input al minuto) e **confermato con una prova**
+  - **Problema:** il limite di passi valeva per ogni singola ricerca: `SELECT COUNT(*) FROM t WHERE s REGEXP '(a*)*b'`
+    su 2 000 righe da 30 caratteri impiegava **38 s** (20 ms × riga), con il lock del motore preso, quindi con tutto
+    il server fermo (P1.17); su 100 000 righe circa mezz'ora. Ogni utente SQL poteva farlo. E il risultato era
+    sbagliato senza avviso: al limite la ricerca diceva "nessuna corrispondenza".
+  - **Corretto (2026-11-26):** al limite di passi lo statement fallisce con "Regular expression too expensive for this
+    value (backtracking limit)" (come `ER_REGEXP_TIME_OUT` di MySQL) e le scansioni si fermano subito
+    (`sv_scan_abort()` in `heap.c`, azzerato a ogni statement); il matcher controlla anche `KILL QUERY` / il timeout
+    ogni 8 192 passi. Prova: 38 s → 21 ms. Test in `tests/test_sql.c` (1 000 righe, errore in meno di 2 s, le
+    scansioni successive funzionano).
+
+### Medio
+
+- [x] **CR-M1 · Il motore ha bisogno di più di 1 MB di stack per 14 sottoquery annidate: crash prima del limite di
+  profondità** — `src/query/executor.c:7215` (`char names[SV_MAX_COLUMNS][64]` = 64 KB in `plan_prepare_ex`,
+  ricorsiva, frame 71 KB), `:13488-13527` (`exec_returning`: `char names[SV_MAX_COLUMNS][128]` + altri array =
+  frame da **168 KB**), `:2214`, `:10335`, `:11568`, `:12923` (altri array da `SV_MAX_COLUMNS` sullo stack);
+  `src/bridge/db_api.h` (nessun requisito di stack documentato) · **confermato con una prova**
+  - **Problema:** con P1.11 `SV_MAX_COLUMNS` è passato da 64 a 1024 e gli array locali dimensionati su di lui sono
+    cresciuti 16 volte. `-Wstack-usage=65536` ne segnala 15 sopra i 64 KB. Prova: `SELECT a FROM v1 WHERE a IN
+    (SELECT … IN (…))` con N livelli, eseguita in un thread con stack di dimensione fissata: con 8 MB il motore
+    rifiuta da solo oltre ~14 livelli ("nested too deeply"); con **1 MB, a 14 livelli il processo va in crash**
+    (stack overflow, core dump); con 2 MB passa.
+  - **Perché è un problema:** server (`SV_THREAD_STACK` 8 MB) e GUI (worker da 16 MB) sono al sicuro, ma
+    `libsegvault.a` è presentata "come SQLite" da incorporare: chi chiama `db_execute` da un thread con lo stack
+    predefinito (1 MB su Windows, 512 KB sui thread secondari di macOS, 128 KB con musl) va in crash con una
+    query lecita. Lo stesso vale per il ripiego di `ui_exec` sul thread principale (`window.c:919-924`) e per il
+    thread principale di Windows (1 MB, nessun `-Wl,--stack` nel Makefile).
+  - **Correzione:** (1) togliere dallo stack gli array da `SV_MAX_COLUMNS` (allocazione dinamica dimensionata su
+    `ts->num_columns`, o un'arena per statement); (2) aggiungere un controllo dello stack rimasto all'ingresso delle
+    funzioni ricorsive (`plan_prepare_ex`, `eval_expr`, `query_exec_inner`): base dello stack salvata per thread
+    in `db_execute`, errore "query too complex" sotto una soglia, invece del crash; (3) documentare in `db_api.h`
+    lo stack minimo; (4) un test CI che rifà la prova su un thread da 1 MB.
+    ```c
+    static _Thread_local char* t_stack_base;              // impostata all'ingresso di db_execute
+    static bool stack_low(void) { char here; return t_stack_base && (size_t)(t_stack_base - &here) > g_stack_budget; }
+    ...
+    if (stack_low()) { snprintf(err, errn, "Query is too complex for this thread's stack"); return NULL; }
+    ```
+  - **Corretto (2026-11-26):** i nomi di `NATURAL` / `USING` in `plan_prepare_ex` sono puntatori (8 KB invece di 64 KB); gli array per colonna di `exec_returning` stanno in un blocco nell'heap (il frame da 168 KB non c'è più). Con 1 MB e 512 KB di stack il motore arriva al suo limite e rifiuta la query pulito; con 256 KB no: requisito minimo di 512 KB scritto in `db_api.h`. Non aggiunto: il controllo dello stack rimasto a runtime.
+
+- [~] **CR-M2 · Le funzioni SQL vengono cercate per nome a ogni riga: catene di 230 `strcmp`** —
+  `src/query/executor.c:4766-4776` (`eval_func` → `eval_internal` `:2812` → `eval_sequence` → `eval_more` `:4424`
+  → `eval_mysql` `:3644`)
+  - **Problema:** l'AST tiene il nome della funzione come testo (`ASTExpr.func[32]`, `parser.h:106`); il binder lo
+    cerca una volta in `find_func` (`:2513`) per controllare l'arità, ma la valutazione rifà la ricerca a ogni
+    chiamata e per ogni riga, scorrendo funzioni di centinaia di righe fatte di `if (!strcmp(f, "…"))`:
+    91 confronti in `eval_more`, 146 in `eval_mysql`, 223 nel file. Una funzione che sta in fondo alla catena
+    (o una funzione definita dall'utente che non c'è) costa centinaia di `strcmp` per riga. Le stesse catene
+    sono anche il punto più difficile da mantenere del file (`eval_mysql` = 688 righe, la funzione più lunga del
+    progetto).
+  - **Perché è un problema:** costo per riga nel percorso caldo di ogni SELECT con espressioni, e una struttura
+    in cui aggiungere una funzione vuol dire indovinare in quale delle quattro catene metterla.
+  - **Correzione:** risolvere la funzione una volta sola nel binder e salvare nell'AST un identificatore
+    (`e->fid`, enum generato dalla tabella `FuncDef`) o direttamente un puntatore a funzione; valutare con uno
+    `switch (e->fid)` oppure con `fd->eval(e, c, out)`. Le catene diventano una tabella:
+    ```c
+    typedef void (*FuncEval)(ASTExpr*, EvalCtx*, EvalVal*);
+    typedef struct { const char* name; int min_args, max_args; FuncEval eval; } FuncDef;
+    static const FuncDef FUNCS[] = { {"UPPER", 1, 1, fn_upper}, {"CONCAT", 1, -1, fn_concat}, … };
+    // bind:  e->fdef = find_func(e->func);      eval:  e->fdef->eval(e, c, out);
+    ```
+  - **In parte (2026-11-26):** `FIS("NOME")` al posto di `!strcmp(f, "NOME")` in `eval_internal` / `eval_sequence` / `eval_more` / `eval_mysql` / `eval_func` / `eval_agg_extra` (266 confronti: prima la lunghezza costante e il primo carattere, poi `memcmp`) e l'appartenenza all'elenco `MINE` di `eval_mysql` memorizzata nel nodo (`ASTExpr.fmine`: prima 115 `strcmp` per riga per ogni funzione fuori elenco). Misura su 200 000 righe: `ABS(n)` 101 → 20 ms, `UPPER(s)` 99 → 25 ms, `JSON_VALID` 99 → 16 ms, `COALESCE` 85 → 18 ms. **Resta:** la tabella `FuncDef` con puntatori a funzione (le catene esistono ancora, ma costano poco). La regex non si ricompila più a ogni riga (CR-B9).
+
+- [x] **CR-M3 · Protocollo MySQL: `COM_STMT_SEND_LONG_DATA` accumula senza limite** — `src/server/server.c:4237-4252`
+  (`my_long_data`), `:4114` (`MAX_STMTS` 4096)
+  - **Problema:** ogni pacchetto è limitato (`max_body`, 16 MB), ma i pezzi di un parametro si concatenano con
+    `realloc(d->p, d->n + add + 1)` senza un totale massimo, finché non arriva un `EXECUTE`. Un client autenticato
+    (in modalità aperta qualunque processo locale, P4.21) manda pacchetti da 16 MB all'infinito per un parametro, o
+    per 65 535 parametri di 4 096 statement, e il server cresce fino a esaurire la RAM; con la politica "OOM =
+    abort" del motore (`include/sv_alloc.h`) o con l'OOM killer di Linux cade tutto il processo (siti, MySQL, GUI).
+  - **Correzione:** un tetto come `max_long_data_size` / `max_allowed_packet` di MySQL (per parametro e per
+    connessione) e un errore `ER_NET_PACKET_TOO_LARGE` (1153) al superamento; liberare i dati dello statement
+    quando lo si chiude o resetta (`COM_STMT_RESET`).
+    ```c
+    if (d->n + add > s->cfg.max_body) { d->too_long = true; return; }   // l'EXECUTE successivo risponde 1153
+    ```
+  - **Corretto (2026-11-26):** totale dei dati lunghi per statement limitato a `max_body` (come `max_allowed_packet`): oltre, i dati si scartano e il prossimo EXECUTE risponde 1153.
+
+- [x] **CR-M4 · Editor SQL: ogni passo di annulla copia tutto il testo (fino a 4 GB) e i fallimenti di `malloc`
+  diventano crash** — `src/widgets/textbox.c:171-205` (`snapshot_take`, `stack_push`, `undo_push`), `:207-212`
+  (`restore_snapshot`), `:66-70` (`rebuild_lines`), `src/widgets/textbox.h:26` (`TEXTBOX_UNDO_CAP 256`),
+  `src/widgets/window.c:450` (file fino a 16 MB nell'editor)
+  - **Problema:** l'annulla salva un'istantanea completa del testo a ogni modifica non accorpata: con un dump da
+    16 MB aperto nell'editor, 256 passi = **4 GB** di RAM, e ogni tasto premuto dopo una pausa di 1,5 s copia
+    16 MB sul thread della UI. Inoltre `snapshot_take` lascia `s.text = NULL` se `malloc` fallisce e
+    `restore_snapshot` fa poi `strlen(NULL)`; `rebuild_lines` e `restore_snapshot` usano `p = realloc(p, …)`
+    senza controllo (crash e perdita del buffer vecchio).
+  - **Correzione:** annulla per differenze (posizione, testo tolto, testo inserito: memoria proporzionale alle
+    modifiche) oppure un budget in byte per la pila oltre al numero di passi; controllare ogni allocazione
+    (un'istantanea mancata = passo non registrato, non un crash).
+    ```c
+    typedef struct { int pos; char* removed; int nrem; char* inserted; int nins; int cursor, anchor; } EditOp;
+    ```
+  - **Corretto (2026-11-26):** **Correzione della diagnosi:** l'editor tronca il testo a `TEXTBOX_MAX_LEN` = 64 KB, quindi il caso peggiore dell'annulla è 256 × 64 KB per pila (circa 32 MB in tutto), non 4 GB; i 16 MB di `window.c:450` sono il file delle query salvate. Corretti i crash: un'istantanea non riuscita non entra nella pila, `restore_snapshot` e `rebuild_lines` controllano `realloc`.
+
+- [ ] **CR-M5 · Il motore è un singleton di processo: circa 100 variabili globali, nessun handle nell'API** —
+  `src/bridge/db_api.c:59-107` (`g_db_rw`, `g_db`, sessioni, `g_open_tx` …: 37 globali `g_*`, 6 thread-local),
+  `src/query/executor.c` (43 globali, 27 `_Thread_local`: `g_uvars` `:2665`, `g_cap`, `g_ij*` `:1855-1861`,
+  `g_mem_indexes`, `g_describe`, `g_infoschema`…), `src/table/heap.c:41-49`, `src/tx/wal.c`, `src/bridge/auth.c`,
+  `src/bridge/locks.c:80-88`; API: `db_init(const char* dir)` / `db_execute(const char* sql)` in `db_api.h`
+  - **Problema:** tutto lo stato del motore vive in variabili statiche di file; l'API pubblica non ha un oggetto
+    `Db*`. Le regole di concorrenza sono scritte solo nei commenti ("Protezione: … sotto db_lock", "chiamata con
+    g_mi_lock in scrittura") e ogni modulo le applica a mano: CR-A1 nasce proprio da una lista globale
+    (`g_heaps`) che nessun lock possedeva, toccata da un percorso (le letture parallele) arrivato dopo. Le 27
+    variabili `_Thread_local` dell'executor sono parametri impliciti passati tra funzioni (`g_describe`,
+    `g_see_db`, `g_cap`…), quindi il comportamento di una funzione dipende da chi l'ha chiamata prima sullo
+    stesso thread.
+  - **Perché è un problema:** `libsegvault.a` ("come SQLite") non può aprire due database nello stesso processo;
+    i test devono girare in processi separati e con cartelle fisse in `/tmp` (`test_parallel.c:125`); ogni
+    nuova funzione concorrente richiede di ricontrollare a mano l'intero insieme di globali.
+  - **Correzione (graduale):** (1) raccogliere lo stato in strutture esplicite (`SvEngine { Catalog*, BufferPool*,
+    WAL*, HeapCache, MemIndexCache, LockTable … }`) con il lock che protegge ogni campo scritto accanto;
+    (2) un `SvEngine*` passato all'executor dentro `ExecCtx` invece dei `_Thread_local`; (3) API con handle
+    (`SvDb* sv_open(path)`, `sv_exec(SvDb*, sql)`), lasciando `db_*` come wrapper sul database predefinito;
+    (4) annotazioni di thread-safety (`__attribute__((capability))` con clang `-Wthread-safety`) sui wrapper di
+    mutex di `platform_lock.h`, così il compilatore segnala un campo letto senza il suo lock.
+
+- [ ] **CR-M6 · File e funzioni "god object": un sesto del codice in `executor.c`, la finestra in un'unica struttura
+  da 116 campi** — `src/query/executor.c` (13 660 righe, 685 KB), `src/widgets/window.c` (6 255 righe) +
+  `window.h:83-243` (`AppWindow`), `src/server/server.c` (5 490 righe), `src/query/parser.c` (5 464),
+  `src/bridge/db_api.c` (3 462)
+  - **Problema:** `executor.c` contiene valutazione delle espressioni, binder, planner e riordino dei join,
+    DML, DDL, `ALTER TABLE`, trigger, interprete delle routine, `information_schema`, `SHOW`, JSON, sequenze e
+    il diario degli indici; `server.c` contiene HTTP/1.1, API JSON, login e throttling, sessioni, dashboard,
+    metriche, siti PHP e tutto il server MySQL; `window.c` gestisce editor, risultati, albero, transazioni,
+    impostazioni, import/export, cronologia, ricerca e sostituzione, sincronizzazione del Designer. 17 funzioni
+    superano le 200 righe (e le righe sono dense, spesso con più istruzioni ciascuna): `eval_mysql` 688
+    (`executor.c:3644`), `parse_statement` 508 (`parser.c:4740`), `eval_more` 341, `backup_thread` 337
+    (`server/main.c:102`), `arm_exec` 320, `ctx_run` 313 (`window.c:3518`), `parse_special_form` 303,
+    `lexer_tokenize` 299, `schema_view_event` 296, `app_window_handle_event` 272, `infoschema_open` 265 (annidamento
+    8). I 23 `-Wredundant-decls` (prototipi ripetuti a metà file, per esempio `executor.c:12906-12907`,
+    `:13328`) sono il sintomo: il file è troppo lungo per essere ordinato.
+  - **Perché è un problema:** revisione e test mirati impossibili (P3.9 è aperto da due settimane proprio perché
+    questi file "non sono stati letti riga per riga"); ogni modifica ricompila 685 KB; conflitti di merge
+    garantiti; nessun confine che impedisca, per esempio, a un pezzo dell'interprete delle routine di usare lo
+    stato del planner.
+  - **Correzione:** dividere per responsabilità, mantenendo `static` dentro ogni nuovo modulo: `query/eval*.c`
+    (funzioni per famiglia, vedi CR-M2), `query/plan.c`, `query/join.c`, `query/dml.c`, `query/ddl.c`,
+    `query/routine.c`, `query/infoschema.c`; `server/http.c`, `server/api.c`, `server/mysql_server.c`,
+    `server/sessions.c`, `server/login_throttle.c`; per la GUI un "controller" per pannello (editor, risultati,
+    albero, impostazioni) e un `AppState` senza widget dentro. Obiettivo misurabile: nessun file sopra le 3 000
+    righe, nessuna funzione sopra le 150 (un controllo in CI con lo script che ha prodotto questi numeri).
+
+- [x] **CR-M7 · `read_whole_file` scambia un errore di lettura per la fine del file: import troncati in silenzio** —
+  `src/widgets/window.c:4304-4306`, messaggi a `:4330-4333` e `:4358-4360`
+  - **Problema:** il ciclo termina su `fread(...) == 0` senza guardare `ferror(f)`: un errore di I/O a metà file
+    (chiavetta estratta, share di rete, settore illeggibile) restituisce i byte letti fin lì come se fossero il
+    file intero, e `run_file` / `import_csv` eseguono un import parziale con esito "OK". Quando invece si supera il
+    limite di 256 MB, la funzione restituisce `NULL` senza impostare `errno` e il messaggio diventa
+    "Cannot read …: Success".
+  - **Correzione:**
+    ```c
+    if (got == 0) { if (ferror(f)) { free(buf); buf = NULL; errno = EIO; } break; }
+    ...
+    if (cap >= ((size_t)256 << 20)) { free(buf); buf = NULL; errno = EFBIG; break; }
+    ```
+  - **Corretto (2026-11-26):** `ferror` controllato (un errore di lettura non è più un file corto) ed `errno` impostato (`EIO`, `EFBIG`).
+
+- [x] **CR-M8 · Windows: eseguibili e DLL cercati in cartelle che qualunque utente locale può creare** **[da verificare]**
+  (solo Windows: letto, non eseguito)
+  — `src/server/fastcgi.c:714` (`C:\php\php-cgi.exe`, `C:\xampp\php\php-cgi.exe`, `C:\UniServerZ\…`),
+  `src/server/cgi.c:216` (`C:\Strawberry\perl\bin\`, `C:\xampp\perl\bin\`, `C:\Perl64\bin\`, `C:\Ruby33-x64\bin\`),
+  `src/server/tls.c:31` + `:226-227` (`LoadLibraryA("libssl-3-x64.dll")` per nome semplice come ultimo tentativo)
+  - **Problema:** su Windows gli utenti autenticati possono creare cartelle nella radice di `C:` (ACL predefinita).
+    Se SegVault non trova PHP accanto a sé né nel `PATH`, prova `C:\php\php-cgi.exe` e simili: chi crea per primo
+    quella cartella sceglie il programma che SegVault eseguirà con l'account di chi lo avvia. Lo stesso vale per gli
+    interpreti CGI e, con `LoadLibraryA` per nome, per una `libssl-3-x64.dll` messa nella cartella corrente o in una
+    voce del `PATH` scrivibile (ricerca standard delle DLL). P2.10 ha già tolto la cartella corrente dalla ricerca
+    di `php-cgi`; questi percorsi "noti" riaprono lo stesso problema.
+  - **Perché è un problema:** il pubblico dichiarato sono i laboratori scolastici (PC condivisi): uno studente prepara
+    `C:\php\php-cgi.exe` e il codice gira con l'account del compagno o del docente che avvia SegVault dopo di lui.
+  - **Correzione:** usare i percorsi "noti" solo se la cartella appartiene a un amministratore o a SYSTEM (non
+    scrivibile dall'utente corrente: `GetNamedSecurityInfo` + controllo del proprietario), oppure eliminarli e
+    chiedere il percorso nella GUI; caricare OpenSSL solo per percorso completo con
+    `LoadLibraryExA(path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)` e chiamare
+    `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)` all'avvio di `segvault.exe` / `segvault-server.exe`.
+  - **Corretto (2026-11-26):** `sv_win_trusted_path()` in `win_acl.c`: proprietario del file e di ogni cartella del percorso fra Amministratori, SYSTEM, TrustedInstaller o l'utente corrente. Applicato a `php-cgi` (PATH e percorsi noti), agli interpreti CGI (`SearchPathA` compreso) e a OpenSSL, che ora si carica solo per percorso completo (`LoadLibraryExA` con `LOAD_WITH_ALTERED_SEARCH_PATH`, cartelle del PATH controllate). Compilato con MinGW senza warning; **da provare su Windows vero**.
+
+- [x] **CR-M9 · Test: tanti e utili per il motore, ma con percorsi fissi in `/tmp`, un'infrastruttura copiata 21 volte
+  e nessun test della finestra principale** — `tests/*.c` (38 percorsi `"/tmp/…"` fissi in 23 file, per esempio
+  `tests/test_parallel.c:125` `rm -rf /tmp/sv_par_test`; `mkdtemp` solo in `test_web.c:238`, `test_mysql.c:50`,
+  `test_tls.c:83`), macro `CHECK` ridefinita in 21 file, nessun test collega `src/widgets/window.c`
+  - **Situazione:** 26 suite e circa 4 000 controlli, tutti verdi su questo albero (`make test` e `make test-asan`
+    rieseguiti per questa revisione), più fault injection per la durabilità, TSan, fuzzing e CI con MinGW + wine:
+    sopra la media per un progetto di questa dimensione. I buchi sono nell'organizzazione:
+    1. **percorsi fissi in `/tmp` con `rm -rf` iniziale:** due esecuzioni insieme (due checkout, `make -j`, CI
+       condivisa) si cancellano i dati a vicenda; su una macchina multiutente un altro utente può creare prima
+       `/tmp/sv_par_test` (o un link simbolico con quel nome) e far fallire o deviare il test;
+    2. **infrastruttura duplicata:** ogni file ha i suoi `CHECK`, `run()`, la sua preparazione della cartella e il suo
+       riepilogo; non c'è un modo comune per eseguire un solo caso o per avere un output leggibile da una macchina;
+    3. **le classi di bug trovate qui non hanno test:** riavvio + lettori paralleli a freddo (CR-A1), API del motore
+       usata mentre un altro thread fa DDL (CR-A5), permessi rivisti dopo un riavvio con nomi "strani" (CR-C1), limiti
+       numerici del parser (CR-A4), stack piccolo (CR-M1);
+    4. **la GUI è testata solo nei moduli estratti** (`grid_edit`, `table_design`, `schema_model`, `db_tools`,
+       `platform`): `window.c`, cioè la logica di stato (transazione, database corrente, job), non ha test (vedi CR-M6).
+  - **Correzione:** un `tests/harness.h` unico (`CHECK`, `CHECK_EQ_STR`, cartella temporanea con `mkdtemp`
+    cancellata a fine test, filtro per nome del caso, riepilogo TAP); convertire i 23 file un po' alla volta;
+    aggiungere i casi di regressione delle voci CR-*; estrarre da `window.c` un `AppState` senza widget (CR-M6) per
+    testarne le transizioni senza X11.
+    ```c
+    // tests/harness.h
+    static char g_tmp[256];
+    static const char* test_tmpdir(void) {
+        if (!g_tmp[0]) { snprintf(g_tmp, sizeof g_tmp, "%s/svtest-XXXXXX", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+                         if (!mkdtemp(g_tmp)) abort(); }
+        return g_tmp;
+    }
+    ```
+
+  - **Corretto (2026-11-27), punti 1-3:** `tests/harness.h` comune (`CHECK`, `test_enter_tmpdir`, `test_src`,
+    `test_summary`). Ogni suite entra all'avvio in una cartella privata creata con `mkdtemp` (0700, in `$TMPDIR` o
+    `/tmp`) e cancellata all'uscita (`SV_TEST_KEEP=1` la conserva; i processi figli non cancellano nulla): i 38
+    percorsi fissi `/tmp/sv_*` sono diventati relativi, quindi due esecuzioni insieme non si toccano e nessuno può
+    preparare prima la cartella o un link con quel nome. La macro `CHECK` duplicata è sparita da 20 file (`test_sql`,
+    `test_btree`, `test_engine`, `test_examples`, `test_decimal` hanno contatori propri e usano solo la cartella;
+    `test_win` resta com'era, gira con MinGW). I file del repository (esempi, fixture 1.3.0) si leggono con
+    `test_src`. Regressioni delle voci CR-*: C1 (`test_auth`), A1 (`test_parallel`, lettori a freddo), A4
+    (`test_sql`), A5 (`test_sessions`) c'erano già; aggiunto CR-M1 in `test_parallel` (sottoquery annidate da 1 a
+    30 livelli su un thread con 512 KB di stack; provato che con 128 KB il test va in crash). Dopo `make test` non
+    resta nessuna cartella né nel repository né in `/tmp`.
+  - **Resta (con CR-M6):** il punto 4, test della logica di `window.c`, richiede prima l'estrazione di un `AppState`
+    senza widget.
+- [x] **CR-M10 · Le transazioni abbandonate delle sessioni HTTP scadono solo quando arriva un'altra richiesta
+  all'API: fino ad allora tengono i lock (anche quello globale `*`)** — `src/server/server.c:96-97`
+  (`SESSION_IDLE_MS`, `TX_IDLE_MS` "una transazione ferma si annulla (non blocca gli altri)"), `:806-817`
+  (`expire_sessions`), chiamata solo da `:833` (nuova sessione), `:990` e `:1009` (una query HTTP); il ciclo del
+  server `:5243-5254` fa ogni 200 ms `db_sync_tick` e `audit_sync_tick`, ma non la scadenza delle sessioni
+  - **Problema:** un client dell'API apre una sessione, fa `BEGIN` e un `UPDATE` (lock X sulla tabella, lock S
+    globale `*` tenuto fino al COMMIT, `db_api.c:1479-1491`) e poi sparisce (crash, rete, script interrotto).
+    Il commento promette l'annullamento dopo 30 s, ma la scadenza la fa solo la prossima richiesta all'API HTTP. Se
+    il resto del traffico passa dal protocollo MySQL (il caso di un sito PHP), nessuno la fa partire: ogni scrittura
+    su quella tabella fallisce con 1205 dopo l'attesa del lock, e ogni DDL (che chiede `*` in modo X) aspetta per
+    sempre, finché qualcuno non chiama l'API o non si riavvia il server.
+  - **Correzione:** chiamare `expire_sessions` dal ciclo periodico del server, con `exec_mx` preso come negli altri
+    punti, e aggiungere un test che apre una transazione via API, aspetta `TX_IDLE_MS` e verifica che un client
+    MySQL possa scrivere sulla tabella senza mandare richieste HTTP.
+    ```c
+    db_sync_tick();
+    audit_sync_tick(s);
+    if (now_ms() - s->last_expire_ms > 1000) {          // al massimo una volta al secondo
+        s->last_expire_ms = now_ms();
+        exec_begin(s); expire_sessions(s); exec_end(s);
+    }
+    ```
+  - **Corretto (2026-11-26):** thread `reaper_main` in `server.c` che ogni secondo chiama `expire_sessions` (con `exec_mx`), avviato da `sv_server_start` e atteso da `sv_server_free`. Nessun test automatico (richiederebbe 30 s di attesa).
+
+- [ ] **CR-M11 · Confine GUI ↔ logica: un terzo di `src/widgets/` non è interfaccia, e GUI e motore parlano solo
+  costruendo testo SQL** — `src/widgets/{csv_import,mysql_import,result_export,export_bin,png_write,sql_text,
+  table_design,db_tools,grid_edit}.c` (circa 2 700 righe senza alcun riferimento a `platform.h` / `widget.h`),
+  `Makefile:63` e `:101` (`segvault-server` compila `src/widgets/png_write.c` e `src/widgets/sql_text.c`),
+  `src/widgets/window.c:4383-…` (`dump_database`: generazione del dump dentro la finestra), `src/widgets/sql_quote.h`
+  (nuovo, non tracciato: quoting degli identificatori lato GUI)
+  - **Problema:** import CSV e MySQL, export, generazione di DDL (`table_design.c`) e di `UPDATE`
+    (`grid_edit.c`), suddivisione degli script (`sql_text.c`) sono logica applicativa senza interfaccia, ma stanno
+    nella cartella dei widget; il server li compila da lì. Il dump del database (ordine di tabelle, dati, chiavi
+    esterne, viste, trigger) è scritto in `window.c` e quindi non è disponibile né all'API né alla CLI. Inoltre
+    la GUI comanda il motore componendo testo SQL (`USE …`, `GRANT …`, `ALTER TABLE …`): ogni nome passa da
+    `sql_ident`, e la injection di identificatori corretta il 2026-11-24 (P3.11) è nata esattamente da questo
+    accoppiamento a stringhe.
+  - **Perché è un problema:** la struttura delle cartelle non dice più chi dipende da chi; la logica utile al
+    server resta legata alla GUI; il codice testabile senza display è mescolato a quello che non lo è (CR-M9).
+  - **Correzione:** spostare questi moduli in `src/app/` (o `src/services/`) senza dipendenze da `platform` /
+    `widgets`, con test propri; portare `dump_database` lì come `sv_dump_database(db, writer)` riusato da GUI, API
+    (`GET /api/v1/databases/x/dump`) e CLI; per le operazioni amministrative più usate dalla GUI (USE, GRANT,
+    REVOKE, DROP) aggiungere funzioni tipizzate in `db_api.h` (`db_use(const char* db)`, `db_grant(...)`) invece di costruire
+    testo SQL (la vecchia `db_use` inutilizzata è stata rimossa con CR-B1).
+
+- [x] **CR-M12 · `UPPER` / `LOWER`, `LIKE` e le collation `_ci` ignoravano le lettere non ASCII** —
+  `src/query/executor.c` (`ci_cmp`, `ci_fold`, `UPPER`/`LOWER`, `like_match_esc`, hash di GROUP BY / JOIN, chiavi degli
+  indici `_ci`) · **confermato con una prova**
+  - **Problema:** tutto passava da `toupper` / `tolower`: `UPPER('Città')` = `CITTà`; in una tabella `utf8mb4_unicode_ci`
+    `'CITTÀ' = 'città'` era falso (e un `UNIQUE` lasciava entrare entrambe); in `LIKE` il carattere `_` valeva un byte,
+    quindi `'à' LIKE '_'` era falso. Per un prodotto usato in Italia è un errore visibile.
+  - **Corretto (2026-11-26):** nuovo `src/query/u8case.h` (ASCII, Latino-1, Latino esteso A, greco, cirillico: mappature
+    che non cambiano la lunghezza in byte) usato da tutti questi punti; `_` in `LIKE` consuma un carattere UTF-8. Come le
+    collation `_ci` di MySQL (general / unicode / 0900_ai) i confronti ignorano anche gli accenti delle lettere latine
+    (`'Èra' = 'era'`, tabelle generate da Unicode NFD più đ ħ ı ł ŧ ø). Corretto insieme `COUNT(DISTINCT k)` su una
+    colonna `_ci`, che contava `'a'` e `'A'` come valori diversi (anche prima, con le sole lettere ASCII). I byte dei
+    caratteri di 3-4 byte (`€`, emoji) non vengono mai toccati. Gli
+    alberi su disco delle colonne `_ci` scritti dalle versioni precedenti (chiavi piegate solo in ASCII) hanno un
+    segno diverso (`tree_ci` 1 contro 2) e si ricostruiscono invece di dare ricerche sbagliate. Test in
+    `tests/test_mysql.c` (8 casi).
+  - **Resta da decidere (prodotto):** senza `COLLATE … _ci` una tabella confronta i testi distinguendo le maiuscole,
+    mentre MySQL usa per default una collation `_ci`. Ora `information_schema` dice il vero (`utf8mb4_bin`, prima
+    `utf8mb4_general_ci`), ma cambiare il default cambierebbe il significato dei database esistenti (indici UNIQUE).
+
+- [x] **CR-M13 · `LAST_INSERT_ID()` dopo un INSERT di più righe restituiva l'ultimo id, MySQL il primo** —
+  `src/query/executor.c` (`exec_insert_in`: `last_generated`; percorso riga per riga del modo MySQL) · **confermato**
+  - **Problema:** con `INSERT INTO t (v) VALUES ('x'), ('y')` MySQL dà 1 (il primo id generato dallo statement), e
+    `mysqli_insert_id()` / PDO `lastInsertId()` lo usano per calcolare gli id delle righe inserite: SegVault dava 2,
+    anche nel pacchetto OK del protocollo MySQL e in `last_insert_id` dell'API HTTP.
+  - **Corretto (2026-11-26):** si registra il primo id generato; aggiornati i due test che fissavano il comportamento
+    vecchio (`test_sql`, `test_server`).
+
+- [x] **CR-M14 · Intero / intero e `AVG` di interi davano un double invece del DECIMAL di MySQL** —
+  `src/query/executor.c` (`OP_DIV`, `AVG` aggregato e finestra)
+  - **Problema:** `SELECT 7 / 2` → `3.5` (MySQL `3.5000`), `AVG(voto)` → `7.33333333333333` (MySQL `7.3333`), tipo di
+    colonna FLOAT invece di DECIMAL: i driver ricevevano un double inesatto e le pagine mostravano numeri diversi da
+    quelli di MySQL (gli esempi delle lezioni compresi).
+  - **Corretto (2026-11-26):** divisione e media di interi con l'aritmetica decimale esistente (scala 0 + 4,
+    `div_precision_increment`); aggiornati i test che fissavano il comportamento vecchio. Il fuzzer differenziale con
+    SQLite resta a 0 differenze.
+
+- [x] **CR-M15 · `ROUND(-0.5)` dava `1` e `FORMAT(0.5, 0)` dava `0`** — `src/query/decimal.c` (`dec_round`),
+  `src/query/executor.c` (`FORMAT`) · **confermato con una prova**
+  - **Problema:** in `dec_round` il segno si leggeva dopo la divisione, quando `-0.5` era già diventato una mantissa 0
+    senza segno: `ROUND(-0.5)` = `1`, `ROUND(-0.05, 1)` = `0.1` (positivi!). `FORMAT` arrotondava un double con
+    `printf`: `FORMAT(0.5, 0)` = `0`, `FORMAT(2.5, 0)` = `2`, `FORMAT(1.005, 2)` = `1.00`, `FORMAT(-0.5, 0)` = `-0`
+    (MySQL: 1, 3, 1.01, -1). Importi e medie mostrati in una pagina risultavano sbagliati.
+  - **Corretto (2026-11-26):** segno preso prima della divisione; `FORMAT` arrotonda con l'aritmetica decimale (a metà
+    lontano dallo zero) e usa `printf` solo come ripiego. Test in `tests/test_sql.c`.
+
+### Basso
+
+- [x] **CR-B1 · Codice morto nascosto da `-Wno-unused-function`** — `Makefile:20` (`-Wno-unused-function`,
+  `-Wno-unused-parameter`)
+  - **Problema:** compilando con `-Wunused-function -Wmissing-prototypes` escono 11 funzioni `static` mai usate e
+    4 funzioni esportate che nessuno chiama:
+    `src/bridge/db_api.c:1868` `invalidate_after_undo`; `src/query/executor.c:2616` `ev_str`, `:5520` `str_hash`,
+    `:6806` `probe_text`, `:9807` `pk_column`, `:9812` `rid_key`; `src/query/parser.c:138` `copy_qualified`,
+    `:1626` `parse_condition`, `:2812` `parse_column_ref`; `src/server/service.c:114` `xml_put`;
+    `src/widgets/schema_model.c:289` `dupf`; esportate senza prototipo e senza chiamanti:
+    `src/bridge/db_api.c:2646` `db_list_procedures`, `:3214` `db_use`, `src/catalog/schema.c:908`
+    `catalog_serialize`, `src/widgets/window.c:969` `app_window_ui_waits`; macro `sleep_ms` in `src/main.c:32`.
+  - **Perché è un problema:** codice che si legge e si mantiene ma non gira (e non è testato); le funzioni
+    esportate allargano la superficie di `libsegvault.a`. `parse_condition` e `parse_column_ref` lasciano
+    pensare a un secondo percorso di parsing che non esiste più.
+  - **Correzione:** eliminarle; togliere `-Wno-unused-function` dai `CFLAGS` (il controllo "nessun warning" della
+    CI lo farà rispettare); se una funzione serve solo ai test, dichiararla in un header `*_internal.h`.
+  - **Corretto (2026-11-26):** rimosse le 11 funzioni `static` e le 4 esportate inutilizzate (più `db_use_impl`, `db_list_procedures_impl`, la macro `sleep_ms` di `main.c`); `catalog_serialize` è `static`; `xml_put`, `unit_put` e `file_pick_worker` dentro l'`#ifdef` della loro piattaforma. `-Wno-unused-function` tolto dal Makefile: build Linux e MinGW senza warning.
+
+- [x] **CR-B2 · Lo stesso buffer di testo dinamico è riscritto almeno 13 volte** — `src/bridge/db_api.c:3250`
+  (`sb_cat`), `src/query/executor.c:3141-3142` (`TextBuf`), `:12154-12158` (`TBuf`/`tb_add`),
+  `src/query/sqljson.c:236` (`SjBuf`), `src/server/mysql_wire.c:824-825` (`Sb`), `src/widgets/csv_import.c:13-15`,
+  `result_export.c:11-13`, `mysql_import.c:9-11`, `table_view.c:785-787`, `window.c:1882-1884`,
+  `schema_model.c:308-310`, `sql_text.c:225`, `table_design.c:75`, `grid_edit.c:11`, più `JsonBuf` di `server/json.c`
+  - **Problema:** ogni copia ha la sua politica di crescita e di errore (`ok`, `oom`, `err`, oppure `free` del
+    buffer e `NULL`, come `sb_cat`); alcune usano `realloc`, altre `sv_realloc` (che termina il processo).
+  - **Perché è un problema:** un bug di overflow o di gestione dell'OOM va corretto 13 volte; le differenze di
+    comportamento (troncare, fermarsi, terminare il processo) sono casuali e non scelte.
+  - **Correzione:** un solo `include/sv_strbuf.h` (`sb_put`, `sb_puts`, `sb_printf`, `sb_take`, flag `oom`
+    "appiccicoso") usato da motore, server e GUI; `JsonBuf` può basarsi su di esso.
+  - **Corretto (2026-11-27):** `include/sv_strbuf.h` (`SvStrBuf`: `svsb_put` / `puts` / `putc` / `printf` / `take` /
+    `free`, flag `oom` appiccicoso, limite `max` facoltativo con `toolong`, crescita senza overflow di `size_t`,
+    `realloc` che non termina il processo). Sostituisce `TextBuf`, `TBuf` (executor), `SjBuf`, `sb_cat` (db_api),
+    `Sb` (mysql_wire), i `Buf` di csv_import / result_export / mysql_import, `TBuf` di table_view, gli `SBuf` di
+    window / schema_model / sql_text, `DBuf`, `GBuf`; `JsonBuf` (API pubblica) usa la stessa `svsb_grow`. I nomi tra
+    backtick della GUI passano da un solo `sql_ident_sb` (sql_quote.h), che rifiuta i nomi non scrivibili invece di
+    spezzarli. Trovati strada facendo: `sb_add` di window.c non si fermava dopo un errore di memoria (un pezzo
+    successivo più corto riusciva e il testo restava bucato in mezzo); il formattatore SQL (`sql_text.c`) partiva da
+    un `malloc` non controllato (`NULL` con capacità > 0, poi `memcpy` su NULL) e contava in `int`. Test: `tests/test_strbuf.c` (13).
+
+- [x] **CR-B3 · Numero magico 1024 nella codifica delle colonne legate: corretto solo finché `SV_MAX_COLUMNS` è
+  1024** — `src/query/executor.c:2227-2228`, `2411`, `2454-2471`, `5209`, `5218`, `5418-5419`, `5839`, `5917`,
+  `6692`, `6726-6755`, `7239` (più di 20 punti con `s * 1024 + c + 1`, `/ 1024`, `% 1024`)
+  - **Problema:** `ASTExpr.bound` codifica (sorgente, colonna) come `s * 1024 + c + 1` con il letterale 1024,
+    uguale per coincidenza a `SV_MAX_COLUMNS` (`include/common.h:59`). Nessun `_Static_assert` li lega.
+  - **Perché è un problema:** alzare `SV_MAX_COLUMNS` (MySQL ne ammette 4 096, P3.12 / P4 vanno in quella
+    direzione) fa leggere a `WHERE c1025 = …` la colonna 0 della sorgente successiva, in silenzio.
+  - **Correzione:** macro uniche e un'asserzione statica:
+    ```c
+    #define BOUND_STRIDE      SV_MAX_COLUMNS
+    #define BOUND_MAKE(s, c)  ((s) * BOUND_STRIDE + (c) + 1)
+    #define BOUND_SRC(b)      (((b) - 1) / BOUND_STRIDE)
+    #define BOUND_COL(b)      (((b) - 1) % BOUND_STRIDE)
+    _Static_assert((long long)MAX_SOURCES * BOUND_STRIDE < INT_MAX, "bound overflow");
+    ```
+  - **Corretto (2026-11-26):** macro `BOUND_STRIDE` / `BOUND_MAKE` / `BOUND_SRC` / `BOUND_COL` legate a `SV_MAX_COLUMNS`, con `_Static_assert` sull'intervallo di un `int`; 41 occorrenze sostituite.
+
+- [x] **CR-B4 · Puntatore confrontato dopo `free`** — `src/query/executor.c:2669-2677` (`executor_uservars_free`)
+  - **Problema:** `free(v); if (g_uvars == v) g_uvars = NULL;` — dopo `free` il valore di `v` è indeterminato per
+    lo standard C (GCC: `-Wuse-after-free=3`). In pratica funziona, ma è comportamento indefinito che un
+    ottimizzatore può sfruttare.
+  - **Correzione:** spostare il confronto prima di `free(v)`.
+  - **Corretto (2026-11-26):** confronto spostato prima di `free`.
+
+- [x] **CR-B5 · Statistiche dell'ottimizzatore: stesso formato a parole separate da spazi di CR-C1** —
+  `src/query/stats.c:72-75` (`stats_save`), `:96-118` (`stats_load`)
+  - **Problema:** `table DB TABLE ROWS NCOLS` e `col NAME …` con `%63s`: un nome di database, tabella o colonna con
+    uno spazio fa fallire il caricamento e `stats_clear()` butta le statistiche di **tutte** le tabelle (piani
+    peggiori ovunque, senza messaggi); un nome costruito apposta (`` `t 1e30 3` ``) scrive statistiche finte per
+    un'altra tabella (`t` con 10³⁰ righe), cioè piani pessimi scelti a comando.
+  - **Correzione:** la stessa codifica dei nomi decisa per CR-C1 (una funzione condivisa `sv_name_encode` /
+    `sv_name_decode` in `include/`), e una riga illeggibile scarta solo la sua tabella.
+  - **Corretto (2026-11-26):** nomi codificati con `sv_name_encode`; al caricamento una tabella illeggibile viene scartata da sola invece di tutte. Verificato con una prova (`` `t 1e30 3` `` / `` `my col` `` dopo il riavvio).
+
+- [x] **CR-B6 · `BACKUP TO '<percorso>'` scrive ovunque: nessun equivalente di `secure_file_priv`** —
+  `src/bridge/db_api.c:1000-1002` (statement SQL), `:3381-3395` (`db_backup_impl`: crea anche le cartelle
+  intermedie), `:3332` (`BK_FILES`: `segvault.db`, `segvault.cat`, `users.dat` con gli hash delle password…)
+  - **Problema:** solo gli amministratori possono eseguirlo (`auth.c`, caso `default`), ma il percorso è libero.
+    Nella configurazione predefinita "amministratore" vuol dire qualunque processo locale (P4.21) o qualunque pagina
+    servita dal server (CR-A2): `BACKUP TO 'www/sito/x'` mette `users.dat` e l'intero database dentro la radice di
+    un sito, e il server stesso li serve via HTTP (i file sono `0600`, ma il processo che li serve è lo stesso che
+    li ha scritti; `handle_web` blocca solo i nomi che iniziano con il punto).
+  - **Correzione:** come `secure_file_priv` di MySQL: una cartella dei backup configurata (predefinita
+    `<dati>/backups`) e percorsi relativi a essa, rifiutando `..` e i percorsi assoluti fuori da lì; in più,
+    `handle_web` dovrebbe rifiutarsi di servire i file del formato SegVault (`segvault.*`, `users.dat`).
+  - **In parte (2026-11-26):** il server web non serve più i file del formato SegVault (`segvault.*`, `users.dat`, `sequences.txt`, anche con alias Windows come `users.dat.`); test in `tests/test_web.c`. **Resta da decidere:** limitare il percorso dello statement SQL `BACKUP TO` a una cartella dei backup cambierebbe il comportamento documentato nel README (`BACKUP TO '/percorso/backup'`).
+  - **Corretto (2026-11-27), senza cambiare il comportamento documentato:** il server registra la sua cartella web e
+    quelle dei siti (`db_backup_protect`, tolte quando il server si ferma) e lo statement SQL `BACKUP TO` rifiuta le
+    destinazioni lì dentro e dentro la cartella dei dati, dopo aver risolto link simbolici e percorsi relativi
+    (prima bastava `BACKUP TO 'data/.'` per aggirare il controllo con `strcmp`); `..` dopo una cartella che non esiste
+    ancora è rifiutato. Il backup dalla GUI (`db_backup`) resta libero. Una cartella dei backup obbligatoria
+    (come `secure_file_priv`) resta possibile in futuro, ma romperebbe chi usa `BACKUP TO '/percorso'`. Test in
+    `tests/test_backup.c` (link simbolici, `data/.`, prefissi simili come `wwwx`) e `tests/test_web.c`.
+
+- [x] **CR-B7 · CI: azioni GitHub fissate per tag e non per commit** — `.github/workflows/ci.yml:16`, `:52`, `:63`,
+  `:86-87`, `:124`, `:129`; `fuzz.yml:23`, `:32`; `release.yml:25`
+  - **Problema:** `actions/checkout@v4`, `actions/upload-artifact@v4`, `msys2/setup-msys2@v2` seguono il tag, che
+    l'autore dell'azione (o chi ne compromette l'account) può spostare. Il workflow di release costruisce e
+    pubblica gli eseguibili distribuiti (P4.18: non firmati), quindi un'azione compromessa finisce nei file che gli
+    utenti scaricano.
+  - **Correzione:** fissare ogni `uses:` allo SHA del commit (`actions/checkout@<sha> # v4.2.2`), permessi
+    minimi anche in `ci.yml` e `fuzz.yml` (`permissions: contents: read`; `release.yml:14` li dichiara già) e
+    Dependabot per gli aggiornamenti delle azioni.
+  - **Corretto (2026-11-26):** ogni `uses:` fissato allo SHA (`actions/checkout` v4 `11d5960`, `upload-artifact` v4 `ea165f8`, `setup-msys2` v2 `3c51bf6`), `permissions: contents: read` in `ci.yml` e `fuzz.yml`, `.github/dependabot.yml` settimanale per le azioni.
+
+- [x] **CR-B8 · `SELECT … FROM DUAL` non era riconosciuto** — `src/query/parser.c` (`parse_select_core`)
+  - **Corretto (2026-11-26):** `FROM DUAL` (MySQL, Oracle) vale come nessuna tabella; test in `tests/test_sql.c`.
+
+- [x] **CR-B9 · Piccole differenze da MySQL trovate dalle prove** — `src/query/executor.c`, `parser.c`
+  - la funzione di testo `INSERT(str, pos, len, new)` non è riconosciuta (il parser vede la parola chiave `INSERT`);
+  - `JSON_SET` / `JSON_REMOVE` restituiscono il documento con spaziature miste (`{"a":1, "b": 2}`) invece della forma
+    normalizzata di MySQL (`{"a": 1, "b": 2}`): conta per chi confronta il testo JSON;
+  - la regex di `REGEXP` viene compilata di nuovo a ogni riga anche quando il pattern è una costante.
+  - **Corretto (2026-11-27):** `INSERT(str, pos, len, new)` come MySQL (anche con lettere accentate, e nelle viste);
+    output JSON nella forma normalizzata di MySQL (`sj_normalize` in `sqljson.c`) per `JSON_SET` / `INSERT` /
+    `REPLACE` / `REMOVE` / `ARRAY_APPEND`, `JSON_EXTRACT` e `->`, `JSON_MERGE_PATCH` e `CAST(… AS JSON)` (che ora
+    rifiuta il testo non JSON); regex in una cache per thread di 8 posti (`sv_regex_cached`, nessuna scrittura
+    nell'AST condiviso, liberata all'uscita del thread): la stessa `REGEXP` su 200 000 righe 290 → 145 ms.
+    Trovate strada facendo e aggiunte: `JSON_ARRAY_INSERT`, `JSON_MERGE_PRESERVE` / `JSON_MERGE` (risultati uguali
+    agli esempi del manuale MySQL). Test in `tests/test_sql.c` e `tests/test_mysql.c`.
+
+- [~] **CR-B10 · Differenze da MySQL trovate con le prove del 2026-11-27** — sonde su `libsegvault.a` confrontate
+  con i risultati documentati di MySQL 8 (funzioni di testo, date, numeri, bit, JSON, conversioni)
+  - **Corretto:** `CAST(-1 AS UNSIGNED)` dava `0` (MySQL: `18446744073709551615`, modulo 2⁶⁴) e
+    `CAST('18446744073709551615' AS UNSIGNED)` si fermava a 2⁶³ − 1; `CAST(1e30 AS SIGNED)` passava da un `double`
+    fuori intervallo (comportamento indefinito in C), ora satura come MySQL. Test in `tests/test_sql.c`.
+  - **Corretto:** `COUNT(DISTINCT a, b, …)` era un errore di sintassi ("Aggregate functions take exactly one
+    argument"); ora conta le combinazioni distinte e salta le righe con un NULL, come MySQL (chiave composta con le
+    lunghezze in testa: `('a1','b')` e `('a','1b')` restano diverse).
+  - **Corretto:** `INSERT … VALUES` saltava i limiti di `TINYINT` / `SMALLINT` / `MEDIUMINT` (200 entrava in un
+    `TINYINT`; `INSERT … SELECT` e `UPDATE` invece li controllavano) e `INT UNSIGNED`, conservato come `BIGINT`,
+    accettava 4294967296. Ora il controllo sta in `row_fits`, comune a ogni scrittura.
+  - **Corretto:** una sottoquery scalare **correlata** senza righe (`(SELECT MAX(y) FROM b WHERE b.aid = a.id)`)
+    dava una stringa vuota invece di NULL, quindi `COALESCE(…, -1)` e `IS NULL` sbagliavano: la copia del testo
+    del risultato trasformava il NULL in "".
+  - **Corretto:** `BINARY x` era ignorato (`'ABC' LIKE BINARY 'abc'` = 1) e `x COLLATE nome` in un'espressione era un
+    errore di sintassi (`ORDER BY nome COLLATE utf8mb4_bin`, `WHERE s = 'a' COLLATE utf8mb4_general_ci`): ora
+    diventano `__COLLATE(x, nome)` e una collation esplicita prevale su quella della colonna in `=`, `<`, `LIKE`.
+  - **Corretto:** la `COLLATE` scritta su una colonna (`s VARCHAR(5) COLLATE utf8mb4_general_ci`) era ignorata:
+    contava solo quella della tabella. Nuovi bit `COLF_CI` / `COLF_BIN` nel catalogo (le versioni precedenti li
+    ignorano).
+  - **Corretto:** `SHOW CREATE TABLE`, `CREATE TABLE … LIKE` e il dump della GUI scrivevano `INT` per `TINYINT` /
+    `SMALLINT` / `MEDIUMINT`, `BIGINT` per `INT UNSIGNED` e perdevano `UNSIGNED` e le collation: dopo un dump e un
+    ripristino i limiti sparivano. Ora i tipi numerici escono come dichiarati e le collation di colonna e di tabella
+    sono scritte.
+  - **Corretto:** il commit implicito di MySQL prima di un DDL (descritto in P1.11 come già fatto) non c'era:
+    `BEGIN; INSERT …; CREATE TABLE x …; ROLLBACK` lasciava la tabella nuova e annullava l'`INSERT`; un `BEGIN`
+    dentro una transazione dava errore. Ora DDL (non `TEMPORARY`), `ANALYZE` / `OPTIMIZE` e `BEGIN` fanno prima il
+    commit della transazione aperta (`implicit_commit_stmt` in `db_api.c`). Test in `tests/test_sql.c`.
+  - **Corretto:** `ORD('à')` dava 195 (il primo byte), MySQL 50080 (i byte del carattere).
+  - **Aperto (minori):** un `DOUBLE` che trabocca (`1e308 * 10`, `EXP(1000)`) dà NULL invece dell'errore "DOUBLE value
+    is out of range"; `-(-9223372036854775808)` e `ABS(-9223372036854775808)` danno un double invece dell'errore
+    BIGINT.
+  - **Aperto:** `ADD COLUMN … AFTER x` / `FIRST` sono accettati ma la colonna va in fondo (serve separare l'ordine
+    logico delle colonne da quello delle tuple).
+  - **Aperto:** l'aritmetica non tiene il tipo unsigned: `CAST(2 AS UNSIGNED) - 3` dà `-1`, MySQL l'errore
+    "BIGINT UNSIGNED value is out of range".
+
+### Falsi positivi degli strumenti e sospetti scartati (controllati, nessuna azione)
+
+Elencati perché chi riprende il lavoro non li ricontrolli da capo.
+
+- **`gcc -fanalyzer` (37 segnalazioni), tutte false:** `src/table/tuple.c:126-156` (overflow dell'heap:
+  `tuple_create(s->num_columns)` alloca proprio quei valori); `src/bridge/db_api.c:2398`, `:3259`;
+  `src/server/mysql_wire.c:834-838` (il buffer resta in `b->p`); `src/server/server.c:5178` (il socket lo chiude
+  `sv_server_free`); `src/tx/wal.c:245` (finestra già letta); `src/widgets/line_edit.c:75`,
+  `result_export.c:22`, `table_view.c:796`, `textbox.c:192`, `csv_import.c:102`; `src/query/lexer.c:64`;
+  `src/platform/fonts_embed.c:26-29` (differenza tra simboli del linker: l'idioma dei dati incorporati);
+  `src/widgets/schema_view.c:995`. Nel motore i "NULL dopo l'allocazione" non sono raggiungibili: la politica
+  dichiarata in `include/sv_alloc.h` è terminare il processo se manca la memoria.
+- **Warning estesi:** `server.c:2370`, `:2425` (`-Wformat-overflow`: i buffer sono dimensionati dalla lunghezza);
+  `h2.c:43`, `tls.c:643` (`-Wlogical-op`: `EAGAIN == EWOULDBLOCK` su Linux, idioma portabile); `server.c:4336`
+  (`-Wjump-misses-init`: `max` non è usato dopo `done:`); i 146 `-Wformat-truncation` sono `snprintf` che troncano
+  di proposito (dove conta, il valore di ritorno è controllato).
+- **Sospetti scartati con una prova:** SIGPIPE nel processo della GUI con HTTPS (TLS usa BIO in memoria e
+  `send(…, MSG_NOSIGNAL)`: 6 disconnessioni con RST durante un download da 40 MB, processo vivo); overflow
+  aritmetici a 64 bit (errore "out of range", nessuna trap con `INT64_MIN DIV -1`); atomicità degli statement con
+  violazioni di PRIMARY KEY / UNIQUE / FOREIGN KEY (corretta; UNIQUE controllato a fine statement come da standard
+  SQL); il leak del parser segnalato dal fuzzing notturno (3 × 50 s del target `exec` con semi 8, 9, 10: nessun
+  errore); altre race nelle letture parallele (8 tipi di query dopo un riavvio sotto TSan: solo CR-A1);
+  `DROP DATABASE` mentre altre transazioni tengono lock con l'indice del database (impossibile: il lock globale `*`
+  in modo X aspetta tutte le transazioni); lock di procedure, trigger, viste e chiavi esterne (espansi in modo
+  conservativo da `ls_name`, `db_api.c`); `PREPARE` / `EXECUTE` (rientrano in `db_execute_impl`, quindi nel
+  percorso normale dei lock); login MySQL e sessioni HTTP (token casuali da 16 byte, confronto a tempo
+  costante, controllo del proprietario della sessione); hash delle password (PBKDF2-HMAC-SHA256 con confronto a
+  tempo costante).
+- **Limiti di questa revisione:** il codice solo Windows (`win32.c`, ACL, percorsi `C:\`) è stato letto ma non
+  eseguito; la GUI non è stata aperta a schermo; `parser.c` ed `executor.c` sono stati campionati con strumenti e
+  prove, non letti riga per riga (P3.9 resta aperto).
+
+

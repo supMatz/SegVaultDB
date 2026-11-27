@@ -1,6 +1,8 @@
 #include "common.h"
 #include "sv_alloc.h"
+#include "sv_strbuf.h"
 #include "executor.h"
+#include "u8case.h"
 #include "../platform_lock.h"
 #include "../table/overflow.h"
 #include "../table/binesc.h"
@@ -74,7 +76,7 @@ static DataType parse_type(const char* type_name) {
 // esc (0 = nessuno): il carattere che lo segue nel pattern vale per sé (ESCAPE '!': '100!%').
 // Iterativo: a un errore si torna solo all'ultimo % (basta: % prende qualunque sequenza), tempo O(|s|·|p|).
 // Prima una ricorsione per ogni %: '%a%a%a…%b' su 40 'a' non finiva mai, 50 000 % facevano traboccare lo stack
-static bool like_match_esc(const char* s, const char* p, char esc) {
+static bool like_match_cs(const char* s, const char* p, char esc, bool cs) {
     const char *star_p = NULL, *star_s = NULL;
     for (;;) {
         if (*p == '%') {
@@ -87,20 +89,25 @@ static bool like_match_esc(const char* s, const char* p, char esc) {
         if (!*s) break;
         bool lit = esc && *p == esc && p[1];
         const char* pc = lit ? p + 1 : p;
-        if (*p && ((!lit && *p == '_') || tolower((unsigned char)*pc) == tolower((unsigned char)*s))) {
-            s++;
-            p = pc + 1;
+        if (*p && !lit && *p == '_') { s += u8_char_len(s); p++; continue; }   // un carattere, non un byte
+        int np, ns;
+        uint32_t cp = u8_get(pc, &np), cs_ = u8_get(s, &ns);
+        if (*p && (cs ? cp == cs_ : u8_ci_cp(cp) == u8_ci_cp(cs_))) {   // 'À' = 'a' come le collation _ci; cs: BINARY / _bin
+            s += ns;
+            p = pc + np;
             continue;
         }
         if (!star_p) return false;
         p = star_p;
-        s = ++star_s;
+        star_s += u8_char_len(star_s);
+        s = star_s;
     }
     while (*p == '%') p++;
     return !*p;
 }
 
-static bool like_match(const char* s, const char* p) { return like_match_esc(s, p, '\\'); }   // come MySQL e PostgreSQL: \\ protegge % e _
+static bool like_match_esc(const char* s, const char* p, char esc) { return like_match_cs(s, p, esc, false); }
+// LIKE: come MySQL e PostgreSQL, \\ protegge % e _ (like_match_cs con esc = '\\')
 
 static QueryResult* unknown_column_error(const char* col, const char* clause) {
     char msg[200];
@@ -108,8 +115,16 @@ static QueryResult* unknown_column_error(const char* col, const char* clause) {
     return result_error_msg(msg);
 }
 
+// nome non ammesso per un oggetto nuovo (sv_name_ok); il nome non viene ripetuto (può avere caratteri di controllo)
+static QueryResult* bad_name_error(const char* what) {
+    char msg[200];
+    snprintf(msg, sizeof(msg), "Invalid %s name: it cannot be empty or contain a backtick (`) or a control character", what);
+    return result_error_msg(msg);
+}
+
 // ---- Executors ----
 static QueryResult* exec_create_db(ExecCtx* ctx, ASTNode* n) {
+    if (!sv_name_ok(n->create_db.db_name)) return bad_name_error("database");
     if (catalog_add_db(ctx->catalog, n->create_db.db_name) != SV_OK)
         return result_error_msg("Failed to create database (may already exist)");
     return result_ok_msg(0);
@@ -346,7 +361,7 @@ static QueryResult* exec_create_table_impl(ExecCtx* ctx, ASTNode* n) {
         return result_error_msg(msg);
     }
 
-    TableSchema* ts = schema_new(n->create_table.num_columns);
+    TableSchema* ts = schema_new_aux(n->create_table.num_columns, 0, SV_MAX_CONSTRAINTS);   // i vincoli si aggiungono qui
     if (!ts) return result_error_msg("Out of memory");
     snprintf(ts->name, sizeof(ts->name), "%s", n->create_table.table_name);
 
@@ -373,9 +388,9 @@ static QueryResult* exec_create_table_impl(ExecCtx* ctx, ASTNode* n) {
             return result_error_msg(msg);
         }
         // ENUM('a','b'): un CHECK con i valori ammessi
-        if (cd->comment[0] == '\x01' && n->create_table.num_cons < SV_MAX_CONS_DEFS) {
-            ConstraintDef* d = &n->create_table.cons[n->create_table.num_cons++];
-            memset(d, 0, sizeof(*d));
+        if (cd->comment[0] == '\x01') {
+            ConstraintDef* d = ast_cons_add(n);                  // (prima, a lista piena, l'ENUM restava senza controllo)
+            if (!d) { free(ts); snprintf(msg, sizeof(msg), "Too many constraints (max %d, ENUM columns count as one each)", SV_MAX_CONS_DEFS); return result_error_msg(msg); }
             d->kind = CONS_CHECK;
             snprintf(d->name, sizeof(d->name), "%.50s_chk_enum", cd->name);
             snprintf(d->check, sizeof(d->check), "`%.64s` IN %.420s", cd->name, cd->comment + 1);
@@ -417,8 +432,11 @@ static QueryResult* exec_create_table_impl(ExecCtx* ctx, ASTNode* n) {
         if (gf && strstr(gf, "cannot be NULL")) gf = NULL;    // su una riga vuota il valore può mancare
         if (gf) { if (gf != msg) snprintf(msg, sizeof(msg), "%s", gf); free(ts); return result_error_msg(msg); }
     }
+    for (int k = 0; k < n->create_table.num_keys; k++)
+        if (!sv_name_ok_opt(n->create_table.keys[k].name)) { free(ts); return bad_name_error("index"); }
     int rc = catalog_add_table(ctx->catalog, db->name, ts);
     free(ts);
+    if (rc == SV_BAD_NAME) return bad_name_error("table, column or constraint");
     if (rc != SV_OK) return result_error_msg("Failed to create table");
 
     TableSchema* saved = catalog_get_table(ctx->catalog, db->name, n->create_table.table_name);
@@ -443,7 +461,7 @@ static QueryResult* exec_create_table_impl(ExecCtx* ctx, ASTNode* n) {
             if (kd->name[0]) snprintf(ix->name, sizeof(ix->name), "%s", kd->name);
             else snprintf(ix->name, sizeof(ix->name), "%.63s", kd->cols[0]);
             for (int j = 0; j < saved->num_indexes - 1; j++)             // nomi automatici distinti (col, col_2, ...)
-                if (!strcasecmp(saved->indexes[j].name, ix->name)) { snprintf(ix->name, sizeof(ix->name), "%.58s_%d", kd->cols[0], k + 2); break; }
+                if (!strcasecmp(saved->indexes[j].name, ix->name)) { snprintf(ix->name, sizeof(ix->name), "%.57s_%d", kd->cols[0], (k + 2) % 100000); break; }
             snprintf(ix->col_name, sizeof(ix->col_name), "%s", kd->cols[0]);
             snprintf(ix->type, sizeof(ix->type), "BTREE");
             ix->ncols = (uint8_t)kd->ncols;
@@ -728,6 +746,7 @@ static QueryResult* alter_column(ExecCtx* ctx, Database* db, TableSchema* ts, AS
     // RENAME COLUMN: solo il catalogo (e i testi che usano il nome)
     if (n->alter_table.rename_from[0]) {
         const char* from = n->alter_table.rename_from, *to = n->alter_table.rename_to;
+        if (!sv_name_ok(to)) return bad_name_error("column");
         int ci = catalog_get_col_index(ts, from);
         if (ci < 0) { snprintf(msg, sizeof(msg), "Unknown column '%.64s'", from); return result_error_msg(msg); }
         if (strcasecmp(from, to) && catalog_get_col_index(ts, to) >= 0) { snprintf(msg, sizeof(msg), "Column '%.64s' already exists", to); return result_error_msg(msg); }
@@ -767,6 +786,7 @@ static QueryResult* alter_column(ExecCtx* ctx, Database* db, TableSchema* ts, AS
     if (add) {
         ColumnDef* cd = &add->create_table.columns[0];
         if (add->create_table.num_columns != 1) fail = "Expected one column definition";
+        else if (!sv_name_ok(cd->name)) fail = "Invalid column name: it cannot be empty or contain a backtick (`) or a control character";
         else if (!known_type(cd->type)) { snprintf(msg, sizeof(msg), "Unknown type '%.32s'", cd->type); fail = msg; }
         else if (catalog_get_col_index(ts, cd->name) >= 0) { snprintf(msg, sizeof(msg), "Column '%.64s' already exists", cd->name); fail = msg; }
         else if (ts->num_columns >= SV_MAX_COLUMNS) fail = "Too many columns (max 1024)";
@@ -892,6 +912,7 @@ static QueryResult* exec_alter_table(ExecCtx* ctx, ASTNode* n) {
     // RENAME TO
     if (n->alter_table.new_name[0]) {
         const char* nn = n->alter_table.new_name;
+        if (!sv_name_ok(nn)) return bad_name_error("table");
         if (strcasecmp(nn, ts->name) &&
             (catalog_get_table(ctx->catalog, db->name, nn) || catalog_get_view(ctx->catalog, db->name, nn)))
             return result_error_msg("A table or view with the new name already exists");
@@ -973,6 +994,22 @@ static bool frac_secs_ok(const char* p) {
     return !*p && d >= 1 && d <= 6;
 }
 
+// intervallo dei tipi interi più stretti di INT, dal tipo dichiarato (TINYINT / SMALLINT / MEDIUMINT si conservano
+// come INT): prima TINYINT accettava 200 e SMALLINT 100000. false = nessun limite oltre quello di INT
+static bool narrow_int_bounds(const Column* c, long long* lo, long long* hi) {
+    static const struct { const char* name; long long lo, hi, uhi; } T[] = {
+        { "tinyint", -128, 127, 255 }, { "smallint", -32768, 32767, 65535 }, { "mediumint", -8388608, 8388607, 16777215 } };
+    for (size_t i = 0; i < sizeof(T) / sizeof(T[0]); i++) {
+        size_t l = strlen(T[i].name);
+        if (strncasecmp(c->sqltype, T[i].name, l) || isalnum((unsigned char)c->sqltype[l])) continue;
+        bool un = (c->flags & COLF_UNSIGNED) != 0;
+        *lo = un ? 0 : T[i].lo;
+        *hi = un ? T[i].uhi : T[i].hi;
+        return true;
+    }
+    return false;
+}
+
 static const char* check_value(const Column* c, const char* v, char* msg, size_t n) {
     const char* p = v;
     while (isspace((unsigned char)*p)) p++;
@@ -1001,6 +1038,11 @@ static const char* check_value(const Column* c, const char* v, char* msg, size_t
                 snprintf(msg, n, "Value %.40s is out of range for column '%s' (%s)", v, c->name, datatype_name(c->type));
                 return msg;
             }
+            long long lo, hi;
+            if (c->type == SV_TYPE_INT && narrow_int_bounds(c, &lo, &hi) && (x < lo || x > hi)) {
+                snprintf(msg, n, "Value %.40s is out of range for column '%s' (%s)", v, c->name, c->sqltype);
+                return msg;
+            }
             return NULL;
         }
         case SV_TYPE_FLOAT: case SV_TYPE_DECIMAL: {
@@ -1008,6 +1050,16 @@ static const char* check_value(const Column* c, const char* v, char* msg, size_t
             double d = strtod(p, &end);
             while (end && isspace((unsigned char)*end)) end++;
             if (end == p || !end || *end || d != d) { snprintf(msg, n, "Column '%s' expects a number, got '%.40s'", c->name, v); return msg; }
+            // DECIMAL(p, s): al più p - s cifre intere dopo l'arrotondamento a s decimali (prima DECIMAL(4,1) prendeva
+            // 999.95 e salvava 1000.0, oltre la precisione dichiarata)
+            if (c->type == SV_TYPE_DECIMAL && c->size > 0 && c->decimal_prec > 0 && c->size >= c->decimal_prec - 1) {
+                int s = c->decimal_prec - 1, ip = c->size - s;
+                double lim = pow(10.0, ip) - 0.5 * pow(10.0, -s);
+                if (ip < 300 && fabs(d) >= lim) {
+                    snprintf(msg, n, "Value %.40s is out of range for column '%s' (%s)", v, c->name, c->sqltype);
+                    return msg;
+                }
+            }
             return NULL;
         }
         case SV_TYPE_BOOL:
@@ -1102,25 +1154,21 @@ static bool col_is_ci(const TableSchema* ts, int c) {
     if (!ts || c < 0 || c >= ts->num_columns) return false;
     DataType t = ts->columns[c].type;
     if (t != SV_TYPE_VARCHAR && t != SV_TYPE_CHAR && t != SV_TYPE_TEXT) return false;
+    if (ts->columns[c].flags & COLF_BIN) return false;          // COLLATE sulla colonna: prevale sulla tabella
+    if (ts->columns[c].flags & COLF_CI) return true;
     size_t l = strlen(ts->collation);
     return l > 3 && !strcmp(ts->collation + l - 3, "_ci");
 }
 
-// confronto di testi senza maiuscole (ASCII; i caratteri UTF-8 multi-byte restano come sono)
-static int ci_cmp(const char* a, const char* b) {
-    for (;; a++, b++) {
-        int x = tolower((unsigned char)*a), y = tolower((unsigned char)*b);
-        if (x != y) return x < y ? -1 : 1;
-        if (!x) return 0;
-    }
-}
+// confronto di testi senza maiuscole, anche per lettere accentate, greche e cirilliche (u8case.h)
+static int ci_cmp(const char* a, const char* b) { return u8_ci_cmp(a, b); }
 
 // copia in minuscolo (malloc); NULL se manca memoria
 static char* ci_fold(const char* s) {
     size_t l = strlen(s);
     char* o = sv_malloc(l + 1);
     if (!o) return NULL;
-    for (size_t i = 0; i <= l; i++) o[i] = (char)tolower((unsigned char)s[i]);
+    u8_ci_fold(o, s);                                   // senza maiuscole e senza accenti (collation _ci)
     return o;
 }
 
@@ -1352,7 +1400,7 @@ typedef struct { RID* r; int n, cap; } RidList;
 // (solo la seconda contiene \x1e) e testi diversi non collidono. Il seme è casuale a ogni avvio:
 // le chiavi vivono solo in memoria, e nessuno può costruire apposta due testi con la stessa chiave.
 #define KEY_INLINE_MAX 200
-#define KEY_BUF        2048     // chiave di 8 colonne (SV_MAX_KEY_COLS) in forma corta o lunga
+#define KEY_BUF        4096     // chiave di 16 colonne (SV_MAX_KEY_COLS) da KEY_INLINE_MAX + separatore ciascuna
 
 static uint64_t g_key_seed[2];
 
@@ -1409,7 +1457,7 @@ static bool key_text(char* buf, size_t cap, const char* s) {
 
 typedef struct MemIndex {
     char      db[SV_MAX_NAME_LEN], table[SV_MAX_NAME_LEN];
-    char      col[SV_MAX_NAME_LEN * 2];   // nome della colonna, o "a,b" per una chiave composta
+    char      col[SV_MAX_NAME_LEN * SV_MAX_KEY_COLS];   // nome della colonna, o "a,b" per una chiave composta
     int       cols[SV_MAX_KEY_COLS];      // posizioni delle colonne della chiave
     int       ncols;
     StrMap    map;          // chiave -> posizione in lists
@@ -1430,6 +1478,8 @@ typedef struct MemIndex {
     // (una lista vuota nasconde la chiave della base). Niente lettura della tabella per costruirlo
     uint32_t  base_root;
     BufferPool* bp;
+    uint64_t  built_seq;    // sequenza delle modifiche (db_api) quando è stato costruito: un ROLLBACK che annulla
+                            // modifiche più recenti lo scarta (le sue chiavi le includono senza diario)
     struct MemIndex* next;
 } MemIndex;
 
@@ -1438,7 +1488,11 @@ typedef struct MemIndex {
 static MemIndex* g_mem_indexes;
 static MemIndex* g_mi_zombies;          // tolti dalla lista con letture in parallelo possibili: liberati in esclusiva
 
+static void ij_forget_index(const MemIndex* ix);
+static uint64_t (*g_ij_seq)(void);       // (diario degli indici, più sotto)
+
 static void mi_free(MemIndex* ix) {
+    ij_forget_index(ix);
     sm_free(&ix->map);
     for (int i = 0; i < ix->nlists; i++) { free(ix->lists[i].r); free(ix->lkeys[i]); }
     free(ix->lists);
@@ -1762,7 +1816,7 @@ static MemIndex* mi_get_cols(ExecCtx* ctx, const char* db, TableSchema* ts, cons
 
 static MemIndex* mi_get_cols_locked(ExecCtx* ctx, const char* db, TableSchema* ts, const int* cols, int ncols) {
     if (ncols < 1 || ncols > SV_MAX_KEY_COLS) return NULL;
-    char name[SV_MAX_NAME_LEN * 2];
+    char name[SV_MAX_NAME_LEN * SV_MAX_KEY_COLS];
     size_t len = 0;
     name[0] = '\0';
     for (int k = 0; k < ncols; k++) {
@@ -1790,6 +1844,7 @@ static MemIndex* mi_get_cols_locked(ExecCtx* ctx, const char* db, TableSchema* t
     memcpy(ix->cols, cols, sizeof(int) * (size_t)ncols);
     ix->ncols = ncols;
     ix->bp = ctx->bp;
+    ix->built_seq = g_ij_seq ? g_ij_seq() : 0;
     int ti = ncols == 1 ? tree_for(ts, cols[0]) : -1;
     if (ti >= 0) {                                              // P1.15: l'albero su disco fa da base, niente lettura
         ix->base_root = ts->tree_root[ti];
@@ -1823,6 +1878,103 @@ static MemIndex* mi_get(ExecCtx* ctx, const char* db, TableSchema* ts, int ci) {
 }
 
 // aggiornamento degli indici già costruiti della tabella
+// ── diario degli indici in memoria (ROLLBACK senza ricostruirli) ─────────────────────────────────
+// Prima un ROLLBACK (anche di un solo statement fallito) buttava gli indici in memoria delle tabelle toccate e il
+// primo statement dopo li ricostruiva leggendo tutta la tabella: BEGIN; INSERT 10 righe; ROLLBACK su una tabella di
+// 100 000 righe = 100 000 righe rilette (1 300 rollback/s contro 89 000 di SQLite). Ora ogni chiave aggiunta / tolta
+// dentro una transazione va nel diario con la sequenza della modifica di db_api; l'annullamento fa il contrario
+// delle voci più recenti del punto a cui si torna. Un indice costruito dopo quel punto (contiene righe annullate
+// senza diario) viene scartato come prima; senza memoria per il diario la transazione torna al vecchio modo.
+typedef struct { uint64_t tx, seq; MemIndex* ix; char* key; RID rid; bool add; } IjEnt;
+static IjEnt*   g_ij;
+static int      g_nij, g_capij;
+static uint64_t (*g_ij_tx)(void);        // transazione corrente (0 = nessuna)
+#define IJ_MAX_LOST 16
+static uint64_t g_ij_lost[IJ_MAX_LOST];  // transazioni con il diario incompleto
+static int      g_nij_lost;
+static bool     g_ij_lost_all;           // troppe: tutte
+
+void executor_set_tx_source(uint64_t (*seq)(void), uint64_t (*tx)(void)) { g_ij_seq = seq; g_ij_tx = tx; }
+
+static bool ij_lost(uint64_t tx) {
+    if (g_ij_lost_all) return true;
+    for (int i = 0; i < g_nij_lost; i++) if (g_ij_lost[i] == tx) return true;
+    return false;
+}
+
+static void ij_mark_lost(uint64_t tx) {
+    if (ij_lost(tx)) return;
+    if (g_nij_lost < IJ_MAX_LOST) g_ij_lost[g_nij_lost++] = tx;
+    else g_ij_lost_all = true;
+}
+
+static void ij_note(MemIndex* ix, const TableSchema* ts, const Tuple* t, RID rid, bool add) {
+    uint64_t tx = g_ij_tx ? g_ij_tx() : 0;
+    if (!tx || ij_lost(tx)) return;
+    char key[KEY_BUF];
+    if (!tuple_key(ts, t, ix->cols, ix->ncols, key, sizeof(key))) return;    // NULL: nella chiave non c'è
+    if (g_nij == g_capij) {
+        int nc = g_capij ? g_capij * 2 : 256;
+        IjEnt* g = nc <= (1 << 22) ? sv_try_realloc(g_ij, sizeof(IjEnt) * (size_t)nc) : NULL;
+        if (!g) { ij_mark_lost(tx); return; }
+        g_ij = g;
+        g_capij = nc;
+    }
+    char* kc = sv_try_malloc(strlen(key) + 1);
+    if (!kc) { ij_mark_lost(tx); return; }
+    strcpy(kc, key);
+    g_ij[g_nij++] = (IjEnt){ tx, g_ij_seq ? g_ij_seq() : 0, ix, kc, rid, add };
+}
+
+static void ij_forget_index(const MemIndex* ix) {
+    for (int i = 0; i < g_nij; i++) if (g_ij[i].ix == ix) g_ij[i].ix = NULL;
+}
+
+// voci della transazione tx dopo la sequenza after: via (COMMIT: after = 0; ROLLBACK [TO]: dopo l'annullamento)
+void executor_index_journal_drop(uint64_t tx, uint64_t after) {
+    int k = 0;
+    for (int i = 0; i < g_nij; i++) {
+        if (g_ij[i].tx == tx && g_ij[i].seq > after) { free(g_ij[i].key); continue; }
+        g_ij[k++] = g_ij[i];
+    }
+    g_nij = k;
+    if (after == 0) {
+        for (int i = 0; i < g_nij_lost; i++) if (g_ij_lost[i] == tx) { g_ij_lost[i] = g_ij_lost[--g_nij_lost]; break; }
+        if (g_nij == 0) { g_ij_lost_all = false; g_nij_lost = 0; }
+    }
+    if (g_nij == 0 && g_capij > 4096) { free(g_ij); g_ij = NULL; g_capij = 0; }
+}
+
+// dopo l'annullamento delle modifiche di tx più recenti di after sulla tabella: indici riportati indietro con il
+// diario (o scartati se non si può), mappa dello spazio libero da rifare
+void executor_index_undo(BufferPool* bp, const char* db, const char* table, uint32_t root_page_id, uint64_t tx, uint64_t after) {
+    if (ij_lost(tx)) { executor_invalidate_table(bp, db, table, root_page_id); return; }
+    mi_free_zombies();
+    MemIndex** pp = &g_mem_indexes;
+    while (*pp) {                                      // costruiti dopo il punto di ritorno: scartati
+        MemIndex* ix = *pp;
+        if (!strcasecmp(ix->db, db) && !strcasecmp(ix->table, table) && ix->built_seq > after) { *pp = ix->next; mi_free(ix); }
+        else pp = &ix->next;
+    }
+    for (int i = g_nij - 1; i >= 0; i--) {
+        IjEnt* e = &g_ij[i];
+        if (e->tx != tx || e->seq <= after || !e->ix) continue;
+        MemIndex* ix = e->ix;
+        if (strcasecmp(ix->db, db) || strcasecmp(ix->table, table)) continue;
+        if (e->add) {                                  // chiave aggiunta: via il suo RID
+            SMSlot* s = sm_slot(&ix->map, e->key, false);
+            if (!s || s->val < 0) continue;
+            RidList* l = &ix->lists[s->val];
+            for (int k = 0; k < l->n; k++)
+                if (l->r[k].page_id == e->rid.page_id && l->r[k].slot_id == e->rid.slot_id) { l->r[k] = l->r[--l->n]; break; }
+        } else if ((ix->base_root && !mi_fault_in(ix, e->key)) || !mi_add_key(ix, e->key, e->rid)) {
+            executor_invalidate_table(bp, db, table, root_page_id);    // (memoria / albero illeggibile)
+            return;
+        }
+    }
+    heap_cache_forget(bp, root_page_id);
+}
+
 static void mi_on_insert(const char* db, TableSchema* ts, const Tuple* t, RID rid) {
     for (MemIndex* ix = g_mem_indexes; ix; ix = ix->next) {
         if (strcasecmp(ix->db, db) || strcasecmp(ix->table, ts->name)) continue;
@@ -1830,6 +1982,7 @@ static void mi_on_insert(const char* db, TableSchema* ts, const Tuple* t, RID ri
             mi_invalidate_table(db, ts->name);   // memoria esaurita: meglio ricostruire che usarlo incompleto
             return;
         }
+        ij_note(ix, ts, t, rid, true);
     }
 }
 
@@ -1837,6 +1990,7 @@ static void mi_on_delete(const char* db, TableSchema* ts, const Tuple* t, RID ri
     for (MemIndex* ix = g_mem_indexes; ix; ix = ix->next) {
         if (strcasecmp(ix->db, db) || strcasecmp(ix->table, ts->name)) continue;
         mi_remove_tuple(ix, ts, t, rid);
+        ij_note(ix, ts, t, rid, false);
     }
 }
 
@@ -1935,24 +2089,46 @@ void executor_trees_count(Catalog* c) {
 }
 
 // prima di registrare una modifica della tabella: i suoi alberi non valgono più
+static MemIndex* mi_get_cols(ExecCtx* ctx, const char* db, TableSchema* ts, const int* cols, int ncols);
+static bool mi_exists(const char* db, const char* table, const char* col);
+
+// prima di abbandonare gli alberi di una tabella: un indice in memoria "pigro" per ognuno che ancora non ce l'ha
+// (base = l'albero, in memoria solo le chiavi cambiate). Senza, la prima scrittura dopo un riavvio faceva costruire
+// ogni altro indice della tabella leggendola tutta (P1.15: 1 678 pagine per 3 scritture e 5 ricerche su 20 000
+// righe). Le pagine dell'albero restano finché un indice le usa (executor_trees_garbage)
+static void trees_adopt(ExecCtx* ctx, TableSchema* ts) {
+    Database* db = catalog_current_db(ctx->catalog);
+    if (!db) return;
+    for (int i = 0; i < ts->ntrees; i++) {
+        int col = ts->tree_col[i];
+        if (col < 0 || col >= ts->num_columns || tree_for(ts, col) < 0) continue;
+        if (mi_exists(db->name, ts->name, ts->columns[col].name)) continue;
+        (void)mi_get_cols(ctx, db->name, ts, &col, 1);          // pigro: nessuna lettura della tabella
+    }
+}
+
 static void trees_on_write(ExecCtx* ctx, TableSchema* ts) {
     bool any = false;
-    if (ts->ntrees) { trees_drop(ts); any = true; }
+    if (ts->ntrees) { trees_adopt(ctx, ts); trees_drop(ts); any = true; }
     if (g_trees_live > 0 && (g_tw_ts != ts || g_tw_gen != g_stmt_gen)) {      // ts copia di lavoro: quella del catalogo
         g_tw_ts = ts;
         g_tw_gen = g_stmt_gen;
         Database* db = catalog_current_db(ctx->catalog);
         TableSchema* c = db ? catalog_get_table(ctx->catalog, db->name, ts->name) : NULL;
-        if (c && c != ts && c->ntrees) { trees_drop(c); any = true; }
+        if (c && c != ts && c->ntrees) { trees_adopt(ctx, c); trees_drop(c); any = true; }
     }
     if (any && g_tree_hook) g_tree_hook();
 }
+
+// segno della piegatura delle chiavi in un albero su disco: 0 = testo così com'è, 2 = minuscolo UTF-8 (u8case.h).
+// Gli alberi delle versioni precedenti hanno 1 (minuscolo solo ASCII): non coincide più e si ricostruiscono
+static uint8_t tree_ci_mark(const TableSchema* ts, int col) { return col_is_ci(ts, col) ? 2 : 0; }
 
 // albero valido della colonna (-1 = nessuno)
 static int tree_for(const TableSchema* ts, int col) {
     for (int i = 0; i < ts->ntrees; i++)
         if (ts->tree_col[i] == col && ts->tree_root[i] && ts->tree_tabroot[i] == ts->root_page_id && !tree_is_bad(ts->tree_root[i]) &&
-            ts->tree_type[i] == (uint8_t)ts->columns[col].type && ts->tree_ci[i] == (uint8_t)col_is_ci(ts, col)) return i;
+            ts->tree_type[i] == (uint8_t)ts->columns[col].type && ts->tree_ci[i] == tree_ci_mark(ts, col)) return i;
     return -1;
 }
 
@@ -2011,7 +2187,7 @@ int executor_trees_write(ExecCtx* ctx, uint64_t lsn) {
         else { tree_garbage_add(root); continue; }
         ts->tree_col[slot] = (uint16_t)col;
         ts->tree_type[slot] = (uint8_t)ts->columns[col].type;
-        ts->tree_ci[slot] = (uint8_t)col_is_ci(ts, col);
+        ts->tree_ci[slot] = tree_ci_mark(ts, col);
         ts->tree_root[slot] = root;
         ts->tree_tabroot[slot] = ts->root_page_id;
         ts->tree_hasmax[slot] = ix->has_max;
@@ -2025,7 +2201,14 @@ int executor_trees_write(ExecCtx* ctx, uint64_t lsn) {
 //  Sorgenti di righe (FROM / JOIN): tabelle o viste
 // ═════════════════════════════════════════════════════════════════
 
-#define MAX_SOURCES 9            // FROM + 8 JOIN
+#define MAX_SOURCES 61           // FROM + 60 JOIN, come MySQL (maschere delle sorgenti a 64 bit)
+// colonna legata (ASTExpr.bound): sorgente s e colonna c codificate come s * BOUND_STRIDE + c + 1 (0 = non legata,
+// negativo = alias della SELECT). Prima il passo era il letterale 1024, uguale per coincidenza a SV_MAX_COLUMNS (CR-B3)
+#define BOUND_STRIDE      SV_MAX_COLUMNS
+#define BOUND_MAKE(s, c)  ((s) * BOUND_STRIDE + (c) + 1)
+#define BOUND_SRC(b)      (((b) - 1) / BOUND_STRIDE)
+#define BOUND_COL(b)      (((b) - 1) % BOUND_STRIDE)
+_Static_assert((long long)(MAX_SOURCES + 64) * BOUND_STRIDE < 2147483647LL, "ASTExpr.bound: sorgenti x colonne oltre un int");
 
 // arena: righe lette da una tabella allocate a blocchi e liberate tutte insieme
 typedef struct ArenaBlk { struct ArenaBlk* next; size_t used, cap; } ArenaBlk;
@@ -2086,8 +2269,8 @@ static void src_need(Source* S, int c) { if (S && c >= 0 && c < SV_MAX_COLUMNS &
 // scende solo in left / right / args: un riferimento in un'altra parte dell'albero resta contato (si copia)
 static void need_minus(uint8_t* need, int s, const struct ASTExpr* e) {
     if (!e || e->type == EXPR_SUBQUERY) return;
-    if (e->type == EXPR_COLUMN && e->bound > 0 && e->outer == 0 && (e->bound - 1) / 1024 == s) {
-        int c = (e->bound - 1) % 1024;
+    if (e->type == EXPR_COLUMN && e->bound > 0 && e->outer == 0 && BOUND_SRC(e->bound) == s) {
+        int c = BOUND_COL(e->bound);
         if (need[c] > 0 && need[c] < 255) need[c]--;
         return;
     }
@@ -2200,7 +2383,7 @@ static const FuncDef FUNCS[] = {
     { "LENGTH", 1, 1 }, { "CHAR_LENGTH", 1, 1 }, { "CHARACTER_LENGTH", 1, 1 },
     { "TRIM", 1, 1 }, { "LTRIM", 1, 1 }, { "RTRIM", 1, 1 },
     { "CONCAT", 1, 32 }, { "CONCAT_WS", 2, 32 }, { "SUBSTRING", 2, 3 }, { "SUBSTR", 2, 3 },
-    { "LEFT", 2, 2 }, { "RIGHT", 2, 2 }, { "REPLACE", 3, 3 }, { "REVERSE", 1, 1 },
+    { "LEFT", 2, 2 }, { "RIGHT", 2, 2 }, { "REPLACE", 3, 3 }, { "INSERT", 4, 4 }, { "REVERSE", 1, 1 },
     { "ABS", 1, 1 }, { "ROUND", 1, 2 }, { "FLOOR", 1, 1 }, { "CEIL", 1, 1 }, { "CEILING", 1, 1 },
     { "MOD", 2, 2 }, { "POWER", 2, 2 }, { "POW", 2, 2 }, { "SQRT", 1, 1 }, { "SIGN", 1, 1 },
     { "COALESCE", 1, 32 }, { "IFNULL", 2, 2 }, { "NULLIF", 2, 2 }, { "IF", 3, 3 },
@@ -2237,13 +2420,14 @@ static const FuncDef FUNCS[] = {
     { "GET_LOCK", 2, 2 }, { "RELEASE_LOCK", 1, 1 }, { "IS_FREE_LOCK", 1, 1 }, { "IS_USED_LOCK", 1, 1 }, { "RELEASE_ALL_LOCKS", 0, 0 },
     { "ANY_VALUE", 1, 1 }, { "ISNULL", 1, 1 }, { "VALUES", 1, 1 },
     // operatori e variabili (dal parser)
-    { "__UVAR", 1, 1 }, { "__SYSVAR", 1, 1 }, { "__UASSIGN", 2, 2 }, { "__BITNOT", 1, 1 }, { "__BITAND", 2, 2 },
+    { "__UVAR", 1, 1 }, { "__SYSVAR", 1, 1 }, { "__UASSIGN", 2, 2 }, { "__BITNOT", 1, 1 }, { "__COLLATE", 2, 2 }, { "__BITAND", 2, 2 },
     { "__BITOR", 2, 2 }, { "__BITXOR", 2, 2 }, { "__SHL", 2, 2 }, { "__SHR", 2, 2 }, { "__NSEQ", 2, 2 }, { "__XOR", 2, 2 },
     { "__PIPES", 2, 2 }, { "__ISTRUE", 1, 1 }, { "__ISFALSE", 1, 1 },
     // JSON (modifica e ricerca), testo, date
     { "JSON_SET", 3, 31 }, { "JSON_INSERT", 3, 31 }, { "JSON_REPLACE", 3, 31 }, { "JSON_REMOVE", 2, 32 },
     { "JSON_ARRAY_APPEND", 3, 31 }, { "JSON_KEYS", 1, 2 }, { "JSON_CONTAINS", 2, 3 }, { "JSON_CONTAINS_PATH", 3, 32 },
     { "JSON_SEARCH", 3, 3 }, { "JSON_PRETTY", 1, 1 }, { "JSON_DEPTH", 1, 1 }, { "JSON_MERGE_PATCH", 2, 32 },
+    { "JSON_MERGE_PRESERVE", 2, 32 }, { "JSON_MERGE", 2, 32 }, { "JSON_ARRAY_INSERT", 3, 31 },
     { "JSON_QUOTE", 1, 1 }, { "JSON_STORAGE_SIZE", 1, 1 },
     { "INITCAP", 1, 1 }, { "SPLIT_PART", 3, 3 }, { "TRANSLATE", 3, 3 }, { "CHR", 1, 1 }, { "CONV", 3, 3 },
     { "SOUNDEX", 1, 1 }, { "OVERLAY", 3, 4 }, { "DATE_TRUNC", 2, 2 }, { "DATE_PART", 2, 2 }, { "STARTS_WITH", 2, 2 },
@@ -2270,7 +2454,7 @@ static int find_column(BindCtx* b, const char* qual, const char* col, int* out_s
             if (found && !qual[0] && b->plan) {
                 // colonna di NATURAL JOIN / USING: le due copie sono la stessa colonna
                 int l = plan_using_left(b->plan, s, c);
-                if (l == *out_src * 1024 + *out_col + 1) {
+                if (l == BOUND_MAKE(*out_src, *out_col)) {
                     if (plan_join_type(b->plan, s) == JOIN_RIGHT) { *out_src = s; *out_col = c; }   // il lato che non manca
                     continue;
                 }
@@ -2313,8 +2497,8 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
                 snprintf(rr->col_name, sizeof(rr->col_name), "%s", e->col_name);
                 snprintf(l->table_name, sizeof(l->table_name), "%s", b->src[s].name);
                 snprintf(rr->table_name, sizeof(rr->table_name), "%s", b->src[rk].name);
-                l->bound = s * 1024 + c + 1;
-                rr->bound = rk * 1024 + rc + 1;
+                l->bound = BOUND_MAKE(s, c);
+                rr->bound = BOUND_MAKE(rk, rc);
                 src_need(&b->src[s], c);
                 src_need(&b->src[rk], rc);
                 args[0] = l; args[1] = rr;
@@ -2323,14 +2507,14 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
                 e->args = args; e->nargs = 2; e->depth = 2;
                 return;
             }
-            if (r == 1) { e->bound = s * 1024 + c + 1; src_need(&b->src[s], c); return; }
+            if (r == 1) { e->bound = BOUND_MAKE(s, c); src_need(&b->src[s], c); return; }
             if (r == 0) {
                 // colonna di una query esterna: la subquery è correlata
                 int level = 1;
                 for (BindCtx* o = b->outer; o && r == 0; o = o->outer, level++) {
                     r = find_column(o, e->table_name, e->col_name, &s, &c);
                     if (r == 1) {
-                        e->bound = s * 1024 + c + 1;
+                        e->bound = BOUND_MAKE(s, c);
                         e->outer = level;
                         src_need(&o->src[s], c);
                         // variabile della routine nella query principale di un'istruzione (ripianificata a ogni
@@ -2448,7 +2632,7 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
             for (int i = 0; i < e->nargs; i++) bind_expr(e->args[i], b);
             for (int i = 0; i < e->win->npart; i++) bind_expr(e->win->part[i], b);
             for (int i = 0; i < e->win->nord; i++) bind_expr(e->win->ord[i], b);
-            if (!b->err[0] && !plan_add_window(b->plan, e)) bind_error(b, "Too many window functions (max 16)");
+            if (!b->err[0] && !plan_add_window(b->plan, e)) bind_error(b, "Too many window functions in one query (max 64)");
             return;
         }
         default:
@@ -2467,15 +2651,14 @@ static bool expr_has_agg(const ASTExpr* e) {
 
 // ── valutazione ──
 
+// nome della funzione SQL f uguale al letterale lit? Prima la lunghezza (costante) e il primo carattere, poi memcmp:
+// le catene di centinaia di confronti per riga diventano quasi solo confronti fra interi (CR-M2)
+#define FIS(lit) (flen == sizeof(lit) - 1 && f[0] == (lit)[0] && !memcmp(f, (lit), sizeof(lit) - 1))
 static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out);
 static bool eval_cond(ASTExpr* e, EvalCtx* c);
 static void eval_subquery(ASTExpr* e, EvalCtx* c, EvalVal* out);
 static void ev_from_oval(EvalVal* v, const SortKey* o);
 
-static bool like_match(const char* s, const char* p);
-
-// testo di un valore (numeri formattati); per i NULL: ""
-static const char* ev_str(const EvalVal* v) { return ev_s(v); }
 
 static int utf8_chars(const char* s) {
     int n = 0;
@@ -2534,8 +2717,8 @@ void executor_uservars_free(UserVars* v) {
     free(v->v);
     for (int i = 0; i < v->nprep; i++) free(v->prep[i].sql);
     free(v->prep);
+    if (g_uvars == v) g_uvars = NULL;           // prima di free: dopo, il valore di v è indeterminato (CR-B4)
     free(v);
-    if (g_uvars == v) g_uvars = NULL;
 }
 
 static UVar* uservar_find(const char* name, bool create) {
@@ -2671,11 +2854,22 @@ static void ev_unsigned(EvalCtx* c, EvalVal* out, uint64_t r) {
 }
 
 // operatori di MySQL e variabili, scritti dal parser come funzioni interne "__..."
+// collation esplicita di un operando (x COLLATE nome, BINARY x): 1 = distingue maiuscole e minuscole (binary, _bin,
+// _cs), 2 = no (_ci), 0 = nessuna. Come in MySQL prevale su quella della colonna
+static int coll_kind(const ASTExpr* x) {
+    if (!x || x->type != EXPR_FUNC || strcmp(x->func, "__COLLATE") || x->nargs != 2 || !x->args[1]->str_val) return 0;
+    const char* n = x->args[1]->str_val;
+    size_t l = strlen(n);
+    if (l >= 3 && !strcasecmp(n + l - 3, "_ci")) return 2;
+    return 1;
+}
+
 static bool eval_internal(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     const char* f = e->func;
+    const size_t flen = strlen(f);                       // per FIS: confronti per lunghezza prima (CR-M2)
     if (f[0] != '_' || f[1] != '_') return false;
-    if (!strcmp(f, "__UVAR"))   { uservar_get(e->args[0]->str_val, out); return true; }
-    if (!strcmp(f, "__SYSVAR")) {
+    if (FIS("__UVAR"))   { uservar_get(e->args[0]->str_val, out); return true; }
+    if (FIS("__SYSVAR")) {
         if (!strcasecmp(e->args[0]->str_val, "foreign_key_checks")) { ev_int(out, executor_fk_checks()); return true; }
         if (!strcasecmp(e->args[0]->str_val, "cache_size")) { ev_int(out, db_cache_size()); return true; }
         if (!strcasecmp(e->args[0]->str_val, "synchronous")) {
@@ -2690,7 +2884,7 @@ static bool eval_internal(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         else { out->null = false; out->is_num = out->is_int = false; out->ci = false; out->is_dec = false; out->str = v; }
         return true;
     }
-    if (!strcmp(f, "__UASSIGN")) {
+    if (FIS("__UASSIGN")) {
         EvalVal v;
         eval_expr(e->args[1], c, &v);
         uservar_set(e->args[0]->str_val, &v);
@@ -2699,19 +2893,24 @@ static bool eval_internal(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     }
     EvalVal a, b;
     eval_expr(e->args[0], c, &a);
-    if (!strcmp(f, "__ISTRUE") || !strcmp(f, "__ISFALSE")) {   // x IS TRUE / IS FALSE: mai NULL
+    if (FIS("__ISTRUE") || FIS("__ISFALSE")) {   // x IS TRUE / IS FALSE: mai NULL
         int t = ev_truth(&a);
         ev_int(out, f[4] == 'T' ? t == 1 : t == 0);
         return true;
     }
-    if (!strcmp(f, "__BITNOT")) { if (a.null) ev_null(out); else ev_unsigned(c, out, ~bit_operand(&a)); return true; }
+    if (FIS("__BITNOT")) { if (a.null) ev_null(out); else ev_unsigned(c, out, ~bit_operand(&a)); return true; }
+    if (FIS("__COLLATE")) {                             // x COLLATE nome, BINARY x: il valore, con la collation scelta
+        ev_copy(out, &a);
+        if (!a.null && !a.is_num) out->ci = coll_kind(e) == 2;
+        return true;
+    }
     eval_expr(e->args[1], c, &b);
-    if (!strcmp(f, "__NSEQ")) {                                // a <=> b: NULL <=> NULL è vero
+    if (FIS("__NSEQ")) {                                // a <=> b: NULL <=> NULL è vero
         if (a.null || b.null) ev_int(out, a.null && b.null);
         else ev_int(out, ev_cmp(&a, &b) == 0);
         return true;
     }
-    if (!strcmp(f, "__PIPES")) {
+    if (FIS("__PIPES")) {
         if (executor_mysql_mode()) {                           // MySQL: || è OR
             int x = ev_truth(&a), y = ev_truth(&b);
             if (x == 1 || y == 1) ev_int(out, 1);
@@ -2730,18 +2929,18 @@ static bool eval_internal(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         free(buf);
         return true;
     }
-    if (!strcmp(f, "__XOR")) {
+    if (FIS("__XOR")) {
         int x = ev_truth(&a), y = ev_truth(&b);
         if (x < 0 || y < 0) ev_null(out); else ev_int(out, x != y);
         return true;
     }
     if (a.null || b.null) { ev_null(out); return true; }
     uint64_t x = bit_operand(&a), y = bit_operand(&b), r;
-    if (!strcmp(f, "__BITAND"))      r = x & y;
-    else if (!strcmp(f, "__BITOR"))  r = x | y;
-    else if (!strcmp(f, "__BITXOR")) r = x ^ y;
-    else if (!strcmp(f, "__SHL"))    r = y >= 64 ? 0 : x << y;
-    else if (!strcmp(f, "__SHR"))    r = y >= 64 ? 0 : x >> y;
+    if (FIS("__BITAND"))      r = x & y;
+    else if (FIS("__BITOR"))  r = x | y;
+    else if (FIS("__BITXOR")) r = x ^ y;
+    else if (FIS("__SHL"))    r = y >= 64 ? 0 : x << y;
+    else if (FIS("__SHR"))    r = y >= 64 ? 0 : x >> y;
     else return false;
     ev_unsigned(c, out, r);
     return true;
@@ -2879,9 +3078,10 @@ static void seq_remember(const Seq* q) {                       // CURRVAL / LAST
 // NEXTVAL / CURRVAL / SETVAL / LASTVAL
 static bool eval_sequence(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     const char* f = e->func;
-    if (strcmp(f, "NEXTVAL") && strcmp(f, "CURRVAL") && strcmp(f, "SETVAL") && strcmp(f, "LASTVAL")) return false;
+    const size_t flen = strlen(f);                       // per FIS: confronti per lunghezza prima (CR-M2)
+    if ((!FIS("NEXTVAL")) && (!FIS("CURRVAL")) && (!FIS("SETVAL")) && (!FIS("LASTVAL"))) return false;
     if (g_describe) { ev_null(out); return true; }      // PREPARE: solo la forma del risultato, nessun effetto
-    if (!strcmp(f, "LASTVAL")) {
+    if (FIS("LASTVAL")) {
         uservar_get("\x01seq.last", out);
         if (out->null) ctx_error(c, "%s", "LASTVAL is not yet defined in this session");
         return true;
@@ -2893,14 +3093,14 @@ static bool eval_sequence(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     snprintf(ref, sizeof(ref), "%.129s", ev_s(&a));
     Seq* q = seq_lookup(c->x, ref, err, sizeof(err));
     if (!q) { ctx_error(c, "%s", err); ev_null(out); return true; }
-    if (!strcmp(f, "CURRVAL")) {
+    if (FIS("CURRVAL")) {
         char key[160];
         snprintf(key, sizeof(key), "\x01seq.%s.%s", q->db, q->name);
         uservar_get(key, out);
         if (out->null) ctx_error(c, "currval of sequence '%s' is not yet defined in this session", q->name);
         return true;
     }
-    if (!strcmp(f, "SETVAL")) {
+    if (FIS("SETVAL")) {
         EvalVal v, called;
         eval_expr(e->args[1], c, &v);
         if (e->nargs > 2) eval_expr(e->args[2], c, &called); else ev_int(&called, 1);
@@ -2956,6 +3156,7 @@ static QueryResult* exec_sequence(ExecCtx* ctx, ASTNode* n) {
         return result_ok_msg(0);
     }
     if (n->seq.op == 0) {                                      // CREATE
+        if (!sv_name_ok(n->seq.name)) return bad_name_error("sequence");
         if (q) {
             if (n->if_exists) return result_ok_msg(0);
             snprintf(msg, sizeof(msg), "Sequence '%.64s' already exists", n->seq.name);
@@ -2998,26 +3199,16 @@ static QueryResult* exec_sequence(ExecCtx* ctx, ASTNode* n) {
     return result_ok_msg(0);
 }
 
-// buffer di testo che cresce (risultati delle funzioni di testo)
-typedef struct { char* d; size_t n, cap; bool err; } TextBuf;
+// buffer di testo che cresce (risultati delle funzioni di testo): il buffer comune, limitato a EV_TEXT_MAX
+typedef SvStrBuf TextBuf;
 static void tb_put(TextBuf* t, const char* s, size_t n) {
-    if (t->err) return;
-    if (t->n + n + 1 > t->cap) {
-        if (t->n + n + 1 > EV_TEXT_MAX + 1) { t->err = true; return; }
-        size_t nc = t->cap ? t->cap * 2 : 256;
-        while (nc < t->n + n + 1) nc *= 2;
-        char* nd = sv_realloc(t->d, nc);
-        if (!nd) { t->err = true; return; }
-        t->d = nd; t->cap = nc;
-    }
-    memcpy(t->d + t->n, s, n);
-    t->n += n;
-    t->d[t->n] = '\0';
+    if (!t->max) t->max = EV_TEXT_MAX;
+    svsb_put(t, s, n);
 }
 static void tb_result(EvalCtx* c, EvalVal* out, TextBuf* t) {
-    if (t->err) { ctx_error(c, "%s", "String result longer than 16 MB"); ev_null(out); }
-    else ev_set_text(c, out, t->d ? t->d : "", t->n);
-    free(t->d);
+    if (t->oom) { ctx_error(c, "%s", t->toolong ? "String result longer than 16 MB" : "Out of memory"); ev_null(out); }
+    else ev_set_text(c, out, t->p ? t->p : "", t->n);
+    svsb_free(t);
 }
 
 static void now_text(char* buf, size_t n, bool date_only) {
@@ -3502,19 +3693,32 @@ static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0
 
 // ── valutazione ──
 // true se f è una funzione di questo blocco (e out è il risultato)
+// una ricerca si è fermata al limite di passi: errore dello statement, come ER_REGEXP_TIME_OUT di MySQL, invece di
+// un "nessuna corrispondenza" falso ripetuto per ogni riga
+static bool regex_limit_error(EvalCtx* c, EvalVal* out) {
+    if (!sv_regex_take_limit()) return false;
+    const char* why = sv_thread_cancelled() ? "Query cancelled"
+                    : "Regular expression too expensive for this value (backtracking limit): simplify the pattern";
+    if (!sv_thread_cancelled()) sv_scan_abort(why);    // le righe restanti non cambierebbero l'esito
+    ctx_error(c, "%s", why);
+    ev_null(out);
+    return true;
+}
+
 static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     const char* f = e->func;
+    const size_t flen = strlen(f);                       // per FIS: confronti per lunghezza prima (CR-M2)
     // senza argomenti
-    if (!strcmp(f, "FOUND_ROWS")) { ev_int(out, g_found_rows); return true; }
-    if (!strcmp(f, "ROW_COUNT")) { ev_int(out, g_row_count); return true; }
-    if (!strcmp(f, "CONNECTION_ID")) { ev_int(out, (int64_t)(((uintptr_t)&g_found_rows) >> 4) & 0x7fffffff); return true; }
-    if (!strcmp(f, "USER") || !strcmp(f, "CURRENT_USER") || !strcmp(f, "SESSION_USER") || !strcmp(f, "SYSTEM_USER")) {
+    if (FIS("FOUND_ROWS")) { ev_int(out, g_found_rows); return true; }
+    if (FIS("ROW_COUNT")) { ev_int(out, g_row_count); return true; }
+    if (FIS("CONNECTION_ID")) { ev_int(out, (int64_t)(((uintptr_t)&g_found_rows) >> 4) & 0x7fffffff); return true; }
+    if (FIS("USER") || FIS("CURRENT_USER") || FIS("SESSION_USER") || FIS("SYSTEM_USER")) {
         ev_set_text(c, out, "root@localhost", 14);
         return true;
     }
-    if (!strcmp(f, "PI")) { ev_num(out, 3.141592653589793); return true; }
-    if (!strcmp(f, "RAND") && e->nargs == 0) { ev_num(out, (double)rand() / ((double)RAND_MAX + 1.0)); return true; }
-    if (!strcmp(f, "UUID")) {
+    if (FIS("PI")) { ev_num(out, 3.141592653589793); return true; }
+    if (FIS("RAND") && e->nargs == 0) { ev_num(out, (double)rand() / ((double)RAND_MAX + 1.0)); return true; }
+    if (FIS("UUID")) {
         char b[40];
         unsigned r[8];
         for (int i = 0; i < 8; i++) r[i] = (unsigned)rand() & 0xffff;
@@ -3522,20 +3726,20 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_set_text(c, out, b, strlen(b));
         return true;
     }
-    if (!strcmp(f, "UUID_SHORT")) { ev_int(out, ((int64_t)time(NULL) << 24) | (rand() & 0xffffff)); return true; }
-    if (!strcmp(f, "RELEASE_ALL_LOCKS")) { ev_int(out, 0); return true; }
-    if (!strcmp(f, "UTC_TIMESTAMP") || !strcmp(f, "UTC_DATE") || !strcmp(f, "UTC_TIME") || !strcmp(f, "SYSDATE") ||
-        !strcmp(f, "LOCALTIME") || !strcmp(f, "LOCALTIMESTAMP") || !strcmp(f, "CURTIME") || !strcmp(f, "CURRENT_TIME")) {
+    if (FIS("UUID_SHORT")) { ev_int(out, ((int64_t)time(NULL) << 24) | (rand() & 0xffffff)); return true; }
+    if (FIS("RELEASE_ALL_LOCKS")) { ev_int(out, 0); return true; }
+    if (FIS("UTC_TIMESTAMP") || FIS("UTC_DATE") || FIS("UTC_TIME") || FIS("SYSDATE") ||
+        FIS("LOCALTIME") || FIS("LOCALTIMESTAMP") || FIS("CURTIME") || FIS("CURRENT_TIME")) {
         MyDT t;
         local_now(&t, !strncmp(f, "UTC_", 4));
         char b[32];
-        if (!strcmp(f, "UTC_DATE")) mydt_text(&t, false, b, sizeof(b));
-        else if (!strcmp(f, "UTC_TIME") || !strcmp(f, "CURTIME") || !strcmp(f, "CURRENT_TIME")) snprintf(b, sizeof(b), "%02d:%02d:%02d", t.h, t.mi, t.s);
+        if (FIS("UTC_DATE")) mydt_text(&t, false, b, sizeof(b));
+        else if (FIS("UTC_TIME") || FIS("CURTIME") || FIS("CURRENT_TIME")) snprintf(b, sizeof(b), "%02d:%02d:%02d", t.h, t.mi, t.s);
         else mydt_text(&t, true, b, sizeof(b));
         ev_set_text(c, out, b, strlen(b));
         return true;
     }
-    if (!strcmp(f, "UNIX_TIMESTAMP") && e->nargs == 0) { ev_int(out, (int64_t)time(NULL)); return true; }
+    if (FIS("UNIX_TIMESTAMP") && e->nargs == 0) { ev_int(out, (int64_t)time(NULL)); return true; }
 
     // funzioni con argomenti (valutati qui, fino a 32)
     static const char* const MINE[] = {
@@ -3549,14 +3753,17 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         "QUARTER", "MONTHNAME", "DAYNAME", "LAST_DAY", "DATEDIFF", "TIMEDIFF", "TIMESTAMPDIFF", "DATE_ADD", "DATE_SUB",
         "ADDDATE", "SUBDATE", "__INTERVAL", "EXTRACT", "MAKEDATE", "MAKETIME", "TO_DAYS", "FROM_DAYS", "TO_SECONDS",
         "SEC_TO_TIME", "TIME_TO_SEC", "CONVERT_TZ", "CAST", "SLEEP", "GET_LOCK", "RELEASE_LOCK", "IS_FREE_LOCK",
-        "IS_USED_LOCK", "ANY_VALUE", "ISNULL", "VALUES", "LAST_INSERT_ID", "CHAR_LENGTH_BYTES" };
-    bool mine = false;
-    for (size_t i = 0; i < sizeof(MINE) / sizeof(MINE[0]) && !mine; i++) mine = !strcmp(f, MINE[i]);
-    if (!mine) return false;
+        "IS_USED_LOCK", "ANY_VALUE", "ISNULL", "VALUES", "LAST_INSERT_ID", "CHAR_LENGTH_BYTES", "INSERT" };
+    if (e->fmine == 0) {                                   // dipende solo dal nome: calcolato una volta per nodo
+        bool mine = false;
+        for (size_t i = 0; i < sizeof(MINE) / sizeof(MINE[0]) && !mine; i++) mine = !strcmp(f, MINE[i]);
+        e->fmine = mine ? 1 : -1;
+    }
+    if (e->fmine < 0) return false;
 
     // DATE_ADD(d, INTERVAL n unità): l'INTERVAL non è un valore, si legge qui
-    if ((!strcmp(f, "DATE_ADD") || !strcmp(f, "DATE_SUB") || !strcmp(f, "ADDDATE") || !strcmp(f, "SUBDATE")) && e->nargs == 2) {
-        int sign = (!strcmp(f, "DATE_SUB") || !strcmp(f, "SUBDATE")) ? -1 : 1;
+    if ((FIS("DATE_ADD") || FIS("DATE_SUB") || FIS("ADDDATE") || FIS("SUBDATE")) && e->nargs == 2) {
+        int sign = (FIS("DATE_SUB") || FIS("SUBDATE")) ? -1 : 1;
         EvalVal dv, iv;
         eval_expr(e->args[0], c, &dv);
         ASTExpr* ie = e->args[1];
@@ -3567,7 +3774,7 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         if (!mydt_parse(ev_s(&dv), &t) || !t.has_date) { ev_null(out); return true; }
         const char* unit = interval && ie->args[1]->str_val ? ie->args[1]->str_val : "DAY";   // ADDDATE(d, n): giorni
         char amt[64], b2[40];
-        snprintf(amt, sizeof(amt), "%s", ev_s(&iv));
+        snprintf(amt, sizeof(amt), "%.63s", ev_s(&iv));
         bool date_only = !t.has_time && (!strcmp(unit, "DAY") || !strcmp(unit, "WEEK") || !strcmp(unit, "MONTH") ||
                                          !strcmp(unit, "QUARTER") || !strcmp(unit, "YEAR") || !strcmp(unit, "YEAR_MONTH"));
         if (!mydt_add(&t, unit, amt, sign)) { ev_null(out); return true; }
@@ -3579,8 +3786,8 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     int na = e->nargs < 32 ? e->nargs : 32;
     EvalVal a[na > 0 ? na : 1];                                // solo gli argomenti che ci sono (stack dei thread)
     // ELT, FIELD, GREATEST, LEAST, ISNULL, CHAR, CONCAT-like: i NULL hanno regole proprie
-    bool null_ok = !strcmp(f, "FIELD") || !strcmp(f, "ELT") || !strcmp(f, "ISNULL") || !strcmp(f, "CHAR") || !strcmp(f, "VALUES") ||
-                   !strcmp(f, "ANY_VALUE") || !strcmp(f, "LAST_INSERT_ID") || !strcmp(f, "QUOTE") || !strcmp(f, "CAST");
+    bool null_ok = FIS("FIELD") || FIS("ELT") || FIS("ISNULL") || FIS("CHAR") || FIS("VALUES") ||
+                   FIS("ANY_VALUE") || FIS("LAST_INSERT_ID") || FIS("QUOTE") || FIS("CAST");
     for (int i = 0; i < na; i++) {
         eval_expr(e->args[i], c, &a[i]);
         if (a[i].null && !null_ok) { ev_null(out); return true; }
@@ -3591,14 +3798,14 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     char b[128];
     TextBuf tb = {0};
 
-    if (!strcmp(f, "ISNULL")) { ev_int(out, a[0].null ? 1 : 0); return true; }
-    if (!strcmp(f, "ANY_VALUE") || !strcmp(f, "VALUES")) { if (a[0].null) ev_null(out); else ev_copy(out, &a[0]); return true; }
-    if (!strcmp(f, "LAST_INSERT_ID")) {                        // LAST_INSERT_ID(x): lo imposta e lo restituisce
+    if (FIS("ISNULL")) { ev_int(out, a[0].null ? 1 : 0); return true; }
+    if (FIS("ANY_VALUE") || FIS("VALUES")) { if (a[0].null) ev_null(out); else ev_copy(out, &a[0]); return true; }
+    if (FIS("LAST_INSERT_ID")) {                        // LAST_INSERT_ID(x): lo imposta e lo restituisce
         if (na == 1 && !a[0].null) g_last_insert_id = (int64_t)N(0);
         ev_int(out, g_last_insert_id);
         return true;
     }
-    if (!strcmp(f, "QUOTE")) {
+    if (FIS("QUOTE")) {
         if (a[0].null) { ev_set_text(c, out, "NULL", 4); return true; }
         tb_put(&tb, "'", 1);
         for (const char* p = S(0); *p; p++) { if (*p == '\'' || *p == '\\') tb_put(&tb, "\\", 1); tb_put(&tb, p, 1); }
@@ -3606,9 +3813,9 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         tb_result(c, out, &tb);
         return true;
     }
-    if (!strcmp(f, "LOCATE") || !strcmp(f, "INSTR")) {         // LOCATE(sub, s [, pos]), INSTR(s, sub): posizione (1..), 0 = no
-        const char* sub = !strcmp(f, "INSTR") ? S(1) : S(0);
-        const char* s = !strcmp(f, "INSTR") ? S(0) : S(1);
+    if (FIS("LOCATE") || FIS("INSTR")) {         // LOCATE(sub, s [, pos]), INSTR(s, sub): posizione (1..), 0 = no
+        const char* sub = FIS("INSTR") ? S(1) : S(0);
+        const char* s = FIS("INSTR") ? S(0) : S(1);
         long long from = na > 2 ? I(2) : 1;
         if (from < 1) { ev_int(out, 0); return true; }
         const char* start = utf8_at(s, (int)(from - 1));
@@ -3622,7 +3829,7 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_int(out, pos);
         return true;
     }
-    if (!strcmp(f, "LPAD") || !strcmp(f, "RPAD")) {
+    if (FIS("LPAD") || FIS("RPAD")) {
         const char* s = S(0);
         long long len = I(1);
         const char* pad = S(2);
@@ -3636,13 +3843,29 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             const char* p = pad;
             while (*p && k < need) { const char* q = utf8_at(p, 1); tb_put(&padb, p, (size_t)(q - p)); p = q; k++; }
         }
-        if (f[0] == 'L') { tb_put(&tb, padb.d ? padb.d : "", padb.n); tb_put(&tb, s, strlen(s)); }
-        else { tb_put(&tb, s, strlen(s)); tb_put(&tb, padb.d ? padb.d : "", padb.n); }
-        free(padb.d);
+        if (f[0] == 'L') { tb_put(&tb, padb.p ? padb.p : "", padb.n); tb_put(&tb, s, strlen(s)); }
+        else { tb_put(&tb, s, strlen(s)); tb_put(&tb, padb.p ? padb.p : "", padb.n); }
+        free(padb.p);
         tb_result(c, out, &tb);
         return true;
     }
-    if (!strcmp(f, "REPEAT") || !strcmp(f, "SPACE")) {
+    if (FIS("INSERT")) {                               // INSERT(str, pos, len, new) come MySQL
+        const char* s = S(0);
+        int chars = utf8_chars(s);
+        double dp = N(1), dl = N(2);
+        if (dp < 1 || dp > chars) { ev_set_text(c, out, s, strlen(s)); return true; }   // posizione fuori: intatta
+        int64_t pos = (int64_t)dp;
+        int64_t len = dl < 0 || dl > chars ? chars : (int64_t)dl;                     // negativa o oltre: fino in fondo
+        if (len > chars - pos + 1) len = chars - pos + 1;
+        const char* b0 = utf8_at(s, (int)(pos - 1));
+        const char* b1 = utf8_at(b0, (int)len);
+        tb_put(&tb, s, (size_t)(b0 - s));
+        tb_put(&tb, S(3), strlen(S(3)));
+        tb_put(&tb, b1, strlen(b1));
+        tb_result(c, out, &tb);
+        return true;
+    }
+    if (FIS("REPEAT") || FIS("SPACE")) {
         bool sp = f[0] == 'S';
         long long n = sp ? I(0) : I(1);
         const char* s = sp ? " " : S(0);
@@ -3653,19 +3876,19 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         tb_result(c, out, &tb);
         return true;
     }
-    if (!strcmp(f, "FIELD")) {                                  // FIELD(x, a, b, ...): posizione di x (0 = assente)
+    if (FIS("FIELD")) {                                  // FIELD(x, a, b, ...): posizione di x (0 = assente)
         if (a[0].null) { ev_int(out, 0); return true; }
         for (int i = 1; i < na; i++) if (!a[i].null && ev_cmp(&a[0], &a[i]) == 0) { ev_int(out, i); return true; }
         ev_int(out, 0);
         return true;
     }
-    if (!strcmp(f, "ELT")) {
+    if (FIS("ELT")) {
         long long k = a[0].null ? 0 : I(0);
         if (k < 1 || k >= na || a[k].null) { ev_null(out); return true; }
         ev_copy(out, &a[k]);
         return true;
     }
-    if (!strcmp(f, "FIND_IN_SET")) {                            // FIND_IN_SET('b', 'a,b,c') = 2
+    if (FIS("FIND_IN_SET")) {                            // FIND_IN_SET('b', 'a,b,c') = 2
         const char* x = S(0);
         const char* list = S(1);
         size_t xl = strlen(x);
@@ -3680,7 +3903,7 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_int(out, 0);
         return true;
     }
-    if (!strcmp(f, "SUBSTRING_INDEX")) {                        // SUBSTRING_INDEX('a.b.c', '.', 2) = 'a.b'
+    if (FIS("SUBSTRING_INDEX")) {                        // SUBSTRING_INDEX('a.b.c', '.', 2) = 'a.b'
         const char* s = S(0);
         const char* d = S(1);
         long long n = I(2);
@@ -3708,13 +3931,21 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_set_text(c, out, s, sl);
         return true;
     }
-    if (!strcmp(f, "ASCII") || !strcmp(f, "ORD")) { ev_int(out, (unsigned char)S(0)[0]); return true; }
-    if (!strcmp(f, "CHAR")) {                                   // byte veri, anche CHAR(0) (binesc.h)
+    if (FIS("ASCII")) { ev_int(out, (unsigned char)S(0)[0]); return true; }
+    if (FIS("ORD")) {                                   // MySQL: i byte del primo carattere come numero (ORD('à') = 50080)
+        const unsigned char* u = (const unsigned char*)S(0);
+        int n = !u[0] ? 0 : u[0] < 0x80 ? 1 : u[0] >= 0xF0 ? 4 : u[0] >= 0xE0 ? 3 : u[0] >= 0xC0 ? 2 : 1;
+        int64_t v = 0;
+        for (int i = 0; i < n && u[i]; i++) v = v * 256 + u[i];
+        ev_int(out, v);
+        return true;
+    }
+    if (FIS("CHAR")) {                                   // byte veri, anche CHAR(0) (binesc.h)
         for (int i = 0; i < na; i++) if (!a[i].null) { long long v = I(i); char e2[2]; tb_put(&tb, e2, sv_bin_put((uint8_t)(v & 0xff), e2)); }
         tb_result(c, out, &tb);
         return true;
     }
-    if (!strcmp(f, "HEX")) {
+    if (FIS("HEX")) {
         if (a[0].is_num) { snprintf(b, sizeof(b), "%llX", (unsigned long long)I(0)); ev_set_text(c, out, b, strlen(b)); return true; }
         const char* s = S(0);
         static const char H[] = "0123456789ABCDEF";
@@ -3727,21 +3958,21 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         tb_result(c, out, &tb);
         return true;
     }
-    if (!strcmp(f, "UNHEX")) {
+    if (FIS("UNHEX")) {
         const char* s = S(0);
         size_t l = strlen(s);
         if (l % 2) { ev_null(out); return true; }
         for (size_t i = 0; i < l; i += 2) {
             int hi = isdigit((unsigned char)s[i]) ? s[i] - '0' : isxdigit((unsigned char)s[i]) ? (tolower((unsigned char)s[i]) - 'a' + 10) : -1;
             int lo = isdigit((unsigned char)s[i + 1]) ? s[i + 1] - '0' : isxdigit((unsigned char)s[i + 1]) ? (tolower((unsigned char)s[i + 1]) - 'a' + 10) : -1;
-            if (hi < 0 || lo < 0) { free(tb.d); ev_null(out); return true; }
+            if (hi < 0 || lo < 0) { free(tb.p); ev_null(out); return true; }
             char e2[2];
             tb_put(&tb, e2, sv_bin_put((uint8_t)(hi * 16 + lo), e2));
         }
         tb_result(c, out, &tb);
         return true;
     }
-    if (!strcmp(f, "MD5") || !strcmp(f, "SHA1") || !strcmp(f, "SHA") || !strcmp(f, "SHA2")) {
+    if (FIS("MD5") || FIS("SHA1") || FIS("SHA") || FIS("SHA2")) {
         const char* s0 = S(0);
         size_t sl0 = strlen(s0);
         char* s = sv_malloc(sl0 + 1);                              // i byte veri (binesc.h)
@@ -3750,7 +3981,7 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         uint8_t h[32];
         size_t hl;
         if (f[0] == 'M') { md5_bytes((const uint8_t*)s, sl, h); hl = 16; }
-        else if (!strcmp(f, "SHA2")) {
+        else if (FIS("SHA2")) {
             long long bits = I(1);
             if (bits != 256 && bits != 0) { free(s); ev_null(out); return true; }
             auth_sha256(s, sl, h); hl = 32;
@@ -3760,7 +3991,7 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         tb_result(c, out, &tb);
         return true;
     }
-    if (!strcmp(f, "CRC32")) {
+    if (FIS("CRC32")) {
         const char* s0 = S(0);
         size_t l0 = strlen(s0);
         char* s = sv_malloc(l0 + 1);
@@ -3769,7 +4000,7 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         free(s);
         return true;
     }
-    if (!strcmp(f, "TO_BASE64")) {
+    if (FIS("TO_BASE64")) {
         const char* s0 = S(0);
         size_t l0 = strlen(s0);
         unsigned char* s = sv_malloc(l0 + 1);
@@ -3784,14 +4015,14 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         tb_result(c, out, &tb);
         return true;
     }
-    if (!strcmp(f, "FROM_BASE64")) {
+    if (FIS("FROM_BASE64")) {
         const char* s = S(0);
         uint32_t acc = 0;
         int bits = 0;
         for (const char* p = s; *p; p++) {
             const char* k = strchr(B64, *p);
             if (*p == '=' || isspace((unsigned char)*p)) continue;
-            if (!k || !*p) { free(tb.d); ev_null(out); return true; }
+            if (!k || !*p) { free(tb.p); ev_null(out); return true; }
             acc = acc << 6 | (uint32_t)(k - B64);
             bits += 6;
             if (bits >= 8) { bits -= 8; char e2[2]; tb_put(&tb, e2, sv_bin_put((uint8_t)((acc >> bits) & 0xff), e2)); }
@@ -3799,13 +4030,19 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         tb_result(c, out, &tb);
         return true;
     }
-    if (!strcmp(f, "STRCMP")) { int r = strcmp(S(0), S(1)); ev_int(out, r < 0 ? -1 : r > 0); return true; }
-    if (!strcmp(f, "FORMAT")) {                                 // FORMAT(1234567.891, 2) = '1,234,567.89'
+    if (FIS("STRCMP")) { int r = strcmp(S(0), S(1)); ev_int(out, r < 0 ? -1 : r > 0); return true; }
+    if (FIS("FORMAT")) {                                 // FORMAT(1234567.891, 2) = '1,234,567.89'
         long long d = I(1);
         if (d < 0) d = 0;
         if (d > 30) d = 30;
-        char num[96];
-        snprintf(num, sizeof(num), "%.*f", (int)d, N(0));
+        // arrotondamento decimale, a metà lontano dallo zero come MySQL: con printf su un double FORMAT(0.5, 0) = '0',
+        // FORMAT(2.5, 0) = '2', FORMAT(1.005, 2) = '1.00' (MySQL: 1, 3, 1.01)
+        char num[DEC_LIMBS * 9 + 80];
+        Dec dx, dr;
+        bool okd = ev_get_dec(&a[0], &dx);
+        if (!okd) { char tmp[64]; snprintf(tmp, sizeof(tmp), "%.15g", N(0)); okd = dec_parse(tmp, &dx); }
+        if (okd && dec_round(&dx, (int)d, &dr)) dec_format(&dr, num, sizeof(num));
+        else snprintf(num, sizeof(num), "%.*f", (int)d, N(0));
         char* dot = strchr(num, '.');
         size_t il = dot ? (size_t)(dot - num) : strlen(num);
         size_t start = num[0] == '-' ? 1 : 0;
@@ -3819,11 +4056,11 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         tb_result(c, out, &tb);
         return true;
     }
-    if (!strcmp(f, "BIT_LENGTH")) { ev_int(out, (int64_t)sv_bin_len(S(0)) * 8); return true; }
-    if (!strcmp(f, "OCTET_LENGTH")) { ev_int(out, (int64_t)sv_bin_len(S(0))); return true; }
-    if (!strcmp(f, "CHARSET")) { ev_set_text(c, out, "utf8mb4", 7); return true; }
-    if (!strcmp(f, "COLLATION")) { ev_set_text(c, out, "utf8mb4_general_ci", 18); return true; }
-    if (!strcmp(f, "BIN") || !strcmp(f, "OCT")) {
+    if (FIS("BIT_LENGTH")) { ev_int(out, (int64_t)sv_bin_len(S(0)) * 8); return true; }
+    if (FIS("OCTET_LENGTH")) { ev_int(out, (int64_t)sv_bin_len(S(0))); return true; }
+    if (FIS("CHARSET")) { ev_set_text(c, out, "utf8mb4", 7); return true; }
+    if (FIS("COLLATION")) { ev_set_text(c, out, "utf8mb4_general_ci", 18); return true; }
+    if (FIS("BIN") || FIS("OCT")) {
         unsigned long long v = (unsigned long long)I(0);
         int base = f[0] == 'B' ? 2 : 8;
         char tmp[70];
@@ -3834,20 +4071,20 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_set_text(c, out, b, (size_t)k);
         return true;
     }
-    if (!strcmp(f, "INET_ATON")) {
+    if (FIS("INET_ATON")) {
         unsigned x[4];
         if (sscanf(S(0), "%u.%u.%u.%u", &x[0], &x[1], &x[2], &x[3]) != 4 || x[0] > 255 || x[1] > 255 || x[2] > 255 || x[3] > 255) { ev_null(out); return true; }
         ev_int(out, (int64_t)x[0] << 24 | x[1] << 16 | x[2] << 8 | x[3]);
         return true;
     }
-    if (!strcmp(f, "INET_NTOA")) {
+    if (FIS("INET_NTOA")) {
         long long v = I(0);
         if (v < 0 || v > 4294967295LL) { ev_null(out); return true; }
         snprintf(b, sizeof(b), "%lld.%lld.%lld.%lld", v >> 24 & 255, v >> 16 & 255, v >> 8 & 255, v & 255);
         ev_set_text(c, out, b, strlen(b));
         return true;
     }
-    if (!strcmp(f, "TRIM_EX")) {                               // TRIM(LEADING|TRAILING|BOTH x FROM s)
+    if (FIS("TRIM_EX")) {                               // TRIM(LEADING|TRAILING|BOTH x FROM s)
         const char* s = S(0);
         const char* r = S(1);
         const char* mode = S(2);
@@ -3861,19 +4098,27 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     }
     if (!strncmp(f, "REGEXP_", 7)) {
         bool icase = true;
-        int mode_arg = !strcmp(f, "REGEXP_LIKE") ? 2 : !strcmp(f, "REGEXP_REPLACE") ? 5 : !strcmp(f, "REGEXP_SUBSTR") ? 4 : 5;
+        int mode_arg = FIS("REGEXP_LIKE") ? 2 : FIS("REGEXP_REPLACE") ? 5 : FIS("REGEXP_SUBSTR") ? 4 : 5;
         if (na > mode_arg && strchr(S(mode_arg), 'c')) icase = false;
         char err[160];
-        SvRegex* re = sv_regex_compile(S(1), icase, err, sizeof(err));
+        bool owned;
+        SvRegex* re = sv_regex_cached(S(1), icase, err, sizeof(err), &owned);   // pattern costante: compilato una volta
         if (!re) { ctx_error(c, "%s", err); ev_null(out); return true; }
         const char* s = S(0);
-        if (!strcmp(f, "REGEXP_LIKE")) { ev_int(out, sv_regex_match(re, s) ? 1 : 0); sv_regex_free(re); return true; }
-        long long pos = na > 2 && strcmp(f, "REGEXP_REPLACE") ? I(2) : (na > 3 && !strcmp(f, "REGEXP_REPLACE") ? I(3) : 1);
-        long long occ = !strcmp(f, "REGEXP_REPLACE") ? (na > 4 ? I(4) : 0) : (na > 3 ? I(3) : 1);
+        sv_regex_take_limit();
+        if (FIS("REGEXP_LIKE")) {
+            bool m = sv_regex_match(re, s);
+            if (owned) sv_regex_free(re);
+            if (regex_limit_error(c, out)) return true;
+            ev_int(out, m ? 1 : 0);
+            return true;
+        }
+        long long pos = na > 2 && (!FIS("REGEXP_REPLACE")) ? I(2) : (na > 3 && FIS("REGEXP_REPLACE") ? I(3) : 1);
+        long long occ = FIS("REGEXP_REPLACE") ? (na > 4 ? I(4) : 0) : (na > 3 ? I(3) : 1);
         if (pos < 1) pos = 1;
         size_t from = (size_t)(utf8_at(s, (int)(pos - 1)) - s);
         size_t st, en;
-        if (!strcmp(f, "REGEXP_REPLACE")) {                     // tutte (occ = 0) o la n-esima occorrenza
+        if (FIS("REGEXP_REPLACE")) {                     // tutte (occ = 0) o la n-esima occorrenza
             const char* rep = S(2);
             tb_put(&tb, s, from);
             size_t at = from;
@@ -3886,7 +4131,8 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
                 if (occ && k == occ) break;
             }
             if (at < strlen(s)) tb_put(&tb, s + at, strlen(s) - at);
-            sv_regex_free(re);
+            if (owned) sv_regex_free(re);
+            if (regex_limit_error(c, out)) { free(tb.p); return true; }
             tb_result(c, out, &tb);
             return true;
         }
@@ -3897,8 +4143,9 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             if (!found) break;
             at = en > st ? en : en + 1;
         }
-        sv_regex_free(re);
-        if (!strcmp(f, "REGEXP_SUBSTR")) { if (found) ev_set_text(c, out, s + st, en - st); else ev_null(out); return true; }
+        if (owned) sv_regex_free(re);
+        if (regex_limit_error(c, out)) return true;
+        if (FIS("REGEXP_SUBSTR")) { if (found) ev_set_text(c, out, s + st, en - st); else ev_null(out); return true; }
         if (!found) { ev_int(out, 0); return true; }
         int p1 = 1;
         for (size_t i = 0; i < st; i++) if (((unsigned char)s[i] & 0xC0) != 0x80) p1++;
@@ -3906,16 +4153,16 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         return true;
     }
     // numeri
-    if (!strcmp(f, "RAND")) { srand((unsigned)I(0)); ev_num(out, (double)rand() / ((double)RAND_MAX + 1.0)); return true; }
-    if (!strcmp(f, "INTDIV")) { double y = N(1); if (y == 0) { ev_null(out); return true; } ev_int(out, (int64_t)(N(0) / y)); return true; }
-    if (!strcmp(f, "GREATEST") || !strcmp(f, "LEAST")) {
+    if (FIS("RAND")) { srand((unsigned)I(0)); ev_num(out, (double)rand() / ((double)RAND_MAX + 1.0)); return true; }
+    if (FIS("INTDIV")) { double y = N(1); if (y == 0) { ev_null(out); return true; } ev_int(out, (int64_t)(N(0) / y)); return true; }
+    if (FIS("GREATEST") || FIS("LEAST")) {
         bool g = f[0] == 'G';
         int best = 0;
         for (int i = 1; i < na; i++) { int r = ev_cmp(&a[i], &a[best]); if (g ? r > 0 : r < 0) best = i; }
         ev_copy(out, &a[best]);
         return true;
     }
-    if (!strcmp(f, "TRUNCATE")) {
+    if (FIS("TRUNCATE")) {
         long long d = I(1);
         if (a[0].is_dec) {                                        // decimale: esatto, con d cifre (P1.9)
             Dec xd, r;
@@ -3952,26 +4199,34 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
                 return true;
             }
     }
-    if (!strcmp(f, "LOG")) {                                    // LOG(x) = ln, LOG(b, x)
+    if (FIS("LOG")) {                                    // LOG(x) = ln, LOG(b, x)
         if (na == 1) { if (N(0) <= 0) ev_null(out); else ev_num(out, log(N(0))); return true; }
         if (N(0) <= 0 || N(0) == 1 || N(1) <= 0) { ev_null(out); return true; }
         ev_num(out, log(N(1)) / log(N(0)));
         return true;
     }
-    if (!strcmp(f, "ATAN") || !strcmp(f, "ATAN2")) { ev_num(out, na == 2 ? atan2(N(0), N(1)) : atan(N(0))); return true; }
+    if (FIS("ATAN") || FIS("ATAN2")) { ev_num(out, na == 2 ? atan2(N(0), N(1)) : atan(N(0))); return true; }
     // CAST(x AS tipo)
-    if (!strcmp(f, "CAST")) {
+    if (FIS("CAST")) {
         if (a[0].null) { ev_null(out); return true; }
         const char* ty = S(1);
         if (!strncmp(ty, "SIGNED", 6) || !strncmp(ty, "UNSIGNED", 8) || !strncmp(ty, "INT", 3) || !strcmp(ty, "YEAR")) {
-            double v = N(0);
-            if (!strncmp(ty, "UNSIGNED", 8) && v < 0) v = 0;
-            ev_int(out, (int64_t)(v < 0 ? ceil(v - 0.5) : floor(v + 0.5)));
-            if (!a[0].is_num) {                                 // testo: come MySQL, la parte intera iniziale
-                char* end;
-                long long x = strtoll(S(0), &end, 10);
-                ev_int(out, !strncmp(ty, "UNSIGNED", 8) && x < 0 ? 0 : x);
+            bool uns = !strncmp(ty, "UNSIGNED", 8);
+            int64_t x;
+            if (a[0].is_int) x = a[0].inum;
+            else if (a[0].is_num) {
+                double v = N(0);
+                if (uns && v >= 9223372036854775808.0) { ev_unsigned(c, out, v >= 18446744073709551615.0 ? UINT64_MAX : (uint64_t)v); return true; }
+                v = v < 0 ? ceil(v - 0.5) : floor(v + 0.5);
+                x = v >= 9223372036854775807.0 ? INT64_MAX : v <= -9223372036854775808.0 ? INT64_MIN : (int64_t)v;
+            } else {                                            // testo: come MySQL, la parte intera iniziale
+                const char* t = S(0);
+                while (*t == ' ') t++;
+                if (uns && *t != '-') { ev_unsigned(c, out, (uint64_t)strtoull(t, NULL, 10)); return true; }
+                x = (int64_t)strtoll(t, NULL, 10);
             }
+            // UNSIGNED come MySQL: un negativo vale modulo 2^64 (CAST(-1 AS UNSIGNED) = 18446744073709551615)
+            if (uns) ev_unsigned(c, out, (uint64_t)x); else ev_int(out, x);
             return true;
         }
         if (!strncmp(ty, "DECIMAL", 7) || !strncmp(ty, "NUMERIC", 7)) {
@@ -3997,7 +4252,16 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             ev_set_text(c, out, b, strlen(b));
             return true;
         }
-        // CHAR[(n)], BINARY, JSON, NCHAR: testo
+        if (!strcmp(ty, "JSON")) {                          // come MySQL: testo JSON valido, in forma normalizzata
+            if (a[0].is_num) { ev_set_text(c, out, S(0), strlen(S(0))); return true; }
+            if (!sj_valid(S(0))) { ctx_error(c, "%s", "Invalid JSON text in argument 1 to function cast_as_json"); ev_null(out); return true; }
+            char* nj = sj_normalize(S(0), strlen(S(0)));
+            if (!nj) { ctx_error(c, "%s", "Out of memory"); ev_null(out); return true; }
+            ev_set_text(c, out, nj, strlen(nj));
+            free(nj);
+            return true;
+        }
+        // CHAR[(n)], BINARY, NCHAR: testo
         const char* s = S(0);
         int n = -1;
         if (sscanf(ty, "%*[A-Z](%d)", &n) == 1 && n >= 0) { const char* end = utf8_at(s, n); ev_set_text(c, out, s, (size_t)(end - s)); return true; }
@@ -4005,14 +4269,14 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         return true;
     }
     // date
-    if (!strcmp(f, "UNIX_TIMESTAMP")) {
+    if (FIS("UNIX_TIMESTAMP")) {
         MyDT t;
         if (!mydt_parse(S(0), &t) || !t.has_date) { ev_int(out, 0); return true; }
         long long local = mydt_secs(&t);
         ev_int(out, local - tz_offset((time_t)local));
         return true;
     }
-    if (!strcmp(f, "FROM_UNIXTIME")) {
+    if (FIS("FROM_UNIXTIME")) {
         long long secs = I(0);
         MyDT t;
         mydt_from_secs(secs + tz_offset((time_t)secs), &t);
@@ -4022,14 +4286,14 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_set_text(c, out, b, strlen(b));
         return true;
     }
-    if (!strcmp(f, "STR_TO_DATE")) {
+    if (FIS("STR_TO_DATE")) {
         MyDT t;
         if (!str_to_date(S(0), S(1), &t)) { ev_null(out); return true; }
         mydt_text(&t, t.has_time, b, sizeof(b));
         ev_set_text(c, out, b, strlen(b));
         return true;
     }
-    if (!strcmp(f, "SEC_TO_TIME")) {
+    if (FIS("SEC_TO_TIME")) {
         long long v = I(0);
         bool neg = v < 0;
         if (neg) v = -v;
@@ -4037,7 +4301,7 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_set_text(c, out, b, strlen(b));
         return true;
     }
-    if (!strcmp(f, "MAKEDATE")) {
+    if (FIS("MAKEDATE")) {
         long long y = I(0), doy = I(1);
         if (doy < 1) { ev_null(out); return true; }
         MyDT t;
@@ -4046,18 +4310,18 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_set_text(c, out, b, strlen(b));
         return true;
     }
-    if (!strcmp(f, "MAKETIME")) { snprintf(b, sizeof(b), "%02lld:%02lld:%02lld", I(0), I(1), I(2)); ev_set_text(c, out, b, strlen(b)); return true; }
-    if (!strcmp(f, "FROM_DAYS")) {
+    if (FIS("MAKETIME")) { snprintf(b, sizeof(b), "%02lld:%02lld:%02lld", I(0), I(1), I(2)); ev_set_text(c, out, b, strlen(b)); return true; }
+    if (FIS("FROM_DAYS")) {
         MyDT t;
         mydt_from_secs((I(0) - 719528) * 86400LL, &t);
         mydt_text(&t, false, b, sizeof(b));
         ev_set_text(c, out, b, strlen(b));
         return true;
     }
-    if (!strcmp(f, "CONVERT_TZ")) { ev_copy(out, &a[0]); return true; }   // fusi orari: niente tabelle, il valore resta
-    if (!strcmp(f, "__INTERVAL")) { ctx_error(c, "%s", "INTERVAL can only be used with DATE_ADD / DATE_SUB or + / -"); ev_null(out); return true; }
-    if (!strcmp(f, "DATE_ADD") || !strcmp(f, "DATE_SUB") || !strcmp(f, "ADDDATE") || !strcmp(f, "SUBDATE")) {
-        int sign = (!strcmp(f, "DATE_SUB") || !strcmp(f, "SUBDATE")) ? -1 : 1;
+    if (FIS("CONVERT_TZ")) { ev_copy(out, &a[0]); return true; }   // fusi orari: niente tabelle, il valore resta
+    if (FIS("__INTERVAL")) { ctx_error(c, "%s", "INTERVAL can only be used with DATE_ADD / DATE_SUB or + / -"); ev_null(out); return true; }
+    if (FIS("DATE_ADD") || FIS("DATE_SUB") || FIS("ADDDATE") || FIS("SUBDATE")) {
+        int sign = (FIS("DATE_SUB") || FIS("SUBDATE")) ? -1 : 1;
         MyDT t;
         if (!mydt_parse(S(0), &t) || !t.has_date) { ev_null(out); return true; }
         const char* unit = "DAY";
@@ -4079,13 +4343,13 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_set_text(c, out, b, strlen(b));
         return true;
     }
-    if (!strcmp(f, "DATEDIFF")) {
+    if (FIS("DATEDIFF")) {
         MyDT x, y;
         if (!mydt_parse(S(0), &x) || !mydt_parse(S(1), &y)) { ev_null(out); return true; }
         ev_int(out, days_from_civil(x.y, x.mo, x.d) - days_from_civil(y.y, y.mo, y.d));
         return true;
     }
-    if (!strcmp(f, "TIMEDIFF")) {
+    if (FIS("TIMEDIFF")) {
         MyDT x, y;
         if (!mydt_parse(S(0), &x) || !mydt_parse(S(1), &y)) { ev_null(out); return true; }
         long long d = (x.has_date ? mydt_secs(&x) : x.h * 3600LL + x.mi * 60 + x.s) - (y.has_date ? mydt_secs(&y) : y.h * 3600LL + y.mi * 60 + y.s);
@@ -4095,7 +4359,7 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_set_text(c, out, b, strlen(b));
         return true;
     }
-    if (!strcmp(f, "TIMESTAMPDIFF")) {                          // (a, b, unità) dopo il parser
+    if (FIS("TIMESTAMPDIFF")) {                          // (a, b, unità) dopo il parser
         MyDT x, y;
         if (!mydt_parse(S(0), &x) || !mydt_parse(S(1), &y)) { ev_null(out); return true; }
         const char* u = S(2);
@@ -4116,7 +4380,7 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_int(out, div == 0 ? d * 1000000 : d / div);
         return true;
     }
-    if (!strcmp(f, "SLEEP")) {
+    if (FIS("SLEEP")) {
         double s = N(0);
         bool interrupted = false;
         if (s > 0) {
@@ -4140,9 +4404,9 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_int(out, 0);
         return true;
     }
-    if (!strcmp(f, "GET_LOCK") || !strcmp(f, "RELEASE_LOCK") || !strcmp(f, "IS_FREE_LOCK")) { ev_int(out, 1); return true; }
-    if (!strcmp(f, "IS_USED_LOCK")) { ev_null(out); return true; }
-    if (!strcmp(f, "TIME_TO_SEC")) {
+    if (FIS("GET_LOCK") || FIS("RELEASE_LOCK") || FIS("IS_FREE_LOCK")) { ev_int(out, 1); return true; }
+    if (FIS("IS_USED_LOCK")) { ev_null(out); return true; }
+    if (FIS("TIME_TO_SEC")) {
         MyDT t;
         if (!mydt_parse(S(0), &t)) { ev_null(out); return true; }
         ev_int(out, t.h * 3600LL + t.mi * 60 + t.s);
@@ -4150,29 +4414,29 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     }
     // parti di una data
     MyDT t;
-    if (!mydt_parse(S(f[0] == 'E' && !strcmp(f, "EXTRACT") ? 1 : 0), &t)) { ev_null(out); return true; }
-    if (!strcmp(f, "DATE")) { if (!t.has_date) { ev_null(out); return true; } mydt_text(&t, false, b, sizeof(b)); ev_set_text(c, out, b, strlen(b)); return true; }
-    if (!strcmp(f, "TIME")) { snprintf(b, sizeof(b), "%02d:%02d:%02d", t.h, t.mi, t.s); ev_set_text(c, out, b, strlen(b)); return true; }
-    if (!strcmp(f, "HOUR")) { ev_int(out, t.h); return true; }
-    if (!strcmp(f, "MINUTE")) { ev_int(out, t.mi); return true; }
-    if (!strcmp(f, "SECOND")) { ev_int(out, t.s); return true; }
-    if (!strcmp(f, "MICROSECOND")) { ev_int(out, t.us); return true; }
+    if (!mydt_parse(S(f[0] == 'E' && FIS("EXTRACT") ? 1 : 0), &t)) { ev_null(out); return true; }
+    if (FIS("DATE")) { if (!t.has_date) { ev_null(out); return true; } mydt_text(&t, false, b, sizeof(b)); ev_set_text(c, out, b, strlen(b)); return true; }
+    if (FIS("TIME")) { snprintf(b, sizeof(b), "%02d:%02d:%02d", t.h, t.mi, t.s); ev_set_text(c, out, b, strlen(b)); return true; }
+    if (FIS("HOUR")) { ev_int(out, t.h); return true; }
+    if (FIS("MINUTE")) { ev_int(out, t.mi); return true; }
+    if (FIS("SECOND")) { ev_int(out, t.s); return true; }
+    if (FIS("MICROSECOND")) { ev_int(out, t.us); return true; }
     if (!t.has_date) { ev_null(out); return true; }
-    if (!strcmp(f, "DAYOFWEEK")) { ev_int(out, (weekday_mon0(&t) + 1) % 7 + 1); return true; }
-    if (!strcmp(f, "WEEKDAY")) { ev_int(out, weekday_mon0(&t)); return true; }
-    if (!strcmp(f, "DAYOFMONTH")) { ev_int(out, t.d); return true; }
-    if (!strcmp(f, "DAYOFYEAR")) { ev_int(out, day_of_year(&t)); return true; }
-    if (!strcmp(f, "WEEK")) { ev_int(out, mysql_week(&t, na > 1 ? (int)I(1) & 7 : 0, NULL)); return true; }
-    if (!strcmp(f, "WEEKOFYEAR")) { ev_int(out, mysql_week(&t, 3, NULL)); return true; }
-    if (!strcmp(f, "YEARWEEK")) { int yy; int w = mysql_week(&t, na > 1 ? ((int)I(1) & 7) | 2 : 2, &yy); ev_int(out, yy * 100 + w); return true; }
-    if (!strcmp(f, "QUARTER")) { ev_int(out, (t.mo + 2) / 3); return true; }
-    if (!strcmp(f, "MONTHNAME")) { const char* m = t.mo >= 1 && t.mo <= 12 ? MONTH_NAMES[t.mo - 1] : ""; ev_set_text(c, out, m, strlen(m)); return true; }
-    if (!strcmp(f, "DAYNAME")) { const char* d = DAY_NAMES[weekday_mon0(&t)]; ev_set_text(c, out, d, strlen(d)); return true; }
-    if (!strcmp(f, "LAST_DAY")) { t.d = days_in_month(t.y, t.mo); mydt_text(&t, false, b, sizeof(b)); ev_set_text(c, out, b, strlen(b)); return true; }
-    if (!strcmp(f, "TO_DAYS")) { ev_int(out, days_from_civil(t.y, t.mo, t.d) + 719528); return true; }
-    if (!strcmp(f, "TO_SECONDS")) { ev_int(out, (days_from_civil(t.y, t.mo, t.d) + 719528) * 86400LL + t.h * 3600 + t.mi * 60 + t.s); return true; }
-    if (!strcmp(f, "DATE_FORMAT") || !strcmp(f, "TIME_FORMAT")) { date_format_into(&t, S(1), &tb); tb_result(c, out, &tb); return true; }
-    if (!strcmp(f, "EXTRACT")) {
+    if (FIS("DAYOFWEEK")) { ev_int(out, (weekday_mon0(&t) + 1) % 7 + 1); return true; }
+    if (FIS("WEEKDAY")) { ev_int(out, weekday_mon0(&t)); return true; }
+    if (FIS("DAYOFMONTH")) { ev_int(out, t.d); return true; }
+    if (FIS("DAYOFYEAR")) { ev_int(out, day_of_year(&t)); return true; }
+    if (FIS("WEEK")) { ev_int(out, mysql_week(&t, na > 1 ? (int)I(1) & 7 : 0, NULL)); return true; }
+    if (FIS("WEEKOFYEAR")) { ev_int(out, mysql_week(&t, 3, NULL)); return true; }
+    if (FIS("YEARWEEK")) { int yy; int w = mysql_week(&t, na > 1 ? ((int)I(1) & 7) | 2 : 2, &yy); ev_int(out, yy * 100 + w); return true; }
+    if (FIS("QUARTER")) { ev_int(out, (t.mo + 2) / 3); return true; }
+    if (FIS("MONTHNAME")) { const char* m = t.mo >= 1 && t.mo <= 12 ? MONTH_NAMES[t.mo - 1] : ""; ev_set_text(c, out, m, strlen(m)); return true; }
+    if (FIS("DAYNAME")) { const char* d = DAY_NAMES[weekday_mon0(&t)]; ev_set_text(c, out, d, strlen(d)); return true; }
+    if (FIS("LAST_DAY")) { t.d = days_in_month(t.y, t.mo); mydt_text(&t, false, b, sizeof(b)); ev_set_text(c, out, b, strlen(b)); return true; }
+    if (FIS("TO_DAYS")) { ev_int(out, days_from_civil(t.y, t.mo, t.d) + 719528); return true; }
+    if (FIS("TO_SECONDS")) { ev_int(out, (days_from_civil(t.y, t.mo, t.d) + 719528) * 86400LL + t.h * 3600 + t.mi * 60 + t.s); return true; }
+    if (FIS("DATE_FORMAT") || FIS("TIME_FORMAT")) { date_format_into(&t, S(1), &tb); tb_result(c, out, &tb); return true; }
+    if (FIS("EXTRACT")) {
         const char* u = S(0);
         long long v = !strcmp(u, "YEAR") ? t.y : !strcmp(u, "MONTH") ? t.mo : !strcmp(u, "DAY") ? t.d : !strcmp(u, "HOUR") ? t.h :
                       !strcmp(u, "MINUTE") ? t.mi : !strcmp(u, "SECOND") ? t.s : !strcmp(u, "MICROSECOND") ? t.us :
@@ -4187,7 +4451,7 @@ static bool eval_mysql(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     #undef S
     #undef N
     #undef I
-    free(tb.d);
+    free(tb.p);
     return false;
 }
 
@@ -4225,18 +4489,18 @@ static void eval_group_concat(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             eval_expr(e->args[i], c, &v);
             if (v.null) null = true; else { const char* s = ev_s(&v); tb_put(&tb, s, strlen(s)); }
         }
-        if (null) { free(tb.d); continue; }                    // una riga con un NULL non conta (come MySQL)
+        if (null) { free(tb.p); continue; }                    // una riga con un NULL non conta (come MySQL)
         tb_put(&tb, "", 1);
-        if (tb.err) { free(tb.d); oom = true; break; }
+        if (tb.oom) { free(tb.p); oom = true; break; }
         if (e->agg_distinct) {
             char key[KEY_BUF];
-            key_text(key, sizeof(key), tb.d);
+            key_text(key, sizeof(key), tb.p);
             SMSlot* sl = sm_slot(&seen, key, true);
-            if (!sl) { free(tb.d); oom = true; break; }
-            if (sl->val >= 0) { free(tb.d); continue; }
+            if (!sl) { free(tb.p); oom = true; break; }
+            if (sl->val >= 0) { free(tb.p); continue; }
             sl->val = 1;
         }
-        items[n].text = tb.d;
+        items[n].text = tb.p;
         items[n].nk = no;
         items[n].flags = flags;
         items[n].keys = keys ? &keys[(size_t)n * (size_t)no] : NULL;
@@ -4267,8 +4531,8 @@ static void eval_group_concat(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     }
     free(items);
     free(keys);
-    if (oom) { free(res.d); ctx_error(c, "%s", "Out of memory in GROUP_CONCAT"); ev_null(out); return; }
-    if (n == 0) { free(res.d); ev_null(out); return; }
+    if (oom) { free(res.p); ctx_error(c, "%s", "Out of memory in GROUP_CONCAT"); ev_null(out); return; }
+    if (n == 0) { free(res.p); ev_null(out); return; }
     tb_result(c, out, &res);
 }
 
@@ -4284,14 +4548,16 @@ static char* json_of(const EvalVal* v) {
 // funzioni JSON di modifica / ricerca e funzioni di testo e date di PostgreSQL / MySQL
 static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     const char* f = e->func;
-    bool jmod = !strcmp(f, "JSON_SET") || !strcmp(f, "JSON_INSERT") || !strcmp(f, "JSON_REPLACE") || !strcmp(f, "JSON_REMOVE") ||
-                !strcmp(f, "JSON_ARRAY_APPEND");
+    const size_t flen = strlen(f);                       // per FIS: confronti per lunghezza prima (CR-M2)
+    bool jmod = FIS("JSON_SET") || FIS("JSON_INSERT") || FIS("JSON_REPLACE") || FIS("JSON_REMOVE") ||
+                FIS("JSON_ARRAY_APPEND") || FIS("JSON_ARRAY_INSERT");
     if (jmod) {
         EvalVal d;
         eval_expr(e->args[0], c, &d);
         if (d.null) { ev_null(out); return true; }
         char* doc = sv_strdup(ev_s(&d));
-        int op = !strcmp(f, "JSON_SET") ? 0 : !strcmp(f, "JSON_INSERT") ? 1 : !strcmp(f, "JSON_REPLACE") ? 2 : !strcmp(f, "JSON_REMOVE") ? 3 : 4;
+        int op = FIS("JSON_SET") ? 0 : FIS("JSON_INSERT") ? 1 : FIS("JSON_REPLACE") ? 2 : FIS("JSON_REMOVE") ? 3 :
+                 FIS("JSON_ARRAY_APPEND") ? 4 : 5;
         int step = op == 3 ? 1 : 2;
         if (op != 3 && e->nargs % 2 == 0) { free(doc); ctx_error(c, "Wrong number of arguments for %s", f); ev_null(out); return true; }
         for (int i = 1; doc && i < e->nargs; i += step) {
@@ -4307,18 +4573,21 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             if (!doc) { ctx_error(c, "Invalid JSON document or path in %s", f); ev_null(out); return true; }
         }
         if (!doc) { ev_null(out); return true; }
-        ev_set_text(c, out, doc, strlen(doc));
+        char* nd = sj_normalize(doc, strlen(doc));
         free(doc);
+        if (!nd) { ctx_error(c, "%s", "Out of memory"); ev_null(out); return true; }
+        ev_set_text(c, out, nd, strlen(nd));
+        free(nd);
         return true;
     }
     if (!strncmp(f, "JSON_", 5)) {
-        bool known = !strcmp(f, "JSON_KEYS") || !strcmp(f, "JSON_CONTAINS") || !strcmp(f, "JSON_CONTAINS_PATH") || !strcmp(f, "JSON_SEARCH") ||
-                     !strcmp(f, "JSON_PRETTY") || !strcmp(f, "JSON_DEPTH") || !strcmp(f, "JSON_MERGE_PATCH") || !strcmp(f, "JSON_QUOTE") ||
-                     !strcmp(f, "JSON_STORAGE_SIZE");
+        bool known = FIS("JSON_KEYS") || FIS("JSON_CONTAINS") || FIS("JSON_CONTAINS_PATH") || FIS("JSON_SEARCH") ||
+                     FIS("JSON_PRETTY") || FIS("JSON_DEPTH") || FIS("JSON_MERGE_PATCH") || FIS("JSON_QUOTE") ||
+                     FIS("JSON_STORAGE_SIZE") || FIS("JSON_MERGE_PRESERVE") || FIS("JSON_MERGE");
         if (!known) return false;
         EvalVal d;
         eval_expr(e->args[0], c, &d);
-        if (!strcmp(f, "JSON_QUOTE")) {
+        if (FIS("JSON_QUOTE")) {
             if (d.null) { ev_null(out); return true; }
             char* q = sj_quote(ev_s(&d));
             if (q) { ev_set_text(c, out, q, strlen(q)); free(q); } else ev_null(out);
@@ -4326,26 +4595,26 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         }
         if (d.null) { ev_null(out); return true; }
         const char* doc = ev_s(&d);
-        if (!strcmp(f, "JSON_STORAGE_SIZE")) { ev_int(out, (int64_t)strlen(doc)); return true; }
+        if (FIS("JSON_STORAGE_SIZE")) { ev_int(out, (int64_t)strlen(doc)); return true; }
         if (!sj_valid(doc)) { ctx_error(c, "Invalid JSON text in argument 1 to function %s", f); ev_null(out); return true; }
         char* docc = sv_strdup(doc);                         // il testo può puntare a un buffer che le prossime valutazioni cambiano
         if (!docc) { ev_null(out); return true; }
         char* r = NULL;
-        if (!strcmp(f, "JSON_KEYS") || !strcmp(f, "JSON_DEPTH") || !strcmp(f, "JSON_PRETTY")) {
+        if (FIS("JSON_KEYS") || FIS("JSON_DEPTH") || FIS("JSON_PRETTY")) {
             const char* v = docc; size_t vl = strlen(docc);
             if (e->nargs > 1) {
                 EvalVal pv; eval_expr(e->args[1], c, &pv);
                 if (pv.null || !sj_extract(docc, ev_s(&pv), &v, &vl)) { free(docc); ev_null(out); return true; }
             }
-            if (!strcmp(f, "JSON_DEPTH")) { ev_int(out, sj_depth(v)); free(docc); return true; }
-            if (!strcmp(f, "JSON_PRETTY")) r = sj_pretty(docc);
+            if (FIS("JSON_DEPTH")) { ev_int(out, sj_depth(v)); free(docc); return true; }
+            if (FIS("JSON_PRETTY")) r = sj_pretty(docc);
             else {
                 char* tmp = sv_malloc(vl + 1);                       // (strndup non c'è su MinGW)
                 if (tmp) { memcpy(tmp, v, vl); tmp[vl] = '\0'; }
                 r = tmp ? sj_keys(tmp, vl) : NULL;
                 free(tmp);
             }
-        } else if (!strcmp(f, "JSON_CONTAINS")) {
+        } else if (FIS("JSON_CONTAINS")) {
             EvalVal cv; eval_expr(e->args[1], c, &cv);
             if (cv.null) { free(docc); ev_null(out); return true; }
             char* cand = sv_strdup(ev_s(&cv));
@@ -4359,7 +4628,7 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             ev_int(out, sj_contains(v, vl, cand, strlen(cand)));
             free(cand); free(docc);
             return true;
-        } else if (!strcmp(f, "JSON_CONTAINS_PATH")) {
+        } else if (FIS("JSON_CONTAINS_PATH")) {
             EvalVal mv; eval_expr(e->args[1], c, &mv);
             bool all = !mv.null && !strcasecmp(ev_s(&mv), "all");
             int hits = 0, n = 0;
@@ -4372,7 +4641,7 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             ev_int(out, all ? hits == n : hits > 0);
             free(docc);
             return true;
-        } else if (!strcmp(f, "JSON_SEARCH")) {
+        } else if (FIS("JSON_SEARCH")) {
             EvalVal mv, sv; eval_expr(e->args[1], c, &mv);
             bool all = !mv.null && !strcasecmp(ev_s(&mv), "all");
             eval_expr(e->args[2], c, &sv);
@@ -4380,18 +4649,21 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             char* pat = sv_strdup(ev_s(&sv));
             r = pat ? sj_search(docc, all, pat) : NULL;
             free(pat);
-        } else {                                              // JSON_MERGE_PATCH(a, b, ...)
+        } else {                                              // JSON_MERGE_PATCH / JSON_MERGE_PRESERVE (a, b, ...)
+            bool patch = FIS("JSON_MERGE_PATCH");
             r = docc; docc = NULL;
             for (int i = 1; r && i < e->nargs; i++) {
                 EvalVal pv; eval_expr(e->args[i], c, &pv);
                 if (pv.null) { free(r); r = NULL; break; }
-                char* nr = sj_merge_patch(r, ev_s(&pv));
+                if (!sj_valid(ev_s(&pv))) { free(r); ctx_error(c, "Invalid JSON text in argument to function %s", f); ev_null(out); return true; }
+                char* nr = patch ? sj_merge_patch(r, ev_s(&pv)) : sj_merge_preserve(r, ev_s(&pv));
                 free(r);
                 r = nr;
             }
         }
         free(docc);
         if (!r) { ev_null(out); return true; }
+        if (!strncmp(f, "JSON_MERGE", 10)) { char* nr = sj_normalize(r, strlen(r)); free(r); r = nr; if (!r) { ev_null(out); return true; } }
         ev_set_text(c, out, r, strlen(r));
         free(r);
         return true;
@@ -4399,12 +4671,12 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     static const char* const MORE[] = { "INITCAP", "SPLIT_PART", "TRANSLATE", "CHR", "CONV", "SOUNDEX", "OVERLAY", "DATE_TRUNC",
                                         "DATE_PART", "STARTS_WITH", "REGEXP_COUNT", "MAKE_SET", "EXPORT_SET" };
     bool mine = false;
-    for (size_t i = 0; i < sizeof(MORE) / sizeof(MORE[0]) && !mine; i++) mine = !strcmp(f, MORE[i]);
+    for (size_t i = 0; i < sizeof(MORE) / sizeof(MORE[0]) && !mine; i++) mine = f[0] == MORE[i][0] && !strcmp(f, MORE[i]);
     if (!mine) return false;
     int na = e->nargs < 8 ? e->nargs : 8;
     EvalVal a[8];
     for (int i = 0; i < na; i++) eval_expr(e->args[i], c, &a[i]);
-    if (!strcmp(f, "MAKE_SET")) {                             // MAKE_SET(bit, s1, s2, ...): le stringhe dei bit accesi
+    if (FIS("MAKE_SET")) {                             // MAKE_SET(bit, s1, s2, ...): le stringhe dei bit accesi
         if (a[0].null) { ev_null(out); return true; }
         uint64_t bits = bit_operand(&a[0]);
         TextBuf tb = {0};
@@ -4416,13 +4688,13 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             if (n++) tb_put(&tb, ",", 1);
             tb_put(&tb, ev_s(&v), strlen(ev_s(&v)));
         }
-        if (!tb.d) { ev_set_text(c, out, "", 0); return true; }
+        if (!tb.p) { ev_set_text(c, out, "", 0); return true; }
         tb_result(c, out, &tb);
         return true;
     }
     for (int i = 0; i < na; i++) if (a[i].null) { ev_null(out); return true; }
     char b[256];
-    if (!strcmp(f, "INITCAP")) {                              // iniziali maiuscole
+    if (FIS("INITCAP")) {                              // iniziali maiuscole
         const char* sv = ev_s(&a[0]);
         size_t n = strlen(sv);
         char* t = sv_malloc(n + 1);
@@ -4437,7 +4709,7 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         free(t);
         return true;
     }
-    if (!strcmp(f, "SPLIT_PART")) {                           // n-esimo pezzo (da 1; negativo: dalla fine)
+    if (FIS("SPLIT_PART")) {                           // n-esimo pezzo (da 1; negativo: dalla fine)
         const char* sv = ev_s(&a[0]);
         char* sc = sv_strdup(sv);
         char* dl = sv_strdup(ev_s(&a[1]));
@@ -4459,7 +4731,7 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         free(sc); free(dl);
         return true;
     }
-    if (!strcmp(f, "TRANSLATE")) {                            // caratteri di from sostituiti da quelli di to (tolti se to è più corto)
+    if (FIS("TRANSLATE")) {                            // caratteri di from sostituiti da quelli di to (tolti se to è più corto)
         char* sv = sv_strdup(ev_s(&a[0]));
         char* fr = sv_strdup(ev_s(&a[1]));
         char* to = sv_strdup(ev_s(&a[2]));
@@ -4476,7 +4748,7 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         free(sv); free(fr); free(to);
         return true;
     }
-    if (!strcmp(f, "CHR")) {                                  // carattere Unicode del codice
+    if (FIS("CHR")) {                                  // carattere Unicode del codice
         long cp = (long)ev_as_num(&a[0]);
         size_t k = 0;
         if (cp < 0 || cp > 0x10FFFF) { ev_null(out); return true; }
@@ -4487,7 +4759,7 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_set_text(c, out, b, k);
         return true;
     }
-    if (!strcmp(f, "CONV")) {                                 // CONV(n, da_base, a_base), basi 2..36
+    if (FIS("CONV")) {                                 // CONV(n, da_base, a_base), basi 2..36
         int fb = (int)ev_as_num(&a[1]), tbase = (int)ev_as_num(&a[2]);
         if (fb < 0) fb = -fb;
         bool neg_out = tbase < 0;
@@ -4512,7 +4784,7 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_set_text(c, out, b, (size_t)o);
         return true;
     }
-    if (!strcmp(f, "SOUNDEX")) {
+    if (FIS("SOUNDEX")) {
         static const char* const CODE = "01230120022455012623010202";   // A..Z
         const char* sv = ev_s(&a[0]);
         int k = 0;
@@ -4529,7 +4801,7 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_set_text(c, out, b, (size_t)k);
         return true;
     }
-    if (!strcmp(f, "OVERLAY")) {                              // OVERLAY(s PLACING r FROM n [FOR m])
+    if (FIS("OVERLAY")) {                              // OVERLAY(s PLACING r FROM n [FOR m])
         const char* sv = ev_s(&a[0]);
         size_t sl = strlen(sv);
         char* sc = sv_strdup(sv);
@@ -4542,32 +4814,35 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         TextBuf tb = {0};
         tb_put(&tb, sc, st); tb_put(&tb, r, strlen(r)); tb_put(&tb, sc + en, sl - en);
         free(sc); free(r);
-        if (!tb.d) { ev_set_text(c, out, "", 0); return true; }
+        if (!tb.p) { ev_set_text(c, out, "", 0); return true; }
         tb_result(c, out, &tb);
         return true;
     }
-    if (!strcmp(f, "STARTS_WITH")) {
+    if (FIS("STARTS_WITH")) {
         const char* x = ev_s(&a[0]);
         char* y = sv_strdup(ev_s(&a[1]));
         ev_int(out, y && !strncmp(x, y, strlen(y)));
         free(y);
         return true;
     }
-    if (!strcmp(f, "REGEXP_COUNT")) {                         // occorrenze del modello
+    if (FIS("REGEXP_COUNT")) {                         // occorrenze del modello
         char* sv = sv_strdup(ev_s(&a[0]));
         char* pat = sv_strdup(ev_s(&a[1]));
         long n = 0;
         char rerr[200];
-        SvRegex* re = sv && pat ? sv_regex_compile(pat, false, rerr, sizeof(rerr)) : NULL;
+        bool owned = false;
+        SvRegex* re = sv && pat ? sv_regex_cached(pat, false, rerr, sizeof(rerr), &owned) : NULL;
         if (sv && pat && !re) { free(sv); free(pat); ctx_error(c, "%s", "Invalid regular expression"); ev_null(out); return true; }
         size_t from = 0, so, eo, sl = sv ? strlen(sv) : 0;
+        sv_regex_take_limit();
         while (re && from <= sl && sv_regex_search(re, sv, from, &so, &eo)) { n++; from = eo > so ? eo : so + 1; }
-        sv_regex_free(re);
+        if (owned) sv_regex_free(re);
         free(sv); free(pat);
+        if (regex_limit_error(c, out)) return true;
         ev_int(out, n);
         return true;
     }
-    if (!strcmp(f, "EXPORT_SET")) {                           // EXPORT_SET(bit, on, off [, sep [, n]])
+    if (FIS("EXPORT_SET")) {                           // EXPORT_SET(bit, on, off [, sep [, n]])
         uint64_t bits = bit_operand(&a[0]);
         char* on = sv_strdup(ev_s(&a[1]));
         char* off = sv_strdup(ev_s(&a[2]));
@@ -4581,7 +4856,7 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             tb_put(&tb, w, strlen(w));
         }
         free(on); free(off); free(sep);
-        if (!tb.d) { ev_set_text(c, out, "", 0); return true; }
+        if (!tb.p) { ev_set_text(c, out, "", 0); return true; }
         tb_result(c, out, &tb);
         return true;
     }
@@ -4591,7 +4866,7 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     snprintf(unit, sizeof(unit), "%s", ev_s(&a[0]));
     for (char* q = unit; *q; q++) *q = (char)toupper((unsigned char)*q);
     if (!mydt_parse(ev_s(&a[1]), &t) || !t.has_date) { ev_null(out); return true; }
-    if (!strcmp(f, "DATE_PART")) {
+    if (FIS("DATE_PART")) {
         long v;
         if (!strcmp(unit, "YEAR")) v = t.y; else if (!strcmp(unit, "MONTH")) v = t.mo; else if (!strcmp(unit, "DAY")) v = t.d;
         else if (!strcmp(unit, "HOUR")) v = t.h; else if (!strcmp(unit, "MINUTE")) v = t.mi; else if (!strcmp(unit, "SECOND")) v = t.s;
@@ -4626,6 +4901,7 @@ static bool eval_more(ASTExpr* e, EvalCtx* c, EvalVal* out) {
 
 static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     const char* f = e->func;
+    const size_t flen = strlen(f);                       // per FIS: confronti per lunghezza prima (CR-M2)
     EvalVal a[3];
     int na = e->nargs < 3 ? e->nargs : 3;
 
@@ -4637,7 +4913,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     if (eval_mysql(e, c, out)) return;
 
     // MATCH(colonne) AGAINST('parole'): punteggio di pertinenza (0 = nessuna corrispondenza)
-    if (!strcmp(f, "MATCH_AGAINST")) {
+    if (FIS("MATCH_AGAINST")) {
         int nc = e->nargs - 2;
         EvalVal q, m;
         eval_expr(e->args[nc], c, &q);
@@ -4661,7 +4937,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     }
 
     // JSON_OBJECT / JSON_ARRAY: tutti gli argomenti (anche oltre 3); numeri così come sono, NULL -> null
-    if (!strcmp(f, "JSON_OBJECT") || !strcmp(f, "JSON_ARRAY")) {
+    if (FIS("JSON_OBJECT") || FIS("JSON_ARRAY")) {
         bool obj = f[5] == 'O';
         if (obj && e->nargs % 2) { ctx_error(c, "%s", "JSON_OBJECT needs key, value pairs"); ev_null(out); return; }
         TextBuf tb = {0};
@@ -4671,7 +4947,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             eval_expr(e->args[i], c, &v);
             if (i) tb_put(&tb, obj && i % 2 ? ": " : ", ", 2);
             bool key = obj && i % 2 == 0;
-            if (v.null) { if (key) { free(tb.d); ctx_error(c, "%s", "JSON_OBJECT key is NULL"); ev_null(out); return; } tb_put(&tb, "null", 4); continue; }
+            if (v.null) { if (key) { free(tb.p); ctx_error(c, "%s", "JSON_OBJECT key is NULL"); ev_null(out); return; } tb_put(&tb, "null", 4); continue; }
             const char* s = ev_s(&v);
             if (!key && (v.is_num || v.is_int)) { tb_put(&tb, s, strlen(s)); continue; }
             if (!key && sj_valid(s) && (*s == '{' || *s == '[')) { tb_put(&tb, s, strlen(s)); continue; }   // JSON annidato
@@ -4684,7 +4960,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     }
 
     // funzioni che non valutano tutti gli argomenti subito
-    if (!strcmp(f, "COALESCE")) {
+    if (FIS("COALESCE")) {
         for (int i = 0; i < e->nargs; i++) {
             eval_expr(e->args[i], c, out);
             if (!out->null) return;
@@ -4692,18 +4968,18 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_null(out);
         return;
     }
-    if (!strcmp(f, "IFNULL")) {
+    if (FIS("IFNULL")) {
         eval_expr(e->args[0], c, out);
         if (out->null) eval_expr(e->args[1], c, out);
         return;
     }
-    if (!strcmp(f, "IF")) {
+    if (FIS("IF")) {
         EvalVal cond;
         eval_expr(e->args[0], c, &cond);
         eval_expr(e->args[ev_truth(&cond) == 1 ? 1 : 2], c, out);
         return;
     }
-    if (!strcmp(f, "CONCAT") || !strcmp(f, "CONCAT_WS")) {
+    if (FIS("CONCAT") || FIS("CONCAT_WS")) {
         bool ws = f[6] == '_';
         TextBuf tb = {0};
         EvalVal sep, v;
@@ -4711,7 +4987,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         bool first = true;
         for (int i = ws ? 1 : 0; i < e->nargs; i++) {
             eval_expr(e->args[i], c, &v);
-            if (v.null) { if (ws) continue; free(tb.d); ev_null(out); return; }   // CONCAT con un NULL = NULL
+            if (v.null) { if (ws) continue; free(tb.p); ev_null(out); return; }   // CONCAT con un NULL = NULL
             const char* parts[2] = { ws && !first ? ev_s(&sep) : "", ev_s(&v) };
             for (int p = 0; p < 2; p++) tb_put(&tb, parts[p], strlen(parts[p]));
             first = false;
@@ -4719,46 +4995,47 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         tb_result(c, out, &tb);
         return;
     }
-    if (!strcmp(f, "DATABASE") || !strcmp(f, "SCHEMA")) {          // database corrente (NULL se nessuno)
+    if (FIS("DATABASE") || FIS("SCHEMA")) {          // database corrente (NULL se nessuno)
         Database* db = c->x ? catalog_current_db(c->x->catalog) : NULL;
         if (db) ev_set_text(c, out, db->name, strlen(db->name)); else ev_null(out);
         return;
     }
-    if (!strcmp(f, "VERSION")) { ev_set_text(c, out, "8.0.35-SegVault", 15); return; }
-    if (!strcmp(f, "LAST_INSERT_ID")) { ev_int(out, g_last_insert_id); return; }
-    if (!strcmp(f, "NOW") || !strcmp(f, "CURRENT_TIMESTAMP") || !strcmp(f, "CURDATE") || !strcmp(f, "CURRENT_DATE")) {
+    if (FIS("VERSION")) { ev_set_text(c, out, "8.0.35-SegVault", 15); return; }
+    if (FIS("LAST_INSERT_ID")) { ev_int(out, g_last_insert_id); return; }
+    if (FIS("NOW") || FIS("CURRENT_TIMESTAMP") || FIS("CURDATE") || FIS("CURRENT_DATE")) {
         char buf[32];
-        now_text(buf, sizeof(buf), !strcmp(f, "CURDATE") || !strcmp(f, "CURRENT_DATE"));
+        now_text(buf, sizeof(buf), FIS("CURDATE") || FIS("CURRENT_DATE"));
         ev_set_text(c, out, buf, strlen(buf));
         return;
     }
 
     for (int i = 0; i < na; i++) {
         eval_expr(e->args[i], c, &a[i]);
-        if (a[i].null && strcmp(f, "NULLIF")) { ev_null(out); return; }   // NULL in ingresso -> NULL
+        if (a[i].null && (!FIS("NULLIF"))) { ev_null(out); return; }   // NULL in ingresso -> NULL
     }
-    if (!strcmp(f, "NULLIF")) {
+    if (FIS("NULLIF")) {
         if (a[0].null) { ev_null(out); return; }
         if (!a[1].null && ev_cmp(&a[0], &a[1]) == 0) { ev_null(out); return; }
         ev_copy(out, &a[0]);
         return;
     }
-    if (!strcmp(f, "UPPER") || !strcmp(f, "UCASE") || !strcmp(f, "LOWER") || !strcmp(f, "LCASE")) {
+    if (FIS("UPPER") || FIS("UCASE") || FIS("LOWER") || FIS("LCASE")) {
         bool up = f[0] == 'U';
         const char* src = ev_s(&a[0]);
         size_t l = strlen(src);
         char* buf = sv_malloc(l + 1);
         if (!buf) { ctx_error(c, "%s", "Out of memory"); ev_null(out); return; }
-        for (size_t i = 0; i < l; i++) buf[i] = (char)(up ? toupper((unsigned char)src[i]) : tolower((unsigned char)src[i]));
+        memcpy(buf, src, l);
+        u8_case_inplace(buf, l, up);                    // UPPER('città') = 'CITTÀ' (prima solo ASCII)
         ev_set_text(c, out, buf, l);
         free(buf);
         return;
     }
-    if (!strcmp(f, "LENGTH"))        { ev_int(out, (int64_t)sv_bin_len(ev_s(&a[0]))); return; }   // byte veri
+    if (FIS("LENGTH"))        { ev_int(out, (int64_t)sv_bin_len(ev_s(&a[0]))); return; }   // byte veri
     if (!strncmp(f, "JSON_", 5)) {
         const char* doc = ev_s(&a[0]);
-        if (!strcmp(f, "JSON_VALID")) { ev_int(out, sj_valid(doc)); return; }
-        if (!strcmp(f, "JSON_UNQUOTE")) {
+        if (FIS("JSON_VALID")) { ev_int(out, sj_valid(doc)); return; }
+        if (FIS("JSON_UNQUOTE")) {
             char* u = sj_unquote(doc, strlen(doc));
             if (!u) { ev_null(out); return; }
             ev_set_text(c, out, u, strlen(u));
@@ -4767,16 +5044,23 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         }
         const char* vs = doc;
         size_t vl = strlen(doc);
-        if (!strcmp(f, "JSON_EXTRACT") || (!strcmp(f, "JSON_LENGTH") && na == 2)) {
+        if (FIS("JSON_EXTRACT") || (FIS("JSON_LENGTH") && na == 2)) {
             if (!sj_extract(doc, ev_s(&a[1]), &vs, &vl)) { ev_null(out); return; }   // percorso assente: NULL
         } else if (!sj_valid(doc)) { ctx_error(c, "Invalid JSON text in argument 1 to %s", f); ev_null(out); return; }
-        if (!strcmp(f, "JSON_EXTRACT")) { ev_set_text(c, out, vs, vl); return; }
-        if (!strcmp(f, "JSON_TYPE")) { const char* t = sj_type(vs, vl); ev_set_text(c, out, t, strlen(t)); return; }
+        if (FIS("JSON_EXTRACT")) {
+            if (*vs != '{' && *vs != '[') { ev_set_text(c, out, vs, vl); return; }
+            char* nv = sj_normalize(vs, vl);                 // oggetti e array nella forma di MySQL
+            if (!nv) { ev_null(out); return; }
+            ev_set_text(c, out, nv, strlen(nv));
+            free(nv);
+            return;
+        }
+        if (FIS("JSON_TYPE")) { const char* t = sj_type(vs, vl); ev_set_text(c, out, t, strlen(t)); return; }
         ev_int(out, sj_length(vs, vl));
         return;
     }
     if (!strncmp(f, "CHAR", 4))      { ev_int(out, utf8_chars(ev_s(&a[0]))); return; }
-    if (!strcmp(f, "TRIM") || !strcmp(f, "LTRIM") || !strcmp(f, "RTRIM")) {
+    if (FIS("TRIM") || FIS("LTRIM") || FIS("RTRIM")) {
         const char* s = ev_s(&a[0]);
         const char* e2 = s + strlen(s);
         if (f[0] != 'R') while (*s == ' ') s++;
@@ -4784,12 +5068,12 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_set_text(c, out, s, (size_t)(e2 - s));
         return;
     }
-    if (!strcmp(f, "SUBSTRING") || !strcmp(f, "SUBSTR") || !strcmp(f, "LEFT") || !strcmp(f, "RIGHT")) {
+    if (FIS("SUBSTRING") || FIS("SUBSTR") || FIS("LEFT") || FIS("RIGHT")) {
         const char* s = ev_s(&a[0]);
         int chars = utf8_chars(s);
         int64_t start, count;
-        if (!strcmp(f, "LEFT"))       { start = 1; count = (int64_t)ev_as_num(&a[1]); }
-        else if (!strcmp(f, "RIGHT")) { count = (int64_t)ev_as_num(&a[1]); start = chars - count + 1; if (start < 1) start = 1; }
+        if (FIS("LEFT"))       { start = 1; count = (int64_t)ev_as_num(&a[1]); }
+        else if (FIS("RIGHT")) { count = (int64_t)ev_as_num(&a[1]); start = chars - count + 1; if (start < 1) start = 1; }
         else {
             start = (int64_t)ev_as_num(&a[1]);
             if (start < 0) start = chars + start + 1;        // posizioni negative: dalla fine
@@ -4802,11 +5086,11 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         ev_set_text(c, out, b0, (size_t)(b1 - b0));
         return;
     }
-    if (!strcmp(f, "REPLACE")) {
+    if (FIS("REPLACE")) {
         const char* s = ev_s(&a[0]), *from = ev_s(&a[1]), *to = ev_s(&a[2]);
         size_t fl = strlen(from), tl = strlen(to);
         TextBuf tb = {0};
-        while (*s && !tb.err) {
+        while (*s && !tb.oom) {
             if (fl && !strncmp(s, from, fl)) { tb_put(&tb, to, tl); s += fl; }
             else {
                 const char* nx = fl ? strstr(s, from) : NULL;         // copia in blocco fino alla prossima occorrenza
@@ -4818,7 +5102,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         tb_result(c, out, &tb);
         return;
     }
-    if (!strcmp(f, "REVERSE")) {
+    if (FIS("REVERSE")) {
         const char* s = ev_s(&a[0]);
         size_t l = strlen(s);
         char* buf = sv_malloc(l + 1);
@@ -4835,7 +5119,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         free(buf);
         return;
     }
-    if (!strcmp(f, "YEAR") || !strcmp(f, "MONTH") || !strcmp(f, "DAY")) {
+    if (FIS("YEAR") || FIS("MONTH") || FIS("DAY")) {
         int y, m, d;
         if (sscanf(ev_s(&a[0]), "%d-%d-%d", &y, &m, &d) != 3) { ev_null(out); return; }
         ev_int(out, f[0] == 'Y' ? y : f[0] == 'M' ? m : d);
@@ -4843,18 +5127,18 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     }
     // numeriche
     double x = ev_as_num(&a[0]);
-    if (!strcmp(f, "ABS")) {
+    if (FIS("ABS")) {
         if (a[0].is_int && a[0].inum != INT64_MIN) ev_int(out, a[0].inum < 0 ? -a[0].inum : a[0].inum);
         else ev_num(out, fabs(x));
         return;
     }
-    if (!strcmp(f, "SIGN"))  { ev_int(out, x > 0 ? 1 : x < 0 ? -1 : 0); return; }
-    if (!strcmp(f, "FLOOR") || !strncmp(f, "CEIL", 4)) {
+    if (FIS("SIGN"))  { ev_int(out, x > 0 ? 1 : x < 0 ? -1 : 0); return; }
+    if (FIS("FLOOR") || !strncmp(f, "CEIL", 4)) {
         double r = f[0] == 'F' ? floor(x) : ceil(x);
         if (r >= -9.2e18 && r <= 9.2e18) ev_int(out, (int64_t)r); else ev_num(out, r);
         return;
     }
-    if (!strcmp(f, "ROUND")) {
+    if (FIS("ROUND")) {
         double dd = e->nargs > 1 ? ev_as_num(&a[1]) : 0;
         if (a[0].is_dec) {            // decimale: esatto, con d cifre (ROUND(150.000, 2) = 150.00, come MySQL)
             Dec xd, r;
@@ -4870,7 +5154,7 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         if (d <= 0 && r >= -9.2e18 && r <= 9.2e18) ev_int(out, (int64_t)r); else ev_num(out, r);
         return;
     }
-    if (!strcmp(f, "MOD")) {
+    if (FIS("MOD")) {
         if (a[0].is_int && a[1].is_int) {
             if (a[1].inum == 0) { ev_null(out); return; }
             if (a[1].inum == -1) { ev_int(out, 0); return; }
@@ -4883,22 +5167,23 @@ static void eval_func(ASTExpr* e, EvalCtx* c, EvalVal* out) {
         return;
     }
     if (!strncmp(f, "POW", 3)) { ev_num(out, pow(x, ev_as_num(&a[1]))); return; }
-    if (!strcmp(f, "SQRT"))    { if (x < 0) ev_null(out); else ev_num(out, sqrt(x)); return; }
+    if (FIS("SQRT"))    { if (x < 0) ev_null(out); else ev_num(out, sqrt(x)); return; }
     ev_null(out);
 }
 
 // aggregati statistici, bit a bit, booleani e JSON
 static bool eval_agg_extra(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     const char* f = e->func;
+    const size_t flen = strlen(f);                       // per FIS: confronti per lunghezza prima (CR-M2)
     bool stat = !strncmp(f, "STD", 3) || !strncmp(f, "VAR", 3);
     bool bit = !strncmp(f, "BIT_", 4);
-    bool boo = !strncmp(f, "BOOL_", 5) || !strcmp(f, "EVERY");
-    bool jarr = !strcmp(f, "JSON_ARRAYAGG"), jobj = !strcmp(f, "JSON_OBJECTAGG");
+    bool boo = !strncmp(f, "BOOL_", 5) || FIS("EVERY");
+    bool jarr = FIS("JSON_ARRAYAGG"), jobj = FIS("JSON_OBJECTAGG");
     if (!stat && !bit && !boo && !jarr && !jobj) return false;
     Tuple** saved = c->cur;
     int64_t n = 0;
     double mean = 0, m2 = 0;                                   // Welford: media e somma dei quadrati degli scarti
-    uint64_t acc = !strcmp(f, "BIT_AND") ? UINT64_MAX : 0;
+    uint64_t acc = FIS("BIT_AND") ? UINT64_MAX : 0;
     int truth = -1;
     TextBuf tb = {0};
     if (jarr || jobj) tb_put(&tb, jarr ? "[" : "{", 1);
@@ -4945,11 +5230,11 @@ static bool eval_agg_extra(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             m2 += d * (x - mean);
         } else if (bit) {
             uint64_t x = bit_operand(&v);
-            if (!strcmp(f, "BIT_AND")) acc &= x; else if (!strcmp(f, "BIT_OR")) acc |= x; else acc ^= x;
+            if (FIS("BIT_AND")) acc &= x; else if (FIS("BIT_OR")) acc |= x; else acc ^= x;
         } else {
             int t = ev_truth(&v);
             if (truth < 0) truth = t;
-            else if (!strcmp(f, "BOOL_OR")) truth = truth || t;
+            else if (FIS("BOOL_OR")) truth = truth || t;
             else truth = truth && t;
         }
     }
@@ -4957,11 +5242,11 @@ static bool eval_agg_extra(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     sm_free(&seen);
     if (jarr || jobj) {
         tb_put(&tb, jarr ? "]" : "}", 1);
-        if (n == 0) { free(tb.d); ev_null(out); return true; }
+        if (n == 0) { free(tb.p); ev_null(out); return true; }
         tb_result(c, out, &tb);
         return true;
     }
-    if (bit) { ev_unsigned(c, out, n || strcmp(f, "BIT_AND") ? acc : UINT64_MAX); return true; }
+    if (bit) { ev_unsigned(c, out, n || (!FIS("BIT_AND")) ? acc : UINT64_MAX); return true; }
     if (boo) { if (truth < 0) ev_null(out); else ev_int(out, truth); return true; }
     // varianza / deviazione: _POP (e STD, STDDEV, VARIANCE come MySQL) divide per n, _SAMP per n - 1
     bool samp = strstr(f, "SAMP") != NULL;
@@ -4969,6 +5254,22 @@ static bool eval_agg_extra(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     double var = m2 / (double)(samp ? n - 1 : n);
     ev_num(out, !strncmp(f, "VAR", 3) ? var : sqrt(var));
     return true;
+}
+
+// chiave di DISTINCT negli aggregati: i numeri uguali hanno la stessa chiave (5 e 5.0), i testi restano distinti dai
+// numeri; colonna _ci: 'Città' e 'CITTA' sono lo stesso valore
+static void distinct_key(EvalVal* v, char* key, size_t kn) {
+    Dec kd;
+    if (v->is_int) snprintf(key, kn, "n%lld", (long long)v->inum);
+    else if (v->is_dec && ev_get_dec(v, &kd)) { key[0] = 'n'; dec_key(&kd, key + 1, kn - 1); }
+    else if (v->is_num && v->num == floor(v->num) && fabs(v->num) < 9e18) snprintf(key, kn, "n%lld", (long long)v->num);
+    else if (v->is_num) snprintf(key, kn, "n%.17g", v->num);
+    else {
+        char* fk = v->ci ? ci_fold(ev_s(v)) : NULL;
+        key[0] = 's';
+        key_text(key + 1, kn - 1, fk ? fk : ev_s(v));
+        free(fk);
+    }
 }
 
 static void eval_aggregate(ASTExpr* e, EvalCtx* c, EvalVal* out) {
@@ -4991,17 +5292,30 @@ static void eval_aggregate(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     StrMap seen = {0};
     for (int k = 0; k < c->ngrp; k++) {
         c->cur = c->grp[k];
+        if (e->nargs > 1) {                                      // COUNT(DISTINCT a, b, ...): righe con un NULL escluse
+            SvStrBuf kb = {0};
+            bool any_null = false;
+            for (int i = 0; i < e->nargs && !any_null; i++) {
+                eval_expr(e->args[i], c, &v);
+                if (v.null) { any_null = true; break; }
+                char key[KEY_BUF];
+                distinct_key(&v, key, sizeof(key));
+                svsb_printf(&kb, "%u:%s", (unsigned)strlen(key), key);   // lunghezza in testa: chiave composta univoca
+            }
+            if (any_null || kb.oom) { bool oom = kb.oom; svsb_free(&kb); if (oom) { ctx_error(c, "%s", "Out of memory"); break; } continue; }
+            SMSlot* sl = sm_slot(&seen, kb.p, true);
+            svsb_free(&kb);
+            if (!sl) { ctx_error(c, "%s", "Out of memory"); break; }
+            if (sl->val >= 0) continue;
+            sl->val = 1;
+            count++;
+            continue;
+        }
         eval_expr(e->args[0], c, &v);
         if (v.null) continue;
         if (e->agg_distinct) {                                   // COUNT/SUM/AVG(DISTINCT x)
-            // i numeri uguali hanno la stessa chiave (5 e 5.0), i testi restano distinti dai numeri
             char key[KEY_BUF];
-            Dec kd;
-            if (v.is_int) snprintf(key, sizeof(key), "n%lld", (long long)v.inum);
-            else if (v.is_dec && ev_get_dec(&v, &kd)) { key[0] = 'n'; dec_key(&kd, key + 1, sizeof(key) - 1); }
-            else if (v.is_num && v.num == floor(v.num) && fabs(v.num) < 9e18) snprintf(key, sizeof(key), "n%lld", (long long)v.num);
-            else if (v.is_num) snprintf(key, sizeof(key), "n%.17g", v.num);
-            else { key[0] = 's'; key_text(key + 1, sizeof(key) - 1, ev_s(&v)); }
+            distinct_key(&v, key, sizeof(key));
             SMSlot* sl = sm_slot(&seen, key, true);
             if (!sl) { ctx_error(c, "%s", "Out of memory"); break; }
             if (sl->val >= 0) continue;
@@ -5043,7 +5357,8 @@ static void eval_aggregate(ASTExpr* e, EvalCtx* c, EvalVal* out) {
     if (!strcmp(e->func, "AVG")) {
         Dec cnt, q;
         dec_from_i64(count, &cnt);
-        if (any_dec && dec_ok && dec_div(&dsum, &cnt, max_scale + DEC_DIV_INC, &q)) { ev_dec(out, &q); return; }   // scala + 4, come MySQL
+        // DECIMAL e anche interi: AVG(int) = DECIMAL con scala 4 in MySQL (7.3333, non 7.33333333333333)
+        if ((any_dec || (all_int && !overflow)) && dec_ok && dec_div(&dsum, &cnt, max_scale + DEC_DIV_INC, &q)) { ev_dec(out, &q); return; }   // scala + 4, come MySQL
         ev_num(out, sum / (double)count);
         return;
     }
@@ -5067,7 +5382,7 @@ static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             }
             if (e->bound == 0) { ctx_error(c, "Unresolved column '%s'", e->col_name); ev_null(out); return; }
             if (e->rt_const) {                                   // variabile della routine in esecuzione
-                int s = (e->bound - 1) / 1024, col = (e->bound - 1) % 1024;
+                int s = BOUND_SRC(e->bound), col = BOUND_COL(e->bound);
                 const TableSchema* rts = NULL;
                 Tuple* t = c->x ? rt_scope_row(c->x->routine, s, &rts) : NULL;
                 if (!t || !rts || col >= t->num_values || col >= rts->num_columns) { ev_null(out); return; }
@@ -5076,7 +5391,7 @@ static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             }
             const EvalCtx* cc = c;
             for (int k = 0; k < e->outer && cc; k++) cc = cc->outer;   // colonna della query esterna
-            int s = (e->bound - 1) / 1024, col = (e->bound - 1) % 1024;
+            int s = BOUND_SRC(e->bound), col = BOUND_COL(e->bound);
             Tuple* t = (cc && cc->cur && s < cc->nsrc) ? cc->cur[s] : NULL;
             if (!t || col >= t->num_values) { ev_null(out); return; }
             ev_from_col(out, &t->values[col], &cc->src[s].ts->columns[col]);
@@ -5152,13 +5467,16 @@ static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out) {
                 if (a.null || b.null || x.null) { ev_null(out); return; }
                 const char* es = ev_s(&x);
                 if (strlen(es) != 1) { ev_null(out); return; }     // ESCAPE vuoto o lungo: nessun risultato
-                bool m = like_match_esc(ev_s(&a), ev_s(&b), es[0]);
+                bool m = like_match_cs(ev_s(&a), ev_s(&b), es[0], (coll_kind(e->left) | coll_kind(e->right->left)) == 1);
                 ev_int(out, e->op == OP_LIKE ? m : !m);
                 return;
             }
             eval_expr(e->left, c, &a);
             eval_expr(e->right, c, &b);
             if (a.null || b.null) { ev_null(out); return; }
+            int ck = coll_kind(e->left) | coll_kind(e->right);     // collation esplicita: vale per entrambi gli operandi
+            if (ck == 1) a.ci = b.ci = false;
+            else if (ck == 2) { if (!a.is_num) a.ci = true; if (!b.is_num) b.ci = true; }
             switch (e->op) {
                 case OP_EQ: ev_int(out, ev_cmp(&a, &b) == 0); return;
                 case OP_NEQ: ev_int(out, ev_cmp(&a, &b) != 0); return;
@@ -5166,8 +5484,8 @@ static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out) {
                 case OP_GT: ev_int(out, ev_cmp(&a, &b) > 0); return;
                 case OP_LE: ev_int(out, ev_cmp(&a, &b) <= 0); return;
                 case OP_GE: ev_int(out, ev_cmp(&a, &b) >= 0); return;
-                case OP_LIKE:     ev_int(out, like_match(ev_s(&a), ev_s(&b))); return;
-                case OP_NOT_LIKE: ev_int(out, !like_match(ev_s(&a), ev_s(&b))); return;
+                case OP_LIKE:     ev_int(out, like_match_cs(ev_s(&a), ev_s(&b), '\\', ck == 1)); return;
+                case OP_NOT_LIKE: ev_int(out, !like_match_cs(ev_s(&a), ev_s(&b), '\\', ck == 1)); return;
                 case OP_PLUS: case OP_MINUS: case OP_MUL: {
                     Dec dx, dy, dr;
                     if (ev_dec_pair(&a, &b, &dx, &dy)) {             // decimali esatti (scala: max per + -, somma per *)
@@ -5212,7 +5530,8 @@ static void eval_expr(ASTExpr* e, EvalCtx* c, EvalVal* out) {
                 }
                 case OP_DIV: {
                     Dec dx, dy, dr;
-                    if (ev_dec_pair(&a, &b, &dx, &dy)) {             // scala del dividendo + 4 (div_precision_increment)
+                    // DECIMAL, e anche intero / intero: in MySQL 7 / 2 = 3.5000 (DECIMAL con scala 0 + 4), non 3.5
+                    if (ev_dec_pair(&a, &b, &dx, &dy) || (a.is_int && b.is_int && ev_get_dec(&a, &dx) && ev_get_dec(&b, &dy))) {   // scala del dividendo + 4 (div_precision_increment)
                         if (dec_is_zero(&dy) || !dec_div(&dx, &dy, dx.scale + DEC_DIV_INC, &dr)) { ev_null(out); return; }
                         ev_dec(out, &dr);
                         return;
@@ -5276,8 +5595,8 @@ static bool find_index_eq(ASTExpr* w, TableSchema* ts, int* out_ci, char* key, s
     for (int side = 0; side < 2; side++) {
         ASTExpr* col = side ? w->right : w->left;
         ASTExpr* val = side ? w->left : w->right;
-        if (col->type != EXPR_COLUMN || col->bound <= 0 || (col->bound - 1) / 1024 != 0) continue;
-        int ci = (col->bound - 1) % 1024;
+        if (col->type != EXPR_COLUMN || col->bound <= 0 || BOUND_SRC(col->bound) != 0) continue;
+        int ci = BOUND_COL(col->bound);
         if (!col_is_indexed(ts, ci)) continue;
         DataType t = ts->columns[ci].type;
         double d;
@@ -5378,12 +5697,6 @@ static uint64_t mix64(uint64_t x) {
     return x;
 }
 
-static uint64_t str_hash(const char* s) {
-    uint64_t h = 1469598103934665603ULL;
-    for (; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ULL; }
-    return h;
-}
-
 // valori uguali per il raggruppamento hanno lo stesso hash (5 e 5.0 compresi)
 static uint64_t ev_hash(const EvalVal* v) {
     if (v->null) return 0x9e3779b97f4a7c15ULL;
@@ -5403,9 +5716,7 @@ static uint64_t ev_hash(const EvalVal* v) {
     }
     // sempre senza maiuscole: 'Anna' e 'anna' finiscono nello stesso secchio, poi decide l'uguaglianza
     // (con o senza collation _ci): così i due lati di un confronto hanno sempre lo stesso hash
-    uint64_t h = 1469598103934665603ULL;
-    for (const char* p = ev_s(v); *p; p++) { h ^= (unsigned char)tolower((unsigned char)*p); h *= 1099511628211ULL; }
-    return h ^ 0x27d4eb2f165667c5ULL;
+    return u8_ci_hash(ev_s(v)) ^ 0x27d4eb2f165667c5ULL;
 }
 
 // stessa chiave di raggruppamento? (NULL con NULL sì, numeri per valore, testi per contenuto)
@@ -5454,9 +5765,7 @@ static bool col_hash(const Tuple* t, int col, DataType type, uint64_t* h, bool c
     else if (type == SV_TYPE_BIGINT) *h = mix64((uint64_t)v->bigint_val);
     else {                                                     // senza maiuscole: vedi ev_hash
         (void)ci;
-        uint64_t x = 1469598103934665603ULL;
-        for (const char* p = v->str_val ? v->str_val : ""; *p; p++) { x ^= (unsigned char)tolower((unsigned char)*p); x *= 1099511628211ULL; }
-        *h = x;
+        *h = u8_ci_hash(v->str_val ? v->str_val : "");
     }
     return true;
 }
@@ -5596,7 +5905,10 @@ struct SelectPlan {
     ASTNode*  n;
     int       depth;
     CteScope  scope;
-    Source    src[MAX_SOURCES];
+    // array per sorgente (P3.12): cap_src elementi in un solo blocco (srcblk), quanti le tabelle della query
+    void*     srcblk;
+    int       cap_src;
+    Source* src;
     int       nsrc;
     OutCol*   out;               // nout colonne di output (lista dinamica: fino a SV_MAX_COLUMNS, P1.11)
     int       nout, cap_out;
@@ -5605,27 +5917,27 @@ struct SelectPlan {
     bool      correlated;        // usa colonne di una query esterna: rieseguita per ogni riga esterna
     bool      compound;          // primo ramo di UNION / INTERSECT / EXCEPT
     struct SelectPlan* next_arm; // ramo successivo
-    int       corder[SV_MAX_ORDER];   // ORDER BY dell'operazione insiemistica: colonna di output
+    int*      corder;                 // ORDER BY dell'operazione insiemistica: colonna di output (num_order)
     // dove si applica ogni condizione
-    ExprVec   pre_static[MAX_SOURCES];  // filtri della sorgente valutati durante la lettura
-    ExprVec   pre_dyn[MAX_SOURCES];     // filtri della sorgente che usano la query esterna
-    ExprVec   jcond[MAX_SOURCES];       // condizioni del join con la sorgente k
+    ExprVec* pre_static;  // filtri della sorgente valutati durante la lettura
+    ExprVec* pre_dyn;     // filtri della sorgente che usano la query esterna
+    ExprVec* jcond;       // condizioni del join con la sorgente k
     ExprVec   resid;                    // resto della WHERE (dopo i join)
     // ricerca per chiave nella sorgente: colonna = espressione senza colonne della sorgente
-    int       probe_col[MAX_SOURCES];
-    ASTExpr*  probe_key[MAX_SOURCES];
-    bool      probe_dyn[MAX_SOURCES];
-    bool      used_index[MAX_SOURCES];
-    bool      used_tree[MAX_SOURCES];     // la ricerca per chiave ha usato l'albero su disco (P1.6)
+    int* probe_col;
+    ASTExpr** probe_key;
+    bool* probe_dyn;
+    bool* used_index;
+    bool* used_tree;     // la ricerca per chiave ha usato l'albero su disco (P1.6)
     int       batch;                      // righe per blocco della lettura (0 = tutte insieme)
     // scansione per intervallo con l'indice: colonna >, >=, <, <=, BETWEEN costanti
-    int       range_col[MAX_SOURCES];
-    ASTExpr*  range_lo[MAX_SOURCES];
-    ASTExpr*  range_hi[MAX_SOURCES];
-    long      range_rows[MAX_SOURCES];   // righe trovate con l'indice (-1 = indice non usato)
-    long      probe_rows[MAX_SOURCES];   // righe trovate dalla ricerca per chiave nell'indice (-1 = non fatta)
-    StrMap    pmap[MAX_SOURCES];
-    int*      pnext[MAX_SOURCES];
+    int* range_col;
+    ASTExpr** range_lo;
+    ASTExpr** range_hi;
+    long* range_rows;   // righe trovate con l'indice (-1 = indice non usato)
+    long* probe_rows;   // righe trovate dalla ricerca per chiave nell'indice (-1 = non fatta)
+    StrMap* pmap;
+    int** pnext;
     bool      loaded;
     // risultato di una subquery non correlata
     ORows     cache;
@@ -5637,17 +5949,17 @@ struct SelectPlan {
     bool      inset_ci;                // i valori della subquery vengono da una colonna _ci
     bool      inset_built;
     long      execs;                    // esecuzioni (EXPLAIN delle subquery)
-    // NATURAL / USING: copia di destra di una colonna unita -> colonna di sinistra (s*1024+c+1)
-    int*      using_left[MAX_SOURCES];   // per sorgente, colonne della sorgente (NULL = nessuna colonna unita)
-    int       using_n[MAX_SOURCES];
+    // NATURAL / USING: copia di destra di una colonna unita -> colonna di sinistra (BOUND_MAKE(s, c))
+    int** using_left;   // per sorgente, colonne della sorgente (NULL = nessuna colonna unita)
+    int* using_n;
     // funzioni finestra della query
-    ASTExpr*  wins[16];
+    ASTExpr*  wins[64];           // funzioni finestra della query (P3.12: erano 16)
     int       nwins;
     // righe reali per EXPLAIN ANALYZE (sommate su tutte le esecuzioni)
-    long      st_scanned[MAX_SOURCES];  // righe lette dalla tabella
-    long      st_loaded[MAX_SOURCES];   // righe dopo i filtri della lettura
-    long      st_dyn[MAX_SOURCES];      // righe dopo i filtri correlati
-    long      st_join[MAX_SOURCES];     // combinazioni dopo il join con la sorgente k
+    long* st_scanned;  // righe lette dalla tabella
+    long* st_loaded;   // righe dopo i filtri della lettura
+    long* st_dyn;      // righe dopo i filtri correlati
+    long* st_join;     // combinazioni dopo il join con la sorgente k
     long      st_resid, st_groups, st_having, st_out;
     double    st_ms;
     char      err[300];
@@ -5655,11 +5967,11 @@ struct SelectPlan {
 
 static int plan_width(const SelectPlan* p) { return p->nout; }
 static int plan_using_left(const SelectPlan* p, int s, int c) {
-    return (s >= 0 && s < MAX_SOURCES && c >= 0 && c < p->using_n[s] && p->using_left[s]) ? p->using_left[s][c] : 0;
+    return (s >= 0 && s < p->cap_src && c >= 0 && c < p->using_n[s] && p->using_left[s]) ? p->using_left[s][c] : 0;
 }
 
 static bool plan_using_set(SelectPlan* p, int s, int c, int v) {
-    if (s < 0 || s >= MAX_SOURCES || c < 0 || c >= SV_MAX_COLUMNS) return false;
+    if (s < 0 || s >= p->cap_src || c < 0 || c >= SV_MAX_COLUMNS) return false;
     if (c >= p->using_n[s]) {
         int nn = c + 1 > 16 ? c + 1 : 16;
         int* nv = sv_try_realloc(p->using_left[s], sizeof(int) * (size_t)nn);
@@ -5694,7 +6006,7 @@ static OutCol* plan_out_new(SelectPlan* p) {
 static int plan_joined_copy(const SelectPlan* p, int s, int c, int* rk, int* rc) {
     for (int q = s + 1; q < p->nsrc; q++)
         for (int cc = 0; cc < p->src[q].ts->num_columns && cc < SV_MAX_COLUMNS; cc++)
-            if (plan_using_left(p, q, cc) == s * 1024 + c + 1) { if (rk) *rk = q; if (rc) *rc = cc; return (int)p->n->select_stmt.joins[q - 1].type; }
+            if (plan_using_left(p, q, cc) == BOUND_MAKE(s, c)) { if (rk) *rk = q; if (rc) *rc = cc; return (int)p->n->select_stmt.joins[q - 1].type; }
     return -1;
 }
 
@@ -5704,17 +6016,38 @@ static int plan_join_type(const SelectPlan* p, int s) {
 static void plan_mark_correlated(SelectPlan* p) { for (; p; p = p->next_arm) p->correlated = true; }
 static bool plan_add_window(SelectPlan* p, ASTExpr* w) {
     for (int i = 0; i < p->nwins; i++) if (p->wins[i] == w) return true;
-    if (p->nwins >= 16) return false;
+    if (p->nwins >= 64) return false;
     w->win->slot = p->nwins;
     p->wins[p->nwins++] = w;
+    return true;
+}
+
+
+#define PLAN_SRC_FIELDS(X) X(Source, src) X(ExprVec, pre_static) X(ExprVec, pre_dyn) X(ExprVec, jcond) X(int, probe_col) X(ASTExpr*, probe_key) X(bool, probe_dyn) X(bool, used_index) X(bool, used_tree) X(int, range_col) X(ASTExpr*, range_lo) X(ASTExpr*, range_hi) X(long, range_rows) X(long, probe_rows) X(StrMap, pmap) X(int*, pnext) X(int*, using_left) X(int, using_n) X(long, st_scanned) X(long, st_loaded) X(long, st_dyn) X(long, st_join)
+
+// gli array per sorgente del piano, per ns sorgenti, in un solo blocco azzerato
+static bool plan_alloc_src(SelectPlan* p, int ns) {
+    if (ns < 1) ns = 1;
+    size_t off = 0;
+#define X(T, f) size_t o_##f = off = (off + 15) & ~(size_t)15; off += sizeof(T) * (size_t)ns;
+    PLAN_SRC_FIELDS(X)
+#undef X
+    char* b = sv_calloc(1, off);
+    if (!b) return false;
+#define X(T, f) p->f = (T*)(void*)(b + o_##f);
+    PLAN_SRC_FIELDS(X)
+#undef X
+    p->srcblk = b;
+    p->cap_src = ns;
+    for (int s = 0; s < ns; s++) { p->probe_col[s] = -1; p->range_col[s] = -1; p->range_rows[s] = -1; p->probe_rows[s] = -1; }
     return true;
 }
 
 static void plan_free(SelectPlan* p) {
     while (p) {
         SelectPlan* nx = p->next_arm;
-        for (int s = 0; s < MAX_SOURCES; s++) free(p->using_left[s]);
-        for (int s = 0; s < MAX_SOURCES; s++) {
+        for (int s = 0; s < p->cap_src; s++) free(p->using_left[s]);
+        for (int s = 0; s < p->cap_src; s++) {
             free(p->pre_static[s].v); free(p->pre_dyn[s].v); free(p->jcond[s].v);
             sm_free(&p->pmap[s]); free(p->pnext[s]);
         }
@@ -5725,6 +6058,8 @@ static void plan_free(SelectPlan* p) {
         for (int s = 0; s < p->nsrc; s++) source_free(&p->src[s]);
         orows_free(&p->cache);
         sm_free(&p->inset);
+        free(p->srcblk);
+        free(p->corder);
         free(p);
         p = nx;
     }
@@ -5749,7 +6084,7 @@ static const char* out_type_name(const SelectPlan* p, int j, const ORows* rows, 
     if (e->type == EXPR_AGG && !strncmp(e->func, "JSON_", 5)) return "JSON";
     if (e->type == EXPR_AGG && (!strcmp(e->func, "MIN") || !strcmp(e->func, "MAX")) && e->nargs == 1 && e->args[0]->type == EXPR_COLUMN &&
         e->args[0]->bound > 0 && e->args[0]->outer == 0)        // MIN/MAX di una colonna
-        return datatype_name(p->src[(e->args[0]->bound - 1) / 1024].ts->columns[(e->args[0]->bound - 1) % 1024].type);
+        return datatype_name(p->src[BOUND_SRC(e->args[0]->bound)].ts->columns[BOUND_COL(e->args[0]->bound)].type);
     bool any = false, all_int = true, all_num = true, small = true, any_dec = false, any_dbl = false;
     for (int i = 0; rows && i < rows->nrows; i++) {
         const OVal* o = &orow(rows, i)[j];
@@ -5918,16 +6253,20 @@ static bool run_arms(ExecCtx* x, ASTNode** arms, int from, int to, int depth, co
 // precedente finché non ne produce di nuove (con UNION le righe già viste non contano)
 static int cte_recursive(ExecCtx* x, Source* s, ASTCte* c, const CteScope* sc, int i, int depth, char* err, size_t errn) {
     CteScope self = { sc->ctes, i + 1, sc->parent };
-    ASTNode* arms[64];
+    // tutti i SELECT dell'unione (P3.11: con arms[64] quelli dopo il 64° venivano ignorati senza errore)
     int na = 0;
-    for (ASTNode* a = c->node; a && na < 64; a = a->select_stmt.set_next) arms[na++] = a;
+    for (ASTNode* a = c->node; a; a = a->select_stmt.set_next) na++;
+    ASTNode** arms = sv_malloc(sizeof(ASTNode*) * (size_t)(na ? na : 1));
+    if (!arms) { snprintf(err, errn, "Out of memory"); return 0; }
+    na = 0;
+    for (ASTNode* a = c->node; a; a = a->select_stmt.set_next) arms[na++] = a;
     int nanchor = 0;
     while (nanchor < na && !arm_refs_table(arms[nanchor], c->name)) nanchor++;
-    if (nanchor == na) return -1;                                  // non ricorsiva: calcolo normale
-    if (nanchor == 0) { snprintf(err, errn, "WITH RECURSIVE '%.64s': the first SELECT (the anchor) must not use '%.64s'", c->name, c->name); return 0; }
+    if (nanchor == na) { free(arms); return -1; }                  // non ricorsiva: calcolo normale
+    if (nanchor == 0) { snprintf(err, errn, "WITH RECURSIVE '%.64s': the first SELECT (the anchor) must not use '%.64s'", c->name, c->name); free(arms); return 0; }
     bool distinct = false;
     for (int k = 0; k + 1 < na; k++) {
-        if (arms[k]->select_stmt.set_op != SETOP_UNION) { snprintf(err, errn, "WITH RECURSIVE '%.64s' must combine its SELECTs with UNION or UNION ALL", c->name); return 0; }
+        if (arms[k]->select_stmt.set_op != SETOP_UNION) { snprintf(err, errn, "WITH RECURSIVE '%.64s' must combine its SELECTs with UNION or UNION ALL", c->name); free(arms); return 0; }
         if (!arms[k]->select_stmt.set_all) distinct = true;
     }
     ORows all = {0}, work = {0}, step = {0};
@@ -6005,6 +6344,7 @@ static int cte_recursive(ExecCtx* x, Source* s, ASTCte* c, const CteScope* sc, i
         free(ts);
     }
     orows_free(&all);
+    free(arms);
     return ok ? 1 : 0;
 }
 
@@ -6147,7 +6487,15 @@ static const char* is_fk_rule(int a) {
     }
 }
 
-static const char* is_collation(const TableSchema* ts) { return ts->collation[0] ? ts->collation : "utf8mb4_general_ci"; }
+// collation dichiarata; senza, i testi si confrontano byte per byte: utf8mb4_bin (prima information_schema diceva
+// utf8mb4_general_ci, cioè senza maiuscole, ma i confronti le distinguevano)
+static const char* is_collation(const TableSchema* ts) { return ts->collation[0] ? ts->collation : "utf8mb4_bin"; }
+static const char* is_col_collation(const TableSchema* ts, const Column* col) {   // COLLATE della colonna, se c'è
+    bool tci = strlen(ts->collation) > 3 && !strcmp(ts->collation + strlen(ts->collation) - 3, "_ci");
+    if ((col->flags & COLF_CI) && !tci) return "utf8mb4_general_ci";
+    if ((col->flags & COLF_BIN) && tci) return "utf8mb4_bin";
+    return is_collation(ts);
+}
 
 bool executor_priv_ok(const ExecCtx* x, const char* db, const char* table, unsigned priv, char* err, size_t errn) {
     if (!x || !x->user || !x->user[0] || x->priv_off > 0) return true;
@@ -6264,7 +6612,7 @@ static bool infoschema_open(ExecCtx* x, Source* s, const char* table, char* err,
                         else if (col->type == SV_TYPE_BOOL) { isb_i(&b, 3); isb_i(&b, 0); }
                         else { isb_null(&b); isb_null(&b); }
                         if (col->type == SV_TYPE_DATETIME) isb_i(&b, 0); else isb_null(&b);
-                        if (is_text_col(col)) { isb_s(&b, "utf8mb4"); isb_s(&b, is_collation(tb)); } else { isb_null(&b); isb_null(&b); }
+                        if (is_text_col(col)) { isb_s(&b, "utf8mb4"); isb_s(&b, is_col_collation(tb, col)); } else { isb_null(&b); isb_null(&b); }
                         is_coltype(col, buf, sizeof(buf)); isb_s(&b, buf);
                         isb_s(&b, is_colkey(tb, c));
                         bool gen = (col->flags & COLF_GENERATED) != 0;
@@ -6512,14 +6860,14 @@ static bool expr_has_udf(const ASTExpr* e) {
     return false;
 }
 
-static void expr_refs(const ASTExpr* e, unsigned* mask, bool* outer, bool* opaque) {
+static void expr_refs(const ASTExpr* e, uint64_t* mask, bool* outer, bool* opaque) {
     if (!e) return;
     switch (e->type) {
         case EXPR_COLUMN:
             if (e->bound < 0) *opaque = true;
             else if (e->rt_const) {}                          // variabile di routine: una costante
             else if (e->outer > 0) *outer = true;
-            else if (e->bound > 0) *mask |= 1u << ((e->bound - 1) / 1024);
+            else if (e->bound > 0) *mask |= (uint64_t)1 << (BOUND_SRC(e->bound));   // fino a 64 sorgenti
             return;
         case EXPR_SUBQUERY: case EXPR_AGG: case EXPR_WINDOW:
             *opaque = true;
@@ -6541,8 +6889,8 @@ static bool src_nullable(const SelectPlan* p, int s) {
     return false;
 }
 
-static int popcount_u(unsigned m) { int c = 0; while (m) { c += (int)(m & 1u); m >>= 1; } return c; }
-static int highest_bit(unsigned m) { int h = -1; for (int i = 0; m; i++, m >>= 1) if (m & 1u) h = i; return h; }
+static int popcount_u(uint64_t m) { int c = 0; while (m) { c += (int)(m & 1u); m >>= 1; } return c; }
+static int highest_bit(uint64_t m) { int h = -1; for (int i = 0; m; i++, m >>= 1) if (m & 1u) h = i; return h; }
 
 // "colonna di s = espressione senza colonne di questa query" -> ricerca per chiave
 static void find_probe(SelectPlan* p, int s, ExprVec* conds, bool dyn) {
@@ -6553,11 +6901,11 @@ static void find_probe(SelectPlan* p, int s, ExprVec* conds, bool dyn) {
         for (int side = 0; side < 2; side++) {
             ASTExpr* col = side ? w->right : w->left;
             ASTExpr* key = side ? w->left : w->right;
-            if (col->type != EXPR_COLUMN || col->bound <= 0 || col->outer || (col->bound - 1) / 1024 != s) continue;
-            unsigned m = 0; bool o = false, op = false;
+            if (col->type != EXPR_COLUMN || col->bound <= 0 || col->outer || BOUND_SRC(col->bound) != s) continue;
+            uint64_t m = 0; bool o = false, op = false;
             expr_refs(key, &m, &o, &op);
             if (m || op || o != dyn) continue;
-            int ci = (col->bound - 1) % 1024;
+            int ci = BOUND_COL(col->bound);
             DataType t = p->src[s].ts->columns[ci].type;
             if (!is_int_type(t) && !is_text_type(t)) continue;
             p->probe_col[s] = ci;
@@ -6578,11 +6926,11 @@ static void find_range(SelectPlan* p, int s, ExprVec* conds) {
         for (int side = 0; side < 2; side++) {
             ASTExpr* col = side ? w->right : w->left;
             ASTExpr* key = side ? w->left : w->right;
-            if (col->type != EXPR_COLUMN || col->bound <= 0 || col->outer || (col->bound - 1) / 1024 != s) continue;
-            unsigned m = 0; bool o = false, op = false;
+            if (col->type != EXPR_COLUMN || col->bound <= 0 || col->outer || BOUND_SRC(col->bound) != s) continue;
+            uint64_t m = 0; bool o = false, op = false;
             expr_refs(key, &m, &o, &op);
             if (m || o || op) continue;
-            int ci = (col->bound - 1) % 1024;
+            int ci = BOUND_COL(col->bound);
             if (p->range_col[s] >= 0 && p->range_col[s] != ci) continue;
             DataType t = ts->columns[ci].type;
             if ((!is_int_type(t) && !is_text_type(t)) || !col_is_indexed(ts, ci)) continue;
@@ -6617,7 +6965,7 @@ static bool range_rids(SelectPlan* p, int s, EvalCtx* ec, RID** rids, int* n) {
             const char* bt = ev_s(bv[k]);
             if (key_is_long(bt, strlen(bt))) return false;               // chiave in forma lunga: niente intervallo
             snprintf(keep[k], sizeof(keep[k]), "%s", bt);
-            if (col_is_ci(S->ts, ci)) for (char* q = keep[k]; *q; q++) *q = (char)tolower((unsigned char)*q);   // indice in minuscolo
+            if (col_is_ci(S->ts, ci)) u8_ci_fold(keep[k], keep[k]);   // stessa piegatura delle chiavi dell'indice
             bv[k]->str = keep[k];
         }
     }
@@ -6633,7 +6981,6 @@ static bool range_worth(const Source* S, int n) {
 
 // chiave di ricerca dal valore calcolato; false se il tipo non è confrontabile esattamente
 static bool probe_text_ci(const EvalVal* v, DataType col, char* buf, size_t n, bool ci);
-static bool probe_text(const EvalVal* v, DataType col, char* buf, size_t n) { return probe_text_ci(v, col, buf, n, false); }
 static bool probe_text_ci(const EvalVal* v, DataType col, char* buf, size_t n, bool ci) {
     if (v->null) return false;
     if (is_int_type(col)) {
@@ -6756,15 +7103,15 @@ static int jo_col_src(const JoSrc* S, int n, const ASTExpr* e) {
 }
 
 // sorgenti usate da un'espressione (bit), -1 se c'è qualcosa che non si sa attribuire (subquery, colonna esterna)
-static long jo_refs(const JoSrc* S, int n, const ASTExpr* e, int d) {
+static int64_t jo_refs(const JoSrc* S, int n, const ASTExpr* e, int d) {
     if (!e) return 0;
     if (d > 64 || e->type == EXPR_SUBQUERY || e->type == EXPR_WINDOW || e->type == EXPR_AGG) return -1;
-    long m = 0;
-    if (e->type == EXPR_COLUMN) { int k = jo_col_src(S, n, e); return k < 0 ? -1 : 1L << k; }
-    long a = jo_refs(S, n, e->left, d + 1), b = jo_refs(S, n, e->right, d + 1);
+    int64_t m = 0;
+    if (e->type == EXPR_COLUMN) { int k = jo_col_src(S, n, e); return k < 0 ? -1 : (int64_t)1 << k; }
+    int64_t a = jo_refs(S, n, e->left, d + 1), b = jo_refs(S, n, e->right, d + 1);
     if (a < 0 || b < 0) return -1;
     m = a | b;
-    for (int i = 0; i < e->nargs; i++) { long c = jo_refs(S, n, e->args[i], d + 1); if (c < 0) return -1; m |= c; }
+    for (int i = 0; i < e->nargs; i++) { int64_t c = jo_refs(S, n, e->args[i], d + 1); if (c < 0) return -1; m |= c; }
     return m;
 }
 
@@ -6819,12 +7166,13 @@ static void jo_conj(ASTExpr* e, ASTExpr** out, int* n, int max) {
     if (*n < max) out[(*n)++] = e;
 }
 
+#define JO_MAX 16                                // tabelle che il riordino considera (P3.12: erano 8)
 static void join_reorder(ExecCtx* x, ASTNode* n, const CteScope* scope) {
     int nj = n->select_stmt.num_joins, ns = nj + 1;
-    if (nj < 2 || ns > 8 || scope || n->select_stmt.set_next || n->select_stmt.from_sub || n->select_stmt.from_tf ||
+    if (nj < 2 || ns > JO_MAX || scope || n->select_stmt.set_next || n->select_stmt.from_sub || n->select_stmt.from_tf ||
         !n->select_stmt.table_name[0]) return;
     Database* cur = catalog_current_db(x->catalog);
-    JoSrc S[8];
+    JoSrc S[JO_MAX];
     for (int i = 0; i < ns; i++) {
         const char *tn, *al, *tdb;
         if (i == 0) { tn = n->select_stmt.table_name; al = n->select_stmt.table_alias; tdb = n->select_stmt.table_db; }
@@ -6844,25 +7192,25 @@ static void join_reorder(ExecCtx* x, ASTNode* n, const CteScope* scope) {
     jo_conj(n->select_stmt.where, conj, &nc, 128);
     for (int j = 0; j < nj; j++) jo_conj(n->select_stmt.joins[j].condition, conj, &nc, 128);
     if (nc >= 128) return;
-    long refs[128];
+    int64_t refs[128];
     for (int i = 0; i < nc; i++) { refs[i] = jo_refs(S, ns, conj[i], 0); }
     // righe di ogni tabella dopo le sue condizioni
-    double base[8];
+    double base[JO_MAX];
     for (int i = 0; i < ns; i++) {
         const TableStats* st = stats_get(S[i].db, S[i].table);
         base[i] = st ? st->rows : (double)S[i].ts->num_rows;
         if (base[i] < 1) base[i] = 1;
-        for (int c = 0; c < nc; c++) if (refs[c] == (1L << i)) base[i] *= jo_sel(S, ns, conj[c]);
+        for (int c = 0; c < nc; c++) if (refs[c] == ((int64_t)1 << i)) base[i] *= jo_sel(S, ns, conj[c]);
         if (base[i] < 1) base[i] = 1;
     }
     // costo di un ordine: somma dei risultati intermedi
     #define JO_COST(ord, outc) do { \
-        long in = 1L << (ord)[0]; double r = base[(ord)[0]], tot = 0; \
+        int64_t in = (int64_t)1 << (ord)[0]; double r = base[(ord)[0]], tot = 0; \
         for (int k = 1; k < ns; k++) { \
             int t = (ord)[k]; double est = r * base[t]; \
             for (int c = 0; c < nc; c++) { \
-                if (refs[c] <= 0 || !(refs[c] & (1L << t)) || (refs[c] & ~(in | (1L << t)))) continue; \
-                if (refs[c] == (1L << t)) continue; \
+                if (refs[c] <= 0 || !(refs[c] & ((int64_t)1 << t)) || (refs[c] & ~(in | ((int64_t)1 << t)))) continue; \
+                if (refs[c] == ((int64_t)1 << t)) continue; \
                 const ASTExpr* e = conj[c]; double sel = 0.5; \
                 if (e->type == EXPR_BINARY && e->op == OP_EQ) { \
                     const ColStats* a = jo_stats(S, ns, e->left), *b = jo_stats(S, ns, e->right); \
@@ -6873,14 +7221,14 @@ static void join_reorder(ExecCtx* x, ASTNode* n, const CteScope* scope) {
                 est *= sel; \
             } \
             if (est < 1) est = 1; \
-            r = est; tot += r; in |= 1L << t; \
+            r = est; tot += r; in |= (int64_t)1 << t; \
         } \
         (outc) = tot; \
     } while (0)
-    int orig[8], best[8];
+    int orig[JO_MAX], best[JO_MAX];
     for (int i = 0; i < ns; i++) orig[i] = i;
     // greedy: la più piccola, poi la prossima che (unita) dà il risultato più piccolo; parità: nome
-    bool used[8] = {0};
+    bool used[JO_MAX] = {0};
     int first = 0;
     for (int i = 1; i < ns; i++)
         if (base[i] < base[first] || (base[i] == base[first] && strcasecmp(S[i].name, S[first].name) < 0)) first = i;
@@ -6890,18 +7238,18 @@ static void join_reorder(ExecCtx* x, ASTNode* n, const CteScope* scope) {
         double pick_cost = 0;
         for (int t = 0; t < ns; t++) {
             if (used[t]) continue;
-            int trial[8];
+            int trial[JO_MAX];
             memcpy(trial, best, sizeof(int) * (size_t)k);
             trial[k] = t;
             // costo del prefisso con t aggiunta (le altre ancora fuori)
-            long in = 0; double r = 0, tot = 0;
+            int64_t in = 0; double r = 0, tot = 0;
             for (int q = 0; q <= k; q++) {
                 int u = trial[q];
-                if (q == 0) { r = base[u]; in = 1L << u; continue; }
+                if (q == 0) { r = base[u]; in = (int64_t)1 << u; continue; }
                 double est = r * base[u];
                 bool joined = false;
                 for (int c = 0; c < nc; c++) {
-                    if (refs[c] <= 0 || refs[c] == (1L << u) || !(refs[c] & (1L << u)) || (refs[c] & ~(in | (1L << u)))) continue;
+                    if (refs[c] <= 0 || refs[c] == ((int64_t)1 << u) || !(refs[c] & ((int64_t)1 << u)) || (refs[c] & ~(in | ((int64_t)1 << u)))) continue;
                     const ASTExpr* e = conj[c];
                     double sel = 0.5;
                     if (e->type == EXPR_BINARY && e->op == OP_EQ) {
@@ -6916,7 +7264,7 @@ static void join_reorder(ExecCtx* x, ASTNode* n, const CteScope* scope) {
                 }
                 if (!joined && q == k) est *= 1e6;         // prodotto cartesiano: solo se non c'è altro
                 if (est < 1) est = 1;
-                r = est; tot += r; in |= 1L << u;
+                r = est; tot += r; in |= (int64_t)1 << u;
             }
             if (pick < 0 || tot < pick_cost || (tot == pick_cost && strcasecmp(S[t].name, S[pick].name) < 0)) { pick = t; pick_cost = tot; }
         }
@@ -6938,8 +7286,11 @@ static void join_reorder(ExecCtx* x, ASTNode* n, const CteScope* scope) {
         for (int k = 0; k < ns; k++)
             if (!e->table_name[0] || !strcasecmp(e->table_name, S[k].name) || !strcasecmp(e->table_name, S[k].table)) nexp += S[k].ts->num_columns;
     }
-    if (nexp > 64) return;
-    ASTExpr* cols[64];
+    // (P3.12 / bug: con cols[64] si saltava il riordino oltre 64 colonne, e la memcpy sotto scriveva oltre la fine
+    // di select_stmt.columns, grande quanto l'elenco scritto — "*" = 8 posti: heap overflow trovato con ASan)
+    if (nexp > SV_MAX_COLUMNS) return;
+    ASTExpr** cols = sv_malloc(sizeof(ASTExpr*) * (size_t)(nexp ? nexp : 1));
+    if (!cols) return;
     int nn = 0;
     for (int i = 0; i < n->select_stmt.num_cols; i++) {
         ASTExpr* e = n->select_stmt.columns[i];
@@ -6957,13 +7308,15 @@ static void join_reorder(ExecCtx* x, ASTNode* n, const CteScope* scope) {
         }
         ast_expr_free(e);
     }
-    memcpy(n->select_stmt.columns, cols, sizeof(ASTExpr*) * (size_t)nn);
+    free(n->select_stmt.columns);                      // la lista espansa prende il posto di quella scritta
+    n->select_stmt.columns = cols;
     n->select_stmt.num_cols = nn;
+    n->select_stmt.cap_cols = nexp ? nexp : 1;
     // le ON nel WHERE, le tabelle nel nuovo ordine (join interni senza condizione propria)
     ASTExpr* where = n->select_stmt.where;
     for (int j = 0; j < nj; j++) { where = jo_and(where, n->select_stmt.joins[j].condition); n->select_stmt.joins[j].condition = NULL; }
     n->select_stmt.where = where;
-    char tn[8][64], al[8][64], tdb[8][64];
+    char tn[JO_MAX][64], al[JO_MAX][64], tdb[JO_MAX][64];
     for (int i = 0; i < ns; i++) {
         const char* a = i == 0 ? n->select_stmt.table_alias : n->select_stmt.joins[i - 1].alias;
         const char* d = i == 0 ? n->select_stmt.table_db : n->select_stmt.joins[i - 1].table_db;
@@ -7000,13 +7353,14 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
     p->scope.ctes = n->select_stmt.ctes;
     p->scope.n = n->select_stmt.num_ctes;
     p->scope.parent = ctes;
-    for (int s = 0; s < MAX_SOURCES; s++) { p->probe_col[s] = -1; p->range_col[s] = -1; p->range_rows[s] = -1; p->probe_rows[s] = -1; }
     Database* db = catalog_current_db(x->catalog);
     const CteScope* scope = p->scope.n ? &p->scope : ctes;
     p->compound = !arm && n->select_stmt.set_next != NULL;
     #define FAIL(...) do { snprintf(err, errn, __VA_ARGS__); plan_free(p); return NULL; } while (0)
 
     if (!p->compound && !arm) join_reorder(x, n, scope);   // join interni: l'ordine che costa meno (P1.13)
+    if (n->select_stmt.num_joins + 1 > MAX_SOURCES) FAIL("Too many tables in one SELECT (max %d)", MAX_SOURCES);
+    if (!plan_alloc_src(p, n->select_stmt.num_joins + 1)) FAIL("Out of memory");
 
     // 1. sorgenti (SELECT senza FROM: nessuna, il risultato ha una riga)
     if (n->select_stmt.table_name[0]) {
@@ -7035,17 +7389,19 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
         if (!jn->natural && !jn->nusing) continue;
         int k = j + 1;
         Source* R = &p->src[k];
-        char names[SV_MAX_COLUMNS][64];
+        // puntatori ai nomi (schema / AST, stabili qui): prima copie da 64 byte, 64 KB di stack in una funzione
+        // ricorsiva (CR-M1)
+        const char* names[SV_MAX_COLUMNS];
         int nn = 0;
         if (jn->natural) {
             for (int c = 0; c < R->ts->num_columns && nn < SV_MAX_COLUMNS; c++)
                 for (int q = 0; q < k; q++)
                     if (catalog_get_col_index(p->src[q].ts, R->ts->columns[c].name) >= 0) {
-                        snprintf(names[nn++], 64, "%s", R->ts->columns[c].name);
+                        names[nn++] = R->ts->columns[c].name;
                         break;
                     }
         } else {
-            for (int u = 0; u < jn->nusing; u++) snprintf(names[nn++], 64, "%s", jn->using_cols[u]);
+            for (int u = 0; u < jn->nusing && nn < SV_MAX_COLUMNS; u++) names[nn++] = jn->using_cols[u];
         }
         ASTExpr* cond = NULL;
         for (int u = 0; u < nn; u++) {
@@ -7059,7 +7415,7 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
                 ls = q; lc = c;
             }
             if (ls < 0) FAIL("Column '%.64s' of USING is not in the tables before the JOIN", names[u]);
-            if (!plan_using_set(p, k, rc, ls * 1024 + lc + 1)) FAIL("Out of memory");
+            if (!plan_using_set(p, k, rc, BOUND_MAKE(ls, lc))) FAIL("Out of memory");
             if (!jn->using_built) {
                 ASTExpr* a = sv_calloc(1, sizeof(ASTExpr));
                 ASTExpr* b2 = sv_calloc(1, sizeof(ASTExpr));
@@ -7100,13 +7456,13 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
                     if (!col) FAIL("Out of memory");
                     col->type = EXPR_COLUMN;
                     snprintf(col->col_name, sizeof(col->col_name), "%s", sr->ts->columns[c].name);
-                    col->bound = s * 1024 + c + 1;
+                    col->bound = BOUND_MAKE(s, c);
                     src_need(sr, c);
                     // colonna unita con un RIGHT / FULL JOIN successivo: COALESCE(sinistra, destra)
                     int rk = -1, rcol = -1;
                     for (int q = s + 1; !e->table_name[0] && q < p->nsrc && rk < 0; q++)
                         for (int cc = 0; cc < p->src[q].ts->num_columns; cc++)
-                            if (plan_using_left(p, q, cc) == s * 1024 + c + 1 &&
+                            if (plan_using_left(p, q, cc) == BOUND_MAKE(s, c) &&
                                 (n->select_stmt.joins[q - 1].type == JOIN_RIGHT || n->select_stmt.joins[q - 1].type == JOIN_FULL)) { rk = q; rcol = cc; break; }
                     if (rk >= 0) {
                         ASTExpr* other = sv_calloc(1, sizeof(ASTExpr));
@@ -7114,7 +7470,7 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
                         ASTExpr** args = sv_calloc(2, sizeof(ASTExpr*));
                         if (!other || !co || !args) { free(other); free(co); free(args); free(col); FAIL("Out of memory"); }
                         *other = *col;
-                        other->bound = rk * 1024 + rcol + 1;
+                        other->bound = BOUND_MAKE(rk, rcol);
                         src_need(&p->src[rk], rcol);
                         co->type = EXPR_FUNC;
                         snprintf(co->func, sizeof(co->func), "COALESCE");
@@ -7219,12 +7575,12 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
         if (oc->owned) continue;
         ASTExpr* e = oc->e;
         if (e->type == EXPR_COLUMN && e->bound > 0 && e->outer == 0) {
-            int s = (e->bound - 1) / 1024, c = (e->bound - 1) % 1024;
+            int s = BOUND_SRC(e->bound), c = BOUND_COL(e->bound);
             oc->src_type = (int)p->src[s].ts->columns[c].type;
         }
         if (e->alias[0])                                                   snprintf(oc->name, sizeof(oc->name), "%s", e->alias);
         else if (e->type == EXPR_COLUMN && p->nsrc > 1 && e->outer == 0 && e->bound > 0)
-            snprintf(oc->name, sizeof(oc->name), "%.64s.%.64s", p->src[(e->bound - 1) / 1024].name, e->col_name);
+            snprintf(oc->name, sizeof(oc->name), "%.64s.%.64s", p->src[BOUND_SRC(e->bound)].name, e->col_name);
         else if (e->type == EXPR_COLUMN || (e->type == EXPR_FUNC && e->col_name[0]))   // (colonna di USING in un FULL JOIN)
             snprintf(oc->name, sizeof(oc->name), "%s", e->col_name);
         else                                                               ast_expr_format(e, oc->name, sizeof(oc->name));
@@ -7239,7 +7595,7 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
     for (int i = 0; i < conj.n; i++) {
         ASTExpr* c = conj.v[i];
         if (expr_has_udf(c)) { xv_push(&costly, c); continue; }
-        unsigned m = 0; bool o = false, op = false;
+        uint64_t m = 0; bool o = false, op = false;
         expr_refs(c, &m, &o, &op);
         bool safe = !op && m != 0;
         for (int s = 0; safe && s < p->nsrc; s++) if ((m >> s & 1u) && src_nullable(p, s)) safe = false;
@@ -7268,10 +7624,10 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
         collect_conj(j->condition, &on);
         for (int i = 0; i < on.n; i++) {
             ASTExpr* c = on.v[i];
-            unsigned m = 0; bool o = false, op = false;
+            uint64_t m = 0; bool o = false, op = false;
             expr_refs(c, &m, &o, &op);
             // condizione dell'ON solo sulla tabella unita: filtra le sue righe prima del join
-            bool pre = !op && m == (1u << k) && (j->type == JOIN_LEFT || !src_nullable(p, k)) && !p->src[k].lateral;
+            bool pre = !op && m == ((uint64_t)1 << k) && (j->type == JOIN_LEFT || !src_nullable(p, k)) && !p->src[k].lateral;
             xv_push(pre ? (o ? &p->pre_dyn[k] : &p->pre_static[k]) : &p->jcond[k], c);
         }
         free(on.v);
@@ -7299,6 +7655,7 @@ static SelectPlan* plan_prepare_ex(ExecCtx* x, ASTNode* n, int depth, BindCtx* o
         }
         for (SelectPlan* a = p->next_arm; a; a = a->next_arm) if (a->correlated) plan_mark_correlated(p);
         // ORDER BY del risultato: posizione o nome di una colonna del risultato
+        if (n->select_stmt.num_order && !(p->corder = sv_malloc(sizeof(int) * (size_t)n->select_stmt.num_order))) FAIL("Out of memory");
         for (int i = 0; i < n->select_stmt.num_order; i++) {
             ASTExpr* o = n->select_stmt.order_exprs[i];
             int k = -1;
@@ -7395,7 +7752,7 @@ static bool plan_load(SelectPlan* p) {
         src_need(&p->src[s], p->range_col[s]);
         for (int c = 0; c < p->using_n[s]; c++) {
             int v = p->using_left[s] ? p->using_left[s][c] : 0;
-            if (v > 0) { src_need(&p->src[s], c); if ((v - 1) / 1024 < p->nsrc) src_need(&p->src[(v - 1) / 1024], (v - 1) % 1024); }
+            if (v > 0) { src_need(&p->src[s], c); if (BOUND_SRC(v) < p->nsrc) src_need(&p->src[BOUND_SRC(v)], BOUND_COL(v)); }
         }
     }
     // LIMIT senza ORDER BY, raggruppamenti, DISTINCT, finestre, join né condizioni dopo la lettura: la lettura della
@@ -7595,8 +7952,8 @@ static bool find_hash_cond(ExprVec* conds, int k, Source* src, int* nk_col, int*
         ASTExpr* on = conds->v[i];
         if (on->type != EXPR_BINARY || on->op != OP_EQ || on->left->type != EXPR_COLUMN || on->right->type != EXPR_COLUMN) continue;
         if (on->left->bound <= 0 || on->right->bound <= 0 || on->left->outer || on->right->outer) continue;
-        int ls = (on->left->bound - 1) / 1024, lc = (on->left->bound - 1) % 1024;
-        int rs = (on->right->bound - 1) / 1024, rc = (on->right->bound - 1) % 1024;
+        int ls = BOUND_SRC(on->left->bound), lc = BOUND_COL(on->left->bound);
+        int rs = BOUND_SRC(on->right->bound), rc = BOUND_COL(on->right->bound);
         if (rs == k && ls < k) { int ts = ls, tc = lc; ls = rs; lc = rc; rs = ts; rc = tc; }
         if (ls != k || rs >= k) continue;
         DataType a = src[ls].ts->columns[lc].type, b = src[rs].ts->columns[rc].type;
@@ -8103,7 +8460,7 @@ static void wacc_result(const WinAcc* a, const char* f, SortKey* out) {
     if (!strcmp(f, "COUNT")) { out->is_num = out->is_int = true; out->inum = a->count; out->num = (double)a->count; return; }
     if (a->count == 0) { out->null = true; return; }
     if (!strcmp(f, "SUM") && a->all_int && !a->overflow) { out->is_num = out->is_int = true; out->inum = a->isum; out->num = (double)a->isum; return; }
-    if (a->any_dec && !a->dec_bad && (!strcmp(f, "SUM") || !strcmp(f, "AVG"))) {   // decimali: esatti
+    if (((a->any_dec && !strcmp(f, "SUM")) || ((a->any_dec || (a->all_int && !a->overflow)) && !strcmp(f, "AVG"))) && !a->dec_bad) {   // decimali (e AVG di interi): esatti
         Dec r = a->ddec, cnt;
         dec_from_i64(a->count, &cnt);
         if (!strcmp(f, "SUM") || dec_div(&a->ddec, &cnt, a->scale + DEC_DIV_INC, &r)) {
@@ -8881,7 +9238,7 @@ static void eval_subquery(ASTExpr* e, EvalCtx* c, EvalVal* out) {
             if (rows->nrows == 0) { ev_null(out); break; }
             if (rows->nrows > 1) { ctx_error(c, "%s", "Subquery used as a value returned more than one row"); ev_null(out); break; }
             ev_from_oval(out, orow(rows, 0));
-            if (!cached && out->str) {                       // le righe vengono liberate: il testo va copiato
+            if (!cached && !out->null && out->str) {         // le righe vengono liberate: il testo va copiato (un NULL resta NULL)
                 bool num = out->is_num, isint = out->is_int, dc = out->is_dec;
                 if (!ev_text_long(out, out->str, strlen(out->str))) { ctx_error(c, "%s", "Out of memory"); ev_null(out); }
                 else { out->is_num = num; out->is_int = isint; out->is_dec = dc; }
@@ -8953,7 +9310,7 @@ static void eval_subquery(ASTExpr* e, EvalCtx* c, EvalVal* out) {
 // statistiche della colonna di una sorgente (NULL: vista, colonna esterna, mai analizzata)
 static const ColStats* src_col_stats(const SelectPlan* p, const ASTExpr* e) {
     if (!p || !e || e->type != EXPR_COLUMN || e->bound <= 0 || e->outer) return NULL;
-    int s = (e->bound - 1) / 1024, c = (e->bound - 1) % 1024;
+    int s = BOUND_SRC(e->bound), c = BOUND_COL(e->bound);
     if (s >= p->nsrc || p->src[s].is_view || !p->src[s].ts || c >= p->src[s].ts->num_columns) return NULL;
     const Source* S = &p->src[s];
     const char* db = S->db;
@@ -9355,7 +9712,7 @@ static QueryResult* rows_result(ExecCtx* ctx, SelectPlan* p, ASTNode* n, int dep
         for (int j = 0; ok && j < nout; j++) {
             const ASTExpr* e = p->out[j].e;
             if (!e || e->type != EXPR_COLUMN || e->bound <= 0 || e->outer) continue;
-            int s = (e->bound - 1) / 1024, c = (e->bound - 1) % 1024;
+            int s = BOUND_SRC(e->bound), c = BOUND_COL(e->bound);
             if (s < 0 || s >= p->nsrc || p->src[s].is_view || !p->src[s].ts || c >= p->src[s].ts->num_columns) continue;
             r->col_tables[j] = sv_strdup(p->src[s].table);
             r->col_columns[j] = sv_strdup(p->src[s].ts->columns[c].name);
@@ -9625,13 +9982,6 @@ static Tuple* tuple_clone(const Tuple* t, const TableSchema* ts) {
 
 // testo di un valore calcolato da salvare (NULL per i NULL)
 static const char* ev_store_text(const EvalVal* v) { return v->null ? NULL : ev_s(v); }
-
-static int pk_column(const TableSchema* ts) {
-    for (int i = 0; i < ts->num_columns; i++) if (ts->columns[i].primary_key) return i;
-    return -1;
-}
-
-static void rid_key(RID r, char* buf, size_t n) { snprintf(buf, n, "%u:%u", r.page_id, (unsigned)r.slot_id); }
 
 // Protezione: scritto e letto solo con il motore in esclusiva (le letture parallele non scrivono).
 static bool g_fk_checks = true;
@@ -10029,6 +10379,19 @@ static const char* row_fits(const TableSchema* ts, const Tuple* t, char* msg, si
     for (int c = 0; c < ts->num_columns && c < t->num_values; c++) {          // UNSIGNED: niente negativi
         const Column* col = &ts->columns[c];
         const Value* v = &t->values[c];
+        long long lo, hi;                                // TINYINT / SMALLINT / MEDIUMINT: su ogni percorso di scrittura
+        if (!v->is_null && col->type == SV_TYPE_INT && narrow_int_bounds(col, &lo, &hi) && (v->int_val < lo || v->int_val > hi)) {
+            snprintf(msg, mn, "Value %lld is out of range for column '%.64s' (%.40s)", (long long)v->int_val, col->name, col->sqltype);
+            return msg;                                  // (prima INSERT ... VALUES (200) entrava in un TINYINT)
+        }
+        // INT UNSIGNED si conserva come BIGINT: al più 2^32 - 1 (prima 4294967296 entrava)
+        if (!v->is_null && col->type == SV_TYPE_BIGINT && (col->flags & COLF_UNSIGNED) &&
+            (!strncasecmp(col->sqltype, "int", 3) && !isalnum((unsigned char)col->sqltype[3]) ? true :
+             !strncasecmp(col->sqltype, "integer", 7) && !isalnum((unsigned char)col->sqltype[7])) &&
+            (uint64_t)v->bigint_val > 4294967295ULL) {
+            snprintf(msg, mn, "Value %llu is out of range for column '%.64s' (%.40s)", (unsigned long long)(uint64_t)v->bigint_val, col->name, col->sqltype);
+            return msg;
+        }
         if (!(col->flags & COLF_UNSIGNED) || v->is_null) continue;
         // BIGINT UNSIGNED: i 64 bit sono il valore senza segno (oltre 2^63 i bit sono "negativi"); il testo
         // negativo è già stato rifiutato da check_value
@@ -10272,7 +10635,8 @@ static const char* resolve_cols(const TableSchema* ts, char names[][64], int n, 
 
 // aggiunge a ts il vincolo d (parent: la tabella riferita, o ts stessa se si riferisce a sé)
 static const char* add_constraint(ExecCtx* ctx, Database* db, TableSchema* ts, ConstraintDef* d, char* msg, size_t mn) {
-    if (ts->num_constraints >= SV_MAX_CONSTRAINTS) return "Too many constraints on the table (max 16)";
+    if (ts->num_constraints >= SV_MAX_CONSTRAINTS) return "Too many constraints on the table (max 64)";
+    if (!sv_name_ok_opt(d->name)) return "Invalid constraint name: it cannot contain a backtick (`) or a control character";
     Constraint c;
     memset(&c, 0, sizeof(c));
     c.kind = (uint8_t)d->kind;
@@ -10419,7 +10783,7 @@ static const char* add_constraint(ExecCtx* ctx, Database* db, TableSchema* ts, C
     }
 
     Constraint* slot = schema_add_constraint(ts);
-    if (!slot) return "Too many constraints on the table (max 16)";
+    if (!slot) return "Too many constraints on the table (max 64) or out of memory";
     *slot = c;
     if (d->kind == CONS_PRIMARY)
         for (int k = 0; k < c.ncols; k++) { ts->columns[c.cols[k]].primary_key = true; ts->columns[c.cols[k]].nullable = false; }
@@ -11006,6 +11370,7 @@ static QueryResult* exec_create_trigger(ExecCtx* ctx, ASTNode* n) {
     trig_program_free(prog);
     lexer_free(tk);
     if (fail) { if (fail != msg) snprintf(msg, sizeof(msg), "%s", fail); return result_error_msg(msg); }
+    if (!sv_name_ok(n->create_trigger.name)) return bad_name_error("trigger");
     TriggerSchema* tg = catalog_new_trigger(db);            // lista dinamica (P1.11: prima 64 al massimo)
     if (!tg) return result_error_msg("Out of memory");
     snprintf(tg->name, sizeof(tg->name), "%s", n->create_trigger.name);
@@ -11176,6 +11541,7 @@ static QueryResult* exec_create_procedure(ExecCtx* ctx, ASTNode* n) {
         snprintf(full, sizeof(full), "Invalid %s: %.300s", is_function ? "function" : "procedure", msg);
         return result_error_msg(full);
     }
+    if (!sv_name_ok(tmp.name)) return bad_name_error(is_function ? "function" : "procedure");
     RoutineSchema* rt = catalog_new_routine(db);            // lista dinamica (P1.11: prima 64 al massimo)
     if (!rt) return result_error_msg("Out of memory");
     *rt = tmp;
@@ -11553,7 +11919,8 @@ static QueryResult* exec_insert_in(ExecCtx* ctx, ASTNode* n, InsScratch* S) {
     int ai = -1;
     for (int i = 0; i < nc; i++) if (ts->columns[i].auto_increment) { ai = i; break; }
     int64_t auto_next = 0;
-    int64_t last_generated = 0;     // ultimo valore AUTO_INCREMENT generato (last_insert_id)
+    int64_t last_generated = 0;     // PRIMO valore AUTO_INCREMENT generato dallo statement: LAST_INSERT_ID() di MySQL
+                                    // (prima l'ultimo: con INSERT … VALUES (…),(…) gli id calcolati dalle app erano sbagliati)
     if (ai >= 0) {
         MemIndex* ix = mi_get(ctx, db->name, ts, ai);
         if (!ix) { orows_free(&srows); return result_error_msg("Out of memory (AUTO_INCREMENT index)"); }
@@ -11634,7 +12001,7 @@ static QueryResult* exec_insert_in(ExecCtx* ctx, ASTNode* n, InsScratch* S) {
                 if (!text[i]) {                                   // valore generato (anche per un NULL esplicito)
                     if (auto_next == INT64_MAX) { fail = "AUTO_INCREMENT value out of range"; break; }
                     snprintf(ai_buf, sizeof(ai_buf), "%lld", (long long)++auto_next);
-                    last_generated = auto_next;
+                    if (!last_generated) last_generated = auto_next;
                     text[i] = ai_buf;
                 } else {
                     char* end = NULL;
@@ -11730,8 +12097,8 @@ static const char* select_matches(ExecCtx* ctx, Database* db, Source* s, ASTExpr
             ASTExpr* col = side ? w->right : w->left;
             ASTExpr* key = side ? w->left : w->right;
             if (col->type != EXPR_COLUMN || col->bound <= 0 || col->outer) continue;
-            int ci = (col->bound - 1) % 1024;
-            unsigned m = 0; bool o = false, op = false;
+            int ci = BOUND_COL(col->bound);
+            uint64_t m = 0; bool o = false, op = false;
             expr_refs(key, &m, &o, &op);
             if (m || op || !col_is_indexed(s->ts, ci) || key->type == EXPR_INT || key->type == EXPR_STRING) continue;
             EvalVal kv;
@@ -11776,7 +12143,8 @@ static const char* select_matches(ExecCtx* ctx, Database* db, Source* s, ASTExpr
     return NULL;
 }
 
-static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
+// set_ci: spazio per num_sets indici di colonna (lo dà exec_update: la lista SET non ha più un tetto fisso)
+static QueryResult* exec_update_cols(ExecCtx* ctx, ASTNode* n, int* set_ci) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
     TableSchema* ts = catalog_get_table(ctx->catalog, db->name, n->update_stmt.table_name);
@@ -11786,7 +12154,6 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
     }
     char msg[300];
     if (!executor_priv_ok(ctx, db->name, ts->name, AUTH_UPDATE, msg, sizeof(msg))) return result_error_msg(msg);
-    int set_ci[SV_MAX_SETS];
     for (int k = 0; k < n->update_stmt.num_sets; k++) {
         set_ci[k] = catalog_get_col_index(ts, n->update_stmt.set_cols[k]);
         if (set_ci[k] < 0) return unknown_column_error(n->update_stmt.set_cols[k], "SET");
@@ -11885,6 +12252,14 @@ static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
     return result_ok_msg(affected);
 }
 
+static QueryResult* exec_update(ExecCtx* ctx, ASTNode* n) {
+    int* set_ci = sv_malloc(sizeof(int) * ((size_t)n->update_stmt.num_sets + 1));
+    if (!set_ci) return result_error_msg("Out of memory");
+    QueryResult* r = exec_update_cols(ctx, n, set_ci);
+    free(set_ci);
+    return r;
+}
+
 static QueryResult* exec_delete(ExecCtx* ctx, ASTNode* n) {
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
@@ -11962,26 +12337,8 @@ static const char* fk_action_name(int a) {
     }
 }
 
-typedef struct { char* p; size_t n, cap; bool ok; } TBuf;
-
-static void tb_add(TBuf* b, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
-#include <stdarg.h>
-static void tb_add(TBuf* b, const char* fmt, ...) {
-    if (!b->ok) return;
-    for (;;) {
-        va_list ap;
-        va_start(ap, fmt);
-        int w = vsnprintf(b->p ? b->p + b->n : NULL, b->p ? b->cap - b->n : 0, fmt, ap);
-        va_end(ap);
-        if (w < 0) { b->ok = false; return; }
-        if (b->p && b->n + (size_t)w < b->cap) { b->n += (size_t)w; return; }
-        size_t nc = (b->cap ? b->cap : 256) * 2 + (size_t)w;
-        char* np = sv_realloc(b->p, nc);
-        if (!np) { b->ok = false; return; }
-        b->p = np;
-        b->cap = nc;
-    }
-}
+typedef SvStrBuf TBuf;                                       // testo dei CREATE TABLE (buffer comune, CR-B2)
+#define tb_add svsb_printf
 
 static void tb_cols(TBuf* b, const TableSchema* ts, const uint8_t* cols, int n) {
     for (int k = 0; k < n; k++) tb_add(b, "%s%s", k ? ", " : "", ts->columns[cols[k]].name);
@@ -12002,7 +12359,7 @@ static void tb_fk(TBuf* b, const TableSchema* ts, const Constraint* c) {
 char* executor_create_statement(Catalog* cat, const char* db, const char* table, bool with_fk) {
     TableSchema* t = catalog_get_table(cat, db, table);
     if (!t) return NULL;
-    TBuf b = { NULL, 0, 0, true };
+    TBuf b = {0};
     char pkname[SV_MAX_NAME_LEN + 8];
     snprintf(pkname, sizeof(pkname), "pk_%.58s", t->name);
     const Constraint* inline_pk = NULL;
@@ -12023,6 +12380,16 @@ char* executor_create_statement(Catalog* cat, const char* db, const char* table,
             snprintf(type, sizeof(type), "DECIMAL(%d)", c->size);
         else
             snprintf(type, sizeof(type), "%s", datatype_name(c->type));
+        // tipi numerici come sono stati dichiarati: TINYINT, INT UNSIGNED, DECIMAL(5,2) UNSIGNED (prima diventavano
+        // INT / BIGINT e un dump o CREATE TABLE ... LIKE perdeva limiti e UNSIGNED)
+        bool numeric = c->type == SV_TYPE_INT || c->type == SV_TYPE_BIGINT || c->type == SV_TYPE_FLOAT || c->type == SV_TYPE_DECIMAL;
+        if (numeric && c->sqltype[0] && strncasecmp(c->sqltype, "serial", 6) && strlen(c->sqltype) < sizeof(type)) {
+            size_t k = 0;
+            for (; c->sqltype[k]; k++) type[k] = (char)toupper((unsigned char)c->sqltype[k]);
+            type[k] = '\0';
+        } else if (numeric && !strncasecmp(c->sqltype, "serial", 6)) snprintf(type, sizeof(type), "BIGINT UNSIGNED");
+        if (is_text_col(c) && (c->flags & (COLF_CI | COLF_BIN)))
+            snprintf(type + strlen(type), sizeof(type) - strlen(type), " COLLATE %s", (c->flags & COLF_CI) ? "utf8mb4_general_ci" : "utf8mb4_bin");
         bool pk_here = (inline_pk && inline_pk->cols[0] == i) || (!has_pk_cons && c->primary_key);
         tb_add(&b, "%s\n    %s %s%s%s%s", i ? "," : "", c->name, type, pk_here ? " PRIMARY KEY" : "",
                c->auto_increment ? " AUTO_INCREMENT" : "", (!c->nullable && !c->primary_key) ? " NOT NULL" : "");
@@ -12044,16 +12411,16 @@ char* executor_create_statement(Catalog* cat, const char* db, const char* table,
             case CONS_FOREIGN: tb_fk(&b, t, c); break;
         }
     }
-    tb_add(&b, "\n);");
-    if (!b.ok) { free(b.p); return NULL; }
-    return b.p;
+    if (t->collation[0] && sv_name_ok(t->collation) && !strpbrk(t->collation, " ;'")) tb_add(&b, "\n) COLLATE %s;", t->collation);
+    else tb_add(&b, "\n);");
+    return svsb_take(&b);
 }
 
 // ALTER TABLE ... ADD CONSTRAINT per le chiavi esterne della tabella ("" se non ne ha)
 char* executor_fk_statements(Catalog* cat, const char* db, const char* table) {
     TableSchema* t = catalog_get_table(cat, db, table);
     if (!t) return NULL;
-    TBuf b = { NULL, 0, 0, true };
+    TBuf b = {0};
     tb_add(&b, "%s", "");
     for (int i = 0; i < t->num_constraints; i++) {
         if (t->constraints[i].kind != CONS_FOREIGN) continue;
@@ -12061,8 +12428,7 @@ char* executor_fk_statements(Catalog* cat, const char* db, const char* table) {
         tb_fk(&b, t, &t->constraints[i]);
         tb_add(&b, ";\n");
     }
-    if (!b.ok) { free(b.p); return NULL; }
-    return b.p;
+    return svsb_take(&b);
 }
 
 // risultato con colonne di testo
@@ -12187,7 +12553,7 @@ static QueryResult* exec_show_extra(ExecCtx* ctx, ASTNode* n) {
             }
         for (int i = 0; i < ts->num_constraints; i++) {
             const Constraint* c = &ts->constraints[i];
-            TBuf cb = { NULL, 0, 0, true };
+            TBuf cb = {0};
             tb_cols(&cb, ts, c->cols, c->ncols);
             snprintf(a, sizeof(a), "%s", cb.p ? cb.p : "");
             free(cb.p);
@@ -12394,7 +12760,8 @@ static QueryResult* exec_create_index(ExecCtx* ctx, ASTNode* n) {
     for (int i = 0; i < ts->num_indexes; i++)
         if (!strcasecmp(ts->indexes[i].name, n->create_index.index_name))
             return result_error_msg("An index with this name already exists on the table");
-    if (ts->num_indexes >= SV_MAX_INDEXES) return result_error_msg("Too many indexes on this table (max 16)");
+    if (ts->num_indexes >= SV_MAX_INDEXES) return result_error_msg("Too many indexes on this table (max 64)");
+    if (!sv_name_ok_opt(n->create_index.index_name)) return bad_name_error("index");
 
     Index idx;
     memset(&idx, 0, sizeof(idx));
@@ -12461,6 +12828,7 @@ static QueryResult* exec_create_view(ExecCtx* ctx, ASTNode* n) {
     if (!db) return result_error_msg("No database selected");
     const char* name = n->create_view.view_name;
     char msg[400];
+    if (!sv_name_ok(name)) return bad_name_error("view");
     if (catalog_get_table(ctx->catalog, db->name, name)) {
         snprintf(msg, sizeof(msg), "Table '%.64s' already exists", name);
         return result_error_msg(msg);
@@ -12731,12 +13099,13 @@ typedef struct {
     char         table[SV_MAX_NAME_LEN];
     int          idcols[SV_MAX_COLUMNS];   // colonne che identificano la riga
     int          nid;
-    int          sets[SV_MAX_SETS];        // UPDATE: indici in n->update_stmt (colonne di questa tabella)
+    int*         sets;                     // UPDATE: indici in n->update_stmt (colonne di questa tabella); num_sets posti
     int          nsets;
     QueryResult* rows;
 } DmlTarget;
 
-static QueryResult* exec_dml_multi(ExecCtx* ctx, ASTNode* n) {
+// setbuf: 8 * num_sets interi, una fetta per tabella bersaglio (exec_dml_multi)
+static QueryResult* exec_dml_multi_impl(ExecCtx* ctx, ASTNode* n, int* setbuf) {
     bool del = n->type == NODE_DELETE;
     Database* db = catalog_current_db(ctx->catalog);
     if (!db) return result_error_msg("No database selected");
@@ -12752,7 +13121,9 @@ static QueryResult* exec_dml_multi(ExecCtx* ctx, ASTNode* n) {
     char msg[400];
     // tabelle bersaglio
     if (del) {
-        for (int i = 0; i < n->delete_stmt.num_targets && ntg < 8; i++) {
+        // (P3.12: oltre l'8ª tabella le altre erano ignorate senza errore: le loro righe restavano)
+        if (n->delete_stmt.num_targets > 8) return result_error_msg("Too many tables in DELETE (max 8)");
+        for (int i = 0; i < n->delete_stmt.num_targets; i++) {
             memset(&tg[ntg], 0, sizeof(tg[ntg]));
             snprintf(tg[ntg].alias, sizeof(tg[ntg].alias), "%s", n->delete_stmt.targets[i]);
             ntg++;
@@ -12764,9 +13135,10 @@ static QueryResult* exec_dml_multi(ExecCtx* ctx, ASTNode* n) {
             int f = -1;
             for (int i = 0; i < ntg; i++) if (!strcasecmp(tg[i].alias, q)) f = i;
             if (f < 0) {
-                if (ntg >= 8) return result_error_msg("Too many tables in UPDATE");
+                if (ntg >= 8) return result_error_msg("Too many tables in UPDATE (max 8)");
                 memset(&tg[ntg], 0, sizeof(tg[ntg]));
                 snprintf(tg[ntg].alias, sizeof(tg[ntg].alias), "%s", q);
+                tg[ntg].sets = setbuf + (size_t)ntg * (size_t)n->update_stmt.num_sets;
                 f = ntg++;
             }
             tg[f].sets[tg[f].nsets++] = k;
@@ -12814,9 +13186,9 @@ static QueryResult* exec_dml_multi(ExecCtx* ctx, ASTNode* n) {
         if (where) { tb_put(&q, " WHERE ", 7); tb_put(&q, where, strlen(where)); }
         if (ol) { tb_put(&q, " ", 1); tb_put(&q, ol, strlen(ol)); }
         tb_put(&q, "", 1);
-        if (q.err) { free(q.d); fail = result_error_msg("Out of memory"); break; }
-        tg[i].rows = run_sql_select(ctx, q.d);
-        free(q.d);
+        if (q.oom) { free(q.p); fail = result_error_msg("Out of memory"); break; }
+        tg[i].rows = run_sql_select(ctx, q.p);
+        free(q.p);
         if (!tg[i].rows || !tg[i].rows->success) { fail = tg[i].rows; tg[i].rows = NULL; }
     }
     // 2. le modifiche, per chiave
@@ -12833,8 +13205,8 @@ static QueryResult* exec_dml_multi(ExecCtx* ctx, ASTNode* n) {
             if (flush && inb) {                                    // DELETE ... WHERE id IN (...)
                 tb_put(&batch, ")", 1);
                 tb_put(&batch, "", 1);
-                QueryResult* d = batch.err ? result_error_msg("Out of memory") : run_sql_dml(ctx, batch.d);
-                free(batch.d);
+                QueryResult* d = batch.oom ? result_error_msg("Out of memory") : run_sql_dml(ctx, batch.p);
+                free(batch.p);
                 memset(&batch, 0, sizeof(batch));
                 inb = 0;
                 if (!d || !d->success) { fail = d ? d : result_error_msg("Out of memory"); break; }
@@ -12852,8 +13224,8 @@ static QueryResult* exec_dml_multi(ExecCtx* ctx, ASTNode* n) {
             }
             tb_put(&key, "", 1);
             char kb[KEY_BUF];
-            key_text(kb, sizeof(kb), key.d ? key.d : "");
-            free(key.d);
+            key_text(kb, sizeof(kb), key.p ? key.p : "");
+            free(key.p);
             SMSlot* sl = sm_slot(&seen, kb, true);
             if (!sl) { fail = result_error_msg("Out of memory"); break; }
             if (sl->val >= 0) continue;
@@ -12888,20 +13260,29 @@ static QueryResult* exec_dml_multi(ExecCtx* ctx, ASTNode* n) {
                 else { tb_put(&st, " = ", 3); sql_lit(&st, cl->value); }
             }
             tb_put(&st, "", 1);
-            QueryResult* d = st.err ? result_error_msg("Out of memory") : run_sql_dml(ctx, st.d);
-            free(st.d);
+            QueryResult* d = st.oom ? result_error_msg("Out of memory") : run_sql_dml(ctx, st.p);
+            free(st.p);
             if (!d || !d->success) { fail = d ? d : result_error_msg("Out of memory"); break; }
             affected += d->rows_affected;
             db_result_free(d);
             ts = catalog_get_table(ctx->catalog, db->name, tg[i].table);
         }
-        free(batch.d);
+        free(batch.p);
         sm_free(&seen);
     }
     for (int i = 0; i < ntg; i++) db_result_free(tg[i].rows);
     if (fail) return fail;
     snprintf(msg, sizeof(msg), "%lld", affected);
     return result_ok_msg((int)affected);
+}
+
+static QueryResult* exec_dml_multi(ExecCtx* ctx, ASTNode* n) {
+    size_t ns = n->type == NODE_DELETE ? 0 : (size_t)n->update_stmt.num_sets;
+    int* setbuf = sv_calloc(8 * ns + 1, sizeof(int));
+    if (!setbuf) return result_error_msg("Out of memory");
+    QueryResult* r = exec_dml_multi_impl(ctx, n, setbuf);
+    free(setbuf);
+    return r;
 }
 
 // ── INSERT IGNORE / REPLACE / ON DUPLICATE KEY UPDATE (MySQL) ──
@@ -13005,7 +13386,7 @@ static QueryResult* exec_insert_mysql(ExecCtx* ctx, ASTNode* n) {
             QueryResult* r = exec_insert(ctx, &one);
             if (r && r->success) {
                 affected += r->rows_affected;
-                if (r->last_insert_id) last_id = r->last_insert_id;
+                if (r->last_insert_id && !last_id) last_id = r->last_insert_id;   // il primo, come MySQL
                 db_result_free(r);
                 break;
             }
@@ -13031,13 +13412,15 @@ static QueryResult* exec_insert_mysql(ExecCtx* ctx, ASTNode* n) {
             op.type = NODE_UPDATE;                               // ON DUPLICATE KEY UPDATE
             snprintf(op.update_stmt.table_name, sizeof(op.update_stmt.table_name), "%s", tsname);
             op.update_stmt.where = where;
+            op.update_stmt.set_cols = n->insert_stmt.dup_cols;  // gli stessi nomi (non si liberano qui)
+            op.update_stmt.set_exprs = sv_calloc((size_t)n->insert_stmt.num_dup + 1, sizeof(ASTExpr*));
+            if (!op.update_stmt.set_exprs) { ast_expr_free(where); fail = result_error_msg("Out of memory"); break; }
             op.update_stmt.num_sets = n->insert_stmt.num_dup;
-            for (int k = 0; k < n->insert_stmt.num_dup; k++) {
-                snprintf(op.update_stmt.set_cols[k], sizeof(op.update_stmt.set_cols[k]), "%s", n->insert_stmt.dup_cols[k]);
+            for (int k = 0; k < n->insert_stmt.num_dup; k++)
                 op.update_stmt.set_exprs[k] = dup_subst(ast_expr_clone(n->insert_stmt.dup_exprs[k]), ts, n->insert_stmt.row_alias);
-            }
             QueryResult* u = exec_update(ctx, &op);
             for (int k = 0; k < op.update_stmt.num_sets; k++) ast_expr_free(op.update_stmt.set_exprs[k]);
+            free(op.update_stmt.set_exprs);
             ast_expr_free(where);
             if (!u || !u->success) { fail = u ? u : result_error_msg("Out of memory"); break; }
             affected += u->rows_affected > 0 ? 2 : 0;            // come MySQL: 2 = riga esistente aggiornata
@@ -13052,6 +13435,7 @@ static QueryResult* exec_insert_mysql(ExecCtx* ctx, ASTNode* n) {
     if (fail) return fail;
     QueryResult* ok = result_ok_msg((int)affected);
     if (ok && last_id > 0) ok->last_insert_id = (long long)last_id;
+    if (last_id > 0) g_last_insert_id = last_id;              // ogni riga l'aveva impostato al suo id
     return ok;
 }
 
@@ -13161,7 +13545,8 @@ static QueryResult* exec_merge(ExecCtx* ctx, ASTNode* n) {
     long long affected = 0;
     QueryResult* fail = NULL;
     // 1. righe nuove (NOT MATCHED): valori calcolati adesso
-    QueryResult* ins[8] = {0};
+    QueryResult** ins = sv_calloc((size_t)n->merge.nwhen + 1, sizeof(QueryResult*));   // una per clausola WHEN
+    if (!ins) { free(q); return result_error_msg("Out of memory"); }
     for (int w = 0; w < n->merge.nwhen && !fail; w++) {
         MergeWhen* c = &n->merge.when[w];
         if (c->kind != 2) continue;
@@ -13171,9 +13556,9 @@ static QueryResult* exec_merge(ExecCtx* ctx, ASTNode* n) {
         snprintf(q, cap, " FROM %s WHERE NOT EXISTS (SELECT 1 FROM `%s` AS `%s` WHERE %s)%s%s%s",
                  n->merge.source, T, ta, n->merge.on, c->cond ? " AND (" : "", c->cond ? c->cond : "", c->cond ? ")" : "");
         tb_put(&tb, q, strlen(q));
-        if (tb.err || !tb.d) { free(tb.d); fail = result_error_msg("Out of memory"); break; }
-        ins[w] = run_sql_text(ctx, tb.d);
-        free(tb.d);
+        if (tb.oom || !tb.p) { free(tb.p); fail = result_error_msg("Out of memory"); break; }
+        ins[w] = run_sql_text(ctx, tb.p);
+        free(tb.p);
         if (!ins[w] || !ins[w]->success) { fail = ins[w]; ins[w] = NULL; }
     }
     // 2. righe con corrispondenza: la prima clausola WHEN MATCHED che vale
@@ -13183,7 +13568,7 @@ static QueryResult* exec_merge(ExecCtx* ctx, ASTNode* n) {
         if (c->kind == 2) continue;
         char extra[SV_MAX_SQL_LEN / 4];
         snprintf(extra, sizeof(extra), "%s%s%s%s%s%s", c->cond ? " AND (" : "", c->cond ? c->cond : "", c->cond ? ")" : "",
-                 prev.d ? " AND NOT (" : "", prev.d ? prev.d : "", prev.d ? ")" : "");
+                 prev.p ? " AND NOT (" : "", prev.p ? prev.p : "", prev.p ? ")" : "");
         TextBuf tb = {0};
         if (c->kind == 1) {
             snprintf(q, cap, "DELETE FROM `%s` AS `%s` WHERE EXISTS (SELECT 1 FROM %s WHERE (%s)%s)", T, ta, n->merge.source, n->merge.on, extra);
@@ -13199,9 +13584,9 @@ static QueryResult* exec_merge(ExecCtx* ctx, ASTNode* n) {
             snprintf(q, cap, " WHERE EXISTS (SELECT 1 FROM %s WHERE (%s)%s)", n->merge.source, n->merge.on, extra);
             tb_put(&tb, q, strlen(q));
         }
-        if (tb.err || !tb.d) { free(tb.d); fail = result_error_msg("Out of memory"); break; }
-        QueryResult* r = run_sql_text(ctx, tb.d);
-        free(tb.d);
+        if (tb.oom || !tb.p) { free(tb.p); fail = result_error_msg("Out of memory"); break; }
+        QueryResult* r = run_sql_text(ctx, tb.p);
+        free(tb.p);
         if (!r || !r->success) { fail = r; break; }
         affected += r->rows_affected;
         db_result_free(r);
@@ -13209,10 +13594,10 @@ static QueryResult* exec_merge(ExecCtx* ctx, ASTNode* n) {
         char one[SV_MAX_SQL_LEN / 4];
         snprintf(one, sizeof(one), "EXISTS (SELECT 1 FROM %s WHERE (%s)%s%s%s)", n->merge.source, n->merge.on,
                  c->cond ? " AND (" : "", c->cond ? c->cond : "", c->cond ? ")" : "");
-        if (prev.d) tb_put(&prev, " OR ", 4);
+        if (prev.p) tb_put(&prev, " OR ", 4);
         tb_put(&prev, one, strlen(one));
     }
-    free(prev.d);
+    free(prev.p);
     // 3. INSERT delle righe senza corrispondenza
     for (int w = 0; w < n->merge.nwhen && !fail; w++) {
         MergeWhen* c = &n->merge.when[w];
@@ -13222,7 +13607,7 @@ static QueryResult* exec_merge(ExecCtx* ctx, ASTNode* n) {
         tb_put(&tb, q, strlen(q));
         if (c->has_cols) {
             tb_put(&tb, "(", 1);
-            for (int k = 0; k < c->n; k++) { if (k) tb_put(&tb, ", ", 2); tb_put(&tb, "`", 1); tb_put(&tb, c->cols[k], strlen(c->cols[k])); tb_put(&tb, "`", 1); }
+            for (int k = 0; k < c->ncols; k++) { if (k) tb_put(&tb, ", ", 2); tb_put(&tb, "`", 1); tb_put(&tb, c->cols[k], strlen(c->cols[k])); tb_put(&tb, "`", 1); }
             tb_put(&tb, ") ", 2);
         }
         tb_put(&tb, "VALUES ", 7);
@@ -13231,14 +13616,15 @@ static QueryResult* exec_merge(ExecCtx* ctx, ASTNode* n) {
             for (int k = 0; k < ins[w]->num_cols; k++) { if (k) tb_put(&tb, ", ", 2); sql_literal(&tb, &ins[w]->rows[r].cells[k]); }
             tb_put(&tb, ")", 1);
         }
-        if (tb.err || !tb.d) { free(tb.d); fail = result_error_msg("Out of memory"); break; }
-        QueryResult* r = run_sql_text(ctx, tb.d);
-        free(tb.d);
+        if (tb.oom || !tb.p) { free(tb.p); fail = result_error_msg("Out of memory"); break; }
+        QueryResult* r = run_sql_text(ctx, tb.p);
+        free(tb.p);
         if (!r || !r->success) { fail = r; break; }
         affected += r->rows_affected;
         db_result_free(r);
     }
-    for (int w = 0; w < 8; w++) db_result_free(ins[w]);
+    for (int w = 0; w < n->merge.nwhen; w++) db_result_free(ins[w]);
+    free(ins);
     free(q);
     if (fail) return fail;
     return result_ok_msg((int)affected);
@@ -13276,11 +13662,20 @@ static QueryResult* exec_returning(ExecCtx* ctx, ASTNode* stmt) {
         BindCtx b;
         memset(&b, 0, sizeof(b));
         b.src = &s; b.nsrc = 1; b.mode = BIND_ROW; b.x = ctx; b.outer = ctx->trig_bind; b.clause = "RETURNING";
-        // colonne: * diventa tutte le colonne della tabella
-        ASTExpr* cols[SV_MAX_COLUMNS];
-        char names[SV_MAX_COLUMNS][128];
+        // colonne: * diventa tutte le colonne della tabella. Gli array per colonna stanno nell'heap: sullo stack
+        // erano 168 KB (CR-M1)
+        struct RetCols {
+            ASTExpr* cols[SV_MAX_COLUMNS];
+            char names[SV_MAX_COLUMNS][128];
+            ASTExpr* owned[SV_MAX_COLUMNS];
+            const char* np[SV_MAX_COLUMNS];
+            bool all_int[SV_MAX_COLUMNS], all_num[SV_MAX_COLUMNS];
+            char* vals[SV_MAX_COLUMNS];
+        }* rc = sv_calloc(1, sizeof(struct RetCols));
+        ASTExpr** cols = rc->cols;
+        char (*names)[128] = rc->names;
+        ASTExpr** owned = rc->owned;
         int nc = 0;
-        ASTExpr* owned[SV_MAX_COLUMNS];
         int nown = 0;
         for (int k = 0; k < nret && nc < SV_MAX_COLUMNS; k++) {
             ASTExpr* e = stmt->returning[k];
@@ -13304,7 +13699,7 @@ static QueryResult* exec_returning(ExecCtx* ctx, ASTNode* stmt) {
         for (int k = 0; k < nc; k++) bind_expr(cols[k], &b);
         if (b.err[0]) out = result_error_msg(b.err);
         else {
-            const char* np[SV_MAX_COLUMNS] = {0};
+            const char** np = rc->np;
             for (int k = 0; k < nc; k++) np[k] = names[k];
             out = text_result(nc, np);
             EvalCtx ec;
@@ -13312,11 +13707,13 @@ static QueryResult* exec_returning(ExecCtx* ctx, ASTNode* stmt) {
             Tuple* cur[1];
             ec.src = &s; ec.nsrc = 1; ec.cur = cur; ec.x = ctx; ec.outer = ctx->trig_eval;
             int cap_rows = 0;
-            bool all_int[SV_MAX_COLUMNS], all_num[SV_MAX_COLUMNS];
+            bool* all_int = rc->all_int;
+            bool* all_num = rc->all_num;
             for (int k = 0; k < nc; k++) all_int[k] = all_num[k] = true;
             for (int i = 0; out && i < cap.n; i++) {
                 cur[0] = cap.v[i];
-                char* vals[SV_MAX_COLUMNS] = {0};
+                char** vals = rc->vals;
+                memset(vals, 0, sizeof(rc->vals));
                 for (int k = 0; k < nc; k++) {
                     EvalVal v;
                     eval_expr(cols[k], &ec, &v);
@@ -13330,7 +13727,7 @@ static QueryResult* exec_returning(ExecCtx* ctx, ASTNode* stmt) {
             }
             for (int k = 0; out && out->success && k < nc; k++) {      // tipi: delle colonne, o dai valori
                 const char* ty = cols[k]->type == EXPR_COLUMN && cols[k]->bound > 0 && cols[k]->outer == 0
-                                 ? datatype_name(ts->columns[(cols[k]->bound - 1) % 1024].type)
+                                 ? datatype_name(ts->columns[BOUND_COL(cols[k]->bound)].type)
                                  : cap.n && all_int[k] ? "BIGINT" : cap.n && all_num[k] ? "FLOAT" : "VARCHAR";
                 free(out->col_types[k]);
                 out->col_types[k] = sv_strdup(ty);
@@ -13338,6 +13735,7 @@ static QueryResult* exec_returning(ExecCtx* ctx, ASTNode* stmt) {
             if (out && out->success) out->rows_affected = r->rows_affected;
         }
         for (int k = 0; k < nown; k++) ast_expr_free(owned[k]);
+        free(rc);
         db_result_free(r);
     } else out = r;
     for (int i = 0; i < cap.n; i++) tuple_free(cap.v[i]);
@@ -13347,6 +13745,7 @@ static QueryResult* exec_returning(ExecCtx* ctx, ASTNode* stmt) {
 
 QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt) {
     if (g_run_depth == 0) heap_damage_clear();
+    sv_scan_abort(NULL);
     g_stmt_gen++;
     g_run_depth++;
     g_select_total = -1;
@@ -13358,6 +13757,9 @@ QueryResult* executor_run(ExecCtx* ctx, ASTNode* stmt) {
             if (r) db_result_free(r);
             r = result_error_msg(dm);
         }
+        const char* why = sv_scan_abort_why();          // scansione fermata da un errore certo: il suo messaggio
+        if (why && r && !r->success && !strncmp(r->error, "Query cancelled", 15)) snprintf(r->error, sizeof(r->error), "%s", why);
+        sv_scan_abort(NULL);                            // finito lo statement: le altre scansioni del thread ripartono
         // FOUND_ROWS() e ROW_COUNT() riguardano lo statement di primo livello (come in MySQL)
         if (r && r->success && stmt->type == NODE_SELECT)
             g_found_rows = stmt->select_stmt.calc_found && g_select_total >= 0 ? g_select_total : r->num_rows;

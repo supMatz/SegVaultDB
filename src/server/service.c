@@ -66,7 +66,7 @@ static int build_args(int argc, char** argv, char* buf, size_t bufsz, char** out
     size_t used = 0;
     int n = 0;
     token[0] = '\0';
-    for (int i = 0; i < argc && n < max - 1; i++) {
+    for (int i = 0; i < argc && n < max - 2; i++) {        // (un'opzione con valore aggiunge due voci, più il NULL finale)
         const char* a = argv[i];
         char tmp[4096];
         if (!strcmp(a, "--install-service") || !strcmp(a, "--uninstall-service") || !strcmp(a, "--background")) continue;
@@ -110,6 +110,7 @@ static void data_dir_of(char** args, int n, char* out, size_t sz) {
     }
 }
 
+#if defined(__APPLE__)
 // testo in un file plist (XML): & < > protetti (un percorso con "&" rendeva il plist illeggibile)
 static void xml_put(FILE* f, const char* s) {
     for (; *s; s++) {
@@ -119,7 +120,9 @@ static void xml_put(FILE* f, const char* s) {
         else fputc(*s, f);
     }
 }
+#endif
 
+#if !defined(_WIN32) && !defined(__APPLE__)
 // testo fra virgolette in un'unità systemd: "\" e '"' protetti, '%' raddoppiato
 static void unit_put(FILE* f, const char* s) {
     for (; *s; s++) {
@@ -128,6 +131,7 @@ static void unit_put(FILE* f, const char* s) {
         fputc(*s, f);
     }
 }
+#endif
 
 int sv_service_install(int argc, char** argv, char* out, size_t outsz) {
     char exe[2048];

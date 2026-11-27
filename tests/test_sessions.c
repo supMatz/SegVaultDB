@@ -7,10 +7,11 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <time.h>
+#include "harness.h"
 
-static int g_tests, g_fail;
-#define CHECK(cond, ...) do { g_tests++; if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
 
 static bool ok(const char* sql) { QueryResult* r = db_execute(sql); bool g = r && r->success; db_result_free(r); return g; }
 static long long num(const char* sql) {
@@ -80,9 +81,33 @@ static void* dl_thread(void* p) {
     return NULL;
 }
 
+// CR-A5: un thread usa il nome di db_current_database() mentre un altro crea ed elimina database (sotto
+// make test-tsan: prima il nome era un puntatore nel catalogo, riallocato e compattato dal DDL)
+static atomic_int g_cd_stop;
+static void* cd_reader(void* a) {
+    (void)a;
+    unsigned long sum = 0;
+    while (!atomic_load(&g_cd_stop)) {
+        const char* db = db_current_database();
+        for (int k = 0; k < 50 && db; k++) sum += strlen(db);
+    }
+    return (void*)(uintptr_t)sum;
+}
+static void* cd_ddl(void* a) {
+    (void)a;
+    for (int i = 0; i < 120; i++) {
+        char q[64];
+        snprintf(q, sizeof q, "DROP DATABASE IF EXISTS cd%d", i); db_result_free(db_execute(q));
+        snprintf(q, sizeof q, "CREATE DATABASE cd%d", i + 1000); db_result_free(db_execute(q));
+    }
+    atomic_store(&g_cd_stop, 1);
+    return NULL;
+}
+
 int main(void) {
-    if (system("rm -rf /tmp/sv_sess_test && mkdir -p /tmp/sv_sess_test") != 0) return 1;
-    if (!db_init("/tmp/sv_sess_test")) return 1;
+    test_enter_tmpdir();                                  // cartella privata (CR-M9)
+    if (system("rm -rf sv_sess_test && mkdir -p sv_sess_test") != 0) return 1;
+    if (!db_init("sv_sess_test")) return 1;
     ok("CREATE DATABASE a"); ok("CREATE DATABASE b");
     ok("USE a"); ok("CREATE TABLE t (id INT PRIMARY KEY, v INT)"); ok("INSERT INTO t VALUES (1, 10)");
     ok("USE b"); ok("CREATE TABLE t (id INT PRIMARY KEY, v INT)");
@@ -310,14 +335,49 @@ int main(void) {
         CHECK(ok("UPDATE a.t SET v = v WHERE id = 1"), "the table is usable afterwards");
     }
 
+    {   // diario degli indici con due sessioni: l'indice costruito dentro la transazione di x1 (con la sua riga non
+        // confermata) va scartato dal ROLLBACK di x1 anche se nel frattempo x2 ha aperto la sua transazione
+        CHECK(ok("CREATE DATABASE ijd") && ok("USE ijd") && ok("CREATE TABLE ia (id INT PRIMARY KEY, v INT)") &&
+              ok("CREATE TABLE ib (id INT PRIMARY KEY, v INT)") && ok("INSERT INTO ia VALUES (1, 1)") && ok("INSERT INTO ib VALUES (1, 1)"),
+              "setup index journal tables");
+        DbSession* x1 = db_session_new();
+        DbSession* x2 = db_session_new();
+        CHECK(db_session_enter(x1) && ok("USE ijd") && ok("BEGIN") && ok("INSERT INTO ia VALUES (100, 1)") &&
+              num("SELECT COUNT(*) FROM ia WHERE id = 100") == 1, "x1: insert and lookup (index built inside the transaction)");
+        db_session_leave(x1);
+        CHECK(db_session_enter(x2) && ok("USE ijd") && ok("BEGIN") && ok("INSERT INTO ib VALUES (200, 2)"), "x2 opens its transaction");
+        db_session_leave(x2);
+        CHECK(db_session_enter(x1) && ok("ROLLBACK"), "x1 rolls back");
+        db_session_leave(x1);
+        CHECK(db_session_enter(x2) && ok("ROLLBACK"), "x2 rolls back");
+        db_session_leave(x2);
+        db_session_end(x1);
+        db_session_end(x2);
+        CHECK(ok("USE ijd") && num("SELECT COUNT(*) FROM ia WHERE id = 100") == 0 && ok("INSERT INTO ia VALUES (100, 3)") &&
+              num("SELECT v FROM ia WHERE id = 100") == 3, "no stale key of x1 left in the index");
+        CHECK(num("SELECT COUNT(*) FROM ib WHERE id = 200") == 0 && ok("INSERT INTO ib VALUES (200, 4)"), "x2's rollback undone in its index");
+    }
+
+    {
+        for (int i = 0; i < 40; i++) { char q[64]; snprintf(q, sizeof q, "CREATE DATABASE cd%d", i); db_result_free(db_execute(q)); }
+        ok("USE a");
+        pthread_t r1, r2;
+        pthread_create(&r1, NULL, cd_reader, NULL);
+        pthread_create(&r2, NULL, cd_ddl, NULL);
+        pthread_join(r2, NULL);
+        pthread_join(r1, NULL);
+        const char* cd = db_current_database();
+        CHECK(cd && !strcmp(cd, "a"), "current database unchanged by concurrent DDL: %s", cd ? cd : "(none)");
+    }
+
     db_shutdown();
-    if (system("rm -rf /tmp/sv_sess_test")) {}
+    if (system("rm -rf sv_sess_test")) {}
 
     // crash con più transazioni aperte insieme: al riavvio restano solo quelle confermate
-    if (system("rm -rf /tmp/sv_sess_crash && mkdir -p /tmp/sv_sess_crash") != 0) return 1;
+    if (system("rm -rf sv_sess_crash && mkdir -p sv_sess_crash") != 0) return 1;
     pid_t pid = fork();
     if (pid == 0) {
-        if (!db_init("/tmp/sv_sess_crash")) _exit(2);
+        if (!db_init("sv_sess_crash")) _exit(2);
         ok("CREATE DATABASE c"); ok("USE c");
         ok("CREATE TABLE a (id INT PRIMARY KEY, v TEXT)"); ok("CREATE TABLE b (id INT PRIMARY KEY, v TEXT)");
         ok("CREATE TABLE d (id INT PRIMARY KEY, v TEXT)");
@@ -337,7 +397,7 @@ int main(void) {
     int st = 0;
     waitpid(pid, &st, 0);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "crashing process ran");
-    CHECK(db_init("/tmp/sv_sess_crash") && ok("USE c"), "recovery with several transactions");
+    CHECK(db_init("sv_sess_crash") && ok("USE c"), "recovery with several transactions");
     CHECK(num("SELECT COUNT(*) FROM a") == 1, "open transaction undone: %lld rows", num("SELECT COUNT(*) FROM a"));
     {
         QueryResult* r = db_execute("SELECT v FROM a WHERE id = 1");
@@ -347,7 +407,7 @@ int main(void) {
     CHECK(num("SELECT COUNT(*) FROM b") == 2, "committed transaction kept: %lld", num("SELECT COUNT(*) FROM b"));
     CHECK(num("SELECT COUNT(*) FROM d") == 2 && num("SELECT COUNT(*) FROM d WHERE id = 2") == 0, "ROLLBACK TO inside a committed transaction respected");
     db_shutdown();
-    if (system("rm -rf /tmp/sv_sess_crash")) {}
+    if (system("rm -rf sv_sess_crash")) {}
     if (g_fail) { printf("session tests: %d of %d FAILED\n", g_fail, g_tests); return 1; }
     printf("OK: %d/%d session checks passed\n", g_tests, g_tests);
     return 0;

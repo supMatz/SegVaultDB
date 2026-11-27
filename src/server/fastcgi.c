@@ -666,6 +666,13 @@ int fcgi_request(FcgiPool* p, const FcgiParam* params, int nparams, const char* 
     return result;
 }
 
+#ifdef _WIN32
+int sv_win_trusted_path(const char* path);       // src/platform/win_acl.c (CR-M8)
+#define TRUSTED_LOCATION(p) sv_win_trusted_path(p)
+#else
+#define TRUSTED_LOCATION(p) 1
+#endif
+
 static bool is_file(const char* path) {
     struct stat st;
     return stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG;
@@ -706,7 +713,7 @@ bool fcgi_find_php_cgi(char* out, size_t outsz) {
 #endif
         if (absolute && l < 900) {
             snprintf(out, outsz, "%.*s/" PHP_CGI_NAME, (int)l, path);
-            if (is_file(out)) return true;
+            if (is_file(out) && TRUSTED_LOCATION(out)) return true;
         }
         path = e ? e + 1 : NULL;
     }
@@ -716,7 +723,7 @@ bool fcgi_find_php_cgi(char* out, size_t outsz) {
     static const char* const common[] = { "/usr/bin/php-cgi", "/usr/local/bin/php-cgi", "/opt/homebrew/bin/php-cgi" };
 #endif
     for (size_t i = 0; i < sizeof(common) / sizeof(common[0]); i++)
-        if (is_file(common[i])) { snprintf(out, outsz, "%s", common[i]); return true; }
+        if (is_file(common[i]) && TRUSTED_LOCATION(common[i])) { snprintf(out, outsz, "%s", common[i]); return true; }
     out[0] = '\0';
     return false;
 }

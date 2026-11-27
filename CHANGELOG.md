@@ -1,6 +1,63 @@
 # Changelog
 
-## Unreleased
+## 1.5.0 — 2026-11-27
+
+**Security and fixes (code review 2026-11-26, see `CR-*` in TODO.md)**
+- Permissions on names with spaces survived a restart wrongly: `GRANT SELECT ON shop.\`t 127\`` came back as
+  `ALL PRIVILEGES ON shop.t`, and grants on such names were lost. `users.dat` now writes encoded names
+  (`grantx` lines); ambiguous old lines are skipped, never reinterpreted. Builds before 1.5.0 do not read the new
+  lines: going back to an older build, users lose their grants (accounts and passwords stay).
+- The admin API (`/api/v1/query`, …) no longer trusts pages of hosted sites (`*.localhost`, `*.test`, configured
+  sites): on a site's address it needs `--token` or `--users`. The server address (localhost, `--static`) is
+  unchanged. SegVault data files (`segvault.*`, `users.dat`) are never served by the web server.
+- SQL `BACKUP TO` refuses folders inside the data folder (also written as `data/.` or through symlinks) and,
+  while the web server runs, inside its `www` folder or a site's folder. Backups from the app are unchanged.
+- `LIMIT 7, 18446744073709551615` (MySQL's "to the end" idiom) returned no rows; values above 2³¹ in
+  `LIMIT` / `OFFSET` / `FETCH` were truncated to 32 bits. `VARCHAR(4294967297)` is now an error.
+- Two data races found with ThreadSanitizer: parallel readers right after a restart built table maps without a
+  lock, and `db_current_database()` returned a pointer into the catalog after releasing the engine lock.
+- HTTP API sessions with an idle transaction are now closed after 30 s even when no other API request arrives
+  (their locks blocked MySQL clients and DDL until then).
+- MySQL protocol: data sent with `COM_STMT_SEND_LONG_DATA` is capped at `max_body` per statement (error 1153).
+- Windows: `php-cgi`, CGI interpreters and OpenSSL found in shared places (`C:\php`, `C:\xampp`, `PATH`) are used
+  only if no other user owns the file or its folders; OpenSSL is loaded by full path only.
+- Desktop app: backup, restore, reading and translating import files run off the window thread; a read error
+  no longer imports a truncated file. Editor undo no longer crashes when memory runs out.
+- Engine stack: nested queries need 512 KB of thread stack instead of more than 1 MB.
+- Dead code removed and `-Wunused-function` enabled; CI actions pinned to commit SHAs.
+- A `REGEXP` with exponential backtracking (`'(a*)*b'`) took 20 ms per row with the engine locked (38 s on 2 000
+  rows) and then answered "no match"; it now fails the statement at the first row ("Regular expression too
+  expensive"), like MySQL's `ER_REGEXP_TIME_OUT`, and honours `KILL QUERY`.
+- `UPPER` / `LOWER`, `LIKE` and `_ci` collations handle accented, Greek and Cyrillic letters (`UPPER('città')` =
+  `CITTÀ`, `'CITTÀ' = 'città'` in a `_ci` table); `_` in `LIKE` matches one character, not one byte. On-disk
+  indexes of `_ci` columns written by older builds are rebuilt. `information_schema` reports `utf8mb4_bin` for
+  tables without a collation (their comparisons were already case-sensitive).
+- `LAST_INSERT_ID()` after a multi-row `INSERT` returns the first generated id, as MySQL (it returned the last).
+- Integer division and `AVG` of integers return a DECIMAL with 4 decimals, as MySQL (`7 / 2` = `3.5000`).
+- `SELECT … FROM DUAL` is accepted.
+- `ROUND(-0.5)` returned `1` (sign lost below one); `FORMAT` rounded like `printf` (`FORMAT(2.5, 0)` = `2`), now
+  half away from zero like MySQL. `_ci` comparisons also ignore accents (`'Èra' = 'era'`), and `COUNT(DISTINCT)`
+  on a `_ci` column counts `'a'` and `'A'` once.
+- SQL functions evaluate 4–6× faster per row (name dispatch no longer runs hundreds of string comparisons).
+- A `REGEXP` with a constant pattern is compiled once instead of on every row (about 2× faster on 200 000 rows).
+- New MySQL functions: text `INSERT(str, pos, len, new)`, `JSON_ARRAY_INSERT`, `JSON_MERGE_PRESERVE` / `JSON_MERGE`.
+- A correlated scalar subquery with no rows returned an empty string instead of NULL (wrong `COALESCE` / `IS NULL`).
+- `BINARY x` and `x COLLATE name` work in expressions (`ORDER BY name COLLATE utf8mb4_bin`, `LIKE BINARY`), and a
+  column's own `COLLATE` is honoured (it was ignored: only the table's counted).
+- `SHOW CREATE TABLE`, `CREATE TABLE … LIKE` and the app's dump keep `TINYINT` / `SMALLINT` / `MEDIUMINT`,
+  `UNSIGNED` and collations (they became `INT` / `BIGINT`, so a dump and restore lost the limits).
+- `INSERT … VALUES` enforces the `TINYINT` / `SMALLINT` / `MEDIUMINT` ranges and `INT UNSIGNED`'s 2³² − 1 (it skipped
+  them; `UPDATE` and `INSERT … SELECT` already checked).
+- DDL inside a transaction commits it first, as in MySQL: `BEGIN; INSERT …; CREATE TABLE …; ROLLBACK` kept the new
+  table but undid the `INSERT`. `BEGIN` inside a transaction commits it and opens a new one (it was an error).
+- `CAST(-1 AS UNSIGNED)` = `18446744073709551615` as in MySQL (it returned 0); `COUNT(DISTINCT a, b)` is accepted.
+- JSON results use MySQL's normalized text (`{"a": 1, "b": [1, 2]}`) for `JSON_SET` / `INSERT` / `REPLACE` /
+  `REMOVE` / `ARRAY_APPEND`, `JSON_EXTRACT` / `->`, `JSON_MERGE_PATCH` and `CAST(… AS JSON)`, which now rejects
+  text that is not JSON.
+- Code quality: one growable text buffer (`include/sv_strbuf.h`) replaces 13 hand-written copies (two of them
+  had bugs: one kept appending after a failed allocation, the SQL formatter started from an unchecked `malloc`);
+  test suites share `tests/harness.h` and each runs in a private `mkdtemp` folder (no fixed `/tmp` paths, nothing
+  left behind); new suite `test_strbuf`, a small-stack test for nested subqueries, fuzz dictionary extended.
 
 **Storage engine**
 - Indexes on disk: at clean shutdown and on `CHECKPOINT`, the in-memory index of each indexed column becomes a
@@ -11,13 +68,58 @@
   `EXPLAIN` shows "B+tree on disk". Databases opened by this version (catalog format v7) cannot be opened by
   1.4.2 or older.
 
+- The first write to a table after a restart no longer reads the whole table: the last page of each table's
+  chain is kept in the catalog (format v8) and the free-space map is completed a few pages per `INSERT`
+  (20 000-row table: 22 pages instead of 1 608). On that first write the other on-disk indexes of the table
+  keep serving lookups (tree + in-memory changes) instead of being rebuilt by a scan. Databases opened by this
+  version (catalog format v8) cannot be opened by older builds.
+
 **Performance**
+- `ROLLBACK` keeps the in-memory indexes: the keys a transaction changed are undone from a journal instead of
+  rebuilding every index of the touched tables by reading them (`BEGIN; INSERT 10 rows; ROLLBACK` on a loaded
+  table: 1 300 → 48 000 per second). Also for `ROLLBACK TO SAVEPOINT` and statements that fail half way.
+- Parse trees are 20× smaller (66 KB → 3.3 KB per node: view / routine text and `CREATE TABLE` / `MERGE` lists
+  moved out of the node): point lookups +42%, concurrent readers +37–40% against the 1.4 baseline.
 - Large results stream: a `SELECT` on one table without `ORDER BY` / `GROUP BY` / `DISTINCT` / `LIMIT` is
   computed in blocks of 2 048 rows and sent to MySQL clients as it goes (beyond 4 MB the packets wait in a
   temporary file instead of memory): `SELECT *` of a 129 MB table needs +23 MB instead of +425 MB.
 - Table scans copy only the text columns the query still uses after its read-time filters, and a
   single-table `LIMIT` without `ORDER BY` / grouping stops reading at `OFFSET + LIMIT` rows
   (`SELECT * … LIMIT 10` on a 57 MB table: 56 → 8 ms; a filtered `COUNT(*)`: 47 → 20 ms).
+
+**Limits (closer to MySQL)**
+- 61 tables per `SELECT` (was 9), 64 indexes and 64 constraints per table (was 16 + 16: mysqldump schemas with
+  many keys failed at `CREATE TABLE`), `UPDATE … SET` / `ON DUPLICATE KEY UPDATE` / `ON CONFLICT` over any number
+  of columns (was 64), `ORDER BY` / `GROUP BY` without the 8 / 16 cap, `MERGE` with up to 256 `WHEN` clauses and
+  1 024 columns, 64 window functions per query. Every remaining cap names its limit in the error.
+
+**Security**
+- Names of new databases, tables, columns, indexes, constraints, views, routines, triggers and sequences can no
+  longer contain a backtick or a control character (`CREATE DATABASE 'x`; DROP …'` was accepted). The GUI quotes
+  every name in the SQL it generates (user permissions, drop / truncate, dumps, editor snippets, CSV import,
+  SQL export) — before, a user with `CREATE` could name a database so that the administrator's next click in the
+  Users panel ran `DROP DATABASE`. `SHOW GRANTS` quotes names like MySQL.
+- Login throttling could be bypassed by alternating guesses with 64 invented user names (the blocked entry left
+  the 64-slot table): 1 024 slots, blocking entries are never evicted first, and a per-address counter for
+  remote clients.
+- `.htaccess`: an unreadable file (permissions, out of file handles), very deep folders or an out-of-memory
+  while loading now deny the folder instead of ignoring its rules; a rule whose `RewriteCond` cannot be loaded
+  (pattern our engine rejects, more than 32 conditions) is disabled instead of running with fewer conditions.
+- The GUI writes `server.token` readable only by the owner. Settings, saved queries, `server.ini`, ER layouts and
+  the user's own `.sql` files saved from the editor are written atomically (a crash or full disk no longer
+  leaves an empty file); the GUI no longer erases named sites past the 32nd from `server.ini`.
+- A heap overflow in join reordering (`SELECT *` over joined tables with more than 8 columns, found with ASan)
+  is fixed; HTTP/2 requests with more than 512 headers are refused instead of losing the extra headers.
+
+- Keys (primary, unique, foreign, indexes) can have up to 16 columns, as in MySQL (was 8).
+- GUI: the "Copy address" and "Open SQL editor" buttons of the server panel follow the theme (they stayed black
+  in the light theme).
+
+**Fixed limits that silently dropped data**
+- Users panel (users, databases and table grants beyond the first 128 / 64 / 4), ER database menu (64), MySQL
+  `SHOW PROCESSLIST` (256 rows), `WITH RECURSIVE` (64 parts), mail catcher (64 attachments), grid editing
+  (read-only above 64 columns), SQL export header (columns dropped on wide results), dumps (a table that could
+  not be read produced a "successful" partial dump).
 
 **Security**
 - The local certificate authority carries critical X.509 name constraints: it can only sign `localhost`,

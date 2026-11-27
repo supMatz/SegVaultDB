@@ -23,6 +23,7 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 
 // ── mutex del motore e lock della cartella dati ─────────────────
 // Il motore non è rientrante: ogni funzione pubblica che tocca catalogo, pagine o
@@ -56,6 +57,7 @@ SCOPO: Implementazione del bridge GUI <-> DB engine.
 #include "../storage/page_migrate.h"
 #include "../query/stats.h"
 #include "sv_alloc.h"
+#include "sv_strbuf.h"
 static SvRwLock g_db_rw;
 static _Thread_local int g_lock_depth;
 static void chg_hook(uint64_t tx, const char* db, const char* table, uint8_t type, RID rid, RID nrid, const uint8_t* old, size_t ol);
@@ -65,6 +67,10 @@ static void pf_stmt_end(void);
 static void pf_process(void);
 static void pf_ddl_saved(int how);
 static void on_trees_dropped(void);
+static uint64_t chg_seq_now(void);
+static uint64_t tx_now(void);
+static int cat_save(void);
+static void tails_from_catalog(void);
 static void db_mutex_init(void) {
     sv_rw_init(&g_db_rw);
     lk_init();
@@ -72,6 +78,7 @@ static void db_mutex_init(void) {
     heap_set_abandon_hook(on_chain_abandoned);     // spazio liberato subito (P1.5)
     executor_set_drop_hook(on_table_dropped);
     executor_set_tree_hook(on_trees_dropped);
+    executor_set_tx_source(chg_seq_now, tx_now);
 }
 static void db_lock(void)       { if (g_lock_depth++ == 0) sv_rw_wr(&g_db_rw); }
 static void db_unlock(void)     { if (--g_lock_depth == 0) sv_rw_wrunlock(&g_db_rw); }
@@ -100,6 +107,32 @@ static struct {
     int           db_fd;
     bool          initialized;
 } g_db = {0};
+
+// salvataggio del catalogo con l'ultima pagina nota di ogni tabella (P1.15: heap_tail_of; 0 = ignota)
+static int cat_save(void) {
+    Catalog* c = g_db.catalog;
+    for (int d = 0; c && g_db.bp && d < c->num_databases; d++)
+        for (int t = 0; t < c->databases[d].num_tables; t++) {
+            TableSchema* ts = c->databases[d].tables[t];
+            uint32_t tail = ts->root_page_id ? heap_tail_of(g_db.bp, ts->root_page_id) : 0;
+            ts->tail_page = tail;
+            ts->tail_root = tail ? ts->root_page_id : 0;
+        }
+    return catalog_save(c, g_db.cat_path);
+}
+
+// dopo il caricamento: le code salvate (solo quelle della radice attuale della tabella) come suggerimenti
+static void tails_from_catalog(void) {
+    heap_tail_reset();
+    Catalog* c = g_db.catalog;
+    for (int d = 0; c && d < c->num_databases; d++)
+        for (int t = 0; t < c->databases[d].num_tables; t++) {
+            const TableSchema* ts = c->databases[d].tables[t];
+            if (ts->tail_page && ts->root_page_id && ts->tail_root == ts->root_page_id)
+                heap_tail_hint(g_db.bp, ts->root_page_id, ts->tail_page);
+        }
+}
+
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -263,6 +296,7 @@ static bool db_init_impl(const char* data_directory) {
         sv_close(g_db.db_fd);
         return false;
     }
+    tails_from_catalog();
     g_db.bp->before_write = wal_before_page_write;    // prima di scrivere una pagina, il log
     g_db.bp->before_write_ctx = g_db.wal;
     g_db.bp->on_link = wal_on_link;
@@ -330,7 +364,7 @@ static void on_trees_dropped(void) {
     if (rec) {
         wal_write(g_db.wal, LOG_CATALOG, 0, 0, (SVRID){0, 0}, rec, (uint32_t)n, NULL, 0);
         free(rec);
-    } else if (n == 1 && catalog_save(g_db.catalog, g_db.cat_path) == SV_OK) catalog_mark_logged(g_db.catalog);
+    } else if (n == 1 && cat_save() == SV_OK) catalog_mark_logged(g_db.catalog);
 }
 
 static void free_tree_page(void* ctx, uint32_t page) { bp_free_page_now(g_db.bp, page, *(const uint64_t*)ctx); }
@@ -355,7 +389,7 @@ static void trees_write(void) {
 static bool do_checkpoint(void) {
     if (!g_db.initialized || io_failed()) return false;
     if (wal_flush(g_db.wal) != SV_OK || bp_flush_all(g_db.bp) != SV_OK) return false;
-    if (catalog_save(g_db.catalog, g_db.cat_path) != SV_OK) return false;
+    if (cat_save() != SV_OK) return false;
     catalog_mark_logged(g_db.catalog);
     trees_free_garbage();                 // il catalogo salvato non nomina più gli alberi abbandonati
     bp_checkpoint_done(g_db.bp);          // prima di accorciare il log: da qui le pagine vecchie vogliono l'immagine
@@ -421,7 +455,7 @@ static bool do_vacuum_full(int* freed) {
                 if (fail) { g_db.catalog->current_db = prev; fprintf(stderr, "[SegVault] VACUUM FULL: %s (table %s)\n", fail, ts->name); return false; }
                 ts->root_page_id = root;
                 ts->num_pages = pages;
-                if (bp_flush_all(g_db.bp) != SV_OK || catalog_save(g_db.catalog, g_db.cat_path) != SV_OK) {
+                if (bp_flush_all(g_db.bp) != SV_OK || cat_save() != SV_OK) {
                     g_db.catalog->current_db = prev;
                     return false;
                 }
@@ -608,6 +642,7 @@ static char g_tx_err[400];
 static _Thread_local char g_see_user[64];
 static bool see_db_of_session(const char* db) { return auth_can_see_db(g_see_user[0] ? g_see_user : g_session_user, db); }
 static bool db_backup_impl(const char* dir, char* err, size_t errn);
+static bool backup_target_ok(const char* dir, char* err, size_t errn);
 
 // statement con shop.prodotto: gira nel database shop (solo per questo statement e questo thread)
 static QueryResult* exec_one(ASTNode* stmt) {
@@ -867,7 +902,7 @@ static QueryResult* exec_table_maint(ASTNode* stmt) {
         snprintf(msg, sizeof(msg), "OK (%lld rows)", rows);
         maint_row(&m, tn, opl, "status", msg);
     }
-    catalog_save(g_db.catalog, g_db.cat_path);                             // statistiche aggiornate
+    cat_save();                             // statistiche aggiornate
     if (!strcmp(op, "ANALYZE")) {
         char sp[1100];
         snprintf(sp, sizeof(sp), "%s" SV_PATH_SEP "segvault.stats", g_db.data_dir);
@@ -905,12 +940,26 @@ static int ddl_durable(void) {
         if (ok) return 1;
         if (io_failed() || g_db.wal->failed) return 0;
     }
-    bool ok = bp_flush_all(g_db.bp) == SV_OK && catalog_save(g_db.catalog, g_db.cat_path) == SV_OK;
+    bool ok = bp_flush_all(g_db.bp) == SV_OK && cat_save() == SV_OK;
     if (ok) catalog_mark_logged(g_db.catalog);
     return ok ? 2 : 0;
 }
 
 static _Thread_local DbRowSink* g_row_sink;        // db_execute_stream in corso su questo thread
+
+// statement che in MySQL chiudono con un commit la transazione aperta (le tabelle TEMPORARY no)
+static bool implicit_commit_stmt(const ASTNode* s) {
+    switch (s->type) {
+        case NODE_CREATE_TABLE: return !s->create_table.temporary;
+        case NODE_DROP_TABLE:   return !s->drop_table.temporary;
+        case NODE_CREATE_DB: case NODE_DROP_DB: case NODE_CREATE_INDEX: case NODE_DROP_INDEX: case NODE_CREATE_VIEW:
+        case NODE_DROP_VIEW: case NODE_ALTER_TABLE: case NODE_TRUNCATE: case NODE_CREATE_TRIGGER: case NODE_DROP_TRIGGER:
+        case NODE_CREATE_PROCEDURE: case NODE_DROP_PROCEDURE: case NODE_SEQUENCE: case NODE_TABLE_MAINT: case NODE_BEGIN:
+            return true;
+        default:
+            return false;
+    }
+}
 
 // esegue uno statement già analizzato (transazioni e CHECKPOINT gestiti qui)
 static QueryResult* exec_one_in(ASTNode* stmt) {
@@ -933,6 +982,10 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
         for (int i = 0; i < stmt->nqual_dbs; i++)
             if (!auth_check(g_session_user, stmt, stmt->qual_dbs[i], err, sizeof(err))) return result_error(err);
     }
+    // DDL o BEGIN dentro una transazione: prima il commit implicito, come MySQL. Prima il DDL restava ma il ROLLBACK
+    // successivo annullava le righe scritte prima di esso (e BEGIN dava errore)
+    if (g_db.exec_ctx.tx_id && implicit_commit_stmt(stmt) && !db_commit())
+        return result_error(g_tx_err[0] ? g_tx_err : "Failed to commit");
     if (stmt->type == NODE_SET) {                 // variabili di sessione di MySQL: accettate
         // prima le assegnazioni (SET @OLD_FOREIGN_KEY_CHECKS = @@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS = 0
         // dei dump: @OLD deve avere il valore di prima), poi il flag
@@ -967,7 +1020,8 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
         result = exec_table_maint(stmt);
     } else if (stmt->type == NODE_BACKUP) {
         char err[600];
-        result = db_backup_impl(stmt->backup.path, err, sizeof(err)) ? result_ok(0) : result_error(err);
+        result = backup_target_ok(stmt->backup.path, err, sizeof(err)) && db_backup_impl(stmt->backup.path, err, sizeof(err))
+                 ? result_ok(0) : result_error(err);
     } else if (stmt->type == NODE_VACUUM) {
         int freed = 0;
         bool full = stmt->delete_stmt.num_targets == 1;
@@ -991,7 +1045,8 @@ static QueryResult* exec_one_in(ASTNode* stmt) {
         atomic_store(&g_read_running, 0);
         if (atomic_load(&g_sv_scan_cancel) || sv_scan_cancelled()) {   // risultato parziale: scartato
             if (result) db_result_free(result);
-            result = result_error("Query cancelled");
+            const char* why = sv_scan_abort_why();          // fermata per un errore certo (regex): quello, non "cancelled"
+            result = result_error(why ? why : "Query cancelled");
             atomic_store(&g_sv_scan_cancel, 0);
         }
     } else {
@@ -1061,6 +1116,7 @@ struct DbSession {
     char         user[64];
     uint64_t     gen;               // avvio del motore a cui appartiene tx_id (dopo un riavvio non vale più)
     int64_t      tx_start;          // posizione del BEGIN nel log (l'annullamento parte da lì)
+    uint64_t     tx_begin_seq;      // sequenza delle modifiche al BEGIN (diario degli indici)
     bool         tx_ddl;            // la transazione ha cambiato lo schema: ROLLBACK invalida tutto
 };
 
@@ -1109,6 +1165,9 @@ typedef struct {
 static TxChange* g_chg;
 static int       g_nchg, g_capchg;
 static uint64_t  g_chg_seq;
+static uint64_t chg_seq_now(void) { return g_chg_seq; }
+static uint64_t g_tx_begin_seq;                  // g_chg_seq al BEGIN della transazione corrente
+static uint64_t tx_now(void) { return g_db.exec_ctx.tx_id; }
 
 static void chg_hook(uint64_t tx, const char* db, const char* table, uint8_t type, RID rid, RID nrid, const uint8_t* old, size_t ol) {
     if (g_nchg == g_capchg) {
@@ -1142,6 +1201,7 @@ static void chg_hook(uint64_t tx, const char* db, const char* table, uint8_t typ
 
 // via le voci della transazione tx dopo il numero after (0 = tutte): COMMIT, ROLLBACK, ROLLBACK TO
 static void chg_drop(uint64_t tx, uint64_t after) {
+    executor_index_journal_drop(tx, after);              // (diario degli indici: stessa vita delle modifiche)
     int k = 0;
     for (int i = 0; i < g_nchg; i++) {
         if (g_chg[i].tx == tx && g_chg[i].seq > after) { free(g_chg[i].old); continue; }
@@ -1608,8 +1668,9 @@ static QueryResult* prepared_statement(const TokenList* tk) {
         char* args[64];
         int na = 0;
         if (TW(2, "USING")) {
-            for (int i = 3; i < n && t[i].type != TOK_EOF && t[i].type != TOK_SEMICOLON && na < 64; i++) {
+            for (int i = 3; i < n && t[i].type != TOK_EOF && t[i].type != TOK_SEMICOLON; i++) {
                 if (t[i].type == TOK_COMMA) continue;
+                if (na == 64) { for (int k = 0; k < na; k++) free(args[k]); return result_error("EXECUTE ... USING takes at most 64 variables"); }
                 if (t[i].type != TOK_IDENTIFIER || t[i].text[0] != '@') { for (int k = 0; k < na; k++) free(args[k]); return result_error("EXECUTE ... USING takes @variables"); }
                 args[na++] = executor_uservar_literal(t[i].text + 1);
             }
@@ -1801,6 +1862,7 @@ static bool db_begin_impl(void) {
     g_num_savepoints = 0;
     g_open_tx++;
     g_tx_start = wal_size(g_db.wal);              // il primo record della transazione (BEGIN) è qui
+    g_tx_begin_seq = g_chg_seq;                   // le modifiche della transazione hanno sequenze più alte
     g_tx_ddl = false;
     wal_write(g_db.wal, LOG_BEGIN, tx->tx_id, 0,
               (SVRID){0,0}, NULL, 0, NULL, 0);
@@ -1826,29 +1888,6 @@ static void rows_after_undo(uint64_t tx, uint64_t after) {
     }
 }
 
-static void invalidate_after_undo(uint64_t tx, uint64_t after, const uint32_t* pages, int npages, bool undo_ok) {
-    if (undo_ok && !g_tx_ddl && !g_chg_lost) rows_after_undo(tx, after);
-    if (!undo_ok || g_tx_ddl || g_chg_lost || !pages) {
-        bp_remove_all(g_db.bp);
-        executor_invalidate_indexes();
-        return;
-    }
-    for (int i = 0; i < npages; i++) bp_remove_page(g_db.bp, pages[i]);
-    uint8_t* seen = sv_calloc((size_t)g_nctab + 1, 1);           // una volta per tabella
-    if (!seen) { bp_remove_all(g_db.bp); executor_invalidate_indexes(); return; }
-    for (int i = 0; i < g_nchg; i++) {
-        const TxChange* c = &g_chg[i];
-        if (c->tx != tx || c->seq <= after) continue;
-        if (c->tid >= g_nctab || seen[c->tid]) continue;
-        seen[c->tid] = 1;
-        const ChgTable* ct = &g_ctab[c->tid];
-        TableSchema* ts = catalog_get_table(g_db.catalog, ct->db, ct->table);
-        if (ts) executor_invalidate_table(g_db.bp, ct->db, ct->table, ts->root_page_id);
-        else { executor_invalidate_indexes(); break; }
-    }
-    free(seen);
-}
-
 // dopo un annullamento sulle pagine della cache (P1.1): le pagine sono già giuste in memoria, si buttano solo le
 // strutture derivate (indici in memoria, mappa dello spazio libero) delle tabelle toccate; con DDL nella transazione,
 // modifiche non registrate o un annullamento fallito, quelle di tutte le tabelle
@@ -1863,7 +1902,9 @@ static void invalidate_after_cache_undo(uint64_t tx, uint64_t after, bool undo_o
         seen[c->tid] = 1;
         const ChgTable* ct = &g_ctab[c->tid];
         TableSchema* ts = catalog_get_table(g_db.catalog, ct->db, ct->table);
-        if (ts) executor_invalidate_table(g_db.bp, ct->db, ct->table, ts->root_page_id);
+        // dal diario, senza rileggere; ROLLBACK intero (after = 0): dal BEGIN, così un indice costruito prima della
+        // transazione non viene scartato
+        if (ts) executor_index_undo(g_db.bp, ct->db, ct->table, ts->root_page_id, tx, after ? after : g_tx_begin_seq);
         else { executor_invalidate_indexes(); break; }
     }
     free(seen);
@@ -1928,6 +1969,9 @@ static void free_chain(uint32_t first, uint32_t total, uint64_t lsn) {
 }
 
 static void free_heap(uint32_t root, uint64_t lsn) {
+    heap_tail_forget(g_db.bp, root);                     // la catena sparisce: nessuna coda o mappa ne resta
+    heap_cache_forget(g_db.bp, root);
+    heap_tail_forget(g_db.bp, root);                     // (heap_cache_forget ne registra una dalla mappa)
     uint32_t* ids = NULL;
     int n = 0, cap = 0;
     for (uint32_t pid = root, guard = 0; pid && guard < (1u << 24); guard++) {
@@ -2162,20 +2206,6 @@ static NameList* db_list_views_impl(const char* db_name) {
     return nl;
 }
 
-static NameList* db_list_procedures_impl(const char* db_name) {
-    if (!g_db.initialized) return NULL;
-    Database* db = catalog_get_db(g_db.catalog, db_name);
-    if (!db) return NULL;
-    NameList* nl = SV_ALLOC(NameList);
-    nl->names    = SV_ALLOC_N(char*, db->num_routines);
-    nl->count    = 0;
-    nl->extras   = NULL;
-    for (int i = 0; i < db->num_routines; i++)
-        if (!db->routines[i].is_function)
-            nl->names[nl->count++] = sv_strdup(db->routines[i].name);
-    return nl;
-}
-
 static NameList* db_list_functions_impl(const char* db_name) {
     if (!g_db.initialized) return NULL;
     Database* db = catalog_get_db(g_db.catalog, db_name);
@@ -2251,11 +2281,6 @@ void db_namelist_free(NameList* nl) {
     free(nl);
 }
 
-static bool db_use_impl(const char* name) {
-    if (!g_db.initialized) return false;
-    return catalog_use_db(g_db.catalog, name) == SV_OK;
-}
-
 static const char* db_current_database_impl(void) {
     if (!g_db.initialized) return NULL;
     Database* db = catalog_current_db(g_db.catalog);
@@ -2311,7 +2336,7 @@ static void db_shutdown_impl(void) {
         executor_seq_flush();                            // sequenze col valore esatto (non la riserva)
         trees_write();                                   // indici su disco per il prossimo avvio (P1.6)
         bool flushed = wal_flush(g_db.wal) == SV_OK && bp_flush_all(g_db.bp) == SV_OK;
-        bool cat = catalog_save(g_db.catalog, g_db.cat_path) == SV_OK;
+        bool cat = cat_save() == SV_OK;
         if (flushed && cat) trees_free_garbage();
         if (flushed) free_list_save();
         clean = flushed && cat && g_open_tx == 0;
@@ -2341,6 +2366,7 @@ static void db_shutdown_impl(void) {
     txm_destroy(g_db.txm);
     catalog_free(g_db.catalog);
     executor_invalidate_indexes();
+    heap_tail_reset();      // (i suggerimenti sono di questo buffer pool: il prossimo avvio li rilegge dal catalogo)
     sv_close(g_db.db_fd);   // rilascia anche il lock del file
     g_db.initialized = false;
 }
@@ -2598,13 +2624,6 @@ NameList* db_list_views(const char* db_name) {
     return r;
 }
 
-NameList* db_list_procedures(const char* db_name) {
-    db_lock();
-    NameList* r = db_list_procedures_impl(db_name);
-    db_unlock();
-    return r;
-}
-
 NameList* db_list_functions(const char* db_name) {
     db_lock();
     NameList* r = db_list_functions_impl(db_name);
@@ -2653,7 +2672,7 @@ ForeignKeyInfo* db_list_foreign_keys(const char* db_name, int* out_count) {
             snprintf(f->name, sizeof(f->name), "%.63s", c->name);
             snprintf(f->table, sizeof(f->table), "%.63s", ts->name);
             snprintf(f->ref_table, sizeof(f->ref_table), "%.63s", c->ref_table);
-            f->ncols = c->ncols > 8 ? 8 : c->ncols;
+            f->ncols = c->ncols > SV_MAX_KEY_COLS ? SV_MAX_KEY_COLS : c->ncols;
             for (int i = 0; i < f->ncols; i++) {
                 if (c->cols[i] < ts->num_columns) snprintf(f->cols[i], 64, "%.63s", ts->columns[c->cols[i]].name);
                 snprintf(f->ref_cols[i], 64, "%.63s", c->ref_cols[i]);
@@ -2698,6 +2717,7 @@ static void session_save(DbSession* s) {
     s->tx_id = g_db.exec_ctx.tx_id;
     s->gen = g_engine_gen;
     s->tx_start = g_tx_start;
+    s->tx_begin_seq = g_tx_begin_seq;
     s->tx_ddl = g_tx_ddl;
     s->fk_off = !executor_fk_checks();
     s->uvars = executor_uservars();
@@ -2711,6 +2731,7 @@ static void session_load(const DbSession* s) {
     bool same = s->gen == g_engine_gen;      // una transazione di prima del riavvio è già stata annullata
     g_db.exec_ctx.tx_id = same ? s->tx_id : 0;
     g_tx_start = same ? s->tx_start : 0;
+    g_tx_begin_seq = same ? s->tx_begin_seq : 0;
     g_tx_ddl = same && s->tx_ddl;
     executor_set_fk_checks(!s->fk_off);
     executor_set_uservars(s->uvars);
@@ -2983,7 +3004,13 @@ bool db_set_user(const char* name) {
     return ok;
 }
 
-const char* db_session_user(void) { return g_session_user; }
+const char* db_session_user(void) {               // copia sotto il lock (g_session_user cambia con la sessione attiva)
+    static _Thread_local char buf[sizeof(g_session_user)];
+    db_lock();
+    snprintf(buf, sizeof(buf), "%s", g_session_user);
+    db_unlock();
+    return buf;
+}
 
 // l'hash della password (PBKDF2, 100 000 giri) si calcola fuori dal lock del motore: un'ondata di login
 // sbagliati non ferma più le query di tutti. Dopo una verifica riuscita, sotto il lock: si ricontrolla che sale
@@ -3164,18 +3191,18 @@ int db_user_table_grants(const char* user, char (*db)[64], char (*table)[64], un
     return n;
 }
 
-bool db_use(const char* name) {
-    db_lock();
-    bool r = db_use_impl(name);
-    db_unlock();
-    return r;
-}
-
+// Il nome vive nel catalogo (Catalog.databases, riallocato da CREATE DATABASE e compattato da DROP DATABASE): si
+// copia sotto il lock in un buffer del thread, mai un puntatore nel catalogo oltre il lock (CR-A5). Quattro buffer
+// a rotazione: il valore resta valido anche dopo altre tre chiamate dello stesso thread.
 const char* db_current_database(void) {
+    static _Thread_local char buf[4][SV_MAX_NAME_LEN];
+    static _Thread_local unsigned next;
+    char* out = buf[next++ & 3];
     db_lock();
     const char* r = db_current_database_impl();
+    if (r) snprintf(out, SV_MAX_NAME_LEN, "%s", r);
     db_unlock();
-    return r;
+    return r ? out : NULL;
 }
 
 SessionInfo* db_session_info(void) {
@@ -3200,19 +3227,6 @@ char* db_get_create_statement_nofk(const char* db_name, const char* table) {
 }
 
 // viste, trigger e procedure del database come istruzioni SQL (per il dump)
-static void sb_cat(char** p, size_t* n, size_t* cap, const char* a) {
-    size_t l = strlen(a);
-    if (!*p) return;
-    if (*n + l + 1 > *cap) {
-        size_t nc = (*n + l + 1) * 2;
-        char* q = sv_realloc(*p, nc);
-        if (!q) { free(*p); *p = NULL; return; }
-        *p = q; *cap = nc;
-    }
-    memcpy(*p + *n, a, l + 1);
-    *n += l;
-}
-
 // il testo SQL contiene la parola name (non dentro un'altra parola; senza distinzione maiuscole/minuscole)?
 static bool sql_mentions(const char* sql, const char* name) {
     size_t nl = strlen(name);
@@ -3228,11 +3242,7 @@ static bool sql_mentions(const char* sql, const char* name) {
 static char* db_get_objects_sql_impl(const char* db_name, int what) {
     Database* db = g_db.initialized ? catalog_get_db(g_db.catalog, db_name) : NULL;
     if (!db) return NULL;
-    size_t n = 0, cap = 4096;
-    char* out = sv_malloc(cap);
-    if (!out) return NULL;
-    out[0] = '\0';
-    char head[400];
+    SvStrBuf out = {0};                                   // buffer comune (CR-B2)
     // viste in ordine di dipendenza: una vista va dopo quelle che nomina (ciascuna viene controllata
     // quando si ricrea); con un ciclo apparente si prosegue nell'ordine del catalogo
     bool* done = what == 0 ? sv_calloc((size_t)db->num_views + 1, 1) : NULL;
@@ -3248,26 +3258,17 @@ static char* db_get_objects_sql_impl(const char* db_name, int what) {
         for (int i = 0; i < db->num_views && pick < 0; i++) if (!done[i]) pick = i;
         done[pick] = true;
         left--;
-        snprintf(head, sizeof(head), "CREATE VIEW %.64s AS ", db->views[pick].name);
-        sb_cat(&out, &n, &cap, head);
-        sb_cat(&out, &n, &cap, db->views[pick].definition);
-        sb_cat(&out, &n, &cap, ";\n");
+        svsb_printf(&out, "CREATE VIEW `%s` AS %s;\n", db->views[pick].name, db->views[pick].definition);   // nomi tra backtick (dump rieseguito)
     }
     free(done);
     for (int i = 0; what == 1 && i < db->num_triggers; i++) {
         TriggerSchema* t = &db->triggers[i];
-        snprintf(head, sizeof(head), "CREATE TRIGGER %.64s %s %.15s ON %.64s ", t->name, t->before ? "BEFORE" : "AFTER", t->event, t->table_name);
-        sb_cat(&out, &n, &cap, head);
-        sb_cat(&out, &n, &cap, t->body);
-        sb_cat(&out, &n, &cap, ";\n");
+        svsb_printf(&out, "CREATE TRIGGER `%s` %s %.15s ON `%s` %s;\n", t->name, t->before ? "BEFORE" : "AFTER", t->event, t->table_name, t->body);
     }
     for (int i = 0; what == 2 && i < db->num_routines; i++) {
-        snprintf(head, sizeof(head), "CREATE %s %.64s", db->routines[i].is_function ? "FUNCTION" : "PROCEDURE", db->routines[i].name);
-        sb_cat(&out, &n, &cap, head);
-        sb_cat(&out, &n, &cap, db->routines[i].body);
-        sb_cat(&out, &n, &cap, ";\n");
+        svsb_printf(&out, "CREATE %s `%s`%s;\n", db->routines[i].is_function ? "FUNCTION" : "PROCEDURE", db->routines[i].name, db->routines[i].body);
     }
-    return out;
+    return svsb_take(&out);
 }
 
 char* db_get_objects_sql(const char* db_name, int what) {
@@ -3373,6 +3374,116 @@ static bool db_restore_impl(const char* dir, char* err, size_t errn) {
     }
     if (!db_init_impl(dd)) { snprintf(err, errn, "Restored files cannot be opened: %.200s (previous data in %.200s)", g_init_error, keep); return false; }
     return ok;
+}
+
+// ── cartelle che lo statement SQL BACKUP TO non può usare (CR-B6) ──
+// Il server registra la sua cartella web e quelle dei siti: un backup lì dentro metterebbe database e users.dat
+// nella radice di un sito. Il backup dalla GUI (db_backup) non passa di qui: il percorso lo sceglie l'utente.
+static SvRwLock g_bk_deny_lock = SV_RWLOCK_INIT;
+static char**   g_bk_deny;
+static int      g_bk_deny_n;
+
+// percorso assoluto con i link risolti, anche se le ultime cartelle non esistono ancora (".." vietato dopo di esse)
+static bool bk_existing(const char* p, char* abs, size_t absn) {
+#ifdef _WIN32
+    struct _stat64 st;
+    char probe[8];
+    if (strlen(p) == 2 && p[1] == ':') { snprintf(probe, sizeof(probe), "%s/", p); p = probe; }   // "C:" = radice del disco
+    if (_stat64(p, &st) != 0 || !_fullpath(abs, p, absn)) return false;
+    for (char* q = abs; *q; q++) if (*q == '\\') *q = '/';
+    return true;
+#else
+    char tmp[PATH_MAX];
+    if (!realpath(p, tmp) || strlen(tmp) >= absn) return false;
+    memcpy(abs, tmp, strlen(tmp) + 1);
+    return true;
+#endif
+}
+
+static bool bk_resolve(const char* path, char* out, size_t outn) {
+    char tmp[4096];
+    int n;
+    bool absolute = path[0] == '/' || path[0] == '\\' || (isalpha((unsigned char)path[0]) && path[1] == ':');
+    if (absolute) n = snprintf(tmp, sizeof(tmp), "%s", path);
+    else {
+        char cwd[2048];
+        if (!getcwd(cwd, sizeof(cwd))) return false;
+        n = snprintf(tmp, sizeof(tmp), "%s/%s", cwd, path);
+    }
+    if (n < 0 || n >= (int)sizeof(tmp)) return false;
+    for (char* q = tmp; *q; q++) if (*q == '\\') *q = '/';
+    size_t cut = strlen(tmp);
+    while (cut > 1 && tmp[cut - 1] == '/') tmp[--cut] = '\0';
+    for (;;) {                                           // tmp[0, cut) = cartella che forse esiste, il resto è nuovo
+        char abs[4096];
+        char save = tmp[cut];
+        tmp[cut] = '\0';
+        bool ok = bk_existing(cut ? tmp : "/", abs, sizeof(abs));
+        tmp[cut] = save;
+        if (ok) {
+            const char* rest = tmp + cut;                 // "" oppure "/a/b"
+            for (const char* c = rest; *c; ) {            // ".." nella parte nuova non si potrebbe risolvere
+                c++;
+                const char* e = strchr(c, '/');
+                size_t cl = e ? (size_t)(e - c) : strlen(c);
+                if (cl == 2 && c[0] == '.' && c[1] == '.') return false;
+                c += cl;
+            }
+            size_t al = strlen(abs);
+            while (al > 0 && abs[al - 1] == '/') abs[--al] = '\0';   // "/" -> "", "C:/" -> "C:"
+            n = snprintf(out, outn, "%s%s", abs, rest);
+            if (!out[0] && outn > 1) { out[0] = '/'; out[1] = '\0'; }
+            return n >= 0 && n < (int)outn;
+        }
+        if (cut == 0) return false;
+        size_t k = cut;
+        while (k > 0 && tmp[k - 1] != '/') k--;
+        if (k == 0) return false;
+        cut = k - 1;
+    }
+}
+
+static bool bk_under(const char* p, const char* root) {   // p è root o una sua sottocartella
+    size_t rl = strlen(root);
+    while (rl > 1 && root[rl - 1] == '/') rl--;
+#ifdef _WIN32
+    if (strncasecmp(p, root, rl)) return false;
+#else
+    if (strncmp(p, root, rl)) return false;
+#endif
+    return p[rl] == '\0' || p[rl] == '/' || (rl == 1 && root[0] == '/');
+}
+
+void db_backup_protect(const char* dir, bool on) {
+    char abs[4096];
+    if (!dir || !dir[0] || !bk_resolve(dir, abs, sizeof(abs))) return;
+    sv_rw_wr(&g_bk_deny_lock);
+    if (on) {
+        char** nv = realloc(g_bk_deny, sizeof(char*) * (size_t)(g_bk_deny_n + 1));
+        char* d = nv ? strdup(abs) : NULL;
+        if (nv) g_bk_deny = nv;
+        if (d) g_bk_deny[g_bk_deny_n++] = d;
+    } else {
+        for (int i = 0; i < g_bk_deny_n; i++)
+            if (!strcmp(g_bk_deny[i], abs)) { free(g_bk_deny[i]); g_bk_deny[i] = g_bk_deny[--g_bk_deny_n]; break; }
+    }
+    sv_rw_wrunlock(&g_bk_deny_lock);
+}
+
+static bool backup_target_ok(const char* dir, char* err, size_t errn) {
+    char abs[4096], data[4096];
+    if (!dir || !dir[0]) { snprintf(err, errn, "Missing backup folder"); return false; }
+    if (!bk_resolve(dir, abs, sizeof(abs))) { snprintf(err, errn, "Invalid backup folder: %.300s", dir); return false; }
+    if (bk_resolve(g_db.data_dir, data, sizeof(data)) && bk_under(abs, data)) {
+        snprintf(err, errn, "The backup folder must not be inside the data folder");
+        return false;
+    }
+    bool deny = false;
+    sv_rw_rd(&g_bk_deny_lock);
+    for (int i = 0; i < g_bk_deny_n && !deny; i++) deny = bk_under(abs, g_bk_deny[i]);
+    sv_rw_rdunlock(&g_bk_deny_lock);
+    if (deny) { snprintf(err, errn, "The backup folder must not be inside a folder served by the web server"); return false; }
+    return true;
 }
 
 bool db_backup(const char* dir, char* err, size_t errn) {

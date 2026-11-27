@@ -266,6 +266,12 @@ static User* find_user(const char* name) {
 }
 
 static unsigned long g_users_version;
+// ── nomi nel file degli utenti ──────────────────────────────────
+// I nomi di database e tabelle possono contenere spazi: nel file si scrivono con sv_name_encode (righe "grantx").
+// Prima (righe "grant") erano scritti così com'erano e `t 255` tornava come tabella `t` con privilegi 255 (CR-C1)
+#define name_encode sv_name_encode
+#define name_decode sv_name_decode
+
 static bool save_users(void) {
     g_users_version++;                    // anche se il salvataggio fallisce: gli utenti in memoria sono cambiati
     if (!g_path[0]) return false;
@@ -277,7 +283,12 @@ static bool save_users(void) {
     for (int i = 0; i < g_nusers; i++) {
         User* u = &g_users[i];
         fprintf(f, "user %s %s %s %d %s\n", u->name, u->salt, u->hash, u->admin ? 1 : 0, u->native[0] ? u->native : "-");
-        for (int k = 0; k < u->ng; k++) fprintf(f, "grant %s %s %s %u\n", u->name, u->g[k].db, u->g[k].table, u->g[k].privs);
+        for (int k = 0; k < u->ng; k++) {          // nomi codificati: uno spazio nel nome non sposta i campi (CR-C1)
+            char db[3 * 64], tb[3 * 64];
+            name_encode(u->g[k].db, db, sizeof(db));
+            name_encode(u->g[k].table, tb, sizeof(tb));
+            fprintf(f, "grantx %s %s %s %u\n", u->name, db, tb, u->g[k].privs);
+        }
     }
     // ultima riga: il numero di utenti. Un file troncato si riconosce (senza utenti tutti sarebbero root)
     fprintf(f, "end %d\n", g_nusers);
@@ -335,7 +346,24 @@ bool auth_init(const char* data_dir) {
             snprintf(u->hash, sizeof(u->hash), "%s", c);
             if (nf == 5 && strlen(d) == 40) snprintf(u->native, sizeof(u->native), "%.40s", d);
             u->admin = adm != 0;
-        } else if (sscanf(line, "grant %63s %63s %79s %u", a, b, c, &pr) == 4) {
+        } else if (!strncmp(line, "grant", 5)) {
+            // "grantx": nomi codificati; "grant" (fino alla 1.5): nomi così come sono, accettati solo se la riga
+            // ha esattamente quattro campi (un nome con spazi la allungherebbe: riga scartata, mai reinterpretata)
+            bool enc = !strncmp(line, "grantx ", 7);
+            char gb[3 * 64], gc[3 * 64];
+            int used = 0;
+            if (sscanf(line + (enc ? 7 : 6), "%63s %191s %191s %u%n", a, gb, gc, &pr, &used) != 4) continue;
+            const char* rest = line + (enc ? 7 : 6) + used;
+            while (*rest == ' ' || *rest == '\r' || *rest == '\n') rest++;
+            bool ok = !*rest && (pr & ~AUTH_ALL) == 0;
+            if (ok && enc) ok = name_decode(gb, 64) && name_decode(gc, 64);
+            else if (ok) ok = strlen(gb) < 64 && strlen(gc) < 64;
+            if (!ok) {
+                fprintf(stderr, "[SegVault] users file: ignoring an unreadable permission line for '%.63s'\n", a);
+                continue;
+            }
+            snprintf(b, sizeof(b), "%s", gb);
+            snprintf(c, sizeof(c), "%s", gc);
             User* u = find_user(a);
             Grant* ng = u ? sv_realloc(u->g, sizeof(Grant) * (size_t)(u->ng + 1)) : NULL;
             if (!ng) continue;
@@ -647,7 +675,12 @@ static void grant_rows(QueryResult* r, const User* u) {
     }
     for (int k = 0; k < u->ng; k++) {
         privs_text(u->g[k].privs, p, sizeof(p));
-        snprintf(line, sizeof(line), "GRANT %s ON %s.%s TO %s", p, u->g[k].db, u->g[k].table, u->name);
+        // nomi tra backtick come MySQL: chi riesegue SHOW GRANTS (copia degli utenti, script) non deve eseguire
+        // un nome come "x.* TO bob; DROP DATABASE y; --" come SQL
+        char qd[70], qt[70];
+        if (strcmp(u->g[k].db, "*")) snprintf(qd, sizeof(qd), "`%s`", u->g[k].db); else snprintf(qd, sizeof(qd), "*");
+        if (strcmp(u->g[k].table, "*")) snprintf(qt, sizeof(qt), "`%s`", u->g[k].table); else snprintf(qt, sizeof(qt), "*");
+        snprintf(line, sizeof(line), "GRANT %s ON %s.%s TO %s", p, qd, qt, u->name);
         const char* v[1] = { line };
         res_row(r, v);
     }

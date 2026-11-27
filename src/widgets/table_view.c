@@ -1,3 +1,4 @@
+#include "../../include/sv_strbuf.h"
 #include "table_view.h"
 #include "theme.h"
 #include <string.h>
@@ -17,7 +18,7 @@ static bool has_grid(const TableView* tv) {
 }
 
 static int num_cols(const TableView* tv) {
-    return SV_MIN(tv->result->num_cols, TABLE_VIEW_MAX_COLS);
+    return SV_MIN(tv->result->num_cols, tv->cols_cap);
 }
 
 // riga visualizzata in posizione i (tiene conto di filtro e ordinamento)
@@ -550,7 +551,24 @@ static bool table_view_handle_event(Widget* self, sEvent* evt) {
     return false;
 }
 
-static void table_view_destroy_fn(Widget* self) { free(((TableView*)self)->order); }
+static void table_view_destroy_fn(Widget* self) {
+    TableView* tv = (TableView*)self;
+    free(tv->order);
+    free(tv->col_widths);
+    free(tv->col_numeric);
+}
+
+// spazio per le larghezze di n colonne (le nuove a 120 px finché l'autosize non le misura)
+static void ensure_cols(TableView* tv, int n) {
+    if (n <= tv->cols_cap) return;
+    int*  w  = realloc(tv->col_widths, sizeof(int) * (size_t)n);
+    if (w) tv->col_widths = w;
+    bool* nu = w ? realloc(tv->col_numeric, sizeof(bool) * (size_t)n) : NULL;
+    if (nu) tv->col_numeric = nu;
+    if (!w || !nu) return;     // memoria esaurita: la griglia resta sulle colonne che ha già
+    for (int i = tv->cols_cap; i < n; i++) { w[i] = 120; nu[i] = false; }
+    tv->cols_cap = n;
+}
 
 TableView* table_view_create(int x, int y, int w, int h) {
     TableView* tv = SV_ALLOC(TableView);
@@ -581,9 +599,6 @@ TableView* table_view_create(int x, int y, int w, int h) {
     tv->font_size    = CELL_FONT;
     tv->draft_row    = -1;
 
-    for (int i = 0; i < TABLE_VIEW_MAX_COLS; i++)
-        tv->col_widths[i] = 120;
-
     table_view_apply_theme(tv);
 
     return tv;
@@ -604,6 +619,7 @@ void table_view_apply_theme(TableView* tv) {
 void table_view_set_result(TableView* tv, QueryResult* result) {
     if (!tv) return;
     tv->result       = result;
+    if (result) ensure_cols(tv, result->num_cols);
     tv->selected_row = -1;
     tv->selected_col = -1;
     tv->hover_row    = -1;
@@ -767,21 +783,8 @@ void table_view_set_filter(TableView* tv, const char* text, int col, bool exact)
 
 // ── esportazione ─────────────────────────────────────────────────
 
-typedef struct { char* b; size_t len, cap; bool ok; } TBuf;
-
-static void tb_put(TBuf* t, const char* s, size_t n) {
-    if (!t->ok) return;
-    if (t->len + n + 1 > t->cap) {
-        size_t cap = t->cap * 2 + n + 256;
-        char* nb = realloc(t->b, cap);
-        if (!nb) { t->ok = false; return; }
-        t->b = nb;
-        t->cap = cap;
-    }
-    memcpy(t->b + t->len, s, n);
-    t->len += n;
-    t->b[t->len] = '\0';
-}
+typedef SvStrBuf TBuf;                                       // buffer comune (CR-B2)
+#define tb_put svsb_put
 
 static void tb_field(TBuf* t, const char* v, bool csv) {
     if (!csv) {   // TSV: tab e a capo diventano spazi
@@ -807,7 +810,7 @@ char* table_view_export(TableView* tv, bool csv) {
     int nc = r->num_cols;
     const char* sep = csv ? "," : "\t";
     const char* eol = csv ? "\r\n" : "\n";
-    TBuf t = { NULL, 0, 0, true };
+    TBuf t = {0};
     for (int c = 0; c < nc; c++) {
         if (c) tb_put(&t, sep, 1);
         tb_field(&t, r->col_names[c] ? r->col_names[c] : "", csv);
@@ -823,8 +826,7 @@ char* table_view_export(TableView* tv, bool csv) {
         }
         tb_put(&t, eol, strlen(eol));
     }
-    if (!t.ok) { free(t.b); return NULL; }
-    return t.b;
+    return svsb_take(&t);
 }
 
 void table_view_fit_column(TableView* tv, int col) {

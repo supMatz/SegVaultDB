@@ -39,12 +39,16 @@
   static inline int sv_mkdir(const char* path) { return _mkdir(path); }
 
   static inline void sv_sleep_ms(int ms) {
+#ifndef _WINBASE_                       // windows.h già incluso: le sue dichiarazioni (dllimport)
     extern void __stdcall Sleep(unsigned long);
+#endif
     Sleep((unsigned long)ms);
   }
 
   static inline double sv_get_time_ms(void) {
+#ifndef _WINBASE_
     extern unsigned long long __stdcall GetTickCount64(void);
+#endif
     return (double)GetTickCount64();
   }
 
@@ -145,7 +149,9 @@
 // poi fsync della cartella, così la sostituzione stessa sopravvive a una caduta di corrente
 #ifdef _WIN32
 static inline int sv_replace_file(const char* tmp, const char* path) {
+#ifndef _WINBASE_
     extern int __stdcall MoveFileExA(const char*, const char*, unsigned long);
+#endif
     return MoveFileExA(tmp, path, 0x1 /* REPLACE_EXISTING */ | 0x8 /* WRITE_THROUGH */) ? 0 : -1;
 }
 #else
@@ -163,12 +169,23 @@ static inline int sv_replace_file(const char* tmp, const char* path) {
 }
 #endif
 
+// chiude f (aperto su tmp e scritto) con fflush + fsync e lo mette al posto di path: chi legge trova il file
+// vecchio o quello nuovo intero, mai uno troncato da una caduta a metà. false (tmp rimosso) se qualcosa non va
+static inline bool sv_fclose_replace(FILE* f, const char* tmp, const char* path) {
+    bool ok = fflush(f) == 0 && !ferror(f) && sv_fsync(fileno(f)) == 0;
+    ok = fclose(f) == 0 && ok;
+    if (ok) ok = sv_replace_file(tmp, path) == 0;
+    if (!ok) remove(tmp);
+    return ok;
+}
+
 // file del motore leggibili solo dal proprietario (dati, log, catalogo, utenti con gli hash delle password):
 // su POSIX creati con permessi 0600; mode "w" o "a" come fopen
 #ifdef _WIN32
 int sv_win_private(const char* path, int is_dir);      // ACL protetta: utente corrente + SYSTEM (win_acl.c)
 void sv_win_acl_sddl(const char* path, char* out, size_t n);   // per i test
 int  sv_win_under_wine(void);
+int  sv_win_trusted_path(const char* path);   // file e cartelle di proprietà fidata (CR-M8, win_acl.c)
 static inline FILE* sv_fopen_private(const char* path, const char* mode) {
     FILE* f = fopen(path, mode);
     if (f) sv_win_private(path, 0);

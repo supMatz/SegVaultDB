@@ -81,6 +81,7 @@ SCOPO: server HTTP/1.1 minimo (socket POSIX / Winsock) e API JSON sopra db_api.h
 #define SOCK_CLOEXEC 0                  // Windows / macOS: nessun flag (Windows non eredita i socket: P2.10)
 #endif
 
+#define LOGIN_SLOTS 1024                  // voci della tabella dei login sbagliati (P3.11: erano 64)
 #define API_PREFIX      "/api/v1"     // prefisso predefinito (vedi SvServerConfig.api_prefix)
 #define MAX_HEADER      (64 * 1024)   // intestazioni di una richiesta, predefinito (--max-header-size KB)
 #define MIN_BODY_RATE   1024          // byte/s minimi di un corpo dopo BODY_GRACE_MS (client lentissimi: 408)
@@ -128,6 +129,7 @@ struct SvServer {
     char*          static_dir;
     char           api[128];            // prefisso dell'API ("" = spenta)
     char*          doc_root;            // percorso assoluto di static_dir (SCRIPT_FILENAME per PHP)
+    bool           bk_protected;        // static_dir e cartelle dei siti registrate con db_backup_protect
     FcgiPool*      php;                 // NULL = PHP spento
     Site*          sites;               // siti con nome (--site); quelli automatici si cercano a ogni richiesta
     int            n_sites;
@@ -155,7 +157,7 @@ struct SvServer {
     int            n_to_close;
     uint8_t*       conn_kind;           // per slot di conns[]: 0 HTTP, 1 MySQL, 2 SMTP, 3 TLS
     uint64_t*      conn_addr;           // per slot: indirizzo remoto (hash; 0 = locale), per il limite per indirizzo
-    struct { uint64_t key; int fails; double last, until; } login_fail[64];   // login sbagliati per utente + indirizzo
+    struct { uint64_t key; int fails; double last, until; } login_fail[LOGIN_SLOTS];   // login sbagliati (utente + indirizzo, e solo indirizzo)
     char           tls_info[300];
     int            mysql_port;
     uint32_t       mysql_ids;           // id delle connessioni MySQL
@@ -183,6 +185,12 @@ struct SvServer {
     SvLogEntry     log[SV_LOG_MAX];     // anello: log[(seq - 1) % SV_LOG_MAX]
     SvBucket       series[SV_SERIES_MAX]; // anello per secondo: series[sec % SV_SERIES_MAX]
     SvSess         sess[SV_MAX_SESSIONS];  // sessioni dei client (protette da exec_mx)
+    bool           reaper_on;              // thread che chiude le sessioni ferme (CR-M10)
+#ifdef _WIN32
+    HANDLE         reaper;
+#else
+    pthread_t      reaper;
+#endif
     struct InnerPool* inner;            // pool fisso per gli stream HTTP/2 in memoria (NULL = non ancora avviato)
     bool           inner_registered;    // sv_inner_register fatto per port
 };
@@ -823,6 +831,47 @@ static SvSess* find_session(SvServer* s, const char* id) {
         if (s->sess[i].db && secret_equal(s->sess[i].id, id)) r = &s->sess[i];
     mx_unlock(&s->exec_mx);
     return r;
+}
+
+// Le sessioni ferme (e le loro transazioni, con i lock) si chiudono ogni secondo anche senza richieste HTTP
+// (CR-M10: prima solo la richiesta successiva all'API lo faceva, e un client MySQL in attesa del lock non la manda).
+// Thread a parte: db_session_end può aspettare il motore, il ciclo che accetta le connessioni no
+#ifdef _WIN32
+static DWORD WINAPI reaper_main(LPVOID arg)
+#else
+static void* reaper_main(void* arg)
+#endif
+{
+    SvServer* s = arg;
+    while (!s->stop) {
+        for (int i = 0; i < 10 && !s->stop; i++) sleep_ms(100);
+        if (s->stop) break;
+        mx_lock(&s->exec_mx);
+        expire_sessions(s);
+        mx_unlock(&s->exec_mx);
+    }
+    return 0;
+}
+
+static void reaper_start(SvServer* s) {
+#ifdef _WIN32
+    s->reaper = CreateThread(NULL, 0, reaper_main, s, 0, NULL);
+    s->reaper_on = s->reaper != NULL;
+#else
+    s->reaper_on = pthread_create(&s->reaper, NULL, reaper_main, s) == 0;
+#endif
+}
+
+static void reaper_join(SvServer* s) {
+    if (!s->reaper_on) return;
+    s->stop = 1;
+#ifdef _WIN32
+    WaitForSingleObject(s->reaper, INFINITE);
+    CloseHandle(s->reaper);
+#else
+    pthread_join(s->reaper, NULL);
+#endif
+    s->reaper_on = false;
 }
 
 // POST /api/v1/sessions (nuova) | DELETE /api/v1/sessions/ID (chiusa, transazione annullata)
@@ -2323,6 +2372,20 @@ static bool never_serve(const char* p) {
     return false;
 }
 
+// file del formato SegVault (dati, catalogo, utenti con gli hash delle password, log): mai serviti, anche se un
+// BACKUP TO li ha messi dentro la cartella di un sito (CR-B6)
+static bool segvault_data_file(const char* path) {
+    const char* b = strrchr(path, '/');
+    b = b ? b + 1 : path;
+    static const char* const F[] = { "segvault.db", "segvault.cat", "segvault.free", "segvault.wal", "users.dat", "sequences.txt" };
+    for (size_t i = 0; i < sizeof(F) / sizeof(F[0]); i++) {
+        size_t l = strlen(F[i]);
+        // anche "users.dat." / "users.dat::$DATA" e simili alias di Windows
+        if (!strncasecmp(b, F[i], l) && (b[l] == '\0' || b[l] == '.' || b[l] == ':' || b[l] == ' ')) return true;
+    }
+    return false;
+}
+
 // sito web (static_dir): file statici, script .php, cartelle con index.php / index.html,
 // e il "front controller" (un percorso che non esiste va a /index.php: URL di WordPress e Laravel)
 static void handle_web(SvServer* s, Request* rq, Response* rs) {
@@ -2334,6 +2397,7 @@ static void handle_web(SvServer* s, Request* rq, Response* rs) {
         if (*q == '/' && q[1] == '.' && !(q == p && !strncmp(q, "/.well-known/", 13))) { web_not_found(rq, rs); return; }
     }
     if (win_alias_segment(p)) { web_not_found(rq, rs); return; }
+    if (segvault_data_file(p)) { web_not_found(rq, rs); return; }
     // .htaccess del sito (mod_rewrite, Require all denied, Options -Indexes), come Apache
     if (!rq->rw_done && !s->cfg.no_htaccess) {
         rq->rw_done = true;
@@ -2502,7 +2566,10 @@ static const char* origin_problem(SvServer* s, const Request* rq) {
         return "Host not allowed (the server only answers to localhost)";
     if (!rq->origin[0]) return NULL;                       // non da un browser (curl, app, backend)
     if (s->cors && (!strcmp(s->cors, "*") || !strcmp(s->cors, rq->origin))) return NULL;
-    // stessa origine: la pagina è servita da questo server (--static)
+    // stessa origine: la pagina è servita da questo server (--static). Non per gli host dei siti (blog.localhost,
+    // *.test, siti configurati): le loro pagine contengono codice di terzi (plugin, pacchetti npm, XSS) che non deve
+    // poter usare l'API di amministrazione (CR-A2)
+    if (rq->site[0]) return "Origin not allowed: the SegVault API does not answer to the pages of a site (use --cors to allow one)";
     const char* o = rq->origin;
     if (!strncmp(o, "http://", 7) && rq->host[0] && !strcasecmp(o + 7, rq->host)) return NULL;
     if (!strncmp(o, "https://", 8) && rq->host[0] && !strcasecmp(o + 8, rq->host)) return NULL;
@@ -2548,7 +2615,11 @@ static struct { uint8_t key[32]; char user[64]; double until; unsigned long ver;
 // Per coppia utente + indirizzo: i primi LOGIN_FREE_FAILS errori non costano niente (errori di battitura), poi
 // ogni errore raddoppia l'attesa prima del prossimo tentativo (1 s, 2 s, 4 s, ... fino a 5 minuti). Durante
 // l'attesa i tentativi si rifiutano senza calcolare l'hash; un login riuscito azzera il conto.
+// Anche per indirizzo da solo (P3.11), con più errori gratis: con 64 voci e solo la coppia utente + indirizzo,
+// chi provava password per "root" alternandole con 64 nomi inventati faceva uscire la voce di root dalla
+// tabella e il conto ripartiva da zero a ogni giro, senza mai aspettare.
 #define LOGIN_FREE_FAILS 5
+#define LOGIN_FREE_FAILS_ADDR 20
 #define LOGIN_MAX_WAIT_MS (5 * 60 * 1000)
 
 static uint64_t login_key(const char* user, const char* addr) {
@@ -2561,44 +2632,72 @@ static uint64_t login_key(const char* user, const char* addr) {
 
 #define LOGIN_FORGET_MS (15 * 60 * 1000)      // un conto fermo da 15 minuti si dimentica
 
-// millisecondi da aspettare prima di poter riprovare (0 = si può)
-static double login_blocked(SvServer* s, const char* user, const char* addr) {
-    uint64_t k = login_key(user, addr);
-    double now = now_ms(), wait = 0;
-    mx_lock(&s->conn_mx);
-    for (int i = 0; i < 64; i++)
-        if (s->login_fail[i].key == k && s->login_fail[i].until > now) wait = s->login_fail[i].until - now;
-    mx_unlock(&s->conn_mx);
-    return wait;
+// chiave del solo indirizzo (un utente che nessuno può chiamare così: '\x01'). Non per la macchina stessa:
+// lì girano tutte le app di sviluppo, e una con la password sbagliata in un ciclo bloccherebbe le altre
+static bool login_loopback(const char* a) {
+    return a && (!strncmp(a, "127.", 4) || !strcmp(a, "::1") || !strncmp(a, "::ffff:127.", 11));
+}
+static uint64_t login_addr_key(const char* addr) { return login_loopback(addr) ? 0 : login_key("\x01", addr); }
+
+static double login_wait_of(SvServer* s, uint64_t k, double now) {
+    for (int i = 0; i < LOGIN_SLOTS; i++)
+        if (s->login_fail[i].key == k) return s->login_fail[i].until > now ? s->login_fail[i].until - now : 0;
+    return 0;
 }
 
-static void login_failed(SvServer* s, const char* user, const char* addr) {
-    uint64_t k = login_key(user, addr);
+// millisecondi da aspettare prima di poter riprovare (0 = si può): la coppia utente + indirizzo o l'indirizzo
+static double login_blocked(SvServer* s, const char* user, const char* addr) {
     double now = now_ms();
     mx_lock(&s->conn_mx);
-    int slot = -1, oldest = 0;
-    for (int i = 0; i < 64 && slot < 0; i++) if (s->login_fail[i].key == k) slot = i;
+    uint64_t ka = login_addr_key(addr);
+    double a = login_wait_of(s, login_key(user, addr), now), b = ka ? login_wait_of(s, ka, now) : 0;
+    mx_unlock(&s->conn_mx);
+    return a > b ? a : b;
+}
+
+// conta un errore sulla voce k (creata se manca): free errori gratis, poi l'attesa raddoppia
+static void login_count(SvServer* s, uint64_t k, int free_fails, double now) {
+    int slot = -1;
+    for (int i = 0; i < LOGIN_SLOTS && slot < 0; i++) if (s->login_fail[i].key == k) slot = i;
     if (slot >= 0 && now - s->login_fail[slot].last > LOGIN_FORGET_MS) s->login_fail[slot].fails = 0;
-    if (slot < 0) {                                  // la voce usata meno di recente (le libere hanno last = 0)
-        for (int i = 1; i < 64; i++) if (s->login_fail[i].last < s->login_fail[oldest].last) oldest = i;
-        slot = oldest;
+    if (slot < 0) {
+        // una voce libera, altrimenti quella meno recente fra le non bloccate: una voce che sta facendo
+        // aspettare qualcuno esce solo se lo fanno tutte (servono LOGIN_SLOTS coppie bloccate insieme)
+        int best = -1;
+        for (int i = 0; i < LOGIN_SLOTS; i++) {
+            if (!s->login_fail[i].key) { best = i; break; }
+            bool blocking = s->login_fail[i].until > now;
+            if (best < 0) { best = i; continue; }
+            bool best_blocking = s->login_fail[best].until > now;
+            if ((best_blocking && !blocking) || (best_blocking == blocking && s->login_fail[i].last < s->login_fail[best].last)) best = i;
+        }
+        slot = best;
         memset(&s->login_fail[slot], 0, sizeof(s->login_fail[slot]));
         s->login_fail[slot].key = k;
     }
     int f = ++s->login_fail[slot].fails;
     s->login_fail[slot].last = now;
-    if (f >= LOGIN_FREE_FAILS) {
-        int sh = f - LOGIN_FREE_FAILS;
+    if (f >= free_fails) {
+        int sh = f - free_fails;
         double wait = sh >= 20 ? LOGIN_MAX_WAIT_MS : 1000.0 * (double)(1u << sh);
         s->login_fail[slot].until = now + (wait > LOGIN_MAX_WAIT_MS ? LOGIN_MAX_WAIT_MS : wait);
     }
+}
+
+static void login_failed(SvServer* s, const char* user, const char* addr) {
+    double now = now_ms();
+    mx_lock(&s->conn_mx);
+    login_count(s, login_key(user, addr), LOGIN_FREE_FAILS, now);
+    uint64_t ka = login_addr_key(addr);
+    if (ka) login_count(s, ka, LOGIN_FREE_FAILS_ADDR, now);
     mx_unlock(&s->conn_mx);
 }
 
+// azzera solo la coppia: il conto dell'indirizzo resta (un account valido non cancella i tentativi sugli altri)
 static void login_succeeded(SvServer* s, const char* user, const char* addr) {
     uint64_t k = login_key(user, addr);
     mx_lock(&s->conn_mx);
-    for (int i = 0; i < 64; i++) if (s->login_fail[i].key == k) memset(&s->login_fail[i], 0, sizeof(s->login_fail[i]));
+    for (int i = 0; i < LOGIN_SLOTS; i++) if (s->login_fail[i].key == k) memset(&s->login_fail[i], 0, sizeof(s->login_fail[i]));
     mx_unlock(&s->conn_mx);
 }
 
@@ -2784,7 +2883,14 @@ static void route(SvServer* s, Request* rq, Response* rs) {
                 free(ep_sql);
                 return;
             }
-        } else if (!bearer && (s->token || s->cfg.require_login)) {
+        } else if (!bearer && (s->token || s->cfg.require_login || rq->site[0])) {
+            // sull'indirizzo di un sito l'API chiede sempre una credenziale, anche senza --token / --users (CR-A2):
+            // la modalità aperta vale solo per l'indirizzo del server (localhost), non per le pagine dei siti
+            if (rq->site[0] && !s->token && !s->cfg.require_login) {
+                json_error(rs, 403, "the SegVault API is not available on a site's address: use http://localhost:%d%s", s->port, s->api);
+                free(ep_sql);
+                return;
+            }
             rs->extra_headers = s->cfg.require_login ? "WWW-Authenticate: Basic realm=\"SegVault\"\r\n" : "WWW-Authenticate: Bearer\r\n";
             json_error(rs, 401, s->cfg.require_login ? "log in: send \"Authorization: Basic base64(user:password)\"%s"
                                                      : "missing or wrong token (send \"Authorization: Bearer <token>\")%s",
@@ -3628,6 +3734,20 @@ static unsigned my_errcode(const char* m, const char** state) {
     return 1105;
 }
 
+// USE `db` per un nome mandato dal client (handshake, COM_CHANGE_USER, COM_INIT_DB): intero o niente. Con
+// "%.63s" un nome più lungo veniva troncato e la sessione finiva in un altro database; un backtick nel nome
+// usciva dalle virgolette. Il risultato è quello di db_execute (errore "Unknown database" se il nome non va)
+static QueryResult* my_use_db(const char* name) {
+    char use[SV_MAX_NAME_LEN + 16];
+    if (!sv_name_ok(name) || strlen(name) >= SV_MAX_NAME_LEN) {
+        QueryResult* r = calloc(1, sizeof(QueryResult));   // (il nome non si ripete: può avere caratteri di controllo)
+        if (r) snprintf(r->error, sizeof(r->error), "Unknown database (invalid name)");
+        return r;
+    }
+    snprintf(use, sizeof(use), "USE `%s`", name);
+    return db_execute(use);
+}
+
 static void my_error(MwOut* o, const char* msg) {
     const char* st;
     unsigned code = my_errcode(msg, &st);
@@ -3848,13 +3968,16 @@ static void my_processlist(SvServer* s, MwOut* o, const char* user) {
     r.success = true;
     r.num_cols = 8;
     r.col_names = (char**)N;
-    Row rows[256];
-    char buf[256][8][210];
+    // una riga per connessione (P3.11: 256 al massimo e ~430 KB sullo stack; max_clients può essere di più)
+    int cap = s->cfg.max_clients > 0 ? s->cfg.max_clients : 1;
+    Row* rows = calloc((size_t)cap, sizeof(Row));
+    char (*buf)[8][210] = malloc(sizeof(*buf) * (size_t)cap);
+    if (!rows || !buf) { free(rows); free(buf); mw_err(o, 1037, "HY001", "Out of memory"); return; }
     const char* vals[8];
     int n = 0;
     double now = now_ms();
     mx_lock(&s->conn_mx);
-    for (int i = 0; s->procs && i < s->cfg.max_clients && n < 256; i++) {
+    for (int i = 0; s->procs && i < s->cfg.max_clients && n < cap; i++) {
         MyProc* p = &s->procs[i];
         if (!p->used || (!admin && strcmp(p->user, user))) continue;
         snprintf(buf[n][0], 210, "%u", p->id);
@@ -3877,6 +4000,8 @@ static void my_processlist(SvServer* s, MwOut* o, const char* user) {
     r.num_rows = n;
     mw_resultset(o, &r, "", MW_STATUS_AUTOCOMMIT);
     for (int i = 0; i < n; i++) free(rows[i].cells);
+    free(rows);
+    free(buf);
 }
 
 // "KILL ...", "SHOW [FULL] PROCESSLIST": true se gestita (risposta in o)
@@ -4051,6 +4176,8 @@ typedef struct {
     uint8_t*    types;          // 2 byte per parametro, dall'ultimo EXECUTE che li ha mandati
     bool        types_set;
     MwLongData* ld;             // valori mandati con COM_STMT_SEND_LONG_DATA
+    size_t      ld_total;       // byte arrivati per il prossimo EXECUTE, tutti i parametri (CR-M3)
+    bool        ld_too_long;    // oltre max_body: il prossimo EXECUTE risponde 1153
     QueryResult* cur;           // cursore aperto (EXECUTE con CURSOR_TYPE_READ_ONLY) e prossima riga
     int         cur_pos;
     DbPrepared* prep;           // albero analizzato una volta (P2.2), al primo EXECUTE; NULL = col testo
@@ -4063,6 +4190,8 @@ typedef struct { MyStmt* v; int n, cap; uint32_t next_id; bool autocommit; } MyS
 
 static void stmt_clear_ld(MyStmt* st) {
     for (int i = 0; st->ld && i < st->nparams; i++) { free(st->ld[i].p); st->ld[i] = (MwLongData){0}; }
+    st->ld_total = 0;
+    st->ld_too_long = false;
 }
 
 static void stmt_close_cursor(MyStmt* st) {
@@ -4167,6 +4296,11 @@ static void my_execute(SvServer* s, Conn* c, MyStmts* ss, MwOut* o, const uint8_
     uint32_t id = (uint32_t)p[1] | (uint32_t)p[2] << 8 | (uint32_t)p[3] << 16 | (uint32_t)p[4] << 24;
     MyStmt* st = stmt_find(ss, id);
     if (!st) { mw_err(o, 1243, "HY000", "Unknown prepared statement handler given to mysqld_stmt_execute"); return; }
+    if (st->ld_too_long) {                                 // dati lunghi oltre il limite: buttati, come max_allowed_packet
+        stmt_clear_ld(st);
+        mw_err(o, 1153, "08S01", "Got a packet bigger than 'max_allowed_packet' bytes (COM_STMT_SEND_LONG_DATA)");
+        return;
+    }
     char err[160];
     char** lits = NULL;
     char* sql = mw_bind_execute(st->sql, p + 5, n - 5, st->nparams, st->types, &st->types_set, st->ld, &lits, err, sizeof(err));
@@ -4182,7 +4316,7 @@ static void my_execute(SvServer* s, Conn* c, MyStmts* ss, MwOut* o, const uint8_
 }
 
 // COM_STMT_SEND_LONG_DATA: stmt id, numero del parametro, un pezzo del valore (nessuna risposta)
-static void my_long_data(MyStmts* ss, const uint8_t* p, size_t n) {
+static void my_long_data(MyStmts* ss, const uint8_t* p, size_t n, size_t max) {
     if (n < 7) return;
     uint32_t id = (uint32_t)p[1] | (uint32_t)p[2] << 8 | (uint32_t)p[3] << 16 | (uint32_t)p[4] << 24;
     unsigned k = (unsigned)p[5] | (unsigned)p[6] << 8;
@@ -4190,6 +4324,13 @@ static void my_long_data(MyStmts* ss, const uint8_t* p, size_t n) {
     if (!st || (int)k >= st->nparams) return;
     MwLongData* d = &st->ld[k];
     size_t add = n - 7;
+    // tetto per statement (CR-M3): prima i pezzi si accumulavano senza limite fino all'EXECUTE
+    if (st->ld_too_long || st->ld_total + add > max) {
+        if (!st->ld_too_long) for (int i = 0; i < st->nparams; i++) { free(st->ld[i].p); st->ld[i] = (MwLongData){0}; }
+        st->ld_too_long = true;
+        return;
+    }
+    st->ld_total += add;
     char* q = realloc(d->p, d->n + add + 1);
     if (!q) return;
     memcpy(q + d->n, p + 7, add);
@@ -4257,9 +4398,7 @@ static void serve_mysql(Conn* c) {
         if (!my_enter(s, ds)) ok = false;
         else {
             db_set_user(user);
-            char use[96];
-            snprintf(use, sizeof(use), "USE `%.63s`", first_db);
-            QueryResult* r = db_execute(use);
+            QueryResult* r = my_use_db(first_db);
             if (!r || !r->success) { my_error(&o, r ? r->error : "out of memory"); ok = false; }
             db_result_free(r);
             db_set_user(NULL);
@@ -4295,7 +4434,7 @@ static void serve_mysql(Conn* c) {
         else if (cmd == MW_COM_FIELD_LIST) mw_eof(&o, MW_STATUS_AUTOCOMMIT);
         else if (cmd == MW_COM_STMT_CLOSE) {               // nessuna risposta
             if (pk.n >= 5) stmt_close(&stmts, (uint32_t)pk.p[1] | (uint32_t)pk.p[2] << 8 | (uint32_t)pk.p[3] << 16 | (uint32_t)pk.p[4] << 24);
-        } else if (cmd == MW_COM_STMT_SEND_LONG_DATA) my_long_data(&stmts, pk.p, pk.n);   // nessuna risposta
+        } else if (cmd == MW_COM_STMT_SEND_LONG_DATA) my_long_data(&stmts, pk.p, pk.n, max);   // nessuna risposta
         else if (cmd == MW_COM_STMT_RESET) {
             MyStmt* st = pk.n >= 5 ? stmt_find(&stmts, (uint32_t)pk.p[1] | (uint32_t)pk.p[2] << 8 | (uint32_t)pk.p[3] << 16 | (uint32_t)pk.p[4] << 24) : NULL;
             if (!st) mw_err(&o, 1243, "HY000", "Unknown prepared statement handler given to mysqld_stmt_reset");
@@ -4358,9 +4497,7 @@ static void serve_mysql(Conn* c) {
                 stmts.autocommit = true;
                 if (nl.db[0]) {
                     db_set_user(nu);
-                    char use[96];
-                    snprintf(use, sizeof(use), "USE `%.63s`", nl.db);
-                    QueryResult* r = db_execute(use);
+                    QueryResult* r = my_use_db(nl.db);
                     if (!r || !r->success) { my_error(&o, r ? r->error : "out of memory"); chg_ok = false; }
                     db_result_free(r);
                     db_set_user(NULL);
@@ -4392,9 +4529,7 @@ static void serve_mysql(Conn* c) {
                 } else if (cmd == MW_COM_STMT_EXECUTE) {
                     my_execute(s, c, &stmts, &o, pk.p, pk.n, user);
                 } else if (cmd == MW_COM_INIT_DB) {
-                    char use[160];
-                    snprintf(use, sizeof(use), "USE `%.100s`", (char*)pk.p + 1);
-                    QueryResult* r = db_execute(use);
+                    QueryResult* r = my_use_db((char*)pk.p + 1);
                     if (r && r->success) mw_ok(&o, 0, 0, MW_STATUS_AUTOCOMMIT, NULL);
                     else my_error(&o, r ? r->error : "out of memory");
                     db_result_free(r);
@@ -5086,6 +5221,10 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
         while (al > 1 && abs[al - 1] == '/') abs[--al] = '\0';
         if (abs[0]) s->doc_root = strdup(abs);
     }
+    // BACKUP TO da SQL non può scrivere nelle cartelle servite (CR-B6)
+    if (s->static_dir) db_backup_protect(s->static_dir, true);
+    for (int i = 0; i < s->n_sites; i++) if (s->sites[i].dir) db_backup_protect(s->sites[i].dir, true);
+    s->bk_protected = true;
     if (cfg->mail && !svc_mail_start(s, err, errsz)) { sv_server_free(s); return NULL; }
     if (cfg->https && !svc_https_start(s, err, errsz)) { sv_server_free(s); return NULL; }
     if ((s->php_cgi_path || s->php_fcgi_addr) && !cfg->php_start_off && !svc_php_start(s, err, errsz)) { sv_server_free(s); return NULL; }
@@ -5156,6 +5295,7 @@ SvServer* sv_server_start(const SvServerConfig* cfg, char* err, size_t errsz) {
         }
     }
     if (cfg->mysql && !svc_mysql_start(s, err, errsz)) { sv_server_free(s); return NULL; }
+    reaper_start(s);
     return s;
 }
 
@@ -5306,8 +5446,13 @@ void sv_server_run(SvServer* s) {
 
 void sv_server_free(SvServer* s) {
     if (!s) return;
+    if (s->bk_protected) {
+        if (s->static_dir) db_backup_protect(s->static_dir, false);
+        for (int i = 0; i < s->n_sites; i++) if (s->sites[i].dir) db_backup_protect(s->sites[i].dir, false);
+    }
     for (int i = 0; i < QCURSORS; i++) if (s->cursors[i].r) qcursor_drop(&s->cursors[i]);
     s->stop = 1;
+    reaper_join(s);
     if (s->listen_fd != BAD_SOCK) sock_close(s->listen_fd);
     if (s->listen6_fd != BAD_SOCK) sock_close(s->listen6_fd);
     if (s->mysql_unix_fd != BAD_SOCK) { sock_close(s->mysql_unix_fd); if (s->cfg.mysql_socket) unlink(s->cfg.mysql_socket); }

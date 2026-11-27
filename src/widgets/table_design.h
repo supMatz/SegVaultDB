@@ -8,8 +8,9 @@ SCOPO: modello del designer di tabelle (senza GUI): la struttura di una tabella 
 
 #include <stdbool.h>
 #include <stddef.h>
+#include "../../include/common.h"
 
-#define DESIGN_MAX_COLS 64
+#define DESIGN_MAX_COLS SV_MAX_COLUMNS    // tutte quelle che il motore ammette
 
 typedef struct {
     int  orig;               // colonna originale (indice in DesignTable dell'originale), -1 = nuova
@@ -23,6 +24,7 @@ typedef struct {
     char index_name[64];     // nome dell'indice esistente
 } DesignCol;
 
+// ~360 KB: da allocare sullo heap o static, non sullo stack
 typedef struct {
     char      name[64];
     int       ncols;
