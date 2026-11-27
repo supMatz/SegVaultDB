@@ -2475,6 +2475,8 @@ static bool qualifier_exists(BindCtx* b, const char* qual) {
     return false;
 }
 
+static void temporal_literal(const ASTExpr* col, ASTExpr* lit, BindCtx* b);
+
 static void bind_expr(ASTExpr* e, BindCtx* b) {
     if (!e || b->err[0]) return;
     char msg[256];
@@ -2638,6 +2640,10 @@ static void bind_expr(ASTExpr* e, BindCtx* b) {
         default:
             bind_expr(e->left, b);
             bind_expr(e->right, b);
+            if (e->type == EXPR_BINARY && e->op <= OP_GE && !b->err[0]) {   // = <> < > <= >=
+                temporal_literal(e->left, e->right, b);
+                temporal_literal(e->right, e->left, b);
+            }
             return;
     }
 }
@@ -3401,6 +3407,36 @@ static void mydt_text(const MyDT* t, bool with_time, char* out, size_t n) {
     else if (t->us) snprintf(out, n, "%04d-%02d-%02d %02d:%02d:%02d.%06ld", t->y, t->mo, t->d, t->h, t->mi, t->s, t->us);
     else snprintf(out, n, "%04d-%02d-%02d %02d:%02d:%02d", t->y, t->mo, t->d, t->h, t->mi, t->s);
 }
+
+// colonna DATE / DATETIME confrontata con una stringa costante: la costante nella forma della colonna, come la
+// conversione di MySQL ('2024-02-01' = '2024-02-01 00:00:00' per un DATETIME, '2024-01-15 00:00:00' = '2024-01-15'
+// per un DATE). Prima i due testi si confrontavano così com'erano: niente uguaglianze, bordi sbagliati con < e >.
+// Riscrivere la costante vale anche per le ricerche con gli indici
+static void temporal_literal(const ASTExpr* col, ASTExpr* lit, BindCtx* b) {
+    if (!col || !lit || col->type != EXPR_COLUMN || col->bound <= 0 || col->rt_const || lit->type != EXPR_STRING || !lit->str_val) return;
+    const BindCtx* bb = b;
+    for (int k = 0; k < col->outer && bb; k++) bb = bb->outer;
+    int s = BOUND_SRC(col->bound), c = BOUND_COL(col->bound);
+    if (!bb || s >= bb->nsrc || !bb->src[s].ts || c >= bb->src[s].ts->num_columns) return;
+    DataType t = bb->src[s].ts->columns[c].type;
+    if (t != SV_TYPE_DATE && t != SV_TYPE_DATETIME) return;
+    MyDT d;
+    if (!mydt_parse(lit->str_val, &d) || !d.has_date) return;
+    char out[40];
+    if (t == SV_TYPE_DATE) {
+        if (d.has_time && (d.h || d.mi || d.s || d.us)) return;   // un orario vero: il confronto fra testi è già giusto
+        mydt_text(&d, false, out, sizeof(out));
+    } else {
+        if (!d.has_time) { d.h = d.mi = d.s = 0; d.us = 0; d.has_time = true; }
+        mydt_text(&d, true, out, sizeof(out));
+    }
+    if (!strcmp(out, lit->str_val)) return;
+    char* nv = sv_strdup(out);
+    if (!nv) return;
+    free(lit->str_val);
+    lit->str_val = nv;
+}
+
 
 static void local_now(MyDT* t, bool utc) {
     time_t now = time(NULL);

@@ -2885,6 +2885,14 @@ Come è stata fatta: warning estesi di GCC 16 (`-Wnull-dereference -Wduplicated-
     `BEGIN; INSERT …; CREATE TABLE x …; ROLLBACK` lasciava la tabella nuova e annullava l'`INSERT`; un `BEGIN`
     dentro una transazione dava errore. Ora DDL (non `TEMPORARY`), `ANALYZE` / `OPTIMIZE` e `BEGIN` fanno prima il
     commit della transazione aperta (`implicit_commit_stmt` in `db_api.c`). Test in `tests/test_sql.c`.
+  - **Corretto (dopo la 1.5.1):** `GROUP BY 1` era un raggruppamento per la costante 1 (una sola riga per tutta la
+    tabella): ora, come in MySQL, vale la prima espressione della `SELECT` (anche in `ROLLUP` e negli statement
+    preparati); una posizione fuori dall'elenco è un errore.
+  - **Corretto (dopo la 1.5.1):** colonne `DATE` / `DATETIME` confrontate con stringhe come testi: `t = '2024-02-01'`
+    non trovava la mezzanotte, `d = '2024-01-15 00:00:00'` non trovava la data, `t > '2024-02-01'` includeva la
+    mezzanotte. Ora il binder porta la costante alla forma della colonna (`temporal_literal`), quindi vale anche per
+    le ricerche con gli indici, per `IN` e `BETWEEN`; i `VARCHAR` restano confronti fra testi, come in MySQL.
+    **Resta:** contro un'espressione calcolata a ogni riga (`t = CURDATE()`) il confronto è ancora fra testi.
   - **Corretto:** `ORD('à')` dava 195 (il primo byte), MySQL 50080 (i byte del carattere).
   - **Aperto (minori):** un `DOUBLE` che trabocca (`1e308 * 10`, `EXP(1000)`) dà NULL invece dell'errore "DOUBLE value
     is out of range"; `-(-9223372036854775808)` e `ABS(-9223372036854775808)` danno un double invece dell'errore

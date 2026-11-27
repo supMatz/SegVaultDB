@@ -350,6 +350,24 @@ int main(void) {
     t("INSERT INTO li (x) VALUES (3)", "OK:1");
     t("SELECT LAST_INSERT_ID()", "3");
     t("SELECT 1 FROM DUAL WHERE 1 = 1", "1");
+    // DATE / DATETIME confrontati con stringhe come MySQL (prima testo contro testo: niente uguaglianze, bordi sbagliati)
+    t("CREATE TABLE tdt (id INT PRIMARY KEY, d DATE, t DATETIME, s VARCHAR(20), INDEX (t))", "OK:0");
+    t("INSERT INTO tdt VALUES (1, '2024-01-15', '2024-01-15 10:00:00', '2024-02-01'), (2, '2024-02-01', '2024-02-01 00:00:00', 'x')", "OK:2");
+    t("SELECT id FROM tdt WHERE t = '2024-02-01'", "2");
+    t("SELECT id FROM tdt WHERE d = '2024-01-15 00:00:00'", "1");
+    t("SELECT COUNT(*) FROM tdt WHERE t > '2024-02-01'", "0");
+    t("SELECT id FROM tdt WHERE t IN ('2024-02-01') OR d = '2024-1-15' ORDER BY id", "1;2");
+    t("SELECT id FROM tdt WHERE t BETWEEN '2024-01-15' AND '2024-02-01' ORDER BY id", "1;2");
+    t("SELECT id FROM tdt WHERE s = '2024-02-01 00:00:00'", "");            // VARCHAR: confronto fra testi
+    t("DROP TABLE tdt", "OK:0");
+    // GROUP BY per posizione come MySQL (prima un numero era una costante: un solo gruppo)
+    t("CREATE TABLE gp (id INT PRIMARY KEY, g VARCHAR(5), v INT)", "OK:0");
+    t("INSERT INTO gp VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'c', NULL)", "OK:4");
+    t("SELECT g, SUM(v) AS s FROM gp GROUP BY 1 ORDER BY 1", "a|30;b|30;c|NULL");
+    t("SELECT UPPER(g) AS u, COUNT(*) FROM gp GROUP BY 1 ORDER BY 2 DESC, 1", "A|2;B|1;C|1");
+    t("SELECT g, SUM(v) FROM gp GROUP BY 2", "ERR:not allowed in GROUP BY");
+    t("SELECT g FROM gp GROUP BY 5", "ERR:Unknown column '5'");
+    t("DROP TABLE gp", "OK:0");
     // sottoquery scalare correlata senza righe: NULL (prima una stringa vuota, anche dentro COALESCE)
     t("CREATE TABLE sqa (id INT PRIMARY KEY)", "OK:0");
     t("CREATE TABLE sqb (id INT PRIMARY KEY, aid INT, y INT)", "OK:0");

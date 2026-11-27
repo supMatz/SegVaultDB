@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `GROUP BY 1` grouped by the constant 1 (one row for the whole table); like MySQL it now means the first
+  expression of the `SELECT` list, also with `ROLLUP` and in prepared statements.
+- `DATE` / `DATETIME` columns compared with strings as MySQL does: `created = '2024-02-01'` now finds midnight,
+  `day = '2024-01-15 00:00:00'` finds the date, and `created > '2024-02-01'` no longer includes midnight (they were
+  compared as plain text). Also with indexes, `IN` and `BETWEEN`.
+
 ## 1.5.1 — 2026-11-27
 
 - Windows: the 1.5.0 packages could not be built (the per-thread `REGEXP` cache used POSIX thread keys, which the

@@ -2065,6 +2065,26 @@ static bool group_room(ParserState* ps, ASTNode* n) {
     return true;
 }
 
+// GROUP BY 2 = la seconda espressione della SELECT, come MySQL (prima un numero era una costante: un solo gruppo)
+static ASTExpr* group_positional(ParserState* ps, ASTNode* n, ASTExpr* ex) {
+    if (!ex || ex->type != EXPR_INT) return ex;
+    long long k = ex->int_val;
+    if (k < 1 || k > n->select_stmt.num_cols) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Unknown column '%lld' in 'group statement'", k);
+        parse_fail(ps, msg, peek(ps));
+        ast_expr_free(ex);
+        return NULL;
+    }
+    const ASTExpr* col = n->select_stmt.columns[k - 1];
+    if (col->type == EXPR_STAR) return ex;                 // SELECT *: lasciato com'è
+    ASTExpr* c = ast_expr_clone(col);
+    if (!c) return ex;
+    c->alias[0] = '\0';
+    ast_expr_free(ex);
+    return c;
+}
+
 static bool parse_group_by(ParserState* ps, ASTNode* n, uint32_t* sets, int* nsets) {
     *nsets = 0;
     bool wide = false;                    // un'espressione oltre la 32ª: niente insiemi a bit (solo GROUP BY normale)
@@ -2072,7 +2092,7 @@ static bool parse_group_by(ParserState* ps, ASTNode* n, uint32_t* sets, int* nse
     uint32_t base_sets[64];
     int nb = 0;
     bool special = false;
-    #define G_ADD(ex, idx) do { int _f = -1; \
+    #define G_ADD(ex, idx) do { int _f = -1; ex = group_positional(ps, n, ex); if (!ex) return false; \
         for (int _j = 0; _j < n->select_stmt.num_group; _j++) if (expr_same(n->select_stmt.group_exprs[_j], ex)) { _f = _j; break; } \
         if (_f >= 0) { ast_expr_free(ex); idx = _f; } \
         else if (!group_room(ps, n)) { ast_expr_free(ex); return false; } \
