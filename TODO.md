@@ -2893,6 +2893,10 @@ Come è stata fatta: warning estesi di GCC 16 (`-Wnull-dereference -Wduplicated-
     mezzanotte. Ora il binder porta la costante alla forma della colonna (`temporal_literal`), quindi vale anche per
     le ricerche con gli indici, per `IN` e `BETWEEN`; i `VARCHAR` restano confronti fra testi, come in MySQL.
     **Resta:** contro un'espressione calcolata a ogni riga (`t = CURDATE()`) il confronto è ancora fra testi.
+  - **Corretto (dopo la 1.5.1):** `SHOW CREATE TABLE` (usato dal dump della GUI e da `CREATE TABLE … LIKE`) scriveva i
+    nomi senza backtick: una colonna `order`, `key` o `my col` rendeva il testo non rieseguibile (dump che non si
+    ripristinava, `LIKE` che falliva). Perdeva anche gli indici secondari (`KEY`, `FULLTEXT KEY`), i `COMMENT` di
+    colonna e di tabella e `ON UPDATE CURRENT_TIMESTAMP`, e un default con un apice (`'it''s'`) rompeva il testo.
   - **Corretto (dopo la 1.5.1):** `INSERT … VALUES (DEFAULT, …)` e `UPDATE … SET c = DEFAULT` davano "Unknown column
     'DEFAULT'" (sintassi usata da ORM e dump): ora valgono il default della colonna, l'`AUTO_INCREMENT` o il
     ricalcolo della colonna generata. Una colonna vera chiamata `` `default` `` resta una colonna.

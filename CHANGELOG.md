@@ -7,6 +7,9 @@
 - `DATE` / `DATETIME` columns compared with strings as MySQL does: `created = '2024-02-01'` now finds midnight,
   `day = '2024-01-15 00:00:00'` finds the date, and `created > '2024-02-01'` no longer includes midnight (they were
   compared as plain text). Also with indexes, `IN` and `BETWEEN`.
+- `SHOW CREATE TABLE`, the app's dump and `CREATE TABLE … LIKE`: names are quoted with backticks (a column named
+  `order`, `key` or `my col` made the dump impossible to restore), and secondary indexes, column and table
+  comments, `ON UPDATE CURRENT_TIMESTAMP` and defaults containing a quote are kept (they were lost or broke the text).
 - `INSERT … VALUES (DEFAULT, …)` and `UPDATE … SET col = DEFAULT` work (they were "Unknown column 'DEFAULT'").
 - `CHAR(n)` drops trailing spaces as MySQL does (`'ab  '` was stored and compared with its spaces). Values stored
   by older builds keep their spaces until they are written again.

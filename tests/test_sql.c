@@ -1153,8 +1153,18 @@ int main(void) {
       "chk_esame_2|CHECK|NULL|NULL|NULL|NULL|lode = 0 OR voto = 30");
     t("DESCRIBE esame", "matricola|INT|NO|PRI;corso|VARCHAR(5)|NO|PRI;voto|INT|NO|;lode|BOOL|YES|");
     t("DESCRIBE dipartimento", "codice|CHAR(3)|NO|PRI;nome|VARCHAR(30)|NO|UNI");
-    t("SHOW CREATE TABLE studente", "studente|CREATE TABLE studente (\n    matricola INT PRIMARY KEY,\n    nome VARCHAR(20),\n"
-      "    CONSTRAINT chk_studente_1 CHECK (matricola > 0)\n);");
+    t("SHOW CREATE TABLE studente", "studente|CREATE TABLE `studente` (\n    `matricola` INT PRIMARY KEY,\n    `nome` VARCHAR(20),\n"
+      "    CONSTRAINT `chk_studente_1` CHECK (matricola > 0)\n);");
+    // nomi riservati o con spazi, default e commenti con apici, indici: il testo si riesegue (prima no)
+    t("CREATE TABLE `select` (`order` INT PRIMARY KEY, `key` VARCHAR(20) DEFAULT 'it''s' COMMENT 'l''ordine', `my col` INT, "
+      "ts DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY ix_k (`key`, `my col`)) COMMENT 'tab''ella'", "OK:0");
+    t("CREATE TABLE sel2 LIKE `select`", "OK:0");
+    t("SELECT COUNT(*) FROM information_schema.statistics WHERE table_name = 'sel2' AND index_name = 'ix_k'", "2");
+    t("SELECT column_default, column_comment FROM information_schema.columns WHERE table_name = 'sel2' AND column_name = 'key'", "it's|l'ordine");
+    t("SELECT extra FROM information_schema.columns WHERE table_name = 'sel2' AND column_name = 'ts'", "DEFAULT_GENERATED on update CURRENT_TIMESTAMP");
+    t("SELECT table_comment FROM information_schema.tables WHERE table_name = 'sel2'", "tab'ella");
+    t("DROP TABLE sel2", "OK:0");
+    t("DROP TABLE `select`", "OK:0");
     t("SHOW INDEXES FROM esame", "#3");
     t("SHOW STATUS", "#16");
     t("CHECKPOINT", "OK:0");

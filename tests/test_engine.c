@@ -211,8 +211,8 @@ int main(void) {
         tests++;
         char* ddl = db_get_create_statement("testdb", "lc");
         printf("TEST %d: %-30s ", tests, "CREATE statement");
-        if (ddl && strstr(ddl, "id INT PRIMARY KEY AUTO_INCREMENT") && strstr(ddl, "name VARCHAR(20) NOT NULL") &&
-            strstr(ddl, "note TEXT")) { printf("OK\n"); passed++; }
+        if (ddl && strstr(ddl, "`id` INT PRIMARY KEY AUTO_INCREMENT") && strstr(ddl, "`name` VARCHAR(20) NOT NULL") &&
+            strstr(ddl, "`note` TEXT")) { printf("OK\n"); passed++; }
         else printf("FAIL: %s\n", ddl ? ddl : "NULL");
         db_free_string(ddl);
     }

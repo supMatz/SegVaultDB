@@ -12407,15 +12407,30 @@ static const char* fk_action_name(int a) {
 typedef SvStrBuf TBuf;                                       // testo dei CREATE TABLE (buffer comune, CR-B2)
 #define tb_add svsb_printf
 
-static void tb_cols(TBuf* b, const TableSchema* ts, const uint8_t* cols, int n) {
+// i nomi sempre tra backtick, come MySQL: prima `order INT` o `my col INT` rendevano il testo non rieseguibile
+// (dump che non si ripristinavano, CREATE TABLE ... LIKE che falliva)
+static void tb_qcols(TBuf* b, const TableSchema* ts, const uint8_t* cols, int n) {
+    for (int k = 0; k < n; k++) tb_add(b, "%s`%s`", k ? ", " : "", ts->columns[cols[k]].name);
+}
+static void tb_cols(TBuf* b, const TableSchema* ts, const uint8_t* cols, int n) {   // elenco da mostrare (SHOW CONSTRAINTS)
     for (int k = 0; k < n; k++) tb_add(b, "%s%s", k ? ", " : "", ts->columns[cols[k]].name);
 }
 
+// 'testo' con apici e backslash raddoppiati (il lexer tratta \ come escape)
+static void tb_quoted(TBuf* b, const char* s) {
+    svsb_putc(b, '\'');
+    for (; *s; s++) {
+        if (*s == '\'' || *s == '\\') svsb_putc(b, *s);
+        svsb_putc(b, *s);
+    }
+    svsb_putc(b, '\'');
+}
+
 static void tb_fk(TBuf* b, const TableSchema* ts, const Constraint* c) {
-    tb_add(b, "CONSTRAINT %s FOREIGN KEY (", c->name);
-    tb_cols(b, ts, c->cols, c->ncols);
-    tb_add(b, ") REFERENCES %s (", c->ref_table);
-    for (int k = 0; k < c->ncols; k++) tb_add(b, "%s%s", k ? ", " : "", c->ref_cols[k]);
+    tb_add(b, "CONSTRAINT `%s` FOREIGN KEY (", c->name);
+    tb_qcols(b, ts, c->cols, c->ncols);
+    tb_add(b, ") REFERENCES `%s` (", c->ref_table);
+    for (int k = 0; k < c->ncols; k++) tb_add(b, "%s`%s`", k ? ", " : "", c->ref_cols[k]);
     tb_add(b, ")");
     if (c->on_delete != FK_NO_ACTION) tb_add(b, " ON DELETE %s", fk_action_name(c->on_delete));
     if (c->on_update != FK_NO_ACTION) tb_add(b, " ON UPDATE %s", fk_action_name(c->on_update));
@@ -12435,7 +12450,7 @@ char* executor_create_statement(Catalog* cat, const char* db, const char* table,
             inline_pk = &t->constraints[i];
     bool has_pk_cons = false;
     for (int i = 0; i < t->num_constraints; i++) if (t->constraints[i].kind == CONS_PRIMARY) has_pk_cons = true;
-    tb_add(&b, "CREATE TABLE %s (", t->name);
+    tb_add(&b, "CREATE TABLE `%s` (", t->name);
     for (int i = 0; i < t->num_columns; i++) {
         const Column* c = &t->columns[i];
         char type[48];
@@ -12458,28 +12473,41 @@ char* executor_create_statement(Catalog* cat, const char* db, const char* table,
         if (is_text_col(c) && (c->flags & (COLF_CI | COLF_BIN)))
             snprintf(type + strlen(type), sizeof(type) - strlen(type), " COLLATE %s", (c->flags & COLF_CI) ? "utf8mb4_general_ci" : "utf8mb4_bin");
         bool pk_here = (inline_pk && inline_pk->cols[0] == i) || (!has_pk_cons && c->primary_key);
-        tb_add(&b, "%s\n    %s %s%s%s%s", i ? "," : "", c->name, type, pk_here ? " PRIMARY KEY" : "",
+        tb_add(&b, "%s\n    `%s` %s%s%s%s", i ? "," : "", c->name, type, pk_here ? " PRIMARY KEY" : "",
                c->auto_increment ? " AUTO_INCREMENT" : "", (!c->nullable && !c->primary_key) ? " NOT NULL" : "");
         if (c->flags & COLF_GENERATED) tb_add(&b, " GENERATED ALWAYS AS (%s) STORED", c->comment);
         else if (c->default_val[0] || c->has_default) {
             bool num = c->type == SV_TYPE_INT || c->type == SV_TYPE_BIGINT || c->type == SV_TYPE_FLOAT ||
                        c->type == SV_TYPE_DECIMAL || c->type == SV_TYPE_BOOL || !strcasecmp(c->default_val, "NULL");
-            tb_add(&b, num ? " DEFAULT %s" : " DEFAULT '%s'", c->default_val);
+            if (num || default_is_now(c->default_val)) tb_add(&b, " DEFAULT %s", c->default_val);
+            else { svsb_puts(&b, " DEFAULT "); tb_quoted(&b, c->default_val); }
         }
+        if (c->flags & COLF_ON_UPDATE_NOW) svsb_puts(&b, " ON UPDATE CURRENT_TIMESTAMP");   // prima perso
+        if (!(c->flags & COLF_GENERATED) && c->comment[0] && c->comment[0] != '\x01') { svsb_puts(&b, " COMMENT "); tb_quoted(&b, c->comment); }
     }
     for (int i = 0; i < t->num_constraints; i++) {
         const Constraint* c = &t->constraints[i];
         if (c == inline_pk || (c->kind == CONS_FOREIGN && !with_fk)) continue;
         tb_add(&b, ",\n    ");
         switch (c->kind) {
-            case CONS_PRIMARY: tb_add(&b, "CONSTRAINT %s PRIMARY KEY (", c->name); tb_cols(&b, t, c->cols, c->ncols); tb_add(&b, ")"); break;
-            case CONS_UNIQUE:  tb_add(&b, "CONSTRAINT %s UNIQUE (", c->name); tb_cols(&b, t, c->cols, c->ncols); tb_add(&b, ")"); break;
-            case CONS_CHECK:   tb_add(&b, "CONSTRAINT %s CHECK (%s)", c->name, c->check); break;
+            case CONS_PRIMARY: tb_add(&b, "CONSTRAINT `%s` PRIMARY KEY (", c->name); tb_qcols(&b, t, c->cols, c->ncols); tb_add(&b, ")"); break;
+            case CONS_UNIQUE:  tb_add(&b, "CONSTRAINT `%s` UNIQUE (", c->name); tb_qcols(&b, t, c->cols, c->ncols); tb_add(&b, ")"); break;
+            case CONS_CHECK:   tb_add(&b, "CONSTRAINT `%s` CHECK (%s)", c->name, c->check); break;
             case CONS_FOREIGN: tb_fk(&b, t, c); break;
         }
     }
-    if (t->collation[0] && sv_name_ok(t->collation) && !strpbrk(t->collation, " ;'")) tb_add(&b, "\n) COLLATE %s;", t->collation);
-    else tb_add(&b, "\n);");
+    // indici (prima persi: un dump ripristinato o CREATE TABLE ... LIKE non li aveva)
+    for (int i = 0; i < t->num_indexes; i++) {
+        const Index* ix = &t->indexes[i];
+        tb_add(&b, ",\n    %sKEY `%s` (", ix->fulltext ? "FULLTEXT " : ix->unique ? "UNIQUE " : "", ix->name);
+        int nc = ix->ncols > 0 ? ix->ncols : 1;
+        for (int k = 0; k < nc; k++) tb_add(&b, "%s`%s`", k ? ", " : "", ix->ncols > 0 ? ix->cols[k] : ix->col_name);
+        svsb_putc(&b, ')');
+    }
+    svsb_puts(&b, "\n)");
+    if (t->collation[0] && sv_name_ok(t->collation) && !strpbrk(t->collation, " ;'")) tb_add(&b, " COLLATE %s", t->collation);
+    if (t->comment[0]) { svsb_puts(&b, " COMMENT "); tb_quoted(&b, t->comment); }
+    svsb_putc(&b, ';');
     return svsb_take(&b);
 }
 
@@ -12491,7 +12519,7 @@ char* executor_fk_statements(Catalog* cat, const char* db, const char* table) {
     tb_add(&b, "%s", "");
     for (int i = 0; i < t->num_constraints; i++) {
         if (t->constraints[i].kind != CONS_FOREIGN) continue;
-        tb_add(&b, "ALTER TABLE %s ADD ", t->name);
+        tb_add(&b, "ALTER TABLE `%s` ADD ", t->name);
         tb_fk(&b, t, &t->constraints[i]);
         tb_add(&b, ";\n");
     }
