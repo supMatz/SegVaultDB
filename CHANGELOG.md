@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.5.1 — 2026-11-27
+
+- Windows: the 1.5.0 packages could not be built (the per-thread `REGEXP` cache used POSIX thread keys, which the
+  Windows build does not link); it now uses Fiber Local Storage there. No other change: use 1.5.1 instead of
+  1.5.0, whose release has no packages. `test_win` exercises the cache under wine.
+
 ## 1.5.0 — 2026-11-27
 
 **Security and fixes (code review 2026-11-26, see `CR-*` in TODO.md)**

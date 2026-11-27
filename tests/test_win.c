@@ -77,6 +77,9 @@ int main(void) {
     CHECK(db_init(dir), "reopen: %s", db_init_error());
     ok("USE d");
     CHECK(num("SELECT COUNT(*) FROM t") == 501 && num("SELECT LENGTH(v) FROM t WHERE id = 9999") == 3, "data after restart");
+    // REGEXP con la cache per thread (Fiber Local Storage su Windows): pattern costante e pattern per riga
+    CHECK(num("SELECT COUNT(*) FROM t WHERE CONCAT('k', id) REGEXP '^k[0-9]+$'") == 501 &&
+          num("SELECT SUM(CONCAT('k', id % 11) REGEXP CONCAT('^k', id % 11, '$')) FROM t") == 501, "REGEXP with the per-thread cache");
     CHECK(db_login("w", "w-pass"), "user after restart");
     {   // P2.6: ACL protetta, solo l'utente corrente e SYSTEM (prima: quella ereditata dalla cartella sopra)
         char up[600];

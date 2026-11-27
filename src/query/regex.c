@@ -7,7 +7,11 @@ SCOPO: motore di espressioni regolari a backtracking (vedi regex.h).
 #include "regex.h"
 
 #include <ctype.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <pthread.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -264,21 +268,34 @@ void sv_regex_free(SvRegex* re) {
 #define RX_CACHE 8
 typedef struct { char* pat; bool icase; SvRegex* re; } RxSlot;
 typedef struct { RxSlot slot[RX_CACHE]; unsigned next; } RxCache;
-static pthread_key_t g_rx_key;
-static pthread_once_t g_rx_once = PTHREAD_ONCE_INIT;
-
 static void rx_cache_free(void* p) {
     RxCache* c = p;
+    if (!c) return;
     for (int i = 0; i < RX_CACHE; i++) { free(c->slot[i].pat); sv_regex_free(c->slot[i].re); }
     free(c);
 }
+#ifdef _WIN32                                // Windows: Fiber Local Storage, con il distruttore all'uscita del thread
+static DWORD g_rx_key = FLS_OUT_OF_INDEXES;
+static INIT_ONCE g_rx_once = INIT_ONCE_STATIC_INIT;
+static void WINAPI rx_fls_free(void* p) { rx_cache_free(p); }
+static BOOL CALLBACK rx_key_init(PINIT_ONCE o, void* a, void** ctx) { (void)o; (void)a; (void)ctx; g_rx_key = FlsAlloc(rx_fls_free); return TRUE; }
+static RxCache* rx_get(void) {
+    InitOnceExecuteOnce(&g_rx_once, rx_key_init, NULL, NULL);
+    return g_rx_key == FLS_OUT_OF_INDEXES ? NULL : (RxCache*)FlsGetValue(g_rx_key);
+}
+static bool rx_set(RxCache* c) { return g_rx_key != FLS_OUT_OF_INDEXES && FlsSetValue(g_rx_key, c); }
+#else
+static pthread_key_t g_rx_key;
+static pthread_once_t g_rx_once = PTHREAD_ONCE_INIT;
 static void rx_key_init(void) { pthread_key_create(&g_rx_key, rx_cache_free); }
+static RxCache* rx_get(void) { pthread_once(&g_rx_once, rx_key_init); return pthread_getspecific(g_rx_key); }
+static bool rx_set(RxCache* c) { return pthread_setspecific(g_rx_key, c) == 0; }
+#endif
 
 SvRegex* sv_regex_cached(const char* pattern, bool icase, char* err, size_t errn, bool* owned) {
     *owned = false;
-    pthread_once(&g_rx_once, rx_key_init);
-    RxCache* c = pthread_getspecific(g_rx_key);
-    if (!c && (c = calloc(1, sizeof(*c))) && pthread_setspecific(g_rx_key, c) != 0) { free(c); c = NULL; }
+    RxCache* c = rx_get();
+    if (!c && (c = calloc(1, sizeof(*c))) && !rx_set(c)) { free(c); c = NULL; }
     if (c)
         for (int i = 0; i < RX_CACHE; i++)
             if (c->slot[i].re && c->slot[i].icase == icase && !strcmp(c->slot[i].pat, pattern)) return c->slot[i].re;

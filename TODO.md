@@ -1,9 +1,9 @@
 # SegVaultDB — Engineering Roadmap
 
-## Stato attuale — versione 1.5.0 (non ancora rilasciata), aggiornato al 2026-11-27
+## Stato attuale — versione 1.5.1, aggiornato al 2026-11-27
 
-Versione nel codice: **1.5.0** (`include/common.h`); ultima release pubblicata: **v1.4.2** (2026-11-16). Tutto
-quello che segue la 1.4.2 è nel `CHANGELOG.md` sotto 1.5.0. `make test` (27 suite) e `make test-asan` verdi.
+Versione nel codice: **1.5.1** (`include/common.h`); ultima release pubblicata: **v1.5.1** (2026-11-27; la v1.5.0 dello
+stesso giorno non ha pacchetti: il build Windows falliva). Le novità dalla 1.4.2 sono nel `CHANGELOG.md` sotto 1.5.0. `make test` (27 suite) e `make test-asan` verdi.
 
 **Code review 2026-11-26 (voci `CR-*`, in fondo al file):** corrette tutte le voci che erano difetti, compresa
 CR-B6 (`BACKUP TO` non scrive più nelle cartelle servite né in quella dei dati) e CR-B9 (`INSERT()`, JSON
