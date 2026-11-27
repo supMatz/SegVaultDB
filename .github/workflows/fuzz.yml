@@ -23,7 +23,7 @@ jobs:
       matrix:
         target: [sql, json, login, page, catalog, exec, http, h2, smtp, htaccess, regex, sqljson, csv, diff]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libsqlite3-dev
       - name: Build the fuzzer (ASan + UBSan)
