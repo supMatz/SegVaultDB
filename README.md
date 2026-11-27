@@ -52,7 +52,7 @@ transazioni, trigger).
 | Caratteristica | Dettagli |
 |---|---|
 | **Linguaggio** | C11, zero dipendenze per il motore e per il server |
-| **Versione** | 1.5.1 |
+| **Versione** | 1.5.2 |
 | **Server di sviluppo** | Web + **PHP** (FastCGI, senza configurazione), un sito per cartella su `NOME.localhost`, **HTTPS + HTTP/2** con una CA locale, **reverse proxy** con WebSocket (Vite, Next.js, Django, Rails), `.htaccess` (`mod_rewrite`), **CGI** (Perl, Python, Ruby), **cattura delle email** (SMTP + pagina web + API), cruscotto, servizi accesi e spenti uno per uno, icona nell'area di notifica, servizio all'avvio |
 | **App desktop** | Win32 / GDI (Windows) · Xlib/X11 + Xft (Linux); all'avvio si sceglie **editor SQL** o **server API** |
 | **Server API** | `segvault-server` (o il pannello dell'app): HTTP/JSON, parametri `?` contro la SQL injection, sessioni con transazioni su più richieste, utenti e permessi (`GRANT`), token, CORS, limite di tempo, registro e monitor delle richieste, audit, backup pianificati; anche il **protocollo di rete MySQL** (PHP, Python, Java senza modifiche) |
@@ -74,7 +74,7 @@ transazioni, trigger).
 ## Download
 
 **Pacchetto completo** (eseguibili, script di avvio, sito d'esempio, README; su Windows `get-php.cmd`
-scarica PHP): `SegVault-1.5.1-windows-x86_64.zip` e `SegVault-1.5.1-linux-x86_64.tar.gz` nelle
+scarica PHP): `SegVault-1.5.2-windows-x86_64.zip` e `SegVault-1.5.2-linux-x86_64.tar.gz` nelle
 [release](https://github.com/supMatz/SegVaultDB/releases). Oppure **un solo file**, senza
 installazione (i font sono dentro l'eseguibile):
 
@@ -285,7 +285,7 @@ lo ferma e torna all'editor.
 ┌──────────────────────────────────────────────────────────────────────┐
 │ File  Edit  View  Query  Import  Export  Settings  Help   untitled.sql│
 ├──────────────────────────────────────────────────────────────────────┤
-│ ◆ SegVault v1.5.1 [▶ Run F5] [Run statement] │ [Commit] [Rollback] │ [Format]   ● Sky  ▤ db │
+│ ◆ SegVault v1.5.2 [▶ Run F5] [Run statement] │ [Commit] [Rollback] │ [Format]   ● Sky  ▤ db │
 ├────────────┬─────────────────────────────────────────────────────────┤
 │ EXPLORER ⟳ │  editor SQL (numeri di riga, highlighting, completamento)│
 │  ▸ uni     │                                                         │
@@ -293,7 +293,7 @@ lo ferma e torna all'editor.
 │            │  RESULTS ● Query OK            filtro    12 rows  History│
 │            │  griglia dei risultati (schede se più SELECT)           │
 ├────────────┴─────────────────────────────────────────────────────────┤
-│ ● SegVault engine 1.5.1  ▤ uni  script.sql         Ln 3, Col 7  F1 Shortcuts│
+│ ● SegVault engine 1.5.2  ▤ uni  script.sql         Ln 3, Col 7  F1 Shortcuts│
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -478,7 +478,7 @@ delle richieste al posto dei risultati.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ ◆ SegVault v1.5.1 [■ Stop server F5] [Copy address]  ● Running · port 8484 [Open SQL editor]│
+│ ◆ SegVault v1.5.2 [■ Stop server F5] [Copy address]  ● Running · port 8484 [Open SQL editor]│
 ├────────────────┬─────────────────────────────────────────────────────┤
 │ SERVER         │ REQUESTS ● 4 requests · up 1m   All Web PHP API MySQL Mail │
 │ ADDRESS        │ time     service client    method path / query     status ms │
@@ -497,7 +497,7 @@ delle richieste al posto dei risultati.
 │ START WITH THE COMPUTER                                              │
 │ TRY IT  curl … │                                                     │
 ├────────────────┴─────────────────────────────────────────────────────┤
-│ ● SegVault engine 1.5.1  API server running  this computer only    F5 Start / Stop│
+│ ● SegVault engine 1.5.2  API server running  this computer only    F5 Start / Stop│
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1372,7 +1372,7 @@ make test-asan     # gli stessi con AddressSanitizer + UndefinedBehaviorSanitize
 |---|---:|---|
 | `test_btree` | 40 011 | B+Tree sotto stress contro un modello di riferimento: inserimenti, aggiornamenti, cancellazioni e scansioni ordinate, con un buffer pool piccolo che costringe a riscrivere e rileggere le pagine |
 | `test_engine` | 131 | Motore: pagine, heap, catalogo, WAL e recovery, import CSV |
-| `test_sql` | 2 170 | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, procedure, viste, transazioni, crash e recovery, testi lunghi, JSON, full-text, 100 transazioni di fila |
+| `test_sql` | 2 211 | SQL dall'inizio alla fine: risultati attesi, errori, vincoli, trigger, procedure, viste, transazioni, crash e recovery, testi lunghi, JSON, full-text, 100 transazioni di fila |
 | `test_mysql` | 152 | Compatibilità con MySQL: il dialetto delle applicazioni PHP (WordPress, Laravel, ...), funzioni di testo, date, JSON e `REGEXP` |
 | `test_examples` | 166 | Ogni istruzione di `examples/` si comporta come scritto nei commenti (anche gli errori attesi) |
 | `test_server` | 258 | Il server su socket reali, endpoint salvati compresi: JSON, parametri, transazioni, token, CORS, origini non ammesse, keep-alive e pipelining, timeout, concorrenza, file statici, utenti e permessi, audit, protocollo MySQL (login, permessi, errori, più istruzioni, transazioni) |
@@ -1538,7 +1538,7 @@ SegVaultDB/
 
 | Costante | Valore | Significato |
 |---|---|---|
-| `SV_VERSION_STR` | `"1.5.1"` | Versione |
+| `SV_VERSION_STR` | `"1.5.2"` | Versione |
 | `SV_PAGE_SIZE` | `4096` | Dimensione di una pagina su disco |
 | `SV_BUFFER_POOL_CAP` | `1024` | Pagine nel buffer pool se la RAM non si legge (di norma 1/8 della RAM, `--cache-size`) |
 | `SV_MAX_DATABASES` | `100000` | Database (liste dinamiche dalla 1.4) |

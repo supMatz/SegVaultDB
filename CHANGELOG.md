@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.5.2 — 2026-11-27
+
+Fixes found by comparing with MySQL after 1.5.1 (CR-B10 in TODO.md):
 
 - `GROUP BY 1` grouped by the constant 1 (one row for the whole table); like MySQL it now means the first
   expression of the `SELECT` list, also with `ROLLUP` and in prepared statements.
